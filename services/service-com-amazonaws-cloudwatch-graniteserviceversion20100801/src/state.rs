@@ -11,6 +11,10 @@
 //!   [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::alarm_history`] — the
 //!   metric-alarm lifecycle written by `PutMetricAlarm` / `SetAlarmState` / `DeleteAlarms`
 //!   and read by `DescribeAlarms` and `DescribeAlarmHistory`.
+//! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::composite_alarms`] — the
+//!   composite alarms written by `PutCompositeAlarm`, whose state is EVALUATED from their
+//!   `AlarmRule` over the alarms the rule references
+//!   ([`ComAmazonawsCloudwatchGraniteserviceversion20100801State::evaluate_composite_alarms`]).
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::metric_streams`] — the
 //!   metric streams written by `PutMetricStream` and read back by `GetMetricStream`.
 //!
@@ -25,8 +29,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ::serde_json::{Map, Value};
 
 use crate::ops::types::{
-    ActionConfiguration, AlarmHistoryItem, Dimension, EvaluationCriteria, EvaluationWindow,
-    GetMetricStreamOutput, MetricAlarm, MetricDataQuery, Tag,
+    ActionConfiguration, AlarmHistoryItem, CompositeAlarm, Dimension, EvaluationCriteria,
+    EvaluationWindow, GetMetricStreamOutput, MetricAlarm, MetricDataQuery, Tag,
 };
 
 /// A dimension set, normalised: dimension name to value, ordered by name, so the same set
@@ -181,6 +185,41 @@ pub struct StoredAlarm {
     pub tags: Vec<Tag>,
 }
 
+/// A stored composite alarm: the modelled shape `DescribeAlarms` returns, plus what the
+/// store has to remember about it that no `CompositeAlarm` member carries — its `AlarmRule`
+/// as the writer PARSED it, the tags `PutCompositeAlarm` accepted, when its next rule
+/// evaluation is owed, and whether its state is currently one `SetAlarmState` forced.
+#[derive(Debug, Clone)]
+pub struct StoredCompositeAlarm {
+    /// The alarm as `DescribeAlarms` reports it.
+    pub alarm: CompositeAlarm,
+    /// The alarm's `AlarmRule`, parsed once by the write that stored it.
+    ///
+    /// The rule TEXT is kept on the alarm too, because `DescribeAlarms` reports it, but
+    /// nothing re-parses it: neither an evaluation nor a relationship read repeats the
+    /// parse, and a stored rule is always one a writer already accepted inside the parser's
+    /// bounds.
+    pub rule: AlarmRule,
+    /// The tags `PutCompositeAlarm` was given for this alarm.
+    pub tags: Vec<Tag>,
+    /// The instant, in epoch seconds, from which this alarm's rule evaluation is owed.
+    ///
+    /// "When this operation creates an alarm, the alarm state is immediately set to
+    /// INSUFFICIENT_DATA. The alarm is then evaluated and its state is set appropriately."
+    /// (`PutCompositeAlarm`) — so a write starts a span during which the alarm still reports
+    /// the state the write left it in, and the evaluation becomes due at its end.
+    pub evaluation_due_secs: f64,
+    /// The states of the alarms this one's rule references, as they stood when
+    /// `SetAlarmState` last forced this alarm's state; `None` when the alarm's state is its
+    /// own evaluated one.
+    ///
+    /// "If you use SetAlarmState on a composite alarm, the composite alarm is not guaranteed
+    /// to return to its actual state. It returns to its actual state only once any of its
+    /// children alarms change state." (`SetAlarmState`) — comparing this snapshot against
+    /// the children's current states is what detects that change.
+    pub forced_child_states: Option<Vec<(String, Option<String>)>>,
+}
+
 /// A stored alarm history item: the modelled shape `DescribeAlarmHistory` returns, plus the
 /// store-wide sequence number it was recorded under.
 ///
@@ -215,6 +254,8 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     pub metrics: HashMap<MetricKey, Vec<StoredDatum>>,
     /// Metric alarms by alarm name.
     pub alarms: HashMap<String, StoredAlarm>,
+    /// Composite alarms by alarm name.
+    pub composite_alarms: HashMap<String, StoredCompositeAlarm>,
     /// Alarm history by alarm name, in append order.
     pub alarm_history: HashMap<String, Vec<StoredHistoryItem>>,
     /// The sequence number the next recorded history item takes.
@@ -353,6 +394,55 @@ pub const MAX_METRIC_STREAMS: usize = 10_000;
 /// How long an alarm history item is retained: CloudWatch keeps alarm history for 14 days.
 pub const ALARM_HISTORY_RETENTION_SECS: f64 = 14.0 * 24.0 * 60.0 * 60.0;
 
+/// The most evaluation passes over the composite alarms ONE call may run.
+///
+/// A composite alarm's rule can reference another composite alarm, so a state change
+/// propagates one level of such a chain per pass. This bounds the work one request can ask
+/// for: at most this many passes over the stored composite alarms, whatever chain a caller
+/// has built. A chain deeper than the bound is not answered wrongly, only settled later —
+/// each following call carries it one more level, and the evaluation is idempotent.
+const MAX_COMPOSITE_EVALUATION_PASSES: usize = 8;
+
+/// `OK`, one of the three modelled `StateValue` values (`STATE_VALUE_VALUES`).
+pub const ALARM_STATE_OK: &str = "OK";
+
+/// `ALARM`, one of the three modelled `StateValue` values (`STATE_VALUE_VALUES`).
+pub const ALARM_STATE_ALARM: &str = "ALARM";
+
+/// `INSUFFICIENT_DATA`, one of the three modelled `StateValue` values
+/// (`STATE_VALUE_VALUES`).
+pub const ALARM_STATE_INSUFFICIENT_DATA: &str = "INSUFFICIENT_DATA";
+
+/// `MetricAlarm`, one of the modelled `AlarmType` values (`ALARM_TYPE_VALUES`): the kind of
+/// alarm `PutMetricAlarm` creates, which is also the kind `DescribeAlarms` and
+/// `DescribeAlarmHistory` report when a request names no `AlarmTypes`.
+pub const ALARM_TYPE_METRIC: &str = "MetricAlarm";
+
+/// `CompositeAlarm`, one of the modelled `AlarmType` values (`ALARM_TYPE_VALUES`): the kind
+/// of alarm `PutCompositeAlarm` creates.
+pub const ALARM_TYPE_COMPOSITE: &str = "CompositeAlarm";
+
+/// `Alarm`, one of the modelled `ActionsSuppressedBy` values
+/// (`ACTIONS_SUPPRESSED_BY_VALUES`): "When the value is `ALARM`, it means that the actions
+/// are suppressed because the suppressor alarm is in `ALARM`" (`CompositeAlarm$ActionsSuppressedBy`).
+pub const ACTIONS_SUPPRESSED_BY_ALARM: &str = "Alarm";
+
+/// How long after a write a composite alarm's rule evaluation is owed.
+///
+/// `PutCompositeAlarm` creates an alarm in `INSUFFICIENT_DATA` and documents that "the alarm
+/// is then evaluated and its state is set appropriately", so the evaluated state is NOT due
+/// at the instant of the write: a caller reading straight after the write still sees the
+/// `INSUFFICIENT_DATA` the write left behind. CloudWatch publishes no duration for that
+/// gap, so this span is the emulator's own choice inside the framework's 250-750 ms window
+/// for a transition the clock owes, and it is never slept on \u2014 the due instant is stored and
+/// the evaluation is materialised by the first call that happens at or after it.
+pub const COMPOSITE_EVALUATION_DELAY_SECS: f64 = 0.5;
+
+/// The modelled maximum length of `StateReasonData`: `CompositeAlarm$StateReasonData` and
+/// `MetricAlarm$StateReasonData` both target `StateReasonData`, a string with
+/// `@length 0..4000`.
+pub const MAX_STATE_REASON_DATA_LEN: usize = 4000;
+
 impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     /// Append `data` to the series `key` names, creating it when it does not exist.
     ///
@@ -435,6 +525,225 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
             !history.is_empty()
         });
     }
+
+    /// The current `StateValue` of the alarm a rule reference names, whichever kind of alarm
+    /// it is; `None` when the store holds no alarm of that name.
+    ///
+    /// "The alarms specified in a composite alarm's rule expression can include metric alarms
+    /// and other composite alarms." (`PutCompositeAlarm`), so both stores are consulted.
+    pub fn alarm_state_value(&self, reference: &str) -> Option<String> {
+        let name = alarm_rule_reference_name(reference);
+        self.alarms
+            .get(name)
+            .and_then(|stored| stored.alarm.state_value.clone())
+            .or_else(|| {
+                self.composite_alarms
+                    .get(name)
+                    .and_then(|stored| stored.alarm.state_value.clone())
+            })
+    }
+
+    /// The names and current states of the alarms one composite-alarm rule references, in the
+    /// order the rule names them.
+    pub fn child_states(&self, rule: &AlarmRule) -> Vec<(String, Option<String>)> {
+        alarm_rule_child_names(rule)
+            .into_iter()
+            .map(|name| {
+                let state = self.alarm_state_value(&name);
+                (name, state)
+            })
+            .collect()
+    }
+
+    /// The alarms one composite alarm's rule references: "These are the metric alarms and
+    /// composite alarms referenced in the AlarmRule field of the composite alarm"
+    /// (`DescribeAlarmsInput$ChildrenOfAlarmName`). Empty for an alarm this store does not
+    /// hold as a composite alarm.
+    pub fn composite_alarm_children(&self, name: &str) -> Vec<String> {
+        self.composite_alarms
+            .get(name)
+            .map(|stored| alarm_rule_child_names(&stored.rule))
+            .unwrap_or_default()
+    }
+
+    /// The composite alarms whose rule references `name`: "These are the composite alarms
+    /// that have AlarmRule parameters that reference the alarm named in ParentsOfAlarmName"
+    /// (`DescribeAlarmsInput$ParentsOfAlarmName`) — the alarm itself is never among them.
+    pub fn composite_alarm_parents(&self, name: &str) -> Vec<String> {
+        let mut parents: Vec<String> = self
+            .composite_alarms
+            .iter()
+            .filter(|(parent, stored)| {
+                parent.as_str() != name
+                    && alarm_rule_child_names(&stored.rule)
+                        .iter()
+                        .any(|child| child == name)
+            })
+            .map(|(parent, _)| parent.clone())
+            .collect();
+        parents.sort();
+        parents
+    }
+
+    /// Materialise every composite-alarm rule evaluation the clock has already made due.
+    ///
+    /// A composite alarm's state is not a value a caller writes: it is "the rule that this
+    /// alarm uses to evaluate its alarm state" (`CompositeAlarm$AlarmRule`) applied to the
+    /// states of the alarms the rule references, so it is COMPUTED here from the alarms the
+    /// store holds. The write is one the clock owed: each evaluation becomes due
+    /// [`COMPOSITE_EVALUATION_DELAY_SECS`] after the call that configured the alarm, and
+    /// from then on the outcome depends only on the stored alarm states — so whichever call
+    /// materialises it, every later caller sees the same thing.
+    pub fn evaluate_composite_alarms(&mut self, now_secs: f64) {
+        // A composite alarm's rule can reference another composite alarm, so one alarm's new
+        // state can change its parent's outcome too; one pass settles one level of that
+        // chain. The number of passes is bounded by [`MAX_COMPOSITE_EVALUATION_PASSES`] as
+        // well as by the number of composite alarms, so the work ONE call can do is bounded
+        // by that constant times the alarms the store holds times the nodes a rule may
+        // carry. The bound is also what stops a CYCLE of composite alarms: "the evaluation
+        // of composite alarms stops if CloudWatch detects a cycle in the evaluation path."
+        let passes = self
+            .composite_alarms
+            .len()
+            .min(MAX_COMPOSITE_EVALUATION_PASSES);
+        for _ in 0..passes {
+            if !self.evaluate_composite_alarms_once(now_secs) {
+                break;
+            }
+        }
+    }
+
+    /// One evaluation pass over every composite alarm, reporting whether any alarm's state
+    /// value changed. Alarms are visited in name order, so the pass is deterministic.
+    fn evaluate_composite_alarms_once(&mut self, now_secs: f64) -> bool {
+        let mut names: Vec<String> = self.composite_alarms.keys().cloned().collect();
+        names.sort();
+        let mut changed = false;
+        for name in names {
+            changed |= self.evaluate_composite_alarm(&name, now_secs);
+        }
+        changed
+    }
+
+    /// Evaluate ONE composite alarm, reporting whether its state value changed.
+    fn evaluate_composite_alarm(&mut self, name: &str, now_secs: f64) -> bool {
+        // Everything this evaluation reads is read before anything is written.
+        let Some(stored) = self.composite_alarms.get(name) else {
+            return false;
+        };
+        if now_secs < stored.evaluation_due_secs {
+            return false;
+        }
+        let rule = &stored.rule;
+        let previous = AlarmStateSnapshot::of_composite_alarm(&stored.alarm);
+        let forced = stored.forced_child_states.clone();
+        let suppressor = stored.alarm.actions_suppressor.clone();
+        let children = self.child_states(rule);
+        // "It returns to its actual state only once any of its children alarms change state."
+        // (`SetAlarmState`) — until then the state a caller forced stands.
+        let forced_stands = forced.is_some_and(|snapshot| snapshot == children);
+        let evaluated = rule.evaluate(&|reference| self.alarm_state_value(reference));
+        // "Actions will be suppressed if the suppressor alarm is in the ALARM state."
+        // (`CompositeAlarm$ActionsSuppressor`) — a reported fact about the suppressor's
+        // current state, so it is derived here rather than stored by the writer.
+        let suppressed = suppressor
+            .as_deref()
+            .filter(|suppressor| {
+                self.alarm_state_value(suppressor).as_deref() == Some(ALARM_STATE_ALARM)
+            })
+            .map(|suppressor| {
+                format!(
+                    "Actions suppressed by alarm {}",
+                    alarm_rule_reference_name(suppressor)
+                )
+            });
+
+        let state = if evaluated {
+            ALARM_STATE_ALARM
+        } else {
+            ALARM_STATE_OK
+        };
+        let summary = format!(
+            "Alarm updated from {} to {state}",
+            previous
+                .state_value
+                .as_deref()
+                .unwrap_or(ALARM_STATE_INSUFFICIENT_DATA)
+        );
+
+        let Some(stored) = self.composite_alarms.get_mut(name) else {
+            return false;
+        };
+        stored.alarm.actions_suppressed_by = suppressed
+            .as_ref()
+            .map(|_| ACTIONS_SUPPRESSED_BY_ALARM.to_string());
+        stored.alarm.actions_suppressed_reason = suppressed;
+        if forced_stands {
+            return false;
+        }
+        // The evaluated state has taken over from any state a caller forced.
+        stored.forced_child_states = None;
+        if stored.alarm.state_value.as_deref() == Some(state) {
+            return false;
+        }
+        stored.alarm.state_value = Some(state.to_string());
+        stored.alarm.state_reason = Some(composite_state_reason(evaluated, state));
+        stored.alarm.state_reason_data = Some(composite_state_reason_data(&children));
+        stored.alarm.state_updated_timestamp = Some(to_timestamp(now_secs));
+        // "The timestamp of the last change to the alarm's StateValue."
+        // (`CompositeAlarm$StateTransitionedTimestamp`) — this call changed it.
+        stored.alarm.state_transitioned_timestamp = Some(to_timestamp(now_secs));
+        let updated = AlarmStateSnapshot::of_composite_alarm(&stored.alarm);
+        let item = AlarmHistoryItem {
+            alarm_name: Some(name.to_string()),
+            alarm_contributor_id: None,
+            alarm_type: Some(ALARM_TYPE_COMPOSITE.to_string()),
+            timestamp: Some(to_timestamp(now_secs)),
+            history_item_type: Some("StateUpdate".to_string()),
+            history_summary: Some(summary),
+            history_data: Some(state_transition_history_data(&previous, &updated)),
+            alarm_contributor_attributes: None,
+        };
+        self.record_history(name, now_secs, item);
+        true
+    }
+}
+
+/// The reason a composite alarm reports for the state its rule evaluation put it in.
+fn composite_state_reason(evaluated: bool, state: &str) -> String {
+    let outcome = if evaluated { "TRUE" } else { "FALSE" };
+    format!("The composite alarm's rule evaluated to {outcome}, so the alarm is in {state} state")
+}
+
+/// The JSON `StateReasonData` of a composite alarm's evaluated state: the alarms its rule
+/// references and the state each one was in when the rule was evaluated.
+///
+/// "An explanation for the alarm state, in JSON format."
+/// (`CompositeAlarm$StateReasonData`), bounded by [`MAX_STATE_REASON_DATA_LEN`] — a document
+/// is JSON, so it can never be truncated to fit: the children are dropped instead when a
+/// rule references more of them than the bound holds.
+fn composite_state_reason_data(children: &[(String, Option<String>)]) -> String {
+    let mut document = Map::new();
+    document.insert("version".to_string(), Value::from(HISTORY_DATA_VERSION));
+    let evaluated: Vec<Value> = children
+        .iter()
+        .map(|(name, state)| {
+            let mut child = Map::new();
+            child.insert("alarmName".to_string(), Value::from(name.as_str()));
+            insert_member(&mut child, "stateValue", json_text(state));
+            Value::Object(child)
+        })
+        .collect();
+    let mut full = document.clone();
+    full.insert(
+        "evaluatedChildren".to_string(),
+        Value::Array(evaluated),
+    );
+    let rendered = Value::Object(full).to_string();
+    if rendered.len() <= MAX_STATE_REASON_DATA_LEN {
+        return rendered;
+    }
+    Value::Object(document).to_string()
 }
 
 /// Whether one stored history item is still inside [`ALARM_HISTORY_RETENTION_SECS`] at
@@ -483,12 +792,51 @@ const CONFIGURATION_CREATE: &str = "Create";
 /// A history document's `type` for an alarm the call OVERWROTE.
 const CONFIGURATION_UPDATE: &str = "Update";
 
+/// One alarm's state, as a history document records it.
+///
+/// The three state members EVERY kind of alarm carries, so one definition of a transition
+/// document serves the metric alarms `SetAlarmState` writes and the composite alarms whose
+/// state the rule evaluation writes, and the two cannot record two different shapes of
+/// document.
+#[derive(Debug, Clone, Default)]
+pub struct AlarmStateSnapshot {
+    /// The alarm's `StateValue`.
+    pub state_value: Option<String>,
+    /// The alarm's `StateReason`.
+    pub state_reason: Option<String>,
+    /// The alarm's `StateReasonData`.
+    pub state_reason_data: Option<String>,
+}
+
+impl AlarmStateSnapshot {
+    /// One metric alarm's state.
+    pub fn of_metric_alarm(alarm: &MetricAlarm) -> Self {
+        Self {
+            state_value: alarm.state_value.clone(),
+            state_reason: alarm.state_reason.clone(),
+            state_reason_data: alarm.state_reason_data.clone(),
+        }
+    }
+
+    /// One composite alarm's state.
+    pub fn of_composite_alarm(alarm: &CompositeAlarm) -> Self {
+        Self {
+            state_value: alarm.state_value.clone(),
+            state_reason: alarm.state_reason.clone(),
+            state_reason_data: alarm.state_reason_data.clone(),
+        }
+    }
+}
+
 /// The JSON record of a state transition: the alarm's state before and after the write.
 ///
 /// A consumer of alarm history reads the state a transition moved the alarm to out of this
 /// document (`HistoryData` → `newState` → `stateValue`), which is why both states are named
 /// rather than only the reason text the summary already carries.
-pub fn state_update_history_data(previous: &MetricAlarm, updated: &MetricAlarm) -> String {
+pub fn state_transition_history_data(
+    previous: &AlarmStateSnapshot,
+    updated: &AlarmStateSnapshot,
+) -> String {
     // `StateReasonData` is itself up to 4000 characters, so two of them need not fit the
     // modelled bound: the second candidate is the same document without them, which always
     // does (a state value plus two reasons of at most 1023 each).
@@ -498,11 +846,23 @@ pub fn state_update_history_data(previous: &MetricAlarm, updated: &MetricAlarm) 
     ])
 }
 
+/// The JSON record of a metric alarm's state transition.
+pub fn state_update_history_data(previous: &MetricAlarm, updated: &MetricAlarm) -> String {
+    state_transition_history_data(
+        &AlarmStateSnapshot::of_metric_alarm(previous),
+        &AlarmStateSnapshot::of_metric_alarm(updated),
+    )
+}
+
 /// The JSON record of a configuration write: the alarm the call stored, and the configuration
 /// it replaced when the call overwrote an alarm that already existed.
-pub fn configuration_update_history_data(
-    previous: Option<&MetricAlarm>,
-    updated: &MetricAlarm,
+///
+/// Takes the configuration documents rather than an alarm, so the metric-alarm and
+/// composite-alarm writers share one record layout and one length bound.
+fn configuration_history_data(
+    previous: Option<Value>,
+    updated: Value,
+    alarm_name: Option<&str>,
 ) -> String {
     let (kind, stored_member) = match previous {
         Some(_) => (CONFIGURATION_UPDATE, "updatedAlarm"),
@@ -520,23 +880,20 @@ pub fn configuration_update_history_data(
         )
     };
     // An alarm's configuration is itself unbounded in the modelled sense (up to 20 metric
-    // queries, each with an expression of up to 2048 characters), so the candidates drop
-    // fidelity in order: both configurations, then only the stored one, then the name of the
-    // alarm the item already belongs to — which always fits.
-    let mut full = heading(alarm_configuration_document(updated));
+    // queries, each with an expression of up to 2048 characters, or a rule of up to 10240),
+    // so the candidates drop fidelity in order: both configurations, then only the stored
+    // one, then the name of the alarm the item already belongs to — which always fits.
+    let mut full = heading(updated.clone());
     if let (Some(previous), Value::Object(members)) = (previous, &mut full) {
-        members.insert(
-            "originalAlarm".to_string(),
-            alarm_configuration_document(previous),
-        );
+        members.insert("originalAlarm".to_string(), previous);
     }
     bounded_history_data(&[
         full,
-        heading(alarm_configuration_document(updated)),
+        heading(updated),
         heading(Value::Object(
             [(
                 "alarmName".to_string(),
-                Value::from(updated.alarm_name.clone()),
+                alarm_name.map_or(Value::Null, Value::from),
             )]
             .into_iter()
             .collect(),
@@ -544,8 +901,89 @@ pub fn configuration_update_history_data(
     ])
 }
 
+/// The JSON record of a METRIC alarm's configuration write.
+pub fn configuration_update_history_data(
+    previous: Option<&MetricAlarm>,
+    updated: &MetricAlarm,
+) -> String {
+    configuration_history_data(
+        previous.map(alarm_configuration_document),
+        alarm_configuration_document(updated),
+        updated.alarm_name.as_deref(),
+    )
+}
+
+/// The JSON record of a COMPOSITE alarm's configuration write.
+pub fn composite_configuration_update_history_data(
+    previous: Option<&CompositeAlarm>,
+    updated: &CompositeAlarm,
+) -> String {
+    configuration_history_data(
+        previous.map(composite_alarm_configuration_document),
+        composite_alarm_configuration_document(updated),
+        updated.alarm_name.as_deref(),
+    )
+}
+
+/// A composite alarm's configuration as a history document records it: every configuration
+/// member the alarm carries, under the model's member name in lower camel case, and only
+/// those it carries. The state members are NOT part of it, for the same reason they are not
+/// part of a metric alarm's: "When you update an existing alarm, its state is left
+/// unchanged" (`PutCompositeAlarm`), so a configuration write records no state.
+fn composite_alarm_configuration_document(alarm: &CompositeAlarm) -> Value {
+    let mut config = Map::new();
+    insert_member(&mut config, "alarmName", json_text(&alarm.alarm_name));
+    insert_member(&mut config, "alarmArn", json_text(&alarm.alarm_arn));
+    insert_member(
+        &mut config,
+        "alarmDescription",
+        json_text(&alarm.alarm_description),
+    );
+    insert_member(&mut config, "alarmRule", json_text(&alarm.alarm_rule));
+    insert_member(
+        &mut config,
+        "actionsEnabled",
+        alarm.actions_enabled.map(Value::from),
+    );
+    insert_member(&mut config, "okActions", json_strings(&alarm.ok_actions));
+    insert_member(&mut config, "alarmActions", json_strings(&alarm.alarm_actions));
+    insert_member(
+        &mut config,
+        "insufficientDataActions",
+        json_strings(&alarm.insufficient_data_actions),
+    );
+    insert_member(
+        &mut config,
+        "actionsSuppressor",
+        json_text(&alarm.actions_suppressor),
+    );
+    insert_member(
+        &mut config,
+        "actionsSuppressorWaitPeriod",
+        alarm.actions_suppressor_wait_period.map(Value::from),
+    );
+    insert_member(
+        &mut config,
+        "actionsSuppressorExtensionPeriod",
+        alarm.actions_suppressor_extension_period.map(Value::from),
+    );
+    insert_member(
+        &mut config,
+        "actionConfiguration",
+        alarm
+            .action_configuration
+            .as_ref()
+            .map(action_configuration_document),
+    );
+    Value::Object(config)
+}
+
 /// One state-transition document, with or without the (potentially long) reason data.
-fn transition_document(previous: &MetricAlarm, updated: &MetricAlarm, reason_data: bool) -> Value {
+fn transition_document(
+    previous: &AlarmStateSnapshot,
+    updated: &AlarmStateSnapshot,
+    reason_data: bool,
+) -> Value {
     Value::Object(
         [
             ("version".to_string(), Value::from(HISTORY_DATA_VERSION)),
@@ -568,7 +1006,7 @@ fn transition_document(previous: &MetricAlarm, updated: &MetricAlarm, reason_dat
 /// `stateReasonData` is itself JSON ("The reason that this alarm is set to this specific state,
 /// in JSON format." — `MetricAlarm$StateReasonData`), so it is embedded as JSON rather than as
 /// a quoted string whenever it parses as JSON.
-fn alarm_state_document(alarm: &MetricAlarm, reason_data: bool) -> Value {
+fn alarm_state_document(alarm: &AlarmStateSnapshot, reason_data: bool) -> Value {
     let mut state = Map::new();
     insert_member(&mut state, "stateValue", json_text(&alarm.state_value));
     insert_member(&mut state, "stateReason", json_text(&alarm.state_reason));
@@ -880,4 +1318,386 @@ fn json_strings(values: &Option<Vec<String>>) -> Option<Value> {
 /// `StateReasonData`, and a history document has to stay parseable either way.
 fn embedded_json(raw: &str) -> Value {
     ::serde_json::from_str(raw).unwrap_or_else(|_| Value::from(raw))
+}
+
+// ---------------------------------------------------------------------------
+// Composite alarm rules (`CompositeAlarm$AlarmRule`)
+// ---------------------------------------------------------------------------
+//
+// "An expression that specifies which other alarms are to be evaluated to determine this
+// composite alarm's state. … You can use operators (AND, OR and NOT) to combine multiple
+// functions in a single expression. You can use parenthesis to logically group the functions
+// in your expression. You can use either alarm names or ARNs to reference the other alarms
+// that are to be evaluated. Functions can include the following: ALARM("alarm-name or
+// alarm-ARN") is TRUE if the named alarm is in ALARM state. OK(…) … INSUFFICIENT_DATA(…) …
+// TRUE always evaluates to TRUE. FALSE always evaluates to FALSE. … Alarm names specified in
+// AlarmRule can be surrounded with double-quotes ("), but do not have to be."
+// (`smithy_query(query="doc",shape="PutCompositeAlarmInput",member="AlarmRule")`)
+//
+// That grammar is CloudWatch's own — no published parser crate reads it — so it is parsed
+// here, ONCE, and shared by the writer that validates a rule and the evaluation that computes
+// a composite alarm's state from it. Operator precedence is the conventional one the
+// documented examples rely on: NOT binds tightest, then AND, then OR.
+//
+// A rule is CALLER-SUPPLIED text, and both the parse and every later walk of the parsed tree
+// (evaluation, the reference walk, the tree's own drop) descend with the tree, so the parser
+// is bounded in THREE ways before any of that recursion can grow with a request:
+//
+// * LENGTH — [`MAX_ALARM_RULE_LEN`], the modelled `@length` of `AlarmRule`, re-checked here
+//   so the bound holds however the parser is reached.
+// * NESTING — [`MAX_RULE_NESTING_DEPTH`], the depth the PARSE descends to, counted as it
+//   descends: one level per `(` and one per `NOT`, the only two sites that recurse.
+// * NODES — [`MAX_RULE_NODES`], the number of functions and operators one rule may carry,
+//   counted as the tree is built. A chain of `OR`s parses iteratively but builds a tree as
+//   deep as the chain is long, so this is what bounds the depth of every walk of the tree.
+//
+// Each bound is refused as the same 400 `ValidationError` a malformed rule is refused with,
+// so no rule that could overflow a thread's stack is ever parsed, stored or evaluated.
+
+/// The longest `AlarmRule` this service parses: the modelled `@length 1..10240` of
+/// `PutCompositeAlarmInput$AlarmRule`
+/// (`smithy_query(query="shape",shape="PutCompositeAlarmInput")`).
+///
+/// The boundary validator refuses a longer one before a handler runs; it is re-checked in
+/// [`parse_alarm_rule`] so the bound holds for every caller of the parser, and because it is
+/// what makes the two structural bounds below reachable in one pass over the text.
+pub const MAX_ALARM_RULE_LEN: usize = 10_240;
+
+/// The deepest NESTING one `AlarmRule` may carry: the levels the parse descends through,
+/// one per `(` and one per `NOT`.
+///
+/// The value is the EMULATOR's choice: CloudWatch's own documented rule examples group a
+/// handful of levels (`(ALARM("a") OR ALARM("b")) AND NOT OK("c")` is two), so 32 is an
+/// order of magnitude above any rule a caller writes, and at roughly four stack frames per
+/// level it is three orders of magnitude inside a worker thread's ordinary stack.
+const MAX_RULE_NESTING_DEPTH: usize = 32;
+
+/// The most functions and operators one `AlarmRule` may carry.
+///
+/// This is the general depth bound. `A OR B OR C …` parses without recursing, but builds a
+/// tree as deep as the chain is long, and [`AlarmRule::evaluate`],
+/// [`AlarmRule::references`] and the tree's own drop all descend with that depth — so the
+/// node count is what bounds them, whatever shape the rule takes.
+///
+/// The value is the EMULATOR's choice, above the one quota CloudWatch publishes for a rule:
+/// "The rule expression of a composite alarm can include as many as 100 underlying alarms",
+/// which with its operators is a few hundred nodes.
+const MAX_RULE_NODES: usize = 1_024;
+
+/// The three state functions a rule can carry. Each one's name is also the `StateValue` it
+/// tests, which is why the parsed node keeps the name as the state.
+const RULE_STATE_FUNCTIONS: [&str; 3] = [
+    ALARM_STATE_ALARM,
+    ALARM_STATE_OK,
+    ALARM_STATE_INSUFFICIENT_DATA,
+];
+
+/// One node of a parsed composite-alarm rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlarmRule {
+    /// `TRUE` or `FALSE`.
+    Literal(bool),
+    /// `ALARM("x")`, `OK("x")` or `INSUFFICIENT_DATA("x")`: true when the alarm `reference`
+    /// names is in `state`.
+    InState {
+        /// The alarm name or ARN the function names.
+        reference: String,
+        /// The `StateValue` the function tests for.
+        state: String,
+    },
+    /// `NOT <rule>`.
+    Not(Box<AlarmRule>),
+    /// `<rule> AND <rule>`.
+    And(Box<AlarmRule>, Box<AlarmRule>),
+    /// `<rule> OR <rule>`.
+    Or(Box<AlarmRule>, Box<AlarmRule>),
+}
+
+impl AlarmRule {
+    /// Evaluate this rule, reading each referenced alarm's current `StateValue` through
+    /// `state_of`.
+    ///
+    /// An alarm the store does not hold is in no state, so every function over it is false:
+    /// the rule still has an outcome, which is what lets a composite alarm keep evaluating
+    /// when a child has been deleted.
+    pub fn evaluate(&self, state_of: &impl Fn(&str) -> Option<String>) -> bool {
+        match self {
+            Self::Literal(value) => *value,
+            Self::InState { reference, state } => {
+                state_of(reference).as_deref() == Some(state.as_str())
+            }
+            Self::Not(inner) => !inner.evaluate(state_of),
+            Self::And(left, right) => left.evaluate(state_of) && right.evaluate(state_of),
+            Self::Or(left, right) => left.evaluate(state_of) || right.evaluate(state_of),
+        }
+    }
+
+    /// Every alarm reference this rule carries, in the order the rule names them, without
+    /// repeats.
+    pub fn references(&self) -> Vec<String> {
+        let mut references = Vec::new();
+        self.collect_references(&mut references);
+        references
+    }
+
+    fn collect_references(&self, into: &mut Vec<String>) {
+        match self {
+            Self::Literal(_) => {}
+            Self::InState { reference, .. } => {
+                if !into.iter().any(|seen| seen == reference) {
+                    into.push(reference.clone());
+                }
+            }
+            Self::Not(inner) => inner.collect_references(into),
+            Self::And(left, right) | Self::Or(left, right) => {
+                left.collect_references(into);
+                right.collect_references(into);
+            }
+        }
+    }
+}
+
+/// The alarm NAME a rule reference names.
+///
+/// "You can use either alarm names or ARNs to reference the other alarms that are to be
+/// evaluated." (`PutCompositeAlarmInput$AlarmRule`) — an alarm ARN's resource part is
+/// `alarm:<name>` (see [`alarm_arn`]), so both forms resolve to the name the store keys on.
+pub fn alarm_rule_reference_name(reference: &str) -> &str {
+    if reference.starts_with("arn:") {
+        if let Some((_, name)) = reference.rsplit_once(":alarm:") {
+            return name;
+        }
+    }
+    reference
+}
+
+/// The alarm names one rule references — its children — resolved from whatever form the rule
+/// used, in the order the rule names them and without repeats.
+pub fn alarm_rule_child_names(rule: &AlarmRule) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for reference in rule.references() {
+        let name = alarm_rule_reference_name(&reference).to_string();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// A rule this parser cannot read, and why. The caller answers it as a refusal naming the
+/// member, so the text is built from the request rather than fixed.
+#[derive(Debug, Clone)]
+pub struct AlarmRuleError {
+    /// What was expected, and where in the rule.
+    pub message: String,
+}
+
+impl std::fmt::Display for AlarmRuleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Parse a composite alarm's `AlarmRule`, within the three bounds this module states.
+pub fn parse_alarm_rule(rule: &str) -> Result<AlarmRule, AlarmRuleError> {
+    if rule.len() > MAX_ALARM_RULE_LEN {
+        return Err(AlarmRuleError {
+            message: format!(
+                "AlarmRule must not be longer than {MAX_ALARM_RULE_LEN} characters"
+            ),
+        });
+    }
+    let mut parser = RuleParser {
+        text: rule,
+        at: 0,
+        depth: 0,
+        nodes: 0,
+    };
+    let parsed = parser.parse_or()?;
+    parser.skip_spaces();
+    if !parser.rest().is_empty() {
+        return Err(parser.error("expected the end of the rule"));
+    }
+    Ok(parsed)
+}
+
+/// A recursive-descent parser over one rule's text, tracking the byte offset it has reached
+/// so a refusal can say WHERE the rule stopped making sense.
+struct RuleParser<'a> {
+    text: &'a str,
+    at: usize,
+    /// How many levels the parse has descended at this point, bounded by
+    /// [`MAX_RULE_NESTING_DEPTH`].
+    depth: usize,
+    /// How many nodes the parse has built, bounded by [`MAX_RULE_NODES`].
+    nodes: usize,
+}
+
+impl<'a> RuleParser<'a> {
+    /// The text this parser has not consumed yet.
+    fn rest(&self) -> &'a str {
+        self.text.get(self.at..).unwrap_or_default()
+    }
+
+    /// Advance past any whitespace.
+    fn skip_spaces(&mut self) {
+        let rest = self.rest();
+        self.at += rest.len() - rest.trim_start().len();
+    }
+
+    /// Consume `ch` when it is the next non-whitespace character.
+    fn take(&mut self, ch: char) -> bool {
+        self.skip_spaces();
+        if self.rest().starts_with(ch) {
+            self.at += ch.len_utf8();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Consume `word` when the next non-whitespace text is that word — case-insensitively,
+    /// and only as a whole word, so `OK` never matches the start of an alarm name.
+    fn take_word(&mut self, word: &str) -> bool {
+        self.skip_spaces();
+        let rest = self.rest();
+        let Some(head) = rest.get(..word.len()) else {
+            return false;
+        };
+        if !head.eq_ignore_ascii_case(word) {
+            return false;
+        }
+        if rest[word.len()..].starts_with(|ch: char| ch.is_alphanumeric() || ch == '_') {
+            return false;
+        }
+        self.at += word.len();
+        true
+    }
+
+    /// A refusal naming what was expected and where.
+    fn error(&self, expected: &str) -> AlarmRuleError {
+        AlarmRuleError {
+            message: format!("AlarmRule: {expected} at offset {}", self.at),
+        }
+    }
+
+    /// Enter one more level of nesting, refusing a rule that nests past
+    /// [`MAX_RULE_NESTING_DEPTH`]. Called at the only two sites the parse recurses from, so
+    /// the recursion can never grow with the request past the bound.
+    fn descend(&mut self) -> Result<(), AlarmRuleError> {
+        self.depth += 1;
+        if self.depth > MAX_RULE_NESTING_DEPTH {
+            return Err(self.error(&format!(
+                "must not nest more than {MAX_RULE_NESTING_DEPTH} levels deep"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Leave one level of nesting.
+    fn ascend(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    /// Account for one more node of the tree, refusing a rule carrying more than
+    /// [`MAX_RULE_NODES`] of them — which is what bounds the DEPTH of every later walk of
+    /// the tree.
+    fn node(&mut self, node: AlarmRule) -> Result<AlarmRule, AlarmRuleError> {
+        self.nodes += 1;
+        if self.nodes > MAX_RULE_NODES {
+            return Err(self.error(&format!(
+                "must not carry more than {MAX_RULE_NODES} functions and operators"
+            )));
+        }
+        Ok(node)
+    }
+
+    fn parse_or(&mut self) -> Result<AlarmRule, AlarmRuleError> {
+        let mut left = self.parse_and()?;
+        while self.take_word("OR") {
+            let right = self.parse_and()?;
+            left = self.node(AlarmRule::Or(Box::new(left), Box::new(right)))?;
+        }
+        Ok(left)
+    }
+
+    fn parse_and(&mut self) -> Result<AlarmRule, AlarmRuleError> {
+        let mut left = self.parse_unary()?;
+        while self.take_word("AND") {
+            let right = self.parse_unary()?;
+            left = self.node(AlarmRule::And(Box::new(left), Box::new(right)))?;
+        }
+        Ok(left)
+    }
+
+    fn parse_unary(&mut self) -> Result<AlarmRule, AlarmRuleError> {
+        if self.take_word("NOT") {
+            self.descend()?;
+            let inner = self.parse_unary()?;
+            self.ascend();
+            return self.node(AlarmRule::Not(Box::new(inner)));
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Result<AlarmRule, AlarmRuleError> {
+        if self.take('(') {
+            self.descend()?;
+            let inner = self.parse_or()?;
+            self.ascend();
+            if !self.take(')') {
+                return Err(self.error("expected `)`"));
+            }
+            return Ok(inner);
+        }
+        if self.take_word("TRUE") {
+            return self.node(AlarmRule::Literal(true));
+        }
+        if self.take_word("FALSE") {
+            return self.node(AlarmRule::Literal(false));
+        }
+        for state in RULE_STATE_FUNCTIONS {
+            if self.take_word(state) {
+                let reference = self.parse_reference()?;
+                return self.node(AlarmRule::InState {
+                    reference,
+                    state: state.to_string(),
+                });
+            }
+        }
+        Err(self.error("expected ALARM, OK, INSUFFICIENT_DATA, TRUE, FALSE, NOT or `(`"))
+    }
+
+    /// The alarm a state function names: `("x")` or `(x)`, since a name "can be surrounded
+    /// with double-quotes (\"), but do not have to be".
+    fn parse_reference(&mut self) -> Result<String, AlarmRuleError> {
+        if !self.take('(') {
+            return Err(self.error("expected `(` after a rule function"));
+        }
+        self.skip_spaces();
+        let reference = if self.take('"') {
+            let rest = self.rest();
+            let Some(end) = rest.find('"') else {
+                return Err(self.error("expected a closing double-quote"));
+            };
+            let name = rest[..end].to_string();
+            self.at += end + 1;
+            name
+        } else {
+            let rest = self.rest();
+            let Some(end) = rest.find(')') else {
+                return Err(self.error("expected `)` after an alarm reference"));
+            };
+            let name = rest[..end].trim_end().to_string();
+            self.at += end;
+            name
+        };
+        if !self.take(')') {
+            return Err(self.error("expected `)` after an alarm reference"));
+        }
+        if reference.is_empty() {
+            return Err(self.error("a rule function must name an alarm"));
+        }
+        Ok(reference)
+    }
 }
