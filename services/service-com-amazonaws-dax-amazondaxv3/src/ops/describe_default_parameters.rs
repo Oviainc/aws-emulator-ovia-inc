@@ -5,8 +5,9 @@
 //! Reports the DAX caching software's system-defined parameters — the catalog
 //! [`crate::state::DEFAULT_PARAMETERS`], which every parameter view in this service
 //! renders from, so one parameter has one definition here. Each is reported with the
-//! value the SYSTEM defines for it and `Source` `system`; this operation writes
-//! nothing, so a later caller sees exactly what this one saw.
+//! value the catalog defines for it, and with the `Description` and `Source` that
+//! catalog entry publishes; this operation writes nothing, so a later caller sees
+//! exactly what this one saw.
 //!
 //! The catalog is paged by `MaxResults`/`NextToken` through the shared
 //! [`crate::state::page`] helper, in the one stable order the catalog is kept in (by
