@@ -265,7 +265,11 @@ fn custom_image_details() -> Value {
         "TargetTags": [{"Key": "backup", "Value": "weekly"}],
         "Schedules": [{
             "Name": "weekly",
-            "CreateRule": {"Interval": 168, "IntervalUnit": "HOURS"},
+            // `CreateRule$Interval`'s "supported values are 1, 2, 3, 4, 6, 8, 12,
+            // and 24" (`smithy_query(query="doc", shape="CreateRule",
+            // member="Interval")`), and `IntervalUnit` offers `HOURS` alone, so
+            // 12 hours is the cadence here; `interval_validation.rs` pins the set.
+            "CreateRule": {"Interval": 12, "IntervalUnit": "HOURS"},
             "RetainRule": {"Count": 2},
         }],
     })

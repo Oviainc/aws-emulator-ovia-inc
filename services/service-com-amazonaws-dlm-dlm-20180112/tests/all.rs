@@ -17,6 +17,8 @@ mod default_policy_only_parameters;
 mod error_paths;
 #[path = "all/execution_role_pass_role.rs"]
 mod execution_role_pass_role;
+#[path = "all/interval_validation.rs"]
+mod interval_validation;
 #[path = "all/lifecycle_policy_crud.rs"]
 mod lifecycle_policy_crud;
 #[path = "all/policy_read_projection.rs"]
