@@ -11,6 +11,12 @@
 //! modelled `ResourceNotFoundException`, so a repeat delete is a 404 rather than
 //! a silent success.
 //!
+//! "Immediately removed from all future API responses" is what this handler
+//! implements: a linked policy is gone from state when this call returns, so a
+//! following `GetPolicy` answers the modelled 404 `ResourceNotFoundException`,
+//! `ListPolicies`/`BatchGetPolicy` no longer report it and `IsAuthorized` no
+//! longer evaluates the grant it carried.
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -176,6 +182,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(template_not_found)?;
 
         store.policy_templates.remove(&template_id);
+        // The documented cascade: every policy whose definition is
+        // template-linked TO THIS TEMPLATE goes with it. A policy is matched by
+        // the link it persists, not by its text — a template-linked policy holds
+        // none of its own — so a static policy that merely mentions the same
+        // entities is untouched.
         let linked: Vec<String> = store
             .policies
             .values()
