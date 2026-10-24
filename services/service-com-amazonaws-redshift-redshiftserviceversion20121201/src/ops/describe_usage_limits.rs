@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeUsageLimits
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeUsageLimits`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeUsageLimits::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the usage limits `CreateUsageLimit` stored, filtered by the
+//! combination the operation documents and paged with this service's shared
+//! `Marker` / `MaxRecords` cursor. A pure report: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -119,11 +114,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DescribeUsageLimitsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeUsageLimits")]
+// `DependentServiceUnavailableFault` is widened in, as on the sibling `Describe*`
+// operations: the model does not list it for this operation, but the service
+// declares the shape, and it is the only modelled way to say "the control-plane
+// store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeUsageLimits",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeUsageLimitsErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -175,20 +178,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeUsageLimits` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeUsageLimitsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeUsageLimits"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeUsageLimitsErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A pure report: nothing here changes what a later caller sees, and a
+        // usage limit has no status the clock owes a transition on.
+        let store = state.lock();
+
+        // Refuse before doing any work: a cluster identifier that names no
+        // cluster is answered without walking the store.
+        if let Some(wanted) = input.cluster_identifier.as_deref() {
+            if store.cluster(wanted).is_none() {
+                return Err(DescribeUsageLimitsErrorModeled::ClusterNotFoundFault(
+                    ClusterNotFoundFault {
+                        message: Some(format!("Cluster {wanted} not found.")),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "Results are filtered based on the combination of input usage limit
+        // identifier, cluster identifier, and feature type parameters": each
+        // filter the request carries narrows the set, and one it omits
+        // constrains nothing — so an unfiltered request reports every usage
+        // limit of the account. Selected by REFERENCE and only the page is
+        // cloned, so the filter walks the collection once and the cloning is
+        // proportional to the page rather than to the store.
+        let matched: Vec<&CreateUsageLimitOutput> = store
+            .usage_limits
+            .iter()
+            .filter(|limit| {
+                input
+                    .usage_limit_id
+                    .as_deref()
+                    .is_none_or(|wanted| limit.usage_limit_id.as_deref() == Some(wanted))
+                    && input
+                        .cluster_identifier
+                        .as_deref()
+                        .is_none_or(|wanted| limit.cluster_identifier.as_deref() == Some(wanted))
+                    && input
+                        .feature_type
+                        .as_deref()
+                        .is_none_or(|wanted| limit.feature_type.as_deref() == Some(wanted))
+                    && st::tags_match(
+                        limit.tags.as_deref().unwrap_or_default(),
+                        input.tag_keys.as_deref(),
+                        input.tag_values.as_deref(),
+                    )
+            })
+            .collect();
+
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(DescribeUsageLimitsOutput {
+            usage_limits: Some(
+                matched[start..end]
+                    .iter()
+                    .map(|limit| (*limit).clone())
+                    .collect(),
+            ),
+            marker: next_marker,
+        })
     }
 }
