@@ -5,8 +5,10 @@
 //! Applies the members this call carries to the data store `CreateFHIRDatastore`
 //! persisted in [`crate::state`] and reports the record that resulted, so a
 //! later `Describe`/`List` reads exactly what this call wrote. A data store no
-//! record holds is a 404; one whose status is not `ACTIVE` is refused with 403
-//! `AccessDeniedException` rather than mutated.
+//! record holds — and one whose record has reached the terminal `DELETED` — is a
+//! `ResourceNotFoundException`; one in a lifecycle transition (`CREATING`,
+//! `DELETING`) is refused with the modelled `ConflictException` rather than
+//! mutated.
 //!
 //! ## Shape of an operation
 //!
@@ -183,19 +185,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A mutation is only accepted by a data store that is ACTIVE. Anything
-        // else — still `CREATING`, on its way out in `DELETING`, or already in
-        // the terminal `DELETED` — is refused with 403 `AccessDeniedException`,
-        // so nothing can edit or resurrect a record the caller cannot use. The
-        // gate comes BEFORE any write, so a refused call leaves the record
-        // exactly as it was.
-        if datastore.status != crate::state::DatastoreStatus::Active {
-            return Err(UpdateFHIRDatastoreErrorModeled::AccessDeniedException(
-                AccessDeniedException {
-                    message: Some(crate::state::DATASTORE_NOT_ACTIVE_MESSAGE.to_string()),
-                },
-            )
-            .into());
+        // A mutation is only accepted by a data store that is ACTIVE, and what
+        // any other status answers is decided by the resource's STATE — never by
+        // `AccessDeniedException`, which this service reserves for an
+        // authorization failure. The gate comes BEFORE any write, so a refused
+        // call leaves the record exactly as it was. This is the same
+        // classification `DeleteFHIRDatastore` applies, so the two mutations of
+        // one record cannot disagree about what its status means.
+        match datastore.status {
+            crate::state::DatastoreStatus::Active => {}
+            // `ConflictException` is modelled as "the data store is in a
+            // transition state and the user requested action cannot be
+            // performed" — which is exactly `CREATING` and `DELETING`.
+            crate::state::DatastoreStatus::Creating | crate::state::DatastoreStatus::Deleting => {
+                return Err(UpdateFHIRDatastoreErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(crate::state::datastore_in_transition_message(
+                            datastore.status,
+                            crate::state::DatastoreAction::Update,
+                        )),
+                    },
+                )
+                .into());
+            }
+            // A deleted data store is not in transition — it is gone, so there
+            // is nothing left to update even while the terminal record stays
+            // readable for its retention.
+            crate::state::DatastoreStatus::Deleted => {
+                return Err(UpdateFHIRDatastoreErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
         }
 
         // A partial update: every member besides the id is optional, and one the

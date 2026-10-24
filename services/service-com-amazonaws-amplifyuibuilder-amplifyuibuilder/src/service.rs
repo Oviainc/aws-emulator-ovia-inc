@@ -28,7 +28,13 @@
 //!   table names and then removes the error-type discriminator from the response the
 //!   framework rendered, for the reason named in [`untyped_errors`]: AmplifyUIBuilder
 //!   names none of its exceptions on the wire, so a client classifies a refusal by
-//!   status.
+//!   status. That same wrapper is the single response path this service's responses
+//!   leave through, so it is also where [`front_door`] finishes each one with the two
+//!   headers AWS's fronting layer adds to every AmplifyUIBuilder response.
+//! - `override_routing_error` — see below: this service renders the framework's own
+//!   routing failure and then finishes it through [`front_door`] too, so a response
+//!   that named no operation declares the same media type and validator as one that
+//!   did.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -51,6 +57,7 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+pub mod front_door;
 pub mod untyped_errors;
 
 /// The `com-amazonaws-amplifyuibuilder-amplifyuibuilder` emulated service: the generated [`ServiceDefinition`] plus
@@ -128,12 +135,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // routing table resolved it. The ENVELOPE is left to the framework: this is
+        // the protocol-correct default rendering (rest -> 501), rendered here rather
+        // than by returning `None` only so that it, too, leaves through this
+        // service's front door — the media type and the `ETag` AWS's fronting layer
+        // puts on every response it serves, including one that named no operation.
+        Some(front_door::served(self.entry.routing_error_response(req)))
     }
 
     fn override_framework_error(
@@ -146,6 +153,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // rendering. Return `Some(resp)` to reword that failure in your own
         // envelope. The error is borrowed, so the default renderer can still
         // consume it on `None`.
+        //
+        // NOT finished through `front_door`, unlike every response this service's own
+        // path renders: the default rendering is reached only by MOVING the error into
+        // `framework_error_response`, and this seam holds a borrow of an error that is
+        // not `Clone`, so there is nothing here to finish. A transport failure the
+        // emulator detects before this service ran is the emulator's own signal rather
+        // than an AmplifyUIBuilder response, so it is left to the framework whole.
         let _ = error;
         None
     }

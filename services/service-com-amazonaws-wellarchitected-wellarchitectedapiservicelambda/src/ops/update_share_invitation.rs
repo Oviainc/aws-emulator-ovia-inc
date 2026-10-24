@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateShareInvitation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateShareInvitation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: answers the share invitation the calling principal was offered. The
+//! invitation is resolved from [`crate::state`] by its `ShareInvitationId` alone — it
+//! names no resource, so the search spans every stored share — and the answer moves the
+//! share it mediates out of `PENDING`: `ACCEPT` to `ACCEPTED`, `REJECT` to `REJECTED`.
+//! The answered invitation is returned and stops being outstanding, so
+//! `ListShareInvitations` no longer reports it and `ListWorkloadShares` reports the
+//! share's new status. An id that names no invitation THIS principal was offered is
+//! `ResourceNotFoundException` (404); one whose share has already left `PENDING` is
+//! `ConflictException` (409).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateShareInvitation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +154,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateShareInvitation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateShareInvitationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateShareInvitation"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateShareInvitationErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        // The answer decides the `ShareStatus` the share moves to, and the mapping of the
+        // two published `ShareInvitationAction` members onto it lives in `crate::state`,
+        // so every resource kind whose invitation can be answered records the same status
+        // for the same answer. `ShareInvitationAction` is a modelled enum, so the boundary
+        // validator refuses an out-of-set value before this handler runs; the refusal here
+        // keeps a caller that constructs the input directly from moving a share into a
+        // status no answer names.
+        let Some(answered_status) =
+            crate::state::share_status_for_invitation_action(&input.share_invitation_action)
+        else {
+            return Err(field_validation(
+                "ShareInvitationAction",
+                &format!(
+                    "Member must satisfy enum value set: [{}]",
+                    SHARE_INVITATION_ACTION_VALUES.join(", ")
+                ),
+            ));
+        };
+
+        let mut store = state.lock();
+
+        // "This API operation can be called independently of any resource" (this
+        // operation's doc): the invitation is named by its `ShareInvitationId` alone, so it
+        // is resolved across every stored share. It is offered to the principal the
+        // resource was shared WITH, and every request this emulator serves is attributed to
+        // its one account, so that account is the principal the invitation is resolved for
+        // — never a value read off the request. An invitation addressed to any other
+        // principal is not this caller's to answer, and is refused with the same 404 as an
+        // id no invitation carries, so neither discloses the other.
+        let Some(share) = store.workload_share_by_invitation_mut(
+            &input.share_invitation_id,
+            ::engine::emulator_account_id(),
+        ) else {
+            return Err(UpdateShareInvitationErrorModeled::ResourceNotFoundException(
+                crate::state::share_invitation_not_found(&input.share_invitation_id),
+            )
+            .into());
+        };
+
+        // An invitation can be answered once: it is outstanding only while the share it
+        // mediates is still waiting on it, and an answer is terminal. A share that has
+        // left `PENDING` — answered already, or revoked or expired by its sharer — has
+        // nothing left to answer, which is the modelled `ConflictException`'s own "the
+        // resource has already been processed, was deleted" case.
+        if share.status != crate::state::DEFAULT_SHARE_STATUS {
+            let standing = share.status.clone();
+            return Err(UpdateShareInvitationErrorModeled::ConflictException(
+                crate::state::share_invitation_answered_conflict(
+                    &input.share_invitation_id,
+                    &standing,
+                ),
+            )
+            .into());
+        }
+
+        share.status = answered_status.to_string();
+        Ok(UpdateShareInvitationOutput {
+            share_invitation: Some(share.to_invitation()),
+        })
     }
 }
+
+/// The service's own modelled `ValidationException` (HTTP 400) naming the member that
+/// failed and the constraint it violated — preferred over the scaffold's synthetic one
+/// because the modelled shape carries `Reason` and `Fields`, which a client reads.
+fn field_validation(member: &str, constraint: &str) -> UpdateShareInvitationError {
+    UpdateShareInvitationErrorModeled::ValidationException(
+        crate::state::member_constraint_exception(member, constraint),
+    )
+    .into()
+}
+

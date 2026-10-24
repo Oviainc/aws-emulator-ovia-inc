@@ -2547,10 +2547,24 @@ pub fn key_value_store_arn(id: &str) -> String {
     ::engine::emulator_arn("cloudfront", "", &format!("key-value-store/{id}"))
 }
 
-/// The path of a key value store resource under this service's API version. The
-/// resource is addressed by NAME, as `DescribeKeyValueStore`'s `{Name}` label is.
-pub fn key_value_store_path(name: &str) -> String {
-    format!("/2020-05-31/key-value-store/{name}")
+/// The path of a key value store resource under this service's API version.
+///
+/// A create's `Location` addresses the new resource by the identifier the SERVICE minted
+/// for it, never by the `Name` the caller supplied — and the identifier a key value store
+/// is addressed by is its ARN ([`key_value_store_arn`]), whose own last segment is the
+/// generated `Id`. That is what the recorded `CreateKeyValueStore` response carries, and
+/// it is the identifier the whole key value store surface uses for a store: the control
+/// plane reports it as `KeyValueStore$ARN`, and the data plane
+/// (`cloudfront-keyvaluestore`) takes it as the `KvsARN` label of every one of its
+/// routes. So `identifier` is a store ARN, not a name and not a bare id.
+///
+/// The ARN rather than the bare `Id` is what the recorded corpus holds this header to:
+/// replaying `cloudfront-keyvaluestore-put-get-describe-etag-chain#setup#1` with the
+/// bare `Id` as the last segment still reported `$headers.location` diverging, and with
+/// the ARN that step left the divergence set. Both forms end in the generated `Id`; the
+/// recording is what distinguishes them.
+pub fn key_value_store_path(identifier: &str) -> String {
+    format!("/2020-05-31/key-value-store/{identifier}")
 }
 
 /// The path of a continuous deployment policy resource under this service's API version.

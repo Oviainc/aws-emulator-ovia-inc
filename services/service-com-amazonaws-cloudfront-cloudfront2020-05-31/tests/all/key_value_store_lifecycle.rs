@@ -41,6 +41,9 @@ use crate::distribution_lifecycle::{
 // ---------------------------------------------------------------------------
 
 /// `POST /2020-05-31/key-value-store` with the request document `body`.
+///
+/// `pub(crate)` so the sibling suite asserting the `Location` rule over every create
+/// issues this one the same way rather than growing its own copy.
 pub(crate) async fn create_key_value_store(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
@@ -127,7 +130,7 @@ pub(crate) fn escape(text: &str) -> String {
 /// `CreateKeyValueStoreRequest`), so the rows sit at both name bounds, draw from each
 /// character class the pattern admits, and cover a missing comment, the empty comment,
 /// a non-ASCII comment and the longest comment the model allows.
-fn create_table() -> Vec<Create> {
+pub(crate) fn create_table() -> Vec<Create> {
     vec![
         Create {
             case: "the shortest admissible name, no comment",
@@ -277,11 +280,20 @@ async fn create_persists_the_store_the_describe_then_reports() {
             is_version_token(&etag),
             "case {case}: expected a version token in the ETag header, got {etag:?}"
         );
+        // The new resource is addressed by the identifier the create minted — for a key
+        // value store its ARN, whose own last segment is the generated Id — not by the
+        // name the caller chose (see `create_location_header.rs` for that rule over
+        // every create this service serves).
         let location = created.header("location").to_string();
         assert_eq!(
             location,
-            format!("https://{HOST}/{API_VERSION}/key-value-store/{}", create.name),
+            format!("https://{HOST}/{API_VERSION}/key-value-store/{arn}"),
             "case {case}: expected the new store's URI in Location, got {location:?}"
+        );
+        assert!(
+            location.ends_with(&format!("/{id}")),
+            "case {case}: expected Location to end with the generated Id {id:?}, got \
+             {location:?}"
         );
 
         assert!(ids.insert(id.clone()), "case {case}: the id {id} repeated");

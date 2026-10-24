@@ -311,6 +311,19 @@ impl Client {
         self.send("GET", &uri, None).await
     }
 
+    /// `UpdateShareInvitation`: `PATCH /shareInvitations/{ShareInvitationId}`. The id is a
+    /// non-greedy `@httpLabel`, so it travels percent-encoded in one path segment, exactly
+    /// as an SDK sends it.
+    pub(crate) async fn update_share_invitation(
+        &self,
+        share_invitation_id: &str,
+        body: Value,
+    ) -> Answer {
+        let encoded = encode_path_segment(share_invitation_id);
+        self.send("PATCH", &format!("/shareInvitations/{encoded}"), Some(body))
+            .await
+    }
+
     /// Record a share of `workload_id` with `shared_with` at `status` straight through
     /// the shared state, and answer its `(ShareId, ShareInvitationId)`.
     ///

@@ -410,8 +410,18 @@ pub const CONNECTOR_FILTER_PROVIDER: &str = "provider";
 /// lets one response carry.
 pub const LIST_CONNECTORS_PAGE_SIZE: usize = 100;
 
-/// The most connectors this store holds, after which `PutConnector` refuses a new one
-/// with `MaxNumberOfConnectorsExceededException`.
+/// The most connectors this store can hold: the bound past which a connector could
+/// not be reported any more, which is what `MaxNumberOfConnectorsExceededException`
+/// stands for.
+///
+/// NOTHING ENFORCES IT TODAY, because nothing in `src/` inserts a connector:
+/// `PutConnector` verifies a provider configuration's credentials WITH the provider
+/// before it materializes anything, and verifying them is an outbound connection this
+/// emulator does not make, so every configuration is refused (see
+/// [`UNVERIFIABLE_AZURE_CREDENTIALS_MESSAGE`] and `crate::ops::put_connector`). It is
+/// kept as the documented cap of the connector store — the number the read paths' page
+/// size is taken from — and is where the quota check belongs if a connector ever
+/// enters the store again.
 ///
 /// The model carries no number for this quota, so the limit is CHOSEN: it is the
 /// `ConnectorSummaries` length maximum (0..100), the most connectors the model can
@@ -2785,6 +2795,64 @@ pub fn connector_name(provider: &str, tenant_identifier: &str) -> String {
     format!("{}-{tenant_identifier}", provider.to_lowercase())
 }
 
+/// The group lengths of the canonical, hyphenated form of a GUID — `8-4-4-4-12`
+/// hexadecimal digits — which is the form Microsoft Entra ID (Azure AD) publishes a
+/// directory (tenant) identifier and an application (client) identifier in.
+pub const AZURE_IDENTIFIER_GUID_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// Whether `value` has the form an Azure tenant or client identifier takes: a GUID in
+/// its canonical hyphenated form.
+///
+/// `AzureTenantIdentifier` and `AzureClientIdentifier` carry no `@pattern` — the model
+/// constrains only their length (1..128) — so the FORM is checked here.
+///
+/// This is a FORM check, not a parse: what matters is the spelling the provider
+/// publishes, and a UUID parser (the `uuid` crate's `try_parse`) accepts the simple
+/// 32-character, braced and URN spellings too, so it would still need this group
+/// check around it. Checking the five groups' lengths and their hexadecimal digits is
+/// how the framework itself asserts this form (`vendor/server/src/lib.rs`,
+/// `vendor/smithy-schema-server/src/query.rs`), and it keeps the check free of a
+/// dependency the rest of this crate does not need.
+pub fn is_azure_guid(value: &str) -> bool {
+    let mut groups = value.split('-');
+    AZURE_IDENTIFIER_GUID_GROUPS.iter().all(|length| {
+        groups.next().is_some_and(|group| {
+            group.len() == *length && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    }) && groups.next().is_none()
+}
+
+/// How Config words a `ConnectorConfiguration` that names no provider at all.
+///
+/// `ConnectorConfiguration` has one provider member and its doc states "You must
+/// specify exactly one provider configuration", so a configuration carrying none
+/// names nothing to connect to. The text is fixed — it is built from no part of the
+/// request — because it is the only thing that tells this refusal apart from the other
+/// `ValidationException` legs of `PutConnector`.
+pub const CONNECTOR_CONFIGURATION_NO_PROVIDER_MESSAGE: &str =
+    "ConnectorConfiguration must contain at least one provider";
+
+/// How Config words a tenant identifier whose form is not an Azure one
+/// ([`is_azure_guid`]). Fixed, and it withholds the value the caller sent.
+pub const INVALID_AZURE_TENANT_IDENTIFIER_MESSAGE: &str = "Invalid tenant identifier";
+
+/// How Config words a client identifier whose form is not an Azure one
+/// ([`is_azure_guid`]). Fixed, for the same reason as
+/// [`INVALID_AZURE_TENANT_IDENTIFIER_MESSAGE`].
+pub const INVALID_AZURE_CLIENT_IDENTIFIER_MESSAGE: &str = "Invalid client identifier";
+
+/// How Config words a provider credential it could not verify with the provider.
+///
+/// A connector IS the credential Config connects to the third-party cloud service
+/// provider with, so the tenant/client pair is verified with that provider before any
+/// connector is materialized, and a pair that does not verify is refused. Verifying
+/// one means calling the provider's identity service — an outbound connection this
+/// emulator does not make — so no pair presented here can be verified and every
+/// well-formed configuration is refused with this text rather than answered with a
+/// connector no credential stands behind.
+pub const UNVERIFIABLE_AZURE_CREDENTIALS_MESSAGE: &str =
+    "Unable to verify Azure credentials for the connector";
+
 /// The Region and the connector name an `Arn` names, or `None` when the value is not
 /// a well-formed connector ARN of this service.
 ///
@@ -2816,8 +2884,13 @@ pub fn connector_arn_parts(arn: &str) -> Option<(&str, &str)> {
 }
 
 /// Why `arn` is not a well-formed connector ARN. BUILT FROM THE REQUEST: it quotes
-/// the value the caller sent and names the form the member takes, so every operation
-/// that takes a connector ARN refuses a malformed one the same way.
+/// the value the caller sent and names the form the member takes.
+///
+/// Reached from `PutThirdPartyServiceLinkedConfigurationRecorder` alone, and that is
+/// deliberate: there the `ConnectorArn` is a reference to a dependency the recorder
+/// needs, so the refusal says which value could not name one. The operations whose
+/// `Arn` IS the connector they act on answer the single
+/// [`CONNECTOR_ARN_NOT_VALID_MESSAGE`] instead.
 pub fn invalid_connector_arn_message(arn: &str) -> String {
     format!(
         "The Arn '{arn}' provided in the request is not a valid connector ARN. Please \
@@ -2831,6 +2904,17 @@ pub fn invalid_connector_arn_message(arn: &str) -> String {
 pub fn no_such_connector_message(arn: &str) -> String {
     format!("The connector '{arn}' provided in the request does not exist.")
 }
+
+/// The ONE text an operation whose `Arn` names the connector it acts on refuses that
+/// `Arn` with when it does not resolve to a connector of this account in the Region
+/// the request is scoped to.
+///
+/// Resolving the `Arn` is all `GetConnector` and `DeleteConnector` do, and a value
+/// that is no connector ARN and a well-formed one that names no connector both fail to
+/// resolve, so both are refused with this one text — fixed, carrying no part of the
+/// request — and neither says which of the two it was: a caller cannot learn from a
+/// refusal whether a connector by that ARN exists.
+pub const CONNECTOR_ARN_NOT_VALID_MESSAGE: &str = "The connector ARN provided is not valid.";
 
 /// The ARN resource type of a configuration aggregator, as Config spells it in the
 /// ARNs it mints (`ConfigurationAggregatorArn`'s pattern:

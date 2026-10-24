@@ -299,46 +299,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every cluster configured with this group now carries a change it has
         // not seen: that is what `pending-reboot` reports, per parameter and for
-        // the membership as a whole.
-        if !pending_reboot.is_empty() {
-            for stored in &mut store.clusters {
-                let Some(memberships) = stored.cluster.cluster_parameter_groups.as_mut() else {
-                    continue;
-                };
-                for membership in memberships
-                    .iter_mut()
-                    .filter(|m| m.parameter_group_name.as_deref() == Some(group_name.as_str()))
-                {
-                    membership.parameter_apply_status =
-                        Some(st::PARAMETER_APPLY_STATUS_PENDING_REBOOT.to_string());
-                    let statuses = membership
-                        .cluster_parameter_status_list
-                        .get_or_insert_with(Vec::new);
-                    for name in &pending_reboot {
-                        match statuses
-                            .iter_mut()
-                            .find(|status| status.parameter_name.as_deref() == Some(name.as_str()))
-                        {
-                            Some(status) => {
-                                status.parameter_apply_status =
-                                    Some(st::PARAMETER_APPLY_STATUS_PENDING_REBOOT.to_string());
-                            }
-                            None => statuses.push(ClusterParameterStatus {
-                                parameter_name: Some(name.clone()),
-                                parameter_apply_status: Some(
-                                    st::PARAMETER_APPLY_STATUS_PENDING_REBOOT.to_string(),
-                                ),
-                                parameter_apply_error_description: None,
-                            }),
-                        }
-                    }
-                }
-            }
-        }
+        // the membership as a whole. The same rule serves the reset path, so it
+        // lives on the store.
+        store.mark_parameter_group_pending_reboot(&group_name, &pending_reboot);
 
+        // The status does not depend on which parameters this request carried:
+        // AWS answers a parameter-group modify with the one sentence that names
+        // both outcomes — a dynamic-only change is being applied to the
+        // associated clusters now, a static one when they are next rebooted.
         Ok(ModifyClusterParameterGroupOutput {
             parameter_group_name: Some(group_name),
-            parameter_group_status: Some(st::PARAMETER_GROUP_STATUS_PENDING_REBOOT.to_string()),
+            parameter_group_status: Some(st::PARAMETER_GROUP_STATUS_UPDATED.to_string()),
         })
     }
 }

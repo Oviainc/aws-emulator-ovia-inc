@@ -71,6 +71,14 @@ pub(crate) const ABSENT_OUTPOST_ID: &str = "op-00000000000000000";
 /// One Outposts emulator over one shared engine, reached the way the router reaches it.
 pub(crate) struct Outposts {
     router: MultiServiceRouter,
+    /// The ONE engine this emulator was built over — the same store every handler
+    /// of it writes to.
+    ///
+    /// Kept so a case can reach this service's own records through
+    /// `state::service_state`, which is the only way to age a stored resource whose
+    /// clock-owed transition falls further out than a test may sleep for. Nothing
+    /// else reads it: every assertion about behaviour goes over the wire.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 /// One answer from the emulator: the status, the wire error code as BOTH restJson1
@@ -102,8 +110,18 @@ impl Outposts {
     pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// This service's store in that shared engine. See [`Outposts::engine`].
+    pub(crate) fn store(
+        &self,
+    ) -> ::engine::ServiceState<
+        service_com_amazonaws_outposts_outpostsolafservice::ComAmazonawsOutpostsOutpostsolafserviceState,
+    > {
+        service_com_amazonaws_outposts_outpostsolafservice::state::service_state(&*self.engine)
+            .expect("the Outposts store is reachable through the shared engine")
     }
 
     /// Dispatch one restJson1 request at `method path`, addressed to `region`, with
@@ -276,8 +294,9 @@ pub(crate) fn text(value: &Value, key: &str) -> String {
 }
 
 /// Whether `id` is `<prefix>-` plus exactly 17 lowercase hex characters, the form
-/// both `SiteId` (`^os-[a-f0-9]{17}$`) and `OutpostId` (`^op-[a-f0-9]{17}$`) declare.
-fn is_minted_id(id: &str, prefix: &str) -> bool {
+/// `SiteId` (`^os-[a-f0-9]{17}$`), `OutpostId` (`^op-[a-f0-9]{17}$`) and `QuoteId`
+/// (`^oq-[a-f0-9]{17}$`) each declare.
+pub(crate) fn is_minted_id(id: &str, prefix: &str) -> bool {
     match id.strip_prefix(prefix).and_then(|id| id.strip_prefix('-')) {
         Some(hex) => {
             hex.len() == 17 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))

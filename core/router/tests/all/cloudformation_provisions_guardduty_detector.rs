@@ -425,11 +425,31 @@ async fn a_stack_provisions_the_guardduty_detector_its_template_declares() {
                 "case {case:?}: expected tag {key:?} to be {value:?}, got {reported_tags}"
             );
         }
+        // Beside what the template declared, CloudFormation records three tags of its own on
+        // every resource it provisions — `aws:cloudformation:stack-name`,
+        // `aws:cloudformation:stack-id` and `aws:cloudformation:logical-id` — plus any
+        // stack-level `Tags` (these rows supply none). The whole set is held to by
+        // `services/service-com-amazonaws-cloudformation-cloudformation/tests/all/stack_tag_propagation.rs`.
+        let logical_id = opt_element(&resources, "LogicalResourceId")
+            .unwrap_or_else(|| panic!("case {case:?}: no <LogicalResourceId> in {resources}"));
+        let stack_id = opt_element(&described, "StackId")
+            .unwrap_or_else(|| panic!("case {case:?}: no <StackId> in {described}"));
+        for (key, value) in [
+            ("aws:cloudformation:stack-name", stack_name.as_str()),
+            ("aws:cloudformation:stack-id", stack_id.as_str()),
+            ("aws:cloudformation:logical-id", logical_id.as_str()),
+        ] {
+            assert_eq!(
+                reported_tags.get(key).and_then(Value::as_str),
+                Some(value),
+                "case {case:?}: expected tag {key:?} to be {value:?}, got {reported_tags}"
+            );
+        }
         assert_eq!(
             reported_tags.as_object().map(serde_json::Map::len),
-            Some(row.expected_tags.len()),
-            "case {case:?}: expected exactly the {} tag(s) the template declared, got \
-             {reported_tags}",
+            Some(row.expected_tags.len() + 3),
+            "case {case:?}: expected exactly the {} tag(s) the template declared beside the \
+             three CloudFormation records, got {reported_tags}",
             row.expected_tags.len()
         );
         if let Some(expected) = row.expected_s3_logs {

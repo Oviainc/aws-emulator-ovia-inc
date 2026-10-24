@@ -298,12 +298,17 @@ async fn reported_tags(
         .unwrap_or_default()
 }
 
+/// The logical id [`one_queue_template`] declares its queue under, and so the value
+/// CloudFormation records on that queue as its `aws:cloudformation:logical-id` tag. Named
+/// once here, so the template and the assertion cannot name two different resources.
+const QUEUE_LOGICAL_ID: &str = "Queue";
+
 /// The template one of the update rows deploys: one `AWS::SQS::Queue` carrying
-/// `properties`, publishing its url.
+/// `properties`, publishing its url, under [`QUEUE_LOGICAL_ID`].
 fn one_queue_template(properties: &str) -> String {
     format!(
-        r#"{{"Resources":{{"Queue":{{"Type":"AWS::SQS::Queue","Properties":{properties}}}}},
-             "Outputs":{{"QueueUrl":{{"Value":{{"Ref":"Queue"}}}}}}}}"#
+        r#"{{"Resources":{{"{QUEUE_LOGICAL_ID}":{{"Type":"AWS::SQS::Queue","Properties":{properties}}}}},
+             "Outputs":{{"QueueUrl":{{"Value":{{"Ref":"{QUEUE_LOGICAL_ID}"}}}}}}}}"#
     )
 }
 
@@ -523,14 +528,32 @@ async fn an_update_applies_changed_queue_properties_in_place() {
             );
         }
         let tags = reported_tags(&router, case, &url).await;
-        let expected_tags: BTreeMap<String, String> = row
+        // The tags the update declares, PLUS the three CloudFormation records on every
+        // resource it provisions and that the update leaves alone — the queue was created
+        // with them, and an in-place update re-states only the tags the declaration names.
+        // The whole set is held to by
+        // `services/service-com-amazonaws-cloudformation-cloudformation/tests/all/stack_tag_propagation.rs`.
+        let mut expected_tags: BTreeMap<String, String> = row
             .expected_tags
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
+        expected_tags.insert(
+            "aws:cloudformation:stack-name".to_string(),
+            row.stack_name.to_string(),
+        );
+        expected_tags.insert(
+            "aws:cloudformation:stack-id".to_string(),
+            xml_text(&body, "StackId").unwrap_or_default(),
+        );
+        expected_tags.insert(
+            "aws:cloudformation:logical-id".to_string(),
+            QUEUE_LOGICAL_ID.to_string(),
+        );
         assert_eq!(
             tags, expected_tags,
-            "case {case:?}: expected the declared tag map after the update"
+            "case {case:?}: expected the declared tag map beside the aws:cloudformation \
+             ones after the update, got {tags:?}"
         );
 
         // The same queue, not a new one: the name still resolves to the same url, the

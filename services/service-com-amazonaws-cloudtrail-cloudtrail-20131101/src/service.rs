@@ -102,10 +102,16 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// * a violated `@range` states the bound it broke — the recorded answer to an
 ///   `UpdateEventDataStore` `RetentionPeriod` above the modelled maximum is `1
 ///   validation error detected: Value at 'retentionPeriod' failed to satisfy constraint:
-///   Member must have value less than or equal to 3653`.
+///   Member must have value less than or equal to 3653`;
+/// * a value outside an enumerated type's value set states the set the model declares —
+///   the recorded answer to a `ListInsightsData` `DataType` outside its enum is `1
+///   validation error detected: Value at 'dataType' failed to satisfy constraint: Member
+///   must satisfy enum value set: [InsightsEvents]`. An enum violation INSIDE an event
+///   selector never reaches here: [`invalid_event_selectors`] is read first and answers
+///   it in the error that model declares.
 ///
 /// Every other class keeps the framework's own sentence ([`Violation::message`], value
-/// and all): these two are the classes this service has recorded wording for, and a
+/// and all): these three are the classes this service has recorded wording for, and a
 /// class with no recorded wording is better left as the framework states it than
 /// reworded on a guess.
 ///
@@ -150,16 +156,26 @@ fn clause(violation: &Violation) -> String {
              or equal to {max}",
             violation.path
         ),
+        ViolationKind::EnumValue(allowed) => format!(
+            "Value at '{}' failed to satisfy constraint: Member must satisfy enum value \
+             set: [{}]",
+            violation.path,
+            allowed.join(", ")
+        ),
         _ => violation.message(),
     }
 }
 
-/// Whether `violation` is a class this service rewords value-free: a violated `@pattern`
-/// or a violated `@range` bound (see [`clause`] for the recorded answer behind each).
+/// Whether `violation` is a class this service rewords value-free: a violated `@pattern`,
+/// a violated `@range` bound, or a value outside an enumerated type's value set (see
+/// [`clause`] for the recorded answer behind each).
 fn is_value_free(violation: &Violation) -> bool {
     matches!(
         violation.kind,
-        ViolationKind::Pattern(_) | ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
+        ViolationKind::Pattern(_)
+            | ViolationKind::MinValue(_)
+            | ViolationKind::MaxValue(_)
+            | ViolationKind::EnumValue(_)
     )
 }
 
@@ -544,11 +560,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // * a value inside `EventSelectors` / `AdvancedEventSelectors` outside its
         //   modelled constraint is `InvalidEventSelectorsException`, the error the
         //   model declares for exactly that case ([`invalid_event_selectors`]);
-        // * a violated `@pattern`, and a value outside a modelled `@range` bound, are a
-        //   `ValidationException` whose clause names the member and the requirement
-        //   WITHOUT the value that broke it ([`value_free_envelope`]). The code stays the
-        //   one the framework would have answered — a client branches on the code, so
-        //   only the wording changes.
+        // * a violated `@pattern`, a value outside a modelled `@range` bound, and a value
+        //   outside an enumerated type's value set are a `ValidationException` whose
+        //   clause names the member and the requirement WITHOUT the value that broke it
+        //   ([`value_free_envelope`]). The code stays the one the framework would have
+        //   answered — a client branches on the code, so only the wording changes.
         //
         // Every other refusal, authentication included, keeps the framework's wording
         // because every reader declines it.

@@ -908,10 +908,25 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
     // Implemented operations: a well-formed ARN for a workflow that does not
     // exist is `ResourceNotFoundException`, at whatever status this service
     // answers a lookup miss with (`crate::state::LOOKUP_MISS_STATUS`).
-    for operation in ["GetWorkflow", "DeleteWorkflow", "StartWorkflowRun"] {
-        let (status, answered) = harness
-            .call(operation, serde_json::json!({"WorkflowArn": arn.clone()}))
-            .await;
+    let implemented_cases: Vec<(&str, serde_json::Value)> = vec![
+        ("GetWorkflow", serde_json::json!({"WorkflowArn": arn.clone()})),
+        (
+            "DeleteWorkflow",
+            serde_json::json!({"WorkflowArn": arn.clone()}),
+        ),
+        (
+            "StartWorkflowRun",
+            serde_json::json!({"WorkflowArn": arn.clone()}),
+        ),
+        // The ARN member an operation resolves the resource through is not always
+        // named `WorkflowArn`: the tagging operations name it `ResourceArn`.
+        (
+            "ListTagsForResource",
+            serde_json::json!({"ResourceArn": arn.clone()}),
+        ),
+    ];
+    for (operation, body) in implemented_cases {
+        let (status, answered) = harness.call(operation, body).await;
         assert_eq!(
             answered["__type"].as_str(),
             Some("ResourceNotFoundException"),
@@ -929,10 +944,6 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
         (
             "ListWorkflowVersions",
             serde_json::json!({"WorkflowArn": arn.clone()}),
-        ),
-        (
-            "ListTagsForResource",
-            serde_json::json!({"ResourceArn": arn.clone()}),
         ),
         (
             "TagResource",

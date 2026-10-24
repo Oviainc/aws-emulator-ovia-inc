@@ -8,7 +8,7 @@
 //!
 //! ```json
 //! HTTP/1.1 404 Not Found
-//! content-type: application/json
+//! content-type: application/json; charset=utf-8
 //!
 //! {"message":"The item specified was not found"}
 //! ```
@@ -168,13 +168,14 @@ pub fn routes<Eng: Send + Sync + 'static>(
 }
 
 /// Serves a modelled operation through the framework exactly as the routing table would,
-/// then strips the error-type discriminator from the response.
+/// then strips the error-type discriminator from the response and finishes it through this
+/// service's front door ([`crate::service::front_door`]).
 ///
 /// It stores no operation of its own: the one it delegates to is the one the service's
 /// routing table names for the request, resolved from the `svc` the framework passes into
 /// [`ErasedOperation::run`]. So the framework owns the whole request walk and every status,
 /// message and member it answers with; this wrapper owns only whether the error names its
-/// shape on the wire.
+/// shape on the wire, and the two headers the front door adds.
 pub struct UntypedErrorOperation;
 
 impl ErasedOperation for UntypedErrorOperation {
@@ -185,13 +186,17 @@ impl ErasedOperation for UntypedErrorOperation {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            match modeled_operation(svc, req) {
+            // The front door is applied LAST, after the discriminator strip: its `ETag` is
+            // a function of the bytes the client receives, so it has to be computed over
+            // the final body rather than over one a later step rewrites.
+            let answered = match modeled_operation(svc, req) {
                 Some(op) => untyped(op.run(svc, req, ctx).await),
                 // Unreachable through `Service::override_operation`, which claims a
                 // request only when the routing table holds its key; answered as the
                 // framework answers an unroutable request rather than guessed at.
                 None => svc.definition().routing_error_response(req),
-            }
+            };
+            crate::service::front_door::served(answered)
         })
     }
 

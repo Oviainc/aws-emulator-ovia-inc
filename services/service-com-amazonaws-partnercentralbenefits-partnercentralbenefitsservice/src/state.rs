@@ -131,6 +131,37 @@ pub const STATUS_CANCELED: &str = "CANCELED";
 /// over the statuses a *submitted* application can carry, not over one example of them.
 pub const STATUS_ACTION_REQUIRED: &str = "ACTION_REQUIRED";
 
+/// The `BenefitApplicationStatus` of an application AWS's review approved. No operation
+/// in this slice puts an application into it — AWS's own review workflow does — so it is
+/// named here because [`TERMINAL_STATUSES`] is defined over every status AWS has finished
+/// with, not over the one this emulator can reach.
+pub const STATUS_APPROVED: &str = "APPROVED";
+
+/// The `BenefitApplicationStatus` of an application AWS's review rejected. Reached the
+/// same way as [`STATUS_APPROVED`], and terminal for the same reason.
+pub const STATUS_REJECTED: &str = "REJECTED";
+
+/// The statuses AWS has finished with: `APPROVED` and `REJECTED` end the review, and
+/// `CANCELED` ends the application.
+///
+/// Nothing moves an application out of one of these — `SubmitBenefitApplication`,
+/// `RecallBenefitApplication` and `CancelBenefitApplication` each refuse from them — so
+/// no change to the application's content is accepted in one either (see
+/// [`BenefitApplication::is_terminal`]). The six `BenefitApplicationStatus` values are
+/// `crate::ops::types::BENEFIT_APPLICATION_STATUS_VALUES`.
+pub const TERMINAL_STATUSES: &[&str] = &[STATUS_APPROVED, STATUS_REJECTED, STATUS_CANCELED];
+
+/// The statuses in which `UpdateBenefitApplication` rewrites an application's members.
+///
+/// An update is the partner editing its own DRAFT, so it is accepted only while the
+/// application has not been submitted: `PENDING_SUBMISSION`. Once it is submitted the
+/// record is the one AWS is reviewing, which is why the API models
+/// `RecallBenefitApplication` (back to draft "for further modifications") and
+/// `AmendBenefitApplication` (change named fields of a submitted application, with an
+/// `AmendmentReason`); from every other status an update is refused with the modelled
+/// `ConflictException`. See [`BenefitApplication::is_updatable`].
+pub const UPDATABLE_STATUSES: &[&str] = &[STATUS_PENDING_SUBMISSION];
+
 /// The statuses `RecallBenefitApplication` returns to draft.
 ///
 /// A recall takes back an application that has been SUBMITTED and that AWS has not
@@ -481,6 +512,18 @@ impl BenefitApplication {
     /// statuses in [`RECALLABLE_STATUSES`].
     pub fn is_recallable(&self) -> bool {
         RECALLABLE_STATUSES.contains(&self.status.as_str())
+    }
+
+    /// Whether `UpdateBenefitApplication` may rewrite this application's members: true
+    /// exactly for the statuses in [`UPDATABLE_STATUSES`].
+    pub fn is_updatable(&self) -> bool {
+        UPDATABLE_STATUSES.contains(&self.status.as_str())
+    }
+
+    /// Whether AWS has finished with this application: true exactly for the statuses in
+    /// [`TERMINAL_STATUSES`]. No change to its content is accepted in one.
+    pub fn is_terminal(&self) -> bool {
+        TERMINAL_STATUSES.contains(&self.status.as_str())
     }
 
     /// Whether `client_token` is the token of the recall that is still in effect on this
@@ -1178,6 +1221,18 @@ pub fn parse_resource_arn<'a>(arn: &'a str, resource: &str) -> Option<(&'a str, 
 /// `resource` is [`CATALOG_KIND`], [`BENEFIT_KIND`] or [`APPLICATION_KIND`].
 pub fn not_found_message(resource: &str, identifier: &str) -> String {
     format!("{resource} `{identifier}` not found")
+}
+
+/// The message a request refused because of the application's STATUS carries: the
+/// application, the status it is in, and the thing that status does not allow — e.g.
+/// ``benefit application benappl-… is IN_REVIEW, so it cannot be updated``.
+///
+/// One construction for every status refusal this service makes (`submitted`, `recalled`,
+/// `updated`, `amended`, `canceled`), so a client reading a `ConflictException` learns
+/// the current status from any of them in the same words. `action` is the past participle
+/// of the refused change.
+pub fn status_conflict_message(id: &str, status: &str, action: &str) -> String {
+    format!("benefit application {id} is {status}, so it cannot be {action}")
 }
 
 /// The entitlement gate: `Some(..)` when the calling account holds no active AWS partner

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePortalProduct
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePortalProduct`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePortalProduct::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a `PortalProductId`, builds the product's ARN from the Region the
+//! request addressed and persists a [`crate::state::PortalProduct`] record holding the
+//! `DisplayName`, `Description` and `Tags` the request carried, then answers 201 with the
+//! stored record. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +150,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePortalProduct` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePortalProductErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePortalProduct"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreatePortalProduct",
+            ));
+        };
+
+        // `DisplayName` (1..255) and `Description` (0..1024) carry modelled length
+        // constraints, which the boundary validator refuses before this handler runs.
+        // Beyond them this refuses a `DisplayName` of nothing but whitespace: a CHOSEN
+        // refusal, not one the model states — "the name of the portal product as it
+        // appears in a published portal" (`CreatePortalProduct$DisplayName`) is the
+        // product's only human-readable name, and a blank one names nothing in that
+        // portal. It is answered with the operation's own modelled
+        // `BadRequestException` naming the member, never a 501.
+        if input.display_name.trim().is_empty() {
+            return Err(bad_request(
+                "Invalid value for DisplayName: the display name must not be blank.",
+            ));
+        }
+
+        let mut store = state.lock();
+
+        // Bound the growth a caller drives, the way CreateApi and CreateModel bound
+        // theirs: `TooManyRequestsException` is the modelled error for "a limit has been
+        // exceeded" (it carries the limit's name in `LimitType`).
+        if store.portal_products.len() >= crate::state::MAX_PORTAL_PRODUCTS {
+            return Err(CreatePortalProductErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("PortalProduct".to_string()),
+                    message: Some(format!(
+                        "The maximum number of portal products ({}) for this account has been reached.",
+                        crate::state::MAX_PORTAL_PRODUCTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let portal_product_id = store.mint_portal_product_id();
+        let record = crate::state::PortalProduct {
+            portal_product_arn: crate::state::portal_product_arn(&region, &portal_product_id),
+            portal_product_id: portal_product_id.clone(),
+            display_name: input.display_name,
+            description: input.description,
+            // A freshly created product owns no product pages and no product REST
+            // endpoint pages, so there is no ordering of them to report yet: nothing is
+            // invented for a member nothing has been added under.
+            display_order: None,
+            last_modified: ::std::time::SystemTime::now(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        // Persist, then read the response back out of the STORE, so what the caller gets
+        // is what a later GetPortalProduct will report rather than an echo of the
+        // request. The id comes from the store's own id bijection, so it names no
+        // existing product and this inserts.
+        store
+            .portal_products
+            .insert(portal_product_id.clone(), record);
+        let stored = store.portal_products[&portal_product_id].to_wire();
+        Ok(CreatePortalProductOutput {
+            description: stored.description,
+            display_name: stored.display_name,
+            display_order: stored.display_order,
+            last_modified: stored.last_modified,
+            portal_product_arn: stored.portal_product_arn,
+            portal_product_id: stored.portal_product_id,
+            tags: stored.tags,
+        })
     }
 }
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the member and the constraint. Takes
+/// the same `&str` the sibling helper in `create_model` does.
+fn bad_request(message: &str) -> CreatePortalProductError {
+    CreatePortalProductErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
