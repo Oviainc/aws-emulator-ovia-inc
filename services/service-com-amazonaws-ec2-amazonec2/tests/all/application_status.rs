@@ -40,6 +40,8 @@ use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::ec2_query;
+// The entries of an ec2Query set, from the one shared definition.
+use super::wire::set_items;
 
 /// The Region every call here is signed for; the zone names the launches land in are
 /// derived from it.
@@ -145,12 +147,6 @@ fn child<'a, 'i>(node: roxmltree::Node<'a, 'i>, name: &str) -> Option<roxmltree:
 
 fn child_text(node: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
     child(node, name).map(|inner| inner.text().unwrap_or_default().to_string())
-}
-
-fn set_items<'a, 'i>(node: roxmltree::Node<'a, 'i>, name: &str) -> Vec<roxmltree::Node<'a, 'i>> {
-    child(node, name)
-        .map(|set| set.children().filter(roxmltree::Node::is_element).collect())
-        .unwrap_or_default()
 }
 
 /// An ISO 8601 timestamp as epoch seconds — which also asserts that what the service

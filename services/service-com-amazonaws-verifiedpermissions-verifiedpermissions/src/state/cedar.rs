@@ -462,18 +462,24 @@ pub fn link_template(
     }
     let values = slot_values(link)?;
 
-    let mut set = cedar_policy::PolicySet::new();
-    set.add_template(template).map_err(|e| {
-        Refusal::ServiceFault(format!("the policy template could not be loaded: {e}"))
-    })?;
-    set.link(template_id, link_id.clone(), values).map_err(|e| {
-        // Linking fails on the VALUES the link bound (a slot Cedar will not
-        // accept the entity for), so it is the caller's placeholder binding that
-        // is named.
-        InvalidInput::new(
-            paths::TEMPLATE_LINKED_DEFINITION,
-            format!("the policy template could not be instantiated with these values: {e}"),
-        )
+    let (set, scope) = link_one(template, template_id, link_id, values).map_err(|failure| {
+        match failure {
+            LinkFailure::Load(e) => {
+                Refusal::ServiceFault(format!("the policy template could not be loaded: {e}"))
+            }
+            // Linking fails on the VALUES the link bound (a slot Cedar will
+            // not accept the entity for), so it is the caller's placeholder
+            // binding that is named.
+            LinkFailure::Link(e) => InvalidInput::new(
+                paths::TEMPLATE_LINKED_DEFINITION,
+                format!("the policy template could not be instantiated with these values: {e}"),
+            )
+            .into(),
+            LinkFailure::Unreadable => Refusal::ServiceFault(
+                "the policy template was linked but the resulting policy could not be read"
+                    .to_string(),
+            ),
+        }
     })?;
 
     if let Some(schema_json) = schema_json {
@@ -490,13 +496,111 @@ pub fn link_template(
         }
     }
 
-    let linked = set.policy(&link_id).ok_or_else(|| {
-        Refusal::ServiceFault(
-            "the policy template was linked but the resulting policy could not be read"
-                .to_string(),
-        )
+    Ok(scope)
+}
+
+/// Which step of [`link_one`] failed, and the diagnostic Cedar gave for it. The
+/// step is reported rather than a finished message, because the two callers
+/// answer on different error channels and name different request members for the
+/// same failure.
+enum LinkFailure {
+    /// The parsed template could not be added to the policy set.
+    Load(String),
+    /// Cedar refused the slot bindings.
+    Link(String),
+    /// The linked policy could not be read back out of the set.
+    Unreadable,
+}
+
+/// Link ONE parsed template, in a policy set holding only it, and report the
+/// scope of the policy that results — plus the set itself, which a caller that
+/// validates against a schema needs.
+///
+/// This is the mechanics [`link_template`] and [`template_scope`] share (add the
+/// template, link it under `link_id`, read the scope off the LINKED policy), in
+/// one place so the two cannot drift; what each caller decides for itself is how
+/// the slots are bound and how a failure is reported.
+fn link_one(
+    template: cedar_policy::Template,
+    template_id: cedar_policy::PolicyId,
+    link_id: cedar_policy::PolicyId,
+    values: HashMap<cedar_policy::SlotId, cedar_policy::EntityUid>,
+) -> Result<(cedar_policy::PolicySet, StaticScope), LinkFailure> {
+    let mut set = cedar_policy::PolicySet::new();
+    set.add_template(template)
+        .map_err(|e| LinkFailure::Load(e.to_string()))?;
+    set.link(template_id, link_id.clone(), values)
+        .map_err(|e| LinkFailure::Link(e.to_string()))?;
+    let scope = {
+        let linked = set.policy(&link_id).ok_or(LinkFailure::Unreadable)?;
+        scope_of(linked)
+    };
+    Ok((set, scope))
+}
+
+/// The entity every `?principal` / `?resource` SLOT is bound to while a
+/// template's OWN scope is read ([`template_scope`]).
+///
+/// It stands for "whatever the policy that instantiates this template will bind
+/// here", so two templates that both leave a scope position open compare EQUAL
+/// in that position while one that names a concrete entity there does not. It is
+/// private to this module and never reaches a response: `template_scope` reports
+/// the scope, not the entity.
+const SLOT_SENTINEL_TYPE: &str = "EmulatorInternal::TemplateSlot";
+const SLOT_SENTINEL_ID: &str = "unbound";
+
+/// The effect and scope of one Cedar policy TEMPLATE, read off the parsed form —
+/// the template counterpart of [`parse_static_policy`]'s result.
+///
+/// A template's scope can name an entity (`principal == User::"erin"`), leave a
+/// placeholder for the instantiating policy (`principal == ?principal`) or name
+/// nothing at all (`principal`), and Cedar reports the scope of a LINKED policy
+/// rather than of a template. So the template is linked against
+/// [`SLOT_SENTINEL_TYPE`] in each slot it uses and the scope is read off that
+/// link: a position holding a placeholder then reports the sentinel, which is
+/// equal across templates, and one naming an entity reports that entity.
+///
+/// That is what lets `UpdatePolicyTemplate` hold the replacement to the elements
+/// its own documentation makes immutable — "You can't change the following
+/// elements: The effect (permit or forbid) of the policy template. The principal
+/// referenced by the policy template. The resource referenced by the policy
+/// template." — by comparing two scopes rather than two strings.
+pub fn template_scope(statement: &str) -> Result<StaticScope, InvalidInput> {
+    let refuse = |reason: String| InvalidInput::new(paths::TEMPLATE_STATEMENT, reason);
+    let template_id = cedar_policy::PolicyId::new(LINK_TEMPLATE_ID);
+    let link_id = cedar_policy::PolicyId::new(LINK_POLICY_ID);
+    let template = parse_template(Some(template_id.clone()), statement).map_err(refuse)?;
+
+    let slots: BTreeSet<String> = template.slots().map(ToString::to_string).collect();
+    let sentinel = entity_uid(
+        &ScopeEntity {
+            entity_type: SLOT_SENTINEL_TYPE.to_string(),
+            entity_id: SLOT_SENTINEL_ID.to_string(),
+        },
+        paths::TEMPLATE_STATEMENT,
+    )?;
+    let mut values: HashMap<cedar_policy::SlotId, cedar_policy::EntityUid> = HashMap::new();
+    for slot in [
+        cedar_policy::SlotId::principal(),
+        cedar_policy::SlotId::resource(),
+    ] {
+        if slots.contains(&slot.to_string()) {
+            values.insert(slot, sentinel.clone());
+        }
+    }
+
+    let (_set, scope) = link_one(template, template_id, link_id, values).map_err(|failure| {
+        match failure {
+            LinkFailure::Load(e) => refuse(format!("the policy template could not be loaded: {e}")),
+            LinkFailure::Link(e) => {
+                refuse(format!("the policy template's scope could not be read: {e}"))
+            }
+            LinkFailure::Unreadable => {
+                refuse("the policy template's scope could not be read".to_string())
+            }
+        }
     })?;
-    Ok(scope_of(linked))
+    Ok(scope)
 }
 
 /// The Cedar slot environment one template link binds: an entity per

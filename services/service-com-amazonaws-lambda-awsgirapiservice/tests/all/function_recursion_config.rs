@@ -16,8 +16,12 @@
 //! through `GetFunctionRecursionConfig`, so a value that was answered but never stored
 //! fails here. The rows differ along what the rule generalises over: the modelled value
 //! set (`Allow | Terminate`), how many calls have been made (none, one, several —
-//! including a repeat of the value already held and a change back to the default), and
-//! the documented `FunctionName` form the requests address the function by.
+//! including a repeat of the value already held and a change back to the default), the
+//! documented `FunctionName` form the requests address the function by, the length of
+//! that name (each bound the model's `UnqualifiedFunctionName` admits, and one past it),
+//! and how many versions the function has published — while a value outside the modelled
+//! set, a name carrying a `:qualifier` the modelled pattern excludes, and a name longer
+//! than the modelled maximum are each refused and store nothing.
 
 use std::sync::Arc;
 
@@ -25,6 +29,11 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use service_com_amazonaws_lambda_awsgirapiservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+// The ARN convention and the account id come from the shared harness in
+// `function_lifecycle`, so this suite cannot disagree with it about what a function's ARN
+// looks like.
+use crate::function_lifecycle::{function_arn, ACCOUNT};
 
 /// Where `CreateFunction` is bound.
 const FUNCTIONS_URI: &str = "/2015-03-31/functions";
@@ -35,12 +44,6 @@ const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=emulator-test-key/20260101/us-east-1/lambda/aws4_request, \
      SignedHeaders=host, Signature=not-verified";
-
-/// The region the scope above names.
-const REGION: &str = "us-east-1";
-
-/// The account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
 
 /// A well-formed execution role ARN, satisfying the model's `RoleArn` pattern.
 const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
@@ -53,6 +56,22 @@ const RECURSIVE_LOOP_VALUES: &[&str] = &["Allow", "Terminate"];
 /// member documentation states: "By default, Lambda sets your function's configuration
 /// to Terminate."
 const DEFAULT_RECURSIVE_LOOP: &str = "Terminate";
+
+/// The `RecursiveLoop` value set as a refusal reports it, in the order the shape declares
+/// its members (`smithy_query(query="shape", shape="RecursiveLoop")` -> `Allow`,
+/// `Terminate`).
+const REPORTED_VALUE_SET: &str = "Allow, Terminate";
+
+/// The longest `FunctionName` the model admits, from
+/// `smithy_query(query="operation", operation="PutFunctionRecursionConfig")`:
+/// `UnqualifiedFunctionName` is `@length(min: 1, max: 140)`.
+const FUNCTION_NAME_MAX: usize = 140;
+
+/// The longest bare function name the member's own documentation admits: "The length
+/// constraint applies only to the full ARN. If you specify only the function name, it is
+/// limited to 64 characters in length."
+const BARE_NAME_MAX: usize = 64;
+
 
 /// What a dispatched request answered.
 struct Answer {
@@ -209,6 +228,41 @@ fn reported(case: &str, operation: &str, answer: &Answer) -> String {
     })
 }
 
+/// A request whose `FunctionName` the model does not admit — one carrying a `:qualifier`
+/// the `UnqualifiedFunctionName` pattern excludes, or one past its length maximum — is
+/// refused at the boundary before any function is looked up: a 400 `ValidationException`
+/// whose message names the member the violated constraint sits on, rather than a 404
+/// about a function that is missing or a 400 from some unrelated cause.
+fn assert_refused_on_the_name(case: &str, operation: &str, answer: &Answer) {
+    assert_eq!(
+        answer.status,
+        400,
+        "case {case:?}: expected 400 from {operation} for a name the model does not admit, \
+         got {} {}",
+        answer.status,
+        answer.text()
+    );
+    assert!(
+        answer.error_code().contains("ValidationException"),
+        "case {case:?}: expected ValidationException from {operation}, got {:?}",
+        answer.error_code()
+    );
+    let message = answer
+        .string("message")
+        .or_else(|| answer.string("Message"))
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected a message member from {operation}, got {}",
+                answer.text()
+            )
+        });
+    assert!(
+        message.contains("'functionName'"),
+        "case {case:?}: expected the message from {operation} to name the member the constraint \
+         sits on, got {message:?}"
+    );
+}
+
 /// One row of the recursion-config table: the function, the `FunctionName` form the
 /// requests address it by, the `RecursiveLoop` values set on it in order, and the value
 /// it must report once they have all been applied.
@@ -267,9 +321,7 @@ fn recursion_cases() -> Vec<RecursionCase> {
         RecursionCase {
             name: "a change back to the default, addressed by a function arn",
             function: "recursion-full-arn",
-            reference: Some(format!(
-                "arn:aws:lambda:{REGION}:{ACCOUNT}:function:recursion-full-arn"
-            )),
+            reference: Some(function_arn("recursion-full-arn")),
             puts: &["Allow", "Terminate"],
             expected: DEFAULT_RECURSIVE_LOOP,
         },
@@ -388,7 +440,7 @@ async fn a_function_that_does_not_exist_has_no_recursion_config() {
     let missing = [
         "recursion-absent".to_string(),
         format!("{ACCOUNT}:function:recursion-absent"),
-        format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:recursion-absent"),
+        function_arn("recursion-absent"),
     ];
 
     for reference in &missing {
@@ -428,4 +480,251 @@ async fn a_function_that_does_not_exist_has_no_recursion_config() {
         fetched, DEFAULT_RECURSIVE_LOOP,
         "a refused call must leave every function at {DEFAULT_RECURSIVE_LOOP:?}, got {fetched:?}"
     );
+}
+
+#[tokio::test]
+async fn a_value_outside_the_modelled_set_is_refused_and_stores_nothing() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+
+    create_function(&router, "recursion-bad-value").await;
+    // Seed a value that is NOT the default, so a refusal that reset the setting, or that
+    // stored the value it was handed, both fail below.
+    let seeded = put_recursion_config(&router, "recursion-bad-value", "Allow").await;
+    let seeded = reported("seed", "PutFunctionRecursionConfig", &seeded);
+    assert_eq!(
+        seeded, "Allow",
+        "the seeded configuration must be stored, got {seeded:?}"
+    );
+
+    // One row per form a value outside the `RecursiveLoop` set takes: a word that is no
+    // setting at all, each modelled value differing only in case, one that merely
+    // contains a modelled value, and the empty string.
+    for value in [
+        "Deny",
+        "allow",
+        "TERMINATE",
+        "Terminate ",
+        "TerminateAll",
+        "",
+    ] {
+        let answer = put_recursion_config(&router, "recursion-bad-value", value).await;
+        assert_eq!(
+            answer.status,
+            400,
+            "case {value:?}: expected 400 from PutFunctionRecursionConfig, got {} {}",
+            answer.status,
+            answer.text()
+        );
+        assert!(
+            answer.error_code().contains("ValidationException"),
+            "case {value:?}: expected ValidationException, got {:?}",
+            answer.error_code()
+        );
+        let message = answer
+            .string("message")
+            .or_else(|| answer.string("Message"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {value:?}: expected a message member, got {}",
+                    answer.text()
+                )
+            });
+        assert_eq!(
+            message,
+            format!(
+                "1 validation error detected: Value '{value}' at 'recursiveLoop' failed to \
+                 satisfy constraint: Member must satisfy enum value set: [{REPORTED_VALUE_SET}]"
+            ),
+            "case {value:?}: expected the envelope naming the member, the value and the value \
+             set, got {message:?}"
+        );
+
+        // The refusal stored nothing: the seeded value still stands.
+        let fetched = get_recursion_config(&router, "recursion-bad-value").await;
+        let fetched = reported(value, "GetFunctionRecursionConfig", &fetched);
+        assert_eq!(
+            fetched, "Allow",
+            "case {value:?}: a refused call must leave the stored value at \"Allow\", got \
+             {fetched:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_setting_is_function_level_whatever_versions_exist() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+
+    create_function(&router, "recursion-versioned").await;
+
+    // The number of published versions is a dimension the rule generalises over: the
+    // setting is one function-level value, so it survives publishing and keeps answering
+    // the same whether the function has none, one or several versions.
+    for versions in 0..3u32 {
+        if versions > 0 {
+            let published = call(
+                &router,
+                "POST",
+                "/2015-03-31/functions/recursion-versioned/versions",
+                &json!({}),
+            )
+            .await;
+            assert_eq!(
+                published.status,
+                201,
+                "case {versions} version(s): PublishVersion must succeed, got {} {}",
+                published.status,
+                published.text()
+            );
+        }
+
+        for value in RECURSIVE_LOOP_VALUES {
+            let case = format!("{versions} version(s), {value}");
+            let put = put_recursion_config(&router, "recursion-versioned", value).await;
+            let put = reported(&case, "PutFunctionRecursionConfig", &put);
+            assert_eq!(
+                put, *value,
+                "case {case:?}: PutFunctionRecursionConfig must answer the value it stored, got \
+                 {put:?}"
+            );
+            let fetched = get_recursion_config(&router, "recursion-versioned").await;
+            let fetched = reported(&case, "GetFunctionRecursionConfig", &fetched);
+            assert_eq!(
+                fetched, *value,
+                "case {case:?}: the function-level setting must report {value:?}, got {fetched:?}"
+            );
+        }
+    }
+
+    // Park the function on the value that is NOT the default, so a refusal below that
+    // reset the setting (or stored the value it was handed) cannot pass unnoticed.
+    let parked = RECURSIVE_LOOP_VALUES
+        .iter()
+        .find(|value| **value != DEFAULT_RECURSIVE_LOOP)
+        .expect("the modelled value set must hold a value other than the default");
+    let put = put_recursion_config(&router, "recursion-versioned", parked).await;
+    let put = reported("parked on the non-default value", "PutFunctionRecursionConfig", &put);
+    assert_eq!(
+        put, *parked,
+        "the parked value must be stored, got {put:?}"
+    );
+
+    // `FunctionName` is an `UnqualifiedFunctionName`, whose pattern admits no
+    // `:qualifier`, so a version or alias is not a resource this setting lives on — and
+    // the version named below does exist, so the refusal is about the qualifier.
+    let qualified = [
+        "recursion-versioned:1".to_string(),
+        "recursion-versioned:$LATEST".to_string(),
+        "recursion-versioned:live".to_string(),
+        format!("{ACCOUNT}:function:recursion-versioned:1"),
+        format!("{}:2", function_arn("recursion-versioned")),
+    ];
+    for reference in &qualified {
+        for (operation, answer) in [
+            (
+                "GetFunctionRecursionConfig",
+                get_recursion_config(&router, reference).await,
+            ),
+            (
+                "PutFunctionRecursionConfig",
+                put_recursion_config(&router, reference, parked).await,
+            ),
+        ] {
+            assert_refused_on_the_name(reference, operation, &answer);
+        }
+    }
+
+    // None of those refusals moved the function-level value off the one last stored.
+    let fetched = get_recursion_config(&router, "recursion-versioned").await;
+    let fetched = reported("after the refusals", "GetFunctionRecursionConfig", &fetched);
+    assert_eq!(
+        fetched, *parked,
+        "a refused call must leave the stored value at {parked:?}, got {fetched:?}"
+    );
+}
+
+#[tokio::test]
+async fn every_name_length_the_model_admits_round_trips() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+
+    // The bounds of the name the rule generalises over: the shortest name the pattern
+    // admits, the longest BARE name the member documents, and the longest reference a
+    // stored function can be addressed by at all — that same name as a full ARN, the form
+    // the model's 140 applies to ("The length constraint applies only to the full ARN").
+    let shortest = "r".to_string();
+    let longest_bare = "r".repeat(BARE_NAME_MAX);
+    // A second function of the same maximum length, addressed by its full ARN, so the ARN
+    // row stands on its own record rather than overwriting the bare row's.
+    let longest_bare_other = "s".repeat(BARE_NAME_MAX);
+    let longest_arn = function_arn(&longest_bare_other);
+    assert!(
+        longest_arn.chars().count() <= FUNCTION_NAME_MAX,
+        "the longest-ARN row must stay within the modelled maximum of {FUNCTION_NAME_MAX}, got {}",
+        longest_arn.chars().count()
+    );
+
+    let rows: [(&str, &str, String, &str); 3] = [
+        (
+            "the shortest admitted name",
+            &shortest,
+            shortest.clone(),
+            "Allow",
+        ),
+        (
+            "the longest documented bare name",
+            &longest_bare,
+            longest_bare.clone(),
+            "Terminate",
+        ),
+        (
+            "the longest documented name as a full arn",
+            &longest_bare_other,
+            longest_arn.clone(),
+            "Allow",
+        ),
+    ];
+
+    for (case, function, reference, value) in &rows {
+        create_function(&router, function).await;
+        let put = put_recursion_config(&router, reference, value).await;
+        let put = reported(case, "PutFunctionRecursionConfig", &put);
+        assert_eq!(
+            put, *value,
+            "case {case:?}: PutFunctionRecursionConfig must answer the value it stored, got \
+             {put:?}"
+        );
+        let fetched = get_recursion_config(&router, reference).await;
+        let fetched = reported(case, "GetFunctionRecursionConfig", &fetched);
+        assert_eq!(
+            fetched, *value,
+            "case {case:?}: expected {value:?} read back, got {fetched:?}"
+        );
+    }
+
+    // One step past the modelled maximum: refused by both operations, nothing stored.
+    let too_long = "r".repeat(FUNCTION_NAME_MAX + 1);
+    for (operation, answer) in [
+        (
+            "GetFunctionRecursionConfig",
+            get_recursion_config(&router, &too_long).await,
+        ),
+        (
+            "PutFunctionRecursionConfig",
+            put_recursion_config(&router, &too_long, "Allow").await,
+        ),
+    ] {
+        assert_refused_on_the_name("one past the modelled maximum", operation, &answer);
+    }
+
+    // The names that do fit still report what they stored, so the refusals wrote nothing.
+    for (case, _, reference, value) in &rows {
+        let fetched = get_recursion_config(&router, reference).await;
+        let fetched = reported(case, "GetFunctionRecursionConfig", &fetched);
+        assert_eq!(
+            fetched, *value,
+            "case {case:?}: a refused call must leave {value:?} in place, got {fetched:?}"
+        );
+    }
 }

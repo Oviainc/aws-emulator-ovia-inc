@@ -202,18 +202,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.expire_due(::std::time::SystemTime::now());
 
         let Some(secret) = store.get(&input.secret_id) else {
-            return Err(no_such_secret(&input.secret_id));
+            return Err(no_such_secret());
         };
         // "If a secret is scheduled for deletion, then its details, including the
         // encrypted secret value, is not accessible."
         if secret.scheduled_for_deletion() {
             return Err(GetSecretValueErrorModeled::InvalidRequestException(
                 InvalidRequestException {
-                    message: Some(
-                        "You can't perform this operation on the secret because it was marked \
-                         for deletion."
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -260,12 +256,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// `ResourceNotFoundException` for a `SecretId` that names no stored secret.
-fn no_such_secret(secret_id: &str) -> GetSecretValueError {
+/// `ResourceNotFoundException` for a `SecretId` that names no stored secret: the
+/// constant sentence Secrets Manager answers with, which carries no part of the
+/// request (see [`crate::state::SECRET_NOT_FOUND_MESSAGE`]).
+fn no_such_secret() -> GetSecretValueError {
     GetSecretValueErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!(
-            "Secrets Manager can't find the specified secret: {secret_id}"
-        )),
+        message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

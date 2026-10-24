@@ -61,6 +61,15 @@ fn set_item<'a, 'i>(
     child(vpc, name).and_then(|set| child(set, "item"))
 }
 
+/// Every entry of the `name` set of `node` — the elements an ec2Query list member is
+/// written as. Reading the TREE is what keeps a nested set inside its parent: a volume
+/// status item's `<details>` entries are `<item>`s of their own.
+pub fn set_items<'a, 'i>(node: roxmltree::Node<'a, 'i>, name: &str) -> Vec<roxmltree::Node<'a, 'i>> {
+    child(node, name)
+        .map(|set| set.children().filter(roxmltree::Node::is_element).collect())
+        .unwrap_or_default()
+}
+
 /// A scalar member of the one VPC a response carries, or a panic naming the case.
 ///
 /// A member of the VPC itself (`state`, `cidrBlock`, …) is a direct child; one of its
