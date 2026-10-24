@@ -19,6 +19,8 @@ mod auto_scaling_group_recommendations_export;
 mod cross_account_requests;
 #[path = "all/ebs_volume_recommendations.rs"]
 mod ebs_volume_recommendations;
+#[path = "all/ebs_volume_recommendations_export.rs"]
+mod ebs_volume_recommendations_export;
 #[path = "all/ecs_service_recommendations.rs"]
 mod ecs_service_recommendations;
 #[path = "all/enrollment_and_preferences.rs"]
