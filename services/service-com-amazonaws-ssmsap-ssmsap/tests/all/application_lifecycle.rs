@@ -117,9 +117,29 @@ impl Emulator {
     /// Dispatch signed for `region`, which is the regional endpoint the call reaches:
     /// the region-scoping suite drives the SAME harness at more than one of them.
     pub(crate) async fn send_in_region(&self, region: &str, path: &str, body: Value) -> Reply {
-        let payload = serde_json::to_vec(&body).expect("the request body serializes");
+        self.send_request("POST", region, path, Some(body)).await
+    }
+
+    /// Dispatch with an explicit HTTP method and an OPTIONAL body, signed for `region`.
+    ///
+    /// Every operation of this service is `POST` with a JSON body except the tagging
+    /// reads and writes, which the model binds to `/tags/{resourceArn}` by method
+    /// (`GET` lists, `POST` tags, `DELETE` untags) — so a suite that drives one of those
+    /// addresses it here. `body: None` sends no bytes at all, which is what a client
+    /// sends for an operation whose every member is bound to the URI.
+    pub(crate) async fn send_request(
+        &self,
+        method: &str,
+        region: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Reply {
+        let payload = match &body {
+            Some(value) => serde_json::to_vec(value).expect("the request body serializes"),
+            None => Vec::new(),
+        };
         let request = http::Request::builder()
-            .method("POST")
+            .method(method)
             .uri(format!("https://ssm-sap.{region}.amazonaws.com{path}"))
             // The SigV4 credential scope is what routes the request to this service and
             // what names the region its ARNs carry. Signatures are not verified unless
@@ -283,7 +303,11 @@ pub(crate) fn is_operation_id(value: &str) -> bool {
 }
 
 /// The `Tags` map of a reply member, as comparable pairs.
-fn tag_pairs(value: Option<&Value>) -> BTreeMap<String, String> {
+///
+/// `pub(crate)` because the suites of this target share one harness:
+/// `tests/all/resource_tags.rs` reads the SAME map out of `ListTagsForResource`'s own
+/// `tags` member.
+pub(crate) fn tag_pairs(value: Option<&Value>) -> BTreeMap<String, String> {
     value
         .and_then(Value::as_object)
         .map(|map| {

@@ -708,6 +708,34 @@ impl RegionState {
             .cloned()
     }
 
+    /// Whether `arn` names a resource THIS Region holds.
+    ///
+    /// The resources AWS Systems Manager for SAP holds are the registered SAP
+    /// application and the SAP HANA databases of that application, so an ARN resolves
+    /// here when it is a registered application's own ARN
+    /// ([`StoredApplication::arn`]) or the ARN of one of the databases derived from
+    /// that registration ([`StoredApplication::databases`]) — and nothing else, since
+    /// the registration is the only thing this store holds.
+    ///
+    /// `region` is the Region this partition holds, which is the Region those ARNs
+    /// embed: an ARN of another Region therefore resolves to nothing here, exactly as
+    /// an application of another Region does ([`Self::resolve_application_id`]).
+    pub fn holds_resource(&self, region: &str, arn: &str) -> bool {
+        // An application is resolved from its ARN the ONE way this store resolves one,
+        // and that pass costs a string comparison per application; only when it finds
+        // nothing is the database set DERIVED, which is the one place that derivation
+        // lives ([`StoredApplication::databases`]).
+        if self.resolve_application_id(None, Some(arn), None).is_some() {
+            return true;
+        }
+        self.applications.values().any(|application| {
+            application
+                .databases(region)
+                .iter()
+                .any(|database| database.arn == arn)
+        })
+    }
+
     /// Permit `source_resource_arn` to take `action_type` on `resource_arn`.
     ///
     /// Adding a grant that is already held changes nothing — the grant is the
@@ -1241,6 +1269,17 @@ pub fn not_found(message: impl Into<String>) -> ResourceNotFoundException {
 /// error answers the same condition with [`no_registered_application`] (400) instead.
 pub fn application_not_found_message(reference: &str) -> String {
     format!("Application {reference} doesn't exist.")
+}
+
+/// The message a call that names a resource by ARN reports when this account and Region
+/// hold no such resource.
+///
+/// Built from the request: the ARN the caller sent is the only variable part, so every
+/// call that resolves a resource by its ARN reports the SAME template around it — the
+/// same construction [`application_not_found_message`] uses for an application named by
+/// its id. It goes with the 404 `ResourceNotFoundException` those operations model.
+pub fn resource_not_found_message(resource_arn: &str) -> String {
+    format!("Resource {resource_arn} doesn't exist.")
 }
 
 /// The message `GetApplication` reports when the request carries NONE of the identifier
