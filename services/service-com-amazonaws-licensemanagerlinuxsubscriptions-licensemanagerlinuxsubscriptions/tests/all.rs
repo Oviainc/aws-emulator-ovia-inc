@@ -21,6 +21,8 @@ mod linux_subscriptions;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/subscription_provider_registration.rs"]
+mod subscription_provider_registration;
 #[path = "all/subscription_providers.rs"]
 mod subscription_providers;
 #[path = "all/tag_not_found_status.rs"]

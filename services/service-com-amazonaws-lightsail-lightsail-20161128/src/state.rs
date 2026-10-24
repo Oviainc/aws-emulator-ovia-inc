@@ -5,7 +5,9 @@
 //! The slice implemented so far is Lightsail's primary resource, the **instance**
 //! (a virtual private server), the **block storage disk** (additional storage an
 //! instance can attach), the **disk snapshot** (a point-in-time copy of a disk
-//! or of an instance's system volume), the **domain** (a DNS zone the account holds
+//! or of an instance's system volume) together with the **export snapshot
+//! record** (what an export of one of those snapshots to Amazon EC2 leaves
+//! behind), the **domain** (a DNS zone the account holds
 //! recordsets in), the **container service** (a compute resource containers are
 //! deployed to), the **bucket** (an object-storage resource of the Lightsail
 //! object storage service) together with the **access keys** it grants
@@ -53,7 +55,9 @@ use crate::ops::types::{
     ContainerImage,
     ContainerService, ContainerServiceDeployment, ContainerServiceDeploymentRequest,
     ContainerServiceECRImagePullerRole, ContainerServiceEndpoint,
-    ContainerServiceHealthCheckConfig, ContainerServiceStateDetail, Domain, DomainEntry, Instance,
+    ContainerServiceHealthCheckConfig, ContainerServiceStateDetail, DestinationInfo,
+    Domain, DomainEntry, ExportSnapshotRecord, ExportSnapshotRecordSourceInfo,
+    Instance,
     InstanceHardware, InstanceHealthSummary, InstanceMetadataOptions, InstanceNetworking,
     InstancePortInfo, InstanceState, LoadBalancer, LoadBalancerTlsCertificateSummary,
     MonitoredResourceInfo, MonthlyTransfer, Operation, PrivateRegistryAccess, Region,
@@ -155,6 +159,17 @@ pub const DISK_SNAPSHOT_ARN_RESOURCE_PREFIX: &str = "DiskSnapshot/";
 /// `DiskSnapshot$resourceType` documentation names ("The Lightsail resource type
 /// (`DiskSnapshot`)").
 pub const RESOURCE_TYPE_DISK_SNAPSHOT: &str = "DiskSnapshot";
+
+/// The resource portion an export snapshot record ARN carries before its id.
+/// Mirrors the `Instance/<uuid>` form the modelled `Instance$arn` documentation
+/// shows, with this resource's own `ResourceType` value.
+pub const EXPORT_SNAPSHOT_RECORD_ARN_RESOURCE_PREFIX: &str = "ExportSnapshotRecord/";
+
+/// The `resourceType` an export snapshot record reports, from the modelled
+/// `ResourceType` enum — the value the modelled
+/// `ExportSnapshotRecord$resourceType` documentation names ("The Lightsail
+/// resource type (`ExportSnapshotRecord`)").
+pub const RESOURCE_TYPE_EXPORT_SNAPSHOT_RECORD: &str = "ExportSnapshotRecord";
 
 /// The resource portion a static IP ARN carries before its id, from the modelled
 /// `StaticIp$arn` documentation
@@ -292,6 +307,16 @@ pub const DISK_SNAPSHOT_STATE_PENDING: &str = "pending";
 /// See [`DISK_SNAPSHOT_STATE_PENDING`].
 pub const DISK_SNAPSHOT_STATE_COMPLETED: &str = "completed";
 
+/// `RecordState` values this slice uses, from the modelled `RecordState` enum
+/// and the `ExportSnapshotRecord$state` documentation ("The state of the export
+/// snapshot record"): an export is answered `Started` and settles into
+/// `Succeeded` once the resource it creates at the destination exists. The
+/// enum's `Failed` member describes an export that failed, which this store
+/// cannot produce — nothing here fails an export.
+pub const RECORD_STATE_STARTED: &str = "Started";
+/// See [`RECORD_STATE_STARTED`].
+pub const RECORD_STATE_SUCCEEDED: &str = "Succeeded";
+
 /// A state the clock already owes a resource whose state is a plain NAME: a
 /// block storage disk's `DiskState` value, a disk snapshot's
 /// `DiskSnapshotState` value, or a managed relational database's `state`.
@@ -395,6 +420,18 @@ pub const OPERATION_TYPE_UPDATE_DOMAIN_ENTRY: &str = "UpdateDomainEntry";
 /// The `operationType` the log entry of an entry's removal from a zone carries,
 /// the modelled `OperationType` enum's own `DeleteDomainEntry` member.
 pub const OPERATION_TYPE_DELETE_DOMAIN_ENTRY: &str = "DeleteDomainEntry";
+/// The `operationType` the log entry of an `ExportSnapshot` call carries.
+///
+/// `Operation$operationType` targets the modelled `OperationType` enum, whose
+/// members this module otherwise keeps to (see
+/// [`OPERATION_TYPE_UPDATE_DOMAIN_ENTRY`], where a modelled value states exactly
+/// the same fact). That enum predates the Amazon EC2 export family — it carries
+/// no member for `ExportSnapshot`, and none for `CreateCloudFormationStack`
+/// either — and no member it does carry states what an export did: logging one
+/// as a snapshot CREATE would misreport the call. A Smithy enum is open on the
+/// wire (a client has to tolerate a value it does not know), so the honest entry
+/// names the operation that ran, exactly as every other value here does.
+pub const OPERATION_TYPE_EXPORT_SNAPSHOT: &str = "ExportSnapshot";
 
 // ---------------------------------------------------------------------------
 // Store bounds
@@ -441,6 +478,13 @@ pub const MAX_RELATIONAL_DATABASES: usize = 500;
 /// refused with the modelled `InvalidInputException`.
 pub const MAX_DISK_SNAPSHOTS: usize = 500;
 
+/// The most export snapshot records this emulator will hold.
+///
+/// Emulator resource guard, NOT an AWS quota: every `ExportSnapshot` call adds a
+/// record, so an export that would exceed it is refused with the modelled
+/// `InvalidInputException`.
+pub const MAX_EXPORT_SNAPSHOT_RECORDS: usize = 500;
+
 /// The most static IP addresses this emulator will hold.
 ///
 /// Emulator resource guard, NOT an AWS quota (Lightsail's own static-IP quota is
@@ -484,6 +528,13 @@ pub const MAX_OPERATION_HISTORY: usize = 2_000;
 /// CHOSEN: Lightsail publishes no page size for this operation, only that the
 /// response carries a `nextPageToken` when more instances remain.
 pub const INSTANCE_PAGE_SIZE: usize = 10;
+
+/// How many export snapshot records one `GetExportSnapshotRecords` page carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation either, only that
+/// the response carries a `nextPageToken` when more records remain — "A next page
+/// token is not returned if there are no more results to display."
+pub const EXPORT_SNAPSHOT_RECORD_PAGE_SIZE: usize = 10;
 
 // ---------------------------------------------------------------------------
 // Catalog paging
@@ -4461,6 +4512,122 @@ impl StoredDiskSnapshot {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Export snapshot records
+// ---------------------------------------------------------------------------
+
+/// The prefix a minted export snapshot record name carries.
+///
+/// CHOSEN: Lightsail does not document how it names an export snapshot record,
+/// only that the record HAS a name the caller never supplied — the modelled
+/// `ExportSnapshot` input takes nothing but the snapshot to export, while
+/// `ExportSnapshotRecord$name` targets `ResourceName` (pattern
+/// `^\w[\w\-]*\w$`). So the name is minted here: this prefix, which says which
+/// operation created the record, followed by the id this store allocated for the
+/// record — the same id its ARN carries, so one value identifies it everywhere.
+pub const EXPORT_SNAPSHOT_RECORD_NAME_PREFIX: &str = "ExportSnapshot-";
+
+/// The id prefix of the Amazon EC2 resource an exported INSTANCE snapshot
+/// becomes, from the modelled `ExportSnapshot` documentation: "Exported instance
+/// snapshots appear in Amazon EC2 as Amazon Machine Images (AMIs)". See
+/// [`ec2_destination_id`].
+pub const EC2_IMAGE_ID_PREFIX: &str = "ami-";
+
+/// The id prefix of the Amazon EC2 resource an exported DISK snapshot becomes,
+/// from the same modelled documentation: "Exported disk snapshots appear in
+/// Amazon EC2 as Amazon EBS volumes". See [`ec2_destination_id`].
+pub const EC2_VOLUME_ID_PREFIX: &str = "vol-";
+
+/// How many hexadecimal characters an EC2 resource id carries after its prefix:
+/// the 17 of the long-form id format every EC2 resource created since 2018 uses
+/// (`vol-0123456789abcdef0`), which is the form `DestinationInfo$id` reports for
+/// a resource created in EC2.
+const EC2_RESOURCE_ID_HEX_LEN: usize = 17;
+
+/// The destination service an export snapshot record reports, as
+/// `DestinationInfo$service` ("The destination service of the record").
+///
+/// `ExportSnapshot` exports to Amazon EC2 and to nothing else, so the one value
+/// this member can carry is that service, named by its own ARN namespace and
+/// endpoint prefix (`ec2`) — the identifier this emulator names a service with
+/// everywhere else.
+pub const EXPORT_DESTINATION_SERVICE: &str = "ec2";
+
+/// The id of the Amazon EC2 resource an export creates: `prefix` (which kind of
+/// resource the exported snapshot became) plus the long-form EC2 id's
+/// [`EC2_RESOURCE_ID_HEX_LEN`] hexadecimal characters, taken from the store-minted
+/// `id` so no two exports in this process name the same destination resource.
+pub fn ec2_destination_id(prefix: &str, id: &str) -> String {
+    let hex = id.replace('-', "");
+    format!(
+        "{prefix}{}",
+        hex.get(..EC2_RESOURCE_ID_HEX_LEN).unwrap_or(hex.as_str())
+    )
+}
+
+/// The ARN of the export snapshot record `id` in `region`.
+pub fn export_snapshot_record_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{EXPORT_SNAPSHOT_RECORD_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// One stored export snapshot record: the record `ExportSnapshot` created, with
+/// the clock-owed transition its state is waiting on.
+///
+/// Every `ExportSnapshot` call appends ONE record — exporting the same snapshot
+/// twice is two exports, and so two records — which is why these are keyed by a
+/// minted name rather than by the snapshot's.
+#[derive(Debug, Clone)]
+pub struct StoredExportSnapshotRecord {
+    /// The record name this store minted — this record's store key and the
+    /// `name` every read reports. See [`EXPORT_SNAPSHOT_RECORD_NAME_PREFIX`].
+    pub name: String,
+    pub arn: String,
+    pub created_at_ms: i64,
+    /// Where the record is: the location of the snapshot that was exported,
+    /// because "Snapshots are exported to the same Amazon Web Services Region in
+    /// Amazon EC2 as the source Lightsail snapshot".
+    pub location: StoredLocation,
+    /// The current `RecordState` value: [`RECORD_STATE_STARTED`] or
+    /// [`RECORD_STATE_SUCCEEDED`].
+    pub state: &'static str,
+    /// The state the clock owes this record, while one is outstanding.
+    pub due: Option<DueNamedState>,
+    /// The snapshot this export was taken of, captured at the instant of the
+    /// export — so the record keeps describing it even if the snapshot itself
+    /// later changes or is deleted.
+    pub source_info: ExportSnapshotRecordSourceInfo,
+    /// The id of the Amazon EC2 resource this export creates. See
+    /// [`ec2_destination_id`].
+    pub destination_id: String,
+}
+
+impl StoredExportSnapshotRecord {
+    /// This record as the modelled `ExportSnapshotRecord`.
+    pub fn view(&self) -> ExportSnapshotRecord {
+        ExportSnapshotRecord {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            location: Some(self.location.view()),
+            resource_type: Some(RESOURCE_TYPE_EXPORT_SNAPSHOT_RECORD.to_string()),
+            state: Some(self.state.to_string()),
+            source_info: Some(self.source_info.clone()),
+            // `DestinationInfo$id` is "The ID of the resource created at the
+            // destination", and while the export is still `Started` nothing has
+            // been created there yet — so the destination is reported from the
+            // instant the export succeeded, not before.
+            destination_info: (self.state == RECORD_STATE_SUCCEEDED).then(|| DestinationInfo {
+                id: Some(self.destination_id.clone()),
+                service: Some(EXPORT_DESTINATION_SERVICE.to_string()),
+            }),
+        }
+    }
+}
+
 /// One stored domain recordset: the DNS zone `CreateDomain` created, with the
 /// entries the account has added to it.
 #[derive(Debug, Clone)]
@@ -6681,6 +6848,11 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// disk snapshot operation takes. A `BTreeMap` so `GetDiskSnapshots` walks a
     /// stable, total order and a page token can name the next snapshot.
     pub disk_snapshots: BTreeMap<String, StoredDiskSnapshot>,
+    /// Every export snapshot record, keyed by the name this store minted for it
+    /// — the only identifier an export snapshot record has, because the caller
+    /// names none. A `BTreeMap` so `GetExportSnapshotRecords` walks a stable,
+    /// total order and a page token can name the next record.
+    pub export_snapshot_records: BTreeMap<String, StoredExportSnapshotRecord>,
     /// The append-only operation log, newest last: the source of truth for the
     /// `operations` every mutating instance call answers with.
     pub operations: Vec<StoredOperation>,
@@ -6833,6 +7005,17 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// Store a newly created disk snapshot.
     pub fn insert_disk_snapshot(&mut self, snapshot: StoredDiskSnapshot) {
         self.disk_snapshots.insert(snapshot.name.clone(), snapshot);
+    }
+
+    /// The export snapshot record `name` names, for a reporting operation.
+    pub fn export_snapshot_record(&self, name: &str) -> Option<&StoredExportSnapshotRecord> {
+        self.export_snapshot_records.get(name)
+    }
+
+    /// Store a newly created export snapshot record.
+    pub fn insert_export_snapshot_record(&mut self, record: StoredExportSnapshotRecord) {
+        self.export_snapshot_records
+            .insert(record.name.clone(), record);
     }
 
     /// Remove the instance `name` names, answering it. `None` when nothing
@@ -7186,8 +7369,8 @@ impl ComAmazonawsLightsailLightsail20161128State {
     }
 
     /// Materialise every transition the clock had already made due at `now_ms`:
-    /// an instance, a disk, a disk snapshot, a managed relational database or a
-    /// load balancer
+    /// an instance, a disk, a disk snapshot, an export snapshot record, a managed
+    /// relational database or a load balancer
     /// settles into the state it was owed, a container service walks
     /// into the phase it was owed (activating the deployment that was waiting),
     /// and an operation whose work is done settles into `Succeeded`.
@@ -7197,7 +7380,8 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// cannot show a caller anything a later caller would not also see.
     ///
     /// Every walk is bounded by [`MAX_INSTANCES`], [`MAX_DISKS`],
-    /// [`MAX_DISK_SNAPSHOTS`], [`MAX_CONTAINER_SERVICES`],
+    /// [`MAX_DISK_SNAPSHOTS`], [`MAX_EXPORT_SNAPSHOT_RECORDS`],
+    /// [`MAX_CONTAINER_SERVICES`],
     /// [`MAX_RELATIONAL_DATABASES`], [`MAX_LOAD_BALANCERS_PER_REGION`] and
     /// [`MAX_OPERATION_HISTORY`], and a record drops out of the work as soon as
     /// it has nothing outstanding.
@@ -7235,6 +7419,13 @@ impl ComAmazonawsLightsailLightsail20161128State {
             if due.at_ms <= now_ms {
                 snapshot.state = due.state;
                 snapshot.due = None;
+            }
+        }
+        for record in self.export_snapshot_records.values_mut() {
+            let Some(due) = record.due else { continue };
+            if due.at_ms <= now_ms {
+                record.state = due.state;
+                record.due = None;
             }
         }
         for service in self.container_services.values_mut() {

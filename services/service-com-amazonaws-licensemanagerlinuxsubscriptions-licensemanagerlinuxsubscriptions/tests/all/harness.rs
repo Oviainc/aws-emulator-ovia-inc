@@ -19,7 +19,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::state::{
-    SubscriptionProviderRecord, PROVIDER_STATUS_ACTIVE,
+    SubscriptionProviderRecord, PROVIDER_STATUS_ACTIVE, PROVIDER_STATUS_INVALID,
+    PROVIDER_STATUS_PENDING, TOKEN_VALIDATION_DELAY,
 };
 use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::{
     ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState,
@@ -37,6 +38,24 @@ pub const RED_HAT: &str = "RedHat";
 /// `SubscriptionProviderStatus` of a provider whose token the service holds and
 /// accepted, named from the crate so a suite cannot hold a second copy of the value.
 pub const ACTIVE: &str = PROVIDER_STATUS_ACTIVE;
+/// `SubscriptionProviderStatus` a fresh registration reports, while the validation of its
+/// access token has not landed.
+pub const PENDING: &str = PROVIDER_STATUS_PENDING;
+/// `SubscriptionProviderStatus` a registration whose access token could not be validated
+/// settles into.
+pub const INVALID: &str = PROVIDER_STATUS_INVALID;
+
+/// Wait out the span the clock owes a fresh registration before its terminal
+/// `SubscriptionProviderStatus` is due, so the next call materializes it.
+///
+/// The emulator never sleeps for the transition — it stores the due instant and
+/// materializes it on the next call that reports a status — so it is the TEST that has to
+/// let the clock pass the span. `std::thread::sleep` rather than `tokio::time::sleep`
+/// because this workspace enables tokio's `macros`/`rt` features only, and nothing else is
+/// pending on the test's runtime while it waits.
+pub fn wait_for_token_validation() {
+    std::thread::sleep(TOKEN_VALIDATION_DELAY + std::time::Duration::from_millis(100));
+}
 
 /// One emulator: the router that dispatches, plus the shared engine its service was
 /// built from (so a test can read or pre-fill the store the handlers use).
@@ -251,15 +270,16 @@ pub fn provider_arn_for(id: &str) -> String {
     format!("arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT}:subscription-provider/{id}")
 }
 
-/// Seed one registration DIRECTLY into the store, and answer its ARN.
+/// Seed one registration DIRECTLY into the store, in a TERMINAL `ACTIVE` status, and
+/// answer its ARN.
 ///
-/// `RegisterSubscriptionProvider` cannot create one here: the real service registers a
-/// provider only once it has validated the access token in the referenced secret against
-/// that provider, which this emulator cannot do (see
-/// `src/ops/register_subscription_provider.rs`), so it refuses every registration. The
-/// read, list, deregister and tag operations still have to answer from the store, so a
-/// suite that exercises them puts the records there itself — the same seam the handlers
-/// use (`engine.state::<…>()`), not a second copy of the store.
+/// `RegisterSubscriptionProvider` creates registrations over the wire (and
+/// `tests/all/subscription_provider_registration.rs` is what exercises that path), but it
+/// can never leave one `ACTIVE`: validating a provider access token needs trust material
+/// this emulator does not hold, so a registration it created settles `INVALID`. A suite
+/// whose rule is about the read/list/tag/deregister side of an ACCEPTED registration
+/// therefore places the record itself, through the same seam the handlers use
+/// (`engine.state::<…>()`), not a second copy of the store.
 pub fn seed_provider(
     h: &Harness,
     id: &str,
@@ -273,18 +293,15 @@ pub fn seed_provider(
     let mut state = state.lock();
     state.providers.insert(
         arn.clone(),
-        SubscriptionProviderRecord {
-            arn: arn.clone(),
-            source: RED_HAT.to_string(),
-            secret_arn: secret_arn.to_string(),
-            status: ACTIVE.to_string(),
-            status_message: None,
-            last_successful_data_retrieval_time: None,
-            tags: tags
-                .iter()
+        SubscriptionProviderRecord::settled(
+            arn.clone(),
+            RED_HAT.to_string(),
+            secret_arn.to_string(),
+            ACTIVE.to_string(),
+            tags.iter()
                 .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
                 .collect::<HashMap<String, String>>(),
-        },
+        ),
     );
     state.provider_order.push(arn.clone());
     arn
@@ -307,6 +324,11 @@ pub fn provider_arn(reply: &Reply, case: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: no SubscriptionProviderArn in {:?}", reply.body))
         .to_string()
+}
+
+/// A string member of a 200 body, or `None` when the body does not carry it.
+pub fn member<'a>(reply: &'a Reply, case: &str, name: &str) -> Option<&'a str> {
+    reply.ok(case).get(name).and_then(Value::as_str)
 }
 
 /// The providers a list body reports, as `(arn, source, secret arn, status)` rows.

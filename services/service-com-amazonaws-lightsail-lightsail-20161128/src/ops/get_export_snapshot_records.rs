@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetExportSnapshotRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetExportSnapshotRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one page of the export snapshot records this service's store holds —
+//! every record an `ExportSnapshot` call appended — and the token that names the
+//! page after it while records remain.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetExportSnapshotRecords::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +164,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetExportSnapshotRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetExportSnapshotRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetExportSnapshotRecords"))
+        let _ = ctx;
+
+        // `pageToken` is the name the previous page stopped before, so a page is
+        // the stored records from that name onward in the store's own total
+        // order. Using the name rather than an index means a record appended
+        // between two pages cannot make the walk skip or repeat another one.
+        let page_token = input.page_token.unwrap_or_default();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // Reporting only: each record is answered exactly as the store holds
+            // it, including the state the clock has already settled it into
+            // (`with_state` applies what the clock owed before this body ran).
+            let mut export_snapshot_records = Vec::new();
+            let mut next_page_token = None;
+            for (name, record) in store.export_snapshot_records.range(page_token.clone()..) {
+                if export_snapshot_records.len()
+                    == crate::state::EXPORT_SNAPSHOT_RECORD_PAGE_SIZE
+                {
+                    next_page_token = Some(name.clone());
+                    break;
+                }
+                export_snapshot_records.push(record.view());
+            }
+            GetExportSnapshotRecordsOutput {
+                // An account that has exported nothing reports an empty list,
+                // not an absent one: the caller asked which exports it has made,
+                // and the answer is "none".
+                export_snapshot_records: Some(export_snapshot_records),
+                next_page_token,
+            }
+        })
+        .ok_or_else(unavailable)
     }
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetExportSnapshotRecordsError {
+    GetExportSnapshotRecordsErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail export snapshot record store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

@@ -163,6 +163,24 @@ recorded fake-token one. Stated plainly so no client is surprised:
   recorded AWS response showing a registration this emulator could faithfully accept.
   Until then the refusal is the honest answer, and it is the recorded one.
 
+#### SUPERSEDED (2026-10-24) — the create path is implemented, as PENDING → INVALID
+
+The blanket refusal above was re-filed as
+`…-license-manager-linux-subscriptions-registersubscriptionprovider-wrong-behavior` and is
+no longer what the emulator does. What was wrong with it: the registration resource is
+created by the call and the token validation runs BEHIND it (the registration answers
+`SubscriptionProviderStatus: PENDING`, and only `GetRegisteredSubscriptionProvider` carries
+a `SubscriptionProviderStatusMessage`), so refusing the call erased a resource the recorded
+service does create — taking the whole create → read → list → tag → deregister lifecycle of
+the service's primary resource off the wire with it.
+
+`RegisterSubscriptionProvider` now persists the registration and answers HTTP 200 with the
+minted `SubscriptionProviderArn`, the registered source and `PENDING`. The validation this
+emulator cannot carry out is reported where the model has a member for it: the registration
+settles into the modelled failure status `INVALID` with the
+`SubscriptionProviderStatusMessage` that says no access token can be established as genuine
+here. It never settles `ACTIVE`, so no validation is reported that nothing performed.
+
 ### KNOWN GAP — a partially-invalid collection quotes only the failing elements
 
 Cause 5's rule is implemented in `src/service/validation.rs`, and one part of it cannot

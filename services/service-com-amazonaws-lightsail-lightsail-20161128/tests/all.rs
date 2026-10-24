@@ -49,6 +49,8 @@ mod domain_entry_recordset;
 mod domain_entry_update;
 #[path = "all/domain_zone.rs"]
 mod domain_zone;
+#[path = "all/export_snapshot_records.rs"]
+mod export_snapshot_records;
 #[path = "all/instance_error_envelope.rs"]
 mod instance_error_envelope;
 #[path = "all/instance_lifecycle.rs"]

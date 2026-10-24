@@ -186,9 +186,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@pattern` of each member, the `TagsMap` size) is refused at the boundary, so
         // reaching here means there is nothing left to check. The
         // `ConnectorDestinationId` is NOT resolved against a stored connector
-        // destination: `CreateConnectorDestination` is still a scaffold stub, so this
-        // emulator holds no destination registry to resolve it against and cannot tell a
-        // destination that exists from one that does not.
+        // destination, even though `CreateConnectorDestination` now keeps a registry of
+        // them: the recorded account-association units name destination ids that no call
+        // in the unit created (none of them calls `CreateConnectorDestination` — this
+        // operation's stub blocked no account-association unit), so a destination this
+        // store does not hold is not evidence that the account does not have one, and
+        // refusing it would refuse a request AWS accepted. Only a create whose referenced
+        // resource this API itself mints in the same account — `CreateConnectorDestination`'s
+        // `CloudConnectorId` — resolves that reference.
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         let created_at = ::std::time::SystemTime::now();

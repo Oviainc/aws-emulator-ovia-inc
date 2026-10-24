@@ -199,6 +199,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        if !workspace.scenes.is_empty() {
+            return Err(DeleteWorkspaceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "workspace {} still contains {} scenes; delete them first",
+                        input.workspace_id,
+                        workspace.scenes.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
         let Some(workspace) = state.workspaces.remove(&input.workspace_id) else {
             return Err(DeleteWorkspaceErrorModeled::InternalServerException(
                 InternalServerException {

@@ -169,8 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // A pure read: every member comes off the stored record, and nothing is written.
-        let state = state.lock();
+        // A report, not a mutation: the only write is materializing the status transition
+        // the clock already owed this registration (the token validation that runs behind
+        // the registration call), which was due at the same instant whether or not anybody
+        // called. Every reported member then comes off the stored record.
+        let mut state = state.lock();
+        state.settle_providers(::std::time::SystemTime::now());
         let record = state
             .resolve_provider(&input.subscription_provider_arn)
             .map_err(into_error)?;

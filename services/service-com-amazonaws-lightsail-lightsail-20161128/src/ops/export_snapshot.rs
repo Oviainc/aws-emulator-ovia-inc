@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExportSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExportSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Appends one export snapshot record to this service's store for the snapshot
+//! the request names — describing that snapshot, the resource it was taken of,
+//! and the Amazon EC2 resource the export creates — and answers the
+//! operation-log entry the export appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExportSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +169,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExportSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExportSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExportSnapshot"))
+        // `ctx` carries request metadata only, and nothing this operation stores
+        // comes from it: "Snapshots are exported to the same Amazon Web Services
+        // Region in Amazon EC2 as the source Lightsail snapshot", and the stored
+        // snapshot record already names that region and zone.
+        let _ = ctx;
+
+        // `sourceSnapshotName` is a modelled `@required` member carrying a
+        // modelled pattern, so the centralized walk refused anything outside it
+        // before this body ran. What is left is what the model cannot express:
+        // the name has to be a snapshot this account holds, and the store has to
+        // have room for the record the export appends. Both are checked BEFORE
+        // the first write, so a refused request records nothing.
+        let source_snapshot_name = input.source_snapshot_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            if store.export_snapshot_records.len() >= crate::state::MAX_EXPORT_SNAPSHOT_RECORDS {
+                return Err(invalid(format!(
+                    "exporting a snapshot would take this account past the {} export \
+                     snapshot records this emulator holds",
+                    crate::state::MAX_EXPORT_SNAPSHOT_RECORDS
+                )));
+            }
+
+            // What the record says about the snapshot it exported, taken from
+            // the SOURCE record as it stands now so the record keeps it however
+            // the snapshot changes afterwards. The exportable snapshots this
+            // store holds are disk snapshots (`CreateDiskSnapshot`), whose own
+            // source is either a block storage disk or an instance's system
+            // volume — which is what `fromResourceName`/`fromResourceArn`
+            // report, "the snapshot's source instance or disk".
+            let snapshot = store
+                .disk_snapshot(&source_snapshot_name)
+                .ok_or_else(|| not_found(&source_snapshot_name))?;
+            let (from_resource_name, from_resource_arn) = match &snapshot.source {
+                crate::state::DiskSnapshotSource::Disk { name, arn }
+                | crate::state::DiskSnapshotSource::Instance { name, arn } => {
+                    (name.clone(), arn.clone())
+                }
+            };
+            let source_info = ExportSnapshotRecordSourceInfo {
+                // The modelled `ExportSnapshotRecordSourceType` value of a disk
+                // snapshot, the same `DiskSnapshot` the snapshot's own
+                // `resourceType` carries.
+                resource_type: Some(crate::state::RESOURCE_TYPE_DISK_SNAPSHOT.to_string()),
+                created_at: Some(crate::state::timestamp(snapshot.created_at_ms)),
+                name: Some(snapshot.name.clone()),
+                arn: Some(snapshot.arn.clone()),
+                from_resource_name: Some(from_resource_name),
+                from_resource_arn: Some(from_resource_arn),
+                // One description per KIND of snapshot: this record exported a
+                // disk snapshot, so there is no instance snapshot to describe.
+                instance_snapshot_info: None,
+                disk_snapshot_info: Some(DiskSnapshotInfo {
+                    size_in_gb: Some(snapshot.size_in_gb),
+                }),
+            };
+            let location = snapshot.location.clone();
+
+            // The record's own id: it names the record and it is the id its ARN
+            // carries. The destination resource gets an id of its own, because
+            // it is an Amazon EC2 resource and not this record.
+            let id = store.mint_uuid();
+            let name = format!("{}{id}", crate::state::EXPORT_SNAPSHOT_RECORD_NAME_PREFIX);
+            let destination_id = crate::state::ec2_destination_id(
+                crate::state::EC2_VOLUME_ID_PREFIX,
+                &store.mint_uuid(),
+            );
+            // The export has only just started: the clock owes the record
+            // `Succeeded`, which is why a read straight after this call still
+            // reports `Started` and names no destination resource yet.
+            let due = crate::state::DueNamedState::after(now, crate::state::RECORD_STATE_SUCCEEDED);
+            store.insert_export_snapshot_record(crate::state::StoredExportSnapshotRecord {
+                name: name.clone(),
+                arn: crate::state::export_snapshot_record_arn(&location.region_name, &id),
+                created_at_ms: now,
+                location: location.clone(),
+                state: crate::state::RECORD_STATE_STARTED,
+                due: Some(due),
+                source_info,
+                destination_id,
+            });
+            // `operations` is a list because other Lightsail calls act on
+            // several resources at once; one `ExportSnapshot` exports exactly
+            // one snapshot, so it answers exactly one entry — against the
+            // SNAPSHOT, which is the resource the export acted on — left
+            // non-terminal until the export the clock owes is due.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_EXPORT_SNAPSHOT,
+                crate::state::RESOURCE_TYPE_DISK_SNAPSHOT,
+                &source_snapshot_name,
+                &location,
+                Some(due.at_ms),
+            );
+            Ok(ExportSnapshotOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names what was
+/// wrong and the bound it broke.
+fn invalid(message: String) -> ExportSnapshotError {
+    ExportSnapshotErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The request names no snapshot this account holds: Lightsail's `DoesNotExist`
+/// rejection — HTTP 400, wire error `NotFoundException`, body `code`
+/// `DoesNotExist` and a message built from the request.
+///
+/// `sourceSnapshotName` names "the instance or disk snapshot to be exported", so
+/// the message names the member's own subject rather than one of the two
+/// resource types it could have been.
+fn not_found(source_snapshot_name: &str) -> ExportSnapshotError {
+    crate::scaffolded::Scaffolded::does_not_exist(format!(
+        "The snapshot does not exist: {source_snapshot_name}"
+    ))
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> ExportSnapshotError {
+    ExportSnapshotErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail export snapshot record store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

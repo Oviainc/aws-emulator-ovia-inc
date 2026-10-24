@@ -67,5 +67,7 @@ mod state_roundtrip;
 mod threat_entity_set_lifecycle;
 #[path = "all/threat_intel_sets.rs"]
 mod threat_intel_sets;
+#[path = "all/trusted_entity_set_delete.rs"]
+mod trusted_entity_set_delete;
 #[path = "all/trusted_entity_set_lifecycle.rs"]
 mod trusted_entity_set_lifecycle;

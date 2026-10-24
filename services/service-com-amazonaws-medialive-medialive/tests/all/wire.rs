@@ -36,14 +36,24 @@ pub const ACCOUNT: &str = "000000000000";
 /// A router carrying this service alone, on its own engine, so each test starts
 /// from an empty store.
 pub fn medialive() -> MultiServiceRouter {
+    medialive_with_engine().0
+}
+
+/// The same router, handed back with the engine it was built on, for a suite
+/// whose rule is about state no operation writes yet (a cluster's alert log,
+/// which the real service raises from hardware this emulator does not run).
+///
+/// One construction path, so a suite that reaches the store cannot drift from
+/// how every other suite builds the service.
+pub fn medialive_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // These suites exercise service behaviour, not request signing.
     router.set_request_authentication(false);
     router.register_service(
-        service_com_amazonaws_medialive_medialive::EmulatedService::new(engine),
+        service_com_amazonaws_medialive_medialive::EmulatedService::new(Arc::clone(&engine)),
     );
-    router
+    (router, engine)
 }
 
 /// Dispatch one request signed for [`DEFAULT_REGION`] and read back its status
