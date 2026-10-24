@@ -1,15 +1,51 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIdMappingWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIdMappingWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the ID mapping workflow `CreateIdMappingWorkflow` persisted in
+//! [`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::id_mapping_workflows`],
+//! so a later `GetIdMappingWorkflow` answers `ResourceNotFoundException` (HTTP 404),
+//! `ListIdMappingWorkflows` stops listing it, and the room it held under the
+//! per-Region "ID mapping workflows" quota
+//! ([`crate::state::MAX_ID_MAPPING_WORKFLOWS`]) comes back. The record carries its own
+//! tags, so they go with it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIdMappingWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The refusal comes straight from the operation's own documentation: "This operation
+//! returns a ResourceNotFoundException if a workflow with the given name does not
+//! exist." `@idempotent` describes the EFFECT of repeating the call, which that same
+//! wording already fixes as a 404 for an absent record, not a 200.
+//!
+//! The `workflowName` label is an `EntityName` (`^[a-zA-Z_0-9-]*$`,
+//! `smithy_query(query="operation",operation="DeleteIdMappingWorkflow")`), the same key
+//! `GetIdMappingWorkflow` reads by and the one the store is keyed by, so the label IS
+//! the key and an ARN — whose `:` and `/` the pattern does not admit — is refused at the
+//! boundary before this handler runs. That key is this resource's OWN namespace: a
+//! MATCHING workflow of the same name is a different resource and is left alone.
+//!
+//! The modelled `ConflictException` (400) reports a resource whose current state
+//! forbids the delete, which for a workflow is a run still in progress ("Workflow is
+//! currently running"). An ID mapping workflow's runs are its ID mapping JOBS, and this
+//! emulator starts none — `StartIdMappingJob`, `GetIdMappingJob` and
+//! `ListIdMappingJobs` are still scaffolds and the store holds no ID mapping job — so
+//! nothing stored can be in progress and that refusal is unreachable here. It becomes
+//! reachable, on the same condition `DeleteMatchingWorkflow` already applies to its
+//! matching jobs, once the ID-mapping job surface is implemented.
+//!
+//! A resource-based policy is not a resource of its own and is keyed by the workflow's
+//! identity, so this delete orphans any policy attached to it: the store stops serving
+//! it immediately (a policy entry is read back only while its resource exists with the
+//! same `createdAt`, see
+//! [`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::resource_policy`])
+//! and collects it when the policy path next runs
+//! ([`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::prune_orphaned_policies`]).
+//!
+//! ## Authorization is not modelled
+//!
+//! The emulator verifies the request SIGNATURE centrally and evaluates no principal,
+//! IAM policy or resource-based policy, here or anywhere else in this service, so the
+//! modelled `AccessDeniedException` (403) below is not reachable from this handler: a
+//! caller whose signature the emulator accepted may delete any workflow this store
+//! holds. The destructive call is recorded instead — the attempt and its outcome, with
+//! the presented access key id — so a test can observe who asked for what.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +187,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIdMappingWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIdMappingWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIdMappingWorkflow"))
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+
+        // The attempt, recorded before any refusal can return. Request metadata only:
+        // nothing of the stored workflow is logged.
+        ::tracing::info!(
+            operation = "DeleteIdMappingWorkflow",
+            workflow_name = %input.workflow_name,
+            akid = %akid,
+            outcome = "requested",
+            "id mapping workflow deletion requested"
+        );
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ::tracing::error!(
+                operation = "DeleteIdMappingWorkflow",
+                workflow_name = %input.workflow_name,
+                akid = %akid,
+                outcome = "InternalServerException",
+                "id mapping workflow deletion failed: no state store attached"
+            );
+            DeleteIdMappingWorkflowErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the Entity Resolution emulator has no state store attached".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+
+        // The `workflowName` label is an `EntityName`, so it is the store's key as it
+        // stands, and the removal and the existence check are ONE lookup: a delete of
+        // an absent name changes nothing.
+        if store
+            .id_mapping_workflows
+            .remove(&input.workflow_name)
+            .is_none()
+        {
+            // The refused outcome is recorded too: a destructive attempt that was
+            // turned down is as much an access record as one that went through.
+            ::tracing::info!(
+                operation = "DeleteIdMappingWorkflow",
+                workflow_name = %input.workflow_name,
+                akid = %akid,
+                outcome = "ResourceNotFoundException",
+                "id mapping workflow deletion refused: no such workflow"
+            );
+            return Err(
+                DeleteIdMappingWorkflowErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::messages::DELETE_ID_MAPPING_WORKFLOW_NOT_FOUND
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        ::tracing::info!(
+            operation = "DeleteIdMappingWorkflow",
+            workflow_name = %input.workflow_name,
+            akid = %akid,
+            outcome = "success",
+            "id mapping workflow deleted"
+        );
+
+        // `message` is a modelled @required output member carrying this operation's own
+        // constant success text, not a sentence about the removed record.
+        Ok(DeleteIdMappingWorkflowOutput {
+            message: crate::state::messages::DELETE_ID_MAPPING_WORKFLOW_SUCCESS.to_string(),
+        })
     }
 }
