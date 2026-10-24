@@ -2,7 +2,8 @@
 
 //! @op UpdateAutomationRule
 //!
-//! IMPLEMENTED. Applies the supplied members to the stored rule under an
+//! IMPLEMENTED. Validates the values it carries the way a create validates its
+//! own, then applies the supplied members to the stored rule under an
 //! optimistic-concurrency check on `ruleRevision`, bumps the revision, stamps
 //! `lastUpdatedTimestamp`, and answers with the merged rule read back from the store.
 //!
@@ -238,6 +239,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "name",
                 "Member must have length greater than or equal to 1",
             )));
+        }
+        // A member an update REPLACES must satisfy the rules a create holds it
+        // to, or the update would turn a valid rule into one this service could
+        // not have created. Each is judged on its own, because an absent member
+        // leaves the stored (already valid) value alone. Checked BEFORE the
+        // store is touched, so a refused update neither applies, consumes the
+        // client token nor bumps the revision.
+        if let Some(report) = input
+            .recommended_action_types
+            .as_deref()
+            .and_then(crate::state::recommended_action_types_violation)
+        {
+            return Err(invalid_parameter(report));
+        }
+        if let Some(report) = input
+            .schedule
+            .as_ref()
+            .and_then(crate::state::schedule_violation)
+        {
+            return Err(invalid_parameter(report));
+        }
+        if let Some(report) = input
+            .criteria
+            .as_ref()
+            .and_then(crate::state::criteria_violation)
+        {
+            return Err(invalid_parameter(report));
         }
 
         let mut probe = input.clone();
