@@ -2,7 +2,9 @@
 
 //! @op UpdatePackagingGroup
 //! IMPLEMENTED: replaces a stored PackagingGroup's CDN `Authorization` — the only
-//! member this request carries — and answers with the record as it now stands in
+//! member this request carries, whose two ARN members are read as ARNs of the
+//! services their documentation names (a Secrets Manager secret and an IAM role)
+//! before the group is written — and answers with the record as it now stands in
 //! [`crate::state`], so the following `DescribePackagingGroup` reports the same
 //! `Authorization` and the unchanged `Id`, `Arn`, `CreatedAt` and `DomainName`.
 //! This is the ONLY file to touch for this operation.
@@ -173,6 +175,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
+
+        // The CDN authorization block names a Secrets Manager secret and the IAM role
+        // MediaPackage reads it as, so both members are read as ARNs of those services
+        // BEFORE the addressed group is resolved and written: a value the caller has to
+        // fix is a violation of that PARAMETER whichever group the URI names, and a
+        // refused update leaves the group's previous authorization exactly as it was.
+        if let Some(authorization) = input.authorization.as_ref() {
+            crate::state::check_authorization_arns(authorization)?;
+        }
 
         // This operation addresses an existing group by its `Id` path label within the
         // Region it was served in, so a group that Region holds none of is a missing
