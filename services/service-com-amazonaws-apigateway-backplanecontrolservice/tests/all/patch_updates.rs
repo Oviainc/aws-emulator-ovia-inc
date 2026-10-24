@@ -54,7 +54,15 @@ async fn patch(gateway: &Gateway, uri: &str, operations: Vec<Value>) -> Answer {
 }
 
 /// Send `operations` to `uri`, asserting the modelled 200 and returning the body.
-async fn patch_ok(gateway: &Gateway, case: &str, uri: &str, operations: Vec<Value>) -> Value {
+///
+/// `pub(crate)` so a sibling suite reuses this one PATCH-and-assert wrapper rather than
+/// keeping its own copy (the `update_stage_readers` suite does).
+pub(crate) async fn patch_ok(
+    gateway: &Gateway,
+    case: &str,
+    uri: &str,
+    operations: Vec<Value>,
+) -> Value {
     let answer = patch(gateway, uri, operations).await;
     assert_eq!(
         answer.status, 200,

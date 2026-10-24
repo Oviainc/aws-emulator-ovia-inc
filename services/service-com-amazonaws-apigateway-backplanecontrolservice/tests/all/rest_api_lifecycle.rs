@@ -185,6 +185,23 @@ pub(crate) fn page_items(body: &Value, case: &str) -> Vec<Value> {
         .clone()
 }
 
+/// `body` with `members` dropped, for comparing two reads of ONE record that may
+/// legitimately differ in those members only — a status the clock owes, an id the service
+/// minted, the instant the record last changed.
+///
+/// This crate's one copy of that strip, so a suite names the members its own rule excludes
+/// instead of writing the same helper again (`without_status`, `without_cluster_status`
+/// and `without_id` are thin wrappers over this).
+pub(crate) fn without(body: &Value, members: &[&str]) -> Value {
+    let mut copy = body.clone();
+    if let Some(object) = copy.as_object_mut() {
+        for member in members {
+            object.remove(*member);
+        }
+    }
+    copy
+}
+
 /// Assert `answer` is the modelled failure `(status, code)` — the status and the
 /// `x-amzn-errortype` code, which is what a client's error handling keys off.
 ///

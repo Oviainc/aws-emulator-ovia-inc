@@ -118,3 +118,5 @@ mod delete_documentation_part;
 mod update_stage_setting_spellings;
 #[path = "all/deployment_collection.rs"]
 mod deployment_collection;
+#[path = "all/update_stage_readers.rs"]
+mod update_stage_readers;
