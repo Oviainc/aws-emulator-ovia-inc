@@ -571,10 +571,72 @@ pub struct UsagePlanEntry {
     /// See the struct docs: absent, because nothing writes it.
     pub product_code: Option<String>,
     pub tags: BTreeMap<String, String>,
+    /// The API keys metered against this plan, keyed by the API key id each one names —
+    /// the `keyId` a `UsagePlanKey` is addressed by. A key is in a plan at most once, so
+    /// the association is a map keyed by that id rather than a list.
+    ///
+    /// Bounded by [`MAX_USAGE_PLAN_KEYS_PER_PLAN`] and reclaimed with the key it names:
+    /// `DeleteApiKey` drops the deleted key's association from every plan (see
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::forget_api_key`]), because a
+    /// deleted key is metered by no plan. A read of this map still joins it against
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::api_keys`] through
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::usage_plan_key`] rather than
+    /// enumerating it directly, so no read can report a key that no longer exists.
+    pub keys: BTreeMap<String, UsagePlanKeyEntry>,
     /// This plan's creation rank, from
     /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
     /// listing can report creation order rather than id order.
     pub sequence: u64,
+}
+
+/// One stored `UsagePlanKey`: the association between a stored [`UsagePlanEntry`] and a
+/// stored [`ApiKeyEntry`], held on the plan that meters the key.
+///
+/// The association stores only what it OWNS — which key it names and the type that key
+/// was added as. The `UsagePlanKey` body's `name` and `value` are the API key's own, so
+/// they are read from the [`ApiKeyEntry`] at report time rather than copied here: two
+/// copies of one key's name is how a renamed key ends up reported two ways.
+///
+/// No `Default`: an association with no key id names nothing, so there is no meaningful
+/// default one — every one is built from the request that added it.
+#[derive(Debug, Clone)]
+pub struct UsagePlanKeyEntry {
+    /// The API key id this association names, which is also the `UsagePlanKey`'s own
+    /// `id`: a usage plan key is addressed by the key it covers.
+    pub key_id: String,
+    /// The type the key was added as; always [`USAGE_PLAN_KEY_TYPE`], the one type the
+    /// model declares valid.
+    pub key_type: String,
+    /// This association's creation rank, from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
+    /// listing can report the order keys were added in rather than id order.
+    pub sequence: u64,
+}
+
+/// The one key type a `UsagePlanKey` takes: from `UsagePlanKey$type`'s own documentation,
+/// "Currently, the valid key type is `API_KEY`."
+pub const USAGE_PLAN_KEY_TYPE: &str = "API_KEY";
+
+/// The `BadRequestException` message for a `keyType` that is not [`USAGE_PLAN_KEY_TYPE`].
+///
+/// API Gateway states no fixed sentence here, so the message is BUILT FROM THE REQUEST:
+/// it names the value that was rejected and the one type the model declares, the way the
+/// identifier refusals below name what they could not resolve.
+pub fn invalid_usage_plan_key_type(key_type: &str) -> String {
+    format!("Invalid key type specified: {key_type}, expected {USAGE_PLAN_KEY_TYPE}")
+}
+
+/// The `ConflictException` message for a key already metered by the plan.
+///
+/// Built from the request, for the reason [`invalid_usage_plan_key_type`] gives.
+pub fn usage_plan_key_already_exists(usage_plan_id: &str, key_id: &str) -> String {
+    format!("API Key {key_id} already in Usage Plan {usage_plan_id}")
+}
+
+/// The `LimitExceededException` message for a plan that already meters as many API keys
+/// as this emulator stores for one plan; see [`MAX_USAGE_PLAN_KEYS_PER_PLAN`].
+pub fn too_many_usage_plan_keys(max: usize) -> String {
+    format!("Maximum number of API keys in a usage plan exceeded: {max}")
 }
 
 /// One stored custom `DomainName`: the name a client reaches an API by, the certificate
@@ -1103,6 +1165,16 @@ pub const MAX_API_KEYS: usize = 10_000;
 
 /// API Gateway's default quota "Usage plans per account per Region: 300".
 pub const MAX_USAGE_PLANS: usize = 300;
+
+/// Emulator resource guard, NOT an AWS quota: the most API keys this emulator associates
+/// with ONE usage plan. API Gateway publishes no "API keys per usage plan" quota — a plan
+/// may meter every key the account holds — so the guard is that count, [`MAX_API_KEYS`]:
+/// an association names a stored API key, and an account stores at most that many.
+///
+/// The bound is checked at the growth site (`CreateUsagePlanKey`) rather than inferred
+/// from the key store, because an association outlives nothing but is reclaimed with its
+/// key: see [`UsagePlanEntry::keys`].
+pub const MAX_USAGE_PLAN_KEYS_PER_PLAN: usize = MAX_API_KEYS;
 
 /// API Gateway's default quota "Custom domain names (regional or edge-optimized) per
 /// account per Region: 120".
@@ -2066,6 +2138,43 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// lock released.
     pub fn reserve_ids(&mut self, count: usize) -> Vec<String> {
         (0..count).map(|_| self.mint_id()).collect()
+    }
+
+    /// Drop every usage plan association that names `key_id`, answering how many plans
+    /// stopped metering it.
+    ///
+    /// Called when an API key is DELETED: a key that no longer exists is metered by no
+    /// plan, so its associations go with it rather than sitting in the plans for the life
+    /// of the process. This is what keeps the association count bounded by the stores it
+    /// joins ([`MAX_API_KEYS`] x [`MAX_USAGE_PLANS`]) rather than by request count.
+    pub fn forget_api_key(&mut self, key_id: &str) -> usize {
+        let mut unmetered = 0;
+        for plan in self.usage_plans.values_mut() {
+            if plan.keys.remove(key_id).is_some() {
+                unmetered += 1;
+            }
+        }
+        unmetered
+    }
+
+    /// The `UsagePlanKey` a `(usagePlanId, keyId)` pair addresses: the association held
+    /// on the plan, paired with the API key record whose name and value the
+    /// `UsagePlanKey` body reports.
+    ///
+    /// `None` when the plan holds no association for that key id, AND when it holds one
+    /// whose API key is no longer stored. `DeleteApiKey` drops those associations itself
+    /// (see [`ComAmazonawsApigatewayBackplanecontrolserviceState::forget_api_key`]), so
+    /// the join is the invariant rather than the reclamation: no read can report a key
+    /// that no longer exists. The two records are returned together because neither alone
+    /// renders a `UsagePlanKey`.
+    pub fn usage_plan_key(
+        &self,
+        usage_plan_id: &str,
+        key_id: &str,
+    ) -> Option<(&UsagePlanKeyEntry, &ApiKeyEntry)> {
+        let entry = self.usage_plans.get(usage_plan_id)?.keys.get(key_id)?;
+        let api_key = self.api_keys.get(&entry.key_id)?;
+        Some((entry, api_key))
     }
 
     /// The ids of every stored API in creation order, the stable sequence [`page_of`]

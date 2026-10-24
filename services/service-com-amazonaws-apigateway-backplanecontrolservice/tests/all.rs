@@ -118,6 +118,8 @@ mod update_deployment;
 mod delete_documentation_part;
 #[path = "all/update_stage_setting_spellings.rs"]
 mod update_stage_setting_spellings;
+#[path = "all/usage_plan_key_lifecycle.rs"]
+mod usage_plan_key_lifecycle;
 #[path = "all/deployment_collection.rs"]
 mod deployment_collection;
 #[path = "all/update_stage_readers.rs"]

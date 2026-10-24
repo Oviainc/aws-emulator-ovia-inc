@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUsagePlanKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUsagePlanKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: associates a STORED `ApiKey` with a STORED `UsagePlan` by persisting a
+//! `UsagePlanKey` record on that plan in [`crate::state`], and answers with the stored
+//! association. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUsagePlanKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Both identifiers must resolve to stored records — the plan the key is metered by and
+//! the key itself — else the request is the modelled 404 `NotFoundException`; a `keyType`
+//! other than the one type the model declares valid
+//! ([`crate::state::USAGE_PLAN_KEY_TYPE`]) is a 400 `BadRequestException`, and a key the
+//! plan already meters is a 409 `ConflictException` rather than a second association of
+//! the same pair.
+//!
+//! The answered body's `name` and `value` are the API key's own, read from the stored
+//! `ApiKey` record, so a later `UpdateApiKey` of that key's name is reported by this
+//! association too.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +92,31 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{ApiKeyEntry, UsagePlanKeyEntry};
+
+/// The `UsagePlanKey` body for one stored association — the one place this crate renders
+/// that shape, so `CreateUsagePlanKey` and `GetUsagePlanKey` cannot report a record
+/// differently.
+///
+/// The association owns its `id` (the API key id it names) and its `type`; the `name` and
+/// `value` are the API key's own, so they are rendered from that record rather than from
+/// a copy taken when the key was added.
+pub fn usage_plan_key_body(
+    entry: &UsagePlanKeyEntry,
+    api_key: &ApiKeyEntry,
+) -> CreateUsagePlanKeyOutput {
+    CreateUsagePlanKeyOutput {
+        id: Some(entry.key_id.clone()),
+        r#type: Some(entry.key_type.clone()),
+        // The key's secret value, which the `UsagePlanKey` shape declares a member for:
+        // "The value of a usage plan key."
+        value: Some(api_key.value.clone()),
+        // An API key need not be named, so an association with an unnamed key reports no
+        // name rather than one this emulator would have to invent.
+        name: api_key.name.clone(),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +190,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUsagePlanKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUsagePlanKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUsagePlanKey"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The one type the model declares valid, checked before the store lock is taken:
+        // a type API Gateway does not meter names no kind of key to add.
+        if input.key_type != crate::state::USAGE_PLAN_KEY_TYPE {
+            return Err(CreateUsagePlanKeyErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::invalid_usage_plan_key_type(&input.key_type)),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // The plan must be a STORED plan: it is the resource the request's URI addresses,
+        // so it is resolved first, the way the path itself reads.
+        if !store.usage_plans.contains_key(&input.usage_plan_id) {
+            return Err(CreateUsagePlanKeyErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::NO_SUCH_USAGE_PLAN.to_string()),
+                },
+            )
+            .into());
+        }
+        // ... and the key must be a stored API key: the association meters that key's
+        // requests, so a `keyId` naming no record associates the plan with nothing.
+        if !store.api_keys.contains_key(&input.key_id) {
+            return Err(CreateUsagePlanKeyErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::NO_SUCH_API_KEY.to_string()),
+                },
+            )
+            .into());
+        }
+        // A key is metered by a plan at most once, so adding one the plan already meters
+        // is a conflict rather than a second association of the same pair. Nothing is
+        // written, so the stored association keeps the rank it was added with.
+        if store
+            .usage_plan_key(&input.usage_plan_id, &input.key_id)
+            .is_some()
+        {
+            return Err(CreateUsagePlanKeyErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::usage_plan_key_already_exists(
+                        &input.usage_plan_id,
+                        &input.key_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Bound the growth a caller drives at this plan's own cap, before anything is
+        // written: an association is reclaimed with the key it names, never by the clock,
+        // so the growth site carries a cap the way every other one in this crate does.
+        let metered = store
+            .usage_plans
+            .get(&input.usage_plan_id)
+            .map_or(0, |plan| plan.keys.len());
+        if metered >= crate::state::MAX_USAGE_PLAN_KEYS_PER_PLAN {
+            return Err(CreateUsagePlanKeyErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    retry_after_seconds: None,
+                    message: Some(crate::state::too_many_usage_plan_keys(
+                        crate::state::MAX_USAGE_PLAN_KEYS_PER_PLAN,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let sequence = store.next_sequence();
+        let entry = UsagePlanKeyEntry {
+            key_id: input.key_id.clone(),
+            key_type: input.key_type,
+            sequence,
+        };
+        // The plan was resolved above, so this association is written to a stored plan.
+        store
+            .usage_plans
+            .get_mut(&input.usage_plan_id)
+            .ok_or_else(crate::state::state_unavailable)?
+            .keys
+            .insert(input.key_id.clone(), entry);
+
+        // Read the pair back out of the store, so what the caller is told is what a later
+        // `GetUsagePlanKey` reports. Both lookups resolved above, so neither `None` arm
+        // is reachable; `state_unavailable` is this crate's answer for a store that
+        // cannot be read rather than an expected outcome.
+        let (stored, stored_key) = store
+            .usage_plan_key(&input.usage_plan_id, &input.key_id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let output = usage_plan_key_body(stored, stored_key);
+        // Everything below is owned, so the store lock is released before the record is
+        // formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — the key's `value` is a secret and is never a field.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            usage_plan = ?input.usage_plan_id,
+            api_key = ?input.key_id,
+            outcome = "created",
+            "usage plan key created",
+        );
+        Ok(output)
     }
 }
