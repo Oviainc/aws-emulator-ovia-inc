@@ -6,8 +6,11 @@
 //!
 //! * [`ComAmazonawsPollyParrotV1State::lexicons`] — the pronunciation lexicons
 //!   `PutLexicon` writes and `GetLexicon`, `ListLexicons`, `DeleteLexicon` and
-//!   `SynthesizeSpeech` read. Keyed by lexicon name in a `BTreeMap`, so
-//!   `ListLexicons` is ordered and paginable without sorting on every call.
+//!   `SynthesizeSpeech` read. Keyed by [`LexiconKey`] — the Region the lexicon was
+//!   put in, then its name — in a `BTreeMap`, so one Region's lexicons sit
+//!   contiguously in name order and `ListLexicons` is paginable over a range scan
+//!   without sorting on every call. Reach them through the accessors on the state
+//!   rather than through the map, so no operation can read past its own Region.
 //! * [`ComAmazonawsPollyParrotV1State::voices`] — the voice catalog `DescribeVoices`
 //!   serves. Seeded once from [`VOICE_CATALOG`] when the state is first touched and
 //!   never written at runtime; Amazon Polly models no operation that mutates it.
@@ -17,7 +20,37 @@
 //!   `TaskId` in a `BTreeMap`, so the list read is ordered and paginable the same way.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::time::{Duration, SystemTime};
+
+/// The key one stored lexicon sits under: the Region it was put in, then its name.
+///
+/// A lexicon is a REGIONAL resource, so its name alone does not identify it: the
+/// model's `LexiconNotFoundException` documents the error as caused by "specifying a
+/// lexicon that is in a different region", and `PutLexicon` as overwriting "a lexicon
+/// with the same name" that "already exists in the region".
+///
+/// Region first and name second, so the derived `Ord` lays one Region's lexicons out
+/// contiguously in name order: [`ComAmazonawsPollyParrotV1State::lexicons_in_region`]
+/// is then a range scan rather than a filter over the whole store.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LexiconKey {
+    /// The Region the lexicon lives in, as [`request_region`] read it from the
+    /// storing call's credential scope.
+    pub region: String,
+    /// The lexicon's name, unique within `region`.
+    pub name: String,
+}
+
+impl LexiconKey {
+    /// The key for `name` in `region`.
+    pub fn new(region: &str, name: &str) -> Self {
+        Self {
+            region: region.to_string(),
+            name: name.to_string(),
+        }
+    }
+}
 
 /// A pronunciation lexicon exactly as `PutLexicon` stored it, plus the attributes
 /// derived from its PLS document at store time.
@@ -194,13 +227,61 @@ pub fn synthesis_task(stored: &StoredSynthesisTask) -> crate::ops::types::Synthe
 /// Per-service state for com-amazonaws-polly-parrot-v1. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsPollyParrotV1State {
-    /// Stored lexicons by name. Ordered, so `ListLexicons` pages deterministically.
-    pub lexicons: BTreeMap<String, StoredLexicon>,
+    /// Stored lexicons by Region and name. Ordered, so `ListLexicons` pages one
+    /// Region deterministically.
+    pub lexicons: BTreeMap<LexiconKey, StoredLexicon>,
     /// The seeded voice catalog, in [`VOICE_CATALOG`] order.
     pub voices: Vec<StoredVoice>,
     /// Speech synthesis tasks by `TaskId`. Ordered for the same reason as the
     /// lexicons: `ListSpeechSynthesisTasks` pages deterministically over it.
     pub synthesis_tasks: BTreeMap<String, StoredSynthesisTask>,
+}
+
+impl ComAmazonawsPollyParrotV1State {
+    /// The lexicon `name` of `region`, or `None` when that Region stores none under
+    /// that name — a lexicon of ANOTHER Region never answers here, which is what
+    /// makes a cross-Region read the modelled "not found".
+    pub fn lexicon(&self, region: &str, name: &str) -> Option<&StoredLexicon> {
+        self.lexicons.get(&LexiconKey::new(region, name))
+    }
+
+    /// The lexicons `region` holds whose name sorts strictly after `after`, in name
+    /// order; `after` is `None` for the whole Region.
+    ///
+    /// A range scan from the cursor, bounded by the Region: the keys of one Region
+    /// are contiguous, so this reads exactly that Region's entries and stops at the
+    /// first key belonging to another.
+    pub fn lexicons_in_region<'a>(
+        &'a self,
+        region: &'a str,
+        after: Option<&str>,
+    ) -> impl Iterator<Item = &'a StoredLexicon> + 'a {
+        // A lexicon name matches `^[0-9A-Za-z]{1,20}$`, so the empty name sorts
+        // before every real one and excluding it excludes nothing.
+        let start = LexiconKey::new(region, after.unwrap_or_default());
+        self.lexicons
+            .range((Bound::Excluded(start), Bound::Unbounded))
+            .take_while(move |(key, _)| key.region == region)
+            .map(|(_, stored)| stored)
+    }
+
+    /// How many lexicons `region` holds — what the per-Region count quota counts.
+    pub fn lexicon_count_in_region(&self, region: &str) -> usize {
+        self.lexicons_in_region(region, None).count()
+    }
+
+    /// Store `stored` in `region` under its own name, replacing whatever that Region
+    /// held under that name and leaving every other Region untouched.
+    pub fn store_lexicon(&mut self, region: &str, stored: StoredLexicon) {
+        self.lexicons
+            .insert(LexiconKey::new(region, &stored.name), stored);
+    }
+
+    /// Remove the lexicon `name` of `region`, answering `None` — and deleting
+    /// nothing — when that Region holds none under that name.
+    pub fn remove_lexicon(&mut self, region: &str, name: &str) -> Option<StoredLexicon> {
+        self.lexicons.remove(&LexiconKey::new(region, name))
+    }
 }
 
 impl Default for ComAmazonawsPollyParrotV1State {
@@ -228,15 +309,32 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsPollyParrotV1State>)
 }
 
-/// The region an ARN this service mints is scoped to, read from the request's SigV4
-/// credential scope.
+/// The region this request was signed for, read from its SigV4 credential scope: the
+/// region the ARNs it mints are scoped to, and the region its resources live in.
 ///
 /// Falls back to [`DEFAULT_REGION`] for an unsigned request, which carries no scope.
+/// The scope is caller-controlled text that lands in an ARN and keys the lexicon
+/// store, so anything that is not an AWS region token is refused here and the default
+/// used instead: a minted ARN can never carry text a client cannot parse back, and a
+/// store key stays a short token.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
+        .filter(|region| {
+            !region.is_empty()
+                && region.len() <= MAX_REGION_CHARACTERS
+                && region
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
+
+/// The most characters a credential scope's region may carry to be read as one.
+///
+/// Comfortably above every published AWS region name, and short enough that the
+/// region cannot itself be the unbounded part of a store key.
+pub const MAX_REGION_CHARACTERS: usize = 64;
 
 /// The region an unsigned request's ARNs are scoped to — the region the emulator's
 /// generated client configuration uses.
@@ -533,6 +631,74 @@ mod tests {
             (settled.task_status.as_str(), settled.pending_status.is_some()),
             ("completed", false),
             "a settled task must stay settled"
+        );
+    }
+
+    /// A lexicon exists only in the Region it was stored in: a read, a count and a
+    /// removal in another Region see nothing of it.
+    #[test]
+    fn the_lexicon_store_is_partitioned_by_region() {
+        let lexicon = |name: &str, region: &str| StoredLexicon {
+            name: name.to_string(),
+            content: "<lexicon/>".to_string(),
+            alphabet: Some("ipa".to_string()),
+            language_code: "en-US".to_string(),
+            last_modified: SystemTime::now(),
+            lexicon_arn: ::engine::emulator_arn("polly", region, &format!("lexicon/{name}")),
+            lexemes_count: 1,
+            size: 10,
+        };
+
+        let mut state = ComAmazonawsPollyParrotV1State::default();
+        // The same name in two regions, plus a second name in one of them.
+        for (region, name) in [("us-east-1", "Shared"), ("eu-west-1", "Shared"), ("eu-west-1", "Only")] {
+            state.store_lexicon(region, lexicon(name, region));
+        }
+
+        for (region, expected) in [
+            ("us-east-1", vec!["Shared"]),
+            ("eu-west-1", vec!["Only", "Shared"]),
+            ("ap-southeast-2", Vec::new()),
+        ] {
+            let names: Vec<&str> = state
+                .lexicons_in_region(region, None)
+                .map(|stored| stored.name.as_str())
+                .collect();
+            assert_eq!(
+                names, expected,
+                "region {region:?}: wrong lexicons, store {:?}",
+                state.lexicons.keys().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                state.lexicon_count_in_region(region),
+                expected.len(),
+                "region {region:?}: the count must be that region's own"
+            );
+        }
+        assert!(
+            state.lexicon("us-east-1", "Only").is_none(),
+            "a name stored only in eu-west-1 must not be readable in us-east-1"
+        );
+
+        // A cursor pages within the region it was taken in.
+        let after: Vec<&str> = state
+            .lexicons_in_region("eu-west-1", Some("Only"))
+            .map(|stored| stored.name.as_str())
+            .collect();
+        assert_eq!(after, vec!["Shared"], "the cursor must page one region");
+
+        // Removing in one region leaves the other region's same-named lexicon.
+        assert!(
+            state.remove_lexicon("ap-southeast-2", "Shared").is_none(),
+            "removing a lexicon of another region must remove nothing"
+        );
+        assert!(
+            state.remove_lexicon("us-east-1", "Shared").is_some(),
+            "removing a lexicon of its own region must remove it"
+        );
+        assert!(
+            state.lexicon("eu-west-1", "Shared").is_some(),
+            "another region's lexicon of the same name must survive the delete"
         );
     }
 

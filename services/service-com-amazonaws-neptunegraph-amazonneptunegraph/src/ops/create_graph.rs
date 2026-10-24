@@ -305,13 +305,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             public_connectivity: input.public_connectivity.unwrap_or(false),
             deletion_protection: input.deletion_protection.unwrap_or(false),
             replica_count: input.replica_count.unwrap_or(DEFAULT_REPLICA_COUNT),
-            kms_key_identifier: input.kms_key_identifier,
+            // The graph's data is encrypted either way: with the key the request named,
+            // or with the service-owned key the sentinel names when it named none.
+            kms_key_identifier: crate::state::graph_encryption_key(input.kms_key_identifier),
             vector_search_configuration: input.vector_search_configuration,
             // Only `RestoreGraphFromSnapshot` / `CreateGraphUsingImportTask` give a
-            // graph a source snapshot, and `buildNumber` is the version of the graph
-            // software the real service runs, which this emulator does not have.
+            // graph a source snapshot.
             source_snapshot_id: None,
-            build_number: None,
+            // The build of the software serving this graph.
+            build_number: crate::state::GRAPH_SOFTWARE_BUILD_NUMBER.to_string(),
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             // Nothing has deleted this graph.
             deletes_at: None,

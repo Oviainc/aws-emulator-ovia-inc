@@ -5,8 +5,10 @@
 //! character, plus the attributes derived from that document at store time.
 //!
 //! A pure read — it takes the state lock, copies out what it needs and writes
-//! nothing, so two `GetLexicon` calls either side of any other call agree. An
-//! unstored name is `LexiconNotFoundException` (404), never an empty success.
+//! nothing, so two `GetLexicon` calls either side of any other call agree. The name is
+//! resolved in the Region the call was signed for, so a name that Region does not
+//! store — including one another Region does — is `LexiconNotFoundException` (404),
+//! never an empty success.
 //!
 //! ## Shape of an operation
 //!
@@ -141,7 +143,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetLexiconErrorModeled::ServiceFailureException(
@@ -149,8 +151,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // A lexicon exists only in the Region it was stored in, so the read is scoped
+        // to the Region this request was signed for: a lexicon of another Region is
+        // not found here, which is exactly what `LexiconNotFoundException` documents
+        // ("specifying a lexicon that is in a different region"). It is also why the
+        // reported `LexiconArn` always names the caller's own Region.
+        let region = crate::state::request_region(ctx.parts());
         let guard = state.lock();
-        let stored = guard.lexicons.get(&input.name).ok_or_else(|| {
+        let stored = guard.lexicon(&region, &input.name).ok_or_else(|| {
             GetLexiconErrorModeled::LexiconNotFoundException(
                 crate::service::errors::lexicon_not_found(),
             )

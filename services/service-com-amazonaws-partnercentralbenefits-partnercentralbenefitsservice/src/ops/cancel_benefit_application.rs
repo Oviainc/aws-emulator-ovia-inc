@@ -9,6 +9,11 @@
 //! [`crate::state::TERMINAL_STATUSES`]: `APPROVED`, `REJECTED` or already `CANCELED` — is
 //! refused with the modelled `ConflictException`.
 //!
+//! Idempotency: `ClientToken` identifies the REQUEST, so a retry carrying the token of a
+//! cancellation that already applied changes nothing a second time and answers success
+//! (see [`crate::state::BenefitApplication::applied_write`]). It is checked BEFORE the
+//! status, because the first call's own write is what made the application terminal.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -185,6 +190,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // A retry of a cancellation that already applied changes nothing a second time
+        // and answers success: the `ClientToken` is the identity of the REQUEST, so a
+        // request repeating one is the same request rather than a new write. It is
+        // checked BEFORE the status, because the first call's own write is what made the
+        // application terminal, and the status gate below refuses a cancellation of a
+        // terminal application.
+        if application
+            .applied_write(Self::NAME, &input.client_token)
+            .is_some()
+        {
+            return Ok(CancelBenefitApplicationOutput {});
+        }
+
         // AWS has finished with a terminal application, so there is nothing left to
         // cancel and the record is left exactly as it is.
         if application.is_terminal() {
@@ -205,6 +223,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `StatusReason` rather than an invented sentence.
         application.status_reason = input.reason;
         application.revise(now);
+
+        // The write this call made, kept so a retry carrying the same `ClientToken`
+        // answers success instead of the refusal this cancellation's own effect would
+        // otherwise produce. The token is at most
+        // [`crate::state::MAX_CLIENT_TOKEN_LEN`] bytes — the modelled `@length(min: 1,
+        // max: 64)` the centralized walk refuses a longer one against.
+        let revision = application.revision;
+        let applied_at_millis = application.updated_at_millis;
+        application.record_write(crate::state::AppliedWrite {
+            operation: Self::NAME,
+            client_token: input.client_token,
+            // The cancellation's `Reason` is already on the record as its
+            // `StatusReason`, so the write record does not keep a second copy.
+            reason: None,
+            // A cancellation writes no caller-named member: it moves the application's
+            // own status, which the revision below identifies.
+            fields: Vec::new(),
+            applied_at_millis,
+            revision,
+        });
 
         Ok(CancelBenefitApplicationOutput {})
     }

@@ -21,6 +21,8 @@ mod export_task_lifecycle;
 mod graph_deletion;
 #[path = "all/graph_lifecycle.rs"]
 mod graph_lifecycle;
+#[path = "all/graph_record_encryption.rs"]
+mod graph_record_encryption;
 #[path = "all/graph_run_state.rs"]
 mod graph_run_state;
 #[path = "all/graph_snapshot_lifecycle.rs"]
