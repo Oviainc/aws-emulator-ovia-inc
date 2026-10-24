@@ -6,7 +6,9 @@
 //! a key the rule does not carry is appended, and a key it already carries
 //! keeps its position and takes the new value, so the stored list holds at most
 //! one entry per key. A `ruleRevision` other than the rule's current one is
-//! refused with `InvalidParameterValueException` (400), as is an addition that
+//! refused with `InvalidParameterValueException` (400), as is a request naming
+//! the same key twice, a key in the reserved tag namespace
+//! (`state::tag_keys_violation`) and an addition that
 //! would leave the rule holding more than `state::MAX_TAGS_PER_RESOURCE` tags;
 //! an ARN no rule has is `ResourceNotFoundException` (404). Tagging is not a
 //! rule revision, so the same request may be repeated — the operation is
@@ -181,6 +183,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // check the create path makes of the `tags` it stores.
         if let Some(report) = crate::state::duplicate_tag_key_violation(&input.tags) {
             return Err(invalid_parameter(report));
+        }
+
+        // `Tag$key` targets `TagKey`, so the boundary validator judged each
+        // key's FORM — but not the namespace it falls in, which no modelled
+        // constraint can express. Judged in the same place and for the same
+        // reason: a refused request adds no tag and consumes no client token.
+        if let Some(message) =
+            crate::state::tag_keys_violation(input.tags.iter().map(|tag| tag.key.as_str()))
+        {
+            return Err(invalid_parameter(message));
         }
 
         let mut probe = input.clone();
