@@ -81,13 +81,17 @@ macro_rules! bedrock_shape_type {
     (struct_of) => {
         ::aws_smithy_schema::ShapeType::Structure
     };
+    (union_of) => {
+        ::aws_smithy_schema::ShapeType::Union
+    };
 }
 
 /// One member's schema, as the vendored codegen would emit it, plus the
 /// `@timestampFormat("date-time")` chain call it cannot.
 ///
 /// `$kind` is the member's shape kind — `string` (a `string` or an `enum` shape, both
-/// string-encoded), `date_time`, `list_of_string`, `list_of_struct(T)` or `struct_of(T)`.
+/// string-encoded), `date_time`, `list_of_string`, `list_of_struct(T)`, `struct_of(T)` or
+/// `union_of(T)`.
 macro_rules! bedrock_member_schema {
     ($ns:literal, $local:literal, $wire:literal, $idx:literal, date_time) => {
         ::aws_smithy_schema::Schema::new_member(
@@ -143,6 +147,10 @@ macro_rules! bedrock_write_member {
         })?;
     };
     ($s:ident, $m:expr, $v:expr, struct_of($inner:ty)) => { $s.write_struct($m, $v)?; };
+    // A union takes the same path as a structure: the vendored codegen's `emit_write`
+    // writes `ShapeKind::Structure | ShapeKind::Union` alike (`write_struct`), and the
+    // union's own `SerializableStruct` impl writes the one member that is set.
+    ($s:ident, $m:expr, $v:expr, union_of($inner:ty)) => { $s.write_struct($m, $v)?; };
 }
 
 /// Read one member, as the vendored codegen's `codegen::emit_read` does for that kind.
@@ -173,6 +181,9 @@ macro_rules! bedrock_read_member {
         __out
     }};
     ($d:ident, $m:expr, struct_of($inner:ty)) => {
+        <$inner as ::aws_smithy_schema_server::DeserializableStruct>::deserialize($d)?
+    };
+    ($d:ident, $m:expr, union_of($inner:ty)) => {
         <$inner as ::aws_smithy_schema_server::DeserializableStruct>::deserialize($d)?
     };
 }

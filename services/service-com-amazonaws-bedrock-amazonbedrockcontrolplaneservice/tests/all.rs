@@ -19,6 +19,8 @@ mod guardrail_timestamp_wire_form;
 mod guardrail_wire_shape;
 #[path = "all/guardrails.rs"]
 mod guardrails;
+#[path = "all/marketplace_model_endpoints.rs"]
+mod marketplace_model_endpoints;
 #[path = "all/model_invocation_logging.rs"]
 mod model_invocation_logging;
 #[path = "all/prompt_routers.rs"]
