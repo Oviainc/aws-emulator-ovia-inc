@@ -301,6 +301,37 @@ pub fn is_http_protocol(protocol: Option<&str>) -> bool {
 /// supported for health checks" — leaving HTTP, HTTPS and TCP.
 pub const HEALTH_CHECK_PROTOCOLS: &[&str] = &["HTTP", "HTTPS", "TCP"];
 
+/// The one `HealthCheckPort` value that is not a port number: the model documents it as
+/// that member's default — "traffic-port, which is the port on which each target
+/// receives traffic from the load balancer".
+pub const TRAFFIC_PORT: &str = "traffic-port";
+
+/// The ports a health check may name. `HealthCheckPort` is modelled as a bare string
+/// (`smithy_query(query="shape",shape="HealthCheckPort")` -> `{"type": "string"}`), so
+/// the model constrains nothing about it and the handler that accepts it is the only
+/// gate; the bound is the one the model puts on every port member it does type as an
+/// integer (`Port` and `TargetControlPort`: `range 1..65535`).
+pub const HEALTH_CHECK_PORT_RANGE: std::ops::RangeInclusive<u32> = 1..=65535;
+
+/// Whether `value` is a health-check port this service accepts — the literal
+/// [`TRAFFIC_PORT`], or a port inside [`HEALTH_CHECK_PORT_RANGE`] — and, when it is
+/// not, the rule it broke, so the refusal can name the member, the value and the
+/// bound the caller has to fix.
+pub fn check_health_check_port(value: &str) -> Result<(), String> {
+    if value == TRAFFIC_PORT
+        || value
+            .parse::<u32>()
+            .is_ok_and(|port| HEALTH_CHECK_PORT_RANGE.contains(&port))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "Health check port '{value}' must be '{TRAFFIC_PORT}' or an integer from {} to {}",
+        HEALTH_CHECK_PORT_RANGE.start(),
+        HEALTH_CHECK_PORT_RANGE.end(),
+    ))
+}
+
 /// The published maximum length of a target group name, from `CreateTargetGroup`'s
 /// `Name` documentation: "can have a maximum of 32 characters".
 pub const TARGET_GROUP_NAME_MAX_LENGTH: usize = 32;
@@ -820,11 +851,11 @@ impl TargetGroupRecord {
     }
 
     /// The port a health check of `target` runs against: the configured health-check
-    /// port, or — for the modelled default `traffic-port` — the port the target
+    /// port, or — for the modelled default [`TRAFFIC_PORT`] — the port the target
     /// receives traffic on.
     pub fn health_check_port_of(&self, target: &RegisteredTarget) -> Option<String> {
         match self.health_check.port.as_deref() {
-            Some("traffic-port") | None => target.port.or(self.port).map(|p| p.to_string()),
+            Some(TRAFFIC_PORT) | None => target.port.or(self.port).map(|p| p.to_string()),
             Some(port) => Some(port.to_string()),
         }
     }

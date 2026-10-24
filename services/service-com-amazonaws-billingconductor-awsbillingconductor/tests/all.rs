@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_exclusivity_refusal.rs"]
 mod account_exclusivity_refusal;
+#[path = "all/associate_pricing_rules.rs"]
+mod associate_pricing_rules;
 #[path = "all/billing_group_core_loop.rs"]
 mod billing_group_core_loop;
 #[path = "all/custom_line_item_and_create_name_refusals.rs"]

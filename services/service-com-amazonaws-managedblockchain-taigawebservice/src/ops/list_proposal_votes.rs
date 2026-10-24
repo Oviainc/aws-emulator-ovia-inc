@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProposalVotes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProposalVotes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProposalVotes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: pages the votes stored on the named proposal, each reported with the
+//! current name of the member that cast it. A `ProposalId` that resolves to no stored
+//! proposal is this operation's own `InvalidRequestException` (it models no 404), never an
+//! empty page. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +116,20 @@ impl From<ListProposalVotesErrorModeled> for ListProposalVotesError {
     }
 }
 
+/// This operation models NO `ResourceNotFoundException` (its client errors are
+/// `AccessDeniedException`, `InvalidRequestException` and `ThrottlingException`), so a
+/// proposal it cannot resolve is an invalid REQUEST — never a 404 the model does not
+/// declare, and never an empty page, which would claim the proposal exists and carries no
+/// votes. `ListNodes` answers an unresolvable member scope the same way.
+fn proposal_not_found(proposal_id: &str, network_id: &str) -> ListProposalVotesError {
+    ListProposalVotesErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(format!(
+            "Proposal with Id {proposal_id} not found in network {network_id}."
+        )),
+    })
+    .into()
+}
+
 /// The `ListProposalVotes` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -157,18 +166,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProposalVotes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProposalVotesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A reporting operation: the page is cut from the votes stored on the proposal,
+        // and the one write it makes is materialising the status transitions the clock
+        // already owed (a proposal past its expiration date, a resource past its
+        // provisioning span) — changes due at this instant whether or not anybody called.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProposalVotes"))
+        // Nothing on this path needs the request metadata: every reported value is read
+        // off stored records, and the refusal names a resource by the id the request
+        // carried rather than by ARN, so this handler mints no ARN and needs no region —
+        // discarded rather than renamed, the way `list_proposals.rs` does.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListProposalVotesErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+
+        let after = match crate::state::decode_cursor(input.next_token.as_deref()) {
+            Ok(after) => after,
+            Err(crate::state::MalformedCursor) => {
+                return Err(ListProposalVotesErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "nextToken is not a pagination token this operation issued"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let mut guard = state.lock();
+        guard.settle(::std::time::SystemTime::now());
+
+        // The PROPOSAL is the resource whose votes this call reports; the network id only
+        // scopes the lookup, so an id that resolves to no stored proposal — including one
+        // scoped by a network nothing stored holds — is refused naming that proposal.
+        let found = guard.networks.get(&input.network_id).and_then(|network| {
+            network
+                .proposals
+                .get(&input.proposal_id)
+                .map(|proposal| (network, proposal))
+        });
+        let Some((network, proposal)) = found else {
+            return Err(proposal_not_found(&input.proposal_id, &input.network_id));
+        };
+
+        let page = crate::state::page_of(
+            proposal.to_vote_summaries(network),
+            after.as_deref(),
+            input.max_results,
+            crate::state::PROPOSAL_MAX_RESULTS,
+        );
+
+        Ok(ListProposalVotesOutput {
+            proposal_votes: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

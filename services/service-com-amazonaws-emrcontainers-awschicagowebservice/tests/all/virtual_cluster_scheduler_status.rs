@@ -26,9 +26,10 @@
 //! 4. Each limit's published `@range` is honoured at both bounds, and a value one past
 //!    either bound is refused.
 //!
-//! The helpers below are `pub(crate)` because the scoping suite beside this one
-//! ([`crate::virtual_cluster_scheduler`]) drives the same endpoints: one definition of
-//! each call, so two suites cannot disagree about what a request looks like.
+//! The helpers below are `pub(crate)` because the suites beside this one
+//! ([`crate::virtual_cluster_scheduler`] and [`crate::virtual_cluster_update`]) drive the
+//! same endpoints: one definition of each call, so no two suites can disagree about what
+//! a request looks like.
 
 use std::time::Duration;
 
@@ -46,7 +47,12 @@ pub(crate) fn wait_for_the_clock() {
 
 /// `POST /virtualclusters`, carrying `scheduler` as the cluster's
 /// `schedulerConfiguration` when the row has one.
-async fn create_cluster(emr: &Emr, name: &str, token: &str, scheduler: Option<Value>) -> Answer {
+pub(crate) async fn create_cluster(
+    emr: &Emr,
+    name: &str,
+    token: &str,
+    scheduler: Option<Value>,
+) -> Answer {
     let mut body = json!({
         "name": name,
         "clientToken": token,
@@ -75,7 +81,7 @@ pub(crate) async fn cluster_id(
 }
 
 /// `POST /virtualclusters/{cluster}/jobruns` with a Spark driver.
-async fn start_run(emr: &Emr, cluster: &str, token: &str) -> Answer {
+pub(crate) async fn start_run(emr: &Emr, cluster: &str, token: &str) -> Answer {
     emr.send(
         "POST",
         &format!("/virtualclusters/{cluster}/jobruns"),

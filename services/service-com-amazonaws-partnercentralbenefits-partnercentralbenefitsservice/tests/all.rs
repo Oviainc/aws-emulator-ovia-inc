@@ -25,6 +25,8 @@ mod entitlement_denial;
 mod get_benefit_allocation;
 #[path = "all/recall_benefit_application.rs"]
 mod recall_benefit_application;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 // `all/resource_tags.rs` is the `UntagResource` suite; it reuses the helpers of the

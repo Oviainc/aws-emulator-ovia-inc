@@ -13,5 +13,15 @@
 // points it into `tests/all/`.
 #[path = "all/endpoint_invocation.rs"]
 mod endpoint_invocation;
+#[path = "all/endpoint_registry.rs"]
+mod endpoint_registry;
+#[path = "all/harness.rs"]
+mod harness;
+#[path = "all/invoke_endpoint.rs"]
+mod invoke_endpoint;
+#[path = "all/invoke_endpoint_async.rs"]
+mod invoke_endpoint_async;
+#[path = "all/invoke_endpoint_with_response_stream.rs"]
+mod invoke_endpoint_with_response_stream;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

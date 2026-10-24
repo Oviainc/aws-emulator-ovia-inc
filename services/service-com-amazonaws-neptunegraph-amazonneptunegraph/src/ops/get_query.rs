@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the status of one query in flight on one graph: its id, its text, the state
+//! it is in and the milliseconds it waited and has been running. A graph or a query
+//! this store does not hold is a 404 `ResourceNotFoundException`. REPORTING only — the
+//! single write it makes is reclaiming the queries whose cancellation the clock has
+//! already made due, which had stopped at that instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +147,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetQuery"))
+        // The graph and the query the request names are the whole request; nothing here
+        // depends on request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetQueryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // A query is addressed as a query OF a graph, so the graph is resolved first:
+        // an identifier no graph holds names no queries either.
+        if store.settled_graph(&input.graph_identifier, now).is_none() {
+            return Err(GetQueryErrorModeled::ResourceNotFoundException(
+                crate::state::graph_not_found(&input.graph_identifier),
+            )
+            .into());
+        }
+
+        let Some(query) = store.live_query(&input.graph_identifier, &input.query_id, now) else {
+            return Err(GetQueryErrorModeled::ResourceNotFoundException(
+                crate::state::query_not_found(&input.graph_identifier, &input.query_id),
+            )
+            .into());
+        };
+
+        // Every member is read off the stored record, and the two durations are read
+        // off the clock against the instants that record holds.
+        Ok(GetQueryOutput {
+            id: Some(query.id.clone()),
+            query_string: Some(query.query_string.clone()),
+            state: Some(query.state.as_wire().to_string()),
+            waited: Some(query.waited_millis(now)),
+            elapsed: Some(query.elapsed_millis(now)),
+        })
     }
 }

@@ -2033,6 +2033,70 @@ pub fn merged_tags(
     merged
 }
 
+/// The tag-key prefix AWS reserves for its own system tags.
+///
+/// AWS-wide tagging rule: a key in this namespace is AWS's own — a caller can neither
+/// create, overwrite nor remove one through a public tagging API — so a request supplying
+/// such a key is refused with the modelled `ValidationException` instead of being served.
+/// The modelled `TagKey` pattern (`^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`, see
+/// `smithy_query(query="shape",shape="Tag")`) admits `:`, so the rule cannot be expressed
+/// as a modelled constraint and the centralized walk cannot enforce it: it lives here, and
+/// every operation that takes caller-supplied tag keys applies it.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` lies in the reserved tag namespace ([`RESERVED_TAG_KEY_PREFIX`]).
+///
+/// The prefix is matched ASCII-case-insensitively: the namespace belongs to AWS whatever
+/// case a caller spells it in, so no case variant can slip a key into it. The comparison
+/// is over BYTES, so a key opening with a multi-byte character (the modelled pattern
+/// admits `\p{L}`) is simply not reserved rather than a slice on a char boundary.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.as_bytes()
+        .get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX.as_bytes()))
+}
+
+/// The requirement a caller-supplied tag key fails when it names the reserved namespace,
+/// worded like the requirements the centralized walk states
+/// ([`crate::service::constraint_requirement`]).
+pub fn reserved_tag_key_requirement() -> String {
+    format!("Member must not use the reserved tag key prefix: {RESERVED_TAG_KEY_PREFIX}")
+}
+
+/// The refusal a request supplying a reserved tag key is answered with, or `None` when
+/// every key it carries is the caller's own.
+///
+/// `member` is the input member those keys came from, spelled as the wire spells it
+/// (`tags` / `tagKeys` on the tagging operations, `Tags` on a create), so the clause names
+/// the member the caller must fix. The message goes through the same two helpers every
+/// other in-handler refusal uses ([`crate::service::member_clause`] and
+/// [`crate::service::validation_envelope`]) and echoes NOTHING of the rejected value; the
+/// element path collapses onto the collection member, the way the walk reports a violation
+/// on a collection's element.
+///
+/// A caller gets this answer whether the keys would be created, overwritten or removed:
+/// one rule, applied wherever a request carries tag keys.
+pub fn reserved_tag_key_refusal<'a>(
+    member: &str,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Option<crate::ops::types::ValidationException> {
+    if !keys.into_iter().any(is_reserved_tag_key) {
+        return None;
+    }
+    let requirement = reserved_tag_key_requirement();
+    let clause = crate::service::member_clause(member, &requirement, false);
+    Some(crate::ops::types::ValidationException {
+        message: crate::service::validation_envelope(std::slice::from_ref(&clause))
+            .unwrap_or_else(|| clause.clone()),
+        reason: VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(validation_field(
+            member,
+            &requirement,
+            VALIDATION_CODE_INVALID_VALUE,
+        )),
+    })
+}
+
 /// A stored tag set as the modelled `Tags` list, in tag-key order.
 ///
 /// A resource carrying no tags reports an EMPTY list rather than omitting the member: the

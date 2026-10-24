@@ -37,6 +37,13 @@
 //! out of what uses the group and out of whether `DeleteInputSecurityGroup` has
 //! deleted it.
 //!
+//! The MediaLive Anywhere NODE lives in its own module ([`nodes`]): one
+//! [`NodeRecord`] per created node, keyed by its minted `Id` and carrying the
+//! cluster the create was addressed to, because a node's id is "Unique in the
+//! Cluster" and every node operation names both. Its deletion is a
+//! DEREGISTRATION — the state its enum models — so a deleted node ends in
+//! `DEREGISTERED` rather than in a `DELETED` the model does not declare.
+//!
 //! A delete never drops a record: a deleted channel, input, input security group
 //! or SdiSource keeps its record in the terminal `DELETED` state its own state
 //! enum models, so a reader goes on reporting it there (which is what the SDK's
@@ -211,6 +218,21 @@ pub use multiplexes::{
 };
 
 pub(crate) use multiplexes::{multiplex_description_output, multiplex_program_description_output};
+
+/// The NODE slice — the MediaLive Anywhere Node: its record, its bounds, its
+/// refusals, the store's methods and its output projection, in one module of its
+/// own for the same reason as the multiplex slice above. What stays in this file
+/// is the part the rest of the state needs: the store members on
+/// [`ComAmazonawsMedialiveMedialiveState`] and the node's entry in the ARN
+/// resolution the tag operations share ([`TaggedResource`]).
+pub mod nodes;
+
+pub use nodes::{
+    node_state, NodeRecord, NodeRefusal, MAX_NODES, MAX_NODE_INTERFACE_MAPPINGS, MAX_NODE_TOKENS,
+    NODE_CONNECTION_STATE,
+};
+
+pub(crate) use nodes::node_description_output;
 
 /// The eventbridge rule TEMPLATE slice: its record, its bounds, its refusal, the
 /// store's methods and its output projection, in one module of its own for the
@@ -1568,6 +1590,18 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// per cluster by the slice's `channel_placement_group_token_key` -> the
     /// group it created. PRIVATE for the same reason as [`Self::channel_tokens`].
     channel_placement_group_tokens: IdempotencyTokens,
+    /// Every node that exists, in every cluster, keyed by its minted `Id`, in id
+    /// order for the same reason as [`Self::channels`]. The cluster a node
+    /// belongs to is on the record, and every node lookup matches it
+    /// ([`Self::node`]), because a node's id is unique in its cluster.
+    pub nodes: BTreeMap<String, NodeRecord>,
+    /// Mint counter behind the node slice's `mint_node_id`.
+    pub next_node_id: u64,
+    /// `CreateNode`'s `RequestId` (`@idempotencyToken`) -> the node it created,
+    /// keyed by the node slice's `node_token_key` because a node is created
+    /// against one cluster's endpoint. PRIVATE for the same reason as
+    /// [`Self::channel_tokens`].
+    node_tokens: IdempotencyTokens,
 }
 
 impl ComAmazonawsMedialiveMedialiveState {
@@ -1607,6 +1641,7 @@ impl ComAmazonawsMedialiveMedialiveState {
         self.settle_input_devices(now);
         self.settle_clusters(now);
         self.settle_channel_placement_groups(now);
+        self.settle_nodes(now);
     }
 
     /// Whether the store is full, so `CreateChannel` must refuse rather than mint
@@ -2890,6 +2925,9 @@ impl ComAmazonawsMedialiveMedialiveState {
         if let Some(record) = self.multiplexes.values().find(|record| record.arn == arn) {
             return Some(TaggedResource::Multiplex(record.id.clone()));
         }
+        if let Some(record) = self.nodes.values().find(|record| record.arn == arn) {
+            return Some(TaggedResource::Node(record.id.clone()));
+        }
         if let Some(record) = self.input_devices.values().find(|record| record.arn == arn) {
             return Some(TaggedResource::InputDevice(record.id.clone()));
         }
@@ -2936,6 +2974,7 @@ impl ComAmazonawsMedialiveMedialiveState {
             TaggedResource::Network(id) => self.networks.get(&id).map(|record| &record.tags),
             TaggedResource::SignalMap(id) => self.signal_maps.get(&id).map(|record| &record.tags),
             TaggedResource::Multiplex(id) => self.multiplexes.get(&id).map(|record| &record.tags),
+            TaggedResource::Node(id) => self.nodes.get(&id).map(|record| &record.tags),
             TaggedResource::InputDevice(id) => {
                 self.input_devices.get(&id).map(|record| &record.tags)
             }
@@ -3007,6 +3046,11 @@ impl ComAmazonawsMedialiveMedialiveState {
             TaggedResource::Multiplex(id) => self
                 .multiplexes
                 .get_mut(&id)
+                .map(|record| &mut record.tags),
+            TaggedResource::Node(id) => self
+                .nodes
+                .get_mut(&id)
+                .filter(|record| !record.is_delete_accepted())
                 .map(|record| &mut record.tags),
             // A claimed device is never deleted — nothing in this service
             // un-claims one — so there is no dead id to filter out here.
@@ -3135,6 +3179,7 @@ enum TaggedResource {
     Network(String),
     SignalMap(String),
     Multiplex(String),
+    Node(String),
     InputDevice(String),
     AlarmTemplateGroup(String),
     EventBridgeRuleTemplateGroup(String),

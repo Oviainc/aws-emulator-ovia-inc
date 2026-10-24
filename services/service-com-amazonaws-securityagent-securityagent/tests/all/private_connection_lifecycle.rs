@@ -22,8 +22,9 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use service_com_amazonaws_securityagent_securityagent::state::{
     default_vpc_id, region_subnets, CREATE_TRANSITION, DEFAULT_DNS_RESOLUTION,
-    LATTICE_ID_SUFFIX_LEN, RESOURCE_CONFIGURATION_ID_PREFIX, RESOURCE_GATEWAY_ID_PREFIX,
-    STATUS_ACTIVE, STATUS_CREATE_IN_PROGRESS, TYPE_SELF_MANAGED, TYPE_SERVICE_MANAGED,
+    LATTICE_ID_SUFFIX_LEN, RESOURCE_CONFIGURATION_ID_PATTERN, RESOURCE_CONFIGURATION_ID_PREFIX,
+    RESOURCE_GATEWAY_ID_PREFIX, STATUS_ACTIVE, STATUS_CREATE_IN_PROGRESS, TYPE_SELF_MANAGED,
+    TYPE_SERVICE_MANAGED,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -388,9 +389,13 @@ async fn create_then_describe_reads_back_the_stored_connection() {
     );
 }
 
-/// The references no account holds. They differ along the FORM of the reference (bare
-/// id, this account's ARN, another region's, another account's, another vendor's, an
-/// id of the wrong shape, free text) and along WHICH member carries it (the
+/// The references no account holds. Every row is a WELL-FORMED resource configuration
+/// identifier or placement — a value whose syntax is right and whose resource the
+/// account simply does not have, which is what makes it a not-found rather than a
+/// validation failure (the malformed forms are
+/// `a_malformed_resource_configuration_id_is_a_validation_failure`'s rows). They differ
+/// along the FORM of the reference (bare id, this account's ARN, another region's,
+/// another account's, another partition's) and along WHICH member carries it (the
 /// self-managed resource configuration, the service-managed VPC, a service-managed
 /// subnet).
 fn unresolvable_rows() -> Vec<(&'static str, Value)> {
@@ -419,32 +424,12 @@ fn unresolvable_rows() -> Vec<(&'static str, Value)> {
                  rcfg-0a1b2c3d4e5f60718"}}),
         ),
         (
-            "an ARN naming another vendor",
-            json!({"selfManaged": {"resourceConfigurationId":
-                "arn:aws:ec2:us-east-1:000000000000:resourceconfiguration/\
-                 rcfg-0a1b2c3d4e5f60718"}}),
-        ),
-        (
             // An account exists in ONE partition, so a cross-partition ARN names
             // nothing this request can reach.
             "an ARN naming another partition",
             json!({"selfManaged": {"resourceConfigurationId":
                 "arn:aws-us-gov:vpc-lattice:us-east-1:000000000000:\
                  resourceconfiguration/rcfg-0a1b2c3d4e5f60718"}}),
-        ),
-        (
-            "an ARN naming another resource type",
-            json!({"selfManaged": {"resourceConfigurationId":
-                "arn:aws:vpc-lattice:us-east-1:000000000000:resourcegateway/\
-                 rgw-0a1b2c3d4e5f60718"}}),
-        ),
-        (
-            "an id of the wrong length",
-            json!({"selfManaged": {"resourceConfigurationId": "rcfg-0a1b"}}),
-        ),
-        (
-            "free text",
-            json!({"selfManaged": {"resourceConfigurationId": "not-an-identifier"}}),
         ),
         (
             "a service-managed VPC the account does not have",
@@ -514,6 +499,181 @@ async fn a_reference_the_account_does_not_hold_is_not_found_and_stores_nothing()
     assert!(
         listed.is_empty(),
         "expected a refused create to leave the listing empty, got {listed:?}"
+    );
+}
+
+/// The values that are not a VPC Lattice resource configuration identifier AT ALL. The
+/// rows differ along WHICH part of the grammar they miss: the prefix, the suffix length,
+/// the suffix alphabet, the ARN's vendor, its resource type, its account segment, and
+/// the "identifier plus other text" forms a `find`-style check would let through.
+///
+/// The grammar is `state::RESOURCE_CONFIGURATION_ID_PATTERN`, the pattern the real
+/// service reports when it refuses one of these.
+fn malformed_resource_configuration_ids() -> Vec<(&'static str, String)> {
+    let suffix = "0a1b2c3d4e5f60718";
+    assert_eq!(
+        suffix.len(),
+        LATTICE_ID_SUFFIX_LEN,
+        "the row builder's suffix must be a well-formed one"
+    );
+    vec![
+        ("free text", "not-an-identifier".to_string()),
+        ("an empty identifier", String::new()),
+        (
+            "the resource gateway prefix instead",
+            format!("{RESOURCE_GATEWAY_ID_PREFIX}{suffix}"),
+        ),
+        ("no prefix at all", suffix.to_string()),
+        (
+            "a suffix one character short",
+            format!("{RESOURCE_CONFIGURATION_ID_PREFIX}{}", &suffix[1..]),
+        ),
+        (
+            "a suffix one character long",
+            format!("{RESOURCE_CONFIGURATION_ID_PREFIX}{suffix}0"),
+        ),
+        (
+            "an upper-case suffix",
+            format!(
+                "{RESOURCE_CONFIGURATION_ID_PREFIX}{}",
+                suffix.to_uppercase()
+            ),
+        ),
+        (
+            "a suffix carrying a hyphen",
+            format!("{RESOURCE_CONFIGURATION_ID_PREFIX}0a1b-c3d4e5f60718"),
+        ),
+        (
+            "a well-formed id with surrounding whitespace",
+            format!("  {RESOURCE_CONFIGURATION_ID_PREFIX}{suffix}  "),
+        ),
+        (
+            "a well-formed id inside other text",
+            format!("id={RESOURCE_CONFIGURATION_ID_PREFIX}{suffix};"),
+        ),
+        (
+            "an ARN naming another vendor",
+            format!(
+                "arn:aws:ec2:{REGION}:000000000000:resourceconfiguration/\
+                 {RESOURCE_CONFIGURATION_ID_PREFIX}{suffix}"
+            ),
+        ),
+        (
+            "an ARN naming another resource type",
+            format!(
+                "arn:aws:vpc-lattice:{REGION}:000000000000:resourcegateway/\
+                 {RESOURCE_GATEWAY_ID_PREFIX}{suffix}"
+            ),
+        ),
+        (
+            "an ARN whose account is not twelve digits",
+            format!(
+                "arn:aws:vpc-lattice:{REGION}:12345:resourceconfiguration/\
+                 {RESOURCE_CONFIGURATION_ID_PREFIX}{suffix}"
+            ),
+        ),
+        (
+            "an ARN with no account segment",
+            format!(
+                "arn:aws:vpc-lattice:{REGION}::resourceconfiguration/\
+                 {RESOURCE_CONFIGURATION_ID_PREFIX}{suffix}"
+            ),
+        ),
+        (
+            "an ARN missing its partition",
+            format!(
+                "arn::vpc-lattice:{REGION}:000000000000:resourceconfiguration/\
+                 {RESOURCE_CONFIGURATION_ID_PREFIX}{suffix}"
+            ),
+        ),
+    ]
+}
+
+/// RULE: an identifier that does not satisfy the member's grammar is refused at
+/// VALIDATION — HTTP 400 `ValidationException`, naming the member and the pattern it
+/// missed — before any resource is resolved, so a syntactically impossible value is
+/// never reported as a resource the account is merely missing (404).
+#[tokio::test]
+async fn a_malformed_resource_configuration_id_is_a_validation_failure() {
+    let router = emulator();
+
+    // A resource configuration the account DOES hold, so every row below is refused on
+    // its syntax rather than for want of a resource to resolve.
+    let host = create(
+        &router,
+        &json!({
+            "privateConnectionName": "host-connection",
+            "mode": service_managed(1, json!({})),
+        }),
+        "the connection whose resource configuration the account holds",
+    )
+    .await;
+    let held = member(&host, "resourceConfigurationId")
+        .expect("the service-managed connection reports its resource configuration");
+
+    for (index, (case, identifier)) in malformed_resource_configuration_ids()
+        .into_iter()
+        .enumerate()
+    {
+        let name = format!("malformed-{index}");
+        let answer = call(
+            &router,
+            "CreatePrivateConnection",
+            &json!({
+                "privateConnectionName": name,
+                "mode": {"selfManaged": {"resourceConfigurationId": identifier}},
+            }),
+        )
+        .await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected 400 ValidationException for {identifier:?}, got {} \
+             ({}) with {}",
+            answer.status,
+            answer.error_code,
+            answer.body
+        );
+        let message = member(&answer.body, "message")
+            .or_else(|| member(&answer.body, "Message"))
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the refusal carried no message: {}", answer.body)
+            });
+        assert!(
+            message.contains("mode.selfManaged.resourceConfigurationId"),
+            "case {case:?}: expected the refusal to name the member, got {message:?}"
+        );
+        assert!(
+            message.contains(RESOURCE_CONFIGURATION_ID_PATTERN),
+            "case {case:?}: expected the refusal to report the pattern \
+             {RESOURCE_CONFIGURATION_ID_PATTERN:?}, got {message:?}"
+        );
+
+        let read = describe(&router, &name).await;
+        assert_eq!(
+            read.status, 404,
+            "case {case:?}: a refused create must persist nothing, but \
+             DescribePrivateConnection({name:?}) answered {} with {}",
+            read.status, read.body
+        );
+    }
+
+    // The well-formed id the account holds is still accepted, so the refusals above are
+    // about the grammar and nothing else.
+    let created = create(
+        &router,
+        &json!({
+            "privateConnectionName": "well-formed",
+            "mode": {"selfManaged": {"resourceConfigurationId": held}},
+        }),
+        "the well-formed identifier the account holds",
+    )
+    .await;
+    assert_eq!(
+        member(&created, "resourceConfigurationId").as_deref(),
+        Some(held.as_str()),
+        "case \"the well-formed identifier the account holds\": expected the resolved \
+         {held:?}, got {created}"
     );
 }
 

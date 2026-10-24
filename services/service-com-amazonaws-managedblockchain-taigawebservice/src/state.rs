@@ -21,7 +21,7 @@ use crate::ops::types::{
     NetworkFrameworkAttributes, NetworkSummary, Node,
     NodeEthereumAttributes, NodeFabricAttributes, NodeFrameworkAttributes,
     NodeLogPublishingConfiguration, NodeSummary, Proposal, ProposalActions, ProposalSummary,
-    ResourceNotFoundException, VotingPolicy,
+    ResourceNotFoundException, VoteSummary, VotingPolicy,
 };
 
 /// The signing name, endpoint prefix and ARN namespace of this service (the model's
@@ -809,6 +809,35 @@ impl StoredProposal {
             tags: Some(map_out(&self.tags)),
             arn: Some(self.arn.clone()),
         }
+    }
+
+    /// The votes cast on this proposal as modelled `VoteSummary` records, as
+    /// `ListProposalVotes` returns them, each paired with the key the listing pages on —
+    /// the voting member's id, which is what [`Self::votes`] is keyed by, so the order is
+    /// the stable id order every other listing here pages in.
+    ///
+    /// `network` is the network this proposal belongs to, for the same reason as in
+    /// [`Self::to_proposal`]: `VoteSummary$MemberName` is "the name of the member that cast
+    /// the vote", so it is read from that member's CURRENT record rather than frozen into
+    /// the vote, and a vote whose member the network no longer holds reports no name
+    /// (there is no record to read one from) while keeping its id and its value.
+    pub fn to_vote_summaries(&self, network: &StoredNetwork) -> Vec<(String, VoteSummary)> {
+        self.votes
+            .iter()
+            .map(|(member_id, vote)| {
+                (
+                    member_id.clone(),
+                    VoteSummary {
+                        vote: Some(vote.clone()),
+                        member_name: network
+                            .members
+                            .get(member_id)
+                            .map(|member| member.name.clone()),
+                        member_id: Some(member_id.clone()),
+                    },
+                )
+            })
+            .collect()
     }
 
     /// The modelled `ProposalSummary` for this record, as `ListProposals` returns it.

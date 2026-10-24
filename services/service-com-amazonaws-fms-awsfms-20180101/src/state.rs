@@ -13,9 +13,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AccountScope, AdminScope, AppsListData, DiscoveredResource, OrganizationalUnitScope, Policy,
-    PolicySummary, PolicyTypeScope, ProtocolsListData, ProtocolsListDataSummary, RegionScope,
-    ResourceNotFoundException, ResourceSet, ResourceSetSummary, Tag,
+    AccountScope, AdminScope, AppsListData, ComplianceViolator, DiscoveredResource, EvaluationResult,
+    OrganizationalUnitScope, Policy, PolicyComplianceStatus, PolicySummary, PolicyTypeScope,
+    ProtocolsListData, ProtocolsListDataSummary, RegionScope, ResourceNotFoundException,
+    ResourceSet, ResourceSetSummary, Tag,
 };
 
 /// The Region an emulated service reports when the request carries no SigV4
@@ -689,6 +690,104 @@ pub fn shield_attack_key_prefix(policy_id: &str) -> String {
     format!("{policy_id}#")
 }
 
+/// `PolicyComplianceStatusType` of a member account none of whose resources
+/// violates the policy. One of
+/// [`crate::ops::types::POLICY_COMPLIANCE_STATUS_TYPE_VALUES`].
+pub const POLICY_COMPLIANCE_COMPLIANT: &str = "COMPLIANT";
+
+/// `PolicyComplianceStatusType` of a member account that owns at least one
+/// resource which violates the policy. One of
+/// [`crate::ops::types::POLICY_COMPLIANCE_STATUS_TYPE_VALUES`].
+pub const POLICY_COMPLIANCE_NON_COMPLIANT: &str = "NON_COMPLIANT";
+
+/// The number of noncompliant resources an evaluation reports without flagging
+/// that it ran out of room: `EvaluationResult$EvaluationLimitExceeded`
+/// "indicates that over 100 resources are noncompliant with the Firewall Manager
+/// policy", so MORE than this many violators in one account sets it. A
+/// DOCUMENTED bound, from that member's own documentation.
+pub const EVALUATION_VIOLATOR_LIMIT: i64 = 100;
+
+/// One resource a Firewall Manager policy evaluation found to violate the
+/// policy, in one member account of the organisation — what the compliance
+/// summary (`ListComplianceStatus`) counts per account.
+///
+/// Like [`ComAmazonawsFmsAwsfms20180101State::discovered_resources`] and
+/// [`ComAmazonawsFmsAwsfms20180101State::shield_attacks`], the map these records
+/// live in is an INVENTORY, not a cache: Firewall Manager learns a violation by
+/// evaluating the member accounts' resources against the policy, this emulator
+/// stands in for no such evaluator, and so the inventory holds exactly what
+/// something put in it. An account with nothing recorded against it is reported
+/// `COMPLIANT` because no violating resource of its is known — never because a
+/// status was invented for it.
+#[derive(Debug, Clone)]
+pub struct PolicyViolationRecord {
+    /// The `PolicyId` of the policy this resource violates. Also the first
+    /// segment of the record's key, so one policy's violations are a contiguous
+    /// range.
+    pub policy_id: String,
+    /// The organisation account that owns the violating resource. The second key
+    /// segment, so one account's violations under one policy are contiguous too.
+    pub account_id: String,
+    /// The violating resource's own id (`ComplianceViolator$ResourceId`). The
+    /// last key segment, so one resource is one violation of one policy.
+    pub resource_id: String,
+    /// The violating resource's type (`ComplianceViolator$ResourceType`).
+    pub resource_type: Option<String>,
+    /// Why the resource is a violator: one of
+    /// [`crate::ops::types::VIOLATION_REASON_VALUES`]
+    /// (`ComplianceViolator$ViolationReason`).
+    pub violation_reason: Option<String>,
+    /// Further detail about the violating resource
+    /// (`ComplianceViolator$Metadata`).
+    pub metadata: Option<HashMap<String, String>>,
+    /// When the evaluation recorded this violation. It is what moves a
+    /// compliance status's `LastUpdated` when the evaluation moves — see
+    /// [`ComAmazonawsFmsAwsfms20180101State::policy_compliance_status`].
+    pub detected_at: SystemTime,
+}
+
+impl PolicyViolationRecord {
+    /// The key this record is held under in
+    /// [`ComAmazonawsFmsAwsfms20180101State::policy_violations`].
+    pub fn key(&self) -> String {
+        policy_violation_key(&self.policy_id, &self.account_id, &self.resource_id)
+    }
+
+    /// This violation as the modelled `ComplianceViolator`, every member read
+    /// off the record, so a reader of the inventory reports what was recorded
+    /// rather than re-deriving it.
+    pub fn violator(&self) -> ComplianceViolator {
+        ComplianceViolator {
+            resource_id: Some(self.resource_id.clone()),
+            violation_reason: self.violation_reason.clone(),
+            resource_type: self.resource_type.clone(),
+            metadata: self.metadata.clone(),
+        }
+    }
+}
+
+/// The key one recorded violation is held under in
+/// [`ComAmazonawsFmsAwsfms20180101State::policy_violations`]: the policy it was
+/// recorded under, then the account that owns the violating resource, then the
+/// resource's own id.
+///
+/// The segments are joined by `#`, which none of them can contain (the model's
+/// `com.amazonaws.fms#PolicyId` is `^[a-z0-9A-Z-]{36}$`, its `AWSAccountId`
+/// `^[0-9]+$` and its `ResourceId` `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`), so
+/// [`policy_violation_account_prefix`] is an unambiguous prefix of exactly one
+/// account's violations under one policy.
+pub fn policy_violation_key(policy_id: &str, account_id: &str, resource_id: &str) -> String {
+    format!("{policy_id}#{account_id}#{resource_id}")
+}
+
+/// The prefix every key of `policy_id`'s violations in `account_id` starts with
+/// — the lower bound of that account's contiguous range in
+/// [`ComAmazonawsFmsAwsfms20180101State::policy_violations`]. See
+/// [`policy_violation_key`].
+pub fn policy_violation_account_prefix(policy_id: &str, account_id: &str) -> String {
+    format!("{policy_id}#{account_id}#")
+}
+
 /// Per-service state for com-amazonaws-fms-awsfms-20180101. A handler reaches it through [`service_state`].
 ///
 /// `policies` is a `BTreeMap` so a page boundary is a key in a total order:
@@ -768,6 +867,16 @@ pub struct ComAmazonawsFmsAwsfms20180101State {
     /// `PolicyId` is minted once and never reused, so no later policy can read
     /// another policy's attacks.
     pub shield_attacks: BTreeMap<String, ShieldAttackRecord>,
+    /// The resources a Firewall Manager policy evaluation found to violate a
+    /// stored policy, keyed by [`policy_violation_key`] so one policy's
+    /// violations — and, within them, one member account's — are a contiguous
+    /// range a compliance page can resume from.
+    ///
+    /// Like [`Self::discovered_resources`] and [`Self::shield_attacks`] this is
+    /// an INVENTORY, not a cache: see [`PolicyViolationRecord`]. An entry
+    /// outlives the deletion of its policy and is then unreachable, because a
+    /// `PolicyId` is minted once and never reused.
+    pub policy_violations: BTreeMap<String, PolicyViolationRecord>,
 }
 
 /// The administrator gate every organisation-scoped Firewall Manager operation
@@ -1058,6 +1167,129 @@ impl ComAmazonawsFmsAwsfms20180101State {
             }
         }
         accounts
+    }
+
+    /// The organisation accounts the stored `policy` applies to, in ascending
+    /// account-id order.
+    ///
+    /// `Policy$IncludeMap`'s own documentation is the rule: "If you specify an
+    /// `IncludeMap`, Firewall Manager applies the policy to all accounts
+    /// specified by the `IncludeMap`, and does not evaluate any `ExcludeMap`
+    /// specifications. If you do not specify an `IncludeMap`, then Firewall
+    /// Manager applies the policy to all accounts except for those specified by
+    /// the `ExcludeMap`."
+    ///
+    /// The accounts a scope map names are the values under its
+    /// [`SCOPE_ID_TYPE_ACCOUNT`] key that ARE account ids ([`is_account_id`]): a
+    /// `CustomerPolicyScopeId` is a free-form string, so a value that is not an
+    /// `AWSAccountId` names no account — the same reading [`Self::member_accounts`]
+    /// applies to the same maps. "All accounts" is the organisation's accounts
+    /// this store records, which is exactly that set.
+    ///
+    /// An `ORG_UNIT` key contributes no accounts: specifying an OU "is the
+    /// equivalent of specifying all accounts in the OU and in any of its child
+    /// OUs", which is membership Organizations holds and this emulator stands in
+    /// for no Organizations — so those accounts are UNKNOWN here rather than
+    /// guessed at, and a policy scoped only to OUs applies to no account this
+    /// store can name.
+    ///
+    /// A `BTreeSet` so the order is total and an account named twice is one
+    /// account: a page boundary over the scope is then a key, not a cursor.
+    pub fn policy_scope_accounts(&self, policy: &Policy) -> BTreeSet<String> {
+        /// The account ids a scope map names, or none when it names no account.
+        fn scoped_accounts(
+            map: Option<&HashMap<String, Vec<String>>>,
+        ) -> BTreeSet<String> {
+            map.and_then(|map| map.get(SCOPE_ID_TYPE_ACCOUNT))
+                .map(|scoped| {
+                    scoped
+                        .iter()
+                        .filter(|id| is_account_id(id))
+                        .map(String::clone)
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        // "If you specify an IncludeMap": a map that names nothing scopes the
+        // policy to nothing (the reading `PutPolicy` applies to the same two
+        // maps when it refuses a document that scopes with both), so it is no
+        // specification and the ExcludeMap reading below applies.
+        let included = policy
+            .include_map
+            .as_ref()
+            .is_some_and(|map| map.values().any(|ids| !ids.is_empty()));
+        if included {
+            return scoped_accounts(policy.include_map.as_ref());
+        }
+        let excluded = scoped_accounts(policy.exclude_map.as_ref());
+        self.member_accounts()
+            .into_iter()
+            .filter(|account| !excluded.contains(account))
+            .collect()
+    }
+
+    /// The `PolicyComplianceStatus` of ONE member account under ONE stored
+    /// policy: the per-account summary `ListComplianceStatus` reports.
+    ///
+    /// Every member is read off the store. The evaluation is the violations
+    /// recorded against THIS policy in THIS account ([`Self::policy_violations`]):
+    /// `ViolatorCount` is how many there are ("the number of resources that are
+    /// noncompliant with the specified policy"), the account is
+    /// [`POLICY_COMPLIANCE_NON_COMPLIANT`] exactly while at least one is recorded
+    /// and [`POLICY_COMPLIANCE_COMPLIANT`] otherwise, and
+    /// `EvaluationLimitExceeded` is set exactly when more than
+    /// [`EVALUATION_VIOLATOR_LIMIT`] of them are.
+    ///
+    /// `LastUpdated` is "the timestamp of the last update to the
+    /// `EvaluationResult` objects", so it is the latest instant anything that
+    /// evaluation reads changed: the policy's own last update, or the most
+    /// recent violation recorded against this account when that is later. It is
+    /// therefore stable across reads and moves only when the state behind it
+    /// does.
+    ///
+    /// `IssueInfoMap` is left out: it carries "details about problems with
+    /// dependent services, such as WAF or Config, and the error message received
+    /// that indicates the problem with the service", and this store records no
+    /// such problem — an empty map would claim a dependent service was checked.
+    pub fn policy_compliance_status(
+        &self,
+        policy: &PolicyRecord,
+        account_id: &str,
+    ) -> PolicyComplianceStatus {
+        let prefix = policy_violation_account_prefix(&policy.policy_id, account_id);
+        let mut violator_count: i64 = 0;
+        let mut last_updated = policy.updated_at;
+        for violation in self
+            .policy_violations
+            .range(prefix.clone()..)
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, violation)| violation)
+        {
+            violator_count += 1;
+            last_updated = last_updated.max(violation.detected_at);
+        }
+        let compliance_status = if violator_count == 0 {
+            POLICY_COMPLIANCE_COMPLIANT
+        } else {
+            POLICY_COMPLIANCE_NON_COMPLIANT
+        };
+        PolicyComplianceStatus {
+            // "The Amazon Web Services account that owns the policy"
+            // (`PolicyComplianceStatus$PolicyOwner`): this emulator presents one
+            // account, and it is the account every stored policy's ARN names.
+            policy_owner: Some(::engine::emulator_account_id().to_string()),
+            policy_id: Some(policy.policy_id.clone()),
+            policy_name: Some(policy.policy.policy_name.clone()),
+            member_account: Some(account_id.to_string()),
+            evaluation_results: Some(vec![EvaluationResult {
+                compliance_status: Some(compliance_status.to_string()),
+                violator_count,
+                evaluation_limit_exceeded: violator_count > EVALUATION_VIOLATOR_LIMIT,
+            }]),
+            last_updated: Some(::aws_smithy_types::DateTime::from(last_updated)),
+            issue_info_map: None,
+        }
     }
 
     /// The stored applications list `list_id` names IN THE NAMESPACE

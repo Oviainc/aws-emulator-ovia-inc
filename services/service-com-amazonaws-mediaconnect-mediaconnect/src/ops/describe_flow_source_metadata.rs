@@ -1,15 +1,37 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeFlowSourceMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeFlowSourceMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeFlowSourceMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports what this service holds about the addressed flow's SOURCE metadata: it answers
+//! from [`crate::state`], so the flow it reports on is the one CreateFlow stored, and a
+//! label the store does not hold is refused `NotFoundException`.
+//!
+//! ## What there is to report, and what there is not
+//!
+//! `TransportMediaInfo` is "information about the flow's transport media" — the transport
+//! stream's `TsId` and its programs, each with its PCR PID and its elementary streams'
+//! codecs, resolutions and frame rates. Those values exist only once a transport stream
+//! has actually been RECEIVED on the source and demultiplexed, and this emulator ingests
+//! no media: nothing listens on a source's ingest endpoint, so no program, PID, codec or
+//! resolution has ever been observed for any flow. The member is therefore ABSENT rather
+//! than carrying a synthesised stream — an empty `TransportMediaInfo` would itself be a
+//! claim about a stream (`TransportMediaInfo$Programs` is required, so an empty list says
+//! "a transport stream with no programs"), and a populated one would be fabricated.
+//! `Timestamp` ("the timestamp of the most recent change in metadata for this flow's
+//! source") is absent for the same reason: no metadata has ever been observed, so there is
+//! no instant at which it last changed.
+//!
+//! What the operation CAN report is the status of that absence, which is what `Messages`
+//! is for ("provides a status code and message regarding issues found with the flow source
+//! metadata"): one entry per source the stored flow holds, naming the source in
+//! `MessageDetail$ResourceName` and stating why no metadata is available — the flow is not
+//! running, or it is running and no content has arrived. `NdiInfo` is reported only for a
+//! flow NDI applies to (see [`ndi_source_metadata_info`]) and reports an empty discovery,
+//! because this emulator runs no NDI discovery and no NDI sender can connect to it.
+//!
+//! AWS publishes no catalog of `MessageDetail$Code` values for this operation (the model
+//! says only "the error code"), so the codes below are this emulator's own, chosen to
+//! describe the condition; the 200 status and the response shape are the contract.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +187,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeFlowSourceMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeFlowSourceMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeFlowSourceMetadata"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeFlowSourceMetadataErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the mediaconnect flow store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // The ONLY write this reporting operation makes, and the same one DescribeFlow
+        // makes: a status change the clock already made due (see
+        // `crate::state::TRANSITION_SPAN`) was owed at that instant whether or not anybody
+        // called. It is materialised before reporting because the flow's status is what
+        // `source_metadata_messages` reads.
+        store.settle_due_transitions(::std::time::SystemTime::now());
+
+        // The `{FlowArn}` label is an IDENTIFIER, so the store resolves it: a label this
+        // store does not hold (one never minted, one whose flow was deleted) addresses no
+        // flow and is refused `NotFoundException`. Unlike `DescribeFlowRequest$FlowArn`,
+        // this operation's member declares no pattern of its own, so the narrow `FlowArn`
+        // shape pattern is the only one the model states for it and the boundary walk has
+        // already refused a label outside that form — see the note on `DescribeFlowInput`
+        // in `super::types` (`describe_flow_types.rs`).
+        let Some(flow) = store.flows.get(&input.flow_arn) else {
+            return Err(
+                DescribeFlowSourceMetadataErrorModeled::NotFoundException(NotFoundException {
+                    message: crate::state::not_found_message(&input.flow_arn),
+                })
+                .into(),
+            );
+        };
+
+        Ok(DescribeFlowSourceMetadataOutput {
+            // "The ARN of the flow that DescribeFlowSourceMetadata was performed on": the
+            // ARN the STORED flow carries, which is the identity the label resolved to.
+            flow_arn: Some(flow.flow_arn.clone()),
+            messages: Some(source_metadata_messages(flow)),
+            // No source metadata has ever been observed for a flow of this emulator, so
+            // there is no transport stream to describe and no "most recent change in
+            // metadata" to timestamp. See the module docs.
+            timestamp: None,
+            transport_media_info: None,
+            ndi_info: ndi_source_metadata_info(flow),
+        })
     }
+}
+
+/// `MessageDetail$Code` for a source of a flow that is not running: MediaConnect reports
+/// source metadata from the content a RUNNING flow receives, so a flow that is not
+/// [`crate::state::STATUS_ACTIVE`] has no source metadata for any of its sources.
+const CODE_FLOW_NOT_RUNNING: &str = "FLOW_NOT_RUNNING";
+
+/// `MessageDetail$Code` for a source of a running flow that no content has arrived on.
+/// Nothing listens on a source's ingest endpoint in this emulator, so this is the
+/// condition every source of a running flow is in.
+const CODE_NO_SOURCE_METADATA: &str = "NO_SOURCE_METADATA";
+
+/// `MessageDetail$Code` for the NDI block of a flow NDI applies to: no NDI sender has
+/// been discovered, so the flow has no active NDI source and no NDI media stream.
+const CODE_NO_NDI_SENDER_DISCOVERED: &str = "NO_NDI_SENDER_DISCOVERED";
+
+/// `Messages`: "provides a status code and message regarding issues found with the flow
+/// source metadata" — ONE entry per source the stored flow holds, in the order the flow
+/// holds them, each naming its source in `MessageDetail$ResourceName` ("the name of the
+/// resource").
+///
+/// The condition is read from the flow's own stored status: a flow that is not running
+/// receives nothing, and a running flow of this emulator receives nothing either, because
+/// no media is ingested (see the module docs). So the list is exactly as long as the
+/// flow's source list, and both the code and the wording (which names the status the flow
+/// is in) follow the stored status — never the shape of the request that asked.
+fn source_metadata_messages(flow: &crate::state::StoredFlow) -> Vec<MessageDetail> {
+    let running = flow.status == crate::state::STATUS_ACTIVE;
+    flow.sources
+        .iter()
+        .map(|source| MessageDetail {
+            code: if running {
+                CODE_NO_SOURCE_METADATA.to_string()
+            } else {
+                CODE_FLOW_NOT_RUNNING.to_string()
+            },
+            message: if running {
+                format!(
+                    "The flow is {}, and no content has been received on this source, so \
+                     its source metadata is not available yet.",
+                    flow.status
+                )
+            } else {
+                format!(
+                    "The flow is {}; source metadata is reported only while the flow is {} \
+                     and receiving content.",
+                    flow.status,
+                    crate::state::STATUS_ACTIVE
+                )
+            },
+            resource_name: Some(source.name.clone()),
+        })
+        .collect()
+}
+
+/// `NdiInfo`: "comprehensive information about the NDI® source that's associated with a
+/// flow", reported only for a flow NDI is associated with — one whose `NdiConfig$NdiState`
+/// is `ENABLED` and one that holds an NDI source, both read through the crate's own
+/// predicates ([`crate::state::ndi_is_enabled`] and
+/// [`crate::state::stored_source_uses_ndi`], which the create/update paths read NDI
+/// through), so this operation cannot disagree with the rest of the crate about what makes
+/// a flow an NDI flow. For every other flow NDI is no part of the source, so the member is
+/// absent.
+///
+/// For a flow it does apply to, the block reports an EMPTY discovery: this emulator runs
+/// no NDI discovery and no NDI sender can connect to it, so no sender has been discovered,
+/// none is active (`ActiveSource` absent) and no NDI media stream has been observed
+/// (`NdiMediaInfo$Streams` empty). Its own `Messages` says so, which is what that member
+/// is for ("any status messages or error codes related to the NDI source and its
+/// metadata").
+fn ndi_source_metadata_info(flow: &crate::state::StoredFlow) -> Option<NdiSourceMetadataInfo> {
+    let associated = crate::state::ndi_is_enabled(flow.ndi_config.as_ref())
+        || flow
+            .sources
+            .iter()
+            .any(crate::state::stored_source_uses_ndi);
+    if !associated {
+        return None;
+    }
+    Some(NdiSourceMetadataInfo {
+        active_source: None,
+        discovered_sources: Vec::new(),
+        media_info: NdiMediaInfo {
+            streams: Vec::new(),
+        },
+        messages: vec![MessageDetail {
+            code: CODE_NO_NDI_SENDER_DISCOVERED.to_string(),
+            message: "No NDI sender has been discovered for this flow, so it has no active \
+                      NDI source and no NDI media stream metadata."
+                .to_string(),
+            resource_name: Some(flow.name.clone()),
+        }],
+    })
 }

@@ -178,6 +178,63 @@ pub const MAX_SECURITY_REQUIREMENT_PACKS: usize = 1_000;
 /// rather than ones a caller creates.
 pub const MANAGEMENT_TYPE_CUSTOMER_MANAGED: &str = "CUSTOMER_MANAGED";
 
+/// The `managementType` of a pack AWS itself ships: the other member of the
+/// `ManagementType` enum (`smithy_query(query="shape",shape="ManagementType")`).
+pub const MANAGEMENT_TYPE_AWS_MANAGED: &str = "AWS_MANAGED";
+
+/// The `vendorName` every AWS managed pack carries — "The vendor name for AWS managed
+/// packs".
+///
+/// RECORDED, not modelled: the model declares the member but not its contents, and a
+/// fresh account's catalog reports this vendor for each of its built-in packs.
+pub const AWS_MANAGED_VENDOR_NAME: &str = "Amazon Web Services";
+
+/// One entry of the catalog of security requirement packs AWS ships with every
+/// account: the id a client references the pack by, its display name, and the status it
+/// is shipped in.
+///
+/// Only the status is a caller's to change — `UpdateSecurityRequirementPack` documents
+/// "For AWS managed packs, only status can be updated" — so the rest of the record is
+/// the service's and is seeded, never written.
+#[derive(Debug, Clone, Copy)]
+pub struct AwsManagedPack {
+    pub pack_id: &'static str,
+    pub name: &'static str,
+    pub status: &'static str,
+}
+
+/// The AWS managed pack catalog a fresh account holds.
+///
+/// RECORDED, not modelled: the model declares the pack shapes and the `AWS_MANAGED`
+/// management type but says nothing about which packs AWS ships, so this table is the
+/// catalog a fresh account's `ListSecurityRequirementPacks` reports — recorded by the
+/// `securityagent-catalog-list-security-requirement-packs` fixture at step `task#1`: the
+/// base pack enabled by default and the three framework packs shipped disabled. Every
+/// entry is read back through the same projection as a created pack, so nothing here is a
+/// response the handlers synthesise.
+pub const AWS_MANAGED_PACKS: [AwsManagedPack; 4] = [
+    AwsManagedPack {
+        pack_id: "srp-am-base",
+        name: "ASA Base Pack",
+        status: PACK_STATUS_ENABLED,
+    },
+    AwsManagedPack {
+        pack_id: "srp-am-nist-csf",
+        name: "NIST CSF Pack",
+        status: PACK_STATUS_DISABLED,
+    },
+    AwsManagedPack {
+        pack_id: "srp-am-pci-dss",
+        name: "PCI DSS Pack",
+        status: PACK_STATUS_DISABLED,
+    },
+    AwsManagedPack {
+        pack_id: "srp-am-well-architected",
+        name: "AWS Well-Architected Pack",
+        status: PACK_STATUS_DISABLED,
+    },
+];
+
 /// The `status` a pack created without one carries.
 ///
 /// Source: the `status` member's documentation on `CreateSecurityRequirementPackInput`
@@ -396,6 +453,28 @@ pub struct SecurityRequirementPack {
 }
 
 impl SecurityRequirementPack {
+    /// One entry of the seeded AWS managed catalog as a stored record: the catalog's own
+    /// id, name and shipped status, the AWS vendor, and `now` as both stamps — nothing
+    /// has updated a pack the account was created with.
+    pub fn aws_managed(entry: &AwsManagedPack, now: SystemTime) -> Self {
+        Self {
+            pack_id: entry.pack_id.to_string(),
+            name: entry.name.to_string(),
+            // The catalog's descriptions are not recorded, and a description AWS does
+            // not ship is not one to invent: the member is optional, so it stays absent.
+            description: None,
+            vendor_name: Some(AWS_MANAGED_VENDOR_NAME.to_string()),
+            management_type: MANAGEMENT_TYPE_AWS_MANAGED.to_string(),
+            status: entry.status.to_string(),
+            // No import has been started for a shipped pack.
+            import_status: None,
+            kms_key_id: None,
+            tags: BTreeMap::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
     /// This pack projected onto the `SecurityRequirementPackSummary` shape
     /// `ListSecurityRequirementPacks` returns: the stored record's own fields, never
     /// request input.
@@ -745,7 +824,12 @@ pub struct TargetDomainIdentity {
 }
 
 /// Per-service state for com-amazonaws-securityagent-securityagent. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+///
+/// `Default` is hand-written rather than derived because the account does not start
+/// empty: the pack store is SEEDED with the AWS managed catalog ([`AWS_MANAGED_PACKS`]),
+/// which a fresh account already holds. The engine builds this state with `Default` the
+/// first time a handler asks for it, so that is the one place the seed can live.
+#[derive(Debug)]
 pub struct ComAmazonawsSecurityagentSecurityagentState {
     /// Every stored application, keyed by its `applicationId`. A `BTreeMap` so
     /// `ListApplications` walks the applications in one stable order and a cursor
@@ -786,7 +870,50 @@ pub struct ComAmazonawsSecurityagentSecurityagentState {
     pub next_security_requirement_pack_seq: u64,
 }
 
+impl Default for ComAmazonawsSecurityagentSecurityagentState {
+    /// The state of a fresh account: every store empty EXCEPT the pack store, which
+    /// already holds the AWS managed catalog.
+    ///
+    /// The seeded packs are stored records like any other, so
+    /// `ListSecurityRequirementPacks` and `GetSecurityRequirementPack` project them
+    /// through exactly the same path as a created pack, and
+    /// `UpdateSecurityRequirementPack` writes their status in place.
+    fn default() -> Self {
+        let now = SystemTime::now();
+        Self {
+            applications: BTreeMap::new(),
+            next_application_seq: 0,
+            private_connections: BTreeMap::new(),
+            next_private_connection_seq: 0,
+            target_domains: BTreeMap::new(),
+            next_target_domain_seq: 0,
+            agent_spaces: BTreeMap::new(),
+            next_agent_space_seq: 0,
+            security_requirement_packs: AWS_MANAGED_PACKS
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.pack_id.to_string(),
+                        SecurityRequirementPack::aws_managed(entry, now),
+                    )
+                })
+                .collect(),
+            next_security_requirement_pack_seq: 0,
+        }
+    }
+}
+
 impl ComAmazonawsSecurityagentSecurityagentState {
+    /// How many of the stored packs a caller created, i.e. how many count against the
+    /// account's pack quota. The seeded AWS managed catalog is the service's own and is
+    /// not part of what a caller may create, so it is not counted.
+    pub fn customer_managed_pack_count(&self) -> usize {
+        self.security_requirement_packs
+            .values()
+            .filter(|pack| pack.management_type == MANAGEMENT_TYPE_CUSTOMER_MANAGED)
+            .count()
+    }
+
     /// Mint the identity of a new application.
     ///
     /// The id is 32 lowercase hex characters drawn from the monotonic counter, so it
@@ -1084,6 +1211,92 @@ pub fn verification_method_violation(method: &str) -> Option<String> {
             "must satisfy enum value set: [{}]",
             VERIFICATION_METHOD_VALUES.join(", ")
         )
+    })
+}
+
+/// The grammar a `resourceConfigurationId` has to satisfy: a bare VPC Lattice resource
+/// configuration id, or the ARN of one. This is the text a refusal REPORTS;
+/// [`resource_configuration_id_violation`] is what enforces it, alternative for
+/// alternative and character class for character class.
+///
+/// RECORDED, not modelled: `ResourceConfigurationId` carries no `@pattern` in this
+/// service's model, so nothing refuses a malformed value at the boundary — and the real
+/// service refuses one at validation, reporting exactly this pattern. It is the union of
+/// VPC Lattice's own two patterns (`com.amazonaws.vpclattice#ResourceConfigurationId`
+/// `^rcfg-[0-9a-z]{17}$` and `com.amazonaws.vpclattice#ResourceConfigurationArn`), which
+/// is why [`RESOURCE_CONFIGURATION_ID_PREFIX`] and [`LATTICE_ID_SUFFIX_LEN`] — the parts
+/// this emulator MINTS ids from — are the same two bounds spelled out here.
+///
+/// The account segment is `[0-9]{12}`, twelve ASCII digits, which is what an AWS account
+/// id is.
+pub const RESOURCE_CONFIGURATION_ID_PATTERN: &str = concat!(
+    r"((rcfg-[0-9a-z]{17})|",
+    r"(arn:[a-z0-9\-]+:vpc-lattice:[a-zA-Z0-9\-]+:[0-9]{12}:",
+    r"resourceconfiguration/rcfg-[0-9a-z]{17}))",
+);
+
+/// Whether `value` is `prefix` followed by exactly [`LATTICE_ID_SUFFIX_LEN`] characters
+/// of `[0-9a-z]` — the bare id form of a VPC Lattice resource, which is also the form
+/// [`base36_id`] mints.
+fn lattice_id(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|suffix| {
+        suffix.len() == LATTICE_ID_SUFFIX_LEN
+            && suffix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+    })
+}
+
+/// Whether `value` is the ARN of a VPC Lattice resource configuration:
+/// `arn:<partition>:vpc-lattice:<region>:<account>:resourceconfiguration/<id>`, with the
+/// partition drawn from `[a-z0-9-]`, the region from `[a-zA-Z0-9-]`, the account twelve
+/// ASCII digits, and the resource id in the bare form [`lattice_id`] accepts. Each
+/// segment is the corresponding alternative of [`RESOURCE_CONFIGURATION_ID_PATTERN`].
+///
+/// Written out rather than run through a regex engine: the grammar is two fixed
+/// alternatives of six fixed segments, not a language, so there is nothing to parse and
+/// no dependency this one check has to pull into the workspace.
+fn resource_configuration_arn(value: &str) -> bool {
+    let fields: Vec<&str> = value.split(':').collect();
+    let [arn, partition, service, region, account, resource] = fields.as_slice() else {
+        return false;
+    };
+    let Some((kind, id)) = resource.split_once('/') else {
+        return false;
+    };
+    *arn == "arn"
+        && !partition.is_empty()
+        && partition
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() || b == b'-')
+        && *service == VPC_LATTICE_ARN_SERVICE
+        && !region.is_empty()
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && account.len() == 12
+        && account.bytes().all(|b| b.is_ascii_digit())
+        && kind == KIND_RESOURCE_CONFIGURATION
+        && lattice_id(id, RESOURCE_CONFIGURATION_ID_PREFIX)
+}
+
+/// Why `identifier` is not a VPC Lattice resource configuration identifier at all, or
+/// `None` when it is one.
+///
+/// This is a SYNTACTIC check, decided from the value alone: it says nothing about
+/// whether the account holds the resource, which is
+/// [`ComAmazonawsSecurityagentSecurityagentState::resolve_resource_configuration`]'s
+/// question. The returned text is the constraint the value missed, for the refusal's
+/// `fieldList` entry.
+///
+/// The WHOLE value has to be an identifier — a well-formed id inside other text names no
+/// resource — which is why neither alternative below accepts a prefix or a suffix around
+/// itself, and why the reported pattern is read as anchored.
+pub fn resource_configuration_id_violation(identifier: &str) -> Option<String> {
+    let matches = lattice_id(identifier, RESOURCE_CONFIGURATION_ID_PREFIX)
+        || resource_configuration_arn(identifier);
+    (!matches).then(|| {
+        format!("must satisfy regular expression pattern: {RESOURCE_CONFIGURATION_ID_PATTERN}")
     })
 }
 

@@ -77,7 +77,8 @@ pub(crate) async fn get_stage(gateway: &Gateway, api: &str, stage_name: &str) ->
 }
 
 /// An API with one resource carrying one method, which is what a deployment snapshots.
-async fn api_with_a_method(gateway: &Gateway, name: &str) -> (String, String) {
+/// Shared with the `delete_stage` suite, which deletes stages of such an API.
+pub(crate) async fn api_with_a_method(gateway: &Gateway, name: &str) -> (String, String) {
     let (api, root) = create_api(gateway, name).await;
     let resource = create_resource(gateway, &api, &root, "pets").await;
     let resource_id = string_member(&resource, "id", name);

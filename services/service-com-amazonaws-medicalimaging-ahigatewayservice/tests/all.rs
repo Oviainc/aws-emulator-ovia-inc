@@ -19,6 +19,8 @@ mod error_message_texts;
 mod image_frames;
 #[path = "all/image_set_copy.rs"]
 mod image_set_copy;
+#[path = "all/import_job_listing.rs"]
+mod import_job_listing;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]

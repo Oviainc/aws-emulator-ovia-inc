@@ -192,6 +192,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every refusal is raised before the first write, so a refused modify leaves
         // the stored health check exactly as it was.
         //
+        // `HealthCheckPort` is a bare string in the model, so nothing in the model
+        // bounds its VALUE and this handler is the only gate — the same rule, and the
+        // same refusal, `CreateTargetGroup` applies to the member.
+        if let Some(port) = input.health_check_port.as_deref() {
+            crate::state::check_health_check_port(port)
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
         // "If the target type is instance, ip, or alb, health checks are always enabled
         // and can't be disabled" — the same rule `CreateTargetGroup` enforces, on the
         // target type the group was created with.

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociatePricingRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociatePricingRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociatePricingRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +150,181 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociatePricingRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociatePricingRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociatePricingRules"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AssociatePricingRulesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // The `PricingPlanArn` pattern accepts the full ARN or the bare id, and both
+        // name the same stored plan.
+        let plan_arn = crate::state::normalize_pricing_plan_arn(&input.arn);
+
+        // The pattern also admits the plans Amazon Web Services owns
+        // (`BasicPricingPlan` / `Passthrough`, whose ARN carries the literal `aws`
+        // account segment). They exist for every caller but belong to no account, so
+        // their contents are not the caller's to change — the same refusal, with the
+        // same modelled reason, `UpdatePricingPlan` gives for a write to one of them.
+        if crate::state::is_aws_managed_pricing_plan(&plan_arn) {
+            return Err(validation(
+                "MISMATCHED_PRICINGPLAN_ARN",
+                "Arn",
+                format!(
+                    "the pricing plan {plan_arn} is managed by Amazon Web Services and its \
+                     pricing rules cannot be changed"
+                ),
+            ));
+        }
+
+        // The plan is the resource this request addresses, so a plan this account does
+        // not hold is the modelled 404 — the answer every other reader and writer of a
+        // plan in this service gives.
+        if !state.pricing_plans.contains_key(&plan_arn) {
+            return Err(AssociatePricingRulesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: "the pricing plan does not exist".to_string(),
+                    resource_id: plan_arn,
+                    resource_type: "pricingplan".to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Each requested rule is normalised FIRST, so every decision below is about the
+        // RULE rather than the spelling the request named it with: the `PricingRuleArn`
+        // pattern accepts the full ARN or the bare id, and both name one rule.
+        let requested: Vec<String> = input
+            .pricing_rule_arns
+            .iter()
+            .map(|arn| crate::state::normalize_pricing_rule_arn(arn))
+            .collect();
+
+        // One request naming one rule twice — in either spelling — is a fault in the
+        // input, and `ValidationExceptionReason` enumerates it by name
+        // (`DUPLICATE_PRICINGRULE_ARNS`).
+        if let Some(duplicate) = crate::state::first_duplicate(&requested) {
+            return Err(validation(
+                "DUPLICATE_PRICINGRULE_ARNS",
+                "PricingRuleArns",
+                format!("the pricing rule {duplicate} is named more than once in this request"),
+            ));
+        }
+
+        // An association names a rule that has to exist: there are no AWS-managed
+        // pricing rules (the `PricingRuleArn` pattern allows only a 12-digit account
+        // segment), so what is stored is the whole universe of rules and an ARN naming
+        // none of them is refused with the reason the model enumerates for exactly that
+        // (`PRICINGRULES_NOT_EXIST`, the same refusal `DeletePricingRule` gives).
+        if let Some(missing) = requested
+            .iter()
+            .find(|arn| !state.pricing_rules.contains_key(*arn))
+        {
+            return Err(validation(
+                "PRICINGRULES_NOT_EXIST",
+                "PricingRuleArns",
+                format!("the pricing rule {missing} does not exist"),
+            ));
+        }
+
+        // What the plan already associates, as full rule ARNs: read through the one
+        // state method every other reader of the association uses, so this decision
+        // cannot drift from what `ListPricingRulesAssociatedToPricingPlan` reports.
+        let associated: std::collections::BTreeSet<String> = state
+            .associated_pricing_rule_arns(&plan_arn)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
+        // A rule the plan already holds cannot be associated again: that is the
+        // "inconsistent state by updating ... a resource" the modelled
+        // `ConflictException` describes, and `ConflictExceptionReason` enumerates the
+        // case by name (`PRICING_RULE_IN_PRICING_PLAN_CONFLICT`,
+        // `smithy_query(query="shape",shape="ConflictExceptionReason")`). The whole
+        // request is refused, so a partially applied association is never stored.
+        if let Some(existing) = requested.iter().find(|arn| associated.contains(*arn)) {
+            return Err(AssociatePricingRulesErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "the pricing rule {existing} is already associated with the pricing \
+                         plan {plan_arn}"
+                    ),
+                    resource_id: existing.clone(),
+                    resource_type: "pricingrule".to_string(),
+                    reason: Some("PRICING_RULE_IN_PRICING_PLAN_CONFLICT".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The membership a plan ACCUMULATES is bounded, and this is the one operation
+        // of the associate/disassociate pair that models the 402
+        // `ServiceLimitExceededException` — so a request that would take the plan past
+        // the bound is refused rather than served by dropping an association a later
+        // caller must still be able to read.
+        if associated.len() + requested.len() > crate::state::MAX_PRICING_RULES_PER_PRICING_PLAN {
+            return Err(
+                AssociatePricingRulesErrorModeled::ServiceLimitExceededException(
+                    ServiceLimitExceededException {
+                        message: format!(
+                            "a pricing plan associates at most {} pricing rules; {plan_arn} \
+                             already associates {}",
+                            crate::state::MAX_PRICING_RULES_PER_PRICING_PLAN,
+                            associated.len()
+                        ),
+                        resource_id: Some(plan_arn),
+                        resource_type: Some("pricingplan".to_string()),
+                        limit_code: "PricingRulesPerPricingPlan".to_string(),
+                        service_code: crate::state::SERVICE_CODE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every check passed, so the whole request applies: the plan's associations
+        // grow by exactly the requested rules, stored as full ARNs, and the plan's
+        // `LastModifiedTime` moves because the plan changed. Nothing else about the
+        // plan — its name, its description, its tags, its creation time — is this
+        // operation's to touch.
+        let Some(plan) = state.pricing_plans.get_mut(&plan_arn) else {
+            return Err(AssociatePricingRulesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the pricing plan disappeared while it was being updated"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        plan.pricing_rule_arns.extend(requested.iter().cloned());
+        plan.last_modified_time_millis = crate::state::now_millis();
+
+        // The audit record for a state-changing call: who asked, what changed and that
+        // it succeeded. No `@sensitive` member of the plan, only the access key id the
+        // caller presented and the ARNs it addressed.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            pricing_plan_arn = %plan_arn,
+            associated_rules = requested.len(),
+            outcome = "associated",
+            "pricing rules associated with a pricing plan"
+        );
+        Ok(AssociatePricingRulesOutput {
+            arn: Some(plan_arn),
+        })
     }
+}
+
+/// Refuse the request with this operation's modelled 400 `ValidationException`.
+fn validation(reason: &str, field: &str, message: String) -> AssociatePricingRulesError {
+    AssociatePricingRulesErrorModeled::ValidationException(crate::state::validation_exception(
+        reason, field, message,
+    ))
+    .into()
 }

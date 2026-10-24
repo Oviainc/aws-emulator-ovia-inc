@@ -64,11 +64,12 @@ pub const IMAGE_SET_COPY_DELAY: Duration = Duration::from_millis(400);
 /// version is one past the one it supersedes.
 pub const FIRST_IMAGE_SET_VERSION_ID: u32 = 1;
 
-/// The smallest page `ListDatastores` will serve — the model's `maxResults` minimum
-/// (`smithy_query(query="operation",operation="ListDatastores")` reports range 1..50).
+/// The smallest page a listing will serve — the model's `maxResults` minimum, which is
+/// the same 1..50 range on both listings that declare one
+/// (`smithy_query(query="operation",operation="ListDatastores,ListDICOMImportJobs")`).
 pub const MIN_LIST_PAGE_SIZE: usize = 1;
 
-/// The largest page `ListDatastores` will serve — the model's `maxResults` maximum, and
+/// The largest page a listing will serve — the model's `maxResults` maximum, and
 /// also the page size used when the caller names no `maxResults`. Every page is clamped
 /// into `MIN_LIST_PAGE_SIZE..=MAX_LIST_PAGE_SIZE` in the handler rather than trusting
 /// the boundary validator alone, so one request can never materialise an unbounded
@@ -1299,6 +1300,84 @@ pub fn to_date_time(instant: SystemTime) -> ::aws_smithy_types::DateTime {
         .unwrap_or_default();
     let seconds = i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX);
     ::aws_smithy_types::DateTime::from_secs_and_nanos(seconds, since_epoch.subsec_nanos())
+}
+
+// ---------------------------------------------------------------------------
+// How this service PAGES a listing
+//
+// Every paginated listing this service serves walks a total order over the
+// collection — the record's own instant first, its identifier to break a tie — and
+// hands the caller an OPAQUE token naming the FULL sort key the next page starts at.
+// Carrying the whole key is what keeps the walk correct when the record the token was
+// minted at is gone by the next call: the resume can neither land before a page
+// already served (repeating a record) nor past one never seen (skipping it).
+//
+// The codec lives here because more than one listing uses it, and a token format
+// spelled twice drifts. Each collection passes its OWN marker, so a token minted for
+// one collection is not a position in another and is refused rather than honoured.
+// ---------------------------------------------------------------------------
+
+/// The total order a listing walks: the record's instant first (seconds, then
+/// nanoseconds), its identifier to break a tie — so a page boundary is stable no matter
+/// how the underlying map iterates.
+pub fn page_sort_key(instant: SystemTime, resource_id: &str) -> (u64, u32, &str) {
+    let since_epoch = instant
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    (
+        since_epoch.as_secs(),
+        since_epoch.subsec_nanos(),
+        resource_id,
+    )
+}
+
+/// A decoded continuation token: the FULL sort key the next page starts at, so resuming
+/// does not depend on the record that minted it still existing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageCursor {
+    instant_secs: u64,
+    instant_nanos: u32,
+    resource_id: String,
+}
+
+impl PageCursor {
+    /// This cursor as a sort key, comparable with [`page_sort_key`].
+    pub fn as_key(&self) -> (u64, u32, &str) {
+        (
+            self.instant_secs,
+            self.instant_nanos,
+            self.resource_id.as_str(),
+        )
+    }
+}
+
+/// Encode the sort key the next page starts at as an opaque `nextToken`.
+///
+/// Hex keeps the token inside `NextToken`'s `^\p{ASCII}{0,8192}$` pattern and makes it
+/// plainly not a resource identifier, so no caller can mistake it for one. `marker`
+/// identifies the COLLECTION the position belongs to.
+pub fn encode_page_token(marker: &str, instant: SystemTime, resource_id: &str) -> String {
+    let (secs, nanos, id) = page_sort_key(instant, resource_id);
+    ::hex::encode(format!("{marker}{secs}.{nanos}:{id}").as_bytes())
+}
+
+/// Decode a token [`encode_page_token`] produced for the collection `marker` names, or
+/// `None` when it was not one — a string that is not hex, does not decode to UTF-8,
+/// carries another collection's marker (or none), or holds a payload this service would
+/// never mint.
+pub fn decode_page_token(marker: &str, token: &str) -> Option<PageCursor> {
+    let bytes = ::hex::decode(token).ok()?;
+    let decoded = String::from_utf8(bytes).ok()?;
+    let payload = decoded.strip_prefix(marker)?;
+    // Every identifier a listing pages over is `[0-9a-z]+`, so neither `:` nor `.` can
+    // appear in it and splitting on the first of each is unambiguous.
+    let (instant, resource_id) = payload.split_once(':')?;
+    let (secs, nanos) = instant.split_once('.')?;
+    Some(PageCursor {
+        instant_secs: secs.parse().ok()?,
+        instant_nanos: nanos.parse().ok()?,
+        resource_id: resource_id.to_string(),
+    })
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
