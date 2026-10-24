@@ -48,6 +48,11 @@
 //! about the preference that no modelled member reports, and a version counts the writes
 //! the resource took rather than the members a reader can see change.
 //!
+//! The PORTALS themselves are not stored beside the preferences, because no operation of
+//! this service creates one: they are the catalog [`procurement_portals`] derives from
+//! the modelled `ProcurementPortalName` values, which `ListProcurementPortals` reports
+//! and which a `PortalIdentifier` on any other operation of this plane resolves against.
+//!
 //! `ListProcurementPortalSuppliers` is served from those same preferences rather than
 //! from a registry of its own: the suppliers CONFIGURED for a portal are the supplier
 //! identities the stored preferences name against that portal, which
@@ -70,9 +75,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AccessDeniedException, InternalServerException, InvoiceProfile, InvoiceSummary, InvoiceUnit,
-    InvoiceUnitRule, MessageKey, ProcurementPortalPreference, ProcurementPortalPreferenceSummary,
-    ProcurementPortalSupplier, ResourceNotFoundException, ResourceTag, ValidationException,
+    AccessDeniedException, FeatureConfigurations, InternalServerException, InvoiceConfiguration,
+    InvoiceProfile, InvoiceSummary, InvoiceUnit, InvoiceUnitRule, MessageKey, ProcurementPortal,
+    ProcurementPortalPreference, ProcurementPortalPreferenceSummary, ProcurementPortalSupplier,
+    ResourceNotFoundException, ResourceTag, ValidationException,
+    EINVOICE_DELIVERY_ATTACHMENT_TYPE_VALUES, EINVOICE_DELIVERY_DOCUMENT_TYPE_VALUES,
     PROCUREMENT_PORTAL_NAME_VALUES,
 };
 
@@ -754,6 +761,80 @@ pub fn procurement_portal_name_for_identifier(identifier: &str) -> Option<&'stat
         .iter()
         .copied()
         .find(|name| procurement_portal_identifier(name) == identifier)
+}
+
+/// Every procurement portal this service serves, keyed by its `PortalIdentifier` — the
+/// catalog `ListProcurementPortals` reports and the one
+/// [`procurement_portal_name_for_identifier`] resolves an identifier against, so a
+/// portal a caller can name a supplier walk or a preference for is exactly a portal this
+/// catalog holds.
+///
+/// The portals are NOT caller-created resources: no operation of this service creates
+/// one (`smithy_query(query="list_operations")` lists two creates, `CreateInvoiceUnit`
+/// and `CreateProcurementPortalPreference`), and the operation is documented as
+/// returning "the Amazon Web Services-supported procurement portals" — a catalog of what
+/// the SERVICE supports rather than of what an account configured. The portals the
+/// service supports are exactly the values of `ProcurementPortalName`
+/// ([`crate::ops::types::PROCUREMENT_PORTAL_NAME_VALUES`]), because that enum is what a
+/// preference may name a portal by, so nothing a caller stores can add one to this
+/// catalog or take one out of it.
+///
+/// Each entry carries what the operation documents it includes — "the portal identifier,
+/// name, and default feature configurations" — and nothing else:
+///
+/// * `PortalIdentifier` is the identifier this emulator derives per portal
+///   ([`procurement_portal_identifier`]), stable across calls and runs.
+/// * `PortalName` is the enum value itself.
+/// * `DefaultFeatureConfigurations` carries the DEFAULT document and attachment types,
+///   which the operation documents as "the supported document and attachment types":
+///   the model publishes no per-portal subset, so the default for every portal is every
+///   type its member's list admits — `EinvoiceDeliveryDocumentTypes` of
+///   `EinvoiceDeliveryDocumentType` ([`crate::ops::types::EINVOICE_DELIVERY_DOCUMENT_TYPE_VALUES`],
+///   five values, inside that list's `@length(min: 0, max: 10)`) and
+///   `EinvoiceDeliveryAttachmentTypes` of `EinvoiceDeliveryAttachmentType`
+///   ([`crate::ops::types::EINVOICE_DELIVERY_ATTACHMENT_TYPE_VALUES`]), which is also
+///   exactly what a preference's `EinvoiceDeliveryPreference` may ask for.
+/// * `PortalDisplayName` is left ABSENT: it is display prose AWS publishes for a portal,
+///   the model carries none for any portal
+///   (`smithy_query(query="shape", shape="ProcurementPortal")`) and the operation's own
+///   documentation leaves it out of what an entry includes, so this reader reports no
+///   display name rather than inventing one — the same reason a reported supplier carries
+///   no `CountryCode` (see [`ComAmazonawsInvoicingInvoicingState::procurement_portal_suppliers`]).
+///
+/// A `BTreeMap` keyed by identifier, so `ListProcurementPortals` walks one stable,
+/// deterministic order and a pagination token (a position in that order) stays
+/// meaningful across calls. It is derived per call rather than cached, which is what
+/// keeps that read from writing anything, and it is bounded by the enum: one entry per
+/// value, whatever a caller asks for.
+pub fn procurement_portals() -> BTreeMap<String, ProcurementPortal> {
+    PROCUREMENT_PORTAL_NAME_VALUES
+        .iter()
+        .map(|portal_name| {
+            let portal_identifier = procurement_portal_identifier(portal_name);
+            let portal = ProcurementPortal {
+                portal_identifier: portal_identifier.clone(),
+                portal_name: (*portal_name).to_string(),
+                portal_display_name: None,
+                default_feature_configurations: Some(FeatureConfigurations {
+                    invoice_configuration: Some(InvoiceConfiguration {
+                        document_types: Some(
+                            EINVOICE_DELIVERY_DOCUMENT_TYPE_VALUES
+                                .iter()
+                                .map(|document_type| (*document_type).to_string())
+                                .collect(),
+                        ),
+                        attachment_types: Some(
+                            EINVOICE_DELIVERY_ATTACHMENT_TYPE_VALUES
+                                .iter()
+                                .map(|attachment_type| (*attachment_type).to_string())
+                                .collect(),
+                        ),
+                    }),
+                }),
+            };
+            (portal_identifier, portal)
+        })
+        .collect()
 }
 
 /// The kind of resource a `PortalIdentifier` names, as the prose form of the portals
