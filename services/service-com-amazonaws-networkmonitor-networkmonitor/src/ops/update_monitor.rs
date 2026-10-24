@@ -190,7 +190,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // `monitorName`'s length bound and `@pattern`, and `aggregationPeriod`'s
         // `@range(min: 30)`, are refused by the framework BEFORE this handler
         // runs, so reaching here means the input satisfies each of them; the
@@ -201,6 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),
             })
         })?;
+        // An update reaches only the region it was signed for: the same name in
+        // another region is a different monitor and is left untouched.
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
         // The documented value list, applied to the REQUIRED member: the same
@@ -217,12 +219,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // monitor, materialised before the record is reported — the same write
         // `GetMonitor` performs, owed at its due instant whether or not anybody
         // called.
-        store.settle_monitor(&input.monitor_name, now);
-        let monitor = store.monitors.get_mut(&input.monitor_name).ok_or_else(|| {
-            UpdateMonitorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::monitor_not_found_message(&input.monitor_name)),
-            })
-        })?;
+        store.settle_monitor(&region, &input.monitor_name, now);
+        let monitor = store
+            .monitor_mut(&region, &input.monitor_name)
+            .ok_or_else(|| {
+                UpdateMonitorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::monitor_not_found_message(&input.monitor_name)),
+                })
+            })?;
 
         // `modifiedAt` moves only when the stored period actually changes, so a
         // repeat of the same update (the model marks this operation
