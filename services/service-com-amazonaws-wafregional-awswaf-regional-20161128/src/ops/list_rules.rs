@@ -151,7 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListRulesErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
-                message: Some("the AWS WAF Rule store is unavailable".to_string()),
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
             })
         })?;
         // A read: it walks the stored Rules and writes nothing.

@@ -232,12 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.updates.len() > crate::state::MAX_UPDATES_PER_REQUEST {
             return Err(UpdateIPSetErrorModeled::WAFLimitsExceededException(
                 WAFLimitsExceededException {
-                    message: Some(format!(
-                        "The request contains {} updates, more than the maximum of {} \
-                         addresses in a single request",
-                        input.updates.len(),
-                        crate::state::MAX_UPDATES_PER_REQUEST
-                    )),
+                    message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
                 },
             )
             .into());
@@ -245,7 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateIPSetErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
-                message: Some("the AWS WAF IPSet store is unavailable".to_string()),
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
             })
         })?;
         let mut state = state.lock();
@@ -256,7 +251,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = state.ip_sets.get(&input.ip_set_id) else {
             return Err(UpdateIPSetErrorModeled::WAFNonexistentContainerException(
                 WAFNonexistentContainerException {
-                    message: Some(format!("IPSet {} does not exist", input.ip_set_id)),
+                    message: Some(
+                        crate::state::MESSAGE_NONEXISTENT_CONTAINER.to_string(),
+                    ),
                 },
             )
             .into());
@@ -295,12 +292,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if working.descriptors.len() >= crate::state::MAX_IP_SET_DESCRIPTORS {
                     return Err(UpdateIPSetErrorModeled::WAFLimitsExceededException(
                         WAFLimitsExceededException {
-                            message: Some(format!(
-                                "The request would exceed the maximum number of IP address \
-                                 ranges ({}) allowed in IPSet {}",
-                                crate::state::MAX_IP_SET_DESCRIPTORS,
-                                input.ip_set_id
-                            )),
+                            message: Some(
+                                crate::state::MESSAGE_LIMITS_EXCEEDED.to_string(),
+                            ),
                         },
                     )
                     .into());
@@ -316,11 +310,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !changed {
                 return Err(UpdateIPSetErrorModeled::WAFInvalidOperationException(
                     WAFInvalidOperationException {
-                        message: Some(format!(
-                            "There was nothing to do: the {action} of {kind} {value} leaves \
-                             IPSet {} unchanged",
-                            input.ip_set_id
-                        )),
+                        message: Some(
+                            crate::state::MESSAGE_INVALID_OPERATION.to_string(),
+                        ),
                     },
                 )
                 .into());
@@ -331,11 +323,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.consume_change_token(&input.change_token) {
             return Err(UpdateIPSetErrorModeled::WAFStaleDataException(
                 WAFStaleDataException {
-                    message: Some(format!(
-                        "The change token {} is not a change token this request can use; \
-                         call GetChangeToken for a new one",
-                        input.change_token
-                    )),
+                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
                 },
             )
             .into());
