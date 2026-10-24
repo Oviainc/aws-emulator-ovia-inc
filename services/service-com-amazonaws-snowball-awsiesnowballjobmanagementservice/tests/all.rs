@@ -19,5 +19,7 @@ mod export_job_parts;
 mod job_lifecycle;
 #[path = "all/job_updates.rs"]
 mod job_updates;
+#[path = "all/service_versions.rs"]
+mod service_versions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

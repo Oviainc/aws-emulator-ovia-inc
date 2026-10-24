@@ -7,14 +7,14 @@
 //! conversions and the list cursor codec — so the handlers agree on one implementation
 //! of each instead of carrying a copy apiece that can drift apart.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     Address, DeviceConfiguration, JobListEntry, JobMetadata, JobResource, Notification,
-    OnDeviceServiceConfiguration, PickupDetails, ShippingDetails, TaxDocuments,
+    OnDeviceServiceConfiguration, PickupDetails, ServiceVersion, ShippingDetails, TaxDocuments,
 };
 
 /// What a handler says when the engine it was constructed with does not carry this
@@ -29,11 +29,48 @@ use crate::ops::types::{
 pub const STATE_UNAVAILABLE: &str =
     "the Snowball emulator's state store is not available on this engine";
 
-/// The page size `ListJobs` uses when the caller declares none.
+/// The page size a list operation uses when the caller declares none.
 ///
-/// `MaxResults` is modelled `range 0..100` (`smithy_query(query="operation",
-/// operation="ListJobs")`), so 100 is the largest page the member admits.
+/// `MaxResults` is modelled `range 0..100` on every list operation of this service that
+/// takes one (`smithy_query(query="operation", operation="ListJobs")`,
+/// `operation="ListServiceVersions"`), so 100 is the largest page the member admits.
 pub const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// The `ServiceName` of Kubernetes as a Snow on-device service
+/// (`shared_types::SERVICE_NAME_VALUES`).
+pub const ON_DEVICE_SERVICE_KUBERNETES: &str = "KUBERNETES";
+
+/// The `ServiceName` of Amazon EKS Anywhere as a Snow on-device service
+/// (`shared_types::SERVICE_NAME_VALUES`).
+pub const ON_DEVICE_SERVICE_EKS_ANYWHERE: &str = "EKS_ANYWHERE";
+
+/// The versions of Amazon EKS Anywhere this emulator reports as supported on a Snow
+/// Family device — newest first — each paired with the Kubernetes minor versions that
+/// release runs, newest first.
+///
+/// Source: the Snow Family documentation for Amazon EKS Anywhere on Snow ("Using Amazon
+/// EKS Anywhere on Snow Family devices", AWS Snowball Edge Developer Guide), whose
+/// version table publishes the EKS Anywhere releases available on Snow together with the
+/// Kubernetes versions each release supports: successive releases move the supported
+/// window forward one Kubernetes minor at a time, and the earliest release on Snow
+/// supports a single Kubernetes minor. The matrix below is that table as it stood for the
+/// EKS Anywhere 0.11–0.15 releases, the releases that shipped on Snow when this catalog
+/// was recorded; a later revision of the guide extends the table, so refresh this matrix
+/// from it rather than assuming it is current. The concrete versions a deployment offers
+/// are exactly what `ListServiceVersions` reports, which is why a caller reads them from
+/// this operation rather than assuming them, and this matrix is what this emulator holds
+/// to report.
+///
+/// This is the ONE place the support matrix is written down: the Kubernetes catalog is
+/// derived from it by [`seed_service_versions`], so the two services can never report
+/// version sets that contradict each other.
+const EKS_ANYWHERE_SUPPORT_MATRIX: &[(&str, &[&str])] = &[
+    ("0.15.0", &["1.25", "1.24", "1.23"]),
+    ("0.14.0", &["1.24", "1.23", "1.22"]),
+    ("0.13.0", &["1.23", "1.22", "1.21"]),
+    ("0.12.0", &["1.22", "1.21"]),
+    ("0.11.0", &["1.21"]),
+];
 
 /// The most addresses this store holds.
 ///
@@ -313,15 +350,92 @@ fn mint_id(prefix: &str, seq: u64, now: SystemTime) -> String {
     )
 }
 
-/// The `ListJobs` cursor for a page that starts at `job_id`.
+/// One supported version of a Snow on-device service, and what that version runs on.
 ///
-/// Hex of the id: the token carries nothing but the key the next page resumes at, and a
-/// cursor is only ever handed back unchanged. It is not a capability — `ListJobs`
-/// resumes only from a job the store actually holds, and refuses anything else — so the
+/// The catalog record behind `ServiceVersion`: it carries the version itself plus one
+/// entry per dependent-service pairing the version supports, so a release that runs three
+/// Kubernetes minors carries three.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredServiceVersion {
+    /// The version, as `ServiceVersion$Version` reports it.
+    pub version: String,
+    /// The `ServiceName` of each service this version depends on, paired with a version
+    /// of that service it supports.
+    pub dependencies: Vec<(String, String)>,
+}
+
+impl StoredServiceVersion {
+    /// This record as the modelled `ServiceVersion`.
+    pub fn to_modeled(&self) -> ServiceVersion {
+        ServiceVersion {
+            version: Some(self.version.clone()),
+        }
+    }
+
+    /// Whether this version runs `version` of the dependent service `service_name` —
+    /// or any version of it, when `version` is `None`.
+    pub fn depends_on(&self, service_name: &str, version: Option<&str>) -> bool {
+        self.dependencies.iter().any(|(dependency, supported)| {
+            dependency == service_name && version.is_none_or(|needed| supported == needed)
+        })
+    }
+}
+
+/// This emulator's on-device service version catalog, keyed by `ServiceName`.
+///
+/// Derived from [`EKS_ANYWHERE_SUPPORT_MATRIX`]: the EKS Anywhere entry is the matrix
+/// itself, and the Kubernetes entry is every Kubernetes version some supported EKS
+/// Anywhere release runs, in first-seen order over a matrix written newest-first — so
+/// the Kubernetes catalog is newest-first too. Kubernetes on a Snow device depends on no
+/// further on-device service, so its entries carry no dependencies.
+fn seed_service_versions() -> BTreeMap<String, Vec<StoredServiceVersion>> {
+    let eks_anywhere: Vec<StoredServiceVersion> = EKS_ANYWHERE_SUPPORT_MATRIX
+        .iter()
+        .map(|(version, kubernetes_versions)| StoredServiceVersion {
+            version: (*version).to_string(),
+            dependencies: kubernetes_versions
+                .iter()
+                .map(|kubernetes_version| {
+                    (
+                        ON_DEVICE_SERVICE_KUBERNETES.to_string(),
+                        (*kubernetes_version).to_string(),
+                    )
+                })
+                .collect(),
+        })
+        .collect();
+
+    let mut kubernetes: Vec<StoredServiceVersion> = Vec::new();
+    for (_, kubernetes_versions) in EKS_ANYWHERE_SUPPORT_MATRIX {
+        for kubernetes_version in *kubernetes_versions {
+            if kubernetes
+                .iter()
+                .all(|held| held.version != *kubernetes_version)
+            {
+                kubernetes.push(StoredServiceVersion {
+                    version: (*kubernetes_version).to_string(),
+                    dependencies: Vec::new(),
+                });
+            }
+        }
+    }
+
+    BTreeMap::from([
+        (ON_DEVICE_SERVICE_EKS_ANYWHERE.to_string(), eks_anywhere),
+        (ON_DEVICE_SERVICE_KUBERNETES.to_string(), kubernetes),
+    ])
+}
+
+/// A list operation's cursor for a page that starts at `key` — a job id for `ListJobs`,
+/// a version for `ListServiceVersions`.
+///
+/// Hex of the key: the token carries nothing but the key the next page resumes at, and a
+/// cursor is only ever handed back unchanged. It is not a capability — a list operation
+/// resumes only from an entry the store actually holds, and refuses anything else — so the
 /// encoding's job is to keep the token out of a caller's business logic, not to be
 /// unguessable.
-pub fn encode_cursor(job_id: &str) -> String {
-    ::hex::encode(job_id.as_bytes())
+pub fn encode_cursor(key: &str) -> String {
+    ::hex::encode(key.as_bytes())
 }
 
 /// The inclusive start key a cursor minted by [`encode_cursor`] carries, or `None` when
@@ -331,7 +445,7 @@ pub fn decode_cursor(token: &str) -> Option<String> {
 }
 
 /// Per-service state for com-amazonaws-snowball-awsiesnowballjobmanagementservice. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     /// Every address `CreateAddress` stored, keyed by the `AddressId` it minted.
     pub addresses: HashMap<String, StoredAddress>,
@@ -339,13 +453,40 @@ pub struct ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     pub jobs: HashMap<String, StoredJob>,
     /// The ids in `jobs` in creation order, so `ListJobs` pages deterministically.
     pub job_order: Vec<String>,
+    /// The versions of each Snow on-device service this emulator supports, keyed by the
+    /// service's `ServiceName` and held newest-version-first, so `ListServiceVersions`
+    /// pages deterministically. Seeded by [`seed_service_versions`] when the store is
+    /// first touched: the supported versions of an on-device service are the service's
+    /// own catalog, not something a caller creates.
+    service_versions: BTreeMap<String, Vec<StoredServiceVersion>>,
     /// How many addresses this store has ever minted an id for, and how many jobs: the
     /// per-store sequence [`mint_id`] hashes, so two records never share an id.
     next_address_seq: u64,
     next_job_seq: u64,
 }
 
+impl Default for ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
+    /// A store holding no address and no job, and the on-device service version catalog
+    /// this emulator supports — the one state the engine builds on first touch.
+    fn default() -> Self {
+        Self {
+            addresses: HashMap::new(),
+            jobs: HashMap::new(),
+            job_order: Vec::new(),
+            service_versions: seed_service_versions(),
+            next_address_seq: 0,
+            next_job_seq: 0,
+        }
+    }
+}
+
 impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
+    /// The supported versions of the on-device service `service_name`, newest first, or
+    /// `None` when this store holds no such service.
+    pub fn service_versions(&self, service_name: &str) -> Option<&[StoredServiceVersion]> {
+        self.service_versions.get(service_name).map(Vec::as_slice)
+    }
+
     /// Whether this store can hold another address, i.e. is below
     /// [`MAX_STORED_ADDRESSES`].
     pub fn can_store_another_address(&self) -> bool {

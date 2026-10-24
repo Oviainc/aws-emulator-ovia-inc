@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServiceVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServiceVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServiceVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the versions of a Snow on-device service this emulator supports, read from
+//! the version catalog in [`crate::state`] and paged the way this service's other list
+//! operations page.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +81,114 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::StoredServiceVersion;
+
+/// How this operation names a dependent service the requested service does not have, or
+/// a version of one it cannot be run against: `InvalidResourceException$ResourceType`
+/// reports "the provided resource value is invalid", so it names which of the two the
+/// request got wrong.
+const DEPENDENT_SERVICE_RESOURCE_TYPE: &str = "dependentService";
+const DEPENDENT_SERVICE_VERSION_RESOURCE_TYPE: &str = "dependentServiceVersion";
+
+/// The `ServiceName` of the service whose versions a request asks for, when that service
+/// is not one this emulator's catalog holds.
+const SERVICE_RESOURCE_TYPE: &str = "service";
+
+/// A `DependentServices` entry as this handler reads it: the dependent service's
+/// `ServiceName`, and the version of it the entry pins, if any.
+///
+/// A member that is absent, empty or nothing but whitespace names no service and no
+/// version, so it counts as unset — the same reading `CreateAddress` gives a submitted
+/// address member.
+fn dependent_pin(dependent: &DependentService) -> (Option<&str>, Option<&str>) {
+    let name = dependent
+        .service_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let version = dependent
+        .service_version
+        .as_ref()
+        .and_then(|version| version.version.as_deref())
+        .map(str::trim)
+        .filter(|version| !version.is_empty());
+    (name, version)
+}
+
+/// Whether some version of `versions` depends on the service `service_name`, i.e.
+/// whether it is a dependent service of the service those versions belong to.
+fn is_dependent_service(versions: &[StoredServiceVersion], service_name: &str) -> bool {
+    versions
+        .iter()
+        .any(|version| version.depends_on(service_name, None))
+}
+
+/// The dependent services of the versions on this page, as the modelled
+/// `DependentServiceList`: the distinct pairings those versions run against, in page
+/// order, restricted to the version `pins` pinned for a dependent service.
+///
+/// Every entry comes from the catalog entries actually reported, so the list describes
+/// the answer rather than repeating the request: a service that depends on nothing
+/// carries none, an unpinned walk carries every pairing its versions support, and a walk
+/// pinned to one version of a dependent service carries the pairing it was selected for.
+fn dependent_services(
+    page: &[&StoredServiceVersion],
+    pins: &[(&str, Option<&str>)],
+) -> Vec<DependentService> {
+    let mut reported: Vec<(&str, &str)> = Vec::new();
+    for version in page {
+        for (dependency, supported) in &version.dependencies {
+            let pairing = (dependency.as_str(), supported.as_str());
+            let pinned_away = pins.iter().any(|(name, pinned)| {
+                *name == pairing.0 && pinned.is_some_and(|pinned| pinned != pairing.1)
+            });
+            if !pinned_away && !reported.contains(&pairing) {
+                reported.push(pairing);
+            }
+        }
+    }
+    reported
+        .into_iter()
+        .map(|(dependency, supported)| DependentService {
+            service_name: Some(dependency.to_string()),
+            service_version: Some(ServiceVersion {
+                version: Some(supported.to_string()),
+            }),
+        })
+        .collect()
+}
+
+/// The walk a cursor belongs to: the service whose catalog is being paged and the
+/// dependent-service pins that selected the list, so a token can only resume the walk it
+/// was minted for.
+///
+/// A `ListServiceVersions` walk is defined by its `ServiceName` AND its
+/// `DependentServices`, so a cursor that carried only the version would resume a
+/// different list whenever either changed — skipping or repeating entries instead of
+/// refusing. The pins are sorted so the same filter always names the same walk however a
+/// caller ordered the list, and `*` stands for an entry that pinned no version.
+fn cursor_context(service_name: &str, pins: &[(&str, Option<&str>)]) -> String {
+    let mut pinned: Vec<String> = pins
+        .iter()
+        .map(|(name, version)| format!("{name}={}", version.unwrap_or("*")))
+        .collect();
+    pinned.sort();
+    format!("{service_name}|{}", pinned.join(","))
+}
+
+/// The cursor for a page of `context`'s walk that starts at `version`.
+fn cursor(context: &str, version: &str) -> String {
+    crate::state::encode_cursor(&format!("{context}|{version}"))
+}
+
+/// The version a cursor minted for `context`'s walk resumes at, or `None` when the token
+/// is not one this service minted for this walk.
+fn cursor_version(context: &str, token: &str) -> Option<String> {
+    crate::state::decode_cursor(token)?
+        .strip_prefix(&format!("{context}|"))
+        .map(str::to_string)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -117,6 +220,29 @@ impl From<ListServiceVersionsErrorModeled> for ListServiceVersionsError {
     fn from(modeled: ListServiceVersionsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The modelled refusal for a resource this request names that the service cannot find:
+/// a service, a dependent service or a version of one that is not in the catalog.
+fn invalid_resource(message: String, resource_type: &str) -> ListServiceVersionsError {
+    ListServiceVersionsErrorModeled::InvalidResourceException(InvalidResourceException {
+        message: Some(message),
+        resource_type: Some(resource_type.to_string()),
+    })
+    .into()
+}
+
+/// The modelled refusal for a `NextToken` this service did not mint, or that no longer
+/// names an entry of the list being paged.
+fn invalid_next_token() -> ListServiceVersionsError {
+    ListServiceVersionsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+        message: Some(
+            "The NextToken string was altered unexpectedly, and the operation has stopped. \
+             Run the operation without changing the NextToken string, and try again."
+                .to_string(),
+        ),
+    })
+    .into()
 }
 
 /// The `ListServiceVersions` operation.
@@ -155,18 +281,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServiceVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServiceVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServiceVersions"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STATE_UNAVAILABLE,
+            ));
+        };
+        // A read: the supported versions of an on-device service are the service's own
+        // catalog, so this operation reports what the store holds and writes nothing.
+        let store = state.lock();
+
+        // `ServiceName` is a modelled enum, so the boundary validator has already refused
+        // every value outside `EKS_ANYWHERE | KUBERNETES` and the member is compared
+        // verbatim: this is the catalog lookup, not a normalisation step.
+        let service_name = input.service_name.clone();
+        let Some(versions) = store.service_versions(&service_name) else {
+            return Err(invalid_resource(
+                format!(
+                    "The service {service_name} can't be found. Check the information you \
+                     provided in your last request, and try again."
+                ),
+                SERVICE_RESOURCE_TYPE,
+            ));
+        };
+
+        // `DependentServices` names "dependant services of the requested service", so
+        // each entry narrows the answer to the versions that run it: a service the
+        // requested service does not depend on, or a version of one no supported version
+        // runs, names a resource this service cannot find.
+        let mut pins: Vec<(&str, Option<&str>)> = Vec::new();
+        for dependent in input.dependent_services.iter().flatten() {
+            let (Some(dependent_name), pinned) = dependent_pin(dependent) else {
+                return Err(invalid_resource(
+                    "A dependent service must name the service it is a dependency of. Check \
+                     the information you provided in your last request, and try again."
+                        .to_string(),
+                    DEPENDENT_SERVICE_RESOURCE_TYPE,
+                ));
+            };
+            if !is_dependent_service(versions, dependent_name) {
+                return Err(invalid_resource(
+                    format!(
+                        "{service_name} has no dependent service {dependent_name}. Check the \
+                         information you provided in your last request, and try again."
+                    ),
+                    DEPENDENT_SERVICE_RESOURCE_TYPE,
+                ));
+            }
+            if let Some(pinned) = pinned {
+                if !versions
+                    .iter()
+                    .any(|version| version.depends_on(dependent_name, Some(pinned)))
+                {
+                    return Err(invalid_resource(
+                        format!(
+                            "No supported version of {service_name} runs {dependent_name} \
+                             {pinned}. Check the information you provided in your last \
+                             request, and try again."
+                        ),
+                        DEPENDENT_SERVICE_VERSION_RESOURCE_TYPE,
+                    ));
+                }
+            }
+            pins.push((dependent_name, pinned));
+        }
+
+        // The supported versions this request asks about: every version in the catalog
+        // that runs each dependent service the request pinned, in catalog order (newest
+        // first), and all of them when it pinned none.
+        let matching: Vec<&StoredServiceVersion> = versions
+            .iter()
+            .filter(|version| {
+                pins.iter()
+                    .all(|(dependent_name, pinned)| version.depends_on(dependent_name, *pinned))
+            })
+            .collect();
+
+        // `MaxResults` is modelled `range 0..100` and is "the maximum number of
+        // ListServiceVersions objects to return". A page of zero entries with a
+        // continuation token would never advance the walk, so the only reading of 0 under
+        // which the walk terminates is "unspecified" — the same as omitting the member,
+        // which gets the largest page the member admits.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .filter(|max| *max > 0)
+            .unwrap_or(crate::state::DEFAULT_MAX_RESULTS);
+
+        // A `NextToken` is one this service minted on an earlier page of THIS walk — the
+        // same service and the same dependent-service pins — and it names the version
+        // that page stopped before. A token that decodes to nothing, that was minted for
+        // another walk, or that names a version this list does not hold cannot be resumed
+        // from.
+        let context = cursor_context(&service_name, &pins);
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => cursor_version(&context, token)
+                .and_then(|version| matching.iter().position(|held| held.version == version))
+                .ok_or_else(invalid_next_token)?,
+        };
+
+        let page: Vec<&StoredServiceVersion> =
+            matching[start..].iter().copied().take(page_size).collect();
+        // Only a page with versions after it carries a token; the last page carries none.
+        let next_token = matching
+            .get(start + page.len())
+            .map(|version| cursor(&context, &version.version));
+        let reported_dependencies = dependent_services(&page, &pins);
+
+        Ok(ListServiceVersionsOutput {
+            service_versions: page
+                .iter()
+                .map(|version| version.to_modeled())
+                .collect(),
+            service_name,
+            // A service that depends on nothing reports no dependent services at all,
+            // rather than an empty list claiming the answer has a dependency context.
+            dependent_services: (!reported_dependencies.is_empty())
+                .then_some(reported_dependencies),
+            next_token,
+        })
     }
 }
