@@ -372,25 +372,37 @@ async fn a_delete_the_service_refuses() {
     );
 }
 
-/// The id length table: the bound the service publishes
-/// (`state::USER_ID_LENGTH_LIMIT` — "User id length must be less than 40."), the longest
-/// id under it, and lengths at and past it.
+/// The id length table: the maximum length the service publishes
+/// (`state::MAX_USER_ID_LEN` — ElastiCache documents a user id as 1 to 40 characters),
+/// the length one under it, the maximum ITSELF (which is accepted), and lengths past it.
 #[tokio::test]
-async fn a_user_id_at_or_past_the_length_bound_is_refused() {
+async fn a_user_id_past_the_length_bound_is_refused() {
     let emulator = Emulator::new();
-    let limit = state::USER_ID_LENGTH_LIMIT;
-    for length in [limit - 1, limit, limit + 1, limit * 2] {
+    let maximum = state::MAX_USER_ID_LEN;
+    for length in [1, maximum - 1, maximum, maximum + 1, maximum * 2] {
         // Only the length varies: the id is a run of one letter, which the modelled
         // `UserId` pattern accepts at any length.
         let id = "u".repeat(length);
         let case = format!("a {length}-character id");
         let created = create_user(&emulator, &id, "on ~* +@all").await;
+        // An id a create stored must be an id every later call can ADDRESS, so each
+        // accepted row is read back through `DescribeUsers` before it is deleted.
+        let described = emulator
+            .call("DescribeUsers", &params(&[("UserId", &id)]))
+            .await;
         let deleted = emulator.call("DeleteUser", &params(&[("UserId", &id)])).await;
-        if length < limit {
+        if length <= maximum {
             assert_eq!(
                 created.status, 200,
-                "case {case}: an id under the bound must be accepted, got {} {}",
+                "case {case}: an id at or under the bound must be accepted, got {} {}",
                 created.status, created.body
+            );
+            assert_eq!(
+                (described.status, described.text("UserId")),
+                (200, Some(id.as_str())),
+                "case {case}: DescribeUsers must report the user it created, got {} {}",
+                described.status,
+                described.body
             );
             assert_eq!(
                 deleted.status, 200,
