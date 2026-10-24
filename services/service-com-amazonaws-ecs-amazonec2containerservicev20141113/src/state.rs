@@ -788,6 +788,12 @@ pub const MAX_CLIENT_TOKEN_LENGTH: usize = 36;
 /// may specify up to 10 services to describe in a single operation."
 pub const MAX_DESCRIBE_SERVICES: usize = 10;
 
+/// How many tags ONE resource may carry, whoever wrote them. The `Tag` doc's first
+/// restriction: "Maximum number of tags per resource - 50" — the same number the `Tags`
+/// list's own length constraint caps a single request at, which is why it bites only
+/// where a request ADDS to a set a resource already carries.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
 // The message of a refusal whose condition is that a NAMED resource does not exist.
 // Amazon ECS answers most of these with ONE fixed sentence that names no resource: the
 // same text for every request that meets the condition, whatever cluster, service, task
@@ -4161,6 +4167,62 @@ pub fn invalid_resource_arn_message(resource_arn: &str) -> String {
         "resourceArn must be an Amazon ECS resource ARN naming one of {}; got \
          {resource_arn:?}",
         kinds.join(", ")
+    )
+}
+
+/// Associate `requested` with the tag set `stored`, the way a tagging write does:
+/// "Associates the specified tags to a resource with the specified resourceArn. If
+/// existing tags on a resource aren't specified in the request parameters, they aren't
+/// changed."
+///
+/// So a key the request names takes the value the request gives it ("each tag key must be
+/// unique, and each tag key can have only one value"), a key the resource does not carry
+/// yet is added, and a key the request does not name keeps the value it had. Keys compare
+/// EXACTLY — "Tag keys and values are case-sensitive" — and the request's entries are
+/// applied in order, so the resource ends up with one entry per key whatever the request
+/// listed. The value is stored as the request gave it, so an empty value stays an empty
+/// value rather than reading as a key with none.
+///
+/// `Err` carries the message of the resource limit the merged set would break ("Maximum
+/// number of tags per resource - 50", [`MAX_TAGS_PER_RESOURCE`]); `stored` is left
+/// untouched in that case, so a refused write changes nothing.
+pub fn merge_tags(stored: &mut Vec<Tag>, requested: &[Tag]) -> Result<(), String> {
+    let mut merged = stored.clone();
+    for tag in requested {
+        match merged.iter_mut().find(|existing| existing.key == tag.key) {
+            Some(existing) => existing.value = tag.value.clone(),
+            None => merged.push(tag.clone()),
+        }
+    }
+    if merged.len() > MAX_TAGS_PER_RESOURCE {
+        return Err(tags_per_resource_limit_message(merged.len()));
+    }
+    *stored = merged;
+    Ok(())
+}
+
+/// Delete the tags `tag_keys` names from the tag set `stored`: "Deletes specified tags
+/// from a resource", where the keys are "the keys of the tags to be removed".
+///
+/// A key the resource does not carry removes nothing, so asking twice leaves the same tag
+/// set as asking once, and a key the request does not name is left where it is.
+pub fn remove_tags(stored: &mut Vec<Tag>, tag_keys: &[String]) {
+    stored.retain(|tag| {
+        !tag_keys
+            .iter()
+            .any(|removed| tag.key.as_deref() == Some(removed.as_str()))
+    });
+}
+
+/// `LimitExceededException$message` for a tagging write whose merged tag set would carry
+/// more than [`MAX_TAGS_PER_RESOURCE`] tags.
+///
+/// DERIVED from the request: it names the limit and how many tags the resource would be
+/// left carrying, so a caller can tell how far over it went.
+pub fn tags_per_resource_limit_message(merged_count: usize) -> String {
+    format!(
+        "The limit of {MAX_TAGS_PER_RESOURCE} tags per resource was exceeded: the request \
+         would leave the resource with {merged_count} tags"
     )
 }
 
