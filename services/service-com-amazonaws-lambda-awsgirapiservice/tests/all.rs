@@ -61,6 +61,8 @@ mod layer_versions;
 mod policy_versions_and_resources;
 #[path = "all/provisioned_concurrency.rs"]
 mod provisioned_concurrency;
+#[path = "all/provisioned_concurrency_resolution.rs"]
+mod provisioned_concurrency_resolution;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/resource_tags.rs"]

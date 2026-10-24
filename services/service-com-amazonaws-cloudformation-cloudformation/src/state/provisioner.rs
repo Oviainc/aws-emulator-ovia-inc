@@ -80,6 +80,13 @@
 //!   `IPSetDescriptors` entry is INSERTed by an `UpdateIPSet`, and both carry a change
 //!   token of their own. Its identity is its owning service's too ("Ref returns the IPSet
 //!   ID"), so its arm answers the `IPSetId` AWS WAF returned as the resource's physical id.
+//! * `AWS::Grafana::Workspace`'s properties are `CreateWorkspace`'s own members under
+//!   DIFFERENT names — the type spells the workspace's own fields without the `workspace`
+//!   prefix that API carries (`Name`/`Description`/`RoleArn`/`DataSources` against
+//!   `workspaceName`/`workspaceDescription`/`workspaceRoleArn`/`workspaceDataSources`) —
+//!   so its arm names the members the resource reference publishes one by one and sends
+//!   nothing for a property the template leaves out. Its identity is that service's as
+//!   well: Amazon Managed Grafana mints the workspace id its `Ref` returns.
 //! * `AWS::EMR::Cluster`'s are mostly `RunJobFlow`'s own members (`ReleaseLabel`,
 //!   `Applications`, `BootstrapActions`, `Tags`, the roles and the scalars), so they pass
 //!   through verbatim; the two that are shaped differently are mapped — the per-role
@@ -168,9 +175,9 @@ use super::provisioning::{
 use super::template::{
     AOSS_COLLECTION, AOSS_SECURITY_POLICY, CLOUDWATCH_METRIC_STREAM, ECR_PUBLIC_REPOSITORY,
     ECS_CLUSTER, EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
-    GUARDDUTY_DETECTOR, S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX, S3VECTORS_VECTOR_BUCKET,
-    SAGEMAKER_MODEL_PACKAGE_GROUP, SNS_TOPIC, SQS_QUEUE, SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY,
-    WAF_REGIONAL_IP_SET,
+    GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
+    S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SNS_TOPIC, SQS_QUEUE, SSM_PARAMETER,
+    STEP_FUNCTIONS_ACTIVITY, WAF_REGIONAL_IP_SET,
 };
 use super::StoredResource;
 
@@ -219,6 +226,7 @@ pub(super) enum Provisioner {
     SnsTopic,
     FisExperimentTemplate,
     WafRegionalIpSet,
+    GrafanaWorkspace,
     GuardDutyDetector,
     RdsDbInstance,
     RdsDbSubnetGroup,
@@ -248,6 +256,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         SNS_TOPIC => Some(Provisioner::SnsTopic),
         FIS_EXPERIMENT_TEMPLATE => Some(Provisioner::FisExperimentTemplate),
         WAF_REGIONAL_IP_SET => Some(Provisioner::WafRegionalIpSet),
+        GRAFANA_WORKSPACE => Some(Provisioner::GrafanaWorkspace),
         GUARDDUTY_DETECTOR => Some(Provisioner::GuardDutyDetector),
         RDS_DB_INSTANCE => Some(Provisioner::RdsDbInstance),
         RDS_DB_SUBNET_GROUP => Some(Provisioner::RdsDbSubnetGroup),
@@ -314,6 +323,9 @@ impl Provisioner {
             // `AWS::WAFRegional::IPSet` publishes `Name` and `IPSetDescriptors` and no
             // `Tags`: the type is not taggable, so no tags are propagated to it.
             Self::WafRegionalIpSet => create_ip_set(ctx, region, resource).await,
+            // `AWS::Grafana::Workspace` publishes no `Tags` property either, so the type
+            // is not taggable and no stack tags are propagated to it.
+            Self::GrafanaWorkspace => create_workspace(ctx, region, resource).await,
             // `AWS::OpenSearchServerless::SecurityPolicy` publishes no `Tags` property and
             // `CreateSecurityPolicy` takes none, so a policy carries no propagated tag.
             Self::OpenSearchServerlessSecurityPolicy => {
@@ -479,6 +491,9 @@ impl Provisioner {
                 delete_experiment_template(ctx, region, physical_resource_id).await
             }
             Self::WafRegionalIpSet => delete_ip_set(ctx, region, physical_resource_id).await,
+            Self::GrafanaWorkspace => {
+                delete_workspace(ctx, region, physical_resource_id).await
+            }
             Self::GuardDutyDetector => delete_detector(ctx, region, physical_resource_id).await,
             // The delete carries one member off the resource's own declaration
             // (`DeleteAutomatedBackups`), so it takes the record rather than the id.
@@ -549,6 +564,9 @@ impl Provisioner {
                 describe_experiment_template(ctx, region, physical_resource_id).await
             }
             Self::WafRegionalIpSet => describe_ip_set(ctx, region, physical_resource_id).await,
+            Self::GrafanaWorkspace => {
+                describe_workspace(ctx, region, physical_resource_id).await
+            }
             Self::GuardDutyDetector => describe_detector(ctx, region, physical_resource_id).await,
             Self::RdsDbInstance => {
                 describe_db_instance(ctx, region, physical_resource_id).await
@@ -3880,7 +3898,7 @@ async fn create_ip_set(
     resource: &StoredResource,
 ) -> Result<Created, Refusal> {
     let request = serde_json::json!({
-        "Name": ip_set_name(resource),
+        "Name": declared_name(resource),
         "ChangeToken": waf_regional_change_token(ctx, region).await?,
     });
     let reported = call_waf_regional(ctx, region, "CreateIPSet", &request).await?;
@@ -4022,14 +4040,17 @@ fn declared_ip_set_descriptors(properties: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// The NAME of the IPSet a resource record declares: the `Name` its type's property
-/// carries, which is the name the template asked for or the `<stack>-<logical id>-<suffix>`
-/// name CloudFormation generated for it — never the physical id, which for this type is the
-/// id AWS WAF Classic minted once the create went through.
+/// The NAME a resource record declares, for a type whose PHYSICAL id is the identifier the
+/// owning service minted: the `Name` the record's attribute carries, which is the name the
+/// template asked for or the `<stack>-<logical id>-<suffix>` name CloudFormation generated
+/// for it — never the physical id, which for such a type is the service's own identifier
+/// once the create went through.
 ///
 /// A record with no such attribute (one whose attribute budget was spent) falls back to the
-/// physical id, which before the create IS that computed name.
-fn ip_set_name(resource: &StoredResource) -> String {
+/// physical id, which before the create IS that computed name. Shared by every arm in that
+/// position (an AWS WAF Classic regional IPSet, an Amazon Managed Grafana workspace), so
+/// the create of one cannot read the declared name differently from the create of another.
+fn declared_name(resource: &StoredResource) -> String {
     resource
         .attributes
         .get("Name")
@@ -4256,6 +4277,183 @@ async fn describe_detector(
 /// internal failure, which says nothing about whether the detector is there.
 fn guardduty_rejected(refusal: &Refusal) -> bool {
     refusal.code == GUARDDUTY_INVALID_INPUT || refusal.code == GUARDDUTY_BAD_REQUEST
+}
+
+// ---------------------------------------------------------------------------
+// Amazon Managed Grafana: AWS::Grafana::Workspace
+// ---------------------------------------------------------------------------
+
+/// Amazon Managed Grafana's signing name, from its model (`sigv4Name: grafana`). That
+/// service speaks `restJson1`, so its operations are bound to a METHOD and a URI rather
+/// than to an `X-Amz-Target` header: `CreateWorkspace` is `POST /workspaces`,
+/// `DeleteWorkspace` is `DELETE /workspaces/{workspaceId}` and `DescribeWorkspace` is
+/// `GET /workspaces/{workspaceId}` (`smithy_query(query="operation",
+/// operation="CreateWorkspace,DeleteWorkspace,DescribeWorkspace")` on that service's
+/// model).
+const GRAFANA_SIGNING_NAME: &str = "grafana";
+
+/// The URI `CreateWorkspace` is bound to, and the collection the per-workspace URIs hang
+/// off.
+const GRAFANA_WORKSPACES_URI: &str = "/workspaces";
+
+/// The error code Amazon Managed Grafana answers for a workspace it does not hold
+/// (`ResourceNotFoundException`, a modelled error of `DeleteWorkspace` and
+/// `DescribeWorkspace`).
+const GRAFANA_RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// The `AWS::Grafana::Workspace` properties `CreateWorkspace` takes whose value goes
+/// through unchanged under the member named beside it, as (property, member) pairs.
+///
+/// Source: AWS's CloudFormation resource reference for the type against the
+/// `CreateWorkspaceRequest` shape. The type spells the workspace's own fields without the
+/// `workspace` prefix that API carries, so the correspondence is a per-member one rather
+/// than a case change: `Description` is `workspaceDescription`, `RoleArn` is
+/// `workspaceRoleArn`, `DataSources` is `workspaceDataSources`,
+/// `NotificationDestinations` is `workspaceNotificationDestinations` and
+/// `OrganizationalUnits` is `workspaceOrganizationalUnits`, while
+/// `AccountAccessType`, `AuthenticationProviders`, `ClientToken`, `GrafanaVersion`,
+/// `OrganizationRoleName`, `PermissionType` and `StackSetName` differ only in the first
+/// character's case.
+///
+/// `Name` is NOT here: it is the one value CloudFormation decides (the name the template
+/// declared, or the one it generated), so [`workspace_name`] is what the create carries
+/// out. `VpcConfiguration` and `NetworkAccessControl` are not here either, because their
+/// own members have to be mapped one structure at a time.
+const GRAFANA_WORKSPACE_MEMBERS: &[(&str, &str)] = &[
+    ("AccountAccessType", "accountAccessType"),
+    ("AuthenticationProviders", "authenticationProviders"),
+    ("ClientToken", "clientToken"),
+    ("DataSources", "workspaceDataSources"),
+    ("Description", "workspaceDescription"),
+    ("GrafanaVersion", "grafanaVersion"),
+    ("NotificationDestinations", "workspaceNotificationDestinations"),
+    ("OrganizationRoleName", "organizationRoleName"),
+    ("OrganizationalUnits", "workspaceOrganizationalUnits"),
+    ("PermissionType", "permissionType"),
+    ("RoleArn", "workspaceRoleArn"),
+    ("StackSetName", "stackSetName"),
+];
+
+/// The members of the type's `VpcConfiguration` property, as `VpcConfiguration` declares
+/// them.
+const GRAFANA_VPC_MEMBERS: &[(&str, &str)] = &[
+    ("SecurityGroupIds", "securityGroupIds"),
+    ("SubnetIds", "subnetIds"),
+];
+
+/// The members of the type's `NetworkAccessControl` property, as
+/// `NetworkAccessConfiguration` declares them.
+const GRAFANA_NETWORK_ACCESS_MEMBERS: &[(&str, &str)] =
+    &[("PrefixListIds", "prefixListIds"), ("VpceIds", "vpceIds")];
+
+/// The properties of the type this provisioner does not map onto `CreateWorkspace`'s
+/// request, because that operation takes neither: a workspace's SAML configuration is
+/// written by `UpdateWorkspaceAuthentication` and its plugin administration by
+/// `UpdateWorkspaceConfiguration`.
+const GRAFANA_UNMAPPED_PROPERTIES: &[&str] = &["SamlConfiguration", "PluginAdminEnabled"];
+
+/// Create the workspace an `AWS::Grafana::Workspace` declares, so a client that reads the
+/// id out of the stack's outputs can call Amazon Managed Grafana with it
+/// (`DescribeWorkspace`, `UpdateWorkspace`) rather than being handed an id that service
+/// never minted.
+///
+/// Amazon Managed Grafana ASSIGNS the id — `Ref` of the type returns the workspace id,
+/// a `^g-[0-9a-f]{10}$` value, while the type's `Name` is only what the create asks for —
+/// so the id this call answers with becomes the resource's physical id, replacing the
+/// stand-in the naming rules computed.
+async fn create_workspace(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    if let Some(property) = GRAFANA_UNMAPPED_PROPERTIES
+        .iter()
+        .find(|property| properties.contains_key(**property))
+    {
+        // The property is not mapped onto `CreateWorkspace`, so creating the workspace
+        // would create one configured differently from the declaration. Refused rather
+        // than silently dropped; mapping it is its own fix.
+        return Err(Refusal {
+            code: "NotImplemented".to_string(),
+            message: format!(
+                "this emulator does not implement the {property} property of {}",
+                resource.resource_type
+            ),
+        });
+    }
+    let mut request = Map::new();
+    copy_members(&properties, GRAFANA_WORKSPACE_MEMBERS, &mut request);
+    request.insert(
+        "workspaceName".to_string(),
+        Value::String(declared_name(resource)),
+    );
+    if let Some(configuration) = properties.get("VpcConfiguration") {
+        request.insert(
+            "vpcConfiguration".to_string(),
+            mapped_members(configuration, GRAFANA_VPC_MEMBERS),
+        );
+    }
+    if let Some(configuration) = properties.get("NetworkAccessControl") {
+        request.insert(
+            "networkAccessControl".to_string(),
+            mapped_members(configuration, GRAFANA_NETWORK_ACCESS_MEMBERS),
+        );
+    }
+    let reported = call_rest_json(
+        ctx,
+        GRAFANA_SIGNING_NAME,
+        region,
+        "POST",
+        GRAFANA_WORKSPACES_URI,
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let Some(id) = reported
+        .get("workspace")
+        .and_then(|workspace| workspace.get("id"))
+        .and_then(Value::as_str)
+    else {
+        // The create answered a success identifying no workspace, so there is nothing a
+        // client could call Amazon Managed Grafana with: reported as a refusal rather
+        // than recorded as a created resource.
+        return Err(Refusal {
+            code: "InternalFailure".to_string(),
+            message: "CreateWorkspace answered no workspace id".to_string(),
+        });
+    };
+    Ok(Created {
+        physical_resource_id: Some(id.to_string()),
+        attributes: BTreeMap::new(),
+    })
+}
+
+/// Delete the workspace a stack created, by the id Amazon Managed Grafana minted for it —
+/// this resource's physical id. A workspace that service no longer holds
+/// (`ResourceNotFoundException`) is already in the state the delete asks for.
+async fn delete_workspace(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    match call_rest_json(
+        ctx,
+        GRAFANA_SIGNING_NAME,
+        region,
+        "DELETE",
+        &format!("{GRAFANA_WORKSPACES_URI}/{physical_resource_id}"),
+        None,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == GRAFANA_RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4537,6 +4735,35 @@ async fn delete_db_instance(
             Ok(())
         }
         Err(refusal) if refusal.code == DB_INSTANCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The workspace's configuration as Amazon Managed Grafana reports it, for drift
+/// detection: `DescribeWorkspace`'s own record, read by the id that service minted.
+///
+/// A workspace it no longer holds (`ResourceNotFoundException`) was deleted. The record's
+/// members are that service's own (lower camel, `workspace`-prefixed for several), so only
+/// a declared property spelled identically on both sides takes part in the comparison —
+/// the position the Amazon ECS and AWS FIS arms above are in too, and what [`super::drift`]
+/// documents: a name mismatch reports the resource as existing rather than as modified.
+async fn describe_workspace(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    match call_rest_json(
+        ctx,
+        GRAFANA_SIGNING_NAME,
+        region,
+        "GET",
+        &format!("{GRAFANA_WORKSPACES_URI}/{physical_resource_id}"),
+        None,
+    )
+    .await
+    {
+        Ok(answer) => Ok(answer.get("workspace").cloned()),
+        Err(refusal) if refusal.code == GRAFANA_RESOURCE_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
 }

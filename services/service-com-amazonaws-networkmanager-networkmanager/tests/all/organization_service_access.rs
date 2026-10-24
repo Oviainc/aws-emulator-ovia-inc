@@ -19,9 +19,11 @@
 //!
 //! The tables below span that class: every value of the documented `Action` catalog and
 //! values differing from it in case, in surrounding whitespace, in length (including at
-//! and one past the modelled bound) and in being another word entirely; `MaxResults` at
-//! each published bound and one past each; and tokens differing in alphabet, in length and
-//! in whether they decode at all.
+//! and one past the modelled bound) and in being another word entirely; sequences of
+//! catalog actions differing in which action mints the record, in how many updates they
+//! apply and in their ordering, plus a retry of the enabling call repeated while the
+//! deployment it started is still owed; `MaxResults` at each published bound and one past
+//! each; and tokens differing in alphabet, in length and in whether they decode at all.
 //!
 //! Nothing here reaches into `crate::state`: the record is only ever read back through
 //! `ListOrganizationServiceAccessStatus`.
@@ -249,6 +251,162 @@ async fn organization_service_access_round_trips_through_stored_state() {
         ),
         organization_id,
         "case re-enable settled: the organization id must not change, got {re_settled}"
+    );
+}
+
+/// The access status the documented catalog pairs with `action`.
+fn expected_access_status(action: &str) -> &'static str {
+    ACTION_CATALOG
+        .into_iter()
+        .find_map(|(catalog_action, status)| (catalog_action == action).then_some(status))
+        .unwrap_or_else(|| panic!("{action:?} is not a value of the documented Action catalog"))
+}
+
+/// Assert `status` reports `access_status` with the accounts that status implies, WITHOUT
+/// pinning which side of the settle span the SLR deployment is on: an enabled organization
+/// deploys the SLR into the one account this emulator presents and reports one of the two
+/// documented `SLRDeploymentStatus` values, for the organization and for that account
+/// alike; a disabled one deploys nothing, so it reports no deployment status at all.
+///
+/// Answers the organization id the record carries, so a caller can assert it is kept.
+fn assert_access(case: &str, status: &Value, access_status: &str) -> String {
+    let organization_id = status["OrganizationId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: expected an OrganizationId in {status}"))
+        .to_string();
+    assert!(
+        is_organization_id(&organization_id),
+        "case {case}: expected an o-<hex> organization id, got {organization_id:?}"
+    );
+    assert_eq!(
+        status["OrganizationAwsServiceAccessStatus"],
+        json!(access_status),
+        "case {case}: expected service access {access_status}, got {status}"
+    );
+    if access_status == ACTION_CATALOG[0].1 {
+        let deployment = status["SLRDeploymentStatus"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: expected an SLRDeploymentStatus in {status}"));
+        assert!(
+            deployment == IN_PROGRESS || deployment == SUCCEEDED,
+            "case {case}: expected one of {IN_PROGRESS}/{SUCCEEDED}, got {deployment:?}"
+        );
+        assert_eq!(
+            status["AccountStatusList"],
+            json!([{
+                "AccountId": engine::emulator_account_id(),
+                "SLRDeploymentStatus": deployment,
+            }]),
+            "case {case}: expected the organization's one account to carry {deployment}, got {status}"
+        );
+    } else {
+        assert!(
+            status["SLRDeploymentStatus"].is_null(),
+            "case {case}: a disabled organization deploys no SLR, got {status}"
+        );
+        assert_eq!(
+            status["AccountStatusList"],
+            json!([]),
+            "case {case}: a disabled organization has no account deployments, got {status}"
+        );
+    }
+    organization_id
+}
+
+/// Sequences of catalog actions applied to a FRESH emulator, differing in which action
+/// mints the record, in how many updates are applied and in their ordering. The rule they
+/// span: the update is the only writer, it mints the organization id once and keeps it
+/// however often access is turned on and off, and the record it leaves behind is the one
+/// the next reader reports.
+const ACTION_SEQUENCES: [(&str, &[&str]); 7] = [
+    ("disable first", &["DISABLE"]),
+    ("disable twice", &["DISABLE", "DISABLE"]),
+    ("enable then disable", &["ENABLE", "DISABLE"]),
+    ("disable then enable", &["DISABLE", "ENABLE"]),
+    ("enable thrice", &["ENABLE", "ENABLE", "ENABLE"]),
+    (
+        "alternating from enabled",
+        &["ENABLE", "DISABLE", "ENABLE", "DISABLE"],
+    ),
+    (
+        "alternating from disabled",
+        &["DISABLE", "ENABLE", "DISABLE", "ENABLE"],
+    ),
+];
+
+#[tokio::test]
+async fn every_update_sequence_leaves_one_record_the_reader_reports() {
+    for (case, actions) in ACTION_SEQUENCES {
+        let emulator = Emulator::new();
+        let mut minted: Option<String> = None;
+        for action in actions {
+            let written = start_update_ok(&emulator, case, action).await;
+            let organization_id = assert_access(case, &written, expected_access_status(action));
+            // The id is minted by the FIRST update, whichever action that is, and every
+            // later update of the same organization keeps it.
+            match &minted {
+                Some(held) => assert_eq!(
+                    &organization_id, held,
+                    "case {case}: {action} must keep the organization id {held}, got {written}"
+                ),
+                None => minted = Some(organization_id.clone()),
+            }
+            // The reader reports the record this update wrote, not a fresh one.
+            let read_back = reported_status(&emulator, case).await;
+            assert_eq!(
+                assert_access(case, &read_back, expected_access_status(action)),
+                organization_id,
+                "case {case}: after {action} the reader must report the stored record, got {read_back}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn repeating_enable_while_the_deployment_is_in_flight_does_not_restart_it() {
+    let emulator = Emulator::new();
+    let started = std::time::Instant::now();
+    let first = start_update_ok(&emulator, "in-flight first", "ENABLE").await;
+    let organization_id = assert_status(
+        "in-flight first",
+        &first,
+        ACTION_CATALOG[0].1,
+        Some(IN_PROGRESS),
+    );
+
+    // Retry the enabling call again and again while the deployment the first call started
+    // is still owed. Each retry reports the SAME organization and the same enabled access:
+    // nothing is re-minted.
+    let retry_window = PAST_SETTLE + std::time::Duration::from_millis(100);
+    let mut retries = 0_u32;
+    while started.elapsed() < retry_window {
+        let retried = start_update_ok(&emulator, "in-flight retry", "ENABLE").await;
+        assert_eq!(
+            assert_access("in-flight retry", &retried, ACTION_CATALOG[0].1),
+            organization_id,
+            "case in-flight retry: a retry must keep the organization id, got {retried}"
+        );
+        retries += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        retries > 1,
+        "case in-flight retry: the retry window must cover more than one retry, got {retries}"
+    );
+
+    // The deployment the FIRST call started was still due at its own instant, so by now it
+    // has succeeded: had any retry restarted it, the last one — taken less than a settle
+    // span ago — would still be reported IN_PROGRESS.
+    let settled = reported_status(&emulator, "in-flight settled").await;
+    assert_eq!(
+        assert_status(
+            "in-flight settled",
+            &settled,
+            ACTION_CATALOG[0].1,
+            Some(SUCCEEDED)
+        ),
+        organization_id,
+        "case in-flight settled: the organization id must not change, got {settled}"
     );
 }
 

@@ -13,6 +13,10 @@
 //! CloudWatch Logs delivery ON additionally requires the caller's `logs:PutResourcePolicy`
 //! permission, because RUM installs the delivery policy on the caller's behalf.
 //!
+//! The operations addressed by an ARN rather than by a `Name` — the tagging surface — are
+//! judged by the same rule and are covered by `tagging_authorization.rs`, which drives
+//! them through the harness below.
+//!
 //! Nothing here is seeded into another service's store by hand: the roles are created
 //! through IAM's own `CreateRole`/`PutRolePolicy`, the session credential comes from STS's
 //! own `AssumeRole`, and the RUM calls carry that credential's access key id in their
@@ -411,12 +415,12 @@ pub(crate) fn monitor_arn(name: &str) -> String {
 }
 
 /// An identity-based policy with the statements given.
-fn identity_policy(statements: &str) -> String {
+pub(crate) fn identity_policy(statements: &str) -> String {
     format!("{{\"Version\":\"2012-10-17\",\"Statement\":[{statements}]}}")
 }
 
 /// One `Allow`/`Deny` statement over an action and a resource.
-fn statement(effect: &str, action: &str, resource: &str) -> String {
+pub(crate) fn statement(effect: &str, action: &str, resource: &str) -> String {
     format!(
         "{{\"Effect\":\"{effect}\",\"Action\":\"{action}\",\"Resource\":\"{resource}\"}}"
     )
@@ -424,7 +428,12 @@ fn statement(effect: &str, action: &str, resource: &str) -> String {
 
 /// A resource policy granting `principal` one action on this monitor, with an optional
 /// condition clause.
-fn resource_policy(effect: &str, principal: &str, action: &str, condition: Option<&str>) -> String {
+pub(crate) fn resource_policy(
+    effect: &str,
+    principal: &str,
+    action: &str,
+    condition: Option<&str>,
+) -> String {
     let condition = condition
         .map(|clause| format!(",\"Condition\":{clause}"))
         .unwrap_or_default();

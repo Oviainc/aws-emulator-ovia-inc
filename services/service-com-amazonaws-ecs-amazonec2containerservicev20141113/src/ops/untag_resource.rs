@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes tags from ONE Amazon ECS resource's own record: "Deletes specified tags from a
+//! resource", where `tagKeys` carries "the keys of the tags to be removed".
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The reverse of `TagResource`, over the same single tag set: the keys named are removed
+//! from the resource's OWN `tags` (the list its describe reports under `TAGS` and the list
+//! `ListTagsForResource` reports for its ARN), a key the resource does not carry removes
+//! nothing, and a key the request does not name is left where it was.
+//!
+//! A `resourceArn` that is not a taggable ECS resource ARN is a request fault
+//! (`InvalidParameterException`); one that is well formed but names nothing this store
+//! holds takes the refusal its KIND already earns everywhere else in this crate — a
+//! cluster's `ClusterNotFoundException`, a task definition's `ClientException`, and
+//! `InvalidParameterException` for the rest (`crate::state::TaggedResourceKind`).
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +154,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+        let _ = ctx;
+
+        // "The Amazon Resource Name (ARN) of the resource to delete tags from": a full
+        // ARN, of one of the kinds that carry a tag set. A value that is none of them
+        // names no resource whose tags could be deleted, so it is refused as the bad
+        // parameter it is rather than reported as an absent resource.
+        let resource_arn = input.resource_arn.as_str();
+        let Some(kind) = crate::state::TaggedResourceKind::from_arn(resource_arn) else {
+            return Err(UntagResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::invalid_resource_arn_message(resource_arn)),
+                },
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        let Some(stored) = guard.resource_tags_mut(kind, resource_arn) else {
+            let (refusal, message) = kind.not_found_refusal(resource_arn);
+            let message = Some(message);
+            return Err(match refusal {
+                crate::state::ResourceRefusal::ClusterNotFound => {
+                    UntagResourceErrorModeled::ClusterNotFoundException(ClusterNotFoundException {
+                        message,
+                    })
+                }
+                crate::state::ResourceRefusal::Client => {
+                    UntagResourceErrorModeled::ClientException(ClientException { message })
+                }
+                crate::state::ResourceRefusal::InvalidParameter => {
+                    UntagResourceErrorModeled::InvalidParameterException(
+                        InvalidParameterException { message },
+                    )
+                }
+            }
+            .into());
+        };
+
+        crate::state::remove_tags(stored, &input.tag_keys);
+
+        // `UntagResourceResponse` models no members: what the call left behind is the
+        // resource's tag set, which `ListTagsForResource` reports.
+        Ok(UntagResourceOutput {})
     }
 }

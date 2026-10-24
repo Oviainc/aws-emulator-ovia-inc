@@ -12,13 +12,19 @@
 //! the key order is group-name order, which is the listing order, and what makes
 //! `ListGroups` paging deterministic and resumable from an opaque token even after
 //! a group in the middle of the listing is deleted.
+//!
+//! Every tag-sync task lives in a second map,
+//! [`ComAmazonawsResourcegroupsArdiState::tag_sync_tasks`], keyed by the task's own
+//! ARN — the identifier `GetTagSyncTask` and `CancelTagSyncTask` address a task by —
+//! so `StartTagSyncTask` and every reader of a task read one record.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use crate::ops::types::{
     Group, GroupConfiguration, GroupConfigurationItem, GroupIdentifier, GroupingStatusesItem,
-    ListGroupResourcesItem, ResourceIdentifier, ResourceQuery, ResourceStatus,
+    ListGroupResourcesItem, ResourceIdentifier, ResourceQuery, ResourceStatus, TagSyncTaskItem,
+    QUERY_TYPE_VALUES,
 };
 
 /// Per-service state for com-amazonaws-resourcegroups-ardi. A handler reaches it through [`service_state`].
@@ -28,6 +34,9 @@ pub struct ComAmazonawsResourcegroupsArdiState {
     /// name. Ordered by region and then by name, so one region's listing and its
     /// continuation token are stable.
     pub groups: BTreeMap<GroupKey, GroupRecord>,
+    /// Every persisted tag-sync task, keyed by `TagSyncTaskRecord::task_arn`.
+    /// Ordered, so a listing of tasks and its continuation token are stable.
+    pub tag_sync_tasks: BTreeMap<String, TagSyncTaskRecord>,
 }
 
 /// Where one resource group lives: the region whose endpoint created it, and the
@@ -80,6 +89,11 @@ impl ComAmazonawsResourcegroupsArdiState {
     ///   names exactly one resource, so it resolves only when it equals that
     ///   group's STORED ARN — which keeps an ARN for another account, partition or
     ///   region from resolving to a same-named local group;
+    /// * the APPLICATION-group form of that ARN, `…:group/<name>/<id>`, names the
+    ///   same group through the id that qualifies its name (see
+    ///   [`GroupRecord::application_group_arn`]), so an ARN this service itself
+    ///   reported — in a tag-sync task, say — resolves back to the group it was
+    ///   minted from, and only while that group still carries that id;
     /// * anything else must be a bare `GroupName`, which the model constrains to
     ///   `[a-zA-Z0-9_\.-]{1,300}` or `<name>/<ulid>` — no colon — so an identifier
     ///   that is neither a well-formed ARN nor a well-formed name resolves to
@@ -93,9 +107,26 @@ impl ComAmazonawsResourcegroupsArdiState {
             if service != "resource-groups" {
                 return None;
             }
-            let key = GroupKey::new(region, resource.strip_prefix("group/")?);
+            let named = resource.strip_prefix("group/")?;
+            let key = GroupKey::new(region, named);
+            if let Some(record) = self.groups.get(&key) {
+                if identifier != record.group_arn {
+                    return None;
+                }
+                return Some(key);
+            }
+            // The application-group form: the trailing segment is the id that
+            // qualifies the group's name, so the group it names is the one stored
+            // under the head segment whose own qualifying id is that segment.
+            let (head, id) = named.rsplit_once('/')?;
+            if !is_qualifying_id(id) {
+                return None;
+            }
+            let key = GroupKey::new(region, head);
             let record = self.groups.get(&key)?;
-            if identifier != record.group_arn {
+            if record.application_id.as_deref() != Some(id)
+                || identifier != format!("{}/{id}", record.group_arn)
+            {
                 return None;
             }
             return Some(key);
@@ -137,6 +168,12 @@ pub const MAX_MEMBERS_PER_GROUP: usize = 1_000;
 /// so a client looping on `Tag` is refused rather than growing a record without
 /// end. Removing a tag makes room again.
 pub const MAX_TAGS_PER_GROUP: usize = 50;
+
+/// The most tag-sync tasks this emulator holds at once, for the same reason as
+/// [`MAX_GROUPS`] and with the same refusal: it bounds in-memory fixture state,
+/// so a client looping on `StartTagSyncTask` is refused rather than growing the
+/// store without end. Cancelling a task makes room again.
+pub const MAX_TAG_SYNC_TASKS: usize = 1_000;
 
 /// The prefix AWS keeps for the tags it sets itself.
 ///
@@ -275,6 +312,38 @@ pub fn check_tags<'a>(tags: impl IntoIterator<Item = (&'a str, &'a str)>) -> Res
     Ok(())
 }
 
+/// `Ok(())` when `query` is a resource query this service stores, else the
+/// message the refusal reports.
+///
+/// The ONE place this service decides whether a `ResourceQuery` is well formed,
+/// so every operation that takes one — a create and a tag-sync task — refuses the
+/// same documents the same way:
+///
+/// * `Type` is a value the modelled `QueryType` declares
+///   ([`crate::ops::types::QUERY_TYPE_VALUES`]);
+/// * `Query` is a JSON object, which is what the model documents it as — "the
+///   query that defines a group or a search", `{"ResourceTypeFilters":[..],
+///   "TagFilters":[..]}` for a tag query and `{"StackIdentifier":".."}` for a
+///   stack query — so a body that is not an object defines no query.
+///
+/// Which keys a given `Type` accepts is NOT refused here: the query is stored
+/// without being run.
+pub fn check_resource_query(query: &ResourceQuery) -> Result<(), String> {
+    if !QUERY_TYPE_VALUES.contains(&query.r#type.as_str()) {
+        return Err(format!(
+            "ResourceQuery.Type {} is not valid: expected one of {}",
+            query.r#type,
+            QUERY_TYPE_VALUES.join(", "),
+        ));
+    }
+    if !serde_json::from_str::<serde_json::Value>(&query.query)
+        .is_ok_and(|parsed| parsed.is_object())
+    {
+        return Err("ResourceQuery.Query is not valid: it must be a JSON object".to_string());
+    }
+    Ok(())
+}
+
 /// The modelled `GroupConfigurationStatus` of a service configuration that is in
 /// effect: nothing is being applied to the group.
 ///
@@ -335,9 +404,42 @@ pub struct GroupRecord {
     /// this group, keyed by resource ARN — what `ListGroupingStatuses` reports.
     /// Ordered by ARN, so that listing and its continuation token are stable.
     pub grouping_statuses: BTreeMap<String, GroupingStatusRecord>,
+    /// The id that qualifies this group's name where an ARN addresses it as an
+    /// APPLICATION group, minted once the group first needs one and kept
+    /// afterwards. `None` until then. See
+    /// [`GroupRecord::application_group_arn`].
+    pub application_id: Option<String>,
 }
 
 impl GroupRecord {
+    /// This group's ARN in the APPLICATION-group form, in which the group's name
+    /// is qualified by a 26-character id:
+    /// `arn:aws:resource-groups:<region>:<account>:group/<name>/<id>`.
+    ///
+    /// A tag-sync task is addressed by an ARN NESTED inside this form (the
+    /// modelled `TagSyncTaskArn` is
+    /// `…:group/<name>/<26 chars>/tag-sync-task/<26 chars>`), while a group is
+    /// created and addressed by its bare name here, so the qualifying id is
+    /// minted on first use and then stored: every ARN this group hosts carries
+    /// the same one, and repeated reads of a hosted resource resolve back to
+    /// this group. A group whose stored name ALREADY carries such an id (the
+    /// `<name>/<id>` form the modelled `GroupName` also admits) is already
+    /// qualified, so its stored ARN is returned unchanged.
+    pub fn application_group_arn(&mut self) -> String {
+        if self
+            .name
+            .rsplit_once('/')
+            .is_some_and(|(head, id)| !head.is_empty() && is_qualifying_id(id))
+        {
+            return self.group_arn.clone();
+        }
+        let id = self
+            .application_id
+            .get_or_insert_with(new_qualifying_id)
+            .as_str();
+        format!("{}/{id}", self.group_arn)
+    }
+
     /// The modelled `Group` structure for this record.
     pub fn to_group(&self) -> Group {
         Group {
@@ -606,6 +708,153 @@ impl GroupingStatusRecord {
             error_code: None,
             error_message: None,
             updated_at: Some(to_date_time(self.updated_at)),
+        }
+    }
+}
+
+/// How many characters the id that qualifies an application group's name, and
+/// the id of a tag-sync task, is written with.
+///
+/// Both modelled ARN productions spell it `[a-z0-9]{26}`, which is the length
+/// and alphabet of a ULID.
+///
+/// Source: `smithy_query(query="shape",shape="TagSyncTaskArn")`.
+pub const QUALIFYING_ID_LENGTH: usize = 26;
+
+/// Whether `id` is shaped like the [`QUALIFYING_ID_LENGTH`]-character id the
+/// modelled ARNs use.
+pub fn is_qualifying_id(id: &str) -> bool {
+    id.len() == QUALIFYING_ID_LENGTH
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// A fresh [`QUALIFYING_ID_LENGTH`]-character id: a ULID, lowercased.
+///
+/// A ULID is a millisecond timestamp followed by entropy, written in 26
+/// Crockford base32 characters, so lowercasing it satisfies the modelled
+/// `[a-z0-9]{26}`; the timestamp leads, so ids sort in minting order and a
+/// listing keyed by one pages in creation order.
+pub fn new_qualifying_id() -> String {
+    ::ulid::Ulid::new().to_string().to_lowercase()
+}
+
+/// The longest group name a tag-sync task's ARN can carry.
+///
+/// The modelled `TagSyncTaskArn` writes the group-name segment as
+/// `[a-zA-Z0-9_\.-]{1,150}`, narrower than the 300 characters a group name may
+/// have, so a task cannot be addressed on a group with a longer name.
+///
+/// Source: `smithy_query(query="shape",shape="TagSyncTaskArn")`.
+pub const MAX_TAG_SYNC_TASK_GROUP_NAME_LENGTH: usize = 150;
+
+/// Whether a tag-sync task's ARN can carry the group name `name`.
+///
+/// The modelled `TagSyncTaskArn` writes that segment as
+/// `[a-zA-Z0-9_\.-]{1,150}`, where the modelled `GroupName` is wider (up to 300
+/// characters, and the `<name>/<id>` form besides), so the name decides whether a
+/// task on this group is addressable at all. A name already qualified by an id is
+/// judged on its leading segment, which is the one the task ARN carries.
+pub fn is_tag_sync_task_group_name(name: &str) -> bool {
+    let segment = name.split('/').next().unwrap_or_default();
+    (1..=MAX_TAG_SYNC_TASK_GROUP_NAME_LENGTH).contains(&segment.len())
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// The modelled `TagSyncTaskStatus` of a task that is managing its application's
+/// resources: the model documents `ACTIVE` as the task "actively managing
+/// resources" and `ERROR` as one that is not, with the reason in
+/// `ErrorMessage`. A task this emulator accepts is managing its group from the
+/// moment it is stored, and nothing here fails a task later, so a stored task
+/// is `ACTIVE` and carries no error message.
+pub const TAG_SYNC_TASK_ACTIVE: &str = "ACTIVE";
+
+/// The message this service answers when a task ARN addresses no stored
+/// tag-sync task.
+///
+/// The service's own FIXED wording, which names nothing the caller sent — the
+/// ARN is already in the request — so every operation that addresses one task
+/// answers the same sentence.
+pub const TAG_SYNC_TASK_NOT_FOUND_MESSAGE: &str = "The specified tag-sync task does not exist";
+
+/// The ARN of the tag-sync task `task_id` on the application group
+/// `application_group_arn`, in the one form every operation of this service
+/// reports: the modelled `TagSyncTaskArn` nests a task under the group it syncs,
+/// so the task's ARN is the group's own application-group ARN (see
+/// [`GroupRecord::application_group_arn`]) followed by `/tag-sync-task/<id>`.
+/// Reported from the group's STORED ARN, so a task carries the region and the
+/// account of the group it belongs to rather than of the request that started
+/// it.
+pub fn tag_sync_task_arn(application_group_arn: &str, task_id: &str) -> String {
+    format!("{application_group_arn}/tag-sync-task/{task_id}")
+}
+
+/// One persisted tag-sync task: what it syncs, the group it syncs into, the role
+/// it assumes, and its status.
+#[derive(Debug, Clone)]
+pub struct TagSyncTaskRecord {
+    /// The task's own ARN, which is also its key in
+    /// [`ComAmazonawsResourcegroupsArdiState::tag_sync_tasks`]. Minted once when
+    /// the task is started and never recomputed, so every later read returns the
+    /// same ARN.
+    pub task_arn: String,
+    /// The region the task lives in: the region of the group it syncs into, which
+    /// is also the region its own ARN names. This service is REGIONAL, so a task
+    /// is visible only to that region's callers.
+    pub region: String,
+    /// The STORED ARN of the group the task syncs resources into, so a reader
+    /// reports the same ARN `GetGroup` does for that group.
+    pub group_arn: String,
+    /// The stored name of that group.
+    pub group_name: String,
+    /// The tag key the task syncs on, for a task started with a tag key-value
+    /// pair; `None` for one started with a resource query.
+    pub tag_key: Option<String>,
+    /// The tag value the task syncs on, present exactly when
+    /// [`TagSyncTaskRecord::tag_key`] is.
+    pub tag_value: Option<String>,
+    /// The query the task syncs on, for a task started with one; `None` for a
+    /// task started with a tag key-value pair.
+    pub resource_query: Option<ResourceQueryRecord>,
+    /// The role the service assumes to tag and untag resources, stored as the
+    /// caller gave it.
+    pub role_arn: String,
+    /// A modelled `TagSyncTaskStatus` value: [`TAG_SYNC_TASK_ACTIVE`] for every
+    /// task this emulator stores.
+    pub status: String,
+    /// Why the task is not managing resources, reported only for a task whose
+    /// status says it failed.
+    pub error_message: Option<String>,
+    /// When the task was started.
+    pub created_at: SystemTime,
+}
+
+impl TagSyncTaskRecord {
+    /// The modelled `ResourceQuery` for this record, if it was started with one.
+    pub fn to_resource_query(&self) -> Option<ResourceQuery> {
+        self.resource_query.as_ref().map(|q| ResourceQuery {
+            r#type: q.query_type.clone(),
+            query: q.query.clone(),
+        })
+    }
+
+    /// The modelled `TagSyncTaskItem` for this record, as `ListTagSyncTasks`
+    /// reports it.
+    pub fn to_item(&self) -> TagSyncTaskItem {
+        TagSyncTaskItem {
+            group_arn: Some(self.group_arn.clone()),
+            group_name: Some(self.group_name.clone()),
+            task_arn: Some(self.task_arn.clone()),
+            tag_key: self.tag_key.clone(),
+            tag_value: self.tag_value.clone(),
+            resource_query: self.to_resource_query(),
+            role_arn: Some(self.role_arn.clone()),
+            status: Some(self.status.clone()),
+            error_message: self.error_message.clone(),
+            created_at: Some(to_date_time(self.created_at)),
         }
     }
 }

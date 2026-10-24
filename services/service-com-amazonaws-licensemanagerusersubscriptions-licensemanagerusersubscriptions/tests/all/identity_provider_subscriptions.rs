@@ -1024,7 +1024,7 @@ async fn filters_select_on_the_documented_attributes() {
     );
     let bad_operation = list_providers(
         &h,
-        &json!({ "Filters": [{ "Attribute": "Product", "Operation": "geq", "Value": "A" }] }),
+        &json!({ "Filters": [{ "Attribute": "Product", "Operation": "like", "Value": "A" }] }),
     )
     .await;
     assert_eq!(
@@ -1129,8 +1129,8 @@ async fn a_malformed_filter_is_refused_even_with_nothing_stored() {
         ),
         (
             "an unsupported comparison",
-            json!([{ "Attribute": "Product", "Operation": "leq", "Value": "x" }]),
-            json!([{ "Attribute": "Status", "Operation": "leq", "Value": "x" }]),
+            json!([{ "Attribute": "Product", "Operation": "like", "Value": "x" }]),
+            json!([{ "Attribute": "Status", "Operation": "like", "Value": "x" }]),
         ),
         (
             "no attribute at all",

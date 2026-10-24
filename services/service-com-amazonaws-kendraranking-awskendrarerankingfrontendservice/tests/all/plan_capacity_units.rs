@@ -14,11 +14,15 @@
 //! stored configuration (or its absence) alone.
 //!
 //! Each rule is asserted over a TABLE whose rows differ along the capacity the plan was
-//! configured with — the member absent, the bottom of the published range, and values
-//! above it — and over the call that configured it (create, then update).
+//! configured with — the member absent, the bottom of the published range, values above
+//! it and the top of the published ceiling — and over the call that configured it
+//! (create, then update). A capacity ABOVE the ceiling is refused rather than stored;
+//! that rule has its own suite in `plan_capacity_quota.rs`.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
+
+use service_com_amazonaws_kendraranking_awskendrarerankingfrontendservice::state;
 
 use crate::harness::{call, emulator, sleep_past_the_transition};
 
@@ -98,9 +102,9 @@ async fn describe_reports_exactly_the_capacity_a_create_configured() {
             expected: json!({ "RescoreCapacityUnits": 42 }),
         },
         CreateCase {
-            case: "the top of the integer the member is modelled as",
-            capacity_units: json!({ "RescoreCapacityUnits": i32::MAX }),
-            expected: json!({ "RescoreCapacityUnits": i32::MAX }),
+            case: "the top of the published extra-capacity ceiling",
+            capacity_units: json!({ "RescoreCapacityUnits": state::MAX_RESCORE_CAPACITY_UNITS }),
+            expected: json!({ "RescoreCapacityUnits": state::MAX_RESCORE_CAPACITY_UNITS }),
         },
     ];
 

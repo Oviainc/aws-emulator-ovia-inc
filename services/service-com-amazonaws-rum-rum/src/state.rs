@@ -1295,6 +1295,19 @@ pub fn access_denied(denial: &authorization::Denied) -> AccessDeniedException {
     }
 }
 
+/// The wire error code, and the HTTP status, a request IAM does not allow is refused with.
+///
+/// One definition for the whole service, beside the body [`access_denied`] builds: the
+/// code and the status are a property of the refusal rather than of the operation that
+/// makes it, and this service's operations make the same one. The operations whose model
+/// DECLARES `AccessDeniedException` take both from that shape's own schema and
+/// `@httpError`; these two are for the ARN-addressed tagging operations, whose modelled
+/// error lists do not declare it — `AccessDeniedException` is a common error rather than
+/// one specific to an operation — and which therefore name the code and the status on
+/// their own error channel.
+pub const ACCESS_DENIED_ERROR_CODE: &str = "AccessDeniedException";
+pub const ACCESS_DENIED_STATUS: u16 = 403;
+
 /// The whole message RUM's ARN-addressed tagging operations report for a resource they
 /// cannot find.
 ///

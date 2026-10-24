@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInstanceCommunicationLimits
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInstanceCommunicationLimits`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInstanceCommunicationLimits::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the instance-wide communication limits the Connect instance's record
+//! holds: whatever `PutInstanceCommunicationLimits` last persisted for it, and
+//! nothing when no call has set any. A pure read — it writes nothing, so polling it
+//! never changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -143,20 +139,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInstanceCommunicationLimits` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInstanceCommunicationLimitsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInstanceCommunicationLimits"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetInstanceCommunicationLimitsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the ConnectCampaignsV2 instance store is unavailable".to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        // Instance-wide limits are configuration of the instance, so an instance with
+        // no finished onboarding job holds none to report — the same 404 whether it
+        // was never onboarded or its job is still IN_PROGRESS. `onboarded_instance` is
+        // the predicate `GetConnectInstanceConfig` and `CreateCampaign` ask, so the
+        // three cannot disagree about which instances this service holds a config for.
+        let Some(record) = store.onboarded_instance(&input.connect_instance_id, now) else {
+            return Err(
+                GetInstanceCommunicationLimitsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::instance_config_not_found_message(
+                            &input.connect_instance_id,
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The whole of the operation: the stored config, verbatim. An onboarded
+        // instance nobody has configured limits for carries none, and the modelled
+        // member is optional precisely so that reads as "no limits set" rather than as
+        // a config of zero limits.
+        Ok(GetInstanceCommunicationLimitsOutput {
+            communication_limits_config: record.communication_limits.clone(),
+        })
     }
 }

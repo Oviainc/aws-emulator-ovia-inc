@@ -181,7 +181,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // `monitorName`'s `@pattern` and length bound are refused by the
         // framework BEFORE this handler runs, so a name that reaches here is
         // one the service could have stored.
@@ -190,11 +189,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),
             })
         })?;
+        // A monitor exists in the region it was created through, so this read
+        // sees only that region's records: the same name in another region names
+        // another resource, and no name reaches a monitor of a region this
+        // request was not signed for.
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
-        store.settle_monitor(&input.monitor_name, now);
-        let monitor = store.monitors.get(&input.monitor_name).ok_or_else(|| {
+        store.settle_monitor(&region, &input.monitor_name, now);
+        let monitor = store.monitor(&region, &input.monitor_name).ok_or_else(|| {
             GetMonitorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: Some(crate::state::monitor_not_found_message(
                     &input.monitor_name,

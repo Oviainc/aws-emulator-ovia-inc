@@ -8,7 +8,8 @@ use aws_smithy_schema_server::constraints::path;
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    CapacityUnitsConfiguration, ResourceNotFoundException, Tag, ValidationException,
+    CapacityUnitsConfiguration, ResourceNotFoundException, ServiceQuotaExceededException, Tag,
+    ValidationException,
 };
 
 /// The `RescoreExecutionPlanStatus` value a plan that is ready to serve `Rescore`
@@ -501,6 +502,41 @@ pub const MAX_TAGS_PER_PLAN: usize = 200;
 /// writes, and by [`MAX_TAGS_PER_PLAN`] for the tag set, which `TagResource` grows
 /// across calls.
 pub const MAX_RESCORE_EXECUTION_PLANS: usize = 100;
+
+/// The number of extra capacity units one rescore execution plan may be provisioned
+/// with.
+///
+/// `CapacityUnitsConfiguration$RescoreCapacityUnits` publishes the ceiling in its own
+/// documentation — "A single extra capacity unit for a rescore execution plan provides
+/// 0.01 rescore requests per second. You can add up to 1000 extra capacity units." —
+/// while the `@range` on `RescoreCapacityUnit` can only carry the lower bound (`min: 0`,
+/// no maximum). So the ceiling is a service-side rule the handlers enforce: a create or
+/// an update asking for more extra capacity than this is refused with the modelled
+/// `ServiceQuotaExceededException` the operation declares, through
+/// [`capacity_units_over_quota`], and the plan's stored capacity is left as it was.
+pub const MAX_RESCORE_CAPACITY_UNITS: i32 = 1000;
+
+/// The modelled quota refusal for a capacity configuration asking for more than
+/// [`MAX_RESCORE_CAPACITY_UNITS`] extra units, or `None` for one within the ceiling.
+///
+/// The ONE place that decision and its sentence are made, so
+/// `CreateRescoreExecutionPlan` and `UpdateRescoreExecutionPlan` — every operation that
+/// takes a `CapacityUnitsConfiguration` — refuse the same values identically. The
+/// sentence names the ceiling that was exceeded and never echoes the amount asked for,
+/// like every other refusal this service states.
+pub fn capacity_units_over_quota(
+    requested: &CapacityUnitsConfiguration,
+) -> Option<ServiceQuotaExceededException> {
+    if requested.rescore_capacity_units <= MAX_RESCORE_CAPACITY_UNITS {
+        return None;
+    }
+    Some(ServiceQuotaExceededException {
+        message: Some(format!(
+            "The amount of extra capacity for a rescore execution plan has exceeded the \
+             quota of {MAX_RESCORE_CAPACITY_UNITS} extra capacity units."
+        )),
+    })
+}
 
 /// The number of documents one `Rescore` request may carry.
 ///

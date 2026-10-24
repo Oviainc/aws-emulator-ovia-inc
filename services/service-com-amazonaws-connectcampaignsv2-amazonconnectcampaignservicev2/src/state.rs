@@ -19,7 +19,9 @@
 //! `GetInstanceOnboardingJobStatus` reports the status that record is at,
 //! `GetConnectInstanceConfig` projects the config it holds, and `CreateCampaign`
 //! consults it before minting a campaign — an instance with no finished onboarding job
-//! is not a campaign target.
+//! is not a campaign target. The instance-wide communication limits live on that same
+//! record: `PutInstanceCommunicationLimits` writes them and
+//! `GetInstanceCommunicationLimits` reports them, so neither keeps a copy of its own.
 //!
 //! The integration store is the single source of truth for what an onboarded Connect
 //! instance is integrated with: `PutConnectInstanceIntegration` writes one record per
@@ -32,9 +34,9 @@ use std::time::SystemTime;
 use crate::ops::types::{
     Campaign, CampaignSummary, ChannelSubtypeConfig, CommunicationLimits,
     CommunicationLimitsConfig, CommunicationTimeConfig, CustomerProfilesIntegrationSummary,
-    EncryptionConfig, EntryLimitsConfig, InstanceConfig, InstanceOnboardingJobStatus,
-    IntegrationConfig, IntegrationSummary, LambdaIntegrationSummary, OpenHours,
-    QConnectIntegrationSummary, Schedule, Source, TimeWindow, DAY_OF_WEEK_VALUES,
+    EncryptionConfig, EntryLimitsConfig, InstanceCommunicationLimitsConfig, InstanceConfig,
+    InstanceOnboardingJobStatus, IntegrationConfig, IntegrationSummary, LambdaIntegrationSummary,
+    OpenHours, QConnectIntegrationSummary, Schedule, Source, TimeWindow, DAY_OF_WEEK_VALUES,
 };
 
 /// The ARN namespace (and SigV4 signing name) this service's ARNs carry, as the
@@ -127,9 +129,10 @@ pub const MAX_COMMUNICATION_LIMITS: usize = 2;
 ///
 /// The one place this service checks a `CommunicationLimits` union against the
 /// `@length` its list member carries, so every operation that accepts one
-/// (`CreateCampaign`, `UpdateCampaignCommunicationLimits`) refuses an over-long list
-/// the same way. `member` is the request path the refusal names, so the message is
-/// built from the request rather than fixed text.
+/// (`CreateCampaign`, `UpdateCampaignCommunicationLimits`,
+/// `PutInstanceCommunicationLimits`) refuses an over-long list the same way. `member`
+/// is the request path the refusal names, so the message is built from the request
+/// rather than fixed text.
 pub fn communication_limits_violation(
     member: &str,
     limits: Option<&CommunicationLimits>,
@@ -557,8 +560,8 @@ impl StoredCampaign {
 ///
 /// The one place this service writes an instance audit record, so a later instance
 /// mutator records the same fields. Only wire metadata and the request's instance id
-/// go in: never a stored encryption or integration config, a key or resource ARN or
-/// any credential material.
+/// go in: never a stored encryption, integration or communication-limits config, a
+/// key or resource ARN or any credential material.
 pub fn audit_onboarding_change(
     parts: &::http::request::Parts,
     operation: &'static str,
@@ -613,6 +616,17 @@ pub const ONBOARDING_JOB_NOT_FAILED_MESSAGE: &str =
 /// campaign: that operation's message is composed from the request.)
 pub const CAMPAIGN_NOT_FOUND_MESSAGE: &str = "CampaignId not found.";
 
+/// What this service answers when a `connectInstanceId` names no Connect instance
+/// onboarded to Campaigns: there is no instance configuration to report, nor any to
+/// configure.
+///
+/// Composed from the request, so the refusal names the instance the caller asked
+/// about. The one text every instance-scoped operation shares, so two of them cannot
+/// disagree about an instance this service holds nothing for.
+pub fn instance_config_not_found_message(connect_instance_id: &str) -> String {
+    format!("ConnectInstanceConfig not found {connect_instance_id}")
+}
+
 /// How long after the `StartInstanceOnboardingJob` call that started it an
 /// onboarding job is due to reach `SUCCEEDED`.
 ///
@@ -624,8 +638,8 @@ pub const CAMPAIGN_NOT_FOUND_MESSAGE: &str = "CampaignId not found.";
 pub const ONBOARDING_JOB_DURATION: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The onboarding job of one Connect instance: the encryption config the
-/// `StartInstanceOnboardingJob` call persisted, and the instant its job is due to
-/// have finished.
+/// `StartInstanceOnboardingJob` call persisted, the instant its job is due to
+/// have finished, and the instance-wide configuration set on it since.
 #[derive(Debug, Clone)]
 pub struct StoredInstanceOnboarding {
     pub connect_instance_id: String,
@@ -635,6 +649,12 @@ pub struct StoredInstanceOnboarding {
     /// The instant this job reaches `SUCCEEDED`: the start instant plus
     /// [`ONBOARDING_JOB_DURATION`]. Before it the job reports `IN_PROGRESS`.
     pub succeeds_at: std::time::SystemTime,
+    /// The instance-wide communication limits `PutInstanceCommunicationLimits`
+    /// persisted for this instance, exactly as that call supplied them, and `None`
+    /// while no call has set any. `GetInstanceCommunicationLimits` reports this
+    /// member and nothing else, so the two cannot disagree. It lives on the
+    /// instance's record, so an instance whose record goes takes its limits with it.
+    pub communication_limits: Option<InstanceCommunicationLimitsConfig>,
 }
 
 impl StoredInstanceOnboarding {
@@ -649,6 +669,7 @@ impl StoredInstanceOnboarding {
             connect_instance_id,
             encryption_config,
             succeeds_at: now + ONBOARDING_JOB_DURATION,
+            communication_limits: None,
         }
     }
 
@@ -1101,6 +1122,41 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// [`Self::onboarded_instance`] decides it.
     pub fn is_onboarded(&self, connect_instance_id: &str, now: SystemTime) -> bool {
         self.onboarded_instance(connect_instance_id, now).is_some()
+    }
+
+    /// The record [`Self::onboarded_instance`] resolves, mutably — for a caller that
+    /// configures the onboarded instance. The same predicate decides it, so an
+    /// instance that is not a campaign target yet is not configurable either.
+    fn onboarded_instance_mut(
+        &mut self,
+        connect_instance_id: &str,
+        now: SystemTime,
+    ) -> Option<&mut StoredInstanceOnboarding> {
+        self.instance_onboarding
+            .get_mut(connect_instance_id)
+            .filter(|record| record.status_at(now) == ONBOARDING_STATUS_SUCCEEDED)
+    }
+
+    /// Replace the instance-wide communication limits of `connect_instance_id` with
+    /// `config`, and report whether the store took it.
+    ///
+    /// `false` means the instance is not onboarded at `now`, so there is no instance
+    /// configuration to put the limits on and nothing was written. Writing the whole
+    /// config rather than merging into it is what makes the put idempotent: the same
+    /// call twice leaves the same config stored.
+    pub fn put_instance_communication_limits(
+        &mut self,
+        connect_instance_id: &str,
+        config: InstanceCommunicationLimitsConfig,
+        now: SystemTime,
+    ) -> bool {
+        match self.onboarded_instance_mut(connect_instance_id, now) {
+            Some(record) => {
+                record.communication_limits = Some(config);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Every stored campaign, in creation order, each with its creation sequence

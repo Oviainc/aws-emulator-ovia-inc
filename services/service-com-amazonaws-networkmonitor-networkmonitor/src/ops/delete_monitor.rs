@@ -138,17 +138,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteMonitorErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),
             })
         })?;
+        // A delete reaches only the region it was signed for: a monitor of
+        // another region is a different resource and stays where it is.
+        let region = crate::state::request_region(ctx);
 
         let mut store = state.lock();
         // Removing the monitor removes the probes it holds with it: the probes
         // live INSIDE the record, so there is no orphan left behind.
-        if store.monitors.remove(&input.monitor_name).is_none() {
+        if store.remove_monitor(&region, &input.monitor_name).is_none() {
             return Err(DeleteMonitorErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::monitor_not_found_message(
@@ -160,9 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // The idempotency records that named it replay nothing now, so drop
         // them rather than leaving a token pointing at a monitor that is gone.
-        store
-            .client_tokens
-            .retain(|_, record| record.monitor_name != input.monitor_name);
+        store.forget_client_tokens_of_monitor(&region, &input.monitor_name);
         Ok(DeleteMonitorOutput {})
     }
 }

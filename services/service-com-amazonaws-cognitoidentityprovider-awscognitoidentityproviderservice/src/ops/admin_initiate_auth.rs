@@ -8,6 +8,10 @@
 //! `NEW_PASSWORD_REQUIRED` challenge with a persisted `Session`. Every other
 //! `AuthFlow` answers 501 until it is implemented.
 //!
+//! On a user pool that carries a `DeviceConfiguration`, a completed sign-in also
+//! records the device it came from and answers with that device's
+//! `NewDeviceMetadata` when the pool did not recognise it.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -436,9 +440,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             }
             Outcome::Authenticate { username } => {
-                let authentication_result = guard
+                let mut authentication_result = guard
                     .issue_tokens(&input.user_pool_id, &input.client_id, &username, now)
                     .ok_or_else(internal_error)?;
+                // The sign-in is complete, so the device it came from is now part
+                // of this user's state on a pool that remembers devices, and the
+                // key of a device the pool did not recognise is what the caller
+                // needs to confirm it. `AuthParameters`: "Add `DEVICE_KEY` if you
+                // want to bypass multi-factor authentication with a remembered
+                // device" — the device the request presented, if any.
+                authentication_result.new_device_metadata = guard.track_sign_in_device(
+                    &input.user_pool_id,
+                    &username,
+                    auth_parameters.get(DEVICE_KEY).map(String::as_str),
+                    now,
+                );
                 Ok(AdminInitiateAuthOutput {
                     challenge_name: None,
                     session: None,
@@ -454,6 +470,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The challenge a user that must change its password is answered with
 /// (`ChallengeNameType` in this service's model).
 const NEW_PASSWORD_REQUIRED: &str = "NEW_PASSWORD_REQUIRED";
+
+/// The `AuthParameters` entry that names the device the sign-in comes from:
+/// "Add `DEVICE_KEY` if you want to bypass multi-factor authentication with a
+/// remembered device" (`AdminInitiateAuth.AuthParameters` in this service's
+/// model).
+const DEVICE_KEY: &str = "DEVICE_KEY";
 
 /// What the stored state decided this sign-in is, read under the state lock
 /// before anything is written.

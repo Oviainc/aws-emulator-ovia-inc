@@ -35,6 +35,8 @@ mod event_topics;
 mod harness;
 #[path = "all/microsoft_ad.rs"]
 mod microsoft_ad;
+#[path = "all/shared_directories.rs"]
+mod shared_directories;
 #[path = "all/snapshots.rs"]
 mod snapshots;
 #[path = "all/state_roundtrip.rs"]
