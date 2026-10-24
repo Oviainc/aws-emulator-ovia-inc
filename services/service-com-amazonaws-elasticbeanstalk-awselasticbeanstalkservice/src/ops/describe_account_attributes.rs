@@ -135,11 +135,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The operation takes no input, and reporting the account's quotas reads
         // nothing out of the store and changes nothing in it: the quotas are the
         // service's own — the very bounds the creates refuse a create past
-        // (`CreateApplication`, `CreateApplicationVersion`, `CreateEnvironment` and
-        // `CreatePlatformVersion`). The one exception is the configuration-template
-        // quota, whose create (`CreateConfigurationTemplate`) is still scaffolded,
-        // so that constant is the published allowance that create will be held to
-        // rather than one anything enforces yet.
+        // (`CreateApplication`, `CreateApplicationVersion`, `CreateEnvironment`,
+        // `CreateConfigurationTemplate` and `CreatePlatformVersion`).
         let _ = (&input, ctx, &self.engine);
 
         Ok(DescribeAccountAttributesOutput {

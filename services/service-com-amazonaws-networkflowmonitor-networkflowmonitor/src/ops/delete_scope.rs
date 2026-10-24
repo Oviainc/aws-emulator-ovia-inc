@@ -149,6 +149,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The FORM of the `scopeId` first, exactly as `GetScope` checks it: a value
+        // that cannot be an identifier this service generates is a fault in the
+        // request (the modelled 400), not a scope that is absent.
+        if !crate::state::is_scope_id(&input.scope_id) {
+            return Err(DeleteScopeErrorModeled::ValidationException(
+                crate::state::invalid_scope_id(),
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteScopeErrorModeled::InternalServerException(
                 crate::state::state_unavailable(),

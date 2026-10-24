@@ -27,3 +27,5 @@ mod scope_listing;
 mod scope_monitor_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/wire_status_and_error_classes.rs"]
+mod wire_status_and_error_classes;

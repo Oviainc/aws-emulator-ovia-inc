@@ -222,13 +222,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `scopeArn` is only constrained to be SOME ARN by the model, so whether it
         // names a scope of this service is this handler's to enforce: a monitor
-        // cannot measure a topology that does not exist.
+        // cannot measure a topology that does not exist. This operation models NO
+        // `ResourceNotFoundException`, so the unresolvable reference cannot be
+        // reported as an absence — and a scope reference the service cannot resolve
+        // it also cannot authorize, so the refusal is the modelled 403. Nothing
+        // here inspects the id INSIDE the ARN: an ARN that resolves to no scope is
+        // refused the same way whatever its resource segment looks like.
         if state.scope_by_arn(&input.scope_arn).is_none() {
-            return Err(CreateMonitorErrorModeled::ValidationException(
-                crate::state::field_validation(
-                    "scopeArn",
-                    format!("{:?} does not name a scope", input.scope_arn),
-                ),
+            return Err(CreateMonitorErrorModeled::AccessDeniedException(
+                crate::state::reference_denied(crate::state::SCOPE_RESOURCE),
             )
             .into());
         }

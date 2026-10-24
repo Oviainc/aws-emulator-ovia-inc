@@ -23,8 +23,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// A KMS key ARN satisfying `KmsKeyArn`'s pattern
-/// `^arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/[-a-f0-9]+$`.
+/// A KMS key ARN satisfying `kmsKeyArn`'s constraint as this service applies it
+/// (`state::KMS_KEY_ARN_PATTERN`, `^arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/.+$`).
 fn kms_key_arn(region: &str) -> String {
     format!(
         "arn:aws:kms:{region}:{}:key/1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",

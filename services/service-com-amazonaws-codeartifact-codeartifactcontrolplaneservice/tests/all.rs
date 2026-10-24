@@ -57,3 +57,5 @@ mod package_version_description;
 mod policy_document_rendering;
 #[path = "all/update_operations_persist.rs"]
 mod update_operations_persist;
+#[path = "all/package_group_arn_encoding.rs"]
+mod package_group_arn_encoding;

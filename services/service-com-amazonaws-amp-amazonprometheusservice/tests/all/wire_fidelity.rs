@@ -39,8 +39,8 @@ fn log_group_arn(region: &str) -> String {
     )
 }
 
-/// A KMS key ARN satisfying `KmsKeyArn`'s pattern
-/// `^arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/[-a-f0-9]+$`.
+/// A KMS key ARN satisfying `kmsKeyArn`'s constraint as this service applies it
+/// (`state::KMS_KEY_ARN_PATTERN`, `^arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/.+$`).
 fn kms_key_arn(region: &str) -> String {
     format!(
         "arn:aws:kms:{region}:{}:key/1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
@@ -256,9 +256,9 @@ async fn a_refused_request_carries_the_modelled_validation_exception() {
     let long_name = "a".repeat(129);
 
     let cases = vec![
-        // `CreateWorkspace$kmsKeyArn`: pattern
-        // `^arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/[-a-f0-9]+$`, length 20..2048 —
-        // this value is 26 characters, so only the pattern is at fault.
+        // `CreateWorkspace$kmsKeyArn`: `state::KMS_KEY_ARN_PATTERN`
+        // (`^arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/.+$`) plus the member's modelled
+        // length 20..2048 — this value is 26 characters, so only the pattern is at fault.
         Refusal {
             case: "a kmsKeyArn outside its published pattern",
             method: "POST",
@@ -266,7 +266,7 @@ async fn a_refused_request_carries_the_modelled_validation_exception() {
             body: serde_json::json!({ "kmsKeyArn": "not-a-valid-kms-arn-at-all" }).to_string(),
             member: "kmsKeyArn",
             requirement: "Member must satisfy regular expression pattern: \
-                          arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/[-a-f0-9]+"
+                          arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/.+"
                 .to_string(),
             must_not_echo: Some("not-a-valid-kms-arn-at-all"),
         },
@@ -453,6 +453,21 @@ async fn a_value_at_a_published_bound_is_accepted() {
             serde_json::json!({ "alias": "kms", "kmsKeyArn": kms_key_arn(region) }).to_string(),
         ),
         (
+            // The key-id segment is `.+`: a multi-region key id is admitted too.
+            // `tests/all/kms_key_arn_and_parent_resolution.rs` tables the whole class.
+            "a multi-region kmsKeyArn inside the constraint the service applies",
+            "POST",
+            "/workspaces".to_string(),
+            serde_json::json!({
+                "alias": "kms-mrk",
+                "kmsKeyArn": format!(
+                    "arn:aws:kms:{region}:{}:key/mrk-0123456789abcdef0123456789abcdef",
+                    engine::emulator_account_id()
+                ),
+            })
+            .to_string(),
+        ),
+        (
             "a rule groups namespace name at its published maximum length",
             "POST",
             format!("/workspaces/{workspace_id}/rulegroupsnamespaces"),
@@ -582,6 +597,16 @@ async fn a_missing_workspace_reports_one_constant_message() {
                      ad-00000000-0000-0000-0000-000000000000"
                 ),
                 String::new(),
+            ),
+            (
+                "CreateAnomalyDetector",
+                "POST",
+                format!("/workspaces/{absent}/anomalydetectors"),
+                serde_json::json!({
+                    "alias": "orphan",
+                    "configuration": { "randomCutForest": { "query": "sum(up)" } },
+                })
+                .to_string(),
             ),
             (
                 "DescribeResourcePolicy",
