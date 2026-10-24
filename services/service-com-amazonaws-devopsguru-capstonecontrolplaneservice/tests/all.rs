@@ -31,6 +31,8 @@ mod insight_reads;
 mod monitored_resources;
 #[path = "all/mutation_idempotency_and_tenancy.rs"]
 mod mutation_idempotency_and_tenancy;
+#[path = "all/organization_overview.rs"]
+mod organization_overview;
 #[path = "all/organization_resource_collection_health.rs"]
 mod organization_resource_collection_health;
 #[path = "all/resource_collection_health.rs"]

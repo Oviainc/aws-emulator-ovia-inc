@@ -148,9 +148,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Read-only: take the guard, copy the record, release it.
         let settings = state.lock().account_settings.clone();
+        // Both settings groups are always reported: the account HAS a deletion-protection
+        // and a vended-metrics configuration whether or not anything has been written to
+        // them, so a group nobody has written goes on the wire as the empty document and
+        // only its unset members are omitted.
         Ok(GetAccountSettingsOutput {
             deletion_protection: Some(settings.deletion_protection()),
-            vended_metrics: settings.vended_metrics(),
+            vended_metrics: Some(settings.vended_metrics()),
         })
     }
 }

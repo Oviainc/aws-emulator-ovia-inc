@@ -614,7 +614,7 @@ async fn every_member_is_reachable_through_the_whole_router() {
         "idleSessionTTLInSeconds": 300,
     })
     .to_string();
-    let calls: [Call<'_>; 8] = [
+    let calls: [Call<'_>; 9] = [
         Call {
             case: "CreateBot on the V2 control plane",
             method: "PUT",
@@ -656,6 +656,17 @@ async fn every_member_is_reachable_through_the_whole_router() {
             method: "POST",
             path: "/bots/0000000000/botAliases/TSTALIASID/botLocales/en_US/sessions/s-1/text",
             body: r#"{"text":"hello"}"#,
+        },
+        Call {
+            // The fifth runtime route, and the only one whose input is an
+            // `@httpPayload` blob rather than JSON: dispatched here with this helper's
+            // `application/json` content type, which is none of the prefixes
+            // `requestContentType` accepts, so the answer is the runtime's own modelled
+            // `ValidationException` — a service's answer, which is what this rule is about.
+            case: "RecognizeUtterance on the V2 runtime",
+            method: "POST",
+            path: "/bots/0000000000/botAliases/TSTALIASID/botLocales/en_US/sessions/s-1/utterance",
+            body: "hello",
         },
         Call {
             case: "GetSession on the V1 runtime, for a bot nothing created",
