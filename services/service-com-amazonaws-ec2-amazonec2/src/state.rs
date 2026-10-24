@@ -339,6 +339,26 @@
 //! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies — the BYOIP range
 //! above included, whose record carries one beside the release it may owe.
 //!
+//! ## IPAM scopes and the pools created in them
+//!
+//! [`ComAmazonawsEc2Amazonec2State::ipam_scopes`] holds the account's IPAM scopes as the
+//! modelled [`IpamScope`] shape itself, keyed by `IpamScopeId`, beside the
+//! [`ComAmazonawsEc2Amazonec2State::ipam_pools`] created in them: a scope is "the
+//! highest-level container within IPAM" (`IpamScope`), so `CreateIpamPool` resolves its
+//! `IpamScopeId` there and takes the pool's IPAM, Region and scope type from the scope it
+//! finds rather than from the request. A scope the account does not hold is refused with
+//! [`invalid_ipam_scope_id_not_found`], and a scope's own "number of pools in the scope"
+//! (`IpamScope$PoolCount`) is RECOUNTED from the pool store
+//! ([`ComAmazonawsEc2Amazonec2State::insert_creating_ipam_pool`]) rather than tracked
+//! separately, so the two cannot drift.
+//!
+//! A pool `CreateIpamPool` answers with is `create-in-progress`, a non-terminal
+//! `IpamPoolState`, so the clock owes it `create-complete` one [`TRANSITION_DELAY`] later;
+//! that due instant is a fact the modelled [`IpamPool`] carries no member for, so it lives
+//! beside the pool under the same id in
+//! [`ComAmazonawsEc2Amazonec2State::ipam_pool_create_complete_at`], the way a `pending`
+//! VPC's does.
+//!
 //! ## Network Access Scopes and their analyses
 //!
 //! [`ComAmazonawsEc2Amazonec2State::network_insights_access_scopes`] holds the account's
@@ -677,7 +697,7 @@ use crate::ops::types::{
     EbsInfo, EfaInfo, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
     ImageCriterion, Instance, InstanceApplicationStatus, InstanceStorageInfo, InstanceTypeInfo,
     IpamInternetRegistryAssociation, IpamPool, IpamRoutingPolicyRegistration,
-    IpamRoutingPolicyRegistrationDelta,
+    IpamResourceTag, IpamRoutingPolicyRegistrationDelta, IpamScope,
     MemoryInfo, NetworkInfo, NitroTpmInfo, PlacementGroupInfo, ProcessorInfo, VCpuInfo,
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
     LaunchTemplate, MacHost, Monitoring, NetworkInsightsAccessScope,
@@ -1747,6 +1767,27 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Every IPAM pool the account holds, by `IpamPoolId`, as the modelled [`IpamPool`]
     /// shape itself.
     pub ipam_pools: BTreeMap<String, IpamPool>,
+    /// Every IPAM scope the account holds, by `IpamScopeId`, as the modelled [`IpamScope`]
+    /// shape itself — "the highest-level container within IPAM" (`IpamScope`), which is what
+    /// `CreateIpamPool` resolves its `IpamScopeId` against and takes the pool's IPAM, Region
+    /// and scope type from.
+    ///
+    /// A fresh account holds none: a scope belongs to an IPAM, and `CreateIpam` and
+    /// `CreateIpamScope` are both still scaffolds, so until one of them is written every
+    /// scope id a request names answers [`INVALID_IPAM_SCOPE_ID_NOT_FOUND`] — exactly as the
+    /// real service does for a scope that does not exist.
+    pub ipam_scopes: BTreeMap<String, IpamScope>,
+    /// When a `create-in-progress` IPAM pool's move to `create-complete` falls due, by
+    /// `IpamPoolId` — the fact the modelled [`IpamPool`] shape carries no member for, stored
+    /// beside the pool under the same id the way [`Self::vpc_available_at`] holds a
+    /// `pending` VPC's `available` move, on the same monotonic clock and the same
+    /// [`TRANSITION_DELAY`]. [`Self::materialize_due_transitions`] applies it.
+    pub ipam_pool_create_complete_at: BTreeMap<String, Instant>,
+    /// A `CreateIpamPool` `ClientToken` and the `IpamPoolId` that call minted, so a replay
+    /// of the same request answers with that pool instead of creating a second one: "a
+    /// unique, case-sensitive identifier that you provide to ensure the idempotency of the
+    /// request" (`CreateIpamPoolRequest$ClientToken`).
+    pub ipam_pool_client_tokens: HashMap<String, String>,
     /// Every IPAM internet registry association the account holds, by
     /// `IpamInternetRegistryAssociationId`, each with the routing policy registrations
     /// (ROAs) made under it — see [`IpamInternetRegistryAssociationRecord`]. Ordered by id,
@@ -1918,6 +1959,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_route_table_announcements: BTreeMap::new(),
             transit_gateway_policy_tables: BTreeMap::new(),
             ipam_pools: BTreeMap::new(),
+            ipam_scopes: BTreeMap::new(),
+            ipam_pool_create_complete_at: BTreeMap::new(),
+            ipam_pool_client_tokens: HashMap::new(),
             ipam_internet_registry_associations: BTreeMap::new(),
             ipam_routing_policy_registration_deltas: BTreeMap::new(),
             ipam_routing_policy_registration_delta_client_tokens: HashMap::new(),
@@ -2984,6 +3028,23 @@ impl ComAmazonawsEc2Amazonec2State {
             // The transition is applied once; nothing is owed on this subnet any more.
             false
         });
+        // An IPAM pool `CreateIpamPool` answered as `create-in-progress` reaches
+        // `create-complete` once its due instant has passed, whether or not anybody called —
+        // the same contract as the `pending` VPC above, and the reason the pool's due
+        // instant is kept beside the pool rather than on the modelled shape.
+        let ipam_pools = &mut self.ipam_pools;
+        self.ipam_pool_create_complete_at.retain(|pool_id, due_at| {
+            if now < *due_at {
+                return true;
+            }
+            if let Some(pool) = ipam_pools.get_mut(pool_id) {
+                if pool.state.as_deref() == Some(IPAM_POOL_STATE_CREATE_IN_PROGRESS) {
+                    pool.state = Some(IPAM_POOL_STATE_CREATE_COMPLETE.to_string());
+                }
+            }
+            // The transition is applied once; nothing is owed on this pool any more.
+            false
+        });
         // A VPC BPA exclusion `CreateVpcBlockPublicAccessExclusion` answered as
         // `create-in-progress` reaches `create-complete` once its due instant has passed,
         // whether or not anybody called — the same contract as a `pending` VPC's move
@@ -3589,6 +3650,18 @@ pub fn tag_bytes(tags: &BTreeMap<String, String>) -> usize {
 
 /// The bytes a modelled `Tag` list holds.
 pub fn tag_list_bytes(tags: &[Tag]) -> usize {
+    tags.iter()
+        .map(|tag| {
+            tag.key.as_ref().map_or(0, String::len) + tag.value.as_ref().map_or(0, String::len)
+        })
+        .sum()
+}
+
+/// The bytes a modelled `IpamResourceTag` list holds — the [`tag_list_bytes`] of the
+/// separate tag shape IPAM's allocation rules carry ("tags that are required for resources
+/// that use CIDRs from this IPAM pool", `IpamPool$AllocationResourceTags`), which a pool
+/// retains for the process's lifetime just as it retains its own tags.
+pub fn ipam_resource_tag_list_bytes(tags: &[IpamResourceTag]) -> usize {
     tags.iter()
         .map(|tag| {
             tag.key.as_ref().map_or(0, String::len) + tag.value.as_ref().map_or(0, String::len)
@@ -14345,6 +14418,68 @@ pub const ADDRESS_FAMILY_IPV4: &str = "ipv4";
 /// The `AddressFamily` of an IPv6 pool or range.
 pub const ADDRESS_FAMILY_IPV6: &str = "ipv6";
 
+/// The id prefix an IPAM scope is minted with.
+///
+/// The prefix AWS's own refusal spells for a scope that does not exist ("The IPAM scope
+/// (ipam-scope-…) does not exist", recorded in the wire corpus for a `CreateIpamPool` naming
+/// an unknown scope), read through the one [`prefixed_id_is_well_formed`] every resource of
+/// this module asks.
+pub const IPAM_SCOPE_ID_PREFIX: &str = "ipam-scope";
+
+/// The `IpamScopeType` of a scope holding the account's own internal space: the other member
+/// of that catalog beside [`IPAM_SCOPE_TYPE_PUBLIC`]
+/// (`smithy_query(query="shape",shape="IpamScopeType")` is `public | private`).
+pub const IPAM_SCOPE_TYPE_PRIVATE: &str = "private";
+
+/// A pool whose creation has been asked for and has not settled yet: the `IpamPoolState`
+/// enum's `create-in-progress` member
+/// (`smithy_query(query="shape",shape="IpamPoolState")`), which is what `CreateIpamPool`
+/// answers with.
+pub const IPAM_POOL_STATE_CREATE_IN_PROGRESS: &str = "create-in-progress";
+
+/// A pool whose creation has settled: the `IpamPoolState` enum's `create-complete` member,
+/// which the clock owes an [`IPAM_POOL_STATE_CREATE_IN_PROGRESS`] pool one
+/// [`TRANSITION_DELAY`] after the call that created it.
+pub const IPAM_POOL_STATE_CREATE_COMPLETE: &str = "create-complete";
+
+/// The `IpamPoolPublicIpSource` a public-scope pool gets when the request names none:
+/// "Default is byoip" (`CreateIpamPoolRequest$PublicIpSource`).
+pub const IPAM_POOL_PUBLIC_IP_SOURCE_BYOIP: &str = "byoip";
+
+/// The `ResourceType` an IPAM pool is tagged under, from the modelled catalog
+/// (`crate::ops::types::RESOURCE_TYPE_VALUES` carries `ipam-pool`), and the type segment of
+/// its ARN.
+pub const RESOURCE_TYPE_IPAM_POOL: &str = "ipam-pool";
+
+/// The `ResourceType` an IPAM scope is tagged under, from the same catalog, and the type
+/// segment of its ARN.
+pub const RESOURCE_TYPE_IPAM_SCOPE: &str = "ipam-scope";
+
+/// How deep a tree of IPAM pools may go: "The pool depth quota is 10"
+/// (`IpamPool$PoolDepth`). A top-level pool sits at depth 1 and a pool created inside a
+/// source pool one deeper, so a create that would pass this is refused rather than stored.
+pub const MAX_IPAM_POOL_DEPTH: i32 = 10;
+
+/// The depth of a pool created with no source pool: "the depth of pools in your IPAM pool"
+/// (`IpamPool$PoolDepth`) counts the pool itself, so a top-level pool is at 1.
+pub const TOP_LEVEL_IPAM_POOL_DEPTH: i32 = 1;
+
+/// The longest netmask an address of `family` can carry: "Possible netmask lengths for IPv4
+/// addresses are 0 - 32. Possible netmask lengths for IPv6 addresses are 0 - 128"
+/// (`CreateIpamPoolRequest$AllocationMinNetmaskLength`).
+///
+/// The modelled `IpamNetmaskLength` carries `range 0..128`, which the boundary validator has
+/// already applied, so this is the per-family bound INSIDE it that a pool's own allocation
+/// rules are held to. The family has been through the modelled `AddressFamily` enum
+/// (`ipv4 | ipv6`) by the time this is asked, so anything that is not IPv6 is IPv4.
+pub fn max_netmask_length_for_family(family: &str) -> i32 {
+    if family == ADDRESS_FAMILY_IPV6 {
+        128
+    } else {
+        32
+    }
+}
+
 /// The address family a canonical BYOIP range belongs to, as `AddressFamily` spells it on
 /// the wire.
 ///
@@ -14407,6 +14542,30 @@ pub const INVALID_IPAM_POOL_ID_NOT_FOUND: &str = "InvalidIpamPoolId.NotFound";
 
 /// `InvalidIpamPoolId.Malformed` (HTTP 400).
 pub const INVALID_IPAM_POOL_ID_MALFORMED: &str = "InvalidIpamPoolId.Malformed";
+
+/// `InvalidIpamScopeId.NotFound` (HTTP 400): the request named an IPAM scope id this account
+/// holds no scope for — the code AWS answers a `CreateIpamPool` naming an unknown scope
+/// with, as the wire corpus records.
+pub const INVALID_IPAM_SCOPE_ID_NOT_FOUND: &str = "InvalidIpamScopeId.NotFound";
+
+/// `InvalidIpamScopeId.Malformed` (HTTP 400): the request named something that is not an
+/// IPAM scope id at all, so there is nothing to look up.
+pub const INVALID_IPAM_SCOPE_ID_MALFORMED: &str = "InvalidIpamScopeId.Malformed";
+
+/// Refuse a well-formed IPAM scope id this account holds no scope for: HTTP 400
+/// [`INVALID_IPAM_SCOPE_ID_NOT_FOUND`].
+///
+/// The wording is this resource's own — "The IPAM scope (…) does not exist.", the sentence
+/// AWS answered a `CreateIpamPool` naming a scope that does not exist with — built from the
+/// id the REQUEST named, never from the recording. The parenthesised id is why this resource
+/// does not go through [`id_not_found`], whose sentence quotes the id instead.
+pub fn invalid_ipam_scope_id_not_found<E>(scope_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_IPAM_SCOPE_ID_NOT_FOUND,
+        400,
+        format!("The IPAM scope ({scope_id}) does not exist."),
+    )
+}
 
 /// Refuse an id of the kind `prefix` names that this service cannot resolve: a malformed
 /// one with `malformed`, an unknown one with `not_found`, in that order — the order the
@@ -14734,7 +14893,7 @@ impl ComAmazonawsEc2Amazonec2State {
         view.ipam_pool_arn = Some(::engine::emulator_arn(
             "ec2",
             view.ipam_region.as_deref().unwrap_or(DEFAULT_REGION),
-            &format!("ipam-pool/{pool_id}"),
+            &format!("{RESOURCE_TYPE_IPAM_POOL}/{pool_id}"),
         ));
         self.add_stored_bytes(
             STORED_RECORD_OVERHEAD_BYTES
@@ -14743,6 +14902,108 @@ impl ComAmazonawsEc2Amazonec2State {
         );
         self.ipam_pools.insert(pool_id.clone(), view);
         Some(pool_id)
+    }
+
+    /// Whether another IPAM scope fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]) — the same contract as
+    /// [`Self::has_ipam_pool_capacity`].
+    pub fn has_ipam_scope_capacity(&self) -> bool {
+        self.ipam_scopes.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Store an IPAM scope and answer the `IpamScopeId` it was given — or `None` when the
+    /// store is at its ceiling and nothing was stored.
+    ///
+    /// The ONE way a scope is stored, so the members the SERVICE owns cannot be built two
+    /// ways: the id, the ARN it reports, the account that owns it and the number of pools in
+    /// it are all derived here — a scope nothing has created a pool in holds none — rather
+    /// than taken from a caller, exactly as [`Self::insert_ipam_pool`] derives a pool's.
+    pub fn insert_ipam_scope(&mut self, mut view: IpamScope) -> Option<String> {
+        if !self.has_ipam_scope_capacity() {
+            return None;
+        }
+        let scope_id = self.next_id(IPAM_SCOPE_ID_PREFIX);
+        view.ipam_scope_id = Some(scope_id.clone());
+        // "The Amazon Resource Name (ARN) of the scope" (`IpamScope$IpamScopeArn`): an EC2
+        // ARN in the IPAM's own Region, under this resource's modelled type.
+        view.ipam_scope_arn = Some(::engine::emulator_arn(
+            "ec2",
+            view.ipam_region.as_deref().unwrap_or(DEFAULT_REGION),
+            &format!("{RESOURCE_TYPE_IPAM_SCOPE}/{scope_id}"),
+        ));
+        // "The Amazon Web Services account ID of the owner of the scope"
+        // (`IpamScope$OwnerId`): this emulator serves one account.
+        view.owner_id = Some(::engine::emulator_account_id().to_string());
+        // "The number of pools in the scope" (`IpamScope$PoolCount`), which
+        // [`Self::recount_ipam_scope_pools`] keeps as pools are created in it.
+        view.pool_count = Some(0);
+        self.add_stored_bytes(
+            STORED_RECORD_OVERHEAD_BYTES
+                + tag_list_bytes(view.tags.as_deref().unwrap_or_default())
+                + view.description.as_deref().unwrap_or_default().len(),
+        );
+        self.ipam_scopes.insert(scope_id.clone(), view);
+        Some(scope_id)
+    }
+
+    /// Store an IPAM pool a create has just made in the scope `scope_id` names, and answer
+    /// the `IpamPoolId` it was given — or `None` when the store is at its ceiling and
+    /// nothing was stored.
+    ///
+    /// The ONE way a CREATED pool is stored, so no path can leave the store disagreeing with
+    /// itself about one: the pool is answered in the non-terminal `create-in-progress` state,
+    /// so the clock owes it [`IPAM_POOL_STATE_CREATE_COMPLETE`] one [`TRANSITION_DELAY`]
+    /// later ([`Self::ipam_pool_create_complete_at`], applied by
+    /// [`Self::materialize_due_transitions`]); `client_token` names the pool from here on so
+    /// a replay of the same request answers it instead of creating a second one; the scope's
+    /// own count of the pools in it is recounted; and every caller-chosen byte the record
+    /// retains — the allocation resource tags and the token beside what
+    /// [`Self::insert_ipam_pool`] already charges — is charged to the store's budget.
+    pub fn insert_creating_ipam_pool(
+        &mut self,
+        scope_id: &str,
+        client_token: Option<&str>,
+        mut view: IpamPool,
+    ) -> Option<String> {
+        view.state = Some(IPAM_POOL_STATE_CREATE_IN_PROGRESS.to_string());
+        let retained = ipam_resource_tag_list_bytes(
+            view.allocation_resource_tags.as_deref().unwrap_or_default(),
+        ) + client_token.unwrap_or_default().len();
+        let pool_id = self.insert_ipam_pool(view)?;
+        self.add_stored_bytes(retained);
+        self.ipam_pool_create_complete_at
+            .insert(pool_id.clone(), Instant::now() + TRANSITION_DELAY);
+        if let Some(token) = client_token {
+            self.ipam_pool_client_tokens
+                .insert(token.to_string(), pool_id.clone());
+        }
+        self.recount_ipam_scope_pools(scope_id);
+        Some(pool_id)
+    }
+
+    /// Set the scope's `PoolCount` to the number of pools the store now holds in it.
+    ///
+    /// "The number of pools in the scope" (`IpamScope$PoolCount`) is DERIVED from the pools
+    /// themselves, so it is recounted from them rather than incremented — two writers cannot
+    /// then leave the scope claiming a pool count the store does not hold. A pool names its
+    /// scope by `IpamScopeArn` (the modelled [`IpamPool`] carries no scope id at all), which
+    /// is what the pools of this scope are counted by.
+    fn recount_ipam_scope_pools(&mut self, scope_id: &str) {
+        let Some(scope_arn) = self
+            .ipam_scopes
+            .get(scope_id)
+            .and_then(|scope| scope.ipam_scope_arn.clone())
+        else {
+            return;
+        };
+        let pools = self
+            .ipam_pools
+            .values()
+            .filter(|pool| pool.ipam_scope_arn.as_deref() == Some(scope_arn.as_str()))
+            .count();
+        if let Some(scope) = self.ipam_scopes.get_mut(scope_id) {
+            scope.pool_count = i32::try_from(pools).ok();
+        }
     }
 }
 

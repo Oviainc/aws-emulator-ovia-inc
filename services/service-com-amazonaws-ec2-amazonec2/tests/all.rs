@@ -96,6 +96,8 @@ mod instance_lifecycle;
 mod instance_type_offerings;
 #[path = "all/instance_types.rs"]
 mod instance_types;
+#[path = "all/ipam_pools.rs"]
+mod ipam_pools;
 #[path = "all/ipam_routing_policy_registrations.rs"]
 mod ipam_routing_policy_registrations;
 #[path = "all/launch_templates.rs"]
