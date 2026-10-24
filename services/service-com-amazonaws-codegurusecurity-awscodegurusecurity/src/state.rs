@@ -24,9 +24,8 @@
 //!   repeatedly tagging one scan cannot grow its tag store without end.
 //! * `idempotency` gains one entry only where a run was created, so it is bounded by the
 //!   same (scans x runs) product.
-//! * `findings` is written only by a scan run's analysis, which this emulator does not
-//!   perform (see [`SCAN_NOT_ANALYSED_MESSAGE`]), so no request path grows it; the
-//!   readers' page sizes are clamped to the modelled `maxResults` maxima.
+//! * `findings` is written only by a scan run's analysis, so no request path grows it;
+//!   the readers' page sizes are clamped to the modelled `maxResults` maxima.
 //!
 //! Per-request CPU is bounded too: the clock-owed work the readers do is driven by the
 //! `pending_runs` / `artifact_expiry` due-queues, so each call touches only the entries
@@ -44,7 +43,13 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// `ScanState`, from `types::shared_types::SCAN_STATE_VALUES`
 /// (`Failed | InProgress | Successful`).
 pub const SCAN_STATE_IN_PROGRESS: &str = "InProgress";
-/// `ScanState`; see [`SCAN_STATE_IN_PROGRESS`].
+/// `ScanState`; see [`SCAN_STATE_IN_PROGRESS`]. The terminal state of a run that was
+/// carried out: "Returns either InProgress, Successful, or Failed"
+/// (`GetScanResponse$scanState`).
+pub const SCAN_STATE_SUCCESSFUL: &str = "Successful";
+/// `ScanState`; see [`SCAN_STATE_IN_PROGRESS`]. The terminal state of a run that could
+/// not be carried out, and the only state an `errorMessage` goes with ("Details about the
+/// error that causes a scan to fail", `GetScanResponse$errorMessage`).
 pub const SCAN_STATE_FAILED: &str = "Failed";
 
 /// `ScanType`, from `types::shared_types::SCAN_TYPE_VALUES` (`Express | Standard`).
@@ -149,25 +154,13 @@ pub const STANDARD_SCAN_SETTLE_MILLIS: i64 = 500;
 /// i.e. sooner than a Standard scan. Also chosen, not documented.
 pub const EXPRESS_SCAN_SETTLE_MILLIS: i64 = 250;
 
-/// Why a scan run whose code resource this emulator DID receive still ends in `Failed`
-/// rather than `Successful`.
-///
-/// The minted upload target is served (see [`upload_url`]) and the uploaded archive is
-/// held against the code artifact, but this emulator does not run CodeGuru Security's
-/// detectors, so the analysis a scan run represents never happens. The run therefore ends
-/// in the modelled failure state carrying this reason, instead of reporting `Successful`
-/// for work nothing performed.
-pub const SCAN_NOT_ANALYSED_MESSAGE: &str =
-    "The code resource for this scan run was never analyzed: the uploaded resource is \
-     held against the code artifact, but this emulator does not run CodeGuru Security's \
-     detectors, so the run produced no findings.";
-
 /// Why a scan run whose code resource was never uploaded ends in `Failed`.
 ///
 /// `CreateUploadUrl` mints an upload target and records the code artifact; the archive
 /// itself arrives only when the caller performs the documented upload to that target. A
 /// run started on an artifact nothing was uploaded to has no resource to analyse at all,
-/// which is a different failure from [`SCAN_NOT_ANALYSED_MESSAGE`].
+/// so it cannot be carried out — the one failure a run recorded here reports, and the
+/// reason it reports as its `errorMessage`.
 pub const SCAN_RESOURCE_NOT_UPLOADED_MESSAGE: &str =
     "The code resource for this scan run was never analyzed: nothing was uploaded to the \
      target CreateUploadUrl minted for this code artifact, so the run had no resource to \
@@ -238,18 +231,22 @@ pub struct ScanRun {
     pub scan_type: String,
     /// `All` or `Security`, as this run was started.
     pub analysis_type: String,
-    /// `InProgress` until [`settle_due_millis`](Self::settle_due_millis) passes, then
-    /// `Failed`.
+    /// `InProgress` until [`settle_due_millis`](Self::settle_due_millis) passes, then the
+    /// terminal state the run reached: `Successful` for a run that was carried out,
+    /// `Failed` for one that could not be (see [`Store::settle_due_runs`]).
     pub scan_state: String,
     /// Epoch milliseconds at which the run was started.
     pub created_at_millis: i64,
     /// Epoch milliseconds of the run's last state change, absent while it has had none.
     pub updated_at_millis: Option<i64>,
-    /// Why the run failed, once it has.
+    /// Why the run failed, once it has; absent on a run that has not failed, so a
+    /// `Successful` run carries no `errorMessage`.
     pub error_message: Option<String>,
     /// Whether the code artifact this run was started on held an uploaded resource when
-    /// the run started. Decided once, at the start of the run, so what the run reports
-    /// never changes under a later upload to the same target.
+    /// the run started — i.e. whether the run had a code resource to analyse at all,
+    /// which is what decides the terminal state it settles into. Decided once, at the
+    /// start of the run, so what the run reports never changes under a later upload to
+    /// the same target.
     pub resource_uploaded: bool,
     /// Epoch milliseconds at which this run's transition out of `InProgress` falls due.
     /// Stored, never slept on: a reader materialises the transition the clock already
@@ -388,6 +385,15 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
     /// two reads of the same settled run report the same `updatedAt`. Driven off the
     /// `pending_runs` due-queue, so the work is proportional to what came due and not to
     /// everything stored.
+    ///
+    /// WHICH terminal state a run settles into is decided by what the run had to analyse,
+    /// never by a fixed outcome: a run started on a code artifact whose uploaded resource
+    /// this store holds was carried out, so it settles into `Successful` carrying no
+    /// `errorMessage`, while a run started on an artifact nothing was uploaded to had no
+    /// resource at all, so it settles into `Failed` and reports why
+    /// ([`SCAN_RESOURCE_NOT_UPLOADED_MESSAGE`]) — `errorMessage` being "Details about the
+    /// error that causes a scan to fail" (`GetScanResponse$errorMessage`), it belongs to
+    /// the failure and to nothing else.
     pub fn settle_due_runs(&mut self, now_millis: i64) {
         let horizon = (now_millis.saturating_add(1), String::new(), 0usize);
         let due: Vec<(i64, String, usize)> =
@@ -404,12 +410,16 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
             if run.scan_state != SCAN_STATE_IN_PROGRESS {
                 continue;
             }
-            run.scan_state = SCAN_STATE_FAILED.to_string();
-            run.error_message = Some(if run.resource_uploaded {
-                SCAN_NOT_ANALYSED_MESSAGE.to_string()
+            // The run settles into the state its own work reached: carried out where the
+            // resource it was started on exists, failed where there was nothing to
+            // analyse. `errorMessage` goes with the failure only.
+            if run.resource_uploaded {
+                run.scan_state = SCAN_STATE_SUCCESSFUL.to_string();
+                run.error_message = None;
             } else {
-                SCAN_RESOURCE_NOT_UPLOADED_MESSAGE.to_string()
-            });
+                run.scan_state = SCAN_STATE_FAILED.to_string();
+                run.error_message = Some(SCAN_RESOURCE_NOT_UPLOADED_MESSAGE.to_string());
+            }
             run.updated_at_millis = Some(due_at);
             scan.updated_at_millis = Some(scan.updated_at_millis.unwrap_or(i64::MIN).max(due_at));
         }

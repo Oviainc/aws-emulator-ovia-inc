@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPageResolutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPageResolutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPageResolutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resolution path of the page the request's `PageId` names: the hierarchy of
+//! contacts the engagement resolved THROUGH to reach the contact channel this page engaged,
+//! the contact the engagement engaged first and the paged contact last.
+//!
+//! The path is rebuilt from the store rather than stamped on the page, because the
+//! resolution IS the stored plan graph: the engagement records the contact it engaged, each
+//! of that contact's plan stages names the contacts it escalates to (and the contact
+//! channels, whose owner is a contact too), and the page records the contact whose channel
+//! was engaged ([`resolution_path`]). Each step carries the `StageIndex` of the plan stage
+//! that resolved to it, and the engaged contact — resolved by no stage — carries none.
+//!
+//! Every step's `Type` is the `Type` its contact was created with, so an escalation plan
+//! reports `ESCALATION`, an on-call schedule `ONCALL_SCHEDULE` and a person `PERSONAL`.
+//!
+//! Two refusals come first, and this read writes nothing either way:
+//!
+//! 1. the account-level Incident Manager precondition
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set_for`])
+//!    — this read's whole subject is one resource ARN, so with no ACTIVE replication set the
+//!    account has no home Region for it and the ARN resolves to nothing: the modelled
+//!    `ValidationException` (HTTP 400), BEFORE the page is looked up;
+//! 2. a `PageId` the store holds no page for — the modelled `ResourceNotFoundException`
+//!    (HTTP 404).
+//!
+//! Paging is the service's shared codec ([`crate::state::encode_next_token`]) over the
+//! resolution path in path order, so a `NextToken` this list did not issue is refused with
+//! the modelled `ValidationException` rather than served as if it resumed something.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +175,211 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPageResolutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPageResolutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPageResolutions"))
+        use crate::state::{
+            decode_next_token, invalid_next_token_message, page_size, take_page,
+            TOKEN_SCOPE_PAGE_RESOLUTIONS,
+        };
+
+        // The page is addressed by ARN and nothing is read off the request envelope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPageResolutionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        let state = state.lock();
+
+        // The account gate comes FIRST, before `PageId` is resolved, so a non-onboarded
+        // account is refused identically whether or not the page it named exists.
+        state
+            .require_active_replication_set_for(&input.page_id)
+            .map_err(account_precondition_failed)?;
+
+        let Some(page) = state.pages.get(&input.page_id) else {
+            return Err(ListPageResolutionsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Page {} not found", input.page_id),
+                    resource_id: input.page_id.clone(),
+                    resource_type: PAGE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let path = resolution_path(&state, page);
+
+        // The resume point: every step strictly after the one the last page ended on, in
+        // this list's own order — which is path order, so the token names the `ContactArn`
+        // that step resolved to.
+        let remaining = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => {
+                let resumed = decode_next_token(TOKEN_SCOPE_PAGE_RESOLUTIONS, token)
+                    .and_then(|contact_arn| {
+                        path.iter()
+                            .position(|step| step.contact_arn == contact_arn)
+                    })
+                    .ok_or_else(|| validation(invalid_next_token_message(token)))?;
+                path[resumed.saturating_add(1)..].to_vec()
+            }
+            None => path,
+        };
+
+        let (page_resolutions, next_token) = take_page(
+            remaining,
+            page_size(None),
+            TOKEN_SCOPE_PAGE_RESOLUTIONS,
+            |step| step.contact_arn.clone(),
+        );
+
+        Ok(ListPageResolutionsOutput {
+            next_token,
+            page_resolutions,
+        })
     }
+}
+
+/// The resolution path of `page`: every contact the engagement resolved through on its way
+/// to the contact channel this page engaged, the engaged contact first and the paged
+/// contact last, each with the `StageIndex` of the plan stage that resolved to it.
+///
+/// The walk is the stored plan graph, entered at the contact the page's engagement engaged:
+/// a stage's `ContactTargetInfo` names a contact the stage escalates to, and a stage's
+/// `ChannelTargetInfo` names a channel whose OWNER is a contact the stage reaches, so both
+/// are edges out of that plan. It is breadth-first over FIRST discovery, so each contact is
+/// entered once — which is what makes a cyclic or diamond-shaped plan terminate — and the
+/// path recovered from it is the shortest resolution to the paged contact.
+///
+/// A contact the store no longer holds contributes no step: its `Type` is a required member
+/// of a step and only the contact record carries it, so a contact that has since been
+/// deleted is reported as nothing rather than as a guessed type.
+fn resolution_path(
+    state: &crate::state::ComAmazonawsSsmcontactsSsmcontactsState,
+    page: &crate::state::PageRecord,
+) -> Vec<ResolutionContact> {
+    use ::std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+    use crate::state::MAX_PLANS_PER_ENGAGEMENT;
+
+    // Where the resolution starts: the contact or escalation plan the engagement engaged.
+    // An engagement is never deleted, so the fallback only guards a page whose engagement
+    // the store does not hold — and for that page the resolution starts at the page's own
+    // contact, the one thing it does record.
+    let root = state
+        .engagements
+        .get(&page.engagement_arn)
+        .map(|engagement| engagement.contact_arn.clone())
+        .unwrap_or_else(|| page.contact_arn.clone());
+
+    // `ContactArn` -> the plan that resolved to it and the index of the stage that did.
+    let mut resolved_by: BTreeMap<String, (String, usize)> = BTreeMap::new();
+    // The contacts already entered, which is what keeps a cyclic or diamond-shaped plan
+    // from being walked twice — and, being capped, what bounds the whole walk exactly as
+    // the paging walk `StartEngagement` drives is bounded.
+    let mut entered: BTreeSet<String> = BTreeSet::new();
+    let mut worklist: VecDeque<String> = VecDeque::new();
+    entered.insert(root.clone());
+    worklist.push_back(root.clone());
+
+    while let Some(engaged_arn) = worklist.pop_front() {
+        let Some(contact) = state.contacts.get(&engaged_arn) else {
+            continue;
+        };
+        for (index, stage) in contact.plan.stages.iter().flatten().enumerate() {
+            for target in &stage.targets {
+                let escalated_to = target
+                    .contact_target_info
+                    .as_ref()
+                    .and_then(|info| info.contact_id.clone());
+                let channel_owner = target
+                    .channel_target_info
+                    .as_ref()
+                    .and_then(|info| state.contact_channels.get(&info.contact_channel_id))
+                    .map(|channel| channel.contact_arn.clone());
+                for reached in [escalated_to, channel_owner].into_iter().flatten() {
+                    if entered.len() >= MAX_PLANS_PER_ENGAGEMENT
+                        || !entered.insert(reached.clone())
+                    {
+                        continue;
+                    }
+                    resolved_by.insert(reached.clone(), (engaged_arn.clone(), index));
+                    worklist.push_back(reached);
+                }
+            }
+        }
+    }
+
+    // Back up from the paged contact to the engaged one. `resolved_by` records each contact
+    // once, at its first discovery, so following it is walking a TREE towards its root: no
+    // contact can repeat and the walk terminates.
+    let mut steps: Vec<(String, Option<usize>)> = Vec::new();
+    let mut current = page.contact_arn.clone();
+    while let Some((resolver, index)) = resolved_by.get(&current) {
+        steps.push((current, Some(*index)));
+        current = resolver.clone();
+    }
+    steps.push((current.clone(), None));
+    // A page whose contact the stored plans no longer resolve — the plan that reached it was
+    // rewritten after the engagement started — still resolves FROM the engaged contact, so
+    // the path keeps that contact as its first step.
+    if current != root {
+        steps.push((root, None));
+    }
+    steps.reverse();
+
+    steps
+        .into_iter()
+        .filter_map(|(contact_arn, stage_index)| {
+            let contact = state.contacts.get(&contact_arn)?;
+            Some(ResolutionContact {
+                r#type: contact.contact_type.clone(),
+                contact_arn,
+                stage_index: stage_index
+                    .and_then(|index| i32::try_from(index).ok())
+                    .filter(|index| *index <= MAX_STAGE_INDEX),
+            })
+        })
+        .collect()
+}
+
+/// The largest value the modelled `StageIndex` admits (`range` 0..100).
+///
+/// A plan with more stages than that has stages this member cannot report, so a step
+/// resolved by one of them is reported WITHOUT a `StageIndex` — the member is optional —
+/// rather than with a value outside its own constraint.
+const MAX_STAGE_INDEX: i32 = 100;
+
+/// The `resourceType` this operation's not-found error names, spelled as `DescribePage` and
+/// `AcceptPage` — the other operations addressed by a `PageId` — spell it.
+const PAGE_RESOURCE_TYPE: &str = "page";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` because the failure is not a member-level one, and `fields` is
+/// present but EMPTY for the same reason — no field of the request is at fault.
+fn account_precondition_failed(message: String) -> ListPageResolutionsError {
+    ListPageResolutionsErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// A member-level refusal: this operation's modelled `ValidationException`, carrying
+/// `message`.
+fn validation(message: impl Into<String>) -> ListPageResolutionsError {
+    ListPageResolutionsErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: None,
+    })
+    .into()
 }

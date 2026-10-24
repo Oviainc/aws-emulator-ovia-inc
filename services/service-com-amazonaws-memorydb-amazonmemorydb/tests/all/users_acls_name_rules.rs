@@ -930,12 +930,24 @@ async fn a_cluster_takes_only_an_engine_version_its_engine_publishes() {
             "InvalidParameterCombinationException",
         ),
         (
+            // Every MemoryDB cluster is a replicated cluster, so an engine that does
+            // not replicate can back none of them.
+            "an engine that does not support replication",
+            json!({
+                "ClusterName": "engine-no-replication",
+                "NodeType": "db.t4g.small",
+                "ACLName": OPEN_ACCESS_ACL_NAME,
+                "Engine": "memcached",
+            }),
+            "InvalidParameterCombinationException",
+        ),
+        (
             "an engine this service does not run",
             json!({
                 "ClusterName": "engine-unknown-engine",
                 "NodeType": "db.t4g.small",
                 "ACLName": OPEN_ACCESS_ACL_NAME,
-                "Engine": "memcached",
+                "Engine": "no-such-engine",
             }),
             "InvalidParameterValueException",
         ),

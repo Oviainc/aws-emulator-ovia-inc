@@ -160,10 +160,25 @@ pub const DEFAULT_EVENT_WINDOW: Duration = Duration::from_secs(60 * 60);
 /// nothing, so it is a value the listing cannot serve.
 pub const MIN_EVENT_DURATION_MINUTES: i32 = 1;
 
-/// The largest `DescribeEvents$Duration` the service can serve: [`EVENT_RETENTION`] in
-/// the whole minutes that member is given in (14 days = 20160 minutes), because no
-/// event older than that is kept.
-pub const MAX_EVENT_DURATION_MINUTES: i32 = 14 * 24 * 60;
+/// What the service answers a `DescribeEvents$Duration` that is not positive with: the
+/// rule itself, stated — the member bounds a window of minutes, so only a positive
+/// number of them names one.
+pub const NON_POSITIVE_DURATION_MESSAGE: &str = "Duration must be positive.";
+
+/// What the service answers a `DescribeEvents$StartTime` that is not in the past with:
+/// an event log holds what has already happened, so a window cannot start after now.
+pub const FUTURE_START_TIME_MESSAGE: &str = "Start time must be in the past.";
+
+/// What the service answers a `DescribeEvents` request that bounds its window twice —
+/// `Duration` beside `StartTime` or `EndTime` — with.
+pub const DURATION_WITH_INTERVAL_MESSAGE: &str =
+    "If Duration is specified, both StartTime and EndTime must be omitted.";
+
+/// What the service answers a `DescribeEvents$SourceName` given without a
+/// `SourceType` with: a name identifies a source within a KIND of source, so the two
+/// members only select together.
+pub const SOURCE_NAME_WITHOUT_TYPE_MESSAGE: &str =
+    "Cannot specify source identifier without source type";
 
 /// The most events this store keeps.
 ///
@@ -1682,7 +1697,8 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
         }
     }
 
-    /// Resolve a tagging call's `ResourceArn` to the resource it names.
+    /// Resolve a tagging call's `ResourceArn` to the resource it names, for a request
+    /// signed for `request_region`.
     ///
     /// Tags belong to a resource, so each of `ListTags`, `TagResource` and
     /// `UntagResource` resolves the ARN against this store before reading or writing a
@@ -1690,17 +1706,29 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
     ///
     /// * an ARN that is not a MemoryDB resource ARN at all —
     ///   [`TagTargetRejection::InvalidArn`], the 400 `InvalidARNFault`;
-    /// * a well-formed one naming no resource in this store —
+    /// * a well-formed one whose region or account is not this endpoint's —
+    ///   [`TagTargetRejection::ForeignScope`], the 400
+    ///   `InvalidParameterValueException` ([`arn_scope_rejection`]), decided BEFORE the
+    ///   store is consulted, because an endpoint that does not serve that scope has no
+    ///   resource to look for;
+    /// * a well-formed one in this scope naming no resource in this store —
     ///   [`TagTargetRejection::NotFound`] carrying the kind whose not-found fault the
     ///   operation models. A resource's ARN is STORED rather than rebuilt per call, so an
-    ///   ARN naming an existing resource in another region or account resolves to nothing
-    ///   too.
-    pub fn tag_target(&self, resource_arn: &str) -> Result<String, TagTargetRejection> {
-        let Some((kind, name)) = parse_resource_arn(resource_arn) else {
+    ///   ARN naming an existing resource under another partition resolves to nothing too.
+    pub fn tag_target(
+        &self,
+        resource_arn: &str,
+        request_region: &str,
+    ) -> Result<String, TagTargetRejection> {
+        let Some(parts) = parse_resource_arn(resource_arn) else {
             return Err(TagTargetRejection::InvalidArn(format!(
                 "{resource_arn} is not a valid MemoryDB resource ARN."
             )));
         };
+        if let Some(message) = arn_scope_rejection(&parts, request_region) {
+            return Err(TagTargetRejection::ForeignScope(message));
+        }
+        let (kind, name) = (parts.kind, parts.name);
         let stored = match kind {
             ResourceKind::Cluster => self.clusters.get(name).map(|cluster| cluster.arn.as_str()),
             ResourceKind::Acl => self.acls.get(name).map(|acl| acl.arn.as_str()),
@@ -2478,6 +2506,119 @@ pub fn engine_rejection(engine: Option<&str>) -> Option<String> {
     (!offered).then(|| format!("Invalid engine name {engine} specified for the cluster"))
 }
 
+/// What `DeleteCluster` answers a `ClusterName` this store does not hold with: the
+/// service's own sentence for the condition, which quotes no value of the request.
+pub const NO_SUCH_CLUSTER_MESSAGE: &str = "Specified cluster does not exist";
+
+/// What the service answers an `UpdateUser` naming no field to change with. Fixed text:
+/// the request carried no value to quote back, so the rule is stated.
+pub const EMPTY_USER_UPDATE_MESSAGE: &str =
+    "Update user needs to have at least one field specified.";
+
+/// What the service answers a filter naming no engine version it offers with
+/// (`DescribeEngineVersions`' `EngineVersion` / `ParameterGroupFamily` / `Engine`).
+/// Fixed text: the rule is stated, not the value the request carried.
+pub const INVALID_ENGINE_VERSION_MESSAGE: &str =
+    "Invalid engine version or parameter group family was provided.";
+
+/// The cache engines AWS offers that do NOT replicate.
+///
+/// Replication is a property of the ENGINE: AWS's Memcached engine "does not support
+/// replication" (it has no replicas and no failover), while the Redis OSS and Valkey
+/// engines do. Every MemoryDB cluster is a replicated cluster — a primary per shard
+/// with its replicas, which is what makes it durable — so an engine from this list can
+/// back no MemoryDB cluster at all, whatever its replica count.
+const NON_REPLICATING_ENGINES: &[&str] = &["memcached"];
+
+/// What the service answers a cluster asked for on an engine that does not replicate
+/// with. Fixed text: the request's own engine is not quoted back, the rule it broke is.
+pub const NO_REPLICATION_MESSAGE: &str = "Specified engine does not support replication.";
+
+/// Why `engine` cannot back a MemoryDB cluster because it does not replicate, or `None`
+/// when it is not one of the non-replicating engines.
+///
+/// A COMBINATION failure rather than a bad value: the engine is a real AWS cache
+/// engine, and what it cannot do is the replicated cluster this operation creates — so
+/// the caller answers it with its modelled `InvalidParameterCombinationException`,
+/// checked BEFORE [`engine_rejection`], whose "this service does not run that engine"
+/// is the weaker statement about the same member.
+pub fn engine_replication_rejection(engine: Option<&str>) -> Option<String> {
+    let engine = engine?;
+    NON_REPLICATING_ENGINES
+        .contains(&engine)
+        .then(|| NO_REPLICATION_MESSAGE.to_string())
+}
+
+/// The node-type families MemoryDB publishes, with the sizes each of them is offered
+/// in, from the AWS MemoryDB *Supported node types* documentation: the burstable `t4g`
+/// family, the general-purpose `m6g`/`m7g`/`m8g` families and the memory-optimized
+/// `r6g`/`r7g`/`r8g` families, plus the data-tiering `r6gd` family.
+///
+/// A node type is `db.<family>.<size>`, and a request naming anything else names no
+/// node MemoryDB can run.
+const NODE_TYPE_FAMILIES: &[(&str, &[&str])] = &[
+    ("t4g", &["small", "medium"]),
+    ("m6g", GENERAL_PURPOSE_SIZES),
+    ("m7g", GENERAL_PURPOSE_SIZES),
+    ("m8g", GENERAL_PURPOSE_SIZES),
+    ("r6g", GENERAL_PURPOSE_SIZES),
+    ("r6gd", &["xlarge", "2xlarge", "4xlarge", "8xlarge"]),
+    ("r7g", GENERAL_PURPOSE_SIZES),
+    ("r8g", GENERAL_PURPOSE_SIZES),
+];
+
+/// The sizes the non-burstable MemoryDB node families are offered in, from the same
+/// *Supported node types* documentation.
+const GENERAL_PURPOSE_SIZES: &[&str] = &[
+    "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge",
+];
+
+/// The prefix every MemoryDB node type carries: MemoryDB node types are named
+/// `db.<family>.<size>`.
+const NODE_TYPE_PREFIX: &str = "db.";
+
+/// What the service answers a node type it does not offer with. Fixed text: the rule is
+/// stated, not the value the request carried.
+pub const INVALID_NODE_TYPE_MESSAGE: &str = "Invalid node type specified.";
+
+/// Why `node_type` names no node type MemoryDB offers, or `None` when it names one.
+///
+/// `NodeType` is a plain `String` in the model, so the catalog is the service's: a node
+/// type is `db.<family>.<size>` with the family and size from
+/// [`NODE_TYPE_FAMILIES`]. The check is on the VALUE, so it is made before the request's
+/// references to other resources are resolved — a cluster cannot be created on a node
+/// MemoryDB does not run, whether or not the ACL it names exists.
+pub fn node_type_rejection(node_type: &str) -> Option<String> {
+    let offered = node_type
+        .strip_prefix(NODE_TYPE_PREFIX)
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(family, size)| {
+            NODE_TYPE_FAMILIES
+                .iter()
+                .any(|(known, sizes)| *known == family && sizes.contains(&size))
+        });
+    (!offered).then(|| INVALID_NODE_TYPE_MESSAGE.to_string())
+}
+
+/// Why the window a `DescribeEvents` request asks for cannot be served, or `None` when
+/// the whole of it lies inside the retention period.
+///
+/// The service keeps [`EVENT_RETENTION`] of history, so no event older than that is
+/// available to report — whichever member bounds the window from below (`StartTime`, or
+/// `Duration` minutes before its end). A window reaching further back than that asks for
+/// events the service does not have, which is a COMBINATION of members it cannot serve
+/// rather than one bad value; the retention period the message names is the constant
+/// above, so the sentence and the rule cannot drift apart.
+pub fn event_window_rejection(start: SystemTime, now: SystemTime) -> Option<String> {
+    let earliest = now.checked_sub(EVENT_RETENTION)?;
+    (start < earliest).then(|| {
+        format!(
+            "Events occurring more than {} days in the past are not available.",
+            EVENT_RETENTION.as_secs() / (24 * 60 * 60)
+        )
+    })
+}
+
 /// The region this request was signed for, or [`DEFAULT_REGION`] when it carries no
 /// SigV4 credential scope. Every ARN and endpoint a handler mints goes through here,
 /// so a resource's region is the caller's rather than a constant.
@@ -2661,10 +2802,10 @@ pub const DEFAULT_PARAMETER_GROUP_PREFIX: &str = "default.";
 /// this service cannot parse at all is not refused here: it is the ARN itself that is
 /// wrong, which the caller is told instead.
 pub fn default_resource_rejection(resource_arn: &str) -> Option<String> {
-    let (kind, name) = parse_resource_arn(resource_arn)?;
-    let is_default = match kind {
+    let parts = parse_resource_arn(resource_arn)?;
+    let is_default = match parts.kind {
         ResourceKind::ParameterGroup | ResourceKind::MultiRegionParameterGroup => {
-            name.starts_with(DEFAULT_PARAMETER_GROUP_PREFIX)
+            parts.name.starts_with(DEFAULT_PARAMETER_GROUP_PREFIX)
         }
         _ => false,
     };
@@ -2798,6 +2939,19 @@ impl ResourceKind {
             Self::MultiRegionParameterGroup => "Multi-Region parameter group name",
         }
     }
+
+    /// Whether this kind of resource is GLOBAL rather than regional.
+    ///
+    /// A multi-Region resource spans regions, so it belongs to no single one of them:
+    /// its ARN carries an EMPTY region segment, the way every global AWS resource's
+    /// does, and there is no region of its own for a caller's region to be compared
+    /// against.
+    pub fn is_global(self) -> bool {
+        matches!(
+            self,
+            Self::MultiRegionCluster | Self::MultiRegionParameterGroup
+        )
+    }
 }
 
 /// The resource-type segment of each kind of MemoryDB ARN.
@@ -2821,14 +2975,30 @@ const RESOURCE_TYPE_SEGMENTS: &[(&str, ResourceKind)] = &[
     ),
 ];
 
-/// The kind and name a MemoryDB resource ARN carries, or `None` when it is not one.
+/// What a MemoryDB resource ARN names: the kind of resource, the resource's own name,
+/// and the scope — region and account — the ARN names them in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceArnParts<'a> {
+    pub kind: ResourceKind,
+    pub name: &'a str,
+    /// The ARN's region segment, EMPTY for a global resource (see
+    /// [`ResourceKind::is_global`]).
+    pub region: &'a str,
+    pub account: &'a str,
+}
+
+/// What a MemoryDB resource ARN names, or `None` when it is not one.
 ///
 /// The shape is the one every ARN this service mints has (see [`cluster_arn`]):
 /// `arn:<partition>:memorydb:<region>:<account>:<type>/<name>`, with a non-empty
-/// partition, region and account, a resource type from [`RESOURCE_TYPE_SEGMENTS`] and a
+/// partition and account, a resource type from [`RESOURCE_TYPE_SEGMENTS`] and a
 /// non-empty resource name. The service segment must be this service's
 /// ([`ARN_NAMESPACE`]): another service's ARN names no MemoryDB resource.
-pub fn parse_resource_arn(resource_arn: &str) -> Option<(ResourceKind, &str)> {
+///
+/// The REGION segment is required only for a regional resource type: a global resource
+/// ([`ResourceKind::is_global`]) belongs to no single region, so its ARN carries no
+/// region and one that omits it is well formed rather than malformed.
+pub fn parse_resource_arn(resource_arn: &str) -> Option<ResourceArnParts<'_>> {
     let mut fields = resource_arn.splitn(6, ':');
     let prefix = fields.next()?;
     let partition = fields.next()?;
@@ -2836,12 +3006,7 @@ pub fn parse_resource_arn(resource_arn: &str) -> Option<(ResourceKind, &str)> {
     let region = fields.next()?;
     let account = fields.next()?;
     let resource = fields.next()?;
-    if prefix != "arn"
-        || partition.is_empty()
-        || service != ARN_NAMESPACE
-        || region.is_empty()
-        || account.is_empty()
-    {
+    if prefix != "arn" || partition.is_empty() || service != ARN_NAMESPACE || account.is_empty() {
         return None;
     }
     let (resource_type, name) = resource.split_once('/')?;
@@ -2851,7 +3016,37 @@ pub fn parse_resource_arn(resource_arn: &str) -> Option<(ResourceKind, &str)> {
     let (_, kind) = RESOURCE_TYPE_SEGMENTS
         .iter()
         .find(|(segment, _)| *segment == resource_type)?;
-    Some((*kind, name))
+    if region.is_empty() && !kind.is_global() {
+        return None;
+    }
+    Some(ResourceArnParts {
+        kind: *kind,
+        name,
+        region,
+        account,
+    })
+}
+
+/// What the service answers a well-formed ARN whose scope is not the endpoint's with.
+///
+/// Fixed text: the request named a region or an account this endpoint does not serve,
+/// so there is no value of the request to quote back — the caller is told which two
+/// parts of the ARN to look at.
+pub const FOREIGN_SCOPE_MESSAGE: &str =
+    "Please check the region or customer ID specified in the request.";
+
+/// Why `parts` names a scope this endpoint does not serve, or `None` when it names this
+/// endpoint's own region and account.
+///
+/// A regional AWS endpoint serves only the resources of its OWN region and of the
+/// caller's account, so an ARN naming another region or another account names nothing
+/// this endpoint can act on — which is a parameter VALUE the service refuses, not a
+/// resource that happens to be missing. A global resource has no region of its own, so
+/// only its account is compared.
+pub fn arn_scope_rejection(parts: &ResourceArnParts<'_>, request_region: &str) -> Option<String> {
+    let foreign_account = parts.account != ::engine::emulator_account_id();
+    let foreign_region = !parts.kind.is_global() && parts.region != request_region;
+    (foreign_account || foreign_region).then(|| FOREIGN_SCOPE_MESSAGE.to_string())
 }
 
 /// Why a tagging call's `ResourceArn` names no resource of this service
@@ -2859,11 +3054,15 @@ pub fn parse_resource_arn(resource_arn: &str) -> Option<(ResourceKind, &str)> {
 ///
 /// Carries the MESSAGE and, for a resolved kind, the kind — not a modelled error: each
 /// of the three tagging operations declares its own error enum, so each lifts this into
-/// its own `InvalidARNFault` / per-kind not-found variant.
+/// its own `InvalidARNFault` / `InvalidParameterValueException` / per-kind not-found
+/// variant.
 #[derive(Debug, Clone)]
 pub enum TagTargetRejection {
     /// The ARN is not a MemoryDB resource ARN at all: the 400 `InvalidARNFault`.
     InvalidArn(String),
+    /// The ARN is well formed but names another region or another account: the 400
+    /// `InvalidParameterValueException` (see [`arn_scope_rejection`]).
+    ForeignScope(String),
     /// The ARN is well formed but names no resource in this store: that kind's
     /// not-found fault.
     NotFound(ResourceKind, String),

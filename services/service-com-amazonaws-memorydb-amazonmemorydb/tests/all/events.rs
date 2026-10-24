@@ -21,9 +21,11 @@
 //!   `SourceName` matched against the identifier each event RECORDED exactly — a
 //!   spelling the log does not hold selects nothing;
 //! * the reported window is `StartTime`..`EndTime`, defaulting to the documented last
-//!   hour or to `Duration` minutes before the end, and a `Duration` outside
-//!   1..=20160 minutes (14 days, the age past which no event is kept) or an interval
-//!   that ends before it begins is refused;
+//!   hour or to `Duration` minutes before the end, and a window that starts in the
+//!   future, starts further back than the 14 days of history the service keeps, states
+//!   itself twice (`Duration` beside either end) or ends before it begins is refused;
+//! * `SourceName` identifies a source WITHIN a `SourceType`, so it cannot be given
+//!   without one;
 //! * the listing reports the window's events NEWEST FIRST and pages over the whole set
 //!   in that order for any `MaxResults`;
 //! * reading the listing changes nothing a later caller sees.
@@ -44,11 +46,24 @@ use crate::user_lifecycle::create_user;
 const SOURCE_TYPES: &[&str] =
     service_com_amazonaws_memorydb_amazonmemorydb::ops::types::SOURCE_TYPE_VALUES;
 
-/// The largest `Duration` (in minutes) the listing serves: 14 days, from
-/// `DescribeEvents` — "you can retrieve up to 14 days' worth of events if necessary".
-/// Mirrors `crate::state::MAX_EVENT_DURATION_MINUTES`; exercised AT the bound and one
-/// past it.
-const MAX_DURATION_MINUTES: i64 = 14 * 24 * 60;
+/// The retention period the listing serves events over: 14 days, from `DescribeEvents` —
+/// "you can retrieve up to 14 days' worth of events if necessary". Mirrors
+/// `crate::state::EVENT_RETENTION`; exercised AT the bound and one past it.
+const RETENTION_DAYS: i64 = 14;
+const RETENTION_SECONDS: i64 = RETENTION_DAYS * 24 * 60 * 60;
+
+/// How far inside (or past) the retention floor a `StartTime` row is placed.
+///
+/// The floor moves with the clock: it is `now - RETENTION_SECONDS` as the SERVICE reads
+/// `now`, which is a moment after the test built the request. A few seconds of slack is
+/// what makes "just inside" and "just past" the floor decidable from outside, while
+/// keeping both within seconds of a 14-day bound. The bound itself is exercised EXACTLY
+/// by the `Duration` rows, whose window the service closes at its own `now`.
+const RETENTION_SLACK: i64 = 5;
+
+/// The largest `Duration` (in minutes) a window can ask for and still lie inside the
+/// retention period above, which is what makes it the largest the listing serves.
+const MAX_DURATION_MINUTES: i64 = RETENTION_DAYS * 24 * 60;
 
 /// The page-size window every MemoryDB listing serves, from the service's own refusal
 /// ("Must be between 1 and 50"), mirrored from `crate::state::MIN_MAX_RESULTS` /
@@ -155,10 +170,16 @@ async fn describe(router: &MultiServiceRouter, body: &Value, case: &str) -> Valu
 
 /// The whole event log, in the order the service reports it.
 async fn whole_log(router: &MultiServiceRouter, case: &str) -> Vec<Reported> {
-    // A window wide enough for every event the suite records, so the listing is the
-    // whole log rather than the default last hour.
-    let body = json!({ "StartTime": 0, "MaxResults": MAX_MAX_RESULTS });
+    // A window wide enough for every event the suite records — the whole retention
+    // period — so the listing is the whole log rather than the default last hour.
+    let body = json!({ "StartTime": window_start(), "MaxResults": MAX_MAX_RESULTS });
     reported(&describe(router, &body, case).await, case)
+}
+
+/// A `StartTime` inside the retention period and well before anything this suite
+/// records: the whole-log window every case below asks for.
+fn window_start() -> i64 {
+    now_secs() - RETENTION_SECONDS + 3_600
 }
 
 /// Now, in the epoch seconds the `awsJson1_1` wire carries a `TStamp` as.
@@ -286,7 +307,7 @@ async fn every_change_is_reported_as_an_event_for_the_resource_it_changed() {
     let router = router();
     let case = "every kind of change";
     let expected_log = drive_every_kind_of_change(&router).await;
-    let body = describe(&router, &json!({ "StartTime": 0, "MaxResults": 50 }), case).await;
+    let body = describe(&router, &json!({ "StartTime": window_start(), "MaxResults": 50 }), case).await;
 
     assert_eq!(
         reported(&body, case),
@@ -353,7 +374,11 @@ async fn a_source_filter_narrows_the_listing() {
         let case = format!("SourceType={source_type:?}");
         let body = describe(
             &router,
-            &json!({ "StartTime": 0, "MaxResults": 50, "SourceType": source_type }),
+            &json!({
+                "StartTime": window_start(),
+                "MaxResults": 50,
+                "SourceType": source_type,
+            }),
             &case,
         )
         .await;
@@ -372,47 +397,61 @@ async fn a_source_filter_narrows_the_listing() {
     // A name as the log RECORDED it, the same name in other spellings (upper, mixed —
     // each names no recorded event, because the filter matches the recorded identifier
     // exactly rather than folding it), a name nothing recorded, and a name paired with a
-    // type that both does and does not hold its events.
-    let name_cases: &[(&str, Option<&str>)] = &[
-        ("alice", None),
-        ("ALICE", None),
-        ("Alice", None),
-        ("acl-one", None),
-        ("ACL-One", None),
-        ("bob-2", None),
-        ("Bob-2", None),
-        ("cl-one", None),
-        ("no-such-resource", None),
-        ("alice", Some("user")),
-        ("ALICE", Some("user")),
-        ("alice", Some("acl")),
-        ("acl-one", Some("acl")),
-        ("ACL-ONE", Some("acl")),
-        ("pg-one", Some("parameter-group")),
-        ("pg-one", Some("node")),
+    // type that both does and does not hold its events. A `SourceName` identifies a
+    // source WITHIN a kind, so each row names the kind too; the rows with no kind are
+    // the refusal that rule makes, asserted after the table.
+    let name_cases: &[(&str, &str)] = &[
+        ("alice", "user"),
+        ("ALICE", "user"),
+        ("Alice", "user"),
+        ("acl-one", "acl"),
+        ("ACL-One", "acl"),
+        ("bob-2", "user"),
+        ("Bob-2", "user"),
+        ("cl-one", "cluster"),
+        ("no-such-resource", "cluster"),
+        ("alice", "acl"),
+        ("ACL-ONE", "acl"),
+        ("pg-one", "parameter-group"),
+        ("pg-one", "node"),
     ];
     for (source_name, source_type) in name_cases {
         let case = format!("SourceName={source_name:?} SourceType={source_type:?}");
-        let mut request = json!({
-            "StartTime": 0,
+        let request = json!({
+            "StartTime": window_start(),
             "MaxResults": 50,
             "SourceName": source_name,
+            "SourceType": source_type,
         });
-        if let Some(source_type) = source_type {
-            request["SourceType"] = json!(source_type);
-        }
         let body = describe(&router, &request, &case).await;
         let want: Vec<Reported> = whole
             .iter()
-            .filter(|event| {
-                event.1 == *source_name && source_type.is_none_or(|wanted| event.0 == wanted)
-            })
+            .filter(|event| event.1 == *source_name && event.0 == *source_type)
             .cloned()
             .collect();
         assert_eq!(
             reported(&body, &case),
             want,
             "case {case:?}: expected only that resource's events, got {body}"
+        );
+    }
+
+    // A `SourceName` with no `SourceType` identifies nothing: a name belongs to a kind,
+    // and two kinds can carry the same name. Checked for a name the log holds and one
+    // it does not, so what is refused is the missing kind rather than the name.
+    for source_name in ["alice", "no-such-resource"] {
+        let case = format!("SourceName={source_name:?} with no SourceType");
+        let (status, body) = call(
+            &router,
+            "DescribeEvents",
+            &json!({ "StartTime": window_start(), "SourceName": source_name }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidParameterCombinationException"),
+            "case {case:?}: expected 400 InvalidParameterCombinationException, got {status} \
+             with {body}"
         );
     }
 }
@@ -450,25 +489,33 @@ async fn the_time_window_selects_which_events_are_reported() {
             false,
         ),
         (
-            "window closed at the epoch",
-            json!({ "StartTime": 0, "EndTime": 0 }),
+            "window closed just inside the retention floor",
+            json!({
+                "StartTime": now - RETENTION_SECONDS + RETENTION_SLACK,
+                "EndTime": now - RETENTION_SECONDS + RETENTION_SLACK,
+            }),
             false,
         ),
-        // A start before the events with no end: everything up to now.
-        ("StartTime at the epoch", json!({ "StartTime": 0 }), true),
-        // A start AFTER the events but inside an explicit interval reaching into the
-        // future: nothing yet to report, with the window a fractional timestamp names.
+        // A start at the oldest instant the service still keeps events for, with no
+        // end: everything up to now.
         (
-            "StartTime one second ahead",
-            json!({ "StartTime": (now + 1) as f64 + 0.5, "EndTime": now + hour }),
-            false,
-        ),
-        // `StartTime` is the stronger statement of the same bound, so it is what the
-        // window starts at when both it and `Duration` are supplied.
-        (
-            "StartTime wins over Duration",
-            json!({ "StartTime": 0, "Duration": 1 }),
+            "StartTime just inside the retention floor",
+            json!({ "StartTime": now - RETENTION_SECONDS + RETENTION_SLACK }),
             true,
+        ),
+        // An interval the events fall inside, bounded by a FRACTIONAL timestamp: the
+        // window is the instant the stamp names, sub-second part included.
+        (
+            "fractional StartTime an hour back",
+            json!({ "StartTime": (now - hour) as f64 + 0.5, "EndTime": now + hour }),
+            true,
+        ),
+        // An interval that closed before the events were recorded, so it holds none of
+        // them even though it lies inside the retention period.
+        (
+            "window closed two hours ago",
+            json!({ "StartTime": now - 2 * hour, "EndTime": now - hour }),
+            false,
         ),
     ];
     for (case, mut request, inside) in cases.iter().cloned() {
@@ -497,7 +544,7 @@ async fn the_listing_pages_over_the_whole_log() {
         let mut next_token: Option<String> = None;
         let mut pages = 0_usize;
         loop {
-            let mut request = json!({ "StartTime": 0, "MaxResults": page_size });
+            let mut request = json!({ "StartTime": window_start(), "MaxResults": page_size });
             if let Some(token) = next_token.as_deref() {
                 request["NextToken"] = json!(token);
             }
@@ -581,13 +628,76 @@ async fn a_request_that_names_no_listing_is_refused() {
             "Duration past the 14-day bound",
             json!({ "Duration": MAX_DURATION_MINUTES + 1 }),
             400,
-            "InvalidParameterValueException",
+            "InvalidParameterCombinationException",
         ),
         (
             "Duration at the 14-day bound",
             json!({ "Duration": MAX_DURATION_MINUTES }),
             200,
             "",
+        ),
+        // The window may not reach further back than the service keeps events, however
+        // it is bounded: at the retention floor it is served, one second past it is not.
+        (
+            "StartTime just inside the retention floor",
+            json!({ "StartTime": now - RETENTION_SECONDS + RETENTION_SLACK }),
+            200,
+            "",
+        ),
+        (
+            "StartTime just past the retention floor",
+            json!({ "StartTime": now - RETENTION_SECONDS - RETENTION_SLACK }),
+            400,
+            "InvalidParameterCombinationException",
+        ),
+        (
+            "StartTime at the epoch",
+            json!({ "StartTime": 0 }),
+            400,
+            "InvalidParameterCombinationException",
+        ),
+        (
+            "an interval whose start is past the retention floor",
+            json!({
+                "StartTime": now - RETENTION_SECONDS - 3_600,
+                "EndTime": now,
+            }),
+            400,
+            "InvalidParameterCombinationException",
+        ),
+        // A log holds what has already happened, so a window cannot START in the
+        // future — whether or not it ends there.
+        (
+            "StartTime in the future",
+            json!({ "StartTime": now + 3_600 }),
+            400,
+            "InvalidParameterValueException",
+        ),
+        (
+            "StartTime in the future with a later EndTime",
+            json!({ "StartTime": now + 3_600, "EndTime": now + 7_200 }),
+            400,
+            "InvalidParameterValueException",
+        ),
+        // `Duration` and the explicit interval state the same window, so the service
+        // takes one of them: beside either end, or both, it is refused.
+        (
+            "Duration beside StartTime",
+            json!({ "Duration": 60, "StartTime": now - 3_600 }),
+            400,
+            "InvalidParameterCombinationException",
+        ),
+        (
+            "Duration beside EndTime",
+            json!({ "Duration": 60, "EndTime": now }),
+            400,
+            "InvalidParameterCombinationException",
+        ),
+        (
+            "Duration beside both ends",
+            json!({ "Duration": 60, "StartTime": now - 3_600, "EndTime": now }),
+            400,
+            "InvalidParameterCombinationException",
         ),
         // An interval that ends before it begins holds no instant.
         (
@@ -619,7 +729,7 @@ async fn a_request_that_names_no_listing_is_refused() {
         // A token that names no position in this listing.
         (
             "NextToken naming no position",
-            json!({ "StartTime": 0, "NextToken": "99999999999999999999" }),
+            json!({ "StartTime": window_start(), "NextToken": "99999999999999999999" }),
             400,
             "InvalidParameterValueException",
         ),
@@ -753,7 +863,7 @@ async fn a_membership_change_records_one_event_per_member_naming_both_resources(
         let body = describe(
             &router,
             &json!({
-                "StartTime": 0,
+                "StartTime": window_start(),
                 "MaxResults": MAX_MAX_RESULTS,
                 "SourceType": "acl",
                 "SourceName": acl,
@@ -785,7 +895,7 @@ async fn a_membership_change_records_one_event_per_member_naming_both_resources(
     let body = describe(
         &router,
         &json!({
-            "StartTime": 0,
+            "StartTime": window_start(),
             "MaxResults": MAX_MAX_RESULTS,
             "SourceType": "acl",
             "SourceName": acl,
@@ -816,7 +926,7 @@ async fn a_membership_change_records_one_event_per_member_naming_both_resources(
         let body = describe(
             &router,
             &json!({
-                "StartTime": 0,
+                "StartTime": window_start(),
                 "MaxResults": MAX_MAX_RESULTS,
                 "SourceType": "user",
                 "SourceName": user,

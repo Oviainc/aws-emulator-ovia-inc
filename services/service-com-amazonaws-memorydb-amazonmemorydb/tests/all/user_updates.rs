@@ -23,7 +23,7 @@
 //! * the user every account ALREADY HAD is the service's, not the caller's: an update
 //!   naming it is refused and it keeps its documented access string;
 //! * a request naming no member to change is the modelled
-//!   `InvalidParameterCombinationException`, and a name state does not hold is the
+//!   `InvalidParameterValueException`, and a name state does not hold is the
 //!   modelled `UserNotFoundFault` — whatever else the request carries, the user is
 //!   resolved before what is asked of it;
 //! * a password is never echoed: only `Authentication$PasswordCount` is reported.
@@ -479,8 +479,8 @@ async fn an_update_needs_an_existing_user_in_a_valid_state() {
     );
 }
 
-/// A request naming no member to change asks for no modification at all, which is the
-/// modelled `InvalidParameterCombinationException`, and it writes nothing: the user
+/// A request naming no member to change names no field to update, which is the
+/// modelled `InvalidParameterValueException`, and it writes nothing: the user
 /// keeps its stored members AND its `active` status.
 #[tokio::test]
 async fn an_update_that_asks_for_nothing_is_refused_and_writes_nothing() {
@@ -494,8 +494,8 @@ async fn an_update_that_asks_for_nothing_is_refused_and_writes_nothing() {
     );
     assert_eq!(
         error_code(&body),
-        "InvalidParameterCombinationException",
-        "case {case:?}: expected the modelled invalid-combination fault, got {body}"
+        "InvalidParameterValueException",
+        "case {case:?}: expected the modelled invalid-value fault, got {body}"
     );
     let described = describe_user(&router, "unchanged", case).await;
     assert_eq!(

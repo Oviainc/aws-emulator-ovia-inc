@@ -49,6 +49,8 @@ mod list_environments;
 mod list_extensions;
 #[path = "all/list_hosted_configuration_versions.rs"]
 mod list_hosted_configuration_versions;
+#[path = "all/pattern_refusal_quoting.rs"]
+mod pattern_refusal_quoting;
 #[path = "all/refusal_message_templates.rs"]
 mod refusal_message_templates;
 #[path = "all/resource_deletes.rs"]
