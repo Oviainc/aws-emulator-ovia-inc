@@ -11,8 +11,9 @@
 //! with an id, an ARN and tags. A global network also owns its
 //! CORE network — the Cloud WAN managed network
 //! whose segments and edges are a function of the core network policy document it holds.
-//! A core network in turn owns its ATTACHMENTS: each joins one resource to ONE of the
-//! edge locations that policy configures, and a Connect attachment is carried over
+//! A core network in turn owns its ATTACHMENTS: each joins one resource to the edge
+//! locations that policy configures — one of them for every kind but a Direct Connect
+//! gateway attachment, which spans several — and a Connect attachment is carried over
 //! another attachment (its transport) rather than over a resource of its own. The policy's
 //! `attachment-policies` rules decide what becomes of each attachment created on the core
 //! network — which segment or network function group it joins, and whether its attachment
@@ -33,8 +34,8 @@ use crate::ops::types::{
     ConnectAttachment, ConnectAttachmentOptions,
     Connection, ConnectionHealth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
     CoreNetworkPolicy, CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment,
-    Device, GlobalNetwork, Link, LinkAssociation, Location, NetworkResource, NetworkTelemetry,
-    OrganizationStatus,
+    Device, DirectConnectGatewayAttachment, GlobalNetwork, Link, LinkAssociation, Location,
+    NetworkResource, NetworkTelemetry, OrganizationStatus,
     ResourceNotFoundException, Site, SiteToSiteVpnAttachment, Tag, ValidationException,
     ValidationExceptionField, VpcAttachment, VpcOptions,
 };
@@ -125,15 +126,19 @@ pub const ATTACHMENT_KIND: &str = "attachment";
 /// it. See [`AttachmentRecord::state_at`].
 pub const ATTACHMENT_STATE_UPDATING: &str = "UPDATING";
 
-/// The three `AttachmentType`s this service mints, of the five the model enumerates
+/// The four `AttachmentType`s this service mints, of the five the model enumerates
 /// (CONNECT, DIRECT_CONNECT_GATEWAY, SITE_TO_SITE_VPN, TRANSIT_GATEWAY_ROUTE_TABLE, VPC:
 /// `smithy_query shape=AttachmentType`, mirrored in `ops::types::ATTACHMENT_TYPE_VALUES`).
-/// The other two belong to creates that are still scaffold stubs.
+/// The remaining one belongs to a create that is still a scaffold stub.
 pub const ATTACHMENT_TYPE_VPC: &str = "VPC";
 /// See [`ATTACHMENT_TYPE_VPC`].
 pub const ATTACHMENT_TYPE_CONNECT: &str = "CONNECT";
 /// See [`ATTACHMENT_TYPE_VPC`].
 pub const ATTACHMENT_TYPE_SITE_TO_SITE_VPN: &str = "SITE_TO_SITE_VPN";
+/// See [`ATTACHMENT_TYPE_VPC`]. The one kind that spans SEVERAL edge locations of its
+/// core network rather than sitting at one (see
+/// [`AttachmentDetail::DirectConnectGateway`]).
+pub const ATTACHMENT_TYPE_DIRECT_CONNECT_GATEWAY: &str = "DIRECT_CONNECT_GATEWAY";
 
 /// Network Manager is a global (partition-scoped) service, so its ARNs carry an empty
 /// region segment: `arn:aws:networkmanager::<account>:global-network/<id>`.
@@ -216,6 +221,9 @@ pub const FIELD_ADD_SUBNET_ARNS: &str = "addSubnetArns";
 pub const FIELD_REMOVE_SUBNET_ARNS: &str = "removeSubnetArns";
 /// See [`FIELD_CORE_NETWORK_ID`].
 pub const FIELD_VPN_CONNECTION_ARN: &str = "vpnConnectionArn";
+/// See [`FIELD_CORE_NETWORK_ID`]: the member carrying the several edge locations a Direct
+/// Connect gateway attachment spans.
+pub const FIELD_EDGE_LOCATIONS: &str = "edgeLocations";
 /// See [`FIELD_GLOBAL_NETWORK_ID`]: the same lowerCamelCase spelling of the request
 /// member, for the device and link references a connection carries.
 pub const FIELD_DEVICE_ID: &str = "deviceId";
@@ -1235,9 +1243,82 @@ pub fn check_subnet_list(
     Ok(())
 }
 
-/// A telemetry-bearing network resource of one global network: a connection registered
-/// with the global network whose session health `GetNetworkTelemetry` reports.
+/// How many edge locations one Direct Connect gateway attachment may span.
 ///
+/// CHOSEN, like [`MAX_SUBNETS_PER_VPC_ATTACHMENT`] and for the same reason: the model
+/// carries no number — `ExternalRegionCodeList` constrains its member string only
+/// (`smithy_query shape=ExternalRegionCodeList`) — and neither the create nor the update
+/// of this attachment kind models a quota error (`smithy_query query="operation"
+/// operation="CreateDirectConnectGatewayAttachment,UpdateDirectConnectGatewayAttachment"`),
+/// so its only purpose is that no caller can grow one attachment's list without end. The
+/// number is generous against what a list can usefully name: an attachment spans EDGES of
+/// its core network, a core network configures at most one edge per Region, and no entry
+/// may repeat ([`check_edge_location_list`]), so a longer list could name no further edge.
+pub const MAX_EDGE_LOCATIONS_PER_ATTACHMENT: usize = 50;
+
+/// Check an `EdgeLocations` list a request carries for a Direct Connect gateway attachment
+/// against `topology`, the policy topology of the core network the attachment belongs to
+/// (`None` where that core network holds none, which configures no edge at all).
+///
+/// The LENGTH is judged FIRST, before anything walks the list, so no per-entry work — and
+/// no retention — is spent on a list already too long to be accepted
+/// ([`MAX_EDGE_LOCATIONS_PER_ATTACHMENT`]). Then the list must name at least one location,
+/// since an attachment joins its resource to at least one edge; every location it names
+/// must be one the policy in force configures an edge for
+/// ([`PolicyTopology::has_edge_location`]); and no location may repeat, since an attachment
+/// spans an edge once or not at all. Membership is tested through a set built once, so a
+/// list at the bound costs O(n log n).
+///
+/// Shared by `CreateDirectConnectGatewayAttachment` and
+/// `UpdateDirectConnectGatewayAttachment` — the create's list and the list an update
+/// OVERWRITES it with are the same thing — so ONE function owns the rule and the two
+/// cannot judge a list differently. Every refusal names [`FIELD_EDGE_LOCATIONS`], the
+/// member both requests carry it in.
+pub fn check_edge_location_list(
+    core_network_id: &str,
+    topology: Option<&PolicyTopology>,
+    requested: &[String],
+) -> Result<(), ValidationException> {
+    if requested.len() > MAX_EDGE_LOCATIONS_PER_ATTACHMENT {
+        return Err(field_rejection(
+            FIELD_EDGE_LOCATIONS,
+            REASON_FIELD_VALIDATION_FAILED,
+            format!(
+                "at most {MAX_EDGE_LOCATIONS_PER_ATTACHMENT} edge locations may be named, but {} were",
+                requested.len()
+            ),
+        ));
+    }
+    if requested.is_empty() {
+        return Err(field_rejection(
+            FIELD_EDGE_LOCATIONS,
+            REASON_FIELD_VALIDATION_FAILED,
+            "a Direct Connect gateway attachment must name at least one edge location"
+                .to_string(),
+        ));
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for location in requested {
+        if !topology.is_some_and(|topology| topology.has_edge_location(location)) {
+            return Err(field_rejection(
+                FIELD_EDGE_LOCATIONS,
+                VALIDATION_REASON_OTHER,
+                format!("core network {core_network_id} configures no edge location in {location}"),
+            ));
+        }
+        if !seen.insert(location.as_str()) {
+            return Err(field_rejection(
+                FIELD_EDGE_LOCATIONS,
+                VALIDATION_REASON_OTHER,
+                format!("edge location {location} is named more than once"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A telemetry-bearing network resource of one global network: a connection registered
+/// with the global network whose session health `GetNetworkTelemetry` reports.///
 /// Its `resource_type` is one of [`TELEMETRY_RESOURCE_TYPES`] — nothing else has a session
 /// to measure — and its identity is its ARN, which is an ARN of the service that OWNS the
 /// connection (Amazon VPC for a transit gateway Connect peer or a VPN connection, this
@@ -1365,7 +1446,9 @@ pub struct AttachmentRecord {
     /// kinds this slice mints.
     pub attachment_type: &'static str,
     /// The edge location the attachment sits at: one of the locations the core network's
-    /// policy configures ([`PolicyTopology::has_edge_location`]).
+    /// policy configures ([`PolicyTopology::has_edge_location`]). For a kind that spans
+    /// SEVERAL of them this is the primary of those locations and is not reported on its
+    /// own (see [`AttachmentDetail::DirectConnectGateway`]).
     pub edge_location: String,
     /// The ARN of the resource this attachment attaches: the VPC for a VPC attachment, the
     /// VPN connection for a site-to-site VPN attachment, and for a Connect attachment the
@@ -1409,9 +1492,11 @@ pub struct AttachmentRecord {
     pub detail: AttachmentDetail,
 }
 
-/// What one attachment kind adds to the shared [`AttachmentRecord`] envelope: exactly the
-/// members its own wrapper shape carries beside `Attachment` (`smithy_query
-/// shape=VpcAttachment,ConnectAttachment,SiteToSiteVpnAttachment`).
+/// What one attachment kind adds to the shared [`AttachmentRecord`] envelope: the members
+/// its own wrapper shape carries beside `Attachment` (`smithy_query
+/// shape=VpcAttachment,ConnectAttachment,SiteToSiteVpnAttachment,DirectConnectGatewayAttachment`),
+/// plus the one envelope member only a single kind fills
+/// ([`Self::DirectConnectGateway`]).
 #[derive(Debug, Clone)]
 pub enum AttachmentDetail {
     /// A VPC attachment: the subnets it reaches the VPC through, in the order the request
@@ -1432,6 +1517,33 @@ pub enum AttachmentDetail {
     /// this attachment attaches — [`AttachmentRecord::resource_arn`] — so storing it here
     /// would be a second copy of one value.
     SiteToSiteVpn,
+    /// A Direct Connect gateway attachment: the edge locations it spans, in the order the
+    /// request listed them.
+    ///
+    /// `DirectConnectGatewayArn` is [`AttachmentRecord::resource_arn`], as
+    /// `VpnConnectionArn` is for the kind above, so it is not stored twice. What IS stored
+    /// here is the one envelope member no other kind fills: this is the only kind that
+    /// sits at SEVERAL edges of its core network, which the envelope reports as
+    /// `Attachment$EdgeLocations` instead of `Attachment$EdgeLocation` ("The edge
+    /// locations that the Direct Connect gateway is associated with. This is returned only
+    /// for Direct Connect gateway attachments. All other attachment types retrun
+    /// EdgeLocation", `smithy_query query="doc" shape="Attachment"
+    /// member="EdgeLocations"`). [`AttachmentRecord::edge_location`] carries the first of
+    /// them — the attachment's PRIMARY edge, the one an `attachment-policies` `region`
+    /// condition is evaluated against ([`primary_edge_location`]) — and is never reported
+    /// for this kind.
+    DirectConnectGateway { edge_locations: Vec<String> },
+}
+
+/// The PRIMARY edge of an attachment spanning `edge_locations`: the first of them, or
+/// `None` where the list is empty — which no stored attachment has, since an attachment
+/// joins a resource to at least one edge of its core network.
+///
+/// One place decides it, so the edge a multi-edge attachment carries as
+/// [`AttachmentRecord::edge_location`] cannot drift between the create and a later update
+/// of its locations.
+pub fn primary_edge_location(edge_locations: &[String]) -> Option<&str> {
+    edge_locations.first().map(String::as_str)
 }
 
 impl AttachmentRecord {
@@ -1492,6 +1604,37 @@ impl AttachmentRecord {
         }
     }
 
+    /// Overwrite the edge locations a Direct Connect gateway attachment spans, at `now`,
+    /// keeping the first of them as the attachment's primary edge
+    /// ([`primary_edge_location`]).
+    ///
+    /// The attachment has CHANGED, so — exactly as an accepted `UpdateVpcAttachment`
+    /// records it — it is [`ATTACHMENT_STATE_UPDATING`] until the transition the clock owes
+    /// falls due a [`SETTLE_DELAY`] later and [`STATE_AVAILABLE`] after it. Answers
+    /// `false`, writing NOTHING, for an empty list, for a record of a kind that sits at one
+    /// edge rather than spanning several, and for a list the record already holds — a
+    /// change that asks for what is stored is no change, so no transition is owed on it.
+    pub fn set_edge_locations(&mut self, requested: Vec<String>, now: SystemTime) -> bool {
+        let Some(primary) = primary_edge_location(&requested).map(str::to_string) else {
+            return false;
+        };
+        match &mut self.detail {
+            AttachmentDetail::DirectConnectGateway { edge_locations } => {
+                if *edge_locations == requested {
+                    return false;
+                }
+                *edge_locations = requested;
+                self.edge_location = primary;
+                self.changed_at = Some(now);
+                self.available_at = Some(now + SETTLE_DELAY);
+                true
+            }
+            AttachmentDetail::Vpc { .. }
+            | AttachmentDetail::Connect { .. }
+            | AttachmentDetail::SiteToSiteVpn => false,
+        }
+    }
+
     /// The modelled `Attachment` envelope of this record, as of `now`.
     pub fn to_attachment(&self, now: SystemTime) -> Attachment {
         Attachment {
@@ -1501,11 +1644,25 @@ impl AttachmentRecord {
             owner_account_id: Some(::engine::emulator_account_id().to_string()),
             attachment_type: Some(self.attachment_type.to_string()),
             state: Some(self.state_at(now).to_string()),
-            edge_location: Some(self.edge_location.clone()),
-            // `EdgeLocations` reports the several edges a multi-edge attachment spans.
-            // Every kind stored here sits at exactly one edge, which `EdgeLocation` above
-            // carries, so this member is absent rather than a one-entry copy of it.
-            edge_locations: None,
+            // Exactly ONE of the two edge members is reported, and which one is a function
+            // of the kind: a Direct Connect gateway attachment spans several edges and
+            // reports them as `EdgeLocations`, every other kind sits at one and reports it
+            // as `EdgeLocation` (see [`AttachmentDetail::DirectConnectGateway`]). Neither
+            // is a copy of the other: the absent member stays absent.
+            edge_location: match &self.detail {
+                AttachmentDetail::DirectConnectGateway { .. } => None,
+                AttachmentDetail::Vpc { .. }
+                | AttachmentDetail::Connect { .. }
+                | AttachmentDetail::SiteToSiteVpn => Some(self.edge_location.clone()),
+            },
+            edge_locations: match &self.detail {
+                AttachmentDetail::DirectConnectGateway { edge_locations } => {
+                    Some(edge_locations.clone())
+                }
+                AttachmentDetail::Vpc { .. }
+                | AttachmentDetail::Connect { .. }
+                | AttachmentDetail::SiteToSiteVpn => None,
+            },
             resource_arn: Some(self.resource_arn.clone()),
             // Which `attachment-policies` rule of the core network policy claimed this
             // attachment, and the segment or network function group that rule put it in,
@@ -1540,7 +1697,9 @@ impl AttachmentRecord {
                 transport_attachment_id: Some(transport_attachment_id.clone()),
                 options: Some(options.clone()),
             }),
-            AttachmentDetail::Vpc { .. } | AttachmentDetail::SiteToSiteVpn => None,
+            AttachmentDetail::Vpc { .. }
+            | AttachmentDetail::SiteToSiteVpn
+            | AttachmentDetail::DirectConnectGateway { .. } => None,
         }
     }
 
@@ -1556,7 +1715,9 @@ impl AttachmentRecord {
                 subnet_arns: Some(subnet_arns.clone()),
                 options: options.clone(),
             }),
-            AttachmentDetail::Connect { .. } | AttachmentDetail::SiteToSiteVpn => None,
+            AttachmentDetail::Connect { .. }
+            | AttachmentDetail::SiteToSiteVpn
+            | AttachmentDetail::DirectConnectGateway { .. } => None,
         }
     }
 
@@ -1575,7 +1736,30 @@ impl AttachmentRecord {
                 attachment: Some(self.to_attachment(now)),
                 vpn_connection_arn: Some(self.resource_arn.clone()),
             }),
-            AttachmentDetail::Vpc { .. } | AttachmentDetail::Connect { .. } => None,
+            AttachmentDetail::Vpc { .. }
+            | AttachmentDetail::Connect { .. }
+            | AttachmentDetail::DirectConnectGateway { .. } => None,
+        }
+    }
+
+    /// The modelled `DirectConnectGatewayAttachment` for this record as of `now`, or `None`
+    /// when the record is not a Direct Connect gateway attachment. See
+    /// [`Self::to_connect_attachment`].
+    ///
+    /// `DirectConnectGatewayArn` is [`Self::resource_arn`]: the resource this attachment
+    /// attaches IS the Direct Connect gateway.
+    pub fn to_direct_connect_gateway_attachment(
+        &self,
+        now: SystemTime,
+    ) -> Option<DirectConnectGatewayAttachment> {
+        match &self.detail {
+            AttachmentDetail::DirectConnectGateway { .. } => Some(DirectConnectGatewayAttachment {
+                attachment: Some(self.to_attachment(now)),
+                direct_connect_gateway_arn: Some(self.resource_arn.clone()),
+            }),
+            AttachmentDetail::Vpc { .. }
+            | AttachmentDetail::Connect { .. }
+            | AttachmentDetail::SiteToSiteVpn => None,
         }
     }
 
@@ -2031,15 +2215,17 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
         }) {
             // An attachment's Describe reader is the one for its OWN kind, so the
             // definition is rendered from that kind's shape — the same shape
-            // `GetVpcAttachment` / `GetConnectAttachment` / `GetSiteToSiteVpnAttachment`
-            // answer. Each conversion answers `None` for a record of another kind, so
-            // exactly one of them builds a shape here.
+            // `GetVpcAttachment` / `GetConnectAttachment` / `GetSiteToSiteVpnAttachment` /
+            // `GetDirectConnectGatewayAttachment` answer. Each conversion answers `None`
+            // for a record of another kind, so exactly one of them builds a shape here.
             let definition = if let Some(vpc) = record.to_vpc_attachment(now) {
                 resource_definition(&VpcAttachment::SCHEMA, &vpc)
             } else if let Some(connect) = record.to_connect_attachment(now) {
                 resource_definition(&ConnectAttachment::SCHEMA, &connect)
             } else if let Some(vpn) = record.to_site_to_site_vpn_attachment(now) {
                 resource_definition(&SiteToSiteVpnAttachment::SCHEMA, &vpn)
+            } else if let Some(gateway) = record.to_direct_connect_gateway_attachment(now) {
+                resource_definition(&DirectConnectGatewayAttachment::SCHEMA, &gateway)
             } else {
                 None
             };

@@ -44,6 +44,8 @@ mod error_wire_status;
 mod hcx_eip_associations;
 #[path = "all/host_ec2_instances.rs"]
 mod host_ec2_instances;
+#[path = "all/host_placement_references.rs"]
+mod host_placement_references;
 #[path = "all/hosts.rs"]
 mod hosts;
 #[path = "all/list_vm_entitlements_connector.rs"]

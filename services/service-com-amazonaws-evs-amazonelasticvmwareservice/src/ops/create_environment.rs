@@ -36,6 +36,11 @@
 //!    must not overlap with other subnets in the VPC" (`InitialVlans` doc) — rule 2 at
 //!    the scope the doc states it, which is what lets each block become a real subnet
 //!    of the VPC.
+//! 9. A `placementGroupId` or `dedicatedHostId` an entry of `hosts` names resolves in
+//!    that same EC2 store: a host is PLACED on those resources and Amazon EVS creates
+//!    neither, so they are the caller's own, judged exactly as rule 7 judges the
+//!    network ([`crate::state::ec2_resources::host_placement_failures`]). An entry
+//!    refused by rule 1 names both mechanisms, so neither of its references is resolved.
 //!
 //! Supplying a parameter the chosen VCF mode does not support is NOT one of them.
 //! `SELF_DEPLOYED` "does not support" `licenseInfo`, `hosts`, `vcfHostnames`, `siteId`
@@ -334,6 +339,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.vpc_id,
             &input.service_access_subnet_id,
         ));
+        // The EC2 resources each requested host is PLACED on, from that same store: a
+        // `placementGroupId` or `dedicatedHostId` names a resource of the caller's own
+        // account, which Amazon EVS does not create. An entry that names BOTH is already
+        // refused for that by `host_failures`, so neither of its references is resolved.
+        let host_member_prefixes: Vec<String> = (0..input.hosts.as_deref().unwrap_or_default().len())
+            .map(|index| format!("hosts[{index}]"))
+            .collect();
+        {
+            let references: Vec<crate::state::ec2_resources::HostPlacementReferences<'_>> = input
+                .hosts
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .zip(host_member_prefixes.iter())
+                .filter(|(host, _)| {
+                    !(host.dedicated_host_id.is_some() && host.placement_group_id.is_some())
+                })
+                .map(
+                    |(host, member_prefix)| crate::state::ec2_resources::HostPlacementReferences {
+                        member_prefix: member_prefix.as_str(),
+                        placement_group_id: host.placement_group_id.as_deref(),
+                        dedicated_host_id: host.dedicated_host_id.as_deref(),
+                    },
+                )
+                .collect();
+            failures.extend(crate::state::ec2_resources::host_placement_failures(
+                &*self.engine,
+                &references,
+            ));
+        }
 
         let region = crate::state::request_region(ctx.parts());
         let mut state = state.lock();

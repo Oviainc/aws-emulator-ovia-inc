@@ -13,6 +13,12 @@
 //! copy of what IAM knows. Nothing is cached: a VPC created a moment ago is usable at
 //! once, and one that has been deleted stops being usable at once.
 //!
+//! A host is placed on EC2 resources of the caller's account the same way: a
+//! `placementGroupId` is "the unique ID of the placement group where the host is placed"
+//! and a `dedicatedHostId` "the unique ID of the Amazon EC2 Dedicated Host", and Amazon
+//! EVS creates neither of them, so whether the account holds them is EC2's fact to state
+//! and is asked of the same store ([`host_placement_failures`]).
+//!
 //! A store this emulator cannot read at all — an engine that is not the in-memory one —
 //! is EVIDENCE OF NOTHING and so refuses nothing: every function here answers `None`
 //! for that case, and the callers treat `None` as "no failure to report".
@@ -131,6 +137,103 @@ pub fn network_failures<Eng: Send + Sync + 'static>(
     } else {
         vec![invalid_subnet_clause(service_access_subnet_id, vpc_id)]
     }
+}
+
+/// The clause stated for a `placementGroupId` the account's own Amazon EC2 store holds no
+/// placement group for.
+///
+/// `member` is the PATH of the member that named it, so one clause serves every operation
+/// that accepts a host: `CreateEnvironmentHost`'s single `host` and `CreateEnvironment`'s
+/// `hosts` entries. Stated in the same form as [`invalid_vpc_clause`], because it is the
+/// same kind of failure: a member naming an EC2 resource the launch cannot be placed in.
+pub fn invalid_placement_group_clause(
+    member: &str,
+    placement_group_id: &str,
+) -> ValidationExceptionField {
+    super::field_failure_stated(
+        member,
+        format!(
+            "The placement group id {placement_group_id} is not valid or does not exist. \
+             Please verify the placement group id exists and is valid."
+        ),
+    )
+}
+
+/// The clause stated for a `dedicatedHostId` the account's own Amazon EC2 store holds no
+/// Dedicated Host for. See [`invalid_placement_group_clause`] for the `member` path.
+pub fn invalid_dedicated_host_clause(
+    member: &str,
+    dedicated_host_id: &str,
+) -> ValidationExceptionField {
+    super::field_failure_stated(
+        member,
+        format!(
+            "The Dedicated Host id {dedicated_host_id} is not valid or does not exist. \
+             Please verify the Dedicated Host id exists and is valid."
+        ),
+    )
+}
+
+/// The EC2 placement references ONE requested host names, and the path of the member that
+/// named it, so a refusal names the member the caller wrote.
+///
+/// `member_prefix` is that member's path without the leaf — `host` for
+/// `CreateEnvironmentHost`, `hosts[<index>]` for a `CreateEnvironment` entry — so the two
+/// operations state one rule with the paths their own inputs have.
+#[derive(Debug, Clone, Copy)]
+pub struct HostPlacementReferences<'a> {
+    /// The path of the `HostInfoForCreate` member these references came from.
+    pub member_prefix: &'a str,
+    /// The `placementGroupId` the host named, when it named one.
+    pub placement_group_id: Option<&'a str>,
+    /// The `dedicatedHostId` the host named, when it named one.
+    pub dedicated_host_id: Option<&'a str>,
+}
+
+/// Every failure of the precondition that the EC2 resources a requested host is PLACED on
+/// exist in the account's own Amazon EC2 store: the placement group it names, and the
+/// Dedicated Host it names.
+///
+/// An Amazon EVS host IS an EC2 bare metal instance (`Host` doc), so a host that names a
+/// placement group ("The unique ID of the placement group where the host is placed",
+/// `HostInfoForCreate$placementGroupId`) or a Dedicated Host ("The unique ID of the Amazon
+/// EC2 Dedicated Host") names a resource the account has to hold already — Amazon EVS
+/// creates neither — exactly as `vpcId` and `serviceAccessSubnetId` do for an environment
+/// ([`network_failures`]). Both stores are read through EC2's own accessor, under one lock
+/// for the whole batch, so the four hosts of a `CreateEnvironment` cost one acquisition.
+///
+/// An unreadable EC2 store reports no failure at all, the "evidence of nothing" answer
+/// every function here gives for it.
+pub fn host_placement_failures<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    hosts: &[HostPlacementReferences<'_>],
+) -> Vec<ValidationExceptionField> {
+    let Some(state) = ec2_state(engine) else {
+        return Vec::new();
+    };
+    let store = state.lock();
+    let mut failures = Vec::new();
+    for host in hosts {
+        if let Some(placement_group_id) = host
+            .placement_group_id
+            .filter(|id| !store.placement_groups.contains_key(*id))
+        {
+            failures.push(invalid_placement_group_clause(
+                &format!("{}.placementGroupId", host.member_prefix),
+                placement_group_id,
+            ));
+        }
+        if let Some(dedicated_host_id) = host
+            .dedicated_host_id
+            .filter(|id| !store.dedicated_hosts.contains_key(*id))
+        {
+            failures.push(invalid_dedicated_host_clause(
+                &format!("{}.dedicatedHostId", host.member_prefix),
+                dedicated_host_id,
+            ));
+        }
+    }
+    failures
 }
 
 /// How many elastic network interfaces Amazon EVS attaches to a host.
