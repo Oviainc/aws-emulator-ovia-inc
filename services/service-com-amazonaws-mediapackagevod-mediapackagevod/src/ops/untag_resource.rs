@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Removes from the resource its `ResourceArn` names exactly the tags
+//! `TagKeys` names, leaving every other tag of that resource in place, and answers the
+//! modelled 204 with no body.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The tags are removed from the ONE tag store (`tags_by_arn`) every operation of this
+//! service reads and writes, so the next `ListTagsForResource`, describe or listing of
+//! that resource reports the reduced map. Nothing else about the resource changes: a
+//! key the resource does not carry removes nothing, which makes the call idempotent -
+//! repeating it answers 204 again and leaves the same map.
+//!
+//! `ResourceArn` is resolved the way every other operation of this REGIONAL control
+//! plane resolves a resource: only a resource held in the Region the request is served
+//! in exists, so the ARN has to be exactly the one this service issued for a resource it
+//! still holds there
+//! ([`crate::state::ComAmazonawsMediapackagevodMediapackagevodState::holds_arn_resource`]).
+//! An ARN that resolves to nothing - another Region's, another account's, an id this
+//! service never created, or a value that is not an ARN of this service at all - is
+//! answered with the modelled `NotFoundException` (HTTP 404) rather than with a 204 that
+//! would claim tags were removed from a resource this service does not hold.
 //!
 //! ## Shape of an operation
 //!
@@ -56,7 +66,22 @@
 //! * `ResourceArn` (__string) **required** — The Amazon Resource Name (ARN) for the resource.
 //!   You can get this from the response to any request to the resource.
 //! * `TagKeys` (__listOf__string) **required** — A comma-separated list of the tag keys to
-//!   remove from the resource.
+//!   remove from the resource. Bound to the `tagKeys` query string
+//!   (`smithy_query(query="operation",operation="UntagResource")` reports
+//!   `httpQuery: tagKeys`), so the keys arrive as repeated query parameters.
+//!
+//! ## Errors
+//!
+//! The model lists NONE for this operation
+//! (`smithy_query(query="operation",operation="UntagResource")` reports `errors: []`), so
+//! the shapes below are widened in through `extra_errors`; each is a shape this SERVICE
+//! models and other operations of it declare:
+//!
+//! * `NotFoundException` (HTTP 404) - `ResourceArn` names no resource this service holds
+//!   in the Region the request is served in: the same condition, and the same channel,
+//!   `ListTagsForResource` and the describes answer a resource they hold nothing for with.
+//! * `InternalServerErrorException` (HTTP 500) - the shared state store is unreachable,
+//!   worded exactly as every other operation of this service words it.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -96,9 +121,18 @@ impl ::aws_smithy_schema::serde::SerializableStruct for UntagResourceOutput {
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mediapackagevod#UntagResource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.mediapackagevod#UntagResource",
+    extra_errors = ["InternalServerErrorException", "NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
+    /// Declared on the service (and on every operation that resolves a resource),
+    /// not on this operation: the shared store could not be reached.
+    InternalServerErrorException(InternalServerErrorException),
+    /// Declared on the service (and on every operation that resolves a resource),
+    /// not on this operation: the ARN names no resource this service holds here.
+    NotFoundException(NotFoundException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -147,23 +181,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = UNTAG_RESOURCE_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 204u16;
 
+    /// Remove the tags `TagKeys` names from the resource `ResourceArn` names. Only
+    /// those keys change: every other tag of the resource, and the resource record
+    /// itself, is left exactly as it was.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the MediaPackage VOD state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // MediaPackage VOD is regional: this request resolves only the resources of
+        // the Region its SigV4 credential scope names.
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = store.lock();
+        if !state.holds_arn_resource(&region, &input.resource_arn) {
+            return Err(UntagResourceErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::arn_resource_not_found_message(
+                        &input.resource_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+        // The ONE tag store, keyed by the resource's ARN: dropping these keys here is
+        // what the describes, the listings and `ListTagsForResource` of this resource
+        // all report next. A key the resource does not carry drops nothing, so the
+        // same request repeated leaves the same map.
+        state.remove_tag_keys(&input.resource_arn, &input.tag_keys);
+        Ok(UntagResourceOutput)
     }
 }

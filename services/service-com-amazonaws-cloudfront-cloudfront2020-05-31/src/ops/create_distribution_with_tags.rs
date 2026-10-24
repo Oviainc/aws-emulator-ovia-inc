@@ -345,6 +345,13 @@ fn create_refusal(refusal: crate::state::CreateRefusal) -> CreateDistributionWit
                 message: Some(message),
             })
         }
+        crate::state::CreateRefusal::InvalidViewerCertificate(message) => {
+            CreateDistributionWithTagsErrorModeled::InvalidViewerCertificate(
+                InvalidViewerCertificate {
+                    message: Some(message),
+                },
+            )
+        }
     }
     .into()
 }

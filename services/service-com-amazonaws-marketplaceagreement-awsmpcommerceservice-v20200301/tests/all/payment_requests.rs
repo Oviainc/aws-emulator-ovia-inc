@@ -13,6 +13,13 @@
 //! that resumes that same list — never a value echoed from the listing call's
 //! own input. `SendAgreementPaymentRequest` is what stores them, "in
 //! `PENDING_APPROVAL` status", so the two are tested as a round trip.
+//!
+//! `GetAgreementPaymentRequest` reports ONE of those stored requests in full —
+//! "the current status, charge details, timestamps, and the charge ID if the
+//! request has been approved" — selected by the agreement it was sent under and
+//! its own id, computed from the same single record the list projects, and
+//! writing nothing: the last two suites here assert that rule, and the refusal
+//! for a pair that names no stored request.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -1033,5 +1040,354 @@ async fn a_payment_request_needs_an_active_agreement_with_that_variable_term() {
         listed_ids(&listed).is_empty(),
         "a refused send stores no payment request, got {:?}",
         listed.body
+    );
+}
+
+/// The resource kinds a lookup that found nothing names in `resourceType` —
+/// `ResourceType`'s values (`smithy_query(query="shape", shape="ResourceType")`).
+const AGREEMENT: &str = "Agreement";
+/// See [`AGREEMENT`].
+const PAYMENT_REQUEST: &str = "PaymentRequest";
+
+async fn get(router: &MultiServiceRouter, agreement_id: &str, payment_request_id: &str) -> Answer {
+    call(
+        router,
+        "GetAgreementPaymentRequest",
+        json!({"agreementId": agreement_id, "paymentRequestId": payment_request_id}),
+    )
+    .await
+}
+
+/// The summary one page reported for `payment_request_id`, which the detail of
+/// the same request must agree with: both are projections of one record.
+fn listed_summary(answer: &Answer, payment_request_id: &str) -> Value {
+    items(answer)
+        .into_iter()
+        .find(|item| item["paymentRequestId"].as_str() == Some(payment_request_id))
+        .unwrap_or_else(|| {
+            panic!(
+                "{payment_request_id} must be listed, got {:?}",
+                answer.body
+            )
+        })
+}
+
+/// `PaymentRequestId` forms that satisfy `^pr-[a-zA-Z0-9]+$` and both bounds of
+/// `@length(min: 1, max: 64)`, none of which this emulator's id minter produces.
+fn unknown_payment_request_ids() -> Vec<(&'static str, String)> {
+    vec![
+        ("the shortest id the pr- pattern admits", "pr-0".to_string()),
+        (
+            "a hex id of the width this emulator mints, but never minted",
+            "pr-ffffffffffffffff".to_string(),
+        ),
+        (
+            "mixed case and digits after the prefix",
+            "pr-Sim2RealProbe71ebf109".to_string(),
+        ),
+        (
+            "the longest PaymentRequestId, 64 characters",
+            format!("pr-{}", "A".repeat(61)),
+        ),
+    ]
+}
+
+/// `GetAgreementPaymentRequest` reports "the current status, charge details,
+/// timestamps, and the charge ID if the request has been approved" of the
+/// payment request the two ids name — every member read from the stored record,
+/// never echoed from the reading call's own input, and reported the same way to
+/// every later caller.
+///
+/// The rows differ along what the rule generalises over: the name's length, the
+/// shape of the amount (whole, fractional, the eight decimals the pattern
+/// admits at most, a trailing point, a long integer part) and whether a
+/// description was given.
+#[tokio::test]
+async fn a_payment_request_is_reported_in_full_from_what_was_sent() {
+    let cases = [
+        Round {
+            case: "the shortest name the model admits, and a whole amount",
+            name: "Milst",
+            charge_amount: "1",
+            description: None,
+        },
+        Round {
+            case: "a described request with a two-decimal amount",
+            name: "Milestone 1 delivery",
+            charge_amount: "100.50",
+            description: Some("the first milestone of the statement of work"),
+        },
+        Round {
+            case: "the eight decimals PositiveAmountUpto8Decimals admits at most",
+            name: "Metered overage",
+            charge_amount: "0.00000001",
+            description: Some("a single hundred-millionth of a unit"),
+        },
+        Round {
+            case: "an amount whose decimal point carries no digits",
+            name: "Annual true-up",
+            charge_amount: "4200.",
+            description: None,
+        },
+        Round {
+            case: "the longest name the model admits, and a long integer part",
+            name: "Milestone payment request with a sixty-four character long name!",
+            charge_amount: "98765432109876",
+            description: Some("a large whole amount"),
+        },
+    ];
+
+    let router = emulator();
+    let agreement = agreement_with_variable_term(&router, "ap-detail", "vpt-detail").await;
+
+    let mut stored_ids: Vec<String> = Vec::new();
+    for case in &cases {
+        let mut body = json!({
+            "agreementId": &agreement,
+            "termId": "vpt-detail",
+            "name": case.name,
+            "chargeAmount": case.charge_amount,
+        });
+        if let Some(description) = case.description {
+            body["description"] = json!(description);
+        }
+        let answer = send(&router, body).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {:?}: sending must succeed, got {} with {:?}",
+            case.case, answer.status, answer.body
+        );
+        stored_ids.push(answer.str_at("/paymentRequestId"));
+    }
+
+    // The list as it stands before anything reads one request in full, so the
+    // reads below can be shown to leave it alone.
+    let before = list(&router, json!({"partyType": "Proposer"})).await;
+
+    for (case, id) in cases.iter().zip(stored_ids.iter()) {
+        assert!(
+            is_payment_request_id(id),
+            "case {:?}: {id:?} must satisfy PaymentRequestId's ^pr-[a-zA-Z0-9]+$",
+            case.case
+        );
+        let answer = get(&router, &agreement, id).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {:?}: getting {id} must succeed, got {} with {:?}",
+            case.case, answer.status, answer.body
+        );
+        assert_eq!(
+            answer.str_at("/paymentRequestId"),
+            *id,
+            "case {:?}: the detail must name the request that was looked up, got {:?}",
+            case.case,
+            answer.body
+        );
+        assert_eq!(
+            answer.str_at("/agreementId"),
+            agreement,
+            "case {:?}: the detail must name the agreement it was sent for, got {:?}",
+            case.case,
+            answer.body
+        );
+        assert_eq!(
+            answer.str_at("/name"),
+            case.name,
+            "case {:?}: the reported name must be the one sent, got {:?}",
+            case.case,
+            answer.body
+        );
+        assert_eq!(
+            answer.str_at("/chargeAmount"),
+            case.charge_amount,
+            "case {:?}: the reported amount must be the one sent, got {:?}",
+            case.case,
+            answer.body
+        );
+        assert_eq!(
+            answer.str_at("/status"),
+            PENDING_APPROVAL,
+            "case {:?}: a stored payment request is {PENDING_APPROVAL}, got {:?}",
+            case.case,
+            answer.body
+        );
+        // "The detailed description of the payment request, if provided": the
+        // member is absent for a send that carried none, never an empty string.
+        match case.description {
+            Some(description) => assert_eq!(
+                answer.str_at("/description"),
+                description,
+                "case {:?}: the reported description must be the one sent, got {:?}",
+                case.case,
+                answer.body
+            ),
+            None => assert!(
+                answer.body["description"].is_null(),
+                "case {:?}: a request sent with no description reports none, got {:?}",
+                case.case,
+                answer.body
+            ),
+        }
+        // "This field is only present for approved payment requests" — nothing
+        // has approved one.
+        assert!(
+            answer.body["chargeId"].is_null(),
+            "case {:?}: a {PENDING_APPROVAL} request has no charge, got {:?}",
+            case.case,
+            answer.body
+        );
+        // The currency is the accepted term's (`VariablePaymentTerm$currencyCode`),
+        // which belongs to the agreement proposal this service does not hold, so
+        // none is reported rather than invented.
+        assert!(
+            answer.body["currencyCode"].is_null(),
+            "case {:?}: no currency is known for the term, got {:?}",
+            case.case,
+            answer.body
+        );
+        // `statusMessage` carries "a rejection reason or validation failure
+        // details": nothing has rejected or failed this request.
+        assert!(
+            answer.body["statusMessage"].is_null(),
+            "case {:?}: a {PENDING_APPROVAL} request carries no status message, got {:?}",
+            case.case,
+            answer.body
+        );
+        let created = answer.body["createdAt"].as_f64();
+        assert!(
+            created.is_some() && created == answer.body["updatedAt"].as_f64(),
+            "case {:?}: a request nothing has changed was last updated when it \
+             was created, got {:?}",
+            case.case,
+            answer.body
+        );
+
+        // The detail and the summary are two projections of ONE record, so every
+        // member they share carries the same value.
+        let summary = listed_summary(&before, id);
+        for member in [
+            "paymentRequestId",
+            "agreementId",
+            "status",
+            "name",
+            "chargeId",
+            "chargeAmount",
+            "currencyCode",
+            "createdAt",
+            "updatedAt",
+        ] {
+            assert_eq!(
+                answer.body[member], summary[member],
+                "case {:?}: the detail and the list must agree on {member}, got {:?} and {:?}",
+                case.case, answer.body[member], summary[member]
+            );
+        }
+
+        // A report: reading it again answers exactly the same thing.
+        let again = get(&router, &agreement, id).await;
+        assert_eq!(
+            answer.body, again.body,
+            "case {:?}: a second read must report the same request, got {:?}",
+            case.case, again.body
+        );
+    }
+
+    // And a read leaves what every later caller sees exactly as it was.
+    let after = list(&router, json!({"partyType": "Proposer"})).await;
+    assert_eq!(
+        after.body["items"], before.body["items"],
+        "reading payment requests in full must not change what a list reports, \
+         got {:?} after {:?}",
+        after.body, before.body
+    );
+}
+
+/// Both ids select: a payment request is reported only for the agreement it was
+/// sent under, and an id naming no stored request of that agreement is the
+/// modelled `ResourceNotFoundException`, naming in `resourceType`/`resourceId`
+/// the OUTERMOST resource that failed to resolve, at the status this service
+/// answers a lookup that found nothing with (see `tests/all/unknown_ids.rs`).
+#[tokio::test]
+async fn a_payment_request_is_found_only_under_the_agreement_it_was_sent_for() {
+    let router = emulator();
+    let first = agreement_with_variable_term(&router, "ap-select1", "vpt-one").await;
+    let second = agreement_with_variable_term(&router, "ap-select2", "vpt-two").await;
+    let stored = sent(&router, &first, "vpt-one", "Milestone one", "125.75").await;
+
+    // The pair that names the stored request is served, so every refusal below
+    // comes from the lookup and not from the form of either id.
+    let served = get(&router, &first, &stored).await;
+    assert_eq!(
+        served.status, 200,
+        "the stored pair must be served, got {} with {:?}",
+        served.status, served.body
+    );
+
+    // (case, agreementId, paymentRequestId, the resource the refusal names, its id)
+    let unknown_agreement = "agmt-ffffffffffffffff".to_string();
+    let mut cases: Vec<(String, String, String, &str, String)> = vec![
+        (
+            "the stored request under another agreement of the same account".to_string(),
+            second.clone(),
+            stored.clone(),
+            PAYMENT_REQUEST,
+            stored.clone(),
+        ),
+        (
+            "an agreement id naming no agreement at all".to_string(),
+            unknown_agreement.clone(),
+            stored.clone(),
+            AGREEMENT,
+            unknown_agreement,
+        ),
+    ];
+    for (case, id) in unknown_payment_request_ids() {
+        cases.push((
+            format!("{case}, under the agreement that holds one"),
+            first.clone(),
+            id.clone(),
+            PAYMENT_REQUEST,
+            id,
+        ));
+    }
+
+    for (case, agreement_id, payment_request_id, resource_type, resource_id) in &cases {
+        let answer = get(&router, agreement_id, payment_request_id).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: a lookup that found nothing answers HTTP 400, got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code(),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.str_at("/resourceType"),
+            *resource_type,
+            "case {case:?}: expected resourceType {resource_type:?}, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.str_at("/resourceId"),
+            *resource_id,
+            "case {case:?}: the refusal must name the id that was looked for, got {:?}",
+            answer.body
+        );
+        assert!(
+            !answer.str_at("/message").is_empty(),
+            "case {case:?}: a refusal must say what was wrong, got {:?}",
+            answer.body
+        );
+    }
+
+    // None of those refusals touched the stored request.
+    let again = get(&router, &first, &stored).await;
+    assert_eq!(
+        again.body, served.body,
+        "a refused lookup must leave the stored request as it was, got {:?}",
+        again.body
     );
 }

@@ -2648,6 +2648,24 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         setting_view(name, value, &root_principal_arn())
     }
 
+    /// Clear the account setting `name` for ONE principal, as `DeleteAccountSetting`
+    /// does ("Disables an account setting for a specified user, role, or the root user
+    /// for an account"), and answer the value that was stored, or `None` when that
+    /// principal had none of that name.
+    ///
+    /// Clearing a principal's entry is what makes the account-wide default apply to it
+    /// again ([`Self::effective_account_setting`]); a clear against the ROOT user clears
+    /// the account-wide default itself, for the same reason a write against it sets one
+    /// (see [`Self::explicit_account_setting`]), so the name falls back to its
+    /// [`ACCOUNT_SETTINGS`] default.
+    pub fn delete_account_setting(&mut self, principal_arn: &str, name: &str) -> Option<String> {
+        if principal_arn == root_principal_arn() {
+            return self.account_setting_defaults.remove(name);
+        }
+        self.principal_account_settings
+            .remove(&(principal_arn.to_string(), name.to_string()))
+    }
+
     /// The cluster's EFFECTIVE settings: one entry for every setting name the model
     /// defines (`ClusterSettingName`), carrying the value stored for this cluster when
     /// one was set and the account setting of that name otherwise.
@@ -3246,6 +3264,16 @@ pub fn is_principal_arn(principal_arn: &str) -> bool {
         && fields[3].is_empty()
         && !fields[4].is_empty()
         && !fields[5].is_empty()
+}
+
+/// The message an `InvalidParameterException` carries when a request's `principalArn`
+/// is not a principal an account setting may belong to ([`is_principal_arn`]): the
+/// member that is wrong and the value it was given.
+///
+/// Shared by every account-setting operation that takes a `principalArn`, so the same
+/// value is refused with the same sentence whichever of them a client calls.
+pub fn invalid_principal_arn_message(principal_arn: &str) -> String {
+    format!("Invalid PrincipalArn: {principal_arn}")
 }
 
 /// The ARN of a task-definition revision:

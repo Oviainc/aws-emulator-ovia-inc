@@ -492,7 +492,12 @@ impl Config {
             out.push_str(&format!("<PriceClass>{price_class}</PriceClass>"));
         }
         out.push_str(&format!("<Enabled>{}</Enabled>", self.enabled));
-        // After `Enabled`, which is where `DistributionConfig` carries `WebACLId`.
+        // `ViewerCertificate` follows `Enabled`: a configuration that declares an
+        // alternate domain name has to name a custom certificate that covers it.
+        if !self.aliases.is_empty() {
+            out.push_str(CUSTOM_VIEWER_CERTIFICATE);
+        }
+        // Then `WebACLId`, which is where `DistributionConfig` carries it.
         if let Some(web_acl_id) = &self.web_acl_id {
             out.push_str(&format!("<WebACLId>{web_acl_id}</WebACLId>"));
         }
@@ -602,6 +607,19 @@ impl Config {
         );
     }
 }
+
+/// The `ViewerCertificate` a configuration that declares an alternate domain name has to
+/// carry.
+///
+/// `ViewerCertificate` states it: a distribution that uses `Aliases` names one of
+/// `ACMCertificateArn` or `IAMCertificateId`, because CloudFront's own default certificate
+/// validates no domain name of the caller's — so a row of the table below that states an
+/// alias states a certificate too, which is what makes it a request CloudFront accepts.
+pub(crate) const CUSTOM_VIEWER_CERTIFICATE: &str = "<ViewerCertificate>\
+     <ACMCertificateArn>arn:aws:acm:us-east-1:000000000000:certificate/\
+     11111111-2222-3333-4444-555555555555</ACMCertificateArn>\
+     <SSLSupportMethod>sni-only</SSLSupportMethod>\
+     <MinimumProtocolVersion>TLSv1.2_2021</MinimumProtocolVersion></ViewerCertificate>";
 
 /// A configuration for `reference`, varying along the members the rules generalise over.
 pub(crate) fn config(case: &'static str, reference: &str) -> Config {
@@ -1839,6 +1857,7 @@ async fn a_wrapper_whose_quantity_disagrees_with_its_items_is_refused() {
          <Method>GET</Method><Method>HEAD</Method></Items></AllowedMethods>\
          </DefaultCacheBehavior>\
          <Comment>consistent</Comment>\
+         {CUSTOM_VIEWER_CERTIFICATE}\
          <CustomErrorResponses><Quantity>0</Quantity></CustomErrorResponses>\
          <Restrictions><GeoRestriction><RestrictionType>whitelist</RestrictionType>\
          <Quantity>1</Quantity><Items><Location>DE</Location></Items>\

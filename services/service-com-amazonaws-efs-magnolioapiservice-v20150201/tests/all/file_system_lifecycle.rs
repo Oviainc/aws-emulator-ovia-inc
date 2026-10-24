@@ -412,10 +412,10 @@ async fn create_file_system_stores_every_configuration_and_reads_it_back() {
             }),
         ),
         (
-            "encrypted with the default EFS key",
-            json!({ "CreationToken": "row-5", "Encrypted": true }),
             // The key the EFS default-key ALIAS resolves to is asserted by
             // `mutation_results.rs`, which covers every `KmsKeyId` form at once.
+            "encrypted with the default EFS key",
+            json!({ "CreationToken": "row-5", "Encrypted": true }),
             json!({ "Encrypted": true }),
         ),
         (
@@ -506,6 +506,16 @@ async fn create_file_system_stores_every_configuration_and_reads_it_back() {
             "case {case:?}: unexpected OwnerId, got {:?}",
             created.get("OwnerId")
         );
+        // Whatever form the request named its key in, an encrypted file system reports
+        // the KEY it resolves to; the resolution itself is asserted by form and by
+        // invariant in `mutation_results.rs`.
+        if request["Encrypted"] == json!(true) {
+            let key = created.string("KmsKeyId");
+            assert!(
+                key.contains(":key/") && !key.contains(":alias/"),
+                "case {case:?}: KmsKeyId must name a key, got {key:?}"
+            );
+        }
 
         // Every member the create answered with comes back from the store, unchanged
         // but for the lifecycle the clock moves.

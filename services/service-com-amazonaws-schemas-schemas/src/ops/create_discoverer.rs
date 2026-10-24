@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDiscoverer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDiscoverer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDiscoverer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a discoverer for one event source in this service's store and answers from the
+//! stored value. A discoverer is the service's subscription to ONE source, so a second
+//! create for a source the store already discovers is a conflict rather than a second
+//! subscription, and a created discoverer is `STARTED`: it discovers from the moment it
+//! exists, until `StopDiscoverer` pauses it.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +153,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDiscoverer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDiscovererErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDiscoverer"))
+        let region = crate::state::request_region(ctx.parts());
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDiscovererError::from(
+                CreateDiscovererErrorModeled::InternalServerErrorException(
+                    crate::state::internal_error(),
+                ),
+            )
+        })?;
+        let mut state = store.lock();
+
+        // `SourceArn` is modelled only by its length, so the form is refused here: a
+        // value that is not an ARN names no event source to discover schemas from.
+        if !crate::state::is_arn(&input.source_arn) {
+            return Err(CreateDiscovererErrorModeled::BadRequestException(
+                crate::state::source_arn_not_an_arn(),
+            )
+            .into());
+        }
+
+        // One discoverer per source: the source identifies the subscription, so asking
+        // for it twice names a resource that already exists.
+        if state.discoverer_for_source(&input.source_arn).is_some() {
+            return Err(CreateDiscovererErrorModeled::ConflictException(
+                crate::state::discoverer_already_exists(&input.source_arn),
+            )
+            .into());
+        }
+
+        // The store lives for the life of the process and only a create adds to it, so
+        // how many discoverers a caller can accumulate is capped. See
+        // `crate::state::MAX_DISCOVERERS`.
+        if state.discoverers.len() >= crate::state::MAX_DISCOVERERS {
+            return Err(CreateDiscovererErrorModeled::BadRequestException(
+                crate::state::store_cap_reached("discoverers", crate::state::MAX_DISCOVERERS),
+            )
+            .into());
+        }
+
+        // Minted only once every refusal above has been answered, so a refused request
+        // consumes no id.
+        let discoverer_id = state.mint_discoverer_id();
+        let discoverer = crate::state::Discoverer {
+            arn: crate::state::discoverer_arn(&region, &discoverer_id),
+            id: discoverer_id.clone(),
+            source_arn: input.source_arn.clone(),
+            description: input.description.clone(),
+            // A discoverer AWS creates is returned discovering, not pending: there is
+            // no transient state between the two `DiscovererState` values.
+            state: crate::state::DiscovererState::Started,
+            // `CrossAccount` defaults to true where the request omits it
+            // (`smithy_query(query="doc", shape="CreateDiscovererRequest",
+            // member="CrossAccount")`: "(default: true)").
+            cross_account: input.cross_account.unwrap_or(true),
+            tags: crate::state::tags_from_input(input.tags.as_ref()),
+        };
+        state.discoverers.insert(discoverer_id.clone(), discoverer);
+
+        // Answer from the STORED discoverer rather than from `input`, so this response
+        // can only ever describe what DescribeDiscoverer will report.
+        let stored = state
+            .discoverers
+            .get(&discoverer_id)
+            .expect("the discoverer inserted above is present");
+        Ok(CreateDiscovererOutput {
+            description: stored.description.clone(),
+            discoverer_arn: Some(stored.arn.clone()),
+            discoverer_id: Some(stored.id.clone()),
+            source_arn: Some(stored.source_arn.clone()),
+            state: Some(stored.state.as_wire().to_string()),
+            cross_account: Some(stored.cross_account),
+            tags: crate::state::tags_to_output(&stored.tags),
+        })
     }
 }

@@ -82,6 +82,14 @@
 //! `ListIntegrations` report — live in
 //! [`ComAmazonawsCloudwatchlogsLogs20140328State::integrations`], each one an
 //! [`IntegrationRecord`] carrying the instant the clock owes it its ACTIVE status.
+//!
+//! The account's lookup tables — the reference data `CreateLookupTable` uploads and
+//! `GetLookupTable` reports — live in
+//! [`ComAmazonawsCloudwatchlogsLogs20140328State::lookup_tables`], each one a
+//! [`LookupTableRecord`], keyed by the name that identifies one ("The name must be unique
+//! within your account and Region"). A lookup table enriches the queries of any log group,
+//! so it is an account-level resource rather than one group's and lives beside the groups
+//! and not on [`LogGroupRecord`].
 
 use std::collections::BTreeMap;
 
@@ -548,6 +556,29 @@ pub const MAX_ANOMALY_DETECTORS: usize = 1_000;
 /// definition already stored is never refused by it: it adds nothing.
 pub const MAX_QUERY_DEFINITIONS: usize = 1_000;
 
+/// THE EMULATOR'S OWN CEILING on the lookup tables one account holds, not a quota cited
+/// from AWS: each table keeps its whole CSV body (modelled `@length` up to 10 MB) in memory
+/// for as long as the process runs and nothing expires one, so `CreateLookupTable` refuses
+/// to create more than this many with the `LimitExceededException` it models ("You have
+/// reached the maximum number of resources that can be created") rather than growing
+/// without bound on request. It is set far above the number of tables a caller legitimately
+/// creates, so only a caller hammering the create reaches it.
+pub const MAX_LOOKUP_TABLES: usize = 1_000;
+
+/// How many BYTES of lookup-table CSV content this emulator will hold across every table of
+/// the account.
+///
+/// [`MAX_LOOKUP_TABLES`] alone would leave total memory bounded only by its product with
+/// the modelled `TableBody` length (10 MB), so this is what actually bounds the process:
+/// whatever a caller does — one table or a thousand — the lookup-table store holds at most
+/// this many bytes of caller-chosen content. Not a fidelity claim, and the same order as
+/// the service-wide retained budgets of this workspace's peer services (s3's
+/// `MAX_OBJECT_BYTES_TOTAL`, appconfig's `MAX_TOTAL_HOSTED_CONFIGURATION_BYTES`,
+/// codeguruprofiler's `MAX_RETAINED_PROFILE_BYTES`). A create that would take the store past
+/// it is refused with the `LimitExceededException` `CreateLookupTable` models, BEFORE the
+/// body is retained, rather than recorded.
+pub const MAX_LOOKUP_TABLE_BYTES_TOTAL: usize = 64 * 1024 * 1024;
+
 /// The only integration type CloudWatch Logs supports, from the model's `IntegrationType`
 /// enum (`OPENSEARCH`), which `PutIntegration` states as well: "Currently, only
 /// integrations with OpenSearch Service are supported".
@@ -728,6 +759,12 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// Monotonic counter behind the anomaly-detector identifiers, so every create mints an
     /// ARN no earlier create used — including after the detector holding it was deleted.
     pub next_anomaly_detector_seq: u64,
+    /// Every lookup table of this account — the reference data `CreateLookupTable` uploads
+    /// and `GetLookupTable` reports — keyed by `lookupTableName`, which is what identifies
+    /// one ("The name must be unique within your account and Region"). A `BTreeMap` so
+    /// `DescribeLookupTables` enumerates in table-name order without re-sorting, which is
+    /// what its `lookupTableNamePrefix` filter and its pagination cursor both read.
+    pub lookup_tables: BTreeMap<String, LookupTableRecord>,
     /// Every integration of this account — the resource `PutIntegration` creates,
     /// `GetIntegration` and `ListIntegrations` report and `DeleteIntegration` removes —
     /// keyed by `integrationName`, the one member every other integration operation
@@ -840,6 +877,16 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
         for detector in self.anomaly_detectors.values_mut() {
             detector.materialize_due_transitions(now_ms);
         }
+    }
+
+    /// How many bytes of lookup-table CSV content the account's store currently holds —
+    /// what [`MAX_LOOKUP_TABLE_BYTES_TOTAL`] bounds. DERIVED by summing the stored bodies,
+    /// so it cannot drift from what the store actually holds.
+    pub fn lookup_table_bytes(&self) -> usize {
+        self.lookup_tables
+            .values()
+            .map(|table| table.table_body.len())
+            .sum()
     }
 
     /// Materialise every integration status change the clock has ALREADY made due, as of
@@ -1575,6 +1622,241 @@ pub fn anomaly_detector_arn(region: &str, id: &str) -> String {
 /// [`mint_uuid_from_seq`] every UUID-shaped id of this service comes from.
 pub fn mint_anomaly_detector_id(seq: u64) -> String {
     mint_uuid_from_seq(seq)
+}
+
+/// The resource-segment prefix of a lookup table's ARN. AWS documents no format for
+/// `LookupTable$lookupTableArn`, so it is built the way every other named CloudWatch Logs
+/// resource of this service builds one — a resource type then the name that identifies the
+/// resource, as `log-group:<name>` and `delivery-destination:<name>` are built.
+pub const LOOKUP_TABLE_ARN_PREFIX: &str = "lookup-table:";
+
+/// A lookup table's ARN, derived from the name that identifies it ("The name must be
+/// unique within your account and Region"), so the same table always answers under the
+/// same ARN and no two tables share one.
+pub fn lookup_table_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn("logs", region, &format!("{LOOKUP_TABLE_ARN_PREFIX}{name}"))
+}
+
+/// The lookup-table name an ARN names, or `None` for anything that is not a lookup
+/// table's ARN of this service — which is how every operation that identifies a table by
+/// `lookupTableArn` reaches the record the store holds under its name.
+pub fn lookup_table_name_from_arn(arn: &str) -> Option<&str> {
+    let (service, resource) = arn_service_and_resource(arn)?;
+    if service != "logs" {
+        return None;
+    }
+    resource
+        .strip_prefix(LOOKUP_TABLE_ARN_PREFIX)
+        .filter(|name| !name.is_empty())
+}
+
+/// What populates a lookup table: "You must specify either tableBody or queryId, but not
+/// both."
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LookupTableSource {
+    /// The CSV content the request carried, verbatim.
+    TableBody(String),
+    /// The id of the completed or cancelled query whose results populate the table.
+    QueryId(String),
+}
+
+/// The refusal for a request that names BOTH of a lookup table's content sources. Like the
+/// log-group selector pair ([`LOG_GROUP_SELECTORS_EXCLUSIVE`]) this is checked ACROSS two
+/// members, which no single member's constraint can express, so it is answered with the
+/// `ValidationException` the lookup-table operations model rather than with their
+/// `InvalidParameterException`.
+pub const LOOKUP_TABLE_SOURCE_EXCLUSIVE: &str =
+    "tableBody and queryId are mutually exclusive parameters.";
+
+/// The refusal for a `CreateLookupTable` that names neither content source: a table is
+/// created "by uploading CSV data or from CloudWatch Logs query results", so a create
+/// naming neither names nothing to create the table from. See
+/// [`LOOKUP_TABLE_SOURCE_EXCLUSIVE`] for the error shape.
+pub const LOOKUP_TABLE_SOURCE_REQUIRED: &str = "Either tableBody or queryId must be provided.";
+
+/// Resolve what a lookup-table request populates the table from. `Ok(None)` is a request
+/// that names neither source — which an UPDATE may do (it can change only the description
+/// or the KMS key) and a CREATE may not; the `Err` carries the message to refuse with.
+pub fn resolve_lookup_table_source(
+    table_body: Option<&str>,
+    query_id: Option<&str>,
+) -> Result<Option<LookupTableSource>, String> {
+    match (table_body, query_id) {
+        (Some(body), None) => Ok(Some(LookupTableSource::TableBody(body.to_string()))),
+        (None, Some(query_id)) => Ok(Some(LookupTableSource::QueryId(query_id.to_string()))),
+        (Some(_), Some(_)) => Err(LOOKUP_TABLE_SOURCE_EXCLUSIVE.to_string()),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The refusal for a `queryId` that names no query whose results could populate a lookup
+/// table — "The ID of a completed or cancelled CloudWatch Logs query". The message is built
+/// from the request so a caller can attribute it to the id it sent.
+///
+/// `StartQuery` is still a scaffold stub, so this account holds no query at all and EVERY
+/// `queryId` names one that is not there. Implementing that operation is what gives this
+/// service a query store to resolve an id against.
+pub fn query_not_found_message(query_id: &str) -> String {
+    format!("Query with id [{query_id}] is not a completed or cancelled query.")
+}
+
+/// What a lookup table's CSV body describes: the column names of its header row and how
+/// many data rows follow it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableBodyShape {
+    /// `LookupTable$tableFields` — "The column headers from the first row of the CSV file."
+    pub fields: Vec<String>,
+    /// `LookupTable$recordsCount` — "The number of data rows in the lookup table, excluding
+    /// the header row."
+    pub records_count: i64,
+}
+
+/// Read a lookup table's CSV body: "the CSV content must include a header row with column
+/// names". The body is parsed by the `csv` crate rather than split by hand, so a quoted
+/// field carrying a comma, a newline or an escaped quote is one field, as CSV defines it.
+///
+/// The `Err` carries the message to refuse the body with: a header row naming no column at
+/// all, and a data row whose field count disagrees with the header's, are both content this
+/// operation cannot build a table from.
+pub fn parse_table_body(body: &str) -> Result<TableBodyShape, String> {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        // A row must carry exactly the header's fields: a lookup table's rows are keyed by
+        // its column names, so a short or long row names no value for some column.
+        .flexible(false)
+        .from_reader(body.as_bytes());
+    let fields: Vec<String> = reader
+        .headers()
+        .map_err(|error| table_body_message(&error))?
+        .iter()
+        .map(str::to_string)
+        .collect();
+    if fields.iter().all(|field| field.trim().is_empty()) {
+        return Err(
+            "tableBody must begin with a header row naming the table's columns".to_string(),
+        );
+    }
+    let mut records_count: i64 = 0;
+    for record in reader.records() {
+        record.map_err(|error| table_body_message(&error))?;
+        records_count = records_count.saturating_add(1);
+    }
+    Ok(TableBodyShape {
+        fields,
+        records_count,
+    })
+}
+
+/// The refusal for a CSV body the parser would not read, as the defect the parser reported:
+/// a row disagreeing with the header names both counts and the row it is at, so a caller
+/// can find the row in the body it sent.
+fn table_body_message(error: &csv::Error) -> String {
+    match error.kind() {
+        csv::ErrorKind::UnequalLengths {
+            pos,
+            expected_len,
+            len,
+        } => format!(
+            "tableBody row {} has {len} fields but the header row names {expected_len}",
+            pos.as_ref().map_or(0, csv::Position::line)
+        ),
+        _ => format!("tableBody is not valid CSV content: {error}"),
+    }
+}
+
+/// One lookup table — the reference data "you can use [...] to enrich log data in
+/// CloudWatch Logs queries" — as it is stored. Every member of the model's `LookupTable`
+/// shape is derived from this record, so `GetLookupTable` and `DescribeLookupTables` answer
+/// from state alone.
+#[derive(Debug, Clone)]
+pub struct LookupTableRecord {
+    /// `LookupTable$lookupTableName` — "The name of the lookup table". Also the key the
+    /// store is keyed by.
+    pub name: String,
+    /// `LookupTable$lookupTableArn` — the ARN [`lookup_table_arn`] built for this table in
+    /// the region the create was signed for.
+    pub arn: String,
+    /// `LookupTable$description` — "The description of the lookup table", when a call named
+    /// one.
+    pub description: Option<String>,
+    /// The CSV content this table holds, VERBATIM as the call that last wrote it sent it: a
+    /// cell's text is the table's data, so nothing re-renders it and no numeric value is
+    /// re-formatted on the way in or out. `GetLookupTable$tableBody` reports it.
+    pub table_body: String,
+    /// `LookupTable$tableFields` — the column names of [`Self::table_body`]'s header row, as
+    /// [`parse_table_body`] read them.
+    pub table_fields: Vec<String>,
+    /// `LookupTable$recordsCount` — the data rows of [`Self::table_body`], excluding its
+    /// header row.
+    pub records_count: i64,
+    /// `LookupTable$kmsKeyId` — "The ARN of the KMS key used to encrypt the lookup table
+    /// data, if applicable". `None` when no call named one, which is the Amazon-owned key
+    /// `CreateLookupTable` documents as the default ("If you don't specify a key, the data is
+    /// encrypted with an Amazon Web Services-owned key") and not a key this emulator invents.
+    pub kms_key_id: Option<String>,
+    /// `CreateLookupTable$createdAt` — "The time when the lookup table was created", in epoch
+    /// milliseconds.
+    pub created_at_ms: i64,
+    /// `LookupTable$lastUpdatedTime` — "The time when the lookup table was last updated", in
+    /// epoch milliseconds. A table nothing has updated since it was created reports the
+    /// instant it was created.
+    pub last_updated_time_ms: i64,
+    /// The tags `CreateLookupTable$tags` assigned to this table. A `BTreeMap` so the stored
+    /// order is stable; no `LookupTable` member reports them, so they are read back through
+    /// the tagging operations once those reach this resource.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl LookupTableRecord {
+    /// A brand-new lookup table holding `table_body`, whose shape `shape` describes. This is
+    /// what `CreateLookupTable` stores; the optional members a create may name —
+    /// `description`, `kmsKeyId`, `tags` — are left at their "the request named none" value
+    /// and set on the returned record by the caller that has them.
+    pub fn new(
+        name: &str,
+        arn: &str,
+        table_body: String,
+        shape: TableBodyShape,
+        created_at_ms: i64,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            arn: arn.to_string(),
+            description: None,
+            table_body,
+            table_fields: shape.fields,
+            records_count: shape.records_count,
+            kms_key_id: None,
+            created_at_ms,
+            last_updated_time_ms: created_at_ms,
+            tags: BTreeMap::new(),
+        }
+    }
+
+    /// `LookupTable$sizeBytes` — "The size of the lookup table in bytes": the length of the
+    /// CSV content this table holds, in the UTF-8 encoding `CreateLookupTable` requires of
+    /// it. DERIVED from the body rather than stored beside it, so it cannot disagree with
+    /// what the table holds.
+    pub fn size_bytes(&self) -> i64 {
+        i64::try_from(self.table_body.len()).unwrap_or(i64::MAX)
+    }
+
+    /// This table as the model's `LookupTable` structure, which is what
+    /// `DescribeLookupTables` reports, so one record renders the same way through any reader
+    /// of it. The body itself is not a member of that shape — only `GetLookupTable` reports
+    /// it — so a listing carries the table's metadata and not its megabytes.
+    pub fn reported(&self) -> crate::ops::types::LookupTable {
+        crate::ops::types::LookupTable {
+            lookup_table_arn: Some(self.arn.clone()),
+            lookup_table_name: Some(self.name.clone()),
+            description: self.description.clone(),
+            table_fields: Some(self.table_fields.clone()),
+            records_count: Some(self.records_count),
+            size_bytes: Some(self.size_bytes()),
+            last_updated_time: Some(self.last_updated_time_ms),
+            kms_key_id: self.kms_key_id.clone(),
+        }
+    }
 }
 
 /// One integration between CloudWatch Logs and another service — the resource

@@ -21,8 +21,9 @@
 //! a key overwritten, keys and values spanning the modelled `TagKey` / `TagValue`
 //! pattern and length bounds). Every assertion is made on every row.
 //!
-//! Applications lists are seeded through the store because `PutAppsList` is
-//! still a 501 stub tracked by its own issue; every other kind is created
+//! Applications lists are seeded through the store so this suite's table stays
+//! about TAGS rather than about the applications-list writer (`PutAppsList`,
+//! covered by the `apps_list_lifecycle` suite); every other kind is created
 //! through its own wire API.
 
 use std::sync::Arc;
@@ -153,9 +154,10 @@ pub(crate) async fn create_resource(
             }));
             create_through_the_api(router, "PutProtocolsList", body, "ProtocolsListArn", case).await
         }
-        // `PutAppsList` is still a 501 stub tracked by its own issue, so the
-        // applications list is seeded the way that writer will write it: the tags
-        // on the record, and the ARN-keyed index refreshed from the same value.
+        // The applications list is seeded the way `PutAppsList` writes it — the
+        // tags on the record, and the ARN-keyed index refreshed from the same
+        // value — so this suite's table stays about tags rather than about that
+        // writer, which the `apps_list_lifecycle` suite covers end to end.
         Kind::AppsList => {
             let list_id = state::mint_identifier();
             let arn = state::apps_list_arn(REGION, &list_id);

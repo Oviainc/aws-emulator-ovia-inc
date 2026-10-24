@@ -227,6 +227,28 @@ pub const MAX_RULES_PER_ACCOUNT: usize = 100;
 /// that would push it past the bound is refused instead of applied.
 pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
+/// How many conditions one filter criteria of a rule may carry.
+///
+/// DOCUMENTED, not chosen: `Criteria` reads "You can specify up to 20 conditions
+/// per filter criteria and 20 values per condition"
+/// (`smithy_query(query="doc",shape="Criteria")`), and each MEMBER of `Criteria`
+/// is one filter criteria — `region` is "Filter criteria for Amazon Web Services
+/// regions where resources must be located", `resourceArn` is "Filter criteria
+/// for specific resource ARNs to include or exclude", and so on — so the cap is
+/// on the length of each condition list.
+pub const MAX_CONDITIONS_PER_CRITERION: usize = 20;
+
+/// How many values one criteria condition may compare against ("…and 20 values
+/// per condition", the same `Criteria` doc sentence).
+pub const MAX_VALUES_PER_CONDITION: usize = 20;
+
+/// How many whitespace-separated fields a schedule expression has.
+///
+/// DOCUMENTED: "A `cron` expression consists of six fields separated by white
+/// spaces: (`minutes` `hours` `day_of_month` `month` `day_of_week` `year`)"
+/// (`smithy_query(query="doc",shape="Schedule",member="scheduleExpression")`).
+pub const CRON_FIELD_COUNT: usize = 6;
+
 /// How many client tokens the idempotency ledger remembers. Reached only by
 /// distinct caller-supplied tokens; the oldest entry is evicted to make room, so
 /// the ledger cannot grow without bound. A replay window that has been evicted
@@ -1546,9 +1568,13 @@ enum CriterionKind {
 /// the protocol boundary admits a condition with no operator, with no values, or
 /// with an operator from the wrong family (a `Numeric*` operator on a string
 /// criterion). None of those can select resources, so each is refused rather
-/// than quietly matching nothing.
+/// than quietly matching nothing. The documented size caps
+/// ([`MAX_CONDITIONS_PER_CRITERION`], [`MAX_VALUES_PER_CONDITION`]) are checked
+/// here too, for the same reason: the model carries no `@length` for either.
 pub fn criteria_violation(criteria: &Criteria) -> Option<String> {
     let mut conditions: Vec<(&str, CriterionKind, Option<&str>, usize)> = Vec::new();
+    // (path, how many conditions that filter criteria carries)
+    let mut criterion_sizes: Vec<(&str, usize)> = Vec::new();
     let text_criteria: [(&str, &Option<Vec<StringCriteriaCondition>>); 4] = [
         ("criteria.region", &criteria.region),
         ("criteria.resourceArn", &criteria.resource_arn),
@@ -1556,6 +1582,7 @@ pub fn criteria_violation(criteria: &Criteria) -> Option<String> {
         ("criteria.restartNeeded", &criteria.restart_needed),
     ];
     for (path, criterion) in text_criteria {
+        criterion_sizes.push((path, criterion.as_ref().map_or(0, Vec::len)));
         for condition in criterion.iter().flatten() {
             conditions.push((
                 path,
@@ -1565,6 +1592,10 @@ pub fn criteria_violation(criteria: &Criteria) -> Option<String> {
             ));
         }
     }
+    criterion_sizes.push((
+        "criteria.resourceTag",
+        criteria.resource_tag.as_ref().map_or(0, Vec::len),
+    ));
     for condition in criteria.resource_tag.iter().flatten() {
         conditions.push((
             "criteria.resourceTag",
@@ -1573,6 +1604,10 @@ pub fn criteria_violation(criteria: &Criteria) -> Option<String> {
             condition.values.as_ref().map_or(0, Vec::len),
         ));
     }
+    criterion_sizes.push((
+        "criteria.ebsVolumeSizeInGib",
+        criteria.ebs_volume_size_in_gib.as_ref().map_or(0, Vec::len),
+    ));
     for condition in criteria.ebs_volume_size_in_gib.iter().flatten() {
         conditions.push((
             "criteria.ebsVolumeSizeInGib",
@@ -1581,6 +1616,13 @@ pub fn criteria_violation(criteria: &Criteria) -> Option<String> {
             condition.values.as_ref().map_or(0, Vec::len),
         ));
     }
+    criterion_sizes.push((
+        "criteria.lookBackPeriodInDays",
+        criteria
+            .look_back_period_in_days
+            .as_ref()
+            .map_or(0, Vec::len),
+    ));
     for condition in criteria.look_back_period_in_days.iter().flatten() {
         conditions.push((
             "criteria.lookBackPeriodInDays",
@@ -1589,12 +1631,30 @@ pub fn criteria_violation(criteria: &Criteria) -> Option<String> {
             condition.values.as_ref().map_or(0, Vec::len),
         ));
     }
+    criterion_sizes.push((
+        "criteria.estimatedMonthlySavings",
+        criteria
+            .estimated_monthly_savings
+            .as_ref()
+            .map_or(0, Vec::len),
+    ));
     for condition in criteria.estimated_monthly_savings.iter().flatten() {
         conditions.push((
             "criteria.estimatedMonthlySavings",
             CriterionKind::Numeric,
             condition.comparison.as_deref(),
             condition.values.as_ref().map_or(0, Vec::len),
+        ));
+    }
+    if let Some((path, _)) = criterion_sizes
+        .into_iter()
+        .find(|(_, size)| *size > MAX_CONDITIONS_PER_CRITERION)
+    {
+        return Some(constraint_report(
+            path,
+            &format!(
+                "Member must have length less than or equal to {MAX_CONDITIONS_PER_CRITERION}"
+            ),
         ));
     }
     // A `resourceTag` condition is also about one tag KEY, so a condition
@@ -1648,7 +1708,94 @@ fn condition_violation(
             "Member must have length greater than or equal to 1",
         ));
     }
+    if value_count > MAX_VALUES_PER_CONDITION {
+        return Some(constraint_report(
+            &format!("{path}.member.values"),
+            &format!("Member must have length less than or equal to {MAX_VALUES_PER_CONDITION}"),
+        ));
+    }
     None
+}
+
+/// Why this `recommendedActionTypes` list cannot drive a rule, if it cannot.
+///
+/// The list names the action types the rule may execute, so an empty one selects
+/// no action at all and leaves a rule that automates nothing; the model carries
+/// no `@length` on `RecommendedActionTypeList`, so the check lives here. The
+/// preview operations refuse their own (required) list the same way.
+pub fn recommended_action_types_violation(action_types: &[String]) -> Option<String> {
+    if action_types.is_empty() {
+        return Some(constraint_report(
+            "recommendedActionTypes",
+            "Member must have length greater than or equal to 1",
+        ));
+    }
+    None
+}
+
+/// Why this `schedule` cannot say when a rule runs, if it cannot.
+///
+/// `scheduleExpression` is "The expression that defines when the schedule runs",
+/// so a schedule without one never runs and is refused rather than stored. The
+/// expression itself is documented as a cron of [`CRON_FIELD_COUNT`] fields
+/// (`minutes hours day_of_month month day_of_week year`) of which "You can
+/// schedule rules to run at most once per day. Your cron expression must use
+/// specific values (not wildcards) for the minutes and hours fields"
+/// (`smithy_query(query="doc",shape="Schedule",member="scheduleExpression")`), so
+/// those two fields must each name ONE value in range: a wildcard, a list, a
+/// range or a step in either would make the rule run more than once a day (or
+/// not at a fixed time at all). The remaining four fields are left to the
+/// expression's own vocabulary, which the doc does not constrain.
+///
+/// `executionWindowInMinutes` carries `@range(60..1440)` in the model, so the
+/// protocol boundary has already refused a window outside it.
+pub fn schedule_violation(schedule: &Schedule) -> Option<String> {
+    let expression = schedule
+        .schedule_expression
+        .as_deref()
+        .unwrap_or_default()
+        .trim();
+    if expression.is_empty() {
+        return Some(constraint_report(
+            "schedule.scheduleExpression",
+            "Member is required",
+        ));
+    }
+    let fields: Vec<&str> = expression.split_whitespace().collect();
+    if fields.len() != CRON_FIELD_COUNT {
+        return Some(constraint_report(
+            "schedule.scheduleExpression",
+            &format!(
+                "Member must be a cron expression of {CRON_FIELD_COUNT} fields: minutes hours \
+                 day_of_month month day_of_week year"
+            ),
+        ));
+    }
+    // (field index, field name, the largest value that field admits)
+    for (index, field, highest) in [(0usize, "minutes", 59u32), (1, "hours", 23)] {
+        if !cron_field_is_one_value(fields[index], highest) {
+            return Some(constraint_report(
+                "schedule.scheduleExpression",
+                &format!(
+                    "Member must use a single specific value from 0 to {highest} for the {field} \
+                     field, not a wildcard, list, range or step"
+                ),
+            ));
+        }
+    }
+    None
+}
+
+/// Does a cron field name exactly ONE value in `0..=highest`?
+///
+/// Every way a cron field can stand for more than one value — the wildcards `*`
+/// and `?`, a list (`0,30`), a range (`0-30`) and a step (`*/15`) — carries a
+/// character that is not a digit, so a field of digits alone within range is
+/// exactly the "specific value" the doc asks for.
+fn cron_field_is_one_value(field: &str, highest: u32) -> bool {
+    !field.is_empty()
+        && field.chars().all(|character| character.is_ascii_digit())
+        && field.parse::<u32>().is_ok_and(|value| value <= highest)
 }
 
 /// A total order key for a wire timestamp: `DateTime` carries seconds and

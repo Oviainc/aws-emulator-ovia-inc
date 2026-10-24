@@ -2232,6 +2232,13 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             return Err(CreateRefusal::ConfigLimit(limit));
         }
 
+        // An alternate domain name is served only under a certificate that validates it,
+        // so a configuration whose aliases and viewer certificate disagree is refused
+        // before any distribution exists to carry the alias.
+        if let Some(message) = alias_certificate_mismatch(&config) {
+            return Err(CreateRefusal::InvalidViewerCertificate(message));
+        }
+
         // A caller reference identifies ONE distribution for its whole life, and what it
         // takes part in is this: repeating a create under a reference the store already
         // holds is either the SAME request again or a second distribution under a taken
@@ -2737,6 +2744,9 @@ pub enum CreateRefusal {
     /// `TooManyDistributions` — "Processing your request would cause you to exceed the
     /// maximum number of distributions allowed."
     TooManyDistributions(String),
+    /// `InvalidViewerCertificate` — the configuration's alternate domain names and its
+    /// viewer certificate disagree (see [`alias_certificate_mismatch`]).
+    InvalidViewerCertificate(String),
 }
 
 /// What a create hands back: the new record's id and version token, and the
@@ -3918,6 +3928,70 @@ impl BehaviorLists<'_> {
                 ));
             }
         }
+    }
+}
+
+/// The `InvalidViewerCertificate` message for a configuration whose alternate domain
+/// names no certificate IT names can serve, or `None` when the two agree.
+///
+/// `ViewerCertificate` states the rule for both directions: "If the distribution doesn't
+/// use `Aliases` (also known as alternate domain names or CNAMEs) … set
+/// `CloudFrontDefaultCertificate` to `true` and leave all other fields empty", and "If you
+/// want viewers to use HTTPS with an alternate domain name … you must choose one of
+/// `ACMCertificateArn` or `IAMCertificateId`" — the certificate has to validate the
+/// authorization to serve the domain name, which CloudFront's own
+/// `*.cloudfront.net` certificate cannot do for a name that is not under it. So a
+/// configuration that declares at least one alias has to name exactly ONE custom
+/// certificate, and a configuration that names none of them — the default certificate, by
+/// itself or by omission — may declare no alias.
+///
+/// Checked on the way IN, on every path that stores a `DistributionConfig`, so no stored
+/// distribution ever carries an alias its certificate does not cover: the condition is a
+/// property of the submitted configuration alone, which is why it lives here beside
+/// [`config_quantity_mismatch`] rather than in one handler.
+pub fn alias_certificate_mismatch(config: &DistributionConfig) -> Option<String> {
+    let aliases: &[String] = config
+        .aliases
+        .as_ref()
+        .and_then(|aliases| aliases.items.as_deref())
+        .unwrap_or_default();
+    if aliases.is_empty() {
+        return None;
+    }
+    let certificate = config.viewer_certificate.as_ref();
+    // An empty string names no certificate: the member is "left empty" exactly as the
+    // default-certificate wording asks for.
+    let named = |value: Option<&String>| {
+        value
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+            .is_some()
+    };
+    let acm = named(certificate.and_then(|certificate| certificate.acm_certificate_arn.as_ref()));
+    let iam = named(certificate.and_then(|certificate| certificate.iam_certificate_id.as_ref()));
+    let default = certificate
+        .is_none_or(|certificate| certificate.cloud_front_default_certificate == Some(true));
+    let aliases = aliases.join(", ");
+    match (acm, iam) {
+        (false, false) => Some(format!(
+            "This distribution states the alternate domain names [{aliases}] and no viewer \
+             certificate that covers them: a distribution with an alternate domain name has \
+             to name one of ViewerCertificate.ACMCertificateArn or \
+             ViewerCertificate.IAMCertificateId, since CloudFront's default certificate \
+             validates no domain name of yours"
+        )),
+        (true, true) => Some(format!(
+            "This distribution states the alternate domain names [{aliases}] with both \
+             ViewerCertificate.ACMCertificateArn and ViewerCertificate.IAMCertificateId: \
+             exactly one of them names the certificate that covers them"
+        )),
+        _ if default => Some(format!(
+            "This distribution states the alternate domain names [{aliases}] with \
+             ViewerCertificate.CloudFrontDefaultCertificate set: the default certificate \
+             serves only the distribution's own CloudFront domain name, so it cannot be \
+             combined with a custom certificate for an alternate domain name"
+        )),
+        _ => None,
     }
 }
 

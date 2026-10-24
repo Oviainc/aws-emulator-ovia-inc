@@ -158,10 +158,10 @@ fn gate_rows(protocols_list_arn: &str, apps_list_arn: &str) -> Vec<Row> {
 }
 
 /// A fresh emulator holding one taggable resource of two kinds, seeded through
-/// the store the way their own writers write them — `PutProtocolsList` is
-/// administrator-gated and `PutAppsList` is still a 501 stub tracked by its own
-/// issue, so seeding is what gives the table an EXISTING resource to name
-/// without first opening the gate under test.
+/// the store the way their own writers write them — both `PutProtocolsList` and
+/// `PutAppsList` are administrator-gated themselves, so seeding is what gives
+/// the table an EXISTING resource to name without first opening the gate under
+/// test.
 fn emulator_holding_taggable_resources() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (router, engine) = emulator_with_engine();
     with_store(&engine, |store| {

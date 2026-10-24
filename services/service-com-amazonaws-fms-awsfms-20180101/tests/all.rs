@@ -27,6 +27,8 @@ mod admin_account_disassociation;
 mod admin_account_scopes;
 #[path = "all/administrator_gated_operations.rs"]
 mod administrator_gated_operations;
+#[path = "all/apps_list_lifecycle.rs"]
+mod apps_list_lifecycle;
 #[path = "all/apps_list_reporting.rs"]
 mod apps_list_reporting;
 #[path = "all/compliance_status.rs"]

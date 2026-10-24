@@ -1120,6 +1120,25 @@ pub mod messages {
     /// API uses for it.
     pub const GET_ID_MAPPING_WORKFLOW_NOT_FOUND: &str = "IdMappingWorkflow Not Found";
 
+    /// `DeleteIdMappingWorkflowOutput$message` — modelled @required, target `String`,
+    /// doc "A successful operation message"
+    /// (`smithy_query(query="operation",operation="DeleteIdMappingWorkflow")`). Not
+    /// itself recorded; it is this operation's own constant, spelled with the resource
+    /// type the API uses, in the same form as the recorded
+    /// [`DELETE_SCHEMA_MAPPING_SUCCESS`]. It carries nothing of the record that was
+    /// removed.
+    pub const DELETE_ID_MAPPING_WORKFLOW_SUCCESS: &str = "IdMappingWorkflow Deleted.";
+
+    /// `DeleteIdMappingWorkflow`'s `ResourceNotFoundException$message` (HTTP 404) — the
+    /// refusal its own doc describes ("This operation returns a
+    /// ResourceNotFoundException if a workflow with the given name does not exist").
+    /// Not itself recorded; it is this operation's own constant. The delete addresses
+    /// the SAME resource by the SAME key as `GetIdMappingWorkflow`, so it follows that
+    /// reader's constant, no-name form ([`GET_ID_MAPPING_WORKFLOW_NOT_FOUND`]) rather
+    /// than the templated [`delete_matching_workflow_not_found`], and composes nothing
+    /// from the request.
+    pub const DELETE_ID_MAPPING_WORKFLOW_NOT_FOUND: &str = "IdMappingWorkflow Not Found";
+
     /// `DeleteSchemaMapping`'s `ConflictException$message` (HTTP 400) when a matching
     /// workflow still names the schema in its `inputSourceConfig` — the refusal this
     /// operation's own doc describes ("This operation will fail if there is a

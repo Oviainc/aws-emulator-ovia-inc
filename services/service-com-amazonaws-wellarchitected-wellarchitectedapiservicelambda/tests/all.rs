@@ -41,6 +41,9 @@ mod lens_resolution;
 #[path = "all/lens_review_answers.rs"]
 mod lens_review_answers;
 
+#[path = "all/lens_review_improvements.rs"]
+mod lens_review_improvements;
+
 #[path = "all/lens_review_rollup.rs"]
 mod lens_review_rollup;
 
