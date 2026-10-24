@@ -219,6 +219,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::TokenReplay::Fresh => {}
         }
 
+        // The account's safety lever keeps experiments from starting for as long as it is
+        // engaged, which is what FIS documents engaging it as doing — so a start is
+        // refused while it holds, and nothing is minted for it. Asked AFTER the
+        // idempotency replay above: a retry of a start this service already accepted
+        // reports that experiment rather than being refused for a lever engaged since.
+        let lever_status = store.settled_safety_lever(now).status;
+        if lever_status.holds_experiments() {
+            return Err(StartExperimentErrorModeled::ConflictException(
+                crate::state::safety_lever_engaged_refusal(lever_status),
+            )
+            .into());
+        }
+
         // The experiment is built from the PERSISTED template, so it carries what that
         // template holds and not what any request said.
         let Some(template) = store

@@ -42,7 +42,10 @@ use crate::virtual_cluster_job_run_loop::{
 };
 
 /// `POST /virtualclusters/{cluster}/endpoints` — `CreateManagedEndpoint`.
-async fn create_endpoint(emr: &Emr, cluster: &str, body: Value) -> Answer {
+///
+/// `pub(crate)` because the describe-focused suite beside this one drives the service
+/// through the SAME helpers, so the two cannot drift into two request paths.
+pub(crate) async fn create_endpoint(emr: &Emr, cluster: &str, body: Value) -> Answer {
     emr.send(
         "POST",
         &format!("/virtualclusters/{cluster}/endpoints"),
@@ -52,7 +55,7 @@ async fn create_endpoint(emr: &Emr, cluster: &str, body: Value) -> Answer {
 }
 
 /// `GET /virtualclusters/{cluster}/endpoints/{id}` — `DescribeManagedEndpoint`.
-async fn describe_endpoint(emr: &Emr, cluster: &str, id: &str) -> Answer {
+pub(crate) async fn describe_endpoint(emr: &Emr, cluster: &str, id: &str) -> Answer {
     emr.send(
         "GET",
         &format!("/virtualclusters/{cluster}/endpoints/{id}"),
@@ -62,7 +65,7 @@ async fn describe_endpoint(emr: &Emr, cluster: &str, id: &str) -> Answer {
 }
 
 /// `GET /virtualclusters/{cluster}/endpoints{query}` — `ListManagedEndpoints`.
-async fn list_endpoints(emr: &Emr, cluster: &str, query: &str) -> Answer {
+pub(crate) async fn list_endpoints(emr: &Emr, cluster: &str, query: &str) -> Answer {
     emr.send(
         "GET",
         &format!("/virtualclusters/{cluster}/endpoints{query}"),
@@ -74,12 +77,12 @@ async fn list_endpoints(emr: &Emr, cluster: &str, query: &str) -> Answer {
 /// Wait until the transition the service owes a fresh endpoint has come due, with margin,
 /// so the next call materialises it. The service stores the due instant and never sleeps;
 /// this is the test's own clock.
-fn wait_for_the_clock() {
+pub(crate) fn wait_for_the_clock() {
     std::thread::sleep(state::TRANSITION_SPAN + Duration::from_millis(250));
 }
 
 /// The `endpoints` a list answer carries, in the order it reported them.
-fn listed(body: &Value, case: &str) -> Vec<Value> {
+pub(crate) fn listed(body: &Value, case: &str) -> Vec<Value> {
     field(body, "/endpoints", case)
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: endpoints is not a list: {body}"))
@@ -87,7 +90,7 @@ fn listed(body: &Value, case: &str) -> Vec<Value> {
 }
 
 /// The ids a list answer carries, in the order it reported them.
-fn listed_ids(body: &Value, case: &str) -> Vec<String> {
+pub(crate) fn listed_ids(body: &Value, case: &str) -> Vec<String> {
     listed(body, case)
         .iter()
         .map(|endpoint| text(endpoint, "/id", case))
@@ -95,14 +98,14 @@ fn listed_ids(body: &Value, case: &str) -> Vec<String> {
 }
 
 /// The `endpoint` a describe answer carries.
-fn described(body: &Value, case: &str) -> Value {
+pub(crate) fn described(body: &Value, case: &str) -> Value {
     field(body, "/endpoint", case).clone()
 }
 
 /// One acceptable `CreateManagedEndpoint` body: the five members the model marks
 /// `@required` beside `virtualClusterId`, which is an `@httpLabel`
 /// (smithy_query: operation `CreateManagedEndpoint`).
-fn endpoint_body(name: &str, token: &str, endpoint_type: &str) -> Value {
+pub(crate) fn endpoint_body(name: &str, token: &str, endpoint_type: &str) -> Value {
     json!({
         "name": name,
         "clientToken": token,
@@ -115,7 +118,7 @@ fn endpoint_body(name: &str, token: &str, endpoint_type: &str) -> Value {
 /// The `CreateManagedEndpoint` bodies the round-trip suite stores, spanning what an
 /// endpoint carries: which optional members are present, how deep
 /// `configurationOverrides` goes, the form of the name, and how many tags there are.
-fn stored_bodies() -> Vec<(&'static str, Value)> {
+pub(crate) fn stored_bodies() -> Vec<(&'static str, Value)> {
     vec![
         (
             "only the required members",

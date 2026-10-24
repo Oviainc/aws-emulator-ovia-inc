@@ -69,6 +69,21 @@
 //! `UpdateTargetAccountConfiguration` changes in place. A configuration names one account
 //! and the role FIS assumes in it, so the two have to agree: the role has to belong to
 //! that account ([`target_account_role_arn_refusal`]).
+//!
+//! Beside those it holds one more record that is NOT caller-created: the SAFETY LEVER
+//! ([`SafetyLeverRecord`]), FIS's account-level control over whether experiments may run,
+//! read by `GetSafetyLever` and moved by `UpdateSafetyLeverState`. No API creates, lists or
+//! deletes a lever — it exists, named by the account's own id ([`safety_lever_id`]) — so
+//! before any update it is the `disengaged` lever every account starts with. It is ONE
+//! record here, as the experiments it governs are one collection: this store holds the
+//! account's records rather than a set of them per Region, and the lever reports its ARN in
+//! the Region of the request that read it, exactly as a catalogued action does
+//! ([`action_arn`]). Engaging it is what FIS documents as stopping the experiments that are
+//! running and keeping new ones from starting, so an engage stops them
+//! ([`ComAmazonawsFisFaultinjectionsimulatorState::stop_experiments_for_safety_lever`])
+//! and `StartExperiment` is refused for as long as the lever holds. The lever also owes
+//! the clock a transition of its own, `engaging` -> `engaged`, materialised the same way
+//! an experiment's is.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
@@ -100,7 +115,8 @@ use crate::ops::types::{
     ExperimentTemplateSummary, ExperimentTemplateTarget, ExperimentTemplateTargetFilter,
     ExperimentTemplateTargetInputFilter, ReportConfigurationCloudWatchDashboardInput,
     ReportConfigurationS3Output, ReportConfigurationS3OutputInput, ResolvedTarget,
-    ResourceNotFoundException, ServiceQuotaExceededException, StartExperimentInput,
+    ResourceNotFoundException, SafetyLever, SafetyLeverState, ServiceQuotaExceededException,
+    StartExperimentInput,
     TargetAccountConfiguration, TargetAccountConfigurationSummary, TargetResourceTypeSummary,
     UpdateExperimentTemplateActionInputItem, UpdateExperimentTemplateInput,
     UpdateExperimentTemplateLogConfigurationInput, UpdateExperimentTemplateReportConfigurationInput,
@@ -442,6 +458,14 @@ pub const STOPPED_BY_REQUEST: &str = "Stopped by a StopExperiment request";
 /// The `state.reason` an experiment carries once its actions have run to the end. Chosen
 /// here for the same reason [`STOPPED_BY_REQUEST`] is.
 pub const COMPLETED_REASON: &str = "Experiment completed";
+
+/// The `state.reason` an experiment carries when the account's safety lever was engaged
+/// while it was running. Chosen here for the same reason [`STOPPED_BY_REQUEST`] is.
+pub const STOPPED_BY_SAFETY_LEVER: &str = "Stopped by the safety lever";
+
+/// The resource segment of a safety lever's ARN
+/// (`arn:aws:fis:<region>:<account>:safety-lever/<id>`).
+pub const SAFETY_LEVER_RESOURCE: &str = "safety-lever";
 
 /// The status an experiment this emulator persists can be in.
 ///
@@ -1283,11 +1307,18 @@ impl ExperimentRecord {
     /// A no-op on an experiment that is already stopping or in a final state, so a stop
     /// this service refuses neither restarts the span nor moves `endTime`.
     pub fn request_stop(&mut self, now: SystemTime) {
+        self.request_stop_for(now, STOPPED_BY_REQUEST);
+    }
+
+    /// [`request_stop`](Self::request_stop) with the `state.reason` the stop is recorded
+    /// under, for a stop this service performs for a reason other than a caller's
+    /// `StopExperiment` — see [`STOPPED_BY_SAFETY_LEVER`].
+    pub fn request_stop_for(&mut self, now: SystemTime, reason: &str) {
         if self.status == ExperimentStatus::Stopping || self.status.is_terminal() {
             return;
         }
         self.status = ExperimentStatus::Stopping;
-        self.reason = Some(STOPPED_BY_REQUEST.to_string());
+        self.reason = Some(reason.to_string());
         self.transition_due = Some(now + TRANSITION_DELAY);
     }
 
@@ -1349,6 +1380,164 @@ impl ExperimentRecord {
     }
 }
 
+/// The status a safety lever this emulator persists can be in.
+///
+/// `SafetyLeverStatus` is modelled `disengaged | engaged | engaging`, while
+/// `SafetyLeverStatusInput` — the only thing a caller can ask for — admits
+/// `disengaged | engaged`. `engaging` is therefore the service's OWN status: the lever is
+/// taking effect, which is what engaging it does to the experiments already running. It
+/// is reached only by way of an engage request and left when the clock says so
+/// ([`SafetyLeverRecord::settle`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafetyLeverStatusKind {
+    /// Experiments may start: the lever is not holding anything back.
+    Disengaged,
+    /// An engage has been accepted and is taking effect.
+    Engaging,
+    /// The lever is engaged.
+    Engaged,
+}
+
+impl SafetyLeverStatusKind {
+    /// The wire value `SafetyLeverStatus` names this status with.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Disengaged => "disengaged",
+            Self::Engaging => "engaging",
+            Self::Engaged => "engaged",
+        }
+    }
+
+    /// True while the lever holds experiments back — engaged, and already from the moment
+    /// the engage is accepted.
+    pub fn holds_experiments(self) -> bool {
+        !matches!(self, Self::Disengaged)
+    }
+}
+
+/// One safety lever: the state of FIS's account-level control over whether experiments may
+/// run.
+///
+/// No API creates or deletes a lever and none lists them, so a lever is not a record a
+/// caller mints: it EXISTS, and a request names it by the account's own id
+/// ([`safety_lever_id`]). A lever nobody has updated is `disengaged` and carries no reason,
+/// which is the state this record defaults to.
+#[derive(Debug, Clone)]
+pub struct SafetyLeverRecord {
+    pub status: SafetyLeverStatusKind,
+    /// The reason the last update gave for the state. `UpdateSafetyLeverState` models it
+    /// `@required`, so every state a caller asked for carries one; a lever no call has
+    /// touched carries none.
+    pub reason: Option<String>,
+    /// When `engaging` falls due to become `engaged`, which is the only transition this
+    /// record owes the clock. See [`TRANSITION_DELAY`].
+    pub transition_due: Option<SystemTime>,
+}
+
+impl Default for SafetyLeverRecord {
+    fn default() -> Self {
+        Self {
+            status: SafetyLeverStatusKind::Disengaged,
+            reason: None,
+            transition_due: None,
+        }
+    }
+}
+
+impl SafetyLeverRecord {
+    /// Materialise the transition the clock already owes at `now`: an engage that has
+    /// taken effect reports `engaged`.
+    pub fn settle(&mut self, now: SystemTime) {
+        let Some(due) = self.transition_due else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.transition_due = None;
+        if self.status == SafetyLeverStatusKind::Engaging {
+            self.status = SafetyLeverStatusKind::Engaged;
+        }
+    }
+
+    /// Engage the lever, recording `reason`.
+    ///
+    /// An engage of a lever that is already engaging or engaged records the new reason and
+    /// leaves the transition where it was: the lever is engaged once, so a repeated
+    /// request neither restarts the span nor takes an engaged lever back to `engaging`.
+    pub fn engage(&mut self, reason: &str, now: SystemTime) {
+        if self.status == SafetyLeverStatusKind::Disengaged {
+            self.status = SafetyLeverStatusKind::Engaging;
+            self.transition_due = Some(now + TRANSITION_DELAY);
+        }
+        self.reason = Some(reason.to_string());
+    }
+
+    /// Disengage the lever, recording `reason`.
+    ///
+    /// Immediate: the model declares no transient status on the way to `disengaged`, so
+    /// nothing is owed the clock afterwards — including by an engage that had not taken
+    /// effect yet.
+    pub fn disengage(&mut self, reason: &str) {
+        self.status = SafetyLeverStatusKind::Disengaged;
+        self.transition_due = None;
+        self.reason = Some(reason.to_string());
+    }
+
+    /// The `SafetyLever` every safety-lever operation reports for this record, named by
+    /// `id` and carrying its ARN in `region`.
+    pub fn to_safety_lever(&self, id: &str, region: &str) -> SafetyLever {
+        SafetyLever {
+            id: Some(id.to_string()),
+            arn: Some(safety_lever_arn(region, id)),
+            state: Some(SafetyLeverState {
+                status: Some(self.status.as_wire().to_string()),
+                reason: self.reason.clone(),
+            }),
+        }
+    }
+}
+
+/// The id of the safety lever of the account this emulator serves.
+///
+/// FIS gives an account one safety lever per Region and offers no API that creates or
+/// enumerates one, so the id a request names it by is the account's own id — which is
+/// what makes the lever reachable without a list operation.
+pub fn safety_lever_id() -> &'static str {
+    ::engine::emulator_account_id()
+}
+
+/// The ARN of the safety lever `id` names, in `region`.
+pub fn safety_lever_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("{SAFETY_LEVER_RESOURCE}/{id}"))
+}
+
+/// The `ResourceNotFoundException` payload for an id that names no safety lever of this
+/// account — see [`safety_lever_id`]. Built from the request: the message names the id
+/// that was looked up.
+pub fn safety_lever_not_found(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Safety lever with ID {id} not found.")),
+    }
+}
+
+/// The `ConflictException` payload for a `StartExperiment` that arrives while the
+/// account's safety lever is engaged — "the request could not be processed because of a
+/// conflict".
+///
+/// Engaging the lever is documented as stopping the experiments that are running and
+/// preventing new ones from starting, so a start is refused for as long as it holds
+/// ([`SafetyLeverStatusKind::holds_experiments`]). The refusal names the status the lever
+/// is in, so a caller can tell an engage that is still taking effect from a settled one.
+pub fn safety_lever_engaged_refusal(status: SafetyLeverStatusKind) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "The safety lever is {} in this account. No experiment can be started.",
+            status.as_wire()
+        )),
+    }
+}
+
 /// Which resource an idempotency token created, so a token a client reuses across two
 /// different operations is not mistaken for a replay of the other one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1400,6 +1589,10 @@ pub struct ComAmazonawsFisFaultinjectionsimulatorState {
     /// An entry is dropped when the resource it names leaves the store, which is what
     /// keeps this map bounded by the live records.
     pub idempotency: BTreeMap<(IdempotentResource, String), IdempotencyRecord>,
+    /// The account's safety lever. ONE record and not a map: no API creates or deletes a
+    /// lever, so there is exactly one to hold and no request can add another — see
+    /// [`SafetyLeverRecord`].
+    pub safety_lever: SafetyLeverRecord,
     /// The counter template ids are minted from, so two calls never share an id.
     pub template_seq: u64,
     /// The counter experiment ids are minted from.
@@ -1500,6 +1693,27 @@ impl ComAmazonawsFisFaultinjectionsimulatorState {
     pub fn settle_experiments(&mut self, now: SystemTime) {
         for record in self.experiments.values_mut() {
             record.settle(now);
+        }
+    }
+
+    /// The account's safety lever as it stands at `now`, with the transition the clock
+    /// already owes it materialised.
+    pub fn settled_safety_lever(&mut self, now: SystemTime) -> &mut SafetyLeverRecord {
+        self.safety_lever.settle(now);
+        &mut self.safety_lever
+    }
+
+    /// Stop every experiment that is still running, as engaging the safety lever does.
+    ///
+    /// Each one goes `stopping` -> `stopped` on the same clock a `StopExperiment` puts it
+    /// on, under the reason the lever stopped it for ([`STOPPED_BY_SAFETY_LEVER`]); an
+    /// experiment that has already ended or is already stopping is left exactly as it is.
+    /// The sweep covers every experiment this store holds, which is what the lever reaches:
+    /// the experiments of this emulator are one collection and not one per Region.
+    pub fn stop_experiments_for_safety_lever(&mut self, now: SystemTime) {
+        for record in self.experiments.values_mut() {
+            record.settle(now);
+            record.request_stop_for(now, STOPPED_BY_SAFETY_LEVER);
         }
     }
 }

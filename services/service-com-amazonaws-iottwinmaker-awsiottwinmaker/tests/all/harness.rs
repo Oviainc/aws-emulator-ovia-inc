@@ -439,6 +439,37 @@ pub(crate) fn component_type_arn(workspace_id: &str, component_type_id: &str) ->
     )
 }
 
+/// The `componentTypeId`s of the built-in component types every workspace is
+/// PROVISIONED with when it is created, in id order.
+///
+/// Read off the service's own catalogue rather than restated here, so a suite
+/// cannot drift from what `CreateWorkspace` seeds: a built-in added to or
+/// dropped from the catalogue moves these expectations with it.
+pub(crate) fn built_in_component_type_ids() -> Vec<String> {
+    service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::built_in_component_types(
+        REGION,
+        "anyWorkspace",
+        std::time::SystemTime::now(),
+    )
+    .into_keys()
+    .collect()
+}
+
+/// `component_type_ids` together with every built-in id, in `componentTypeId`
+/// order — what a listing of a workspace holding those component types reports,
+/// since a workspace carries the service's built-ins beside whatever a caller
+/// created in it.
+pub(crate) fn with_built_in_component_types<I>(component_type_ids: I) -> Vec<String>
+where
+    I: IntoIterator,
+    I::Item: Into<String>,
+{
+    let mut ids: Vec<String> = component_type_ids.into_iter().map(Into::into).collect();
+    ids.extend(built_in_component_type_ids());
+    ids.sort();
+    ids
+}
+
 pub(crate) fn scene_arn(workspace_id: &str, scene_id: &str) -> String {
     format!("arn:aws:iottwinmaker:{REGION}:{ACCOUNT}:workspace/{workspace_id}/scene/{scene_id}")
 }

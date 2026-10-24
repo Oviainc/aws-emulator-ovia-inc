@@ -173,7 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // A workspace's contents are deleted before the workspace itself —
         // every kind of them, so no contained resource and no ARN it was
-        // indexed under can outlive the workspace that owned it.
+        // indexed under can outlive the workspace that owned it. The CALLER's
+        // contents, that is: the built-in component types the workspace was
+        // provisioned with are the service's own, nothing deletes them on their
+        // own, and they go with the workspace
+        // (`Workspace::created_component_types`).
         if !workspace.entities.is_empty() {
             return Err(DeleteWorkspaceErrorModeled::ValidationException(
                 ValidationException {
@@ -186,13 +190,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if !workspace.component_types.is_empty() {
+        let created_component_types = workspace.created_component_types().count();
+        if created_component_types > 0 {
             return Err(DeleteWorkspaceErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(format!(
                         "workspace {} still contains {} component types; delete them first",
-                        input.workspace_id,
-                        workspace.component_types.len()
+                        input.workspace_id, created_component_types
                     )),
                 },
             )
@@ -240,7 +244,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The workspace was proven empty above, so only its own ARN is indexed.
+        // The workspace was proven empty of the caller's resources above, and a
+        // built-in component type's ARN is deliberately not indexed (see
+        // `crate::state::built_in_component_types`), so only the workspace's own
+        // ARN is.
         state.arn_index.remove(&workspace.arn);
 
         Ok(DeleteWorkspaceOutput {

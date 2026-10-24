@@ -35,6 +35,8 @@ mod participants;
 mod signing_name_routing;
 #[path = "all/stage_sessions.rs"]
 mod stage_sessions;
+#[path = "all/stage_storage_configuration_reference.rs"]
+mod stage_storage_configuration_reference;
 #[path = "all/stages.rs"]
 mod stages;
 #[path = "all/state_roundtrip.rs"]

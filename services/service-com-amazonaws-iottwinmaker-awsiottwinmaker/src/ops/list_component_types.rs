@@ -29,13 +29,12 @@
 //!   is its dotted prefix, so a type is in the namespace when its id starts with
 //!   the namespace followed by a `.`; an id carrying no such prefix belongs to no
 //!   namespace and is selected by no `namespace` filter.
-//! * `isAbstract` — every component type this emulator stores was created
-//!   through `CreateComponentType`, which offers no way to declare one abstract,
-//!   so [`crate::state::ComponentType::is_abstract`] — the accessor
-//!   `GetComponentType` reports from too — answers `false` for each of them. The
-//!   filter therefore selects every stored component type for `false` and none
-//!   for `true`, rather than inventing an abstractness the create never
-//!   persisted.
+//! * `isAbstract` — the stored component types whose abstractness matches, read
+//!   off [`crate::state::ComponentType::is_abstract`], the same field
+//!   `GetComponentType` reports from. `CreateComponentType` offers no way to
+//!   declare one abstract, so the abstract ones are exactly the service's
+//!   built-ins, which every workspace is provisioned with
+//!   ([`crate::state::built_in_component_types`]).
 //!
 //! `maxResults` caps the page: its documented default is 25 and its documented
 //! minimum 1, so an omitted value serves 25 rows and an explicit zero is refused.
@@ -374,13 +373,12 @@ fn matches_filter(
             .component_type_id
             .strip_prefix(namespace.as_str())
             .is_some_and(|rest| rest.starts_with('.') && rest.len() > 1),
-        // Every component type this service stores was created through
-        // `CreateComponentType`, which cannot declare one abstract, so each is
-        // concrete. Read through `ComponentType::is_abstract`, the same
-        // accessor `GetComponentType` reports from, so the filter and the read
-        // cannot drift apart if a writer ever persists abstractness.
+        // The abstractness the record carries, read through the same field
+        // `GetComponentType` reports from, so the filter and the read cannot
+        // drift apart: a component type created through this API is concrete,
+        // and the service's built-ins are abstract.
         Some(ListComponentTypesFilter::isAbstract(is_abstract)) => {
-            component_type.is_abstract() == *is_abstract
+            component_type.is_abstract == *is_abstract
         }
     }
 }

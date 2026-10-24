@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let group = pool
             .groups
             .get_mut(&input.group_name)
-            .ok_or_else(|| group_not_found(&input.group_name))?;
+            .ok_or_else(group_not_found)?;
 
         // This operation "updates ANY OF the properties for precedence, IAM role, or
         // description" of the named group (`UpdateGroup`), so a member the request
@@ -224,10 +224,12 @@ fn user_pool_not_found(user_pool_id: &str) -> UpdateGroupError {
     .into()
 }
 
-/// This operation's `ResourceNotFoundException` for a group the pool does not hold.
-fn group_not_found(group_name: &str) -> UpdateGroupError {
+/// This operation's `ResourceNotFoundException` for a group the pool does not
+/// hold. Carries the fixed message of
+/// [`crate::state::GROUP_NOT_FOUND_MESSAGE`], which names no group.
+fn group_not_found() -> UpdateGroupError {
     UpdateGroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Group not found: {group_name}")),
+        message: Some(crate::state::GROUP_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

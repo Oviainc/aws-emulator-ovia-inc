@@ -188,6 +188,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Same reason for `communicationTimeConfig`: its `dailyHours` keys name days
+        // of the model's `DayOfWeek` catalog but sit behind the `OpenHours` union, so
+        // the shared check refuses a day naming no weekday here too, exactly as
+        // `UpdateCampaignCommunicationTime` does.
+        if let Some(message) = input
+            .communication_time_config
+            .as_ref()
+            .and_then(|config| {
+                crate::state::communication_time_violation("communicationTimeConfig", config)
+            })
+        {
+            return Err(CreateCampaignErrorModeled::ValidationException(ValidationException {
+                message,
+                x_amz_error_type: None,
+            })
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateCampaignErrorModeled::InternalServerException(
                 InternalServerException {

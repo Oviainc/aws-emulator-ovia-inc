@@ -6,6 +6,12 @@
 //! `ConflictException`; the ARN it mints is indexed so `GetWorkspace` resolves
 //! the record by ARN as well as by id.
 //!
+//! The workspace is provisioned with the service's own BUILT-IN component types
+//! ([`crate::state::built_in_component_types`]): none of them is created
+//! through this API, so they are stored with the workspace and resolve — through
+//! `GetComponentType`, `ListComponentTypes` and every `extendsFrom` or
+//! `componentTypeId` reference — from the instant this call returns.
+//!
 //! Authorization is NOT emulated here (nor anywhere in this service), so the
 //! modelled `AccessDeniedException` is never returned: the emulator verifies
 //! request signatures centrally and carries no IAM policy or `iam:PassRole`
@@ -209,7 +215,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 creation_date_time: now,
                 update_date_time: now,
                 entities: ::std::collections::BTreeMap::new(),
-                component_types: ::std::collections::BTreeMap::new(),
+                // The workspace is PROVISIONED with the component types the
+                // service itself ships: none of them is created through this
+                // API, and they exist in a workspace from the instant it does,
+                // so they are stored here rather than synthesised by whichever
+                // read asks for one. See
+                // `crate::state::built_in_component_types`.
+                component_types: crate::state::built_in_component_types(
+                    &region,
+                    &input.workspace_id,
+                    now,
+                ),
                 scenes: ::std::collections::BTreeMap::new(),
                 // A new workspace is linked to no other service: the sync jobs
                 // that link one in are created afterwards, and
