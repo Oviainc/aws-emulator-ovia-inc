@@ -264,6 +264,70 @@ pub fn same_notification(left: &Notification, right: &Notification) -> bool {
         && threshold_type(left) == threshold_type(right)
 }
 
+/// The notification of `stored` that `wanted` names ([`same_notification`]), or `None`
+/// when the budget holds no such notification.
+pub fn find_notification<'a>(
+    stored: &'a StoredBudget,
+    wanted: &Notification,
+) -> Option<&'a StoredNotification> {
+    stored
+        .notifications
+        .iter()
+        .find(|held| same_notification(&held.notification, wanted))
+}
+
+/// "A budget can have up to ten notifications" (`Notification`). `CreateNotification`
+/// answers `CreationLimitExceededException` ("You've exceeded the notification or
+/// subscriber limit") once a budget already holds this many.
+pub const MAX_NOTIFICATIONS_PER_BUDGET: usize = 10;
+
+/// "Each notification must have at least one subscriber. A notification can have one
+/// SNS subscriber and up to 10 email subscribers, for a total of 11 subscribers"
+/// (`Notification`). The at-least-one and the total of 11 are the modelled
+/// `@length(min: 1, max: 11)` on `Subscribers`, refused at request validation before a
+/// handler runs; the PER-TYPE halves are these two, which no constraint trait can
+/// express — [`subscriber_limit_violation`] enforces them.
+pub const MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION: usize = 1;
+
+/// See [`MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION`].
+pub const MAX_EMAIL_SUBSCRIBERS_PER_NOTIFICATION: usize = 10;
+
+/// `SubscriptionType$SNS` — "the type of notification that Amazon Web Services sends
+/// to a subscriber", for a subscriber that is an Amazon SNS topic.
+const SUBSCRIPTION_TYPE_SNS: &str = "SNS";
+
+/// `SubscriptionType$EMAIL` — a subscriber that is an email address.
+const SUBSCRIPTION_TYPE_EMAIL: &str = "EMAIL";
+
+/// The per-type subscriber limits of one notification, checked over the subscribers it
+/// would end up with. `Err` carries the sentence that goes in
+/// `CreationLimitExceededException$Message`; `Ok` means the set is within both halves
+/// of [`MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION`] /
+/// [`MAX_EMAIL_SUBSCRIBERS_PER_NOTIFICATION`].
+pub fn subscriber_limit_violation(subscribers: &[Subscriber]) -> Result<(), String> {
+    let count = |kind: &str| {
+        subscribers
+            .iter()
+            .filter(|subscriber| subscriber.subscription_type == kind)
+            .count()
+    };
+    for (kind, limit) in [
+        (SUBSCRIPTION_TYPE_SNS, MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION),
+        (
+            SUBSCRIPTION_TYPE_EMAIL,
+            MAX_EMAIL_SUBSCRIBERS_PER_NOTIFICATION,
+        ),
+    ] {
+        if count(kind) > limit {
+            return Err(format!(
+                "Unable to create notification: a notification can have at most {limit} \
+                 {kind} subscriber(s)."
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The `PlannedBudgetLimits` entry in force at `at`.
 ///
 /// The map's key is the start of the planned month or quarter, "`UTC` in epoch seconds"
