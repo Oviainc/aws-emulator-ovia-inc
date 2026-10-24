@@ -221,16 +221,13 @@ fn refused(refusal: crate::state::MultiplexRefusal) -> CreateMultiplexError {
                 )),
             })
         }
-        crate::state::MultiplexRefusal::SettingOutOfRange {
-            member,
-            value,
-            min,
-            max,
-        } => CreateMultiplexErrorModeled::BadRequestException(BadRequestException {
-            message: Some(format!(
-                "multiplexSettings.{member} must be between {min} and {max}, got {value}"
-            )),
-        }),
+        // Worded by the shared refusal, so a create is refused exactly as an
+        // update carrying the same settings is.
+        crate::state::MultiplexRefusal::SettingOutOfRange(settings) => {
+            CreateMultiplexErrorModeled::BadRequestException(BadRequestException {
+                message: Some(settings.to_string()),
+            })
+        }
         crate::state::MultiplexRefusal::StoreFull => {
             CreateMultiplexErrorModeled::TooManyRequestsException(TooManyRequestsException {
                 message: Some(format!(

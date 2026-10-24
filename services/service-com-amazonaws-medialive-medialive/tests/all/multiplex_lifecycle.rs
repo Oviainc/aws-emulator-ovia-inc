@@ -24,24 +24,24 @@ pub(crate) const MULTIPLEXES: &str = "/prod/multiplexes";
 /// The published bounds of `MultiplexSettings$TransportStreamBitrate`, from its
 /// target shape `__integerMin1000000Max100000000`
 /// (`smithy_query(query="shape", shape="MultiplexSettings")`).
-const TRANSPORT_STREAM_BITRATE: (i64, i64) = (1_000_000, 100_000_000);
+pub(crate) const TRANSPORT_STREAM_BITRATE: (i64, i64) = (1_000_000, 100_000_000);
 
 /// The published bounds of `MultiplexSettings$TransportStreamId`, from its
 /// target shape `__integerMin0Max65535`.
-const TRANSPORT_STREAM_ID: (i64, i64) = (0, 65_535);
+pub(crate) const TRANSPORT_STREAM_ID: (i64, i64) = (0, 65_535);
 
 /// The published bounds of
 /// `MultiplexSettings$MaximumVideoBufferDelayMilliseconds`, from its target
 /// shape `__integerMin800Max3000`.
-const VIDEO_BUFFER_DELAY: (i64, i64) = (800, 3_000);
+pub(crate) const VIDEO_BUFFER_DELAY: (i64, i64) = (800, 3_000);
 
 /// The published bounds of `MultiplexSettings$TransportStreamReservedBitrate`,
 /// from its target shape `__integerMin0Max100000000`.
-const TRANSPORT_STREAM_RESERVED_BITRATE: (i64, i64) = (0, 100_000_000);
+pub(crate) const TRANSPORT_STREAM_RESERVED_BITRATE: (i64, i64) = (0, 100_000_000);
 
 /// Every ranged member of `MultiplexSettings`, by wire name, with the inclusive
 /// bounds the model publishes for it — the whole class the range rule covers.
-const RANGED_SETTINGS: [(&str, (i64, i64)); 4] = [
+pub(crate) const RANGED_SETTINGS: [(&str, (i64, i64)); 4] = [
     ("transportStreamBitrate", TRANSPORT_STREAM_BITRATE),
     ("transportStreamId", TRANSPORT_STREAM_ID),
     ("maximumVideoBufferDelayMilliseconds", VIDEO_BUFFER_DELAY),
