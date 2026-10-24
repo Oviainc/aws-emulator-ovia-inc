@@ -213,6 +213,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::hop_destination_queues(hops)
                 .any(|reference| !state.holds_queue(reference))
         });
+        // And every entry of a new hop list has to state a wait inside the range the
+        // member publishes, or it sets up no hop at all — the same test `CreateJob` and
+        // `CreateJobTemplate` take.
+        let hop_wait_problem = input
+            .hop_destinations
+            .as_deref()
+            .and_then(crate::state::hop_wait_problem);
 
         // The ADDRESSED resource is checked first: the template must exist, and a
         // built-in one cannot be changed at all — "System or built-in job templates can't
@@ -240,6 +247,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateJobTemplateErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::not_found_message("hopDestinations")),
             })
+            .into());
+        }
+        if let Some(problem) = hop_wait_problem {
+            return Err(UpdateJobTemplateErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(problem),
+                },
+            )
             .into());
         }
 

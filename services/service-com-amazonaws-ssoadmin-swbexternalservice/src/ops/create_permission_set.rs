@@ -270,6 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default(),
             // No policy is attached at creation; the attach/put operations own these.
             managed_policies: Vec::new(),
+            customer_managed_policies: ::std::collections::BTreeMap::new(),
             inline_policy: None,
             permissions_boundary: None,
         };

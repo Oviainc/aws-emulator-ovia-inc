@@ -249,6 +249,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // And every hop destination has to state a wait inside the range the member
+        // publishes, or it sets up no hop at all — the same test `CreateJob` takes, so a
+        // template cannot store a hop a job could not use.
+        if let Some(problem) = crate::state::hop_wait_problem(&hop_destinations) {
+            return Err(CreateJobTemplateErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(problem),
+                },
+            )
+            .into());
+        }
 
         // "A name you create for each job template. Each name must be unique within your
         // account." A create under a name that is already in use does NOT conflict: see

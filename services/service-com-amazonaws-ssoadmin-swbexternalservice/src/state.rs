@@ -899,6 +899,104 @@ impl Instance {
 /// every later read reports the same path, whether or not the writer sent one.
 pub const DEFAULT_MANAGED_POLICY_PATH: &str = "/";
 
+/// One customer managed policy reference ATTACHED to a permission set.
+///
+/// `CustomerManagedPolicyReference` is a (`Name`, `Path`) pair naming an IAM policy that
+/// the caller has deployed in each member account, so the reference's IDENTITY is that
+/// pair — the same name under a different path is a different policy. The stored `Path` is
+/// always explicit: a reference attached without one is normalised to
+/// [`DEFAULT_MANAGED_POLICY_PATH`], the value the member documents as its default, so
+/// every later read and every identity comparison sees one form of the same reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomerManagedPolicyReferenceRecord {
+    /// `CustomerManagedPolicyReference$Name` (`ManagedPolicyName`, 1..128).
+    pub name: String,
+    /// `CustomerManagedPolicyReference$Path` (`ManagedPolicyPath`, 1..512), materialised.
+    pub path: String,
+}
+
+impl CustomerManagedPolicyReferenceRecord {
+    /// The record a modeled `CustomerManagedPolicyReference` describes, with its `Path`
+    /// materialised to the documented default when the request named none.
+    pub fn from_shape(reference: &CustomerManagedPolicyReference) -> Self {
+        Self {
+            name: reference.name.clone(),
+            path: reference
+                .path
+                .clone()
+                .unwrap_or_else(|| DEFAULT_MANAGED_POLICY_PATH.to_string()),
+        }
+    }
+
+    /// This reference's IDENTITY, and the key an enumeration of a permission set's
+    /// references orders and pages by.
+    ///
+    /// `|` separates the two parts unambiguously: it is in neither member's character
+    /// class (`ManagedPolicyName` is `^[\w+=,.@-]+$` and `ManagedPolicyPath` is
+    /// `^((/[A-Za-z0-9\.,\+@=_-]+)*)/$`), so no two distinct pairs share a key.
+    pub fn identity(&self) -> String {
+        format!("{}|{}", self.name, self.path)
+    }
+
+    /// This record as the modeled `CustomerManagedPolicyReference` shape — what
+    /// `ListCustomerManagedPolicyReferencesInPermissionSet` reports, so a read answers
+    /// with the pair the attach stored and the `Path` it stored for it.
+    pub fn to_shape(&self) -> CustomerManagedPolicyReference {
+        CustomerManagedPolicyReference {
+            name: self.name.clone(),
+            path: Some(self.path.clone()),
+        }
+    }
+}
+
+/// The greatest number of customer managed policy references this emulator holds on ONE
+/// permission set.
+///
+/// NOT a figure the model carries: it is the emulator's own ceiling, the per-permission-set
+/// counterpart of [`MAX_RECORDS_PER_STORE`] and of [`MAX_SCOPES_PER_APPLICATION`]. An
+/// attach inserts one entry per distinct (`Name`, `Path`) pair, the two members' patterns
+/// admit unboundedly many of them, and an attached reference lives until a caller detaches
+/// it — so without a ceiling a caller could grow the process until the host runs out of
+/// memory. An attach that would add a reference beyond it is refused with the modelled
+/// `ServiceQuotaExceededException`, which AWS documents as "the principal has crossed the
+/// permitted number of resources that can be created".
+pub const MAX_CUSTOMER_MANAGED_POLICIES_PER_PERMISSION_SET: usize = 20;
+
+/// The message an attach refuses a new reference with once a permission set already holds
+/// [`MAX_CUSTOMER_MANAGED_POLICIES_PER_PERMISSION_SET`] of them; built from the request,
+/// which names the permission set the ceiling was reached on.
+pub fn customer_managed_policy_ceiling_message(permission_set_arn: &str) -> String {
+    format!(
+        "Cannot attach another customer managed policy reference: this emulator holds at \
+         most {MAX_CUSTOMER_MANAGED_POLICIES_PER_PERMISSION_SET} customer managed policy \
+         references per permission set, and {permission_set_arn} already holds that many"
+    )
+}
+
+/// The refusal a detach of a reference the permission set does not hold earns, as the
+/// message of the modelled `ResourceNotFoundException` (HTTP 404).
+///
+/// Built from the request: it names the pair that resolved to nothing and the permission
+/// set it was looked for on, because an unattached reference on a known permission set is
+/// a different failure from an unknown permission set.
+pub fn customer_managed_policy_not_attached_message(
+    permission_set_arn: &str,
+    name: &str,
+    path: &str,
+) -> String {
+    format!(
+        "Could not find customer managed policy reference with name {name} and path \
+         {path} attached to permission set {permission_set_arn}."
+    )
+}
+
+/// Cursor scope of a `ListCustomerManagedPolicyReferencesInPermissionSet` enumeration:
+/// the operation and the permission set whose references it walks (the instance included,
+/// since the same permission-set ARN under another instance is another resource).
+pub fn cursor_customer_managed_policies(instance_arn: &str, permission_set_arn: &str) -> String {
+    format!("customerManagedPolicies|{instance_arn}|{permission_set_arn}")
+}
+
 /// The permissions boundary attached to a permission set: EXACTLY ONE of an AWS managed
 /// policy ARN or a customer managed policy reference.
 ///
@@ -926,13 +1024,16 @@ impl PermissionsBoundaryRecord {
             &boundary.customer_managed_policy_reference,
             &boundary.managed_policy_arn,
         ) {
-            (Some(reference), None) => Some(Self::CustomerManagedPolicy {
-                name: reference.name.clone(),
-                path: reference
-                    .path
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_MANAGED_POLICY_PATH.to_string()),
-            }),
+            (Some(reference), None) => {
+                // The `Path` default is materialised in exactly ONE place —
+                // [`CustomerManagedPolicyReferenceRecord::from_shape`] — so a boundary's
+                // reference and an attached reference normalise identically.
+                let reference = CustomerManagedPolicyReferenceRecord::from_shape(reference);
+                Some(Self::CustomerManagedPolicy {
+                    name: reference.name,
+                    path: reference.path,
+                })
+            }
             (None, Some(managed_policy_arn)) => Some(Self::ManagedPolicy {
                 managed_policy_arn: managed_policy_arn.clone(),
             }),
@@ -950,10 +1051,15 @@ impl PermissionsBoundaryRecord {
                 managed_policy_arn: Some(managed_policy_arn.clone()),
             },
             Self::CustomerManagedPolicy { name, path } => PermissionsBoundary {
-                customer_managed_policy_reference: Some(CustomerManagedPolicyReference {
-                    name: name.clone(),
-                    path: Some(path.clone()),
-                }),
+                // Projected by the same record that projects an attached reference, so
+                // the two cannot disagree about the shape they report.
+                customer_managed_policy_reference: Some(
+                    CustomerManagedPolicyReferenceRecord {
+                        name: name.clone(),
+                        path: path.clone(),
+                    }
+                    .to_shape(),
+                ),
                 managed_policy_arn: None,
             },
         }
@@ -986,6 +1092,17 @@ pub struct PermissionSetRecord {
     pub relay_state: Option<String>,
     pub tags: Vec<Tag>,
     pub managed_policies: Vec<String>,
+    /// The CUSTOMER MANAGED POLICY REFERENCES attached to this permission set, by
+    /// [`CustomerManagedPolicyReferenceRecord::identity`].
+    ///
+    /// They live ON the permission-set record rather than in a second map, so a
+    /// permission set that no longer exists holds none of them and the attach, detach and
+    /// list operations all resolve the same permission set every other read resolves. A
+    /// `BTreeMap` so an enumeration walks one stable order and can page by that identity,
+    /// and so an attach of a reference already attached stores it ONCE. Holds at most
+    /// [`MAX_CUSTOMER_MANAGED_POLICIES_PER_PERMISSION_SET`] references; an attach that
+    /// would add one beyond that ceiling is refused rather than grown into.
+    pub customer_managed_policies: BTreeMap<String, CustomerManagedPolicyReferenceRecord>,
     pub inline_policy: Option<String>,
     /// The permissions boundary `PutPermissionsBoundaryToPermissionSet` attached, if one
     /// is attached: a permission set carries AT MOST ONE, so a later put REPLACES it.
