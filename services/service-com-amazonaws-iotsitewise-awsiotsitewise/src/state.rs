@@ -12,7 +12,9 @@
 //! stream no asset property owns lives in its own map
 //! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::disassociated_time_series`]),
 //! which is what `DisassociateTimeSeriesFromAssetProperty` leaves behind and what
-//! alias-addressed ingestion creates. Every
+//! alias-addressed ingestion creates. The service's own settings live here too:
+//! the logging options, one entry per scope a call named
+//! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::logging_options`]). Every
 //! handler reads and writes THIS struct through [`service_state`]; nothing in
 //! `src/ops/` keeps state of its own.
 
@@ -24,8 +26,8 @@ use crate::ops::types::{
     AssetModelCompositeModelPathSegment, AssetModelCompositeModelSummary, AssetModelHierarchy,
     AssetModelProperty, AssetModelPropertyDefinition, AssetModelStatus, AssetProperty,
     AssetPropertyValue, AssetStatus, AssetSummary, DatasetConfig, DatasetSource, DatasetStatus,
-    ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, PropertyType, TimeInNanos,
-    Variant,
+    ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, LoggingOptions, PropertyType,
+    TimeInNanos, Variant,
 };
 
 /// The `iotsitewise` ARN service namespace, as `OPERATIONS.md` reports it.
@@ -56,6 +58,22 @@ pub const STATE_ACTIVE: &str = "ACTIVE";
 pub const STATE_UPDATING: &str = "UPDATING";
 /// `AssetState`/`AssetModelState` value a deleted resource's last answer carries.
 pub const STATE_DELETING: &str = "DELETING";
+
+/// The `LoggingLevel` a scope reports until a `PutLoggingOptions` sets one.
+///
+/// Logging is a setting, not a resource: a scope nobody has configured is simply
+/// not logging, and `OFF` is the modelled verbosity level for that. A read of an
+/// unset scope reports it WITHOUT storing anything, so the first read cannot
+/// change what a later caller sees.
+pub const DEFAULT_LOGGING_LEVEL: &str = "OFF";
+
+/// The key [`ComAmazonawsIotsitewiseAwsiotsitewiseState::logging_options`] holds
+/// the account-and-region-wide logging options under — the ones a call that names
+/// no `workspaceName` sets and reads.
+///
+/// The empty string, which collides with no workspace-scoped entry: the modelled
+/// `WorkspaceName` is `len 1..64`, so no workspace can be named by it.
+pub const ACCOUNT_LOGGING_SCOPE: &str = "";
 
 /// How many characters an `ETag` carries: the modelled type is
 /// `^[\w-]{43}$`, so every tag this service reports is exactly this long.
@@ -238,6 +256,35 @@ pub const MAX_CHILDREN_PER_HIERARCHY: usize = 500;
 /// recently updated series instead. The emulator's own bound, not a published AWS
 /// quota, and high enough that no ordinary workflow meets it.
 pub const MAX_DISASSOCIATED_TIME_SERIES: usize = 1_000;
+
+/// How many logging-option scopes this store keeps.
+///
+/// `PutLoggingOptions` is the only thing that adds one and the scope key is the
+/// caller's own `workspaceName`, so the collection needs a bound of its own.
+/// Unlike the resource caps above, this one has an eviction policy available to
+/// it rather than a refusal: the operation declares no limit error, and a scope
+/// dropped from the store simply reports [`DEFAULT_LOGGING_LEVEL`] again — the
+/// answer an unconfigured scope already gets — so past this many scopes
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::set_logging_options`] drops the
+/// least recently set WORKSPACE scope. The account-and-region-wide scope
+/// ([`ACCOUNT_LOGGING_SCOPE`]) is exempt, so the unnamed scope is never dropped.
+/// The emulator's own bound, not a published AWS quota, and high enough that no
+/// ordinary workflow meets it.
+pub const MAX_LOGGING_SCOPES: usize = 1_000;
+
+/// One scope's logging options and the instant they were set.
+///
+/// The instant is what the bound on
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::logging_options`] reads: past
+/// [`MAX_LOGGING_SCOPES`] scopes the least recently set workspace scope is the
+/// one dropped.
+#[derive(Debug, Clone)]
+pub struct LoggingOptionsRecord {
+    /// The options the last `PutLoggingOptions` on this scope stored.
+    pub options: LoggingOptions,
+    /// When that put landed.
+    pub set_at: SystemTime,
+}
 
 /// A time series (data stream) that no asset property owns.
 ///
@@ -923,6 +970,14 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// on a given platform device. One device hosts at most one gateway, so this
     /// is what makes a second create naming the same device a conflict.
     pub gateway_devices: HashMap<String, String>,
+    /// The logging options each scope has been SET to, keyed by the
+    /// `workspaceName` the call named and by [`ACCOUNT_LOGGING_SCOPE`] for a call
+    /// that named none. An absent key is a scope no `PutLoggingOptions` has
+    /// configured, which reports [`DEFAULT_LOGGING_LEVEL`] — see
+    /// [`Self::logging_options_for`]. Bounded at [`MAX_LOGGING_SCOPES`] by
+    /// evicting the least recently set workspace scope, which is why each entry
+    /// carries the instant it was set.
+    pub logging_options: HashMap<String, LoggingOptionsRecord>,
     /// Datasets by `datasetId`.
     pub datasets: HashMap<String, DatasetRecord>,
 }
@@ -1318,6 +1373,58 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         self.set_property_alias(asset_id, property_id, None);
         if let Some(properties) = self.property_values.get_mut(asset_id) {
             properties.remove(property_id);
+        }
+    }
+
+    /// The logging options `workspace` reports: the ones last set for that scope,
+    /// or [`DEFAULT_LOGGING_LEVEL`] while nothing has set any. `None` asks for the
+    /// account-and-region-wide scope.
+    ///
+    /// A pure READ: an unconfigured scope is not materialised, so it still reports
+    /// the default to the next caller.
+    pub fn logging_options_for(&self, workspace: Option<&str>) -> LoggingOptions {
+        self.logging_options
+            .get(workspace.unwrap_or(ACCOUNT_LOGGING_SCOPE))
+            .map(|record| record.options.clone())
+            .unwrap_or_else(|| LoggingOptions {
+                level: DEFAULT_LOGGING_LEVEL.to_string(),
+            })
+    }
+
+    /// Set `workspace`'s logging options, replacing whatever that scope carried.
+    /// `None` sets the account-and-region-wide scope. One scope's options are
+    /// independent of every other's.
+    ///
+    /// Bounded at [`MAX_LOGGING_SCOPES`]: past that many scopes the least recently
+    /// set WORKSPACE scope is dropped, so a stream of puts naming fresh workspaces
+    /// cannot grow this map without limit. A dropped scope reports
+    /// [`DEFAULT_LOGGING_LEVEL`] again, which is what it reported before anything
+    /// set it; the account-and-region-wide scope is exempt from the eviction, so
+    /// the unnamed scope survives any number of workspace-scoped puts.
+    pub fn set_logging_options(
+        &mut self,
+        workspace: Option<&str>,
+        options: LoggingOptions,
+        now: SystemTime,
+    ) {
+        self.logging_options.insert(
+            workspace.unwrap_or(ACCOUNT_LOGGING_SCOPE).to_string(),
+            LoggingOptionsRecord {
+                options,
+                set_at: now,
+            },
+        );
+        while self.logging_options.len() > MAX_LOGGING_SCOPES {
+            let Some(oldest) = self
+                .logging_options
+                .iter()
+                .filter(|(scope, _)| scope.as_str() != ACCOUNT_LOGGING_SCOPE)
+                .min_by_key(|(_, record)| record.set_at)
+                .map(|(scope, _)| scope.clone())
+            else {
+                break;
+            };
+            self.logging_options.remove(&oldest);
         }
     }
 

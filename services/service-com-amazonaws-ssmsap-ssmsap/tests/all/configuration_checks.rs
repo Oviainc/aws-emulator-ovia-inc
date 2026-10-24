@@ -54,7 +54,10 @@ const ERROR: &str = "ERROR";
 /// Wait out the terminal status the clock owes a freshly started check: comfortably
 /// longer than [`TRANSITION_SPAN`]. The emulator never sleeps; this is the test waiting
 /// for the clock, which is the only thing that can make the transition due.
-async fn settle() {
+///
+/// `pub(crate)` so `tests/all/configuration_check_reads.rs`, which pins what a READ of
+/// one of these records may do, waits for the clock the same way.
+pub(crate) async fn settle() {
     tokio::time::sleep(TRANSITION_SPAN + Duration::from_millis(300)).await;
 }
 
@@ -67,7 +70,10 @@ fn whole_catalogue() -> Vec<String> {
 }
 
 /// The `ConfigurationCheckOperations` of a `StartConfigurationChecks` reply.
-fn started(reply: &Reply) -> Vec<Value> {
+///
+/// `pub(crate)` for the same reason as [`settle`]: one reading of a start's reply for
+/// every suite of this target.
+pub(crate) fn started(reply: &Reply) -> Vec<Value> {
     reply
         .member("ConfigurationCheckOperations")
         .and_then(Value::as_array)
@@ -75,12 +81,24 @@ fn started(reply: &Reply) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// The `ConfigurationCheckOperation` a `GetConfigurationCheckOperation` reply reports,
+/// `Value::Null` when it reports none.
+///
+/// `pub(crate)` for the same reason as [`started`]: one reading of a read's reply for
+/// every suite of this target.
+pub(crate) fn read_record(reply: &Reply) -> Value {
+    reply
+        .member("ConfigurationCheckOperation")
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
 /// A member of one `ConfigurationCheckOperation`, treating JSON `null` as absent.
-fn field<'a>(operation: &'a Value, name: &str) -> Option<&'a Value> {
+pub(crate) fn field<'a>(operation: &'a Value, name: &str) -> Option<&'a Value> {
     operation.get(name).filter(|value| !value.is_null())
 }
 
-fn string_field(operation: &Value, name: &str) -> String {
+pub(crate) fn string_field(operation: &Value, name: &str) -> String {
     field(operation, name)
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -90,7 +108,7 @@ fn string_field(operation: &Value, name: &str) -> String {
 impl Emulator {
     /// Register a HANA application and wait out its registration, so a check is started
     /// against an application that is fully `ACTIVATED`.
-    async fn with_application(&self, id: &str) {
+    pub(crate) async fn with_application(&self, id: &str) {
         let reply = self.send("/register-application", valid_registration(id, "HANA")).await;
         assert_eq!(
             reply.status, 200,
@@ -99,11 +117,11 @@ impl Emulator {
         settle().await;
     }
 
-    async fn start_checks(&self, body: Value) -> Reply {
+    pub(crate) async fn start_checks(&self, body: Value) -> Reply {
         self.send("/start-configuration-checks", body).await
     }
 
-    async fn get_check(&self, id: &str) -> Reply {
+    pub(crate) async fn get_check(&self, id: &str) -> Reply {
         self.send(
             "/get-configuration-check-operation",
             json!({"OperationId": id}),
@@ -246,10 +264,7 @@ async fn a_start_files_one_readable_operation_per_requested_check() {
                  got {}: {:?}",
                 fetched.status, fetched.body
             );
-            let read_back = fetched
-                .member("ConfigurationCheckOperation")
-                .cloned()
-                .unwrap_or(Value::Null);
+            let read_back = read_record(&fetched);
             for member in ["Id", "ApplicationId", "ConfigurationCheckId", "Status"] {
                 assert_eq!(
                     string_field(&read_back, member),
@@ -264,10 +279,7 @@ async fn a_start_files_one_readable_operation_per_requested_check() {
         settle().await;
         for id in &ids {
             let fetched = emulator.get_check(id).await;
-            let done = fetched
-                .member("ConfigurationCheckOperation")
-                .cloned()
-                .unwrap_or(Value::Null);
+            let done = read_record(&fetched);
             assert_eq!(
                 string_field(&done, "Status"),
                 ERROR,
@@ -382,13 +394,7 @@ async fn a_check_still_running_cannot_be_started_again_until_it_ends() {
     settle().await;
     let done = emulator.get_check(&running_id).await;
     assert_eq!(
-        string_field(
-            &done
-                .member("ConfigurationCheckOperation")
-                .cloned()
-                .unwrap_or(Value::Null),
-            "Status"
-        ),
+        string_field(&read_record(&done), "Status"),
         ERROR,
         "expected the first check to have ended, got {done:?}"
     );
@@ -553,6 +559,16 @@ async fn an_operation_id_that_names_no_configuration_check_is_refused() {
         crossed.status, 400,
         "an application OperationId is not a configuration check operation, got {crossed:?}"
     );
+    assert_eq!(
+        crossed.code(),
+        VALIDATION_EXCEPTION,
+        "expected {VALIDATION_EXCEPTION} for an application OperationId, got {crossed:?}"
+    );
+    assert!(
+        message(&crossed).contains(&operation_id),
+        "the refusal must name the id it could not resolve, got {:?}",
+        message(&crossed)
+    );
 
     let check = emulator
         .start_checks(json!({
@@ -565,11 +581,21 @@ async fn an_operation_id_that_names_no_configuration_check_is_refused() {
         .await;
     let check_id = string_field(&started(&check)[0], "Id");
     let crossed_back = emulator
-        .send("/get-operation", json!({"OperationId": check_id}))
+        .send("/get-operation", json!({"OperationId": check_id.clone()}))
         .await;
     assert_eq!(
         crossed_back.status, 400,
         "a configuration check id is not an application operation, got {crossed_back:?}"
+    );
+    assert_eq!(
+        crossed_back.code(),
+        VALIDATION_EXCEPTION,
+        "expected {VALIDATION_EXCEPTION} for a configuration check id, got {crossed_back:?}"
+    );
+    assert!(
+        message(&crossed_back).contains(&check_id),
+        "the refusal must name the id it could not resolve, got {:?}",
+        message(&crossed_back)
     );
 }
 

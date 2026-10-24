@@ -29,7 +29,7 @@ use super::job_lifecycle::{Emulator, Reply, REGION};
 
 /// `GET /2017-08-29/versions` — the binding
 /// `smithy_query(query="operation",operation="ListVersions")` reports, success code 200.
-async fn list_versions(emulator: &Emulator, query: &str) -> Reply {
+pub(crate) async fn list_versions(emulator: &Emulator, query: &str) -> Reply {
     let uri = if query.is_empty() {
         "/2017-08-29/versions".to_string()
     } else {
@@ -61,7 +61,7 @@ fn listed(reply: &Reply) -> Vec<(String, Option<i64>)> {
 }
 
 /// The `version` label of every entry in `versions`, in the order returned.
-fn labels(reply: &Reply) -> Vec<String> {
+pub(crate) fn labels(reply: &Reply) -> Vec<String> {
     listed(reply).into_iter().map(|(label, _)| label).collect()
 }
 

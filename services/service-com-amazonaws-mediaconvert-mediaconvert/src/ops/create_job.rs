@@ -252,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is never locked across that call. Every purely-local refusal is answered here,
         // before any outbound work: a request naming a template or a queue this account
         // does not hold costs no probe.
-        let (template, queue, policy) = {
+        let (template, queue, policy, job_engine_version_used) = {
             let mut store = state.lock();
             store.settle(now);
             if let Some(token) = token.as_deref() {
@@ -303,10 +303,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into());
             }
+            // "Use Job engine versions to run jobs for your production workflow on one
+            // version, while you test and validate the latest version." A requested
+            // version is RESOLVED against the account's Job engine version catalogue —
+            // the same one `ListVersions` reports — and `Job$JobEngineVersionUsed` states
+            // what each outcome is: "When you request an expired version, the response for
+            // this property will be empty. Requests to create jobs with an expired version
+            // result in a regular job, as if no specific Job engine version was requested.
+            // When you request an invalid version, the response for this property will be
+            // empty. Requests to create jobs with an invalid version result in a 400 error
+            // message, and no job is created." So a version the catalogue does not publish
+            // is refused here, before anything is stored, and a published one that has
+            // expired is simply not used.
+            let job_engine_version_used = match input.job_engine_version.as_deref() {
+                Some(requested) => {
+                    let Some(record) = store.job_engine_versions.get(requested) else {
+                        return Err(CreateJobErrorModeled::BadRequestException(
+                            BadRequestException {
+                                message: Some(
+                                    crate::state::invalid_job_engine_version_message(),
+                                ),
+                            },
+                        )
+                        .into());
+                    };
+                    record
+                        .is_available_at(now)
+                        .then(|| record.version.clone())
+                }
+                None => None,
+            };
             // The account's input policy is read here too — it is local state, so the
             // decision it carries costs no probe — and applied below, once the settings
             // the job will actually run from are known.
-            (template, queue, store.policy.clone())
+            (template, queue, store.policy.clone(), job_engine_version_used)
         };
 
         // "When you create a job, you can either specify a job template or specify the
@@ -338,11 +368,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .acceleration_settings
             .or_else(|| inherited.map(|record| record.acceleration_settings.clone()))
             .unwrap_or_else(crate::state::default_acceleration_settings);
+        // Every hop destination the REQUEST states has to state a wait inside the range
+        // the member publishes, or it sets up no hop at all — the one test every operation
+        // that accepts hop destinations takes, so a list inherited from a job template was
+        // already held to it by the operation that stored the template.
+        if let Some(problem) = input
+            .hop_destinations
+            .as_deref()
+            .and_then(crate::state::hop_wait_problem)
+        {
+            return Err(CreateJobErrorModeled::BadRequestException(BadRequestException {
+                message: Some(problem),
+            })
+            .into());
+        }
         let hop_destinations = input.hop_destinations.unwrap_or_else(|| {
             inherited
                 .map(|record| record.hop_destinations.clone())
                 .unwrap_or_default()
         });
+        // "This queue cannot be the original queue to which the job is submitted", and the
+        // member is "Optional unless the job is submitted on the default queue" — a hop that
+        // names no queue moves the job to the default queue, so on a job submitted there it
+        // has to name one. Either way a destination that resolves to the queue the job is
+        // already in moves nothing, which is the modelled 400.
+        if hop_destinations
+            .iter()
+            .any(|hop| crate::state::hop_destination_queue_name(hop) == queue)
+        {
+            return Err(CreateJobErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::hop_destination_is_source_message(&queue)),
+            })
+            .into());
+        }
         // Every input the job will read, which both the policy decision below and the
         // probe after it are taken against: the request's own
         // `Settings.Inputs[].FileInput` merged with whatever the referenced template
@@ -478,7 +536,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // and a job with no attempt reports `NOT_SHARED` and no share details.
             share: None,
             hop_destinations,
+            // `accept_job` schedules the first hop and owns the index into the list.
+            next_hop: 0,
+            hops_at: None,
+            // Nothing has hopped this job yet: its first move is owed by the clock, not by
+            // this call.
+            queue_transitions: Vec::new(),
             job_engine_version_requested: input.job_engine_version,
+            // Resolved against the account's catalogue above: the requested version when it
+            // is published and still available, and none otherwise.
+            job_engine_version_used,
             simulate_reserved_queue: input.simulate_reserved_queue,
             user_metadata: input.user_metadata.unwrap_or_default().into_iter().collect(),
             client_request_token: token,

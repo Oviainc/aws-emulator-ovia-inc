@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TestState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TestState`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: runs ONE state by itself, with no state machine and no execution
+//! around it — the state's own data flow, `Choice` rules, `Wait` members and `Fail`
+//! members are evaluated through [`crate::state::asl`], and what the state produced
+//! (its `output`, the `nextState` it names, the `status` it ended in and, at
+//! `DEBUG`/`TRACE`, the document it carried after each filter) is what the call
+//! answers. Nothing is persisted: "you can test a state without creating a state
+//! machine or updating an existing state machine".
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TestState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request this operation cannot serve is refused with one of the operation's own
+//! modelled errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -134,6 +135,89 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use serde_json::Value;
+
+use crate::state::asl;
+
+/// The level a request that names none is tested at: "By default, Step Functions sets
+/// `inspectionLevel` to `INFO` if you don't specify a level."
+const DEFAULT_INSPECTION_LEVEL: &str = "INFO";
+
+/// The inspection levels that report the state's data processing: "`DEBUG`: Shows the
+/// final state output along with the input and output data processing result" and
+/// "`TRACE`: [...] also shows the final state output along with the input and output
+/// data processing result". `INFO` "shows the final state output" alone, so it carries
+/// no `inspectionData`.
+const DATA_FLOW_LEVELS: &[&str] = &["DEBUG", "TRACE"];
+
+/// This operation's modelled refusal of a request it cannot serve: "The input does
+/// not satisfy the constraints specified by an Amazon Web Services service."
+///
+/// `reason` is left unset deliberately: every member `ValidationExceptionReason`
+/// declares (`API_DOES_NOT_SUPPORT_LABELED_ARNS`, `MISSING_REQUIRED_PARAMETER`,
+/// `CANNOT_UPDATE_COMPLETED_MAP_RUN`, `INVALID_ROUTING_CONFIGURATION`) classifies
+/// another API's rejection, and none of them classifies a defect in the state under
+/// test.
+fn refuse(message: String) -> TestStateError {
+    TestStateErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+        reason: None,
+    })
+    .into()
+}
+
+/// The modelled `InvalidDefinition` — "The provided Amazon States Language definition
+/// is not valid" — carrying one diagnostic, in the envelope every operation of this
+/// service reports a definition defect in.
+fn invalid_definition(diagnostic: String) -> TestStateError {
+    TestStateErrorModeled::InvalidDefinition(InvalidDefinition {
+        message: Some(crate::state::resource_error_message(
+            crate::state::INVALID_STATE_MACHINE_DEFINITION,
+            &diagnostic,
+        )),
+    })
+    .into()
+}
+
+/// The mocked outcome `mock` names: "A JSON object that contains a mocked `result` or
+/// `errorOutput`" — exactly one of the two, since the state's invocation either
+/// produced a result or failed.
+///
+/// `fieldValidationMode` "determines the level of strictness when validating mocked
+/// results against their respective API models". No integration is invoked here and
+/// this emulator carries no API model for one, so there is nothing to validate a
+/// mocked result against: the member is read only to refuse a value the enum does not
+/// declare, and a mocked result is taken as the state's result at every mode.
+fn read_mock(mock: &MockInput) -> Result<asl::Mock, TestStateError> {
+    if let Some(mode) = mock.field_validation_mode.as_deref() {
+        if !MOCK_RESPONSE_VALIDATION_MODE_VALUES.contains(&mode) {
+            return Err(refuse(format!(
+                "mock.fieldValidationMode must be one of [{}], got '{mode}'",
+                MOCK_RESPONSE_VALIDATION_MODE_VALUES.join(", ")
+            )));
+        }
+    }
+    match (mock.result.as_deref(), mock.error_output.as_ref()) {
+        (Some(_), Some(_)) => Err(refuse(
+            "a mock names either a result or an errorOutput, not both".to_string(),
+        )),
+        (Some(result), None) => match serde_json::from_str::<Value>(result) {
+            Ok(value) => Ok(asl::Mock::Result(value)),
+            Err(error) => Err(refuse(format!(
+                "mock.result must be a JSON string containing the mocked result of the state \
+                 invocation: {error}"
+            ))),
+        },
+        (None, Some(error_output)) => Ok(asl::Mock::Error(asl::Failure {
+            error: error_output.error.clone(),
+            cause: error_output.cause.clone(),
+        })),
+        (None, None) => Err(refuse(
+            "a mock must name a result or an errorOutput".to_string(),
+        )),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -205,18 +289,311 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TestState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TestStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TestState"))
+        // `TestState` "accepts the definition of a single state and executes it. You
+        // can test a state without creating a state machine or updating an existing
+        // state machine": the call names no resource, so it reads none of this
+        // service's state and leaves nothing behind — the answer is computed from the
+        // request alone, and two identical calls answer the same thing. `ctx` carries
+        // request metadata, and nothing here is scoped to the endpoint's region
+        // because no ARN of this service is read or minted; the engine the operation
+        // was constructed from is the store it does not touch.
+        let _ = (ctx, &self.engine);
+
+        // `revealSecrets` "specifies whether or not to include secret information in
+        // the test result. For HTTP Tasks, a secret includes the data that an
+        // EventBridge connection adds to modify the HTTP request headers, query
+        // parameters, and body." No state tested here calls an HTTP Task and no
+        // EventBridge connection adds anything to one, so there is no secret for the
+        // member to include or omit either way; the `states:RevealSecrets` permission
+        // it is gated on is an IAM policy decision, and this emulator verifies request
+        // SIGNATURES rather than evaluating policies, so the member is read and
+        // deliberately inert rather than silently missed.
+        let _ = input.reveal_secrets;
+
+        // The modelled lengths (`definition` 1..1048576, `input`/`variables`/`context`
+        // 0..262144, `stateName` 1..80, `roleArn` 1..256) and the `InspectionLevel`
+        // enum are refused by the centralized walk before this handler runs; the level
+        // is re-read here so a value outside the enum can never be taken for one.
+        let level = input
+            .inspection_level
+            .clone()
+            .unwrap_or_else(|| DEFAULT_INSPECTION_LEVEL.to_string());
+        if !INSPECTION_LEVEL_VALUES.contains(&level.as_str()) {
+            return Err(refuse(format!(
+                "inspectionLevel must be one of [{}], got '{level}'",
+                INSPECTION_LEVEL_VALUES.join(", ")
+            )));
+        }
+
+        // "The Amazon Resource Name (ARN) of the execution role with the required IAM
+        // permissions for the state": an ARN this operation models `InvalidArn` for,
+        // judged by the same rule every role ARN of this service is.
+        if let Some(role_arn) = input.role_arn.as_deref() {
+            if let Some(reason) = crate::state::invalid_role_arn_reason(role_arn) {
+                return Err(TestStateErrorModeled::InvalidArn(InvalidArn {
+                    message: Some(reason),
+                })
+                .into());
+            }
+        }
+
+        // "A string that contains the JSON input data for the state" — a state tested
+        // with no input data is tested on the empty JSON object, which is what the
+        // walk receives.
+        let state_input = input.input.clone().unwrap_or_else(|| "{}".to_string());
+        if let Err(error) = serde_json::from_str::<Value>(&state_input) {
+            return Err(TestStateErrorModeled::InvalidExecutionInput(
+                InvalidExecutionInput {
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::INVALID_STATE_MACHINE_EXECUTION_INPUT,
+                        &error.to_string(),
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "JSON object literal that sets variables used in the state under test.
+        // Object keys are the variable names and values are the variable values."
+        let variables = match input.variables.as_deref() {
+            None => None,
+            Some(text) => match serde_json::from_str::<Value>(text) {
+                Ok(value) if value.is_object() => Some(value),
+                Ok(_) => {
+                    return Err(refuse(
+                        "variables must be a JSON object literal whose keys are the variable \
+                         names"
+                            .to_string(),
+                    ))
+                }
+                Err(error) => {
+                    return Err(refuse(format!(
+                        "variables must be a JSON object literal whose keys are the variable \
+                         names: {error}"
+                    )))
+                }
+            },
+        };
+
+        // "A JSON string representing a valid Context object for the state under
+        // test. This field may only be specified if a mock is specified in the same
+        // request."
+        let context_override = match (input.context.as_deref(), input.mock.as_ref()) {
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(refuse(
+                    "context may only be specified if a mock is specified in the same request"
+                        .to_string(),
+                ))
+            }
+            (Some(text), Some(_)) => match serde_json::from_str::<Value>(text) {
+                Ok(value) if value.is_object() => Some(value),
+                Ok(_) => {
+                    return Err(refuse(
+                        "context must be a JSON object: a Context object for the state under test"
+                            .to_string(),
+                    ))
+                }
+                Err(error) => {
+                    return Err(refuse(format!(
+                        "context must be a JSON string representing a valid Context object: \
+                         {error}"
+                    )))
+                }
+            },
+        };
+
+        // The definition is JUDGED before it is read, by the walk that words every
+        // definition refusal this service answers: with a `stateName` it is a
+        // fully-formed state machine, and without one it is the single state itself.
+        // Either walk refuses a definition that is not JSON, so what the parse below
+        // could fail on is already reported in those words.
+        let judged = match input.state_name {
+            Some(_) => asl::validate(&input.definition),
+            None => asl::validate_single_state(&input.definition),
+        };
+        if let Err(diagnostic) = judged {
+            return Err(invalid_definition(diagnostic));
+        }
+        let Ok(document) = serde_json::from_str::<Value>(&input.definition) else {
+            return Err(invalid_definition(
+                "the definition is not valid JSON".to_string(),
+            ));
+        };
+
+        // Which state is under test, and the name it carries.
+        let (name, state) = match input.state_name.as_deref() {
+            // "Denotes the particular state within a state machine definition to be
+            // tested. If this field is specified, the definition must contain a
+            // fully-formed state machine definition" — judged as one above, so the
+            // state the request named only has to be one it declares.
+            Some(state_name) => {
+                let state = document
+                    .get("States")
+                    .and_then(Value::as_object)
+                    .and_then(|states| states.get(state_name));
+                let Some(state) = state else {
+                    return Err(refuse(format!(
+                        "stateName '{state_name}' names no state the definition declares"
+                    )));
+                };
+                (state_name, state)
+            }
+            // With no `stateName`, the definition IS the state: "accepts the
+            // definition of a single state". Such a state is declared in no state
+            // list, so it carries no name and its `Next` names no state that can be
+            // resolved — it is reported as the state to transition to.
+            None => ("", &document),
+        };
+        let Some(state) = state.as_object() else {
+            // Unreachable: both walks above refuse a state that is not a JSON object.
+            return Err(invalid_definition(format!(
+                "{} must be a JSON object",
+                asl::SINGLE_STATE_LABEL
+            )));
+        };
+        let state_type = state.get("Type").and_then(Value::as_str).unwrap_or_default();
+
+        // "Defines a mocked result or error for the state under test. A mock can only
+        // be specified for Task, Map, or Parallel states. If it is specified for
+        // another state type, an exception will be thrown."
+        let mock = match input.mock.as_ref() {
+            None => None,
+            Some(mock) => {
+                if !asl::INVOKING_STATE_TYPES.contains(&state_type) {
+                    return Err(refuse(format!(
+                        "a mock may only be specified for a [{}] state, and the state under test \
+                         is a '{state_type}' state",
+                        asl::INVOKING_STATE_TYPES.join(", ")
+                    )));
+                }
+                Some(read_mock(mock)?)
+            }
+        };
+        // "TestState only supports the following when a mock is specified: Activity
+        // tasks, .sync or .waitForTaskToken service integration patterns, Parallel, or
+        // Map states." A `Map`'s iterations and a `Parallel`'s branches are the
+        // state's own work, so without a mock standing in for their outcome there is
+        // no single state to test.
+        if mock.is_none() && matches!(state_type, "Map" | "Parallel") {
+            return Err(refuse(format!(
+                "a '{state_type}' state is tested only when a mock is specified for its outcome"
+            )));
+        }
+
+        // "The number of retry attempts that have occurred for the state's Retry that
+        // applies to the mocked error" — the range (0..) is modelled, so a negative
+        // one never reaches here.
+        let retries_taken = match input
+            .state_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.retrier_retry_count)
+        {
+            None => 0,
+            Some(count) => match u64::try_from(count) {
+                Ok(count) => count,
+                Err(_) => {
+                    return Err(refuse(
+                        "stateConfiguration.retrierRetryCount must not be negative".to_string(),
+                    ))
+                }
+            },
+        };
+
+        let start = crate::state::now();
+        // What the context object (`$$`) reports: nothing but what this request fixed.
+        // The test runs no execution and names no state machine, so there is no
+        // execution id, name or state machine ARN for one to read — a request that
+        // needs them supplies the whole context object itself, which is what `context`
+        // is for.
+        let context = asl::Context {
+            execution_arn: String::new(),
+            execution_name: String::new(),
+            state_machine_arn: String::new(),
+            state_machine_name: String::new(),
+            role_arn: input.role_arn.clone().unwrap_or_default(),
+        };
+
+        // The walk is CPU work a caller's definition sizes, so it runs on a blocking
+        // thread rather than on an async worker: a state whose evaluation reaches the
+        // interpreter's own deadline (`asl::MAX_INTERPRET_DURATION`) ends there instead
+        // of holding a worker the runtime needs for health, timeouts and shutdown.
+        let interpreted = {
+            let name = name.to_string();
+            let state = state.clone();
+            let state_input = state_input.clone();
+            let mock = mock.clone();
+            tokio::task::spawn_blocking(move || {
+                asl::test_state(&asl::StateTest {
+                    name: &name,
+                    state: &state,
+                    input: &state_input,
+                    start,
+                    context: &context,
+                    context_override: context_override.as_ref(),
+                    mock: mock.as_ref(),
+                    retries_taken,
+                })
+            })
+            .await
+        };
+        let Ok(trial) = interpreted else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::INTERPRETER_UNAVAILABLE,
+            ));
+        };
+        let asl::Trial {
+            status,
+            output,
+            next_state,
+            error,
+            cause,
+            inspection,
+            retry_index,
+            retry_backoff_seconds,
+            catch_index,
+        } = trial;
+
+        // `inspectionLevel` "determines the values to return when a state is tested",
+        // and only the two data-flow levels report the processing stages. The HTTP
+        // request and response `TRACE` adds are an HTTP Task's, which this emulator
+        // does not call, so no state tested here has either.
+        let inspection_data = DATA_FLOW_LEVELS.contains(&level.as_str()).then(|| {
+            let error_details = (retry_index.is_some() || catch_index.is_some()).then_some(
+                InspectionErrorDetails {
+                    catch_index,
+                    retry_index,
+                    retry_backoff_interval_seconds: retry_backoff_seconds,
+                },
+            );
+            InspectionData {
+                input: inspection.input,
+                after_input_path: inspection.after_input_path,
+                after_parameters: inspection.after_parameters,
+                result: inspection.result,
+                after_result_selector: inspection.after_result_selector,
+                after_result_path: inspection.after_result_path,
+                // "JSON string that contains the set of workflow variables after
+                // execution of the state. The set will include variables assigned in
+                // the state and variables set up as test state input." Nothing this
+                // emulator runs assigns one or READS one: `Assign` is a member it does
+                // not interpret, so a state carrying it is not run at all, and a
+                // variable reference is no path this interpreter resolves, so a state
+                // reading one fails with `States.Runtime` rather than running without
+                // it. The set after the state is therefore the set the request set up.
+                variables: variables.as_ref().map(Value::to_string),
+                error_details,
+                ..InspectionData::default()
+            }
+        });
+
+        Ok(TestStateOutput {
+            output,
+            error,
+            cause,
+            inspection_data,
+            next_state,
+            status: Some(status.to_string()),
+        })
     }
 }

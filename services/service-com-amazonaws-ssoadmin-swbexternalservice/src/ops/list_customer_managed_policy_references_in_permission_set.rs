@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCustomerManagedPolicyReferencesInPermissionSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCustomerManagedPolicyReferencesInPermissionSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCustomerManagedPolicyReferencesInPermissionSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the customer managed policy references attached to a stored permission set,
+//! one page at a time: exactly the set the attach operation wrote and the detach operation
+//! removes from, in the stable order of each reference's (`Name`, `Path`) identity, with a
+//! `NextToken` only while references are left over.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +158,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCustomerManagedPolicyReferencesInPermissionSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCustomerManagedPolicyReferencesInPermissionSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCustomerManagedPolicyReferencesInPermissionSet"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListCustomerManagedPolicyReferencesInPermissionSetErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The cursor is scoped to THIS enumeration: the operation and the permission set
+        // whose references it walks.
+        let scope = crate::state::cursor_customer_managed_policies(
+            &input.instance_arn,
+            &input.permission_set_arn,
+        );
+        let after = crate::state::cursor_after(&scope, input.next_token.as_deref()).map_err(
+            |message| {
+                ListCustomerManagedPolicyReferencesInPermissionSetErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message.to_string()),
+                        reason: None,
+                    },
+                )
+            },
+        )?;
+
+        let ordered: Vec<(String, CustomerManagedPolicyReference)> = {
+            let mut store = state.lock();
+            // A READ, except for what the CLOCK already owes the instances themselves,
+            // and the account's ambient instance if nothing has enabled one yet.
+            store.on_request(
+                &crate::state::request_region(ctx.parts()),
+                ::std::time::SystemTime::now(),
+            );
+            // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup:
+            // permission sets are a feature of an organization instance, so on an account
+            // instance none can ever exist and the enumeration is refused rather than
+            // answered empty. An ARN this account holds no instance for is NOT this
+            // refusal — it falls through to the 404 below.
+            if store.permission_set_surface_withdrawn(&input.instance_arn) {
+                return Err(
+                    ListCustomerManagedPolicyReferencesInPermissionSetErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
+                            ),
+                            // The model's `ValidationExceptionReason` enum carries only
+                            // KMS key states, none of which this refusal is.
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if store.instance(&input.instance_arn).is_none() {
+                return Err(
+                    ListCustomerManagedPolicyReferencesInPermissionSetErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "No instance found with the ARN {}",
+                                input.instance_arn
+                            )),
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // Absent, or belonging to another instance, or already deleted — all the same
+            // answer: there is no such permission set whose references could be walked.
+            let record = store
+                .permission_set(&input.instance_arn, &input.permission_set_arn)
+                .ok_or_else(|| {
+                    ListCustomerManagedPolicyReferencesInPermissionSetErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "No permission set found with the ARN {}",
+                                input.permission_set_arn
+                            )),
+                            reason: None,
+                        },
+                    )
+                })?;
+            // Exactly the references currently attached, in identity order, which is both
+            // the page order and the cursor order.
+            record
+                .customer_managed_policies
+                .iter()
+                .map(|(identity, reference)| (identity.clone(), reference.to_shape()))
+                .collect()
+        };
+
+        let (customer_managed_policy_references, next_token) =
+            crate::state::page(&scope, ordered, after.as_deref(), input.max_results);
+        Ok(ListCustomerManagedPolicyReferencesInPermissionSetOutput {
+            customer_managed_policy_references: Some(customer_managed_policy_references),
+            next_token,
+        })
     }
 }

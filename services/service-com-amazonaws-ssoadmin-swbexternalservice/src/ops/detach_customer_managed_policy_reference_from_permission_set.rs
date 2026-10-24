@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachCustomerManagedPolicyReferenceFromPermissionSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachCustomerManagedPolicyReferenceFromPermissionSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachCustomerManagedPolicyReferenceFromPermissionSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes ONE customer managed policy reference from the set a stored permission set
+//! carries. The reference the request names is matched on its identity — its (`Name`,
+//! `Path`) pair, with `Path` taken to be its documented default `/` when the request names
+//! none — so a pair the permission set does not carry is a
+//! `ResourceNotFoundException` rather than a no-op 200, and a later
+//! `ListCustomerManagedPolicyReferencesInPermissionSet` reports exactly the references
+//! that are left.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +156,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachCustomerManagedPolicyReferenceFromPermissionSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachCustomerManagedPolicyReferenceFromPermissionSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachCustomerManagedPolicyReferenceFromPermissionSet"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DetachCustomerManagedPolicyReferenceFromPermissionSetErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        // The reference the request names, with `Path` materialised the same way the
+        // attach materialised it, so a detach that omits `Path` removes the reference an
+        // attach that omitted it stored.
+        let reference = crate::state::CustomerManagedPolicyReferenceRecord::from_shape(
+            &input.customer_managed_policy_reference,
+        );
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // What the CLOCK already owes every instance, plus the account's ambient instance
+        // if nothing has enabled one yet, so this write resolves the same instance a read
+        // at this instant would resolve.
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: permission
+        // sets are a feature of an organization instance, so on an account instance no
+        // permission set can ever exist and the refusal does not depend on whether this
+        // one does. An ARN this account holds no instance for is NOT this refusal — it
+        // falls through to the 404 below.
+        if store.permission_set_surface_withdrawn(&input.instance_arn) {
+            return Err(
+                DetachCustomerManagedPolicyReferenceFromPermissionSetErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
+                        ),
+                        // The model's `ValidationExceptionReason` enum carries only KMS
+                        // key states, none of which this refusal is.
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        if store.instance(&input.instance_arn).is_none() {
+            return Err(
+                DetachCustomerManagedPolicyReferenceFromPermissionSetErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No instance found with the ARN {}",
+                            input.instance_arn
+                        )),
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let permission_set_arn = input.permission_set_arn.clone();
+        // Absent, or belonging to another instance, or already deleted — all the same
+        // answer: there is no such permission set to detach a policy reference from.
+        let record = store
+            .permission_set_mut(&input.instance_arn, &input.permission_set_arn)
+            .ok_or_else(|| {
+                DetachCustomerManagedPolicyReferenceFromPermissionSetErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No permission set found with the ARN {permission_set_arn}"
+                        )),
+                        reason: None,
+                    },
+                )
+            })?;
+
+        // The reference itself is a resource of this call: a pair this permission set does
+        // not carry — never attached, or already detached — is NOT a successful detach,
+        // so it earns the modelled `ResourceNotFoundException` rather than an empty 200
+        // that would tell the caller a policy was removed when none was.
+        if record
+            .customer_managed_policies
+            .remove(&reference.identity())
+            .is_none()
+        {
+            return Err(
+                DetachCustomerManagedPolicyReferenceFromPermissionSetErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::customer_managed_policy_not_attached_message(
+                                &permission_set_arn,
+                                &reference.name,
+                                &reference.path,
+                            ),
+                        ),
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The modeled response carries no members: the remaining set is observed through
+        // `ListCustomerManagedPolicyReferencesInPermissionSet`.
+        Ok(DetachCustomerManagedPolicyReferenceFromPermissionSetOutput {})
     }
 }
