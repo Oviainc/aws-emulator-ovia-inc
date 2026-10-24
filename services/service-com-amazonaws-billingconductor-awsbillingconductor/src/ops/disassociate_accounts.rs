@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateAccounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateAccounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateAccounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes account ids from a STORED billing group's membership, so the group's
+//! `Size` and the account-association index both move with it and a removed account
+//! becomes `UNMONITORED` — the inverse of `AssociateAccounts`.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +115,16 @@ impl From<DisassociateAccountsErrorModeled> for DisassociateAccountsError {
     }
 }
 
+/// Refuse the request with this operation's modelled 400 `ValidationException`,
+/// worded like every other account-list refusal of this service
+/// ([`crate::state::validation_exception`]).
+fn validation(reason: &str, field: &str, message: String) -> DisassociateAccountsError {
+    DisassociateAccountsErrorModeled::ValidationException(crate::state::validation_exception(
+        reason, field, message,
+    ))
+    .into()
+}
+
 /// The `DisassociateAccounts` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -157,18 +161,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateAccounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateAccountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateAccounts"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DisassociateAccountsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // The `BillingGroupArn` pattern accepts the full ARN or the bare id.
+        let group_arn = crate::state::normalize_billing_group_arn(&input.arn);
+        let Some(group) = state.billing_groups.get(&group_arn) else {
+            return Err(DisassociateAccountsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: "the billing group does not exist".to_string(),
+                    resource_id: group_arn,
+                    resource_type: "billinggroup".to_string(),
+                },
+            )
+            .into());
+        };
+        let primary_account_id = group.primary_account_id.clone();
+        let members = group.linked_account_ids.clone();
+
+        // One request may not name the same account twice — the `DUPLICATE_ACCOUNT`
+        // reason `ValidationExceptionReason` enumerates, refused the same way
+        // `AssociateAccounts` and `CreateBillingGroup` refuse it.
+        if let Some(duplicate) = crate::state::first_duplicate(&input.account_ids) {
+            return Err(validation(
+                "DUPLICATE_ACCOUNT",
+                "AccountIds",
+                format!("account {duplicate} is listed more than once"),
+            ));
+        }
+
+        // The group's primary account is the account the group's charges are billed
+        // to, so it cannot be taken out of the group it is the primary account of:
+        // `ValidationExceptionReason` enumerates `PRIMARY_CANNOT_DISASSOCIATE` for
+        // exactly this request, and it is checked before membership because it holds
+        // whatever the membership list says.
+        for account_id in &input.account_ids {
+            if primary_account_id.as_deref() == Some(account_id.as_str()) {
+                return Err(validation(
+                    "PRIMARY_CANNOT_DISASSOCIATE",
+                    "AccountIds",
+                    format!(
+                        "account {account_id} is the primary account of billing group \
+                         {group_arn} and cannot be disassociated from it"
+                    ),
+                ));
+            }
+        }
+
+        // "Removes the specified list of account IDs from the GIVEN billing group":
+        // the request names the group the accounts come out of, so an account that is
+        // not a member of THAT group — in no group at all, or in another one — is a
+        // fault in the input rather than an inconsistent state of the group
+        // addressed, which is the `ACCOUNTS_NOT_ASSOCIATED` reason the model
+        // enumerates (no `ConflictExceptionReason` value describes it).
+        for account_id in &input.account_ids {
+            if !members.contains(account_id) {
+                return Err(validation(
+                    "ACCOUNTS_NOT_ASSOCIATED",
+                    "AccountIds",
+                    format!(
+                        "account {account_id} is not associated with billing group {group_arn}"
+                    ),
+                ));
+            }
+        }
+
+        // Every refusal above is decided before anything is written, so a refused
+        // request leaves the membership, the association index and the group's
+        // `LastModifiedTime` exactly as they were — whichever account in the list is
+        // at fault.
+        let now = crate::state::now_millis();
+        if let Some(group) = state.billing_groups.get_mut(&group_arn) {
+            if !input.account_ids.is_empty() {
+                group
+                    .linked_account_ids
+                    .retain(|account_id| !input.account_ids.contains(account_id));
+                group.last_modified_time_millis = now;
+            }
+        }
+        // A disassociated account stays in the consolidated billing family while
+        // belonging to no billing group, which is what `ListAccountAssociations`
+        // reports as `UNMONITORED` — the same release `DeleteBillingGroup` performs
+        // for every member of the group it removes.
+        for account_id in &input.account_ids {
+            if state
+                .account_associations
+                .get(account_id)
+                .is_some_and(|owner| owner == &group_arn)
+            {
+                state.account_associations.remove(account_id);
+            }
+            state.note_unassociated_account(account_id);
+        }
+
+        Ok(DisassociateAccountsOutput {
+            arn: Some(group_arn),
+        })
     }
 }

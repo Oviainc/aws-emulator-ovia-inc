@@ -819,7 +819,10 @@ async fn the_gate_precedes_semantic_validation_resource_lookup_and_the_scaffold(
                 "Arn": "arn:aws:billingconductor::000000000000:billinggroup/BOGUSGROUP1",
                 "AccountIds": ["111111111111"],
             }),
-            payer_status: 501,
+            // The payer account reaches the resource lookup: the modelled 404 for a
+            // group that does not exist. A caller that is not the payer never learns
+            // whether it exists.
+            payer_status: 404,
         },
         Row {
             case: "an AssociateAccounts naming a billing group that exists nowhere",
