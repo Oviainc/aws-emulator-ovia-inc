@@ -4,6 +4,11 @@
 //! IMPLEMENTED: removes the stored `ApiKey` record for `apiKey`, so a later `GetApiKey`
 //! no longer finds it; answers `NotFoundException` when no key has that id.
 //!
+//! A deleted key is metered by no usage plan, so its `UsagePlanKey` associations go with
+//! it: the record is dropped from every plan that metered it (see
+//! [`crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState::forget_api_key`]),
+//! leaving no association a later read could resolve.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -169,6 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+        // The key is gone, so the usage plans that metered it stop metering it: an
+        // association names a stored key, and this one no longer exists.
+        let unmetered = store.forget_api_key(&input.api_key);
         // The store lock is released before the record is formatted: the critical
         // section covers the state change only.
         drop(store);
@@ -179,6 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation = Self::NAME,
             caller = ?crate::state::request_caller(ctx.parts()),
             api_key = ?input.api_key,
+            usage_plans_unmetered = unmetered,
             outcome = "deleted",
             "api key deleted",
         );

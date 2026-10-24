@@ -335,6 +335,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default()
                 .into_iter()
                 .collect::<::std::collections::BTreeMap<String, String>>(),
+            // A plan is created metering no API key: `CreateUsagePlanKey` is what adds
+            // one.
+            keys: ::std::collections::BTreeMap::new(),
             sequence,
         };
 
