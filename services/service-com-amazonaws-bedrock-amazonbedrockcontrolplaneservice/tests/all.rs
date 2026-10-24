@@ -21,6 +21,8 @@ mod guardrail_wire_shape;
 mod guardrails;
 #[path = "all/model_invocation_logging.rs"]
 mod model_invocation_logging;
+#[path = "all/prompt_routers.rs"]
+mod prompt_routers;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/state_roundtrip.rs"]

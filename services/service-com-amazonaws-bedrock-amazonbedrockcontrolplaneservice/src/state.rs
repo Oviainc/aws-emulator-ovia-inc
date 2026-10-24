@@ -13,6 +13,10 @@
 //! share, so the configuration one request stores is the configuration the next
 //! request reads back.
 //!
+//! And it holds the prompt routers `ops/create_prompt_router.rs` mints and
+//! `ops/get_prompt_router.rs` reads back, so a router created by one request is the
+//! router every later request sees.
+//!
 //! The record shapes, and the conversions between the `*PolicyConfig` shapes a
 //! request carries and the `*Policy` shapes a response carries, live here rather
 //! than in one operation's file because six operations share them (a file under
@@ -35,7 +39,7 @@ use crate::ops::types::{
     GuardrailSensitiveInformationPolicyConfig, GuardrailTopic, GuardrailTopicConfig,
     GuardrailTopicPolicy, GuardrailTopicPolicyConfig, GuardrailTopicsTier,
     GuardrailTopicsTierConfig, GuardrailWord, GuardrailWordConfig, GuardrailWordPolicy,
-    GuardrailWordPolicyConfig, LoggingConfig, Tag,
+    GuardrailWordPolicyConfig, LoggingConfig, PromptRouterTargetModel, RoutingCriteria, Tag,
 };
 
 /// The working version every guardrail always has, as `GuardrailDraftVersion`
@@ -85,7 +89,47 @@ pub const MAX_VERSIONS_PER_GUARDRAIL: usize = 20;
 /// than minting a number the model does not admit.
 pub const MAX_VERSION_NUMBER: u32 = 99_999_999;
 
-/// The number of base-36 digits each half of a minted guardrail id carries.
+/// `PromptRouterStatus` — a prompt router that is serving.
+///
+/// `AVAILABLE` is the ONLY value the enum carries
+/// (`smithy_query(query="shape",shape="PromptRouterStatus")`), so a router this emulator
+/// mints is serving from the call that mints it onwards: there is no non-terminal status
+/// for the clock to move it out of, and nothing asynchronous to wait on.
+pub const PROMPT_ROUTER_AVAILABLE: &str = "AVAILABLE";
+
+/// `PromptRouterType` — the type of a router a caller created.
+///
+/// The enum is `[custom, default]`: `default` names the routers Amazon Bedrock itself
+/// publishes (which is why `ListPromptRouters$type` defaults to it and why the
+/// `PromptRouterArn` pattern spells `default-prompt-router`), so a router that exists
+/// because `CreatePromptRouter` was called is the other one.
+pub const PROMPT_ROUTER_TYPE_CUSTOM: &str = "custom";
+
+/// The granularity `RoutingCriteria$responseQualityDifference` is accepted at.
+///
+/// The member is modelled `@range(min: 0, max: 100)` and the boundary validator already
+/// refuses a value outside that span; Amazon Bedrock additionally accepts only the
+/// multiples of this step inside it, refusing anything else with 400
+/// `ValidationException` (recorded in `simparity-behavioral-ga-prod-v1` as
+/// `bedrock.create-prompt-router-invalid-routing-criteria-rejected`).
+pub const RESPONSE_QUALITY_DIFFERENCE_STEP: f64 = 5.0;
+
+/// The most prompt routers this account may hold at once, past which a create is
+/// refused with `ServiceQuotaExceededException`.
+///
+/// The Amazon Bedrock service quota "Prompt routers per account" has a default of 500
+/// (adjustable); this emulator enforces that default, so the store cannot grow without a
+/// server-side bound no matter how many creates a caller issues.
+pub const MAX_PROMPT_ROUTERS_PER_ACCOUNT: usize = 500;
+
+/// The most tags one resource of this service may carry.
+///
+/// `TooManyTagsException` documents the bound itself — "The request contains more tags
+/// than can be associated with a resource (50 tags per resource)" — so a create carrying
+/// more is refused with that error rather than stored.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The number of base-36 digits each half of a minted resource id carries.
 ///
 /// `GuardrailId` is `^[a-z0-9]+$` with length at most 64; base 36 over
 /// `0-9a-z` is exactly that alphabet.
@@ -240,6 +284,37 @@ impl Guardrail {
     }
 }
 
+/// One stored prompt router: the identity `CreatePromptRouter` minted, the
+/// configuration that request carried, and the two instants a read reports.
+///
+/// `status` and `router_type` are `&'static str` for the same reason
+/// [`GuardrailRevision::status`] is: both are single values this emulator mints rather
+/// than anything a request chooses ([`PROMPT_ROUTER_AVAILABLE`],
+/// [`PROMPT_ROUTER_TYPE_CUSTOM`]).
+#[derive(Debug, Clone)]
+pub struct PromptRouter {
+    /// The `PromptRouterArn` this router is addressed by, minted by
+    /// [`prompt_router_arn`].
+    pub arn: String,
+    /// `promptRouterName`, as the create request spelled it.
+    pub name: String,
+    pub description: Option<String>,
+    /// `models` — the foundation models this router may route to, in request order.
+    pub models: Vec<PromptRouterTargetModel>,
+    pub fallback_model: PromptRouterTargetModel,
+    pub routing_criteria: RoutingCriteria,
+    pub tags: Vec<Tag>,
+    /// `PromptRouterStatus`; [`PROMPT_ROUTER_AVAILABLE`] for every router minted here.
+    pub status: &'static str,
+    /// `PromptRouterType`; [`PROMPT_ROUTER_TYPE_CUSTOM`] for a router a caller created.
+    pub router_type: &'static str,
+    pub created_at: SystemTime,
+    /// When the router last changed. Equal to [`PromptRouter::created_at`] until some
+    /// operation changes the router; the model carries no `UpdatePromptRouter`, so no
+    /// request moves it today.
+    pub updated_at: SystemTime,
+}
+
 /// Per-service state for com-amazonaws-bedrock-amazonbedrockcontrolplaneservice. A handler reaches it through [`service_state`].
 ///
 /// Every map here is bounded, and each bound holds by construction rather than by
@@ -256,6 +331,11 @@ impl Guardrail {
 /// * each guardrail's [`Guardrail::version_tokens`] is bounded the same way against
 ///   its live versions, including when a SINGLE version is deleted
 ///   ([`Guardrail::remove_version`]).
+///
+/// * `prompt_routers` and `prompt_router_names` hold one entry per live prompt router,
+///   capped at [`MAX_PROMPT_ROUTERS_PER_ACCOUNT`] by the quota `CreatePromptRouter`
+///   enforces, and `prompt_router_create_tokens` holds at most one entry per live router
+///   for the same reason `create_tokens` does.
 ///
 /// * `model_invocation_logging` is a single optional settings record, which a put
 ///   replaces rather than appends to.
@@ -287,6 +367,24 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// again. It is keyed by nothing for the same reason the guardrail store is not
     /// keyed by region: this store models the one account the emulator serves.
     pub model_invocation_logging: Option<LoggingConfig>,
+    /// Every stored prompt router, keyed by its `PromptRouterArn` — the one identifier
+    /// `GetPromptRouter` and `DeletePromptRouter` address a router by.
+    pub prompt_routers: HashMap<String, PromptRouter>,
+    /// `(region, promptRouterName)` -> `PromptRouterArn`, so a duplicate name is a
+    /// `ConflictException`.
+    ///
+    /// Keyed by the region too because the model documents the name as unique "within
+    /// your Amazon Web Services account in the current region"
+    /// (`smithy_query(query="doc",shape="CreatePromptRouterRequest",member="promptRouterName")`),
+    /// so the same name in another region names another router.
+    pub prompt_router_names: HashMap<(String, String), String>,
+    /// `CreatePromptRouter` idempotency: `(region, clientRequestToken)` -> the
+    /// `PromptRouterArn` that token minted. Scoped to that one operation, and to the
+    /// region the request addressed, the way the name index is.
+    pub prompt_router_create_tokens: HashMap<(String, String), String>,
+    /// How many prompt router ids this store has minted; the uniqueness half of a
+    /// minted id.
+    pub minted_prompt_routers: u64,
 }
 
 impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
@@ -307,16 +405,38 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// guessable sequence number.
     pub fn mint_guardrail_id(&mut self, now: SystemTime) -> String {
         self.minted_guardrails += 1;
-        let ordinal = self.minted_guardrails;
-        let nanos = now
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |since| since.subsec_nanos().into());
-        format!(
-            "{}{}",
-            base36(ordinal, ID_HALF_WIDTH),
-            base36(nanos, ID_HALF_WIDTH)
-        )
+        minted_id(self.minted_guardrails, now)
     }
+
+    /// The prompt router a `PromptRouterArn` names.
+    pub fn prompt_router(&self, arn: &str) -> Option<&PromptRouter> {
+        self.prompt_routers.get(arn)
+    }
+
+    /// Mint a fresh prompt router id: the resource half of a
+    /// `default-prompt-router/<id>` ARN, unique within this store.
+    ///
+    /// Built like a guardrail id, and for the same two reasons: the leading half is this
+    /// store's mint count so two ids can never collide, and the trailing half is drawn
+    /// from the creation instant so an id is not a guessable sequence number. `[a-z0-9]+`
+    /// is inside the `[a-zA-Z0-9-:.]+` the `PromptRouterArn` pattern admits there.
+    pub fn mint_prompt_router_id(&mut self, now: SystemTime) -> String {
+        self.minted_prompt_routers += 1;
+        minted_id(self.minted_prompt_routers, now)
+    }
+}
+
+/// A minted resource id: `^[a-z0-9]+$`, the store's mint `ordinal` then the sub-second
+/// part of `now`, each in [`ID_HALF_WIDTH`] base-36 digits.
+fn minted_id(ordinal: u64, now: SystemTime) -> String {
+    let nanos = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos().into());
+    format!(
+        "{}{}",
+        base36(ordinal, ID_HALF_WIDTH),
+        base36(nanos, ID_HALF_WIDTH)
+    )
 }
 
 /// The `guardrailId` inside a `guardrailIdentifier`: the bare id, or the resource
@@ -332,6 +452,33 @@ pub fn guardrail_id_of(identifier: &str) -> &str {
 /// `arn:aws:bedrock:<region>:<account>:guardrail/<id>`.
 pub fn guardrail_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn("bedrock", region, &format!("guardrail/{id}"))
+}
+
+/// The ARN of a prompt router in `region`:
+/// `arn:aws:bedrock:<region>:<account>:default-prompt-router/<id>`.
+///
+/// `default-prompt-router` is the resource type `PromptRouterArn` admits — its pattern
+/// is `^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:default-prompt-router/[a-zA-Z0-9-:.]+$`
+/// (`smithy_query(query="shape",shape="PromptRouterArn")`) — so every router this
+/// emulator mints is addressable through the members that carry that shape, whatever
+/// `PromptRouterType` the router itself reports. `TaggableResourcesArn` spells the same
+/// resource `prompt-router/[a-z0-9]{12}`; `PromptRouterArn` is the shape every
+/// prompt-router operation carries, so it decides the form, and a minted id is 12
+/// base-36 digits so it satisfies the other spelling's id form too.
+pub fn prompt_router_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn("bedrock", region, &format!("default-prompt-router/{id}"))
+}
+
+/// Whether `value` is a `responseQualityDifference` Amazon Bedrock accepts: a multiple
+/// of [`RESPONSE_QUALITY_DIFFERENCE_STEP`].
+///
+/// The modelled `@range(0..100)` is enforced ahead of any handler, so this is only about
+/// the granularity inside that span. An exact remainder test: the step and every multiple
+/// of it below 100 are representable in binary floating point, so a value that is a
+/// multiple is one exactly.
+#[must_use]
+pub fn is_accepted_response_quality_difference(value: f64) -> bool {
+    value % RESPONSE_QUALITY_DIFFERENCE_STEP == 0.0
 }
 
 /// A `GuardrailVersion`/`GuardrailNumericalVersion` as a number, or `None` when it
