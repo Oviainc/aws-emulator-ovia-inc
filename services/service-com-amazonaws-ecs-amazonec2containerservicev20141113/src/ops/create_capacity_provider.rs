@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCapacityProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCapacityProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCapacityProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a capacity provider and reports it. A provider is a NAMED binding onto the
+//! capacity that runs tasks — a caller's own Auto Scaling group, or capacity Amazon ECS
+//! manages — so the record this writes is what a later `capacityProviderStrategy` entry,
+//! `PutClusterCapacityProviders` association and `DescribeCapacityProviders` read back.
+//! The name and the Auto Scaling group each identify the provider, so neither is shared
+//! with a provider that already exists.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +182,203 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCapacityProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCapacityProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCapacityProvider"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateCapacityProviderErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let name = input.name.clone();
+        if let Err(message) = crate::state::validate_capacity_provider_name(&name) {
+            return Err(
+                CreateCapacityProviderErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You can create capacity providers for Amazon ECS Managed Instances and EC2
+        // instances": a provider is built on EXACTLY one of the two, since each describes
+        // the whole of where its capacity comes from.
+        let message = match (
+            input.auto_scaling_group_provider.is_some(),
+            input.managed_instances_provider.is_some(),
+        ) {
+            (false, false) => Some(
+                "either autoScalingGroupProvider or managedInstancesProvider must be \
+                 specified",
+            ),
+            (true, true) => Some(
+                "autoScalingGroupProvider and managedInstancesProvider must not both be \
+                 specified",
+            ),
+            _ => None,
+        };
+        if let Some(message) = message {
+            return Err(
+                CreateCapacityProviderErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `CapacityProvider$cluster`: "Managed instances capacity providers are
+        // cluster-scoped, meaning they can only be used within their associated cluster"
+        // — so a managed-instances provider has to say which cluster that is, while an
+        // Auto Scaling group provider belongs to the account and may name none.
+        if input.managed_instances_provider.is_some() && input.cluster.is_none() {
+            return Err(
+                CreateCapacityProviderErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            "cluster is required when managedInstancesProvider is \
+                             specified, which is scoped to that cluster"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The `cluster` member takes "the name of the cluster", by short name or ARN. A
+        // request that names none scopes the provider to no cluster at all, which is NOT
+        // the `default` cluster every other operation's `cluster` member falls back to.
+        let cluster_name = input
+            .cluster
+            .as_deref()
+            .map(|reference| crate::state::cluster_name_from_reference(Some(reference)));
+        let region = crate::state::request_region(ctx);
+        let requested_group = input
+            .auto_scaling_group_provider
+            .as_ref()
+            .map(|provider| provider.auto_scaling_group_arn.clone());
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        // A deleted cluster is not one this provider can be scoped to ("The cluster has
+        // been deleted"), so a tombstone is refused exactly as a name that never existed.
+        if let Some(cluster_name) = cluster_name.as_deref() {
+            if !guard.has_active_cluster(cluster_name) {
+                return Err(
+                    CreateCapacityProviderErrorModeled::ClusterNotFoundException(
+                        ClusterNotFoundException {
+                            message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The name IDENTIFIES the provider — a `capacityProviderStrategy` entry names one
+        // by nothing else — so a second create under a name the account already holds is
+        // not a second provider, and it cannot replace the first either: the configuration
+        // of an existing provider is `UpdateCapacityProvider`'s to change. The model's
+        // `@idempotent` trait says a RETRY of this call is safe (it mints nothing twice),
+        // not that a name already taken is accepted.
+        if guard
+            .capacity_providers
+            .get(&name)
+            .is_some_and(|existing| existing.status != crate::state::CAPACITY_PROVIDER_INACTIVE)
+        {
+            return Err(
+                CreateCapacityProviderErrorModeled::ClientException(ClientException {
+                    message: Some(
+                        "A capacity provider with the specified name already exists. To \
+                         change the configuration of an existing capacity provider, use \
+                         UpdateCapacityProvider."
+                            .to_string(),
+                    ),
+                })
+                .into(),
+            );
+        }
+
+        // Managed scaling drives the group's desired capacity, so two providers on ONE
+        // Auto Scaling group would scale it against each other: a group already bound to
+        // a provider is not available to another one. The group is compared by NAME
+        // (`auto_scaling_group_key`), so naming it by ARN once and by name once is still
+        // the same group.
+        if let Some(requested) = requested_group.as_deref() {
+            let key = crate::state::auto_scaling_group_key(requested);
+            let conflict = guard.capacity_providers.values().find(|existing| {
+                existing.status != crate::state::CAPACITY_PROVIDER_INACTIVE
+                    && existing
+                        .auto_scaling_group()
+                        .is_some_and(|group| crate::state::auto_scaling_group_key(group) == key)
+            });
+            if let Some(conflict) = conflict {
+                return Err(
+                    CreateCapacityProviderErrorModeled::ClientException(ClientException {
+                        message: Some(format!(
+                            "The specified Auto Scaling group is already being used by \
+                             capacity provider {}.",
+                            conflict.name
+                        )),
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        if guard.capacity_providers.len() >= crate::state::MAX_CAPACITY_PROVIDERS {
+            return Err(
+                CreateCapacityProviderErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "this emulator holds at most {} capacity providers; delete one \
+                             before creating another",
+                            crate::state::MAX_CAPACITY_PROVIDERS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `CreateManagedInstancesProviderConfiguration` is what the request carries and
+        // `ManagedInstancesProvider` what a response reports: the same configuration,
+        // member for member, so the stored provider reports back what it was created with.
+        let managed_instances_provider =
+            input
+                .managed_instances_provider
+                .as_ref()
+                .map(|requested| ManagedInstancesProvider {
+                    infrastructure_role_arn: Some(requested.infrastructure_role_arn.clone()),
+                    instance_launch_template: Some(requested.instance_launch_template.clone()),
+                    propagate_tags: requested.propagate_tags.clone(),
+                    infrastructure_optimization: requested.infrastructure_optimization.clone(),
+                    auto_repair_configuration: requested.auto_repair_configuration.clone(),
+                });
+        let record = crate::state::CapacityProviderRecord {
+            arn: crate::state::capacity_provider_arn(&region, &name),
+            name: name.clone(),
+            // AWS answers a create with the provider already usable, so nothing is owed
+            // here by the clock: `CapacityProvider$status` is ACTIVE from this answer on.
+            status: crate::state::CAPACITY_PROVIDER_ACTIVE.to_string(),
+            cluster: cluster_name,
+            auto_scaling_group_provider: input.auto_scaling_group_provider.clone(),
+            provider_type: managed_instances_provider.as_ref().map(|_| {
+                crate::state::CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES.to_string()
+            }),
+            managed_instances_provider,
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+        // `CreateCapacityProvider` has no `include` member to narrow the response with, so
+        // the provider it just created is reported with the tags it was created with.
+        let view = record.view(true);
+        guard.capacity_providers.insert(name, record);
+
+        Ok(CreateCapacityProviderOutput {
+            capacity_provider: Some(view),
+        })
     }
 }

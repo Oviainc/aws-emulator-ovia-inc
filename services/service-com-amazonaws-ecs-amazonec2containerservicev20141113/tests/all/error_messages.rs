@@ -20,8 +20,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    create_cluster, identity_document, ok, refusal, register_capacity, service, string, ACCOUNT,
-    SIGNED_REGION,
+    awsvpc_network_configuration, create_cluster, identity_document, ok, refusal,
+    register_capacity, service, string, ACCOUNT, SIGNED_REGION,
 };
 use crate::task_lifecycle::container;
 
@@ -74,6 +74,7 @@ async fn fixture() -> MultiServiceRouter {
             "serviceName": SERVICE,
             "taskDefinition": FAMILY,
             "desiredCount": 1,
+            "networkConfiguration": awsvpc_network_configuration(),
         }),
         "fixture",
     )
@@ -371,7 +372,11 @@ async fn deleting_a_cluster_that_still_holds_work_is_refused_with_one_fixed_sent
     ok(
         &router,
         "RunTask",
-        json!({ "cluster": "tasks-only", "taskDefinition": FAMILY }),
+        json!({
+            "cluster": "tasks-only",
+            "taskDefinition": FAMILY,
+            "networkConfiguration": awsvpc_network_configuration(),
+        }),
         "delete",
     )
     .await;
