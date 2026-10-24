@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBucketCors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBucketCors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBucketCors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the cors configuration `PutBucketCors` last set on the named bucket, rule for
+//! rule and in that order, and answers `NoSuchCORSConfiguration` (HTTP 404) for a bucket no
+//! configuration has been set on. A read, so it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -91,14 +86,21 @@ use super::types::*;
 // `GetBucketCorsError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `GetBucketCorsError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#GetBucketCors")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="GetBucketCors")` reports `errors: []`), but
+// `Bucket` is an @httpLabel, so a request can name a bucket that does not exist and AWS
+// answers the service-wide `NoSuchBucket` ("The specified bucket does not exist",
+// `httpError 404`) — the same 404 `PutBucketCors` answers for that name, which is why the
+// shape is widened in here rather than a second rule invented.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#GetBucketCors",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum GetBucketCorsErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -152,18 +154,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBucketCors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBucketCorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBucketCors"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Nothing can be reported about a bucket the emulator cannot look up, and
+            // neither "no such bucket" nor "no cors configuration" would be a true
+            // statement about it — so this answers the server fault S3 publishes for a
+            // request it could not carry out at all.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            ));
+        };
+
+        // Read-only: the guard is taken, the rules are copied out, and nothing is written —
+        // a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(GetBucketCorsErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let Some(rules) = bucket.cors() else {
+            // "To enable cross-origin resource sharing (CORS) on a bucket, you add the cors
+            // subresource to the bucket" (`PutBucketCors`'s own documentation): a bucket
+            // that has had none added has no configuration to report, and `CORSRules` is
+            // the whole output document, so a 200 with an empty document would report a
+            // configuration that allows no cross-origin access rather than the absence of
+            // one. AWS answers the code below with HTTP 404; the model declares no shape
+            // for it, so it goes out through the unmodelled channel.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_CORS_CONFIGURATION_CODE,
+                NO_SUCH_CORS_CONFIGURATION_STATUS,
+                crate::state::NO_SUCH_CORS_CONFIGURATION_MESSAGE,
+            ));
+        };
+
+        Ok(GetBucketCorsOutput {
+            // The rules in the order they were put, each member reported exactly when the
+            // stored rule carries it: the store keeps no cors configuration without a rule
+            // (`PutBucketCors` refuses one), so a `Some` here always names at least one.
+            cors_rules: Some(
+                rules
+                    .iter()
+                    .map(|rule| CORSRule {
+                        id: rule.id.clone(),
+                        // An empty list and an absent one are the same state on the wire for
+                        // a flattened list, so the container is reported exactly when the
+                        // rule names an entry in it.
+                        allowed_headers: (!rule.allowed_headers.is_empty())
+                            .then(|| rule.allowed_headers.clone()),
+                        allowed_methods: rule.allowed_methods.clone(),
+                        allowed_origins: rule.allowed_origins.clone(),
+                        expose_headers: (!rule.expose_headers.is_empty())
+                            .then(|| rule.expose_headers.clone()),
+                        max_age_seconds: rule.max_age_seconds,
+                    })
+                    .collect(),
+            ),
+        })
     }
 }
+
+/// The HTTP status AWS answers `NoSuchCORSConfiguration` with: 404, the status S3's
+/// error-responses list carries for a subresource that is not there.
+const NO_SUCH_CORS_CONFIGURATION_STATUS: u16 = 404;
