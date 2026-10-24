@@ -31,3 +31,5 @@ mod start_investigation_scope_and_merits;
 mod state_roundtrip;
 #[path = "all/support.rs"]
 mod support;
+#[path = "all/tag_and_untag_resource.rs"]
+mod tag_and_untag_resource;

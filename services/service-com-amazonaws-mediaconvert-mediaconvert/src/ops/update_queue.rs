@@ -227,9 +227,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Each remaining member is "the new <member> ... if you are changing it": one the
         // request carries replaces the stored value, one it omits leaves the stored value
         // exactly as it was. The description is kept verbatim, as `CreateQueue` keeps it.
-        if let Some(status) = input.status {
-            record.status = status;
-        }
+        //
+        // "Pause or activate a queue by changing its status between ACTIVE and PAUSED."
+        // A queue going back to ACTIVE is also what releases the jobs it was holding, so
+        // the direction of the change is remembered for `rearm_queue` below.
+        let activated = match input.status {
+            Some(status) => {
+                let activated = record.status == crate::state::QUEUE_STATUS_PAUSED
+                    && status == crate::state::QUEUE_STATUS_ACTIVE;
+                record.status = status;
+                activated
+            }
+            None => false,
+        };
         if let Some(description) = input.description {
             record.description = Some(description);
         }
@@ -246,6 +256,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The response is projected from the record that was just stored — the same view
         // `GetQueue` serializes — so the update and every later read cannot disagree.
         let record = record.clone();
+        // A paused queue's jobs "won't begin", so the jobs this queue was holding begin
+        // now that it is active again — each with the same wait every other job gets.
+        if activated {
+            state.rearm_queue(&name, now);
+        }
         let (submitted, progressing) = state.job_counts(&name);
 
         Ok(UpdateQueueOutput {
