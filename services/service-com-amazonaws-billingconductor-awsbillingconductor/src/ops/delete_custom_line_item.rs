@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCustomLineItem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCustomLineItem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCustomLineItem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a stored custom line item from the billing periods the request names, so a
+//! later read no longer reports it for them. A request that names no
+//! `BillingPeriodRange` deletes the item outright; one that names a range deletes it
+//! only from the periods that range covers, which narrows the span the stored item
+//! applies in and removes the record only once nothing is left of it.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +149,186 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCustomLineItem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCustomLineItemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCustomLineItem"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteCustomLineItemErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // "The ARN of the custom line item to be deleted." The `CustomLineItemArn`
+        // pattern accepts the full ARN as well as the bare 10-character id, so both
+        // spellings resolve to the one record the store is keyed by.
+        let item_arn = crate::state::normalize_custom_line_item_arn(&input.arn);
+
+        // This operation models no `ResourceNotFoundException`, so an `Arn` that names
+        // no stored item is refused with the modelled `ValidationException` and the
+        // reason `ValidationExceptionReason` enumerates for exactly that
+        // (`MISSING_CUSTOMLINEITEM`).
+        let Some(stored) = state.custom_line_items.get(&item_arn).cloned() else {
+            return Err(validation(
+                "MISSING_CUSTOMLINEITEM",
+                "Arn",
+                format!("the custom line item {item_arn} does not exist"),
+            ));
+        };
+
+        let remaining = match input.billing_period_range.as_ref() {
+            // "Deletes the custom line item identified by the given ARN": a request
+            // that names no billing periods deletes the item itself, so no read of any
+            // billing period reports it again.
+            None => Remaining::Gone,
+            Some(range) => {
+                // The range is half-open, as its member names say, so an end at or
+                // before the start would name no billing period to delete the item
+                // from at all.
+                if !crate::state::billing_period_range_is_ordered(range) {
+                    return Err(validation(
+                        "ILLEGAL_BILLING_PERIOD_RANGE",
+                        "BillingPeriodRange.ExclusiveEndBillingPeriod",
+                        "the exclusive end billing period must be later than the inclusive \
+                         start billing period"
+                            .to_string(),
+                    ));
+                }
+                remaining_span(&stored, range)
+            }
+        };
+
+        let outcome = match remaining {
+            Remaining::Gone => {
+                // One state method removes the item and everything that only existed
+                // because of it: the associations other percentage items held to it,
+                // and the idempotency entries that named it.
+                state.remove_custom_line_item(&item_arn);
+                "deleted"
+            }
+            Remaining::Narrowed {
+                inclusive_start,
+                exclusive_end,
+            } => {
+                if let Some(item) = state.custom_line_items.get_mut(&item_arn) {
+                    item.inclusive_start_billing_period = inclusive_start;
+                    item.exclusive_end_billing_period = exclusive_end;
+                    // The record changed, so the instant a read reports as its most
+                    // recent modification advances with it.
+                    item.last_modified_time_millis = crate::state::now_millis();
+                }
+                "narrowed"
+            }
+            // The request named only billing periods the item never applied in, so
+            // there is nothing of it to delete from them and no stored value changes.
+            Remaining::Unchanged => "unchanged",
+        };
+
+        // The audit record for a state-changing call: who asked, what it addressed and
+        // what it did. Never a `@sensitive` member — the item's name and its
+        // description are both `@sensitive` — only the access key id the caller
+        // presented and the ARN it addressed.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            custom_line_item_arn = %item_arn,
+            outcome = outcome,
+            "custom line item delete served"
+        );
+        Ok(DeleteCustomLineItemOutput {
+            arn: Some(item_arn),
+        })
     }
+}
+
+/// What a delete leaves of the billing periods a stored custom line item applies in.
+///
+/// A stored item holds ONE half-open span
+/// ([`crate::state::CustomLineItemRecord`]), so deleting it from the periods a
+/// request names either leaves that span alone, narrows it, or leaves nothing of it.
+#[derive(Debug)]
+enum Remaining {
+    /// The request named only periods the item does not apply in, so it keeps the span
+    /// it had.
+    Unchanged,
+    /// The item still applies, in this narrower half-open span.
+    Narrowed {
+        inclusive_start: Option<String>,
+        exclusive_end: Option<String>,
+    },
+    /// Nothing of the item is left, so the record goes.
+    Gone,
+}
+
+/// The billing periods `item` still applies in once it is deleted from the ones `range`
+/// covers.
+///
+/// Both spans are half-open (`InclusiveStartBillingPeriod` is in the range,
+/// `ExclusiveEndBillingPeriod` is not) and an absent bound is open, exactly as
+/// [`crate::state::billing_period_range_covers`] reads them. So what is left is the
+/// item's span MINUS the request's: the part before the request's start, the part from
+/// the request's end on, or neither.
+///
+/// A request whose range ends inside the item's span would leave both parts, which one
+/// stored span cannot hold — AWS keeps each generation of an item as a version, which
+/// this service does not persist yet (`ListCustomLineItemVersions` is still a scaffold,
+/// with its own issue) — so the part before the request's start is what remains and the
+/// item ends where the delete begins.
+fn remaining_span(
+    item: &crate::state::CustomLineItemRecord,
+    range: &CustomLineItemBillingPeriodRange,
+) -> Remaining {
+    let item_start = item
+        .inclusive_start_billing_period
+        .as_deref()
+        .and_then(crate::state::billing_period_key);
+    let item_end = item
+        .exclusive_end_billing_period
+        .as_deref()
+        .and_then(crate::state::billing_period_key);
+    let delete_start = crate::state::billing_period_key(&range.inclusive_start_billing_period);
+    let delete_end = range
+        .exclusive_end_billing_period
+        .as_deref()
+        .and_then(crate::state::billing_period_key);
+
+    // Two half-open spans share a billing period only when each one starts before the
+    // other ends.
+    if !precedes(item_start, delete_end) || !precedes(delete_start, item_end) {
+        return Remaining::Unchanged;
+    }
+    if precedes(item_start, delete_start) {
+        return Remaining::Narrowed {
+            inclusive_start: item.inclusive_start_billing_period.clone(),
+            exclusive_end: Some(range.inclusive_start_billing_period.clone()),
+        };
+    }
+    // An open-ended request deletes every period from its start on, so only a request
+    // that names an end can leave a part of the item after it.
+    if delete_end.is_some() && precedes(delete_end, item_end) {
+        return Remaining::Narrowed {
+            inclusive_start: range.exclusive_end_billing_period.clone(),
+            exclusive_end: item.exclusive_end_billing_period.clone(),
+        };
+    }
+    Remaining::Gone
+}
+
+/// Does the half-open bound `start` come strictly before `end`? An absent `start` is the
+/// unbounded past and an absent `end` the unbounded future, so either one absent orders.
+fn precedes(start: Option<i64>, end: Option<i64>) -> bool {
+    match (start, end) {
+        (Some(start), Some(end)) => start < end,
+        _ => true,
+    }
+}
+
+/// Refuse the request with this operation's modelled 400 `ValidationException`, naming
+/// the `ValidationExceptionReason` the model enumerates and the member at fault.
+fn validation(reason: &str, field: &str, message: String) -> DeleteCustomLineItemError {
+    DeleteCustomLineItemErrorModeled::ValidationException(crate::state::validation_exception(
+        reason, field, message,
+    ))
+    .into()
 }
