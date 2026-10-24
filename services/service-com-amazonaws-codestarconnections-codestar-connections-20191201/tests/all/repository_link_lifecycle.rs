@@ -34,10 +34,11 @@
 //!
 //! The reader each assertion reads state back through is `ListTagsForResource` on the
 //! link's own ARN (a link is a resource of this service, so it is taggable) together
-//! with `CreateRepositoryLink`'s duplicate-triple refusal: `GetRepositoryLink` and
-//! `ListRepositoryLinks` are still scaffold stubs with their own open issues
-//! (`20261023T122922Z-codestar-connections-getrepositorylink-stub.md`,
-//! `20261023T122922Z-codestar-connections-listrepositorylinks-stub.md`).
+//! with `CreateRepositoryLink`'s duplicate-triple refusal; `GetRepositoryLink` reads the
+//! same records back by id, and the rules it follows are asserted in
+//! `repository_link_reads`, which reuses this suite's table. `ListRepositoryLinks` is
+//! still a scaffold stub with its own open issue
+//! (`20261023T122922Z-codestar-connections-listrepositorylinks-stub.md`).
 
 use serde_json::{Value, json};
 
@@ -63,18 +64,18 @@ const REPOSITORY_NAME_MAX_LEN: usize = 128;
 
 /// One row of the create/delete table: a repository link to register, differing from the
 /// other rows along what the rules generalise over.
-struct Row {
-    case: &'static str,
+pub(crate) struct Row {
+    pub(crate) case: &'static str,
     /// The `ProviderType` the backing connection is created with — what
     /// `RepositoryLinkInfo.ProviderType` must report, since it is the provider type of
     /// the connection the link names.
-    provider_type: &'static str,
-    owner_id: String,
-    repository_name: String,
+    pub(crate) provider_type: &'static str,
+    pub(crate) owner_id: String,
+    pub(crate) repository_name: String,
     /// `EncryptionKeyArn`, for the rows that supply one.
-    encryption_key_arn: Option<String>,
+    pub(crate) encryption_key_arn: Option<String>,
     /// Tags supplied at create, as (key, value) pairs.
-    tags: Vec<(String, String)>,
+    pub(crate) tags: Vec<(String, String)>,
 }
 
 /// A KMS key ARN of the shape `CreateRepositoryLink.EncryptionKeyArn`'s modelled pattern
@@ -85,7 +86,7 @@ fn encryption_key_arn(key_id: &str) -> String {
 
 /// The rows: every modelled provider type, both published length bounds of `OwnerId` and
 /// `RepositoryName`, a link with an encryption key and links with 0, 1 and several tags.
-fn rows() -> Vec<Row> {
+pub(crate) fn rows() -> Vec<Row> {
     let mut rows: Vec<Row> = PROVIDER_TYPES
         .iter()
         .map(|provider_type| Row {
@@ -147,7 +148,7 @@ fn rows() -> Vec<Row> {
 }
 
 /// The `CreateRepositoryLink` request body for one row, against `connection_arn`.
-fn create_body(row: &Row, connection_arn: &str) -> Value {
+pub(crate) fn create_body(row: &Row, connection_arn: &str) -> Value {
     let mut body = json!({
         "ConnectionArn": connection_arn,
         "OwnerId": row.owner_id,
@@ -185,7 +186,12 @@ fn is_repository_link_id(candidate: &str) -> bool {
 
 /// Assert the `RepositoryLinkInfo` one answer carries reports the row and the connection
 /// it was created against, and return `(RepositoryLinkId, RepositoryLinkArn)`.
-fn assert_link_info(case: &str, row: &Row, connection_arn: &str, info: &Value) -> (String, String) {
+pub(crate) fn assert_link_info(
+    case: &str,
+    row: &Row,
+    connection_arn: &str,
+    info: &Value,
+) -> (String, String) {
     let id = info["RepositoryLinkId"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: no RepositoryLinkId in {info}"))
@@ -240,7 +246,11 @@ fn assert_link_info(case: &str, row: &Row, connection_arn: &str, info: &Value) -
 
 /// The tags `ListTagsForResource` reports for `resource_arn`, asserting the read itself
 /// succeeded — the reader that proves a link is held in state.
-async fn tags_of(emulator: &Emulator, case: &str, resource_arn: &str) -> Vec<(String, String)> {
+pub(crate) async fn tags_of(
+    emulator: &Emulator,
+    case: &str,
+    resource_arn: &str,
+) -> Vec<(String, String)> {
     let (status, body) = emulator
         .call(
             "ListTagsForResource",
@@ -442,8 +452,11 @@ async fn the_duplicate_refusal_states_the_response_it_is_carried_on() {
         for needle in [
             format!("RepoConfiguration already exists. Arn: {arn}").as_str(),
             "(Service: CodeConnections;",
-            // The tail states the status and the code the response itself carries.
-            "Status Code: 400;",
+            // The tail states the status the Git-sync component RAISED the exception with
+            // — the modelled `@httpError` of the shape — which on this legacy endpoint is
+            // not the status the response itself carries (see
+            // `state::with_framework_tail`).
+            "Status Code: 409;",
             "Error Code: ResourceAlreadyExistsException;",
             "Proxy: null)",
         ] {

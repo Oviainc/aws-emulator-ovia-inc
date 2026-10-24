@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRepositoryLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRepositoryLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRepositoryLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports the repository link its `RepositoryLinkId` names
+//! out of this service's state, and refuses an id that resolves to no link. It is a pure
+//! REPORT — it writes nothing — and this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +148,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRepositoryLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRepositoryLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A pure report: it resolves the id in state and renders the stored row through
+        // the store's ONE projection onto the wire shape, so what this answers and what
+        // `CreateRepositoryLink` answered for the same link are the same record. Nothing
+        // is written, so reading a link never perturbs what a later caller sees.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetRepositoryLinkErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "CodeStar connections state is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        // An id this service holds no link under names a resource that is ABSENT, which
+        // is the modeled `ResourceNotFoundException`. The modeled `InvalidInputException`
+        // is for a value that is malformed rather than unresolvable, and the `@pattern`
+        // on `RepositoryLinkId` is enforced by the boundary validator before this handler
+        // runs, so a value reaching here is well-formed and the only question left is
+        // whether it resolves.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRepositoryLink"))
+        // ANSWERED 400, not the `@httpError 404` the shape declares: see
+        // `state::REPOSITORY_LINK_NOT_FOUND_STATUS` for the recorded wire this follows.
+        let Some(record) = store.repository_links.get(&input.repository_link_id) else {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                GetRepositoryLinkErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::repository_link_not_found_message(
+                            &input.repository_link_id,
+                        )),
+                    },
+                ),
+                crate::state::REPOSITORY_LINK_NOT_FOUND_STATUS,
+            ));
+        };
+
+        Ok(GetRepositoryLinkOutput {
+            repository_link_info: record.to_repository_link_info(),
+        })
     }
 }

@@ -39,11 +39,21 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The upload plane
+//!
+//! `CreateUploadUrl` publishes an upload target as its `s3Url`, and such a URL is a
+//! promise that a client can perform the documented upload to it. The target is served
+//! here, through [`Service::can_handle`] (which also claims the upload host this service
+//! publishes) and [`Service::override_routing_error`] (which serves the `PUT`, a request
+//! that names no modelled operation by construction). See [`upload_plane`].
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+mod upload_plane;
 
 /// The error code this service answers a resource ARN that is not an ARN with.
 ///
@@ -85,6 +95,13 @@ fn is_malformed_resource_arn(violation: &Violation) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the generated entry threads into every operation.
+    ///
+    /// Held here because the upload plane is served from
+    /// [`Service::override_routing_error`], which is not an operation and so has no
+    /// `self.engine` of its own; it must read and write the one store the operations use,
+    /// not a second copy.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -93,7 +110,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
         }
     }
 }
@@ -110,10 +128,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+        if smithy_server_runtime::resolve_route_key(parts)
+            .is_some_and(|key| key == self.entry.identity().signing_name())
+        {
+            return true;
         }
+        // And a request addressed to the UPLOAD host this service publishes its upload
+        // targets under, whose first label names no service at all: without this the
+        // router answers `UnknownService` for a URL this service handed out. See the
+        // module docs.
+        request_host(parts).is_some_and(crate::state::is_upload_host)
     }
 
     fn override_operation(
@@ -166,10 +190,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501).
+        //
+        // A request to an upload target this service published is exactly that case by
+        // construction — the path is not in the model — so this is where the documented
+        // upload is received. The UPLOAD host decides: a request to this service's own
+        // endpoint that named no operation is a routing failure, whatever its path looks
+        // like, and keeps the framework's default.
+        if !upload_host_of(req).is_some_and(crate::state::is_upload_host) {
+            return None;
+        }
+        let target = crate::state::parse_upload_path(request_path(req.uri()))?;
+        Some(upload_plane::serve(&*self.engine, req, &target))
     }
 
     fn override_framework_error(
@@ -184,5 +216,46 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+/// The `Host` header of a buffered request, or the URI authority when the request is
+/// HTTP/2 (which carries `:authority` on the URI instead of a `Host` header).
+fn request_host(parts: &http::request::Parts) -> Option<&str> {
+    match parts.headers.get("host").and_then(|host| host.to_str().ok()) {
+        Some(host) => Some(host),
+        None => parts.uri.authority().map(http::uri::Authority::as_str),
+    }
+}
+
+/// The host a runtime-API request is addressed to: its `Host` header, or the authority of
+/// its URI when the request carries none (HTTP/2 names the endpoint there).
+fn upload_host_of(req: &aws_smithy_runtime_api::http::Request) -> Option<&str> {
+    match req.headers().get("host") {
+        Some(host) => Some(host),
+        None => request_authority(req.uri()),
+    }
+}
+
+/// The authority of an absolute request URI, or `None` when the URI carries none.
+fn request_authority(uri: &str) -> Option<&str> {
+    let (_scheme, authority_and_path) = uri.split_once("://")?;
+    Some(match authority_and_path.find('/') {
+        Some(path_start) => &authority_and_path[..path_start],
+        None => authority_and_path,
+    })
+}
+
+/// The path component of a request URI, with any scheme, authority and query removed.
+fn request_path(uri: &str) -> &str {
+    // The query is dropped FIRST: a query VALUE may carry `://`, which a scheme scan over
+    // the whole URI would mistake for the authority.
+    let without_query = uri.split('?').next().unwrap_or(uri);
+    match without_query.split_once("://") {
+        Some((_scheme, authority_and_path)) => match authority_and_path.find('/') {
+            Some(path_start) => &authority_and_path[path_start..],
+            None => "/",
+        },
+        None => without_query,
     }
 }

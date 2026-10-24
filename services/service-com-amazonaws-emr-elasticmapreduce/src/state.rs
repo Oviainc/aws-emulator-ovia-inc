@@ -2141,20 +2141,22 @@ pub const AUDIT_TARGET: &str = "emulator::audit";
 
 /// Emit the structured access record one state-changing call owes.
 ///
-/// A security configuration is created and deleted by name, and the effect on the store
-/// is otherwise invisible after the fact, so each branch that returns from such a call
-/// records it: the operation, the identity the request PRESENTED (its SigV4 access key
-/// id, an identifier and not a secret), the request target it named, and the outcome.
-/// The subscriber supplies the timestamp.
+/// Every branch that returns from such a call records it: the operation, the resource it
+/// names, the identity the request PRESENTED (its SigV4 access key id, an identifier and
+/// not a secret), the request target it named, and the outcome. The subscriber supplies
+/// the timestamp. A security configuration is created and deleted by name and a cluster
+/// is launched under a minted id, and in both cases the effect on the store is otherwise
+/// invisible after the fact, which is what the record attributes. A call that only
+/// REPORTS leaves no record: it changed nothing to attribute.
 ///
 /// There is no network peer in the record because a Smithy handler is not given one:
 /// `OperationContext::parts()` carries the request's method, URI, headers and
 /// extensions, and nothing in this framework puts a peer address in them.
 ///
-/// Deliberately metadata only: no configuration document is logged, so a caller's own
-/// data never reaches the log. Every interpolated value is request-derived, so
-/// [`audit_field`] bounds it and strips the control characters that would otherwise let
-/// one request forge a second record.
+/// Deliberately metadata only: no configuration document and no part of a cluster's
+/// configuration is logged, so a caller's own data never reaches the log. Every
+/// interpolated value is request-derived, so [`audit_field`] bounds it and strips the
+/// control characters that would otherwise let one request forge a second record.
 pub fn audit(
     operation: &str,
     resource: &str,
@@ -2198,6 +2200,8 @@ pub enum AuditOutcome {
     SecurityConfigurationCreated,
     /// A stored security configuration was deleted.
     SecurityConfigurationDeleted,
+    /// A cluster (job flow) was launched and persisted, under the id EMR minted for it.
+    ClusterLaunched,
     /// The request was refused as invalid (400).
     ValidationRefused,
     /// The name is already taken (400 `InvalidRequestException`).
@@ -2216,6 +2220,7 @@ impl AuditOutcome {
         match self {
             Self::SecurityConfigurationCreated => "security-configuration-created",
             Self::SecurityConfigurationDeleted => "security-configuration-deleted",
+            Self::ClusterLaunched => "cluster-launched",
             Self::ValidationRefused => "validation-refused",
             Self::Conflict => "conflict",
             Self::QuotaExceeded => "quota-exceeded",

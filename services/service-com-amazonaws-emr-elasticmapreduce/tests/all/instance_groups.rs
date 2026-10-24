@@ -22,7 +22,14 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::job_flow_lifecycle::{assert_minted_id, assert_refused, at, kept_alive_request, Emr};
+use crate::job_flow_lifecycle::{
+    assert_minted_id, assert_refused, at, kept_alive_request, Emr, REQUEST_TARGET,
+};
+use crate::security_configurations::audit_capture;
+
+/// This suite's own access key id, which no other suite presents, so the process-wide
+/// audit capture can tell its records from a sibling's.
+const AUDIT_AKID: &str = "AKIDEMRINSTANCEGROUPS";
 
 /// Longer than the service's clock-owed transition span (500 ms), so a group that was
 /// `PROVISIONING`, and a cluster that was `TERMINATING`, has reached its next state by
@@ -817,4 +824,168 @@ async fn list_instance_groups_refuses_an_unknown_cluster() {
             assert_refused(label, status, &payload, "ValidationException");
         }
     }
+}
+
+/// THE RULE: launching a cluster CHANGES this service's state, so `RunJobFlow` leaves
+/// exactly ONE structured audit record — on its refusal branches too — naming the
+/// operation, the resource (the minted cluster id when one was minted, else the name the
+/// request asked for), the presented access key id, the request target and the outcome,
+/// and carrying no part of the request's own configuration. `ListInstanceGroups` only
+/// reports, so it leaves none.
+#[tokio::test]
+async fn launching_a_cluster_emits_one_audit_record_and_listing_its_groups_emits_none() {
+    let capture = audit_capture();
+    let emr = Emr::with_akid(AUDIT_AKID);
+
+    // Harness self-test, so a failure below can never be mistaken for a missing record.
+    tracing::info!(target: "emulator::audit", access_key_id = AUDIT_AKID, "probe");
+    let probe = capture.drain_audit_records(AUDIT_AKID);
+    assert_eq!(
+        probe.len(),
+        1,
+        "the capture harness must see an audit record emitted on this thread, got {probe:?}"
+    );
+
+    // A value that must never reach the log, carried in the part of the request that
+    // describes the cluster rather than names it.
+    let secret = "not-in-the-log";
+    let configured = json!({
+        "KeepJobFlowAliveWhenNoSteps": true,
+        "InstanceGroups": [{
+            "Name": secret,
+            "InstanceRole": "MASTER",
+            "InstanceType": "m5.xlarge",
+            "InstanceCount": 1,
+            "Configurations": [{
+                "Classification": "spark-defaults",
+                "Properties": { "spark.executor.extraJavaOptions": secret },
+            }],
+        }],
+    });
+    let too_many_groups: Vec<Value> = (0..=MAX_INSTANCE_GROUPS_PER_CLUSTER)
+        .map(|_| json!({ "InstanceRole": "TASK", "InstanceType": "m5.xlarge", "InstanceCount": 1 }))
+        .collect();
+
+    // (label, the cluster name the request carries, its Instances member, the outcome it
+    // must record). `None` for the expected resource means "the id the launch minted".
+    let audited = [
+        (
+            "a launch that persists a cluster",
+            "audited-launch",
+            configured.clone(),
+            "cluster-launched",
+            None,
+        ),
+        (
+            "a launch past the instance group maximum",
+            "refused-bound",
+            json!({ "KeepJobFlowAliveWhenNoSteps": true, "InstanceGroups": too_many_groups }),
+            "validation-refused",
+            Some("refused-bound"),
+        ),
+        (
+            "a launch carrying groups and fleets at once",
+            "refused-both",
+            json!({
+                "InstanceGroups": [{
+                    "InstanceRole": "MASTER", "InstanceType": "m5.xlarge", "InstanceCount": 1,
+                }],
+                "InstanceFleets": [{
+                    "InstanceFleetType": "MASTER",
+                    "TargetOnDemandCapacity": 1,
+                    "InstanceTypeConfigs": [{ "InstanceType": "m5.xlarge" }],
+                }],
+            }),
+            "validation-refused",
+            Some("refused-both"),
+        ),
+        (
+            "a launch whose group asks for too many EBS volumes",
+            "refused-volumes",
+            json!({
+                "KeepJobFlowAliveWhenNoSteps": true,
+                "InstanceGroups": [{
+                    "InstanceRole": "CORE",
+                    "InstanceType": "m5.xlarge",
+                    "InstanceCount": 1,
+                    "EbsConfiguration": {
+                        "EbsBlockDeviceConfigs": [{
+                            "VolumeSpecification": { "VolumeType": "gp2", "SizeInGB": 32 },
+                            "VolumesPerInstance": MAX_EBS_VOLUMES_PER_INSTANCE + 1,
+                        }],
+                    },
+                }],
+            }),
+            "validation-refused",
+            Some("refused-volumes"),
+        ),
+    ];
+
+    let mut launched = String::new();
+    for (label, name, instances, outcome, expected_resource) in audited {
+        let (_, payload) = emr
+            .call("RunJobFlow", launch(name, instances.clone()))
+            .await;
+        let records = capture.drain_audit_records(AUDIT_AKID);
+        assert_eq!(
+            records.len(),
+            1,
+            "case {label:?}: expected exactly one audit record, captured {records:?}"
+        );
+        let record = &records[0];
+        let resource = match expected_resource {
+            Some(resource) => resource.to_string(),
+            None => {
+                launched = payload["JobFlowId"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("case {label:?}: no JobFlowId in {payload}"))
+                    .to_string();
+                launched.clone()
+            }
+        };
+        for (field, expected) in [
+            ("operation", "RunJobFlow"),
+            ("resource", resource.as_str()),
+            ("outcome", outcome),
+            ("access_key_id", AUDIT_AKID),
+            ("request_target", REQUEST_TARGET),
+        ] {
+            assert_eq!(
+                record.field(field),
+                Some(expected),
+                "case {label:?}: expected {field}={expected:?}, got {record:?}"
+            );
+        }
+        // Metadata only: no part of the submitted cluster configuration is logged.
+        let rendered = format!("{record:?}");
+        assert!(
+            !rendered.contains(secret),
+            "case {label:?}: the record must carry no part of the configuration, got {rendered}"
+        );
+    }
+
+    // Reporting calls record nothing: there is no state change to attribute.
+    let groups = list_all_groups(&emr, "audited-launch", &launched).await;
+    assert_eq!(
+        groups.len(),
+        1,
+        "case \"audited-launch\": the launched cluster must report its group, got {groups:?}"
+    );
+    let (status, _) = emr
+        .call("ListInstanceGroups", json!({ "ClusterId": "j-NOSUCHCLUSTER" }))
+        .await;
+    assert_eq!(status, 400, "an unknown cluster id must still be refused");
+    let (status, _) = emr
+        .call(
+            "ListInstanceGroups",
+            json!({ "ClusterId": &launched, "Marker": "ig-NOSUCHGROUP" }),
+        )
+        .await;
+    assert_eq!(status, 400, "an unknown marker must still be refused");
+    let leaked = capture.drain_audit_records(AUDIT_AKID);
+    assert!(
+        leaked.is_empty(),
+        "case \"reporting calls\": a reporting operation must emit no audit record, \
+         captured {leaked:?}"
+    );
 }

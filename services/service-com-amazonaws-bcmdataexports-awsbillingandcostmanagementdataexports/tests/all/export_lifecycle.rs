@@ -751,8 +751,15 @@ async fn an_export_round_trips_through_persisted_state() {
             description: Some(format!("updated {}", case.label)),
             query_statement: "SELECT line_item_resource_id FROM COST_AND_USAGE_REPORT".to_string(),
             queried_tables: vec!["COST_AND_USAGE_REPORT"],
+            // `line_item_resource_id` is one of the columns the table publishes only while
+            // INCLUDE_RESOURCES is TRUE, so the update that selects it states that value:
+            // a query may only name the columns in force under the configuration it
+            // states (`query_column_selection`).
             table_configurations: Some(json!({
-                "COST_AND_USAGE_REPORT": { "TIME_GRANULARITY": "MONTHLY" }
+                "COST_AND_USAGE_REPORT": {
+                    "TIME_GRANULARITY": "MONTHLY",
+                    "INCLUDE_RESOURCES": "TRUE",
+                }
             })),
             bucket_owner: Some("210987654321"),
             output: (
