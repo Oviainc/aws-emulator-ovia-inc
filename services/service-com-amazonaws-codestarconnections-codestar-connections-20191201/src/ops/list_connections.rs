@@ -212,12 +212,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             if !store.hosts.contains_key(host_arn) {
-                return Err(ListConnectionsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::host_not_found_message(host_arn)),
-                    },
-                )
-                .into());
+                return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                    ListConnectionsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::host_not_found_message(host_arn)),
+                        },
+                    ),
+                    crate::state::RESOURCE_NOT_FOUND_STATUS,
+                ));
             }
         }
         let ordered = store.connections_in_creation_order();

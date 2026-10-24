@@ -38,6 +38,13 @@
 //! [`ApplicationDatabase::summary`]) — which is what `ListDatabases` reports, so a
 //! database cannot outlive the registration it came from.
 //!
+//! What a configuration check RUN produced hangs off that same record: the sub-check
+//! results in [`StoredConfigurationCheckOperation::sub_check_results`], each holding the
+//! rule results of its own sub-check ([`StoredSubCheckResult::rule_results`]), which is
+//! what `ListSubCheckResults` and `ListSubCheckRuleResults` page over. So a result a
+//! caller can read is one some run produced, and it is forgotten exactly when the run
+//! that produced it is.
+//!
 //! Resource permissions work the same way: `PutResourcePermission` grants and
 //! `GetResourcePermission` reads the SAME triples in [`RegionState::resource_permissions`],
 //! and the `Policy` document both report is PROJECTED from them by
@@ -50,7 +57,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Application, ApplicationCredential, ApplicationSummary, ConfigurationCheckOperation,
     ConflictException, DatabaseSummary, Filter, InternalServerException, Operation,
-    ResourceNotFoundException, ValidationException, CONFIGURATION_CHECK_TYPE_VALUES,
+    ResourceNotFoundException, RuleResult, SubCheckResult, ValidationException,
+    CONFIGURATION_CHECK_TYPE_VALUES,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -545,6 +553,99 @@ pub const CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE: &str =
     "This emulator holds no SAP system to evaluate configuration check rules against, \
      so no rule results were produced for this check.";
 
+/// The result of ONE rule a sub-check evaluated: the record `ListSubCheckRuleResults`
+/// reports, held inside the [`StoredSubCheckResult`] it belongs to.
+///
+/// A rule result exists only because a rule was evaluated, so these records are written
+/// by the check run that produced them and by nothing else: no read mints one, and a
+/// `RuleResultId` a caller holds therefore always names a result that was produced.
+#[derive(Debug, Clone)]
+pub struct StoredRuleResult {
+    /// The `RuleResultId`, a UUID — the form the model's pattern describes.
+    pub id: String,
+    pub description: Option<String>,
+    /// A `RuleResultStatus` value (see
+    /// [`crate::ops::types::RULE_RESULT_STATUS_VALUES`]).
+    pub status: Option<String>,
+    pub message: Option<String>,
+    /// `RuleResultMetadata`, in key order: a `BTreeMap` so two reads of an unchanged
+    /// result render the same document.
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl StoredRuleResult {
+    /// Project the stored rule result onto the modelled `RuleResult`.
+    ///
+    /// A member this record does not hold is reported ABSENT rather than as an empty
+    /// value, so a caller can tell "nothing was recorded" from "recorded as empty".
+    pub fn view(&self) -> RuleResult {
+        RuleResult {
+            id: Some(self.id.clone()),
+            description: self.description.clone(),
+            status: self.status.clone(),
+            message: self.message.clone(),
+            metadata: if self.metadata.is_empty() {
+                None
+            } else {
+                Some(self.metadata.iter().map(|(key, value)| (key.clone(), value.clone())).collect())
+            },
+        }
+    }
+}
+
+/// The result of ONE sub-check of a configuration check operation: the record
+/// `ListSubCheckResults` reports, holding the rule results
+/// `ListSubCheckRuleResults` reports for it.
+///
+/// A sub-check result belongs to the check operation that ran it
+/// ([`StoredConfigurationCheckOperation::sub_check_results`]), so it lives and dies with
+/// that record: deregistering the application forgets the operation and with it every
+/// sub-check result and rule result the run produced.
+#[derive(Debug, Clone)]
+pub struct StoredSubCheckResult {
+    /// The `SubCheckResultId`, a UUID — the form the model's pattern describes.
+    pub id: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    /// `SubCheckReferencesList`: the references the sub-check cites.
+    pub references: Vec<String>,
+    /// The rule results this sub-check produced, which is what
+    /// `ListSubCheckRuleResults` pages over.
+    pub rule_results: Vec<StoredRuleResult>,
+}
+
+impl StoredSubCheckResult {
+    /// Project the stored sub-check result onto the modelled `SubCheckResult`.
+    ///
+    /// As with [`StoredRuleResult::view`], a member this record does not hold is
+    /// reported absent rather than invented.
+    pub fn view(&self) -> SubCheckResult {
+        SubCheckResult {
+            id: Some(self.id.clone()),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            references: if self.references.is_empty() {
+                None
+            } else {
+                Some(self.references.clone())
+            },
+        }
+    }
+
+    /// This sub-check's rule results in the order a listing reports and pages them: by
+    /// their own `RuleResultId`.
+    ///
+    /// Id order is a stable order independent of how the records happen to be held, so
+    /// the call that hands out a `NextToken` and the call that resumes from it walk the
+    /// results in the SAME order — which is what makes a resumed page continue where the
+    /// previous one stopped instead of repeating or skipping a result.
+    pub fn rule_results_in_id_order(&self) -> Vec<&StoredRuleResult> {
+        let mut ordered: Vec<&StoredRuleResult> = self.rule_results.iter().collect();
+        ordered.sort_by(|left, right| left.id.cmp(&right.id));
+        ordered
+    }
+}
+
 /// A configuration check operation: one requested check, running against one
 /// registered application. The record `GetConfigurationCheckOperation` reads.
 #[derive(Debug, Clone)]
@@ -562,6 +663,15 @@ pub struct StoredConfigurationCheckOperation {
     pub end_time: Option<SystemTime>,
     /// When this check's terminal status falls due. See [`TRANSITION_SPAN`].
     pub terminal_due_at: SystemTime,
+    /// The sub-check results this run produced, which is what `ListSubCheckResults`
+    /// pages over and where `ListSubCheckRuleResults` resolves a `SubCheckResultId`.
+    ///
+    /// A run of this emulator evaluates no rule, for the reason
+    /// [`CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE`] states, so it produces no
+    /// sub-check result either: the two listings report what the run produced, and a
+    /// run that produced nothing is reported as holding nothing rather than as
+    /// something invented.
+    pub sub_check_results: Vec<StoredSubCheckResult>,
 }
 
 impl StoredConfigurationCheckOperation {
@@ -603,6 +713,20 @@ impl StoredConfigurationCheckOperation {
             end_time: self.end_time.map(::aws_smithy_types::DateTime::from),
             rule_status_counts: None,
         }
+    }
+
+    /// This run's sub-check results in the order a listing reports and pages them: by
+    /// their own `SubCheckResultId`, for the reason
+    /// [`StoredSubCheckResult::rule_results_in_id_order`] gives.
+    pub fn sub_check_results_in_id_order(&self) -> Vec<&StoredSubCheckResult> {
+        let mut ordered: Vec<&StoredSubCheckResult> = self.sub_check_results.iter().collect();
+        ordered.sort_by(|left, right| left.id.cmp(&right.id));
+        ordered
+    }
+
+    /// The sub-check result of THIS run that `id` names, if it produced one.
+    pub fn sub_check_result(&self, id: &str) -> Option<&StoredSubCheckResult> {
+        self.sub_check_results.iter().find(|result| result.id == id)
     }
 
     /// The value a `ListConfigurationCheckOperations` filter whose `Name` is `name`
@@ -943,6 +1067,10 @@ impl RegionState {
             // A check that has not finished has no end time yet.
             end_time: None,
             terminal_due_at: now + TRANSITION_SPAN,
+            // The results a run produces are written by the run; see
+            // [`StoredConfigurationCheckOperation::sub_check_results`] for why a run of
+            // this emulator produces none.
+            sub_check_results: Vec::new(),
         };
         self.configuration_check_operations
             .insert(record.id.clone(), record.clone());
@@ -951,6 +1079,19 @@ impl RegionState {
             StoredConfigurationCheckOperation::eviction_rank,
         );
         record
+    }
+
+    /// The sub-check result `id` names, wherever in this Region it was produced.
+    ///
+    /// A sub-check result is identified by its own id alone — `ListSubCheckRuleResults`
+    /// takes no operation id beside it — so the lookup spans this Region's configuration
+    /// check operations and stops at the run that produced it. It is scoped to ONE
+    /// Region like every other lookup here: a result produced at another regional
+    /// endpoint does not resolve through this one.
+    pub fn sub_check_result(&self, id: &str) -> Option<&StoredSubCheckResult> {
+        self.configuration_check_operations
+            .values()
+            .find_map(|check| check.sub_check_result(id))
     }
 
     /// The configuration check operation for `check_id` that is still running against
@@ -1371,6 +1512,29 @@ pub fn no_registered_application(reference: &str) -> ValidationException {
         "No registered application found for account: {}, and application: {reference}",
         ::engine::emulator_account_id()
     ))
+}
+
+/// Why an `OperationId` that names no configuration check operation of this account and
+/// Region is refused.
+///
+/// The operations that take one (`GetConfigurationCheckOperation`,
+/// `ListSubCheckResults`) model no 404, so an id that resolves to nothing is the
+/// `ValidationException` they do model — and both refuse it in the same words, naming
+/// the id, so a caller can tell the two apart only by the call it made.
+pub fn no_configuration_check_operation_message(operation_id: &str) -> String {
+    format!(
+        "No configuration check operation with ID {operation_id} exists in this account and Region"
+    )
+}
+
+/// Why a `SubCheckResultId` that names no sub-check result of this account and Region is
+/// refused, for the same reason as [`no_configuration_check_operation_message`]:
+/// `ListSubCheckRuleResults` models no 404, so an id that resolves to nothing is its
+/// `ValidationException`.
+pub fn no_sub_check_result_message(sub_check_result_id: &str) -> String {
+    format!(
+        "No sub-check result with ID {sub_check_result_id} exists in this account and Region"
+    )
 }
 
 /// This service's modelled `ResourceNotFoundException` (HTTP 404) carrying `message`.

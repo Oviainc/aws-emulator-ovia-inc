@@ -364,7 +364,7 @@ async fn a_created_repository_link_is_held_until_a_delete_removes_it() {
             .call("ListTagsForResource", json!({ "ResourceArn": arn }))
             .await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {case:?}: expected the deleted link's ARN to name no resource, got \
              {status} {body}"
         );
@@ -618,7 +618,7 @@ async fn a_delete_removes_exactly_the_link_its_id_names() {
                     .call("ListTagsForResource", json!({ "ResourceArn": arn }))
                     .await;
                 assert_eq!(
-                    status, 404,
+                    status, 400,
                     "case {case:?}: the deleted link {index} must be gone, got {status} {body}"
                 );
                 assert_eq!(

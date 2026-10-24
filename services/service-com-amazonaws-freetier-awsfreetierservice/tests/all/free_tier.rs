@@ -49,7 +49,7 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Call one operation and return its HTTP status and JSON body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("https://freetier.us-east-1.amazonaws.com/")
@@ -87,7 +87,7 @@ pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Valu
 }
 
 /// The wire error code (`__type`) of an error body, without its namespace.
-fn error_code(payload: &Value) -> String {
+pub(crate) fn error_code(payload: &Value) -> String {
     payload["__type"]
         .as_str()
         .unwrap_or_default()
@@ -675,8 +675,10 @@ async fn activity_detail_agrees_with_its_summary() {
     }
 }
 
-/// An id that could name an activity but names none is a 404; an id that cannot
-/// be an `ActivityId` at all is a 400. The two failures are different claims.
+/// An id that could name an activity but names none is refused as
+/// `ResourceNotFoundException`; an id that cannot be an `ActivityId` at all is
+/// refused as `ValidationException`. The two failures are different claims, and
+/// this service answers both with the status it sends for that error shape.
 #[tokio::test]
 async fn unknown_and_malformed_activity_ids_are_told_apart() {
     let router = router();
@@ -696,7 +698,7 @@ async fn unknown_and_malformed_activity_ids_are_told_apart() {
             &router,
             "GetAccountActivity",
             &json!({"activityId": id}),
-            404,
+            400,
             "ResourceNotFoundException",
         )
         .await;
