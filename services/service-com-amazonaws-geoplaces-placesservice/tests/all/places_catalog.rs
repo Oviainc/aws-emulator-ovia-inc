@@ -1492,21 +1492,61 @@ async fn a_requested_political_view_is_reported_in_alpha_three_form() {
     }
 }
 
-/// Suggest is not implemented yet, and says so with HTTP 501 rather than an empty
-/// success.
+/// No operation this service binds answers HTTP 501 any more: Suggest was the
+/// last scaffold, so every route reports behaviour computed from the catalog.
+///
+/// The rows are every operation in this crate's `OPERATIONS.md`, so a service
+/// whose scaffold census is wrong fails here rather than silently.
 #[tokio::test]
-async fn the_operations_this_slice_leaves_out_still_answer_501() {
+async fn every_operation_this_service_binds_answers_rather_than_501() {
     let emulator = Emulator::new();
-    for (case, path) in [("suggest", "/v2/suggest")] {
-        let call = emulator
-            .post(path, &json!({"QueryText": "Space Needle"}))
-            .await;
+    let place = emulator
+        .catalog()
+        .first()
+        .cloned()
+        .expect("the seeded catalog holds places");
+    let position = json!([place.position[0], place.position[1]]);
+    for (case, path, body) in [
+        (
+            "Autocomplete",
+            "/v2/autocomplete",
+            json!({"QueryText": "Space Needle"}),
+        ),
+        ("Geocode", "/v2/geocode", json!({"QueryText": "Space Needle"})),
+        (
+            "ReverseGeocode",
+            "/v2/reverse-geocode",
+            json!({"QueryPosition": position, "QueryRadius": 1}),
+        ),
+        (
+            "SearchNearby",
+            "/v2/search-nearby",
+            json!({"QueryPosition": position, "QueryRadius": 1}),
+        ),
+        (
+            "SearchText",
+            "/v2/search-text",
+            json!({"QueryText": "Space Needle"}),
+        ),
+        ("Suggest", "/v2/suggest", json!({"QueryText": "Space Needle"})),
+    ] {
+        let call = emulator.post(path, &body).await;
         assert_eq!(
             call.status,
-            501,
-            "case {case}: an unimplemented operation must answer 501, got {} with {}",
+            200,
+            "case {case}: expected the operation to answer 200, got {} with {}",
             call.status,
             String::from_utf8_lossy(&call.body)
         );
     }
+
+    // GetPlace is the one operation reached by GET.
+    let call = emulator.get(&format!("/v2/place/{}", place.place_id)).await;
+    assert_eq!(
+        call.status,
+        200,
+        "case GetPlace: expected the operation to answer 200, got {} with {}",
+        call.status,
+        String::from_utf8_lossy(&call.body)
+    );
 }
