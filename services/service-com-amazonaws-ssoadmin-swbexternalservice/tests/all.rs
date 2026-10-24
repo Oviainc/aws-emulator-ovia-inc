@@ -39,6 +39,8 @@ mod instance_delete;
 mod instance_describe;
 #[path = "all/instance_region_removal.rs"]
 mod instance_region_removal;
+#[path = "all/instance_region_status.rs"]
+mod instance_region_status;
 #[path = "all/instance_regions.rs"]
 mod instance_regions;
 #[path = "all/instance_update.rs"]

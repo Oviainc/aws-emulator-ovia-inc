@@ -203,19 +203,19 @@ async fn each_put_lexicon_refusal_carries_the_sentence_for_its_own_code() {
         ),
         (
             "an unsupported alphabet",
-            r#"<lexicon version="1.0" alphabet="x-klingon" xml:lang="en-US"/>"#.to_string(),
+            r#"<lexicon xmlns="http://www.w3.org/2005/01/pronunciation-lexicon" version="1.0" alphabet="x-klingon" xml:lang="en-US"/>"#.to_string(),
             "InvalidLexiconException",
             "Invalid PLS Lexicon",
         ),
         (
             "an unsupported language",
-            r#"<lexicon version="1.0" alphabet="ipa" xml:lang="xx-ZZ"/>"#.to_string(),
+            r#"<lexicon xmlns="http://www.w3.org/2005/01/pronunciation-lexicon" version="1.0" alphabet="ipa" xml:lang="xx-ZZ"/>"#.to_string(),
             "UnsupportedPlsLanguageException",
             "Unsupported PLS language",
         ),
         (
             "another unsupported language",
-            r#"<lexicon version="1.0" alphabet="ipa" xml:lang="klingon"/>"#.to_string(),
+            r#"<lexicon xmlns="http://www.w3.org/2005/01/pronunciation-lexicon" version="1.0" alphabet="ipa" xml:lang="klingon"/>"#.to_string(),
             "UnsupportedPlsLanguageException",
             "Unsupported PLS language",
         ),
