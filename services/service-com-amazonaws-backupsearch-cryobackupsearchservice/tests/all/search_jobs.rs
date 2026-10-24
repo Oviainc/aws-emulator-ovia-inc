@@ -1133,9 +1133,12 @@ async fn tags_added_after_creation_join_the_ones_stored_at_creation() {
     {
         let tagged = call(&emulator, "us-west-2", "POST", &tags_uri, Some(body)).await;
         assert_eq!(
-            tagged.status, 200,
-            "case {case:?}: expected 200 from TagResource, got {} ({:?})",
-            tagged.status, tagged.body
+            tagged.status,
+            state::NO_CONTENT_SUCCESS_STATUS,
+            "case {case:?}: expected {} from TagResource, got {} ({:?})",
+            state::NO_CONTENT_SUCCESS_STATUS,
+            tagged.status,
+            tagged.body
         );
         let listed = call(&emulator, "us-west-2", "GET", &tags_uri, None).await;
         let actual: BTreeMap<String, String> = listed
@@ -1252,9 +1255,17 @@ async fn a_tag_set_past_the_caps_that_bound_one_record_is_refused() {
         .await;
         let tags_uri = format!("/tags/{}", percent_encode(&job.string("SearchJobArn")));
         let tagged = call(&on_merge, "us-west-2", "POST", &tags_uri, Some(tags)).await;
+        // A refused write answers the modelled error's status; an accepted one answers
+        // this service's no-content success status, since `TagResourceResponse` is empty
+        // and its success code is defaulted in the model.
+        let expected_on_merge = if expected_status == 400 {
+            expected_status
+        } else {
+            state::NO_CONTENT_SUCCESS_STATUS
+        };
         assert_eq!(
-            tagged.status, expected_status,
-            "case {case:?} at TagResource: expected {expected_status}, got {} ({:?})",
+            tagged.status, expected_on_merge,
+            "case {case:?} at TagResource: expected {expected_on_merge}, got {} ({:?})",
             tagged.status, tagged.body
         );
         if expected_status == 400 {
@@ -1348,4 +1359,30 @@ fn one_tag(key: String, value: String) -> Value {
 /// the segment. The framework percent-decodes the label before the handler sees it.
 pub(crate) fn percent_encode(segment: &str) -> String {
     segment.replace('/', "%2F")
+}
+
+/// A query-string value with every byte outside RFC 3986's unreserved set
+/// percent-encoded, for the `@httpQuery`-bound members (`UntagResource$TagKeys`).
+///
+/// `+` in particular HAS to be escaped: a query value is decoded with `+` meaning a
+/// space, so an unescaped `+` would name a different tag key than the stored one.
+/// [`percent_encode`] above is the path-label encoder (it escapes only `/`) and cannot
+/// serve a query value, so the two live side by side here — one encoder each, shared by
+/// every suite rather than copied into them.
+///
+/// Written out rather than pulled from `percent-encoding`: a dependency edge is a
+/// `Cargo.lock` edit, and every concurrently landing fix rewrites that file, which made
+/// an earlier change unlandable (the gate's squash merge refused it with
+/// ManualMergeRequiredException on three successive submits that all ten reviewers had
+/// approved). Eight lines, test-only, over values these suites write themselves.
+pub(crate) fn query_value(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(byte).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
 }

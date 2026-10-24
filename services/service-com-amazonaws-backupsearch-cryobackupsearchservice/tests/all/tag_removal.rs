@@ -17,9 +17,11 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
+
 // The crate's ONE HTTP test harness lives in the search-job suite; both suites drive the
 // same emulator the same way, so it is shared rather than written twice.
-use crate::search_jobs::{call, emulator, percent_encode, Answer};
+use crate::search_jobs::{call, emulator, percent_encode, query_value, Answer};
 
 /// The region every call in this suite is signed for. The rule does not vary by region
 /// (the search-job suite already walks the regions), so one is enough here.
@@ -61,29 +63,6 @@ fn untag_uri(arn: &str, keys: &[&str]) -> String {
         .map(|key| format!("tagKeys={}", query_value(key)))
         .collect();
     format!("/tags/{}?{}", percent_encode(arn), query.join("&"))
-}
-
-/// A query-string value with every byte outside RFC 3986's unreserved set
-/// percent-encoded. `+` in particular HAS to be escaped: a query value is decoded with
-/// `+` meaning a space, so an unescaped `+` would name a different key than the one
-/// stored. The sibling suite's `percent_encode` is the path-label encoder (it escapes
-/// only `/`), which cannot serve a query value.
-///
-/// Written out here rather than pulled from `percent-encoding`: a dependency edge is a
-/// `Cargo.lock` edit, and every concurrently landing fix rewrites that file, which made
-/// this change unlandable (the gate's squash merge refused it with
-/// ManualMergeRequiredException on three successive submits that all ten reviewers had
-/// approved). Eight lines, test-only, over values this file writes.
-fn query_value(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                char::from(byte).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
 }
 
 /// The tags `ListTagsForResource` reports for `arn`, as a sorted map so a comparison does
@@ -253,9 +232,12 @@ async fn untag_removes_exactly_the_named_keys_and_leaves_the_rest() {
     {
         let removed = call(&emulator, REGION, "DELETE", &untag_uri(&arn, keys), None).await;
         assert_eq!(
-            removed.status, 200,
-            "case {case:?}: UntagResource must answer 200, got {} ({:?})",
-            removed.status, removed.body
+            removed.status,
+            state::NO_CONTENT_SUCCESS_STATUS,
+            "case {case:?}: UntagResource must answer {}, got {} ({:?})",
+            state::NO_CONTENT_SUCCESS_STATUS,
+            removed.status,
+            removed.body
         );
         assert!(
             removed.error_code.is_none(),
@@ -290,17 +272,23 @@ async fn untag_is_idempotent_so_repeating_a_call_reports_the_same_set() {
         let uri = untag_uri(&arn, keys);
         let first = call(&emulator, REGION, "DELETE", &uri, None).await;
         assert_eq!(
-            first.status, 200,
-            "case {case:?}: the first UntagResource must be 200, got {} ({:?})",
-            first.status, first.body
+            first.status,
+            state::NO_CONTENT_SUCCESS_STATUS,
+            "case {case:?}: the first UntagResource must be {}, got {} ({:?})",
+            state::NO_CONTENT_SUCCESS_STATUS,
+            first.status,
+            first.body
         );
         let after_first = stored_tags(&emulator, &arn).await;
 
         let again = call(&emulator, REGION, "DELETE", &uri, None).await;
         assert_eq!(
-            again.status, 200,
-            "case {case:?}: repeating UntagResource must be 200, got {} ({:?})",
-            again.status, again.body
+            again.status,
+            state::NO_CONTENT_SUCCESS_STATUS,
+            "case {case:?}: repeating UntagResource must be {}, got {} ({:?})",
+            state::NO_CONTENT_SUCCESS_STATUS,
+            again.status,
+            again.body
         );
         let after_second = stored_tags(&emulator, &arn).await;
         assert_eq!(
@@ -337,9 +325,12 @@ async fn untag_touches_only_the_resource_its_arn_names() {
     )
     .await;
     assert_eq!(
-        untagged.status, 200,
-        "UntagResource must answer 200, got {} ({:?})",
-        untagged.status, untagged.body
+        untagged.status,
+        state::NO_CONTENT_SUCCESS_STATUS,
+        "UntagResource must answer {}, got {} ({:?})",
+        state::NO_CONTENT_SUCCESS_STATUS,
+        untagged.status,
+        untagged.body
     );
 
     let left = stored_tags(&emulator, &first).await;

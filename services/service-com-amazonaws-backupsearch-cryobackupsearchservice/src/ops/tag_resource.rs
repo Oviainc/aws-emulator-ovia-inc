@@ -7,6 +7,8 @@
 //! `ListTagsForResource` then returns the merged set. An ARN no resource of this account
 //! matches is a `ResourceNotFoundException` (404).
 //!
+//! A success answers HTTP 204 with no content: see `SUCCESS_STATUS` below.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -132,7 +134,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // `TagResourceResponse` has NO members and the model states no success code for this
+    // operation (`http: {code: 200, codeDefaulted: true}`), so there is no content to
+    // report and the status is this service's own behavioural fact:
+    // [`crate::state::NO_CONTENT_SUCCESS_STATUS`], which documents the rule and the one
+    // empty-output operation it does not cover.
+    const SUCCESS_STATUS: u16 = crate::state::NO_CONTENT_SUCCESS_STATUS;
 
     async fn handle(
         &self,

@@ -25,5 +25,7 @@ mod search_job_outcome_and_paging;
 mod search_jobs;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/success_status.rs"]
+mod success_status;
 #[path = "all/tag_removal.rs"]
 mod tag_removal;

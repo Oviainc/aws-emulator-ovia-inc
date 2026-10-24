@@ -43,6 +43,25 @@ use crate::ops::types::{
     SearchScope, SearchScopeSummary,
 };
 
+/// The HTTP status a successful call of this service that has NO content to report
+/// answers with.
+///
+/// The three tag operations all leave their success code DEFAULTED in the model (`@http`
+/// carries no `code:`, i.e. `smithy_query(query="operation", operation="TagResource")`
+/// reports `code: 200, codeDefaulted: true`), so the Smithy default of 200 is not a
+/// statement about this service: the status is a behavioural fact and the recorded AWS
+/// responses are what state it. Of those three, the two whose output is a declared
+/// structure with NO members — `TagResourceResponse` and `UntagResourceResponse` — have
+/// no content to parse and are answered with 204 No Content. A 200 there promises a body
+/// the response does not carry, so every client path gated on 204 (conditional body
+/// parsing, caches and proxies that key on it) takes the wrong branch.
+///
+/// The third, `ListTagsForResource`, keeps the defaulted 200: its output declares `Tags`,
+/// so it HAS content to report. Nor does this extend to `StopSearchJob`, whose output
+/// structure is just as empty but whose model carries an EXPLICIT `@http(code: 200)` (no
+/// `codeDefaulted`): there the model states the status, so it keeps 200.
+pub const NO_CONTENT_SUCCESS_STATUS: u16 = 204;
+
 /// The `SearchJobState` values the model declares, so no handler spells one as a bare
 /// literal. The full set is `ops::types::SEARCH_JOB_STATE_VALUES`.
 pub const RUNNING: &str = "RUNNING";

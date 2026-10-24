@@ -27,7 +27,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
-use crate::search_jobs::{call, emulator, percent_encode, Answer, PAST_THE_DUE_INSTANT};
+use crate::search_jobs::{
+    call, emulator, percent_encode, query_value, Answer, PAST_THE_DUE_INSTANT,
+};
 
 /// Which of this service's taggable resources a row addresses. The set is the resources
 /// the model gives both an ARN of this service and a `TagMap` on the operation that mints
@@ -217,23 +219,6 @@ async fn untag_resource(
     .await
 }
 
-/// A query-string value with every byte outside RFC 3986's unreserved set
-/// percent-encoded. `+` in particular HAS to be escaped: a query value is decoded with
-/// `+` meaning a space, so an unescaped `+` would name a different key than the stored
-/// one. (The sibling suites' `percent_encode` is the path-label encoder, which escapes
-/// only `/` and cannot serve a query value.)
-fn query_value(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                char::from(byte).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
-}
-
 /// Start a search job carrying `tags` and bring it to `STOPPED`, which is a status an
 /// export may be started from. Answers its identifier and its ARN.
 async fn stopped_search_job(
@@ -349,9 +334,12 @@ async fn the_tags_of_every_resource_this_service_mints_are_read_back_added_to_an
         //    are left as they were.
         let tagged = tag_resource(&emulator, region, &arn, added.clone()).await;
         assert_eq!(
-            tagged.status, 200,
-            "case {case:?}: TagResource must answer 200, got {} ({:?})",
-            tagged.status, tagged.body
+            tagged.status,
+            state::NO_CONTENT_SUCCESS_STATUS,
+            "case {case:?}: TagResource must answer {}, got {} ({:?})",
+            state::NO_CONTENT_SUCCESS_STATUS,
+            tagged.status,
+            tagged.body
         );
         let mut expected = as_map(&created_with);
         expected.extend(as_map(&added));
@@ -364,9 +352,12 @@ async fn the_tags_of_every_resource_this_service_mints_are_read_back_added_to_an
         // 3. UntagResource removes exactly the keys it names, present or not.
         let untagged = untag_resource(&emulator, region, &arn, removed).await;
         assert_eq!(
-            untagged.status, 200,
-            "case {case:?}: UntagResource must answer 200, got {} ({:?})",
-            untagged.status, untagged.body
+            untagged.status,
+            state::NO_CONTENT_SUCCESS_STATUS,
+            "case {case:?}: UntagResource must answer {}, got {} ({:?})",
+            state::NO_CONTENT_SUCCESS_STATUS,
+            untagged.status,
+            untagged.body
         );
         for key in removed {
             expected.remove(*key);
@@ -427,15 +418,21 @@ async fn a_tag_write_touches_only_the_resource_its_arn_names() {
 
         let tagged = tag_resource(&emulator, region, addressed, json!({"written": case})).await;
         assert_eq!(
-            tagged.status, 200,
-            "case {case:?}: TagResource must answer 200, got {} ({:?})",
-            tagged.status, tagged.body
+            tagged.status,
+            state::NO_CONTENT_SUCCESS_STATUS,
+            "case {case:?}: TagResource must answer {}, got {} ({:?})",
+            state::NO_CONTENT_SUCCESS_STATUS,
+            tagged.status,
+            tagged.body
         );
         let untagged = untag_resource(&emulator, region, addressed, &["env"]).await;
         assert_eq!(
-            untagged.status, 200,
-            "case {case:?}: UntagResource must answer 200, got {} ({:?})",
-            untagged.status, untagged.body
+            untagged.status,
+            state::NO_CONTENT_SUCCESS_STATUS,
+            "case {case:?}: UntagResource must answer {}, got {} ({:?})",
+            state::NO_CONTENT_SUCCESS_STATUS,
+            untagged.status,
+            untagged.body
         );
 
         let written = stored_tags(&emulator, region, case, addressed).await;
