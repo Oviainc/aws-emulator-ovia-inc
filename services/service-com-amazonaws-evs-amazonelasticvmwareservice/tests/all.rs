@@ -50,5 +50,7 @@ mod state_roundtrip;
 mod tagging_not_found;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;
+#[path = "all/versions_catalog.rs"]
+mod versions_catalog;
 #[path = "all/vlan_subnet_propagation.rs"]
 mod vlan_subnet_propagation;

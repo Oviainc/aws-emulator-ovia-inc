@@ -43,10 +43,11 @@
 //! ONCE with one `ValidationException` whose `fieldList` carries an entry per failure —
 //! the shape `CreateEnvironment` answers with. A refused request adds nothing.
 //!
-//! `esxVersion` is stored as supplied and reported by nothing: the modelled `Host`
-//! shape carries no ESX version member, and the catalogue that would resolve the
-//! default version for an environment's VCF version is `GetVersions`, which still
-//! answers 501.
+//! `esxVersion` is stored as the version the host RUNS: the one the request named, or
+//! — when it named none — the default ESX version the service's own version catalogue
+//! gives the environment's VCF version ([`crate::state::default_esx_version`], the
+//! catalogue `GetVersions` reports). It is reported by nothing, because the modelled
+//! `Host` shape carries no ESX version member.
 //!
 //! ## Shape of an operation
 //!
@@ -334,10 +335,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         });
+        // "If you don't specify an ESX version when adding hosts using
+        // CreateEnvironmentHost action, Amazon EVS automatically uses the default ESX
+        // version for your environment's VCF version" (this operation's doc): the
+        // version the host runs is the request's when it named one, and otherwise the
+        // default this service's own catalogue gives this environment's VCF version —
+        // the same catalogue `GetVersions` reports. A VCF version the catalogue knows no
+        // Bill Of Materials for resolves to no version at all, rather than to a made-up
+        // one.
+        let esx_version = input.esx_version.clone().or_else(|| {
+            crate::state::default_esx_version(&environment.vcf_version).map(str::to_string)
+        });
         let host = crate::state::StoredHost::creating(
             &input.host,
             ip_address,
-            input.esx_version,
+            esx_version,
             created_at_ms,
             ec2,
             pending,
