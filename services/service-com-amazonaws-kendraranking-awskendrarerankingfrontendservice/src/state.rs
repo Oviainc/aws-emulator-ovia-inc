@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use aws_smithy_schema_server::constraints::path;
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
@@ -352,6 +353,117 @@ impl RescoreExecutionPlan {
         self.status = transient.to_string();
         self.pending_status = Some(PendingStatus::due_after_transient_span(settled, now_millis));
     }
+}
+
+// ---------------------------------------------------------------------------
+// The character set a tag key or value may be built from.
+//
+// "A tag key and value can consist of Unicode letters, digits, white space, and
+// any of the following symbols: _ . : / = + - @." (`Tag` in the model). Neither
+// `TagKey` nor `TagValue` carries a `@pattern`, so the boundary validator cannot
+// refuse a character outside that set: the rule is stated here instead, and every
+// operation that takes a tag key or value from the request applies it before it
+// writes anything.
+// ---------------------------------------------------------------------------
+
+/// The symbols a tag key or value may use beside Unicode letters, digits and white
+/// space (`Tag` in the model names exactly these eight).
+pub const TAG_SYMBOLS: [char; 8] = ['_', '.', ':', '/', '=', '+', '-', '@'];
+
+/// The key prefix AWS reserves for itself, so a caller may not write a tag under it.
+/// Matched against [`normalized_tag_key`], since a tag key is case-insensitive here
+/// ("Keys are not case sensitive and must be unique." — `Tag$Key`).
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether every character of `text` is one a tag key or value may be built from.
+pub fn tag_text_is_permitted(text: &str) -> bool {
+    text.chars()
+        .all(|c| c.is_alphanumeric() || c.is_whitespace() || TAG_SYMBOLS.contains(&c))
+}
+
+/// Whether `key` lies under the prefix AWS reserves for its own tags.
+pub fn tag_key_is_reserved(key: &str) -> bool {
+    normalized_tag_key(key).starts_with(RESERVED_TAG_KEY_PREFIX)
+}
+
+/// The requirement clause a key or value outside the documented character set failed.
+fn tag_character_requirement() -> String {
+    let symbols: Vec<String> = TAG_SYMBOLS.iter().map(char::to_string).collect();
+    format!(
+        "Member must consist of Unicode letters, digits, white space and the symbols {}",
+        symbols.join(" ")
+    )
+}
+
+/// The requirement clause a key under the reserved prefix failed.
+fn tag_key_prefix_requirement() -> String {
+    format!("Member must not begin with the reserved prefix {RESERVED_TAG_KEY_PREFIX}")
+}
+
+/// The dotted path of a member of the `position`-th element of the request list
+/// `list`, spelled the way the boundary validator spells one (`tags.1.member.key`).
+/// `member` is omitted for a list whose element IS the value (`tagKeys.1.member`).
+fn element_path(list: &str, position: usize, member: Option<&str>) -> String {
+    let mut segments = vec![list.to_string(), path::element(position)];
+    if let Some(member) = member {
+        segments.push(path::member(member));
+    }
+    path::join(&segments)
+}
+
+/// The modelled `ValidationException` the tags of a write are refused with, or `None`
+/// when every key and value is one the service admits.
+///
+/// Every offending key and value is reported, in request order, so a caller is told
+/// about all of them at once — the standard AWS report. A request this refuses is
+/// refused WHOLE: the caller applies it before writing any tag.
+pub fn tag_set_rejection(list_member: &str, tags: &[Tag]) -> Option<ValidationException> {
+    let mut clauses = Vec::new();
+    for (index, tag) in tags.iter().enumerate() {
+        let position = index + 1;
+        if !tag_text_is_permitted(&tag.key) {
+            clauses.push(clause(
+                &element_path(list_member, position, Some("Key")),
+                &tag_character_requirement(),
+            ));
+        } else if tag_key_is_reserved(&tag.key) {
+            // The reserved prefix is only worth stating for a key the service would
+            // otherwise have taken: a key outside the character set already failed.
+            clauses.push(clause(
+                &element_path(list_member, position, Some("Key")),
+                &tag_key_prefix_requirement(),
+            ));
+        }
+        if !tag_text_is_permitted(&tag.value) {
+            clauses.push(clause(
+                &element_path(list_member, position, Some("Value")),
+                &tag_character_requirement(),
+            ));
+        }
+    }
+    (!clauses.is_empty()).then(|| ValidationException {
+        message: Some(validation_report(&clauses)),
+    })
+}
+
+/// [`tag_set_rejection`] for a list of bare tag keys: the same character set, since
+/// these are `TagKey` values too. The reserved prefix is not stated here — it bounds
+/// the keys a caller may WRITE, and a key it refuses can never be held.
+pub fn tag_key_rejection(list_member: &str, keys: &[String]) -> Option<ValidationException> {
+    let clauses: Vec<String> = keys
+        .iter()
+        .enumerate()
+        .filter(|(_, key)| !tag_text_is_permitted(key))
+        .map(|(index, _)| {
+            clause(
+                &element_path(list_member, index + 1, None),
+                &tag_character_requirement(),
+            )
+        })
+        .collect();
+    (!clauses.is_empty()).then(|| ValidationException {
+        message: Some(validation_report(&clauses)),
+    })
 }
 
 /// The form of a tag key two spellings of the same key share: its lowercasing.
