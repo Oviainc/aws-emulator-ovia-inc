@@ -81,7 +81,7 @@ pub const HOST_STATUS_DELETE_BLOCKED: &[&str] = &[
 /// Region used when a request carries no SigV4 credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// The page size `ListConnections` applies when the caller asks for none.
+/// The page size a paginated list operation applies when the caller asks for none.
 ///
 /// `MaxResults` is modeled `range 0..100` with `default 0`, so an omitted member
 /// arrives as `0` — indistinguishable from "no page size requested". The modeled
@@ -217,11 +217,11 @@ impl StoredRepositoryLink {
 ///
 /// One record per `HostArn`, holding every member of the modeled `Host` shape the API
 /// can observe, so an operation that reports or deletes a host works off this one row
-/// rather than recomputing one. `CreateHost` writes the row, `GetHost` renders it
-/// through [`StoredHost::to_host`], and `DeleteHost` reads [`StoredHost::status`] (the
-/// delete is refused while the host's VPC configuration is in flight) before removing
-/// the whole record. `ListHosts` and `UpdateHost` report and update this same row (each
-/// still a scaffold with its own open issue).
+/// rather than recomputing one. `CreateHost` writes the row, `GetHost` and `ListHosts`
+/// render it through [`StoredHost::to_host`], and `DeleteHost` reads
+/// [`StoredHost::status`] (the delete is refused while the host's VPC configuration is in
+/// flight) before removing the whole record. `UpdateHost` updates this same row (still a
+/// scaffold with its own open issue).
 #[derive(Debug, Clone)]
 pub struct StoredHost {
     /// `Name` as supplied at create.
@@ -238,6 +238,9 @@ pub struct StoredHost {
     pub status: String,
     /// The status description, when the service has one to report.
     pub status_message: Option<String>,
+    /// Creation order, and the value `ListHosts`' `NextToken` resumes from. Drawn from
+    /// the same store counter as a connection's, so no two records share one.
+    pub sequence: u64,
 }
 
 impl StoredHost {
@@ -301,6 +304,17 @@ impl ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
         let mut connections: Vec<&StoredConnection> = self.connections.values().collect();
         connections.sort_unstable_by_key(|connection| connection.sequence);
         connections
+    }
+
+    /// Every host in creation order — the order `ListHosts` pages over.
+    ///
+    /// Borrowed, not cloned, for the same reason as
+    /// [`Self::connections_in_creation_order`]: the request sorts POINTERS and clones
+    /// only the page it returns.
+    pub fn hosts_in_creation_order(&self) -> Vec<&StoredHost> {
+        let mut hosts: Vec<&StoredHost> = self.hosts.values().collect();
+        hosts.sort_unstable_by_key(|host| host.sequence);
+        hosts
     }
 
     /// The repository link already registered for this connection, owner and repository,

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListHosts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListHosts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListHosts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages over the hosts held in [`crate::state`] in creation order. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -79,12 +72,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codestarconnections-cod
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `ListHostsError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codestarconnections#ListHosts")]
+// here — hence the `ListHostsError` alias below. This operation declares NO error of
+// its own, so every variant here is widened in through `extra_errors`:
+// `InternalServerException` is the service's own shape (see `types::shared_types`) and
+// is the only honest answer for "this service is mounted on an engine that holds no
+// state" — a 400 would blame the caller's request and a 501 would claim the operation
+// is unwritten.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codestarconnections#ListHosts",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListHostsErrorModeled {
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -138,18 +138,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListHosts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListHostsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListHosts"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListHostsErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "CodeStar connections state is unavailable on this engine".to_string(),
+                ),
+            })
+        })?;
+
+        // `MaxResults` is modeled `range 0..100` with `default 0`, so an omitted page
+        // size arrives as 0 and means "no page size requested".
+        let page_size = match usize::try_from(input.max_results) {
+            Ok(0) | Err(_) => crate::state::MAX_PAGE_SIZE,
+            Ok(requested) => requested.min(crate::state::MAX_PAGE_SIZE),
+        };
+
+        // The cursor is this service's own opaque token; nothing else is a valid one.
+        let resume_from = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_next_token(token).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(format!(
+                    "NextToken is not a pagination token issued by this service: {token}"
+                ))
+            })?,
+        };
+
+        let store = state.lock();
+        // The ordered suffix the cursor names: every host from the resume point on, of
+        // which the page below is the first `page_size`.
+        let mut from_cursor = store
+            .hosts_in_creation_order()
+            .into_iter()
+            .filter(|host| host.sequence >= resume_from);
+
+        // Only this page is CLONED into the response, plus a peek at the one record
+        // that says where the next page starts; ordering the store's hosts beforehand
+        // is what makes that resume point well defined.
+        let hosts: Vec<Host> = from_cursor
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::StoredHost::to_host)
+            .collect();
+        // A token is emitted only when a further page exists, and it names where that
+        // page starts — so paging through N hosts yields each exactly once.
+        let next_token = from_cursor
+            .next()
+            .map(|host| crate::state::encode_next_token(host.sequence));
+        drop(store);
+
+        Ok(ListHostsOutput {
+            hosts: Some(hosts),
+            next_token,
+        })
     }
 }
