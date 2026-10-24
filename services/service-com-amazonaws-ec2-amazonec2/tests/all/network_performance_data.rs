@@ -659,10 +659,11 @@ async fn an_unanswerable_request_is_refused() {
             "InvalidParameterValue",
         ),
         // `Metric`, `Statistic` and `Period` target the modelled `MetricType`,
-        // `StatisticType` and `PeriodType` enums, so a value outside one of them is refused
-        // by the centralized modelled-constraint walk ahead of the handler, which answers
-        // `ValidationError`. Either way the request is refused, never answered as a series
-        // with no data.
+        // `StatisticType` and `PeriodType` enums, and `MaxResults` a modelled `@range`, so a
+        // value outside one of them is refused by the centralized modelled-constraint walk
+        // ahead of the handler — with the boundary's own code rather than the one the handler
+        // answers for the values it checks itself. Either way the request is refused, never
+        // answered as a series with no data.
         (
             "a metric outside the modelled enum".to_string(),
             with(&well_formed, "Metric", "aggregate-throughput"),
@@ -695,6 +696,9 @@ async fn an_unanswerable_request_is_refused() {
                 params
             },
             400,
+            // `MaxResults` carries no modelled bound here, so the HANDLER is what refuses a
+            // page that would hold no result — with EC2's own code for a value it cannot
+            // accept.
             "InvalidParameterValue",
         ),
         (
@@ -801,8 +805,9 @@ async fn an_unanswerable_request_is_refused() {
     // A series is named by its source, destination, metric, statistic and aggregation
     // period: a query leaving any of them out names no series, and an empty value names
     // nothing either. The second code is the one an EMPTY value earns: a free-form string
-    // member is missing, while an enum member's empty value is outside its enum and so is
-    // refused by the modelled-constraint walk first.
+    // member is missing, so the handler refuses it with EC2's own `MissingParameter`, while
+    // an enum member's empty value is outside its enum and so is refused by the
+    // modelled-constraint walk first, with the boundary's own code.
     for (member, empty_code) in [
         ("Source", "MissingParameter"),
         ("Destination", "MissingParameter"),

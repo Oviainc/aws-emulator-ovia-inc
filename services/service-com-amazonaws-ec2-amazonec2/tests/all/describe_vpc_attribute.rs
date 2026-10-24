@@ -433,8 +433,8 @@ async fn a_dry_run_reports_the_outcome_without_reporting_the_attribute() {
 /// The rule: an `Attribute` outside the model's `VpcAttributeName` enum is a BAD REQUEST,
 /// refused with HTTP 400 — never a 501, which would say the operation is unimplemented, and
 /// never a 200 reporting some attribute the request did not ask about. The enum constraint
-/// the model declares is what refuses it, before the handler runs, so the code is
-/// `ValidationError`.
+/// the model declares is what refuses it, before the handler runs, with the boundary's own
+/// code for a value outside a declared constraint.
 ///
 /// The rows differ in how the value misses the enum: a near-miss in casing, a name of a
 /// SUBNET attribute, and an empty value.
@@ -463,7 +463,7 @@ async fn describe_vpc_attribute_refuses_an_attribute_outside_the_enum() {
         assert_eq!(
             code, "ValidationError",
             "case {case:?}: expected the modelled enum constraint to refuse the value \
-             with ValidationError, got {code:?} in {body}"
+             at the boundary, got {code:?} in {body}"
         );
         assert!(
             code != "NotImplemented",
