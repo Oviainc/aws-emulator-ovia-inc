@@ -14,6 +14,9 @@
 #[path = "all/agent_contexts.rs"]
 mod agent_contexts;
 
+#[path = "all/agent_goal_listing.rs"]
+mod agent_goal_listing;
+
 #[path = "all/agent_goals.rs"]
 mod agent_goals;
 
