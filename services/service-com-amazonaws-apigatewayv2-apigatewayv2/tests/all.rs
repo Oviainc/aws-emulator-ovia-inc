@@ -45,3 +45,5 @@ mod service_claim;
 mod stage_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/vpc_link_lifecycle.rs"]
+mod vpc_link_lifecycle;
