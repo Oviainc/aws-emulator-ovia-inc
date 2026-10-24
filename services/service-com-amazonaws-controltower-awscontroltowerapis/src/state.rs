@@ -11,14 +11,30 @@
 //! the landing zone it acted on, so `GetLandingZoneOperation` still resolves the
 //! identifier a `DeleteLandingZone` returned.
 //!
-//! RETENTION: that log is append-only only WITHIN a bound. It is the one store here a
-//! caller can grow by repeating calls — the landing zone and tag maps are capped at the
-//! single landing zone an account may hold — so it retains at most
-//! [`MAX_LANDING_ZONE_OPERATIONS`] records, evicting the oldest TERMINAL record to make
-//! room (see [`ComAmazonawsControltowerAwscontroltowerapisState::record_operation`]).
-//! That cap also bounds the per-request scan [`settle`] runs under the state lock.
+//! Baselines work the same way one level down: an `EnabledBaseline` is a baseline applied
+//! to a target, and `EnableBaseline`/`DisableBaseline` each start an asynchronous
+//! operation whose record lands in a SECOND log keyed by `operationIdentifier`
+//! ([`ComAmazonawsControltowerAwscontroltowerapisState::baseline_operations`]), which
+//! `GetBaselineOperation` resolves. The two logs are separate: an identifier a landing
+//! zone call returned is not a baseline operation and vice versa.
+//!
+//! RETENTION: every store a caller can grow by repeating calls is BOUNDED, so ordinary
+//! request traffic cannot grow this process's heap, or the per-request scan [`settle`]
+//! runs under the state lock, without limit:
+//!
+//! * `landing_zones` holds the one landing zone an account may have;
+//! * the two operation logs are append-only only WITHIN a bound, retaining at most
+//!   [`MAX_LANDING_ZONE_OPERATIONS`] / [`MAX_BASELINE_OPERATIONS`] records and evicting
+//!   the oldest TERMINAL record to make room (see [`enforce_log_bound`]);
+//! * `enabled_baselines` holds at most [`MAX_ENABLED_BASELINES`] enablements, and
+//!   `EnableBaseline` is REFUSED past that cap rather than growing the store (see
+//!   [`record_enablement`]), because an enablement is a resource a caller must tear down
+//!   rather than a history record a newer one may evict;
+//! * `tags` is keyed by the ARNs of the two stores above, and an entry is dropped with
+//!   the resource it tags, so it is bounded by them.
 //!
 //! [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
+//! [`record_enablement`]: ComAmazonawsControltowerAwscontroltowerapisState::record_enablement
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
@@ -31,8 +47,8 @@ pub const ARN_NAMESPACE: &str = "controltower";
 /// read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// How long a landing zone operation stays `IN_PROGRESS` before the clock owes it a
-/// terminal status.
+/// How long an asynchronous operation — a landing zone one or a baseline one — stays
+/// `IN_PROGRESS` before the clock owes it a terminal status.
 ///
 /// `CreateLandingZone`/`DeleteLandingZone` "start an asynchronous operation" (model
 /// docs), so a caller must be able to observe `IN_PROGRESS` and a `PROCESSING` landing
@@ -51,6 +67,29 @@ pub const OPERATION_SETTLE_AFTER: Duration = Duration::from_millis(500);
 /// is CHOSEN: large enough that no lifecycle an emulator client drives reaches it, small
 /// enough to bound the store.
 pub const MAX_LANDING_ZONE_OPERATIONS: usize = 1024;
+
+/// The most baseline operation records the log retains.
+///
+/// Same reasoning, and the same CHOSEN size, as [`MAX_LANDING_ZONE_OPERATIONS`]: a record
+/// stays resolvable through `GetBaselineOperation` until the log is full, at which point
+/// the oldest terminal record is evicted. Counted separately because the two logs are
+/// separate stores, so a busy baseline caller cannot evict landing zone history.
+pub const MAX_BASELINE_OPERATIONS: usize = 1024;
+
+/// The most `EnabledBaseline` resources this account may hold at once.
+///
+/// Unlike an operation log, this store holds RESOURCES: a caller tears an enablement down
+/// with `DisableBaseline`, so nothing here may be evicted to make room for a newer one
+/// without losing a resource its owner still has. `EnableBaseline` is therefore refused
+/// past this cap with the `ServiceQuotaExceededException` the model declares for it ("The
+/// request would cause a service quota to be exceeded"), which both keeps the store
+/// — and the per-request [`settle`] scan — bounded and is the answer AWS gives when an
+/// account is at its limit. AWS publishes its own Control Tower quotas; this value is
+/// CHOSEN: far above any lifecycle an emulator client drives, small enough to bound the
+/// store.
+///
+/// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
+pub const MAX_ENABLED_BASELINES: usize = 512;
 
 /// The newest landing zone version this emulator's catalog offers.
 ///
@@ -185,6 +224,115 @@ pub struct LandingZoneOperation {
     pub due_at: SystemTime,
 }
 
+/// `BaselineOperationType`: which call produced a baseline operation record.
+///
+/// Wire values from the model's `BaselineOperationType` enum (`ENABLE_BASELINE` |
+/// `DISABLE_BASELINE` | `UPDATE_ENABLED_BASELINE` | `RESET_ENABLED_BASELINE`), which is
+/// exactly the set of calls `GetBaselineOperation` documents as starting one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaselineOperationType {
+    EnableBaseline,
+    DisableBaseline,
+    UpdateEnabledBaseline,
+    ResetEnabledBaseline,
+}
+
+impl BaselineOperationType {
+    /// The value this operation type serializes as.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::EnableBaseline => "ENABLE_BASELINE",
+            Self::DisableBaseline => "DISABLE_BASELINE",
+            Self::UpdateEnabledBaseline => "UPDATE_ENABLED_BASELINE",
+            Self::ResetEnabledBaseline => "RESET_ENABLED_BASELINE",
+        }
+    }
+}
+
+/// `BaselineOperationStatus`: how far a baseline operation has got.
+///
+/// Wire values from the model's `BaselineOperationStatus` enum
+/// (`SUCCEEDED` | `FAILED` | `IN_PROGRESS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaselineOperationStatus {
+    InProgress,
+    Succeeded,
+    Failed,
+}
+
+impl BaselineOperationStatus {
+    /// The value this status serializes as.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::InProgress => "IN_PROGRESS",
+            Self::Succeeded => "SUCCEEDED",
+            Self::Failed => "FAILED",
+        }
+    }
+}
+
+/// `EnablementStatus`: the deployment status of an enabled resource.
+///
+/// Wire values from the model's `EnablementStatus` enum, reported through
+/// `EnablementStatusSummary$status` (`SUCCEEDED` | `FAILED` | `UNDER_CHANGE`, where
+/// `UNDER_CHANGE` is "the configuration is changing").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnablementStatus {
+    Succeeded,
+    Failed,
+    UnderChange,
+}
+
+impl EnablementStatus {
+    /// The value this status serializes as.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Succeeded => "SUCCEEDED",
+            Self::Failed => "FAILED",
+            Self::UnderChange => "UNDER_CHANGE",
+        }
+    }
+}
+
+/// A persisted `EnabledBaseline`: one baseline applied to one target.
+///
+/// `parameters` keeps the caller's `EnabledBaselineParameters` as key/`Document` pairs in
+/// the order supplied, so the enablement parameters a later reporting call reports are the
+/// ones `EnableBaseline` was given.
+#[derive(Debug, Clone)]
+pub struct EnabledBaseline {
+    pub arn: String,
+    pub baseline_identifier: String,
+    pub baseline_version: String,
+    pub target_identifier: String,
+    pub parameters: Vec<(String, ::aws_smithy_types::Document)>,
+    /// `EnablementStatusSummary$status`, derived from the log by [`settle`].
+    ///
+    /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
+    pub status: EnablementStatus,
+    /// `EnablementStatusSummary$lastOperationIdentifier`: the most recent operation
+    /// started against this resource.
+    pub last_operation_identifier: String,
+    pub created_at: SystemTime,
+}
+
+/// One entry of the baseline operation log.
+#[derive(Debug, Clone)]
+pub struct BaselineOperationRecord {
+    pub operation_identifier: String,
+    pub operation_type: BaselineOperationType,
+    /// The `EnabledBaseline` this operation acted on. Kept even after that resource is
+    /// gone, so a `DISABLE_BASELINE` identifier still resolves.
+    pub enabled_baseline_arn: String,
+    pub status: BaselineOperationStatus,
+    pub start_time: SystemTime,
+    pub end_time: Option<SystemTime>,
+    pub status_message: Option<String>,
+    /// The instant the clock owes this operation its terminal status. Stored, never
+    /// slept on: a reader materialises the transition once it is due.
+    pub due_at: SystemTime,
+}
+
 /// Per-service state for com-amazonaws-controltower-awscontroltowerapis. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsControltowerAwscontroltowerapisState {
@@ -194,8 +342,13 @@ pub struct ComAmazonawsControltowerAwscontroltowerapisState {
     /// The operation log, keyed by `operationIdentifier`. Append-only up to
     /// [`MAX_LANDING_ZONE_OPERATIONS`] records; see the module header on retention.
     pub landing_zone_operations: HashMap<String, LandingZoneOperation>,
+    /// Enabled baselines keyed by the `EnabledBaseline` ARN this service minted for them.
+    pub enabled_baselines: HashMap<String, EnabledBaseline>,
+    /// The baseline operation log, keyed by `operationIdentifier`. Append-only up to
+    /// [`MAX_BASELINE_OPERATIONS`] records; see the module header on retention.
+    pub baseline_operations: HashMap<String, BaselineOperationRecord>,
     /// Tags keyed by the tagged resource's ARN — the single home for this service's
-    /// tags, written by `CreateLandingZone`'s `tags` member.
+    /// tags, written by `CreateLandingZone`'s and `EnableBaseline`'s `tags` members.
     pub tags: HashMap<String, BTreeMap<String, String>>,
 }
 
@@ -230,6 +383,50 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
                 LandingZoneStatus::Processing
             } else {
                 LandingZoneStatus::Active
+            };
+        }
+
+        for operation in self.baseline_operations.values_mut() {
+            if operation.status == BaselineOperationStatus::InProgress && now >= operation.due_at {
+                operation.status = BaselineOperationStatus::Succeeded;
+                // The end time is when the operation became due, not when a caller
+                // happened to look, so repeated reads report one stable instant.
+                operation.end_time = Some(operation.due_at);
+            }
+        }
+
+        // A DISABLE_BASELINE that has reached its terminal status has finished tearing
+        // its `EnabledBaseline` down, so the resource is gone whether or not anybody
+        // called; its operation record stays, and still resolves.
+        let torn_down: Vec<String> = self
+            .baseline_operations
+            .values()
+            .filter(|operation| {
+                operation.operation_type == BaselineOperationType::DisableBaseline
+                    && operation.status == BaselineOperationStatus::Succeeded
+            })
+            .map(|operation| operation.enabled_baseline_arn.clone())
+            .collect();
+        for arn in torn_down {
+            self.enabled_baselines.remove(&arn);
+            // A tag entry never outlives the resource it tags, which is what keeps the
+            // tag map bounded by the two resource stores.
+            self.tags.remove(&arn);
+        }
+
+        let baseline_operations = &self.baseline_operations;
+        for (arn, enabled_baseline) in self.enabled_baselines.iter_mut() {
+            // A FAILED enablement is not re-derived from the log, for the same reason as
+            // a FAILED landing zone: a reader must not overwrite a failure.
+            if enabled_baseline.status == EnablementStatus::Failed {
+                continue;
+            }
+            enabled_baseline.status = if baseline_operation_in_flight(baseline_operations, arn)
+                .is_some()
+            {
+                EnablementStatus::UnderChange
+            } else {
+                EnablementStatus::Succeeded
             };
         }
     }
@@ -300,36 +497,217 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
                 due_at: now + OPERATION_SETTLE_AFTER,
             },
         );
-        self.enforce_operation_log_bound();
+        enforce_log_bound(
+            &mut self.landing_zone_operations,
+            MAX_LANDING_ZONE_OPERATIONS,
+        );
         operation_identifier
     }
 
-    /// Drop records until the log holds at most [`MAX_LANDING_ZONE_OPERATIONS`].
+    /// The stored ARN an `enabledBaselineIdentifier` names, or `None` when no enabled
+    /// baseline matches.
     ///
-    /// Evicts the oldest TERMINAL record first, so an operation a caller is still polling
-    /// is never dropped out from under it; only when every record is in flight does the
-    /// oldest overall go. The `start_time`/identifier pair orders the candidates totally,
-    /// so which record goes does not depend on the map's iteration order.
-    fn enforce_operation_log_bound(&mut self) {
-        while self.landing_zone_operations.len() > MAX_LANDING_ZONE_OPERATIONS {
-            let oldest = |terminal_only: bool| {
-                self.landing_zone_operations
-                    .values()
-                    .filter(|op| {
-                        !terminal_only || op.status != LandingZoneOperationStatus::InProgress
-                    })
-                    .min_by(|a, b| {
-                        (a.start_time, a.operation_identifier.as_str())
-                            .cmp(&(b.start_time, b.operation_identifier.as_str()))
-                    })
-                    .map(|op| op.operation_identifier.clone())
-            };
-            let Some(evicted) = oldest(true).or_else(|| oldest(false)) else {
-                break;
-            };
-            self.landing_zone_operations.remove(&evicted);
+    /// Accepts the full ARN (the map key) and the bare resource id that ARN ends in, the
+    /// same two forms [`resolve_landing_zone_arn`] accepts.
+    ///
+    /// [`resolve_landing_zone_arn`]: Self::resolve_landing_zone_arn
+    pub fn resolve_enabled_baseline_arn(&self, identifier: &str) -> Option<String> {
+        if self.enabled_baselines.contains_key(identifier) {
+            return Some(identifier.to_string());
         }
+        self.enabled_baselines
+            .keys()
+            .find(|arn| arn.split('/').next_back() == Some(identifier))
+            .cloned()
     }
+
+    /// The ARN of the enabled baseline that already applies `baseline_identifier` to
+    /// `target_identifier`, or `None` when that pair is not enabled. Call [`settle`]
+    /// first, so a pair whose DISABLE has become due reads as not enabled.
+    ///
+    /// [`settle`]: Self::settle
+    pub fn enabled_baseline_on_target(
+        &self,
+        baseline_identifier: &str,
+        target_identifier: &str,
+    ) -> Option<String> {
+        self.enabled_baselines
+            .values()
+            .filter(|enabled| {
+                enabled.baseline_identifier == baseline_identifier
+                    && enabled.target_identifier == target_identifier
+            })
+            // The ARN orders the candidates totally, so the answer does not depend on the
+            // map's iteration order.
+            .map(|enabled| enabled.arn.clone())
+            .min()
+    }
+
+    /// The identifier of the earliest-started baseline operation still `IN_PROGRESS`
+    /// against `arn`, or `None` when none is. Call [`settle`] first.
+    ///
+    /// [`settle`]: Self::settle
+    pub fn baseline_operation_in_flight(&self, arn: &str) -> Option<String> {
+        baseline_operation_in_flight(&self.baseline_operations, arn)
+    }
+
+    /// Append a baseline operation to its log and return its `operationIdentifier`.
+    ///
+    /// Enforces the log's retention bound ([`MAX_BASELINE_OPERATIONS`]) on the way out,
+    /// so this is the single place that log can grow.
+    pub fn record_baseline_operation(
+        &mut self,
+        operation_type: BaselineOperationType,
+        enabled_baseline_arn: &str,
+        now: SystemTime,
+    ) -> String {
+        let operation_identifier = new_operation_identifier();
+        self.baseline_operations.insert(
+            operation_identifier.clone(),
+            BaselineOperationRecord {
+                operation_identifier: operation_identifier.clone(),
+                operation_type,
+                enabled_baseline_arn: enabled_baseline_arn.to_string(),
+                status: BaselineOperationStatus::InProgress,
+                start_time: now,
+                end_time: None,
+                status_message: None,
+                due_at: now + OPERATION_SETTLE_AFTER,
+            },
+        );
+        enforce_log_bound(&mut self.baseline_operations, MAX_BASELINE_OPERATIONS);
+        operation_identifier
+    }
+
+    /// Persist an enablement and start its `ENABLE_BASELINE` operation, returning that
+    /// operation's `operationIdentifier`.
+    ///
+    /// `None` when the account already holds [`MAX_ENABLED_BASELINES`] enablements: the
+    /// request is then refused and NOTHING is written — neither the resource nor an
+    /// operation record. The single insertion site for `enabled_baselines`, so the cap
+    /// cannot be bypassed from a handler.
+    pub fn record_enablement(
+        &mut self,
+        arn: &str,
+        baseline_identifier: &str,
+        baseline_version: &str,
+        target_identifier: &str,
+        parameters: Vec<(String, ::aws_smithy_types::Document)>,
+        now: SystemTime,
+    ) -> Option<String> {
+        if self.enabled_baselines.len() >= MAX_ENABLED_BASELINES {
+            return None;
+        }
+
+        let operation_identifier = self.record_baseline_operation(
+            BaselineOperationType::EnableBaseline,
+            arn,
+            now,
+        );
+        self.enabled_baselines.insert(
+            arn.to_string(),
+            EnabledBaseline {
+                arn: arn.to_string(),
+                baseline_identifier: baseline_identifier.to_string(),
+                baseline_version: baseline_version.to_string(),
+                target_identifier: target_identifier.to_string(),
+                parameters,
+                // The enablement is changing until its ENABLE_BASELINE operation is due;
+                // the status is derived from the log by `settle`, and seeded to match.
+                status: EnablementStatus::UnderChange,
+                last_operation_identifier: operation_identifier.clone(),
+                created_at: now,
+            },
+        );
+        Some(operation_identifier)
+    }
+}
+
+/// One record of an asynchronous operation log, as the shared retention bound reads it.
+///
+/// Implemented by both logs' record types so [`enforce_log_bound`] is written once; the
+/// two logs hold different record shapes but retain them by the same rule.
+trait OperationLogRecord {
+    /// The record's `operationIdentifier`, which is also its key in the log.
+    fn identifier(&self) -> &str;
+    /// When the operation started.
+    fn start_time(&self) -> SystemTime;
+    /// Whether the operation has yet to reach a terminal status.
+    fn is_in_flight(&self) -> bool;
+}
+
+impl OperationLogRecord for LandingZoneOperation {
+    fn identifier(&self) -> &str {
+        &self.operation_identifier
+    }
+
+    fn start_time(&self) -> SystemTime {
+        self.start_time
+    }
+
+    fn is_in_flight(&self) -> bool {
+        self.status == LandingZoneOperationStatus::InProgress
+    }
+}
+
+impl OperationLogRecord for BaselineOperationRecord {
+    fn identifier(&self) -> &str {
+        &self.operation_identifier
+    }
+
+    fn start_time(&self) -> SystemTime {
+        self.start_time
+    }
+
+    fn is_in_flight(&self) -> bool {
+        self.status == BaselineOperationStatus::InProgress
+    }
+}
+
+/// Drop records until `log` holds at most `max_records`.
+///
+/// Evicts the oldest TERMINAL record first, so an operation a caller is still polling is
+/// never dropped out from under it; only when every record is in flight does the oldest
+/// overall go. The `start_time`/identifier pair orders the candidates totally, so which
+/// record goes does not depend on the map's iteration order.
+fn enforce_log_bound<R: OperationLogRecord>(log: &mut HashMap<String, R>, max_records: usize) {
+    while log.len() > max_records {
+        let oldest = |terminal_only: bool| {
+            log.values()
+                .filter(|record| !terminal_only || !record.is_in_flight())
+                .min_by(|a, b| {
+                    (a.start_time(), a.identifier()).cmp(&(b.start_time(), b.identifier()))
+                })
+                .map(|record| record.identifier().to_string())
+        };
+        let Some(evicted) = oldest(true).or_else(|| oldest(false)) else {
+            break;
+        };
+        log.remove(&evicted);
+    }
+}
+
+/// The identifier of the earliest-started operation in `operations` still `IN_PROGRESS`
+/// against the enabled baseline `arn`, or `None` when none is.
+///
+/// The single definition of "in flight" for baselines: `settle` derives an enabled
+/// baseline's status from it while holding a mutable borrow of the enabled baseline map,
+/// which is why it takes the operation map rather than `&self`.
+fn baseline_operation_in_flight(
+    operations: &HashMap<String, BaselineOperationRecord>,
+    arn: &str,
+) -> Option<String> {
+    operations
+        .values()
+        .filter(|operation| {
+            operation.enabled_baseline_arn == arn
+                && operation.status == BaselineOperationStatus::InProgress
+        })
+        .min_by(|a, b| {
+            (a.start_time, a.operation_identifier.as_str())
+                .cmp(&(b.start_time, b.operation_identifier.as_str()))
+        })
+        .map(|operation| operation.operation_identifier.clone())
 }
 
 /// Whether any operation in `operations` against `arn` is still `IN_PROGRESS`.
@@ -408,6 +786,27 @@ pub fn new_operation_identifier() -> String {
         let _ = write!(identifier, "{byte:02x}");
     }
     identifier
+}
+
+/// `arn:aws:controltower:<region>:<account>:enabledbaseline/<id>`.
+///
+/// Built through `engine::emulator_arn`, so the account segment is the emulator's
+/// canonical account id rather than a literal. Satisfies `Arn`'s
+/// `^arn:aws[0-9a-zA-Z_\-:\/]+$` pattern and its 20..2048 length.
+pub fn enabled_baseline_arn(region: &str, enabled_baseline_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("enabledbaseline/{enabled_baseline_id}"),
+    )
+}
+
+/// A fresh `EnabledBaseline` resource id, used as the ARN's resource segment.
+///
+/// The same 36-character lowercase-hex UUID form as an `OperationIdentifier`, which
+/// keeps the minted ARN inside `Arn`'s `^arn:aws[0-9a-zA-Z_\-:\/]+$` pattern.
+pub fn new_enabled_baseline_id() -> String {
+    new_operation_identifier()
 }
 
 /// A fresh landing zone resource id, used as the ARN's resource segment.
