@@ -21,6 +21,14 @@
 //! the description, the parameters, the platform types, the hash — is derived from the
 //! content that was persisted (see [`parse_document_content`]).
 //!
+//! A document a caller created is not the only one an account holds: Systems Manager
+//! also PUBLISHES a catalogue of its own documents ([`PUBLISHED_DOCUMENTS`]) in every
+//! account and Region, which resolve by name without anybody creating them and are
+//! owned by Amazon. A read goes through [`ComAmazonawsSsmAmazonssmState::resolve_document`],
+//! which answers with the created document of that name or, failing that, the published
+//! one — derived from the catalogue's body by the same content reader, so a published
+//! document reports nothing a created one would not.
+//!
 //! The third is the **managed nodes** the node describes report
 //! ([`ManagedNodeRecord`]), keyed by `(region, node id)`: `DescribeInstanceProperties`
 //! projects a node's `properties` and `DescribeInstanceInformation` projects the same
@@ -1303,6 +1311,473 @@ pub fn parse_document_content(
     })
 }
 
+// ---------------------------------------------------------------------------
+// The SSM documents Systems Manager publishes
+// ---------------------------------------------------------------------------
+
+/// The `Owner` a document Systems Manager publishes reports.
+///
+/// `Owner` is "the Amazon Web Services user that created the document"
+/// (`DocumentDescription$Owner`), and a published document was created by Amazon rather
+/// than by the account that reads it — the owner a listing selects it by
+/// (`ListDocuments`' `Owner` filter: `Self`, `Amazon`, `Public`, `Private`,
+/// `ThirdParty`).
+pub const PUBLISHED_DOCUMENT_OWNER: &str = "Amazon";
+
+/// One document of the catalogue Systems Manager publishes: present in every account and
+/// Region without anybody creating it, and readable — never writable — by the account
+/// that reads it.
+#[derive(Debug, Clone, Copy)]
+pub struct PublishedDocument {
+    /// The name the document resolves by, which is also what a read reports.
+    pub name: &'static str,
+    /// A `DocumentType` value (`crate::ops::types::DOCUMENT_TYPE_VALUES`).
+    pub document_type: &'static str,
+    /// The document's body, in [`DEFAULT_DOCUMENT_FORMAT`]. Everything a read reports
+    /// beyond the name and the type is derived from it by the one content reader
+    /// ([`parse_document_content`]), exactly as it is for a document a caller created.
+    pub content: &'static str,
+}
+
+/// The body of the runbook that configures versioning on an S3 bucket.
+///
+/// The parameters each published runbook takes are the ones the "Systems Manager
+/// Automation runbook reference" documents for it; the body below is this emulator's
+/// stand-in for the published body, declaring those parameters so a read derives them.
+const CONFIGURE_S3_BUCKET_VERSIONING: &str = r#"{
+  "schemaVersion": "0.3",
+  "description": "Configures versioning on an Amazon S3 bucket.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "default": ""
+    },
+    "BucketName": {
+      "type": "String",
+      "description": "(Required) The name of the S3 bucket to configure versioning on."
+    },
+    "VersioningState": {
+      "type": "String",
+      "description": "(Optional) The versioning state of the bucket.",
+      "default": "Enabled",
+      "allowedValues": ["Enabled", "Suspended"]
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "PutBucketVersioning",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "s3",
+        "Api": "PutBucketVersioning",
+        "Bucket": "{{ BucketName }}",
+        "VersioningConfiguration": { "Status": "{{ VersioningState }}" }
+      }
+    },
+    {
+      "name": "VerifyBucketVersioning",
+      "action": "aws:executeAwsApi",
+      "inputs": { "Service": "s3", "Api": "GetBucketVersioning", "Bucket": "{{ BucketName }}" }
+    }
+  ]
+}"#;
+
+/// The body of the runbook that blocks public access on an S3 bucket. See
+/// [`CONFIGURE_S3_BUCKET_VERSIONING`] for where the parameters come from.
+const CONFIGURE_S3_BUCKET_PUBLIC_ACCESS_BLOCK: &str = r#"{
+  "schemaVersion": "0.3",
+  "description": "Configures the public access block of an Amazon S3 bucket.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "default": ""
+    },
+    "BucketName": {
+      "type": "String",
+      "description": "(Required) The name of the S3 bucket to configure."
+    },
+    "BlockPublicAcls": {
+      "type": "Boolean",
+      "description": "(Optional) Whether Amazon S3 blocks public ACLs for this bucket.",
+      "default": true
+    },
+    "IgnorePublicAcls": {
+      "type": "Boolean",
+      "description": "(Optional) Whether Amazon S3 ignores public ACLs for this bucket.",
+      "default": true
+    },
+    "BlockPublicPolicy": {
+      "type": "Boolean",
+      "description": "(Optional) Whether Amazon S3 blocks public bucket policies for this bucket.",
+      "default": true
+    },
+    "RestrictPublicBuckets": {
+      "type": "Boolean",
+      "description": "(Optional) Whether Amazon S3 restricts public bucket policies for this bucket.",
+      "default": true
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "PutBucketPublicAccessBlock",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "s3",
+        "Api": "PutPublicAccessBlock",
+        "Bucket": "{{ BucketName }}",
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": "{{ BlockPublicAcls }}",
+          "IgnorePublicAcls": "{{ IgnorePublicAcls }}",
+          "BlockPublicPolicy": "{{ BlockPublicPolicy }}",
+          "RestrictPublicBuckets": "{{ RestrictPublicBuckets }}"
+        }
+      }
+    }
+  ]
+}"#;
+
+/// The body of the runbook that removes a bucket's public read and write grants. See
+/// [`CONFIGURE_S3_BUCKET_VERSIONING`] for where the parameters come from.
+const DISABLE_S3_BUCKET_PUBLIC_READ_WRITE: &str = r#"{
+  "schemaVersion": "0.3",
+  "description": "Removes the public read and write grants of an Amazon S3 bucket.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "default": ""
+    },
+    "S3BucketName": {
+      "type": "String",
+      "description": "(Required) The name of the S3 bucket whose public grants are removed."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "PutBucketAcl",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "s3",
+        "Api": "PutBucketAcl",
+        "Bucket": "{{ S3BucketName }}",
+        "ACL": "private"
+      }
+    }
+  ]
+}"#;
+
+/// The body of the runbook that turns on default encryption of an S3 bucket. See
+/// [`CONFIGURE_S3_BUCKET_VERSIONING`] for where the parameters come from.
+const ENABLE_S3_BUCKET_ENCRYPTION: &str = r#"{
+  "schemaVersion": "0.3",
+  "description": "Turns on default server-side encryption of an Amazon S3 bucket.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "default": ""
+    },
+    "BucketName": {
+      "type": "String",
+      "description": "(Required) The name of the S3 bucket to encrypt."
+    },
+    "SSEAlgorithm": {
+      "type": "String",
+      "description": "(Optional) The server-side encryption algorithm to apply by default.",
+      "default": "AES256"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "PutBucketEncryption",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "s3",
+        "Api": "PutBucketEncryption",
+        "Bucket": "{{ BucketName }}",
+        "ServerSideEncryptionConfiguration": {
+          "Rules": [
+            {
+              "ApplyServerSideEncryptionByDefault": { "SSEAlgorithm": "{{ SSEAlgorithm }}" }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}"#;
+
+/// The body of the runbook that publishes a notification to an SNS topic. See
+/// [`CONFIGURE_S3_BUCKET_VERSIONING`] for where the parameters come from.
+const PUBLISH_SNS_NOTIFICATION: &str = r#"{
+  "schemaVersion": "0.3",
+  "description": "Publishes a notification to an Amazon SNS topic.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
+      "default": ""
+    },
+    "TopicArn": {
+      "type": "String",
+      "description": "(Required) The ARN of the SNS topic to publish to."
+    },
+    "Message": {
+      "type": "String",
+      "description": "(Required) The message to publish."
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "Publish",
+      "action": "aws:executeAwsApi",
+      "inputs": {
+        "Service": "sns",
+        "Api": "Publish",
+        "TopicArn": "{{ TopicArn }}",
+        "Message": "{{ Message }}"
+      }
+    }
+  ]
+}"#;
+
+/// The body of the command document that runs a shell script on a managed node.
+///
+/// A command document's step precondition is what restricts it to a platform
+/// ([`declared_platform_types`]), so the platforms the published document is reported
+/// compatible with are declared the same way a created document's are.
+const RUN_SHELL_SCRIPT: &str = r#"{
+  "schemaVersion": "2.2",
+  "description": "Run a shell script or specify the commands to run.",
+  "parameters": {
+    "commands": {
+      "type": "StringList",
+      "description": "(Required) Specify a shell script or a command to run."
+    },
+    "workingDirectory": {
+      "type": "String",
+      "description": "(Optional) The path to the working directory on your managed node.",
+      "default": ""
+    },
+    "executionTimeout": {
+      "type": "String",
+      "description": "(Optional) The time in seconds for a command to be completed before it is considered to have failed.",
+      "default": "3600"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "runShellScriptOnLinux",
+      "action": "aws:runShellScript",
+      "precondition": { "StringEquals": ["platformType", "Linux"] },
+      "inputs": {
+        "commands": "{{ commands }}",
+        "workingDirectory": "{{ workingDirectory }}",
+        "timeoutSeconds": "{{ executionTimeout }}"
+      }
+    },
+    {
+      "name": "runShellScriptOnMacOS",
+      "action": "aws:runShellScript",
+      "precondition": { "StringEquals": ["platformType", "MacOS"] },
+      "inputs": {
+        "commands": "{{ commands }}",
+        "workingDirectory": "{{ workingDirectory }}",
+        "timeoutSeconds": "{{ executionTimeout }}"
+      }
+    }
+  ]
+}"#;
+
+/// The body of the command document that runs a PowerShell script on a managed node. See
+/// [`RUN_SHELL_SCRIPT`] for how the platforms are declared.
+const RUN_POWER_SHELL_SCRIPT: &str = r#"{
+  "schemaVersion": "2.2",
+  "description": "Run a PowerShell script or specify the commands to run.",
+  "parameters": {
+    "commands": {
+      "type": "StringList",
+      "description": "(Required) Specify a PowerShell script or a command to run."
+    },
+    "workingDirectory": {
+      "type": "String",
+      "description": "(Optional) The path to the working directory on your managed node.",
+      "default": ""
+    },
+    "executionTimeout": {
+      "type": "String",
+      "description": "(Optional) The time in seconds for a command to be completed before it is considered to have failed.",
+      "default": "3600"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "runPowerShellScript",
+      "action": "aws:runPowerShellScript",
+      "precondition": { "StringEquals": ["platformType", "Windows"] },
+      "inputs": {
+        "commands": "{{ commands }}",
+        "workingDirectory": "{{ workingDirectory }}",
+        "timeoutSeconds": "{{ executionTimeout }}"
+      }
+    }
+  ]
+}"#;
+
+/// The body of the command document that updates the SSM Agent on a managed node. It
+/// declares no precondition, so it is compatible with every platform the model lists.
+const UPDATE_SSM_AGENT: &str = r#"{
+  "schemaVersion": "2.2",
+  "description": "Update the SSM Agent to the latest version or specify an older version.",
+  "parameters": {
+    "version": {
+      "type": "String",
+      "description": "(Optional) The version of the SSM Agent to install. An empty value installs the latest version.",
+      "default": ""
+    },
+    "allowDowngrade": {
+      "type": "String",
+      "description": "(Optional) Whether the SSM Agent may be downgraded to an earlier version.",
+      "default": "false",
+      "allowedValues": ["true", "false"]
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "updateSSMAgent",
+      "action": "aws:updateSsmAgent",
+      "inputs": {
+        "agentName": "amazon-ssm-agent",
+        "source": "https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/{{version}}/amazon-ssm-agent.msi",
+        "allowDowngrade": "{{ allowDowngrade }}",
+        "targetVersion": "{{ version }}"
+      }
+    }
+  ]
+}"#;
+
+/// The documents Systems Manager publishes, which exist in every account and Region
+/// without anybody creating them.
+///
+/// The names and document types are the ones the AWS Systems Manager User Guide
+/// publishes — the "Systems Manager Automation runbook reference" for the `AWS-*`
+/// Automation runbooks (the runbooks a Config remediation configuration names as its
+/// target) and the "Systems Manager command document" reference for the `AWS-*` command
+/// documents. Each body declares the parameters that reference documents for its
+/// document, so a read derives its description, schema version, parameters and platform
+/// types from the body rather than restating them here.
+///
+/// Every name here starts with one of the prefixes [`RESERVED_DOCUMENT_NAME_PREFIXES`]
+/// reserves, which is why no `CreateDocument` can collide with one.
+pub const PUBLISHED_DOCUMENTS: &[PublishedDocument] = &[
+    PublishedDocument {
+        name: "AWS-ConfigureS3BucketVersioning",
+        document_type: "Automation",
+        content: CONFIGURE_S3_BUCKET_VERSIONING,
+    },
+    PublishedDocument {
+        name: "AWS-ConfigureS3BucketPublicAccessBlock",
+        document_type: "Automation",
+        content: CONFIGURE_S3_BUCKET_PUBLIC_ACCESS_BLOCK,
+    },
+    PublishedDocument {
+        name: "AWS-DisableS3BucketPublicReadWrite",
+        document_type: "Automation",
+        content: DISABLE_S3_BUCKET_PUBLIC_READ_WRITE,
+    },
+    PublishedDocument {
+        name: "AWS-EnableS3BucketEncryption",
+        document_type: "Automation",
+        content: ENABLE_S3_BUCKET_ENCRYPTION,
+    },
+    PublishedDocument {
+        name: "AWS-PublishSNSNotification",
+        document_type: "Automation",
+        content: PUBLISH_SNS_NOTIFICATION,
+    },
+    PublishedDocument {
+        name: "AWS-RunShellScript",
+        document_type: "Command",
+        content: RUN_SHELL_SCRIPT,
+    },
+    PublishedDocument {
+        name: "AWS-RunPowerShellScript",
+        document_type: "Command",
+        content: RUN_POWER_SHELL_SCRIPT,
+    },
+    PublishedDocument {
+        name: "AWS-UpdateSSMAgent",
+        document_type: "Command",
+        content: UPDATE_SSM_AGENT,
+    },
+];
+
+/// The published document `name` names, or `None` when the catalogue holds none.
+///
+/// A name is resolved as written: an SSM document name is case-sensitive, so a
+/// differently-cased spelling names no document.
+pub fn published_document(name: &str) -> Option<&'static PublishedDocument> {
+    PUBLISHED_DOCUMENTS
+        .iter()
+        .find(|published| published.name == name)
+}
+
+/// What each catalogue body yields: the members the content reader derives from it, and
+/// its hash.
+///
+/// Derived ONCE for the process rather than per read. The bodies are `const`, so two
+/// reads of one published document cannot differ, and no request pays for parsing them.
+/// A body this reader cannot read — a mistake in a `const` of this crate, which the test
+/// suite reads every entry to catch, never a caller's input — yields nothing derived
+/// rather than panicking a live request: the document does exist either way.
+static PUBLISHED_PROJECTIONS: ::std::sync::LazyLock<Vec<(ParsedDocumentContent, String)>> =
+    ::std::sync::LazyLock::new(|| {
+        PUBLISHED_DOCUMENTS
+            .iter()
+            .map(|published| {
+                let parsed = parse_document_content(
+                    published.content,
+                    DEFAULT_DOCUMENT_FORMAT,
+                    published.document_type,
+                )
+                .unwrap_or_default();
+                (parsed, document_content_hash(published.content))
+            })
+            .collect()
+    });
+
+/// The published document `name` names together with what its body yields, or `None`
+/// when the catalogue holds no document of that name.
+fn published_document_projection(
+    name: &str,
+) -> Option<(
+    &'static PublishedDocument,
+    &'static ParsedDocumentContent,
+    &'static str,
+)> {
+    let index = PUBLISHED_DOCUMENTS
+        .iter()
+        .position(|published| published.name == name)?;
+    let published = PUBLISHED_DOCUMENTS.get(index)?;
+    let (parsed, hash) = PUBLISHED_PROJECTIONS.get(index)?;
+    Some((published, parsed, hash.as_str()))
+}
+
+/// The hash the system takes over a document's content: "The Sha256 or Sha1 hash created
+/// by the system when the document was created" (`DocumentDescription$Hash`), with "Sha1
+/// hashes have been deprecated", rendered hex the way AWS reports it.
+pub fn document_content_hash(content: &str) -> String {
+    use ::sha2::Digest;
+    ::hex::encode(::sha2::Sha256::digest(content.as_bytes()))
+}
+
 /// One stored SSM document: what the create supplied, what the service derived from its
 /// content, and the status move the clock still owes.
 ///
@@ -1335,6 +1810,10 @@ pub struct DocumentRecord {
     /// reports.
     pub attachment_names: Vec<String>,
     pub tags: BTreeMap<String, String>,
+    /// "The Amazon Web Services user that created the document"
+    /// (`DocumentDescription$Owner`): the account for a document a caller created here,
+    /// and [`PUBLISHED_DOCUMENT_OWNER`] for one Systems Manager publishes.
+    pub owner: String,
     pub created_date: SystemTime,
     /// A `DocumentStatus` value.
     pub status: String,
@@ -1373,9 +1852,7 @@ impl DocumentRecord {
             name: Some(self.name.clone()),
             display_name: self.display_name.clone(),
             version_name: self.version_name.clone(),
-            // "The Amazon Web Services user that created the document" — every
-            // document this emulator holds was created in its one account.
-            owner: Some(::engine::emulator_account_id().to_string()),
+            owner: Some(self.owner.clone()),
             created_date: Some(::aws_smithy_types::DateTime::from(self.created_date)),
             status: Some(self.status.clone()),
             // "A message returned by Amazon Web Services Systems Manager that explains
@@ -1476,7 +1953,7 @@ pub fn node_page_size(max_results: Option<i32>) -> Result<usize, String> {
 pub const INVALID_NEXT_TOKEN: &str = "The NextToken value is not valid";
 
 /// Per-service state for com-amazonaws-ssm-amazonssm. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsSsmAmazonssmState {
     /// Every parameter, keyed by `(region, canonical name)`: "A parameter name must be
     /// unique within an Amazon Web Services Region". A `BTreeMap` so a listing walks a
@@ -1499,6 +1976,23 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// scaffold. A describe therefore reports the empty set for a fresh emulator — what
     /// the store holds — rather than nodes nobody registered.
     pub managed_nodes: BTreeMap<(String, String), ManagedNodeRecord>,
+
+    /// When this store came into being, and so how old the documents Systems Manager
+    /// publishes ([`PUBLISHED_DOCUMENTS`]) are here: they exist for as long as the
+    /// account does, so there is no create to date them from. Captured ONCE, so two
+    /// reads of one published document report the same `CreatedDate`.
+    pub created_at: SystemTime,
+}
+
+impl Default for ComAmazonawsSsmAmazonssmState {
+    fn default() -> Self {
+        Self {
+            parameters: BTreeMap::new(),
+            documents: BTreeMap::new(),
+            managed_nodes: BTreeMap::new(),
+            created_at: SystemTime::now(),
+        }
+    }
 }
 
 impl ComAmazonawsSsmAmazonssmState {
@@ -1513,6 +2007,48 @@ impl ComAmazonawsSsmAmazonssmState {
     /// The document `name` names in `region`, or `None` when that Region holds none.
     pub fn document(&self, region: &str, name: &str) -> Option<&DocumentRecord> {
         self.documents.get(&(region.to_string(), name.to_string()))
+    }
+
+    /// The document Systems Manager publishes under `name`, as it is reached through
+    /// `region`'s endpoint, or `None` when the catalogue holds none of that name.
+    ///
+    /// Built from the catalogue's own body, so everything the read reports beyond the
+    /// name and the type — the schema version, the description, the parameters, the
+    /// platform types, the hash — is derived by the one content reader that reads a
+    /// created document's content. A published document is already registered, so it is
+    /// `Active` with no transition owed, and it is owned by Amazon rather than by the
+    /// account reading it.
+    pub fn published_document_record(&self, region: &str, name: &str) -> Option<DocumentRecord> {
+        let (published, parsed, hash) = published_document_projection(name)?;
+        Some(DocumentRecord {
+            name: published.name.to_string(),
+            region: region.to_string(),
+            display_name: None,
+            version_name: None,
+            document_type: published.document_type.to_string(),
+            document_format: DEFAULT_DOCUMENT_FORMAT.to_string(),
+            target_type: None,
+            hash: hash.to_string(),
+            content: published.content.to_string(),
+            parsed: parsed.clone(),
+            requires: None,
+            attachment_names: Vec::new(),
+            tags: BTreeMap::new(),
+            owner: PUBLISHED_DOCUMENT_OWNER.to_string(),
+            created_date: self.created_at,
+            status: DOCUMENT_STATUS_ACTIVE.to_string(),
+            active_due: None,
+        })
+    }
+
+    /// The document `name` names through `region`'s endpoint: the one a caller created
+    /// there, or the one Systems Manager publishes under that name. A name neither holds
+    /// names no document, which is what the not-found error reports.
+    pub fn resolve_document(&self, region: &str, name: &str) -> Option<DocumentRecord> {
+        if let Some(stored) = self.document(region, name) {
+            return Some(stored.clone());
+        }
+        self.published_document_record(region, name)
     }
 
     /// Store `record` as `region`'s document of that name.

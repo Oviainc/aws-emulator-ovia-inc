@@ -4,10 +4,11 @@
 //! Describe a stored SSM document — the read half of this service's document slice.
 //! This is the ONLY file to touch for this operation.
 //!
-//! It reports what `CreateDocument` persisted, from the one store in [`crate::state`]:
-//! the only write it makes is materialising the status move the clock already owes
-//! ([`crate::state::DOCUMENT_TRANSITION_DELAY`]), which was due at the same instant
-//! even if nobody had called.
+//! It reports the document the request names, whether a caller created it or Systems
+//! Manager publishes it ([`crate::state::PUBLISHED_DOCUMENTS`]), from the one store in
+//! [`crate::state`]: the only write it makes is materialising the status move the clock
+//! already owes ([`crate::state::DOCUMENT_TRANSITION_DELAY`]), which was due at the same
+//! instant even if nobody had called.
 //!
 //! Implementing this operation also closes
 //! `issues/.../ssm-describedocument-stub.md`, which asks for exactly this handler;
@@ -173,12 +174,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A document is resolved through the endpoint it is asked for: an ARN naming
         // another account or another Region than this request was signed for names
         // nothing reachable here. The Region therefore never comes from the request
-        // body — only from the signed credential scope.
+        // body — only from the signed credential scope. An ARN field left EMPTY names
+        // no account at all, the way the ARN of a document Systems Manager publishes
+        // carries none, so it resolves through this endpoint rather than being a miss.
         let region = crate::state::request_region(ctx.parts());
         if query
             .account
-            .is_some_and(|account| account != ::engine::emulator_account_id())
-            || query.region.is_some_and(|named| named != region)
+            .is_some_and(|account| !account.is_empty() && account != ::engine::emulator_account_id())
+            || query
+                .region
+                .is_some_and(|named| !named.is_empty() && named != region)
         {
             return Err(missing().into());
         }
@@ -186,7 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // The one write a report makes: the move to `Active` the clock already owed.
         store.materialize_due(::std::time::SystemTime::now());
-        let Some(record) = store.document(&region, query.name) else {
+        // The account holds the documents a caller created here AND the ones Systems
+        // Manager publishes, so a name the catalogue carries resolves without any
+        // create; only a name neither holds is a miss.
+        let Some(record) = store.resolve_document(&region, query.name) else {
             return Err(missing().into());
         };
 

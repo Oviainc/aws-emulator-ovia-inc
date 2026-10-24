@@ -25,5 +25,7 @@ mod parameter_deletion;
 mod parameter_store;
 #[path = "all/parameters_by_path.rs"]
 mod parameters_by_path;
+#[path = "all/published_documents.rs"]
+mod published_documents;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
