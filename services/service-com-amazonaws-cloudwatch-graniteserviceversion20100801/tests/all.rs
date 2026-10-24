@@ -21,6 +21,8 @@ mod composite_alarms;
 mod ec2_alarm_actions;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/log_alarms.rs"]
+mod log_alarms;
 #[path = "all/metric_streams.rs"]
 mod metric_streams;
 #[path = "all/metrics_and_alarms.rs"]

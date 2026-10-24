@@ -481,12 +481,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // An alarm name names ONE alarm whatever kind it is ("This name must be unique within
-        // the Region." — `PutCompositeAlarmInput$AlarmName`), so this writer refuses a name a
-        // composite alarm already holds, exactly as `PutCompositeAlarm` refuses one a metric
-        // alarm holds. Without both halves the store could hold two alarms under one name.
-        if store.composite_alarms.contains_key(&input.alarm_name) {
+        // the Region." — `PutCompositeAlarmInput$AlarmName`), so this writer refuses a name
+        // another kind of alarm already holds, exactly as the other alarm writers refuse one a
+        // metric alarm holds. Without every half the store could hold two alarms under one
+        // name.
+        if let Some(kind) = store
+            .alarm_kind(&input.alarm_name)
+            .filter(|kind| *kind != crate::state::ALARM_TYPE_METRIC)
+        {
             return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "a composite alarm named {} already exists in this Region",
+                "a {kind} named {} already exists in this Region",
                 input.alarm_name
             )));
         }
@@ -516,7 +520,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // published quota is 5,000 alarms per Region per account, which is also this
         // in-memory store's capacity bound. Replacing an alarm that already exists does not
         // add one, so it is never refused here.
-        if !is_update && store.alarms.len() >= crate::state::MAX_ALARMS {
+        if !is_update && store.alarm_count() >= crate::state::MAX_ALARMS {
             return Err(PutMetricAlarmErrorModeled::LimitExceededFault(LimitExceededFault {
                 message: Some(format!(
                     "the quota of {} alarms has already been reached",
