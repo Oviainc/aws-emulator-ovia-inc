@@ -18,6 +18,9 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
+# gzip: this service's `x-amz-lex-*` header payloads are "compressed with gzip
+# and then base64 encoded" (RecognizeUtterance's own documentation).
+flate2 = "1"
 tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }

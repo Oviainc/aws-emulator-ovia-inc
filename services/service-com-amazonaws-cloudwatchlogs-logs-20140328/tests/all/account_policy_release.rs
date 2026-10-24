@@ -32,21 +32,11 @@
 use serde_json::{json, Value};
 
 use crate::account_policies::{
-    describe, described_names, member, put_body, put_policy, scoped_criteria,
-    subscription_filter_document,
+    delete_body, describe, described_names, member, put_body, put_policy, scoped_criteria,
+    subscription_filter_document, POLICY_TYPES,
 };
 use crate::account_policy_selection_criteria::document_for;
 use crate::harness::Logs;
-
-/// Every value of the model's `PolicyType` enum, which is what `policyType` targets.
-/// Source: `smithy_query(query="shape", shape="PolicyType")`.
-const POLICY_TYPES: [&str; 5] = [
-    "DATA_PROTECTION_POLICY",
-    "SUBSCRIPTION_FILTER_POLICY",
-    "FIELD_INDEX_POLICY",
-    "TRANSFORMER_POLICY",
-    "METRIC_EXTRACTION_POLICY",
-];
 
 /// How many metric extraction policies the account may hold when each is scoped. Source:
 /// `PutAccountPolicy` — "Each account can have either one account-level metric extraction
@@ -76,11 +66,6 @@ struct RefusedPut {
     document: String,
     criteria: Option<String>,
     expected: &'static str,
-}
-
-/// One `DeleteAccountPolicy` request body.
-fn delete_body(name: &str, policy_type: &str) -> Value {
-    json!({"policyName": name, "policyType": policy_type})
 }
 
 /// The names one type's policies are reported under, sorted, so a case asserts WHICH

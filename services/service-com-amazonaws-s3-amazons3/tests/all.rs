@@ -15,6 +15,8 @@
 mod bucket_acl;
 #[path = "all/bucket_cors.rs"]
 mod bucket_cors;
+#[path = "all/bucket_deletion_emptiness.rs"]
+mod bucket_deletion_emptiness;
 #[path = "all/bucket_encryption.rs"]
 mod bucket_encryption;
 #[path = "all/bucket_lifecycle.rs"]
@@ -55,6 +57,8 @@ mod multipart_upload_initiation;
 mod object_and_policy;
 #[path = "all/object_and_tagging_roundtrip.rs"]
 mod object_and_tagging_roundtrip;
+#[path = "all/object_batch_deletion.rs"]
+mod object_batch_deletion;
 #[path = "all/object_default_encryption.rs"]
 mod object_default_encryption;
 #[path = "all/object_encryption.rs"]

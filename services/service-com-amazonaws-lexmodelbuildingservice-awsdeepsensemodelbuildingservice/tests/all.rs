@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/bot_authoring_lifecycle.rs"]
 mod bot_authoring_lifecycle;
+#[path = "all/shared_model_routes.rs"]
+mod shared_model_routes;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

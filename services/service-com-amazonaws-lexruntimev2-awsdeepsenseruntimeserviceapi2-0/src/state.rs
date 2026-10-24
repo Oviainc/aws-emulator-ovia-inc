@@ -4,12 +4,64 @@
 //!
 //! The service is the Lex V2 *runtime*: its only resource is the conversation
 //! session a client holds with one bot alias in one locale. `PutSession`,
-//! `RecognizeText`, `GetSession` and `DeleteSession` are four views of the one
-//! [`Session`] stored here, keyed by the four `@httpLabel` values that address it.
+//! `RecognizeText`, `RecognizeUtterance`, `GetSession` and `DeleteSession` are
+//! five views of the one [`Session`] stored here, keyed by the four
+//! `@httpLabel` values that address it.
+//!
+//! Beside the store itself, this module holds the two things more than one of
+//! those operations needs: `advance_turn`, the one conversation turn
+//! `RecognizeText` and `RecognizeUtterance` are two encodings of, and
+//! [`headers`], the wire form of the structured `x-amz-lex-*` headers
+//! `PutSession` and `RecognizeUtterance` answer with.
 
-use crate::ops::types::{ActiveContext, Interpretation, Message, SessionState};
+pub mod headers;
+
+use crate::ops::types::{
+    ActiveContext, DialogAction, Intent, Interpretation, Message, SessionState,
+};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
+
+/// The intent Amazon Lex V2 reports when no intent of the bot locale matches
+/// the input. This runtime holds no bot locale definition — bots are built
+/// through the Lex *models* service, not this runtime — so no intent can be
+/// matched from an utterance, which is exactly the case the real service
+/// answers with the fallback intent.
+pub const FALLBACK_INTENT: &str = "FallbackIntent";
+
+/// `Close`: "indicates that there will not be a response from the user"
+/// (`DialogAction$type` docs).
+pub const DIALOG_ACTION_CLOSE: &str = "Close";
+
+/// `Lex` itself interpreted the input, as opposed to `Bedrock`
+/// (`Interpretation$interpretationSource`).
+pub const INTERPRETATION_SOURCE: &str = "Lex";
+
+/// The response content type a caller gets when it asks for none, and the one
+/// value of `responseContentType` that is not speech: "if the value is
+/// `text/plain;charset=utf-8`, Amazon Lex V2 returns text in the response"
+/// (`RecognizeUtteranceRequest$responseContentType`, which lists every accepted
+/// value).
+pub const TEXT_CONTENT_TYPE: &str = "text/plain;charset=utf-8";
+
+/// The prefix every speech `responseContentType` carries: all of the model's
+/// speech values (`audio/mpeg`, `audio/ogg`, `audio/pcm`, `audio/*`) begin with
+/// it, and so does every audio `requestContentType` it lists.
+pub const AUDIO_PREFIX: &str = "audio/";
+
+/// Does this `responseContentType` ask for synthesized speech?
+///
+/// "If the value begins with `audio/`, Amazon Lex V2 returns speech in the
+/// response" — which it synthesizes with Amazon Polly. Held here rather than in
+/// either operation, because the two operations that take a
+/// `responseContentType` must answer the same way for the same value; the
+/// comparison is case-insensitive, as a media type is compared.
+pub fn asks_for_speech(response_content_type: &str) -> bool {
+    response_content_type
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with(AUDIO_PREFIX)
+}
 
 /// Per-service state for com-amazonaws-lexruntimev2-awsdeepsenseruntimeserviceapi2-0. A handler reaches it through [`service_state`].
 ///
@@ -228,6 +280,115 @@ impl ComAmazonawsLexruntimev2Awsdeepsenseruntimeserviceapi20State {
         self.expire_idle_sessions(now);
         self.sessions.remove(key)
     }
+
+    /// Advance the conversation `key` addresses by ONE turn, and report what the
+    /// turn left on the session.
+    ///
+    /// This is the whole of what an utterance does to a session, held here
+    /// because the service offers the SAME turn through two encodings:
+    /// `RecognizeText`, which carries the input and the dialog state as JSON in
+    /// the body, and `RecognizeUtterance`, which carries them as a request
+    /// payload and gzipped headers. The two differ only in how a turn is spelled
+    /// on the wire ("Sends user input to Amazon Lex V2" is the documented
+    /// purpose of both), so both drive this one method and cannot drift apart.
+    ///
+    /// `supplied_state` and `supplied_attributes` are what the request carried.
+    /// The text the turn processes is what the real service runs its NLU model
+    /// over; this emulator holds no bot locale to match it against, and matching
+    /// on the utterance text would invent intents no bot declares, so it is not
+    /// interpreted into an intent of its own and is not passed here.
+    pub fn advance_turn(
+        &mut self,
+        key: SessionKey,
+        now: SystemTime,
+        supplied_state: Option<SessionState>,
+        supplied_attributes: Option<HashMap<String, String>>,
+    ) -> Result<Turn, TurnRefused> {
+        // Refuse an attribute map this turn may not store BEFORE the session is
+        // looked up for writing, so a refused turn leaves the conversation
+        // exactly as it was — and a refused FIRST turn leaves no session behind
+        // at all, so a following GetSession is still the modelled 404. These
+        // maps accumulate over the turns of a session, which is why the bound is
+        // checked against the merge with what is already stored (nothing, for a
+        // session that does not exist yet) rather than against the request
+        // alone.
+        {
+            let stored = self.session(&key, now);
+            check_attribute_bytes(
+                "sessionState.sessionAttributes",
+                stored.and_then(|session| session.session_state.session_attributes.as_ref()),
+                supplied_state
+                    .as_ref()
+                    .and_then(|supplied| supplied.session_attributes.as_ref()),
+            )
+            .map_err(TurnRefused::Attributes)?;
+            check_request_attributes(
+                "requestAttributes",
+                stored.map(|session| &session.request_attributes),
+                supplied_attributes.as_ref(),
+            )
+            .map_err(TurnRefused::Attributes)?;
+        }
+
+        // "Amazon Lex V2 creates a session when the user starts a
+        // conversation": the first utterance of a session starts it, so an
+        // absent session is created here rather than refused. `session_mut` is
+        // the bounded insertion path: it expires idle sessions and refuses to
+        // grow the store past its cap, so a caller looping over fresh session
+        // ids is refused rather than served until the emulator runs out of
+        // memory.
+        let session = self.session_mut(key, now).map_err(TurnRefused::StoreFull)?;
+
+        // Charge the turn FIRST, so the contexts already on the session pay for
+        // this turn ("each request and response from the bot is a turn") while
+        // the ones this request supplies below start on their full budget.
+        session.spend_turn(now);
+
+        if let Some(supplied) = supplied_state {
+            session.merge_session_state(supplied, now);
+        }
+        if let Some(supplied) = supplied_attributes {
+            merge_attributes(&mut session.request_attributes, supplied);
+        }
+
+        // The active intent after this turn: the one the session carries (set by
+        // this request or an earlier PutSession), else the fallback intent.
+        let intent = session.session_state.intent.clone().unwrap_or(Intent {
+            name: FALLBACK_INTENT.to_string(),
+            slots: None,
+            state: None,
+            confirmation_state: None,
+        });
+        session.session_state.intent = Some(intent.clone());
+        // Nothing was elicited from the user, so unless the caller set the next
+        // step itself the dialog closes.
+        if session.session_state.dialog_action.is_none() {
+            session.session_state.dialog_action = Some(DialogAction {
+                r#type: DIALOG_ACTION_CLOSE.to_string(),
+                slot_to_elicit: None,
+                slot_elicitation_style: None,
+                sub_slot_to_elicit: None,
+            });
+        }
+        // The interpretation of this turn, written back onto the session so a
+        // following GetSession reports the same one. No `nluConfidence` is
+        // reported: no model scored this input, and a made-up score would be
+        // indistinguishable from one.
+        session.interpretations = vec![Interpretation {
+            nlu_confidence: None,
+            sentiment_response: None,
+            intent: Some(intent),
+            interpretation_source: Some(INTERPRETATION_SOURCE.to_string()),
+        }];
+
+        Ok(Turn {
+            session_id: session.session_id.clone(),
+            session_state: session.visible_session_state(now),
+            messages: session.messages.clone(),
+            interpretations: session.interpretations.clone(),
+            request_attributes: session.request_attributes.clone(),
+        })
+    }
 }
 
 /// The identity of a session: the four `@httpLabel` values every operation in
@@ -420,6 +581,32 @@ impl Session {
             self.set_active_contexts(contexts, now);
         }
     }
+}
+
+/// What one conversation turn left behind, read back off the stored session:
+/// every value the two operations that advance a turn report to their caller.
+#[derive(Debug, Clone)]
+pub struct Turn {
+    /// The session the turn advanced, by its own id.
+    pub session_id: String,
+    /// The dialog state after the turn, as a caller observes it.
+    pub session_state: SessionState,
+    /// The messages the session carries.
+    pub messages: Vec<Message>,
+    /// The interpretations of this turn's input.
+    pub interpretations: Vec<Interpretation>,
+    /// The request attributes accumulated over the session.
+    pub request_attributes: HashMap<String, String>,
+}
+
+/// Why a turn was refused BEFORE it changed anything, so a refused turn leaves
+/// the conversation exactly as it was.
+#[derive(Debug, Clone)]
+pub enum TurnRefused {
+    /// An attribute map this turn may not store: the caller's to fix.
+    Attributes(AttributesRefused),
+    /// The session store is at capacity, so this turn cannot start a session.
+    StoreFull(SessionStoreFull),
 }
 
 /// Fold `supplied` into `stored`: a supplied key overwrites, every other stored

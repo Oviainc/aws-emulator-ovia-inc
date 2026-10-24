@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBucket
-//! IMPLEMENTED: removes the bucket record, and only when the bucket holds no objects.
+//! IMPLEMENTED: removes the bucket record, and only when the bucket holds no object
+//! version at all — neither a current object nor a version retained behind a delete.
 //!
-//! "All objects ... in the bucket must be deleted before the bucket itself can be
-//! deleted": a non-empty bucket is refused with `BucketNotEmpty` (409), which S3
+//! "All objects (including all object versions and delete markers) ... must be deleted
+//! before the bucket itself can be deleted": a bucket that still holds anything is
+//! refused with `BucketNotEmpty` (409), which S3
 //! documents but its Smithy model declares no shape for — see `crate::scaffolded`. A
 //! bucket another emulated service provisioned as the object store of one of its own
 //! resources is refused too, with `AccessDenied` (403): that service owns its lifecycle.
@@ -220,13 +222,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // Every object must be deleted first, so a bucket that still holds one is
-        // refused and keeps its objects.
-        if !bucket.objects().is_empty() {
+        // "All objects (INCLUDING ALL OBJECT VERSIONS and delete markers) in the bucket
+        // must be deleted before the bucket itself can be deleted": emptiness is over the
+        // bucket's whole version history, not over its current view. A versioned delete
+        // KEEPS the version it displaces (`Bucket::keeps_superseded`) — that retained
+        // version is what the delete marker hides — so a bucket whose every key has been
+        // deleted still holds those versions and is still not empty. The current-object
+        // map alone would call it empty and destroy them with the bucket.
+        if !bucket.holds_no_versions() {
+            // The code and the 409 are the requirement; the sentence varies with whether
+            // what is left to delete is reached as a version, which is the case for a
+            // bucket that carries a versioning state at all ("All objects added to the
+            // bucket receive a unique version ID", and a suspended bucket keeps every
+            // version it already had).
+            let message = if bucket.versioning.is_some() {
+                crate::state::BUCKET_NOT_EMPTY_VERSIONED_MESSAGE
+            } else {
+                crate::state::BUCKET_NOT_EMPTY_MESSAGE
+            };
             return Err(crate::scaffolded::Scaffolded::unmodeled(
-                "BucketNotEmpty",
+                crate::state::BUCKET_NOT_EMPTY_CODE,
                 409,
-                "The bucket you tried to delete is not empty",
+                message,
             ));
         }
 
