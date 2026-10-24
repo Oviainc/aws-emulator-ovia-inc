@@ -668,6 +668,95 @@ async fn an_identifier_that_names_no_stored_endpoint_is_refused() {
     );
 }
 
+/// How a missing private graph endpoint is reported: the modelled
+/// `ResourceNotFoundException` is rendered from the addressing pair the REQUEST
+/// carried — the graph the endpoint would reach, then the VPC it would be reached
+/// from — so the failure is a function of the request and never of which stored
+/// record happens to be absent.
+fn endpoint_not_found_message(graph_id: &str, vpc_id: &str) -> String {
+    format!("Private Graph Endpoint to Graph: {graph_id} from VPC: {vpc_id} does not exist")
+}
+
+#[tokio::test]
+async fn a_missing_endpoint_is_reported_naming_the_graph_and_the_vpc() {
+    let router = emulator();
+    let graph_id = graph_in_service(&router, "message-source").await;
+    let other_graph = graph_in_service(&router, "message-other").await;
+
+    // One pair is made to hold an endpoint and then reclaimed, so the table below asks
+    // about a pair that once WAS an endpoint beside pairs that never were.
+    let (status, created) = create_endpoint(
+        &router,
+        &graph_id,
+        json!({"vpcId": "vpc-reclaimed", "subnetIds": subnets(1)}),
+    )
+    .await;
+    assert_eq!(status, 201, "the fixture endpoint: got {status}: {created}");
+    wait_until_available(
+        &router,
+        &format!("/graphs/{graph_id}/endpoints/vpc-reclaimed"),
+    )
+    .await;
+    let (status, deleted) = delete_endpoint(&router, &graph_id, "vpc-reclaimed").await;
+    assert_eq!(status, 200, "the fixture delete: got {status}: {deleted}");
+    let gone = wait_until_gone(&router, &graph_id, "vpc-reclaimed").await;
+    let expected = endpoint_not_found_message(&graph_id, "vpc-reclaimed");
+    assert_eq!(
+        gone["message"],
+        json!(expected),
+        "case the endpoint the clock reclaimed: expected message {expected:?}, got {}",
+        gone["message"]
+    );
+
+    // (case, graphIdentifier, vpcId) — every row names a stored graph and a VPC that
+    // holds no endpoint, differing in the form and length of the VPC id, in which graph
+    // the lookup is resolved against, and in whether the pair ever held an endpoint.
+    let cases: Vec<(&str, &str, &str)> = vec![
+        ("a vpc that never held an endpoint", &graph_id, "vpc-never"),
+        ("a long vpc id", &graph_id, "vpc-0000000000000001e"),
+        ("the reclaimed pair", &graph_id, "vpc-reclaimed"),
+        (
+            "a graph that never had an endpoint",
+            &other_graph,
+            "vpc-reclaimed",
+        ),
+    ];
+
+    for (case, graph_identifier, vpc_id) in cases {
+        let expected = endpoint_not_found_message(graph_identifier, vpc_id);
+        let answers = [
+            (
+                "GetPrivateGraphEndpoint",
+                get_endpoint(&router, graph_identifier, vpc_id).await,
+            ),
+            (
+                "DeletePrivateGraphEndpoint",
+                delete_endpoint(&router, graph_identifier, vpc_id).await,
+            ),
+        ];
+        for (op, (status, body)) in answers {
+            assert_eq!(
+                status, 404,
+                "case {case:?} ({op} {graph_identifier}/{vpc_id}): expected 404, got \
+                 {status}: {body}"
+            );
+            let code = error_code(&body);
+            assert_eq!(
+                code, "ResourceNotFoundException",
+                "case {case:?} ({op} {graph_identifier}/{vpc_id}): expected \
+                 ResourceNotFoundException, got {code:?}: {body}"
+            );
+            assert_eq!(
+                body["message"],
+                json!(expected),
+                "case {case:?} ({op} {graph_identifier}/{vpc_id}): expected message \
+                 {expected:?}, got {}",
+                body["message"]
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn an_endpoint_does_not_outlive_the_graph_it_reaches() {
     let router = emulator();
