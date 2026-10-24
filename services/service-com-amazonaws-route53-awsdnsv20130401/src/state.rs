@@ -2,9 +2,10 @@
 
 //! Engine state for the com-amazonaws-route53-awsdnsv20130401 service.
 //!
-//! Route 53 is a control plane over two resources: the hosted zone and, inside
-//! it, the resource record set. Both live here, in ONE store, so every operation
-//! reads the records another operation wrote. The helpers in this module are the
+//! Route 53 is a control plane over the hosted zone and, inside it, the
+//! resource record set, plus the traffic policy a record set can be generated
+//! from. They all live here, in ONE store, so every operation reads the records
+//! another operation wrote. The helpers in this module are the
 //! shared vocabulary the handlers in `src/ops/` use for them — DNS name
 //! normalization, the sort key `ListResourceRecordSets` orders by, the
 //! `/hostedzone/` and `/change/` id prefixes the API wraps ids in, and the id
@@ -26,8 +27,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::shared_types::{
-    ChangeInfo, DelegationSet, HostedZone, HostedZoneConfig, NoSuchHostedZone, ResourceRecordSet,
-    Tag, VPC, V_P_C_REGION_VALUES,
+    ChangeInfo, DelegationSet, HostedZone, HostedZoneConfig, NoSuchHostedZone, NoSuchTrafficPolicy,
+    ResourceRecordSet, Tag, TrafficPolicy, VPC, R_R_TYPE_VALUES, V_P_C_REGION_VALUES,
 };
 
 /// How long after a change is submitted it reaches `INSYNC`.
@@ -201,6 +202,19 @@ pub const HOSTED_ZONE_ALREADY_EXISTS_MESSAGE: &str =
 pub const HOSTED_ZONE_NOT_EMPTY_MESSAGE: &str =
     "The specified hosted zone contains resource record sets other than the default SOA and NS \
      records and so cannot be deleted. Delete all non-default records and try again.";
+
+/// The version number a traffic policy's first version carries.
+///
+/// `TrafficPolicy$Version`'s own documentation: "For a new traffic policy, the
+/// value of Version is always 1."
+pub const FIRST_TRAFFIC_POLICY_VERSION: i32 = 1;
+
+/// The `AWSPolicyFormatVersion` a traffic policy document declares.
+///
+/// The "Traffic Policy Document Format" reference this operation's own
+/// documentation points at publishes exactly one format version, so a document
+/// declaring any other names a format this API version does not define.
+pub const TRAFFIC_POLICY_FORMAT_VERSION: &str = "2015-10-01";
 
 /// The IPv4 CIDR blocks Route 53's health checkers send their health checks
 /// from, as the service publishes them.
@@ -494,6 +508,59 @@ pub fn vpc_position_in(vpcs: &[VPC], vpc_id: &str) -> Option<usize> {
         .position(|vpc| vpc.vpc_id.as_deref() == Some(vpc_id))
 }
 
+/// One version of a traffic policy: the document that version holds, and the
+/// values read off it.
+///
+/// A version's document is immutable once created — only its comment is
+/// editable (`UpdateTrafficPolicyComment`) — so the `RRType` the document names
+/// is read off it once, when the version is created, rather than on every read.
+#[derive(Debug, Clone)]
+pub struct StoredTrafficPolicyVersion {
+    /// The `RRType` the document's `RecordType` names, as
+    /// [`traffic_policy_record_type`] read it off the document.
+    pub record_type: String,
+    /// The traffic policy document, exactly as the caller sent it.
+    pub document: String,
+    /// This version's comment, when it was created with one.
+    pub comment: Option<String>,
+}
+
+/// A traffic policy and every version of it.
+///
+/// A traffic policy is addressed by `(Id, Version)` — `GetTrafficPolicy` takes
+/// both — so the versions live ON the policy, keyed by version number: one
+/// policy's id and name cannot then disagree between two of its versions, and
+/// the highest key is its latest version.
+#[derive(Debug, Clone)]
+pub struct StoredTrafficPolicy {
+    /// The policy id, which is also this record's key in
+    /// [`ComAmazonawsRoute53Awsdnsv20130401State::traffic_policies`].
+    pub id: String,
+    /// The `Name` the policy was created with, shared by every version of it.
+    pub name: String,
+    /// This policy's versions, keyed (and therefore ordered) by version number.
+    pub versions: BTreeMap<i32, StoredTrafficPolicyVersion>,
+}
+
+impl StoredTrafficPolicy {
+    /// The modelled `TrafficPolicy` for one version of this policy, or `None`
+    /// when the policy holds no such version.
+    ///
+    /// The ONE projection every traffic-policy response is built from, so a
+    /// create and a later read cannot report one policy version differently.
+    pub fn to_traffic_policy(&self, version: i32) -> Option<TrafficPolicy> {
+        let stored = self.versions.get(&version)?;
+        Some(TrafficPolicy {
+            id: self.id.clone(),
+            version,
+            name: self.name.clone(),
+            r#type: stored.record_type.clone(),
+            document: stored.document.clone(),
+            comment: stored.comment.clone(),
+        })
+    }
+}
+
 /// Per-service state for com-amazonaws-route53-awsdnsv20130401. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsRoute53Awsdnsv20130401State {
@@ -510,6 +577,10 @@ pub struct ComAmazonawsRoute53Awsdnsv20130401State {
     /// The ids in [`ComAmazonawsRoute53Awsdnsv20130401State::changes`] in
     /// submission order, so the oldest can be evicted first.
     change_order: VecDeque<String>,
+    /// Every traffic policy, keyed by its id. A `BTreeMap` so a listing pages
+    /// over a stable total order of policy ids. Bounded by
+    /// [`MAX_TRAFFIC_POLICIES`].
+    pub traffic_policies: BTreeMap<String, StoredTrafficPolicy>,
     /// The id generator, kept here so ids stay unique across calls.
     ids: IdMinter,
     /// The health-checker CIDR blocks `GetCheckerIpRanges` reports, in the order
@@ -528,6 +599,7 @@ impl Default for ComAmazonawsRoute53Awsdnsv20130401State {
             zone_by_caller_reference: HashMap::new(),
             changes: HashMap::new(),
             change_order: VecDeque::new(),
+            traffic_policies: BTreeMap::new(),
             ids: IdMinter::default(),
             checker_ip_ranges: checker_ip_ranges(),
         }
@@ -544,6 +616,31 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
                 return id;
             }
         }
+    }
+
+    /// Mint a traffic policy id: 8-4-4-4-12 lowercase hex, the form Route 53
+    /// returns for one (`TrafficPolicyId` is `len 1..36`, which is that form's
+    /// length). Retried until it is unused.
+    pub fn mint_traffic_policy_id(&mut self) -> String {
+        loop {
+            let id = self.ids.mint_uuid();
+            if !self.traffic_policies.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// The traffic policy carrying `name`, if the account holds one.
+    ///
+    /// `TrafficPolicyAlreadyExists`'s own documentation — "A traffic policy that
+    /// has the same value for Name already exists" — is about the POLICY, not
+    /// one of its versions, so the lookup is over the policies, and it is
+    /// searched off the store rather than tracked beside it: a policy that is
+    /// deleted frees its name by itself.
+    pub fn traffic_policy_with_name(&self, name: &str) -> Option<&StoredTrafficPolicy> {
+        self.traffic_policies
+            .values()
+            .find(|policy| policy.name == name)
     }
 
     /// Record a newly submitted change and return it, so the caller can render
@@ -602,15 +699,17 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
     pub fn account_limit_usage(&self, limit_type: &str) -> Option<(i64, i64)> {
         let (limit, count) = match limit_type {
             ACCOUNT_LIMIT_MAX_HOSTED_ZONES => (MAX_HOSTED_ZONES, self.zones.len()),
+            ACCOUNT_LIMIT_MAX_TRAFFIC_POLICIES => {
+                (MAX_TRAFFIC_POLICIES, self.traffic_policies.len())
+            }
             // The entity kinds below have no collection in this store yet —
-            // `CreateHealthCheck`, `CreateReusableDelegationSet`,
-            // `CreateTrafficPolicy` and `CreateTrafficPolicyInstance` are all
-            // still scaffolds, so nothing can bring one into being and the
-            // account holds none of them. Each gets its count from the
-            // collection this struct grows when its create is implemented.
+            // `CreateHealthCheck`, `CreateReusableDelegationSet` and
+            // `CreateTrafficPolicyInstance` are all still scaffolds, so nothing
+            // can bring one into being and the account holds none of them. Each
+            // gets its count from the collection this struct grows when its
+            // create is implemented.
             ACCOUNT_LIMIT_MAX_HEALTH_CHECKS => (MAX_HEALTH_CHECKS, 0),
             ACCOUNT_LIMIT_MAX_REUSABLE_DELEGATION_SETS => (MAX_REUSABLE_DELEGATION_SETS, 0),
-            ACCOUNT_LIMIT_MAX_TRAFFIC_POLICIES => (MAX_TRAFFIC_POLICIES, 0),
             ACCOUNT_LIMIT_MAX_TRAFFIC_POLICY_INSTANCES => (MAX_TRAFFIC_POLICY_INSTANCES, 0),
             _ => return None,
         };
@@ -798,6 +897,170 @@ pub fn apply_tag_changes(
     Ok(())
 }
 
+/// The modelled `NoSuchTrafficPolicy` (HTTP 404) for an `(Id, Version)` pair
+/// that names no traffic policy version in this store.
+///
+/// The ONE place this service words that refusal, so every operation addressed
+/// at a traffic policy answers a missing one identically. The message is
+/// REQUEST-DERIVED — it names the id and version the request asked about, which
+/// is what tells a caller whether the policy or the version was the missing
+/// half.
+pub fn no_such_traffic_policy(requested_id: &str, requested_version: i32) -> NoSuchTrafficPolicy {
+    NoSuchTrafficPolicy {
+        message: Some(format!(
+            "No traffic policy exists with ID {requested_id} and version {requested_version}"
+        )),
+    }
+}
+
+/// The `RRType` a traffic policy document records, or the reason the document
+/// is not a valid one (`InvalidTrafficPolicyDocument`, HTTP 400).
+///
+/// The document is the traffic policy's definition, and `TrafficPolicy$Type` is
+/// "the DNS type of the resource record sets that Amazon Route 53 creates when
+/// you use a traffic policy to create a traffic policy instance" — so the type
+/// is READ OFF the document rather than taken from the request, which carries
+/// no type at all. The structure checked here is the one the "Traffic Policy
+/// Document Format" reference defines: a JSON object declaring its
+/// `AWSPolicyFormatVersion`, the `RecordType` it creates, the `Endpoints` it can
+/// route to, and exactly one entry point — `StartEndpoint`, naming one of those
+/// endpoints, or `StartRule`, naming one of the `Rules`.
+///
+/// Every refusal names the member that was wrong and what was wrong with it, so
+/// the caller can act on it; the document itself is never quoted back.
+pub fn traffic_policy_record_type(document: &str) -> Result<String, String> {
+    let parsed: serde_json::Value = serde_json::from_str(document)
+        .map_err(|error| format!("the traffic policy document is not valid JSON: {error}"))?;
+    let Some(root) = parsed.as_object() else {
+        return Err("the traffic policy document must be a JSON object".to_string());
+    };
+
+    match root
+        .get("AWSPolicyFormatVersion")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(TRAFFIC_POLICY_FORMAT_VERSION) => {}
+        Some(other) => {
+            return Err(format!(
+                "AWSPolicyFormatVersion {other} is not a traffic policy document format version; \
+                 the supported version is {TRAFFIC_POLICY_FORMAT_VERSION}"
+            ))
+        }
+        None => {
+            return Err(
+                "the traffic policy document must carry AWSPolicyFormatVersion as a string"
+                    .to_string(),
+            )
+        }
+    }
+
+    let record_type = match root.get("RecordType").and_then(serde_json::Value::as_str) {
+        Some(value) if R_R_TYPE_VALUES.contains(&value) => value.to_string(),
+        Some(other) => {
+            return Err(format!(
+                "RecordType {other} is not a DNS record type a traffic policy can create"
+            ))
+        }
+        None => {
+            return Err(
+                "the traffic policy document must carry RecordType as a string".to_string()
+            )
+        }
+    };
+
+    let endpoints = root
+        .get("Endpoints")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            "the traffic policy document must carry Endpoints as a JSON object".to_string()
+        })?;
+    if endpoints.is_empty() {
+        return Err("the traffic policy document must define at least one endpoint in Endpoints"
+            .to_string());
+    }
+    if let Some(name) = named_entry_that_is_not_an_object(endpoints) {
+        return Err(format!("the endpoint {name} in Endpoints must be a JSON object"));
+    }
+
+    let start_endpoint = root
+        .get("StartEndpoint")
+        .and_then(serde_json::Value::as_str);
+    let start_rule = root.get("StartRule").and_then(serde_json::Value::as_str);
+    match (start_endpoint, start_rule) {
+        (Some(_), Some(_)) => Err("the traffic policy document must carry exactly one of \
+                                   StartEndpoint and StartRule, not both"
+            .to_string()),
+        (None, None) => Err("the traffic policy document must carry either StartEndpoint or \
+                             StartRule as a string"
+            .to_string()),
+        (Some(endpoint), None) => {
+            if endpoints.contains_key(endpoint) {
+                Ok(record_type)
+            } else {
+                Err(format!(
+                    "StartEndpoint {endpoint} names no endpoint in Endpoints"
+                ))
+            }
+        }
+        (None, Some(rule)) => {
+            let rules = root
+                .get("Rules")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| {
+                    "a traffic policy document with a StartRule must carry Rules as a JSON object"
+                        .to_string()
+                })?;
+            if let Some(name) = named_entry_that_is_not_an_object(rules) {
+                return Err(format!("the rule {name} in Rules must be a JSON object"));
+            }
+            if rules.contains_key(rule) {
+                Ok(record_type)
+            } else {
+                Err(format!("StartRule {rule} names no rule in Rules"))
+            }
+        }
+    }
+}
+
+/// The name of the first entry of a traffic policy document's `Endpoints` or
+/// `Rules` block that is not itself a JSON object, if there is one: both blocks
+/// map a name to a definition, so an entry that is not an object defines
+/// nothing.
+fn named_entry_that_is_not_an_object(
+    entries: &serde_json::Map<String, serde_json::Value>,
+) -> Option<&String> {
+    entries
+        .iter()
+        .find(|(_, definition)| !definition.is_object())
+        .map(|(name, _)| name)
+}
+
+/// The endpoint host a `Location` URL falls back to when the request carried no
+/// `Host` header to build one from.
+const DEFAULT_ENDPOINT_HOST: &str = "route53.amazonaws.com";
+
+/// The absolute URL of a resource a create answers with, as its `Location`
+/// carries it.
+///
+/// Built from the endpoint the caller actually addressed, so the URL it gets
+/// back is one it can follow; `path` is the resource's path BELOW the API
+/// version prefix (`hostedzone/<id>`, `trafficpolicy/<id>/<version>`) — the
+/// same path the operation that reads the resource back is bound to. One
+/// helper, so two creates cannot word the same URL differently.
+pub fn resource_location(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    path: &str,
+) -> String {
+    let host = ctx
+        .parts()
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_ENDPOINT_HOST);
+    format!("https://{host}/2013-04-01/{path}")
+}
+
 /// The modelled `NoSuchHostedZone` (HTTP 404) for a zone id that names no zone
 /// in this store.
 ///
@@ -932,6 +1195,20 @@ impl IdMinter {
         x ^= x << 17;
         self.seed = x;
         x
+    }
+
+    /// 8-4-4-4-12 lowercase hex, the form of the ids Route 53 mints for the
+    /// resources it does not give a letter-prefixed id (a traffic policy).
+    fn mint_uuid(&mut self) -> String {
+        let hex = format!("{:016x}{:016x}", self.next_u64(), self.next_u64());
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        )
     }
 
     /// `prefix` followed by `len` characters from [`IdMinter::ALPHABET`].

@@ -23,7 +23,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The endpoint host the tests address, which is also the routing signal the
 /// router resolves this service from.
-const ENDPOINT: &str = "route53.amazonaws.com";
+///
+/// `pub(crate)` so a sibling suite asserting a `Location` URL names the same
+/// host the request was sent to.
+pub(crate) const ENDPOINT: &str = "route53.amazonaws.com";
 
 /// A router with just this service mounted on a fresh shared engine.
 ///
@@ -41,7 +44,7 @@ pub(crate) fn router() -> MultiServiceRouter {
 /// One HTTP exchange against the router.
 pub(crate) struct Reply {
     pub(crate) status: u16,
-    location: Option<String>,
+    pub(crate) location: Option<String>,
     /// Every element of the response body that carries text, as
     /// `(path from the root, text)` pairs in document order.
     doc: Vec<(String, String)>,
