@@ -175,6 +175,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // below, read once so the record carries one reading of the clock.
         let now = std::time::SystemTime::now();
 
+        // The list is caller-chosen and `ProfileArns` publishes no modelled maximum, so its
+        // LENGTH is checked first — one comparison, before any per-entry work and before the
+        // shared store lock is taken — and an oversized request is refused without being
+        // walked, exactly as `AssociateProfiles` refuses one.
+        if input.profile_arns.len() > crate::state::MAX_PROFILE_ARNS_PER_REQUEST {
+            return Err(DisassociateProfilesErrorModeled::ValidationException(
+                crate::state::too_many_profile_arns_exception(input.profile_arns.len()),
+            )
+            .into());
+        }
+
         let mut store = state.lock();
         // "Disassociate a profile from a workload": the profiles are a member OF the
         // workload, so the workload has to exist to hold any — resolved here, before any

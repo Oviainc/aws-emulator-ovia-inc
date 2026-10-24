@@ -206,9 +206,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 risk_counts: Some(crate::state::risk_counts_to_map(
                     &workload.pillar_risk_counts(lens, pillar_id),
                 )),
-                // The risk counts restricted to the questions a PROFILE prioritises exist
-                // only once a profile is associated with the workload; profiles are still
-                // a stub, so there is nothing to project.
+                // The risk counts restricted to the questions a PROFILE prioritises are not
+                // projected for a pillar either: which questions those are is decided by
+                // the profile template this emulator does not carry (`GetProfileTemplate`
+                // is a stub with its own issue), so no question of any workload is
+                // prioritized.
                 prioritized_risk_counts: None,
             })
             .collect();

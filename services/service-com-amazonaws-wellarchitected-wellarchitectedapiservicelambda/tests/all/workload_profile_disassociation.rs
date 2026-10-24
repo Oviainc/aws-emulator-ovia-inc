@@ -11,104 +11,31 @@
 //! a modelled 404 `ResourceNotFoundException` that leaves every association as it stood.
 //!
 //! The profiles here are minted over HTTP by `CreateProfile`, so every ARN a row sends is
-//! one the service handed out. ASSOCIATING a profile has no HTTP path yet —
-//! `AssociateProfiles` is still a stub with its own issue — so the association each row
-//! starts from is seeded through the shared state by this suite's own
-//! [`associate_profile`], exactly as this crate's suites seed a stored answer or a workload
-//! share whose writer is still a stub.
+//! one the service handed out, and the association each row starts from is made over HTTP by
+//! `AssociateProfiles` wherever that operation can produce it. An association pinned at a
+//! version OTHER than the one the profile is at is not reachable over HTTP — associating
+//! pins the profile's current version and `UpgradeProfileVersion` is still a stub with its
+//! own issue — so those rows seed it through the shared state, exactly as this crate's
+//! suites seed a stored answer or a workload share whose writer is still a stub.
 //!
 //! Everything asserted crosses the HTTP boundary: requests go through the real
 //! `MultiServiceRouter`, so routing, restJson1 (de)serialization, boundary constraint
 //! validation and the handler all run as they do in production.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::workload_harness::{created_id, minimal_create, Answer, Client};
+use super::workload_harness::{
+    age_workload, assert_not_found, created_id, created_profile, lens_review_profiles,
+    minimal_create, profiles_of, updated_at_of, Answer, Client,
+};
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state as state_crate;
 
 /// The Region the shared harness signs every request for, and so the Region an ARN built
 /// here is in.
 const REGION: &str = "us-west-2";
-
-fn member<'a>(answer: &'a Answer, name: &str) -> &'a str {
-    answer.body.get(name).and_then(Value::as_str).unwrap_or("")
-}
-
-/// A minimal valid `CreateProfile` request: `ProfileName`, `ProfileDescription`,
-/// `ProfileQuestions` and `ClientRequestToken` are all `@required`
-/// (`smithy_query(query="operation", operation="CreateProfile")`).
-fn minimal_profile(name: &str) -> Value {
-    json!({
-        "ProfileName": name,
-        "ProfileDescription": "a profile under test",
-        "ProfileQuestions": [{
-            "QuestionId": "priority",
-            "SelectedChoiceIds": ["priority_cost"],
-        }],
-        "ClientRequestToken": format!("tok-{name}"),
-    })
-}
-
-/// A profile minted over HTTP: its `ProfileArn` and the `ProfileVersion` the service put
-/// it at, both checked against the modelled forms
-/// (`^arn:aws[-a-z]*:wellarchitected:[a-z]{2}(-gov)?-[a-z]+-\d:\d{12}:profile/[a-z0-9]+$`
-/// and `@length(1, 32)` `^[A-Za-z0-9-]+$`).
-async fn created_profile(client: &Client, name: &str) -> (String, String) {
-    let answer = client.create_profile(minimal_profile(name)).await;
-    assert_eq!(
-        answer.status, 200,
-        "case {name:?}: expected CreateProfile 200, got {answer:?}"
-    );
-    let arn = member(&answer, "ProfileArn").to_string();
-    let version = member(&answer, "ProfileVersion").to_string();
-    assert!(
-        arn.starts_with(&format!(
-            "arn:aws:wellarchitected:{REGION}:{}:profile/",
-            engine::emulator_account_id()
-        )),
-        "case {name:?}: unexpected ProfileArn {arn:?}"
-    );
-    assert!(
-        (1..=32).contains(&version.len())
-            && version
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-'),
-        "case {name:?}: ProfileVersion must match ^[A-Za-z0-9-]{{1,32}}$, got {version:?}"
-    );
-    (arn, version)
-}
-
-/// The `Workload` a `GetWorkload` reports, as a JSON object.
-async fn stored_workload(client: &Client, workload_id: &str, case: &str) -> Value {
-    let answer = client.get(workload_id).await;
-    assert_eq!(
-        answer.status, 200,
-        "case {case:?}: expected GetWorkload 200, got {answer:?}"
-    );
-    answer.body.get("Workload").cloned().unwrap_or(Value::Null)
-}
-
-/// The `Workload$Profiles` a workload reports, empty for a workload that reports none.
-async fn profiles_of(client: &Client, workload_id: &str, case: &str) -> Vec<Value> {
-    stored_workload(client, workload_id, case)
-        .await
-        .get("Profiles")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-}
-
-/// The `Workload$UpdatedAt` a workload reports, as the epoch seconds restJson1 carries it.
-async fn updated_at_of(client: &Client, workload_id: &str, case: &str) -> f64 {
-    stored_workload(client, workload_id, case)
-        .await
-        .get("UpdatedAt")
-        .and_then(Value::as_f64)
-        .unwrap_or_else(|| panic!("case {case:?}: the workload must report UpdatedAt"))
-}
 
 /// A workload created over HTTP, with one profile — also created over HTTP — associated
 /// with it, pinned at `version` or at the version the created profile is at, and that
@@ -126,7 +53,7 @@ async fn workload_with_profile(
     );
     let (arn, minted_version) = created_profile(client, name).await;
     let version = version.unwrap_or(&minted_version).to_string();
-    associate_profile(client, &workload_id, &arn, &version);
+    associate_profile(client, &workload_id, &arn, &version, &minted_version).await;
     assert_eq!(
         profiles_of(client, &workload_id, name).await,
         vec![json!({ "ProfileArn": arn, "ProfileVersion": version })],
@@ -146,16 +73,36 @@ async fn disassociate_profiles(client: &Client, workload_id: &str, body: Value) 
         .await
 }
 
-/// Associate `profile_arn`, at `profile_version`, with `workload_id` straight through the
-/// shared state.
+/// Associate `profile_arn`, at `profile_version`, with `workload_id`.
 ///
-/// Associating a profile has no HTTP path yet: `AssociateProfiles` is still a stub with its
-/// own issue (`20261024T015923Z-wellarchitected-associateprofiles-stub`), so the association
-/// this suite has to UNDO is seeded exactly as this crate's suites seed a stored answer or a
-/// workload share whose writer is a stub. The PROFILE itself is minted over HTTP by
-/// `CreateProfile`, and the operation under test and the `GetWorkload` that reads the result
-/// back both cross the HTTP boundary.
-fn associate_profile(client: &Client, workload_id: &str, profile_arn: &str, version: &str) {
+/// Over HTTP through `AssociateProfiles` when the version asked for is the one the profile
+/// is at, which is the version associating pins (`super::workload_profile_association`
+/// covers that operation itself). An association pinned at any OTHER version is reachable
+/// only by seeding the shared state — `UpgradeProfileVersion`, which moves a workload to a
+/// later version, is still a stub with its own issue — exactly as this crate's suites seed a
+/// stored answer whose writer is a stub. The operation under test and the `GetWorkload` that
+/// reads the result back both cross the HTTP boundary either way.
+async fn associate_profile(
+    client: &Client,
+    workload_id: &str,
+    profile_arn: &str,
+    version: &str,
+    minted_version: &str,
+) {
+    if version == minted_version {
+        let answer = client
+            .send(
+                "PATCH",
+                &format!("/workloads/{workload_id}/associateProfiles"),
+                Some(json!({ "ProfileArns": [profile_arn] })),
+            )
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "expected AssociateProfiles 200 for {profile_arn}, got {answer:?}"
+        );
+        return;
+    }
     let state = client.store();
     let mut store = state.lock();
     let workload = store
@@ -166,80 +113,6 @@ fn associate_profile(client: &Client, workload_id: &str, profile_arn: &str, vers
         profile_arn: profile_arn.to_string(),
         profile_version: version.to_string(),
     });
-}
-
-/// The `LensReview$Profiles` the workload's review of the framework lens reports: "the
-/// profiles associated with the workload" (`smithy_query(query="doc", shape="LensReview",
-/// member="Profiles")`), so a review has to agree with `GetWorkload` about them.
-async fn lens_review_profiles(client: &Client, workload_id: &str, case: &str) -> Vec<Value> {
-    let answer = client
-        .send(
-            "GET",
-            &format!("/workloads/{workload_id}/lensReviews/wellarchitected"),
-            None,
-        )
-        .await;
-    assert_eq!(
-        answer.status, 200,
-        "case {case:?}: expected GetLensReview 200, got {answer:?}"
-    );
-    answer
-        .body
-        .get("LensReview")
-        .and_then(|review| review.get("Profiles"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-}
-
-/// Move the stored workload's `UpdatedAt` back by `age`, so a write the handler makes to
-/// it is observable whatever the clock's granularity between two in-process requests.
-/// Only the SEED reaches state directly; the write under test is the handler's.
-fn age_workload(client: &Client, workload_id: &str, age: Duration) {
-    let state = client.store();
-    let mut store = state.lock();
-    let workload = store
-        .workloads
-        .get_mut(workload_id)
-        .expect("the workload under test must exist");
-    workload.updated_at = SystemTime::now() - age;
-}
-
-/// The refusal a lookup that resolved nothing gets: 404 `ResourceNotFoundException`, with
-/// the modelled `ResourceType` of the resource that was missing and the identifier AS SENT.
-fn assert_not_found(
-    case: &str,
-    answer: &Answer,
-    resource_type: &str,
-    resource_id: &str,
-    subject: &str,
-) {
-    assert_eq!(
-        answer.status, 404,
-        "case {case:?}: expected HTTP 404, got {answer:?}"
-    );
-    assert_eq!(
-        answer.error_code, "ResourceNotFoundException",
-        "case {case:?}: expected ResourceNotFoundException, got {answer:?}"
-    );
-    assert_eq!(
-        member(answer, "ResourceType"),
-        resource_type,
-        "case {case:?}: expected ResourceType {resource_type}, got {answer:?}"
-    );
-    assert_eq!(
-        member(answer, "ResourceId"),
-        resource_id,
-        "case {case:?}: ResourceId must be the identifier as sent, got {answer:?}"
-    );
-    assert_eq!(
-        member(answer, "Message"),
-        format!(
-            "[ResourceNotFound] No {subject} was found in account {}.",
-            engine::emulator_account_id()
-        ),
-        "case {case:?}: unexpected Message, got {answer:?}"
-    );
 }
 
 /// One row of the removal table: the version the association is pinned at (`None` for the
@@ -293,7 +166,7 @@ async fn disassociate_profiles_removes_every_named_association() {
         let (workload_id, arn, version) = workload_with_profile(&client, row.name, row.version).await;
         // The workload's review of its lens reports the same associations as the workload.
         assert_eq!(
-            lens_review_profiles(&client, &workload_id, row.case).await,
+            lens_review_profiles(&client, &workload_id, "wellarchitected", row.case).await,
             vec![json!({ "ProfileArn": arn, "ProfileVersion": version })],
             "case {:?}: a lens review must report the workload's association",
             row.case
@@ -329,7 +202,7 @@ async fn disassociate_profiles_removes_every_named_association() {
             row.case
         );
         assert!(
-            lens_review_profiles(&client, &workload_id, row.case)
+            lens_review_profiles(&client, &workload_id, "wellarchitected", row.case)
                 .await
                 .is_empty(),
             "case {:?}: a lens review of the workload must report no profile either",
