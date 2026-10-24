@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBProxies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBProxies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBProxies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the RDS proxies this service holds in the region the request is signed for.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +143,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBProxies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBProxiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBProxies"))
+        let region =
+            crate::state::request_region(ctx).map_err(DescribeDBProxiesError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBProxiesError::invalid_parameter_value)?;
+        // This operation's `Filters` member documents "this parameter is not currently
+        // supported", so there is nothing to match on: a request that carries one is
+        // refused rather than served a list the filter was meant to narrow.
+        if let Some(filter) = input.filters.unwrap_or_default().first() {
+            return Err(DescribeDBProxiesError::invalid_parameter_value(format!(
+                "unrecognized filter name: {}; Filters is not currently supported by this \
+                 operation",
+                filter.name
+            )));
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones owed
+        // at this instant whether or not anybody called.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: a request sees only the proxies of the region it was signed
+        // for.
+        let candidates: Vec<&crate::state::DbProxyRecord> = match &input.db_proxy_name {
+            Some(requested) => {
+                let proxy = store
+                    .db_proxies
+                    .get(&(region.clone(), requested.clone()))
+                    .ok_or_else(|| {
+                        DescribeDBProxiesError::from(
+                            DescribeDBProxiesErrorModeled::DBProxyNotFoundFault(
+                                DBProxyNotFoundFault {
+                                    message: Some(format!("DBProxy {requested} not found.")),
+                                },
+                            ),
+                        )
+                    })?;
+                vec![proxy]
+            }
+            None => store.db_proxies_in(&region),
+        };
+        let proxies: Vec<(String, DBProxy)> = candidates
+            .into_iter()
+            .map(|proxy| (proxy.name.clone(), proxy.to_wire()))
+            .collect();
+
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(proxies, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBProxiesError::invalid_parameter_value)?;
+        Ok(DescribeDBProxiesOutput {
+            db_proxies: Some(page.items),
+            marker: page.next_marker,
+        })
     }
 }

@@ -550,7 +550,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         });
 
-        let record = crate::state::DbInstanceRecord {
+        let mut record = crate::state::DbInstanceRecord {
             identifier: identifier.clone(),
             region: region.clone(),
             dbi_resource_id: crate::state::mint_dbi_resource_id(mint),
@@ -646,7 +646,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_else(|| crate::state::DEFAULT_ENGINE_LIFECYCLE_SUPPORT.to_string()),
             instance_create_time: crate::state::now_as_wire_timestamp(),
             tags: input.tags.unwrap_or_default(),
+            // The instance's log starts empty; the line below is its first entry, and the
+            // transitions the clock then makes due add the rest (`DbInstanceRecord`).
+            engine_log: crate::state::InstanceLog::default(),
         };
+        record.engine_log.record(format!(
+            "DB instance {} created with engine {}; status {}",
+            record.identifier, record.engine, record.status
+        ));
 
         let db_instance = record.to_wire();
         let dbi_resource_id = record.dbi_resource_id.clone();

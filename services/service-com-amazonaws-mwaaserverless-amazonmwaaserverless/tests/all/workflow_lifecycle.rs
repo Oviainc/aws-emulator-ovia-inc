@@ -109,8 +109,8 @@ impl Harness {
     }
 
     /// The `(WorkflowVersion, IsLatestVersion)` pairs the STORE holds for a workflow,
-    /// in the order the versions were appended — the only way to show which single
-    /// version is flagged latest while `ListWorkflowVersions` is still a stub.
+    /// in the order the versions were appended — what the STORE holds, independent of
+    /// what any listing reports.
     pub(crate) fn stored_versions(&self, workflow_arn: &str) -> Vec<(String, bool)> {
         self.engine
             .state::<ComAmazonawsMwaaserverlessAmazonmwaaserverlessState>()

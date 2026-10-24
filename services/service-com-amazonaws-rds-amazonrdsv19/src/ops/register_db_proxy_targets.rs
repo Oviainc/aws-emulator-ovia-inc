@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterDBProxyTargets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterDBProxyTargets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Registers DB instances or DB clusters this service holds as the targets of a proxy's
+//! target group. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterDBProxyTargets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A registration stores WHICH database was registered and nothing else: everything a
+//! target reports about that database — its ARN, its endpoint, its port — is read from the
+//! database's own record when `DescribeDBProxyTargets` projects it, so the two cannot
+//! disagree.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +166,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterDBProxyTargets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterDBProxyTargetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterDBProxyTargets"))
+        let region =
+            crate::state::request_region(ctx).map_err(RegisterDBProxyTargetsError::validation)?;
+        let instances = input.db_instance_identifiers.unwrap_or_default();
+        let clusters = input.db_cluster_identifiers.unwrap_or_default();
+        for (member, values) in [
+            ("DBInstanceIdentifiers", &instances),
+            ("DBClusterIdentifiers", &clusters),
+        ] {
+            crate::state::check_request_list_len(
+                member,
+                values.len(),
+                crate::state::DB_PROXY_TARGET_QUOTA_PER_PROXY,
+            )
+            .map_err(RegisterDBProxyTargetsError::invalid_parameter_value)?;
+        }
+        if instances.is_empty() && clusters.is_empty() {
+            return Err(RegisterDBProxyTargetsError::invalid_parameter_combination(
+                "name at least one of DBInstanceIdentifiers or DBClusterIdentifiers: a \
+                 registration with neither registers nothing",
+            ));
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated registration.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope.
+        let key = (region.clone(), input.db_proxy_name.clone());
+        let Some(proxy) = store.db_proxies.get(&key) else {
+            return Err(RegisterDBProxyTargetsErrorModeled::DBProxyNotFoundFault(
+                DBProxyNotFoundFault {
+                    message: Some(format!("DBProxy {} not found.", input.db_proxy_name)),
+                },
+            )
+            .into());
+        };
+        if let Err(message) = crate::state::check_target_group_name(
+            &input.db_proxy_name,
+            input.target_group_name.as_deref(),
+        ) {
+            return Err(
+                RegisterDBProxyTargetsErrorModeled::DBProxyTargetGroupNotFoundFault(
+                    DBProxyTargetGroupNotFoundFault {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+        // A proxy that is still coming up cannot take a registration: the state the clock
+        // has yet to settle is real.
+        if proxy.status != crate::state::DB_PROXY_STATUS_AVAILABLE {
+            return Err(RegisterDBProxyTargetsErrorModeled::InvalidDBProxyStateFault(
+                InvalidDBProxyStateFault {
+                    message: Some(format!(
+                        "DB proxy {} is in state {} and cannot take a target registration",
+                        input.db_proxy_name, proxy.status
+                    )),
+                },
+            )
+            .into());
+        }
+        if proxy.targets.len() + instances.len() + clusters.len()
+            > crate::state::DB_PROXY_TARGET_QUOTA_PER_PROXY
+        {
+            return Err(RegisterDBProxyTargetsError::invalid_parameter_value(format!(
+                "DB proxy {} holds at most {} targets",
+                input.db_proxy_name,
+                crate::state::DB_PROXY_TARGET_QUOTA_PER_PROXY
+            )));
+        }
+
+        // Every database the request names is resolved BEFORE anything is registered, so a
+        // request naming one that does not exist leaves the proxy's target group exactly as
+        // it was. The identifiers are stored lowercased, as both database types' are.
+        let mut registering: Vec<crate::state::DbProxyTargetRecord> = Vec::new();
+        for identifier in &instances {
+            let identifier = identifier.to_ascii_lowercase();
+            if !store
+                .db_instances
+                .contains_key(&(region.clone(), identifier.clone()))
+            {
+                return Err(RegisterDBProxyTargetsErrorModeled::DBInstanceNotFoundFault(
+                    DBInstanceNotFoundFault {
+                        message: Some(format!("DBInstance {identifier} not found.")),
+                    },
+                )
+                .into());
+            }
+            registering.push(crate::state::DbProxyTargetRecord {
+                identifier,
+                is_cluster: false,
+            });
+        }
+        for identifier in &clusters {
+            let identifier = identifier.to_ascii_lowercase();
+            if !store
+                .db_clusters
+                .contains_key(&(region.clone(), identifier.clone()))
+            {
+                return Err(RegisterDBProxyTargetsErrorModeled::DBClusterNotFoundFault(
+                    DBClusterNotFoundFault {
+                        message: Some(format!("DBCluster {identifier} not found.")),
+                    },
+                )
+                .into());
+            }
+            registering.push(crate::state::DbProxyTargetRecord {
+                identifier,
+                is_cluster: true,
+            });
+        }
+        let proxy = &store.db_proxies[&key];
+        for target in &registering {
+            if proxy
+                .target_position(&target.identifier, target.is_cluster)
+                .is_some()
+            {
+                return Err(
+                    RegisterDBProxyTargetsErrorModeled::DBProxyTargetAlreadyRegisteredFault(
+                        DBProxyTargetAlreadyRegisteredFault {
+                            message: Some(format!(
+                                "{} is already registered with DB proxy {}",
+                                target.identifier, input.db_proxy_name
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The targets this call registered are what it answers with, each projected from
+        // the database behind it.
+        let db_proxy_targets: Vec<DBProxyTarget> = registering
+            .iter()
+            .map(|target| store.proxy_target_to_wire(&region, target))
+            .collect();
+        let now = crate::state::now_as_wire_timestamp();
+        let proxy = store
+            .db_proxies
+            .get_mut(&key)
+            .expect("the proxy was found above and the store is locked");
+        proxy.targets.extend(registering);
+        proxy.updated_date = now;
+
+        Ok(RegisterDBProxyTargetsOutput {
+            db_proxy_targets: Some(db_proxy_targets),
+        })
     }
 }
