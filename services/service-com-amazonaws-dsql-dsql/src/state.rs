@@ -981,6 +981,26 @@ pub fn resource_not_found(
     }
 }
 
+/// The modelled `ValidationException` for an input member whose value failed a
+/// requirement this service enforces itself (one the model cannot express, so the
+/// boundary validator passed the request through).
+///
+/// Every such refusal is built HERE rather than per handler, because the shape has
+/// members a client reads: `message` and the `@required` `reason` are always filled,
+/// and `fieldList` names the member and the requirement it failed — so a refusal is
+/// never the synthetic single-member `smithy.framework#ValidationException`, which
+/// carries no `reason` at all.
+pub fn invalid_member_value(member: &str, requirement: &str, value: &str) -> ValidationException {
+    ValidationException {
+        message: format!("{member} {requirement}, got {value}"),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: requirement.to_string(),
+        }]),
+    }
+}
+
 /// The modelled `ValidationException` for a `resourceArn`-shaped member whose value
 /// names no resource of this service at all, as [`parse_resource_arn`] reads it.
 ///
@@ -988,19 +1008,34 @@ pub fn resource_not_found(
 /// validator does, so the caller can fix the request from the message alone, and it
 /// fills the shape's `@required` `reason` so a client that branches on it can.
 pub fn invalid_resource_arn(member: &str, value: &str) -> ValidationException {
-    let requirement = format!(
-        "must be the ARN of an Aurora DSQL resource \
-         (arn:<partition>:{ARN_SERVICE}:<region>:<account>:<type>/<id>)"
-    );
-    ValidationException {
-        message: format!("{member} {requirement}, got {value}"),
-        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: member.to_string(),
-            message: requirement,
-        }]),
-    }
+    invalid_member_value(
+        member,
+        &format!(
+            "must be the ARN of an Aurora DSQL resource \
+             (arn:<partition>:{ARN_SERVICE}:<region>:<account>:<type>/<id>)"
+        ),
+        value,
+    )
 }
+
+/// The modelled `ValidationException` for a `nextToken` this service never issued,
+/// as [`decode_pagination_cursor`] reads it.
+///
+/// Shared by every paginated reader, so one fabricated cursor is refused the same
+/// way whichever list operation received it — and with the modelled shape's
+/// `@required` `reason` filled, not the synthetic `message`-only one.
+pub fn unissued_pagination_token(value: &str) -> ValidationException {
+    invalid_member_value(
+        NEXT_TOKEN_MEMBER,
+        "must be a nextToken a previous page of this operation returned",
+        value,
+    )
+}
+
+/// The name the paginated operations' cursor member carries on the wire
+/// (`smithy_query(query="operation", operation="ListClusters")`: `nextToken`,
+/// bound to the `next-token` query parameter).
+pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
 
 /// The modelled `ResourceNotFoundException` for a cluster this service does not
 /// hold: [`resource_not_found`] over the ARN the addressed identifier has in the

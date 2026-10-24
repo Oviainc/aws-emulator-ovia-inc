@@ -290,6 +290,15 @@ async fn an_unissued_next_token_is_refused() {
             "case {token:?}: the refusal must be a ValidationException, got {:?}",
             answer.error
         );
+        // The MODELLED shape, so the `@required` `reason` is there to branch on.
+        // The whole body contract is asserted in
+        // `tests/all/modeled_validation_exception.rs`.
+        assert_eq!(
+            answer.str("reason"),
+            "fieldValidationFailed",
+            "case {token:?}: the modelled reason must say the member's value failed, got {:?}",
+            answer.body
+        );
     }
 }
 
