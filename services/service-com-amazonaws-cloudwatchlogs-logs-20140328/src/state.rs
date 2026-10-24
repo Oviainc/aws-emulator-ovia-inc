@@ -61,6 +61,14 @@
 //! [`ComAmazonawsCloudwatchlogsLogs20140328State::delivery_destinations`], each one a
 //! [`DeliveryDestinationRecord`], keyed by the name that identifies one.
 //!
+//! The account's logical destinations — each "a cross-account destination that receives
+//! subscription log events", which `PutDestination` creates or updates and
+//! `DescribeDestinations` reports — live in
+//! [`ComAmazonawsCloudwatchlogsLogs20140328State::destinations`], each one a
+//! [`DestinationRecord`], keyed by the `destinationName` that identifies one. A destination
+//! names a physical resource of another service, so it is an account-level resource and no
+//! log group owns it.
+//!
 //! The account's log anomaly detectors — "one anomaly detector in the account", which
 //! `CreateLogAnomalyDetector` creates and `GetLogAnomalyDetector` reports — live in
 //! [`ComAmazonawsCloudwatchlogsLogs20140328State::anomaly_detectors`], each one an
@@ -700,6 +708,17 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// another log group), so it lives here rather than on [`LogGroupRecord`]: deleting the
     /// log group it points at does not delete the destination.
     pub delivery_destinations: BTreeMap<String, DeliveryDestinationRecord>,
+    /// Every logical destination of this account — the resource `PutDestination` creates or
+    /// updates, `DescribeDestinations` reports and `DeleteDestination` removes — keyed by
+    /// `Destination$destinationName`, the one member every other destination operation
+    /// identifies one by. A `BTreeMap` so `DescribeDestinations` enumerates them in the
+    /// order it documents ("The results are ASCII-sorted by destination name") without
+    /// re-sorting, which is also what makes its pagination cursor stable.
+    ///
+    /// A destination is a LOGICAL object naming a physical resource of another service, so
+    /// it lives here rather than on [`LogGroupRecord`]: the log groups whose subscription
+    /// filters deliver to it neither own it nor outlive it.
+    pub destinations: BTreeMap<String, DestinationRecord>,
     /// Every log anomaly detector of this account — the resource `CreateLogAnomalyDetector`
     /// creates and `GetLogAnomalyDetector` reports — keyed by `anomalyDetectorArn`, the one
     /// member every other anomaly-detector operation identifies one by. A `BTreeMap` so
@@ -769,11 +788,10 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
         match resource {
             TaggedResource::LogGroup(name) => self.log_groups.get(name).map(|group| &group.tags),
             TaggedResource::Delivery(id) => self.deliveries.get(id).map(|delivery| &delivery.tags),
-            // A logical destination carries tags too, but `PutDestination` is still a
-            // scaffold stub, so the account holds no destination at all: an ARN naming one
-            // names a resource that does not exist. Implementing that operation is what
-            // gives this arm a store to look in.
-            TaggedResource::Destination(_) => None,
+            TaggedResource::Destination(name) => self
+                .destinations
+                .get(name)
+                .map(|destination| &destination.tags),
         }
     }
 
@@ -790,7 +808,10 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
                 .deliveries
                 .get_mut(id)
                 .map(|delivery| &mut delivery.tags),
-            TaggedResource::Destination(_) => None,
+            TaggedResource::Destination(name) => self
+                .destinations
+                .get_mut(name)
+                .map(|destination| &mut destination.tags),
         }
     }
 
@@ -1324,6 +1345,101 @@ impl DeliveryDestinationRecord {
 pub fn delivery_destination_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("logs", region, &format!("delivery-destination:{name}"))
 }
+
+/// The number of logical destinations one account holds: CloudWatch Logs documents a quota
+/// of 500 destinations per account per Region ("Destinations: 500 per account per Region",
+/// CloudWatch Logs quotas), so a put that would create a 501st destination is refused. The
+/// ceiling also bounds this store, whose keys are caller-chosen (`DestinationName` is
+/// `@length(min: 1, max: 512)`, so distinct names are effectively unlimited) and whose
+/// records stay resident for as long as the process runs: a put that UPDATES a destination
+/// already stored is never refused by it, because it adds nothing.
+pub const MAX_DESTINATIONS: usize = 500;
+
+/// One logical destination — "a cross-account destination that receives subscription log
+/// events", which `PutDestination` creates or updates and `DescribeDestinations` reports —
+/// as it is stored. Every member of the model's `Destination` shape is reported from this
+/// record, so `DescribeDestinations` answers from state alone.
+#[derive(Debug, Clone)]
+pub struct DestinationRecord {
+    /// `Destination$destinationName` — "The name of the destination." Also the key the
+    /// store holds this destination under: it is the only thing `DeleteDestination` and
+    /// `PutDestinationPolicy` identify one by.
+    pub destination_name: String,
+    /// `Destination$arn` — "The ARN of this destination", as [`destination_arn`] builds it.
+    pub arn: String,
+    /// `Destination$targetArn` — "The Amazon Resource Name (ARN) of the physical target
+    /// where the log events are delivered (for example, a Kinesis stream)."
+    pub target_arn: String,
+    /// `Destination$roleArn` — "A role for impersonation, used when delivering log events
+    /// to the target."
+    pub role_arn: String,
+    /// `Destination$accessPolicy` — "An IAM policy document that governs which Amazon Web
+    /// Services accounts can create subscription filters against this destination." `None`
+    /// until `PutDestinationPolicy` sets one: "By default, PutDestination does not set any
+    /// access policy with the destination [...] the destination owner must call
+    /// PutDestinationPolicy after PutDestination."
+    pub access_policy: Option<String>,
+    /// `Destination$creationTime` — "The creation time of the destination, expressed as the
+    /// number of milliseconds after Jan 1, 1970 00:00:00 UTC." Stamped when the destination
+    /// is created and kept across later puts, which UPDATE that destination rather than
+    /// create one.
+    pub creation_time_ms: i64,
+    /// The tag set `PutDestination$tags` assigns to the destination — "An optional list of
+    /// key-value pairs to associate with the resource" — and the one every tagging
+    /// operation reads and writes through
+    /// [`ComAmazonawsCloudwatchlogsLogs20140328State::resource_tags`]. A `BTreeMap` so the
+    /// stored order is stable.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl DestinationRecord {
+    /// A brand-new destination, with its ARN DERIVED from the request's Region and its own
+    /// name rather than taken from the caller, and no access policy: "By default,
+    /// PutDestination does not set any access policy with the destination."
+    pub fn new(
+        region: &str,
+        destination_name: &str,
+        target_arn: &str,
+        role_arn: &str,
+        creation_time_ms: i64,
+    ) -> Self {
+        Self {
+            destination_name: destination_name.to_string(),
+            arn: destination_arn(region, destination_name),
+            target_arn: target_arn.to_string(),
+            role_arn: role_arn.to_string(),
+            access_policy: None,
+            creation_time_ms,
+            tags: BTreeMap::new(),
+        }
+    }
+
+    /// This destination as the model's `Destination` structure, which is what
+    /// `PutDestination` and `DescribeDestinations` both report.
+    pub fn reported(&self) -> crate::ops::types::Destination {
+        crate::ops::types::Destination {
+            destination_name: Some(self.destination_name.clone()),
+            target_arn: Some(self.target_arn.clone()),
+            role_arn: Some(self.role_arn.clone()),
+            access_policy: self.access_policy.clone(),
+            arn: Some(self.arn.clone()),
+            creation_time: Some(self.creation_time_ms),
+        }
+    }
+}
+
+/// A logical destination's ARN, the form `TagResource$resourceArn` documents for one ("The
+/// ARN format of a destination is
+/// arn:aws:logs:Region:account-id:destination:destination-name"): a `destination` resource
+/// of this service, identified by the destination's own name.
+pub fn destination_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn("logs", region, &format!("{DESTINATION_ARN_PREFIX}{name}"))
+}
+
+/// AWS's refusal for a `PutDestination` whose `roleArn` or `targetArn` is not an ARN: the
+/// service parses the destination's two ARNs together and reports the failure of either
+/// without naming which one failed.
+pub const DESTINATION_ARN_PARSE_FAILED: &str = "Error parsing ARN from given role or target";
 
 /// One log anomaly detector — "one anomaly detector in the account" — as it is stored.
 /// Every member of the model's `AnomalyDetector` shape is reported from this record, so

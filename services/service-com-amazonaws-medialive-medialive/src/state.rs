@@ -155,6 +155,22 @@ pub use schedules::{
 
 pub(crate) use alarm_template_groups::alarm_template_group_output;
 
+/// The channel placement group slice: its record, its bounds, its refusals, the
+/// store's methods and its output projection, in one module of its own for the
+/// same reason as [`alarm_template_groups`]. What stays in this file is the part
+/// the rest of the state needs: the store members on
+/// [`ComAmazonawsMedialiveMedialiveState`].
+pub mod channel_placement_groups;
+
+pub use channel_placement_groups::{
+    channel_placement_group_state, ChannelPlacementGroupDescription,
+    ChannelPlacementGroupRecord, ChannelPlacementGroupRefusal,
+    MAX_CHANNEL_PLACEMENT_GROUPS, MAX_CHANNEL_PLACEMENT_GROUP_NODES,
+    MAX_CHANNEL_PLACEMENT_GROUP_TOKENS,
+};
+
+pub(crate) use channel_placement_groups::channel_placement_group_output;
+
 /// The cloudwatch alarm TEMPLATE slice: its record, its bounds, its refusal, the
 /// store's methods and its output projection, in one module of its own for the
 /// same reason as [`alarm_template_groups`]. What stays in this file is the part
@@ -1541,6 +1557,17 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// `CreateCluster`'s `RequestId` (`@idempotencyToken`) -> the cluster it
     /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
     cluster_tokens: IdempotencyTokens,
+    /// Every channel placement group that exists, keyed by its minted `Id`. A
+    /// `BTreeMap` so a later `ListChannelPlacementGroups` walks it in id order
+    /// on every call.
+    pub channel_placement_groups: BTreeMap<String, ChannelPlacementGroupRecord>,
+    /// Mint counter behind the channel placement group slice's
+    /// `mint_channel_placement_group_id`.
+    pub next_channel_placement_group_id: u64,
+    /// `CreateChannelPlacementGroup`'s `RequestId` (`@idempotencyToken`), keyed
+    /// per cluster by the slice's `channel_placement_group_token_key` -> the
+    /// group it created. PRIVATE for the same reason as [`Self::channel_tokens`].
+    channel_placement_group_tokens: IdempotencyTokens,
 }
 
 impl ComAmazonawsMedialiveMedialiveState {
@@ -1579,6 +1606,7 @@ impl ComAmazonawsMedialiveMedialiveState {
         self.settle_multiplexes(now);
         self.settle_input_devices(now);
         self.settle_clusters(now);
+        self.settle_channel_placement_groups(now);
     }
 
     /// Whether the store is full, so `CreateChannel` must refuse rather than mint
@@ -2884,6 +2912,13 @@ impl ComAmazonawsMedialiveMedialiveState {
         if let Some(record) = self.clusters.values().find(|record| record.arn == arn) {
             return Some(TaggedResource::Cluster(record.id.clone()));
         }
+        if let Some(record) = self
+            .channel_placement_groups
+            .values()
+            .find(|record| record.arn == arn)
+        {
+            return Some(TaggedResource::ChannelPlacementGroup(record.id.clone()));
+        }
         None
     }
 
@@ -2913,6 +2948,10 @@ impl ComAmazonawsMedialiveMedialiveState {
                 .get(&id)
                 .map(|record| &record.tags),
             TaggedResource::Cluster(id) => self.clusters.get(&id).map(|record| &record.tags),
+            TaggedResource::ChannelPlacementGroup(id) => self
+                .channel_placement_groups
+                .get(&id)
+                .map(|record| &record.tags),
         }
     }
 
@@ -2986,6 +3025,11 @@ impl ComAmazonawsMedialiveMedialiveState {
             TaggedResource::Cluster(id) => self
                 .clusters
                 .get_mut(&id)
+                .map(|record| &mut record.tags),
+            TaggedResource::ChannelPlacementGroup(id) => self
+                .channel_placement_groups
+                .get_mut(&id)
+                .filter(|record| !record.is_delete_accepted())
                 .map(|record| &mut record.tags),
         }
     }
@@ -3095,6 +3139,7 @@ enum TaggedResource {
     AlarmTemplateGroup(String),
     EventBridgeRuleTemplateGroup(String),
     Cluster(String),
+    ChannelPlacementGroup(String),
 }
 
 /// One monitor deployment of one signal map, as `StartMonitorDeployment`

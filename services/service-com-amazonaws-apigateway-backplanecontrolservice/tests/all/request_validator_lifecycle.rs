@@ -22,7 +22,9 @@ use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
     MAX_REQUEST_VALIDATORS_PER_API, MAX_STRING_CHARS,
 };
 
-use crate::rest_api_lifecycle::{assert_failure, create_api, string_member, Answer, Gateway};
+use crate::rest_api_lifecycle::{
+    assert_failure, create_api, string_member, without, Answer, Gateway,
+};
 
 /// `CreateRequestValidator` on `api` with `request`.
 async fn create_validator(gateway: &Gateway, api: &str, request: Value) -> Answer {
@@ -61,12 +63,11 @@ async fn created_validator(gateway: &Gateway, api: &str, case: &str, request: Va
 /// The response body with `id` removed, so a case can state the record the request asked
 /// for without naming the id the service minted for it.
 fn without_id(body: &Value, case: &str) -> Value {
-    let mut stripped = body.clone();
-    stripped
-        .as_object_mut()
-        .unwrap_or_else(|| panic!("case {case}: expected an object, got {body:?}"))
-        .remove("id");
-    stripped
+    assert!(
+        body.is_object(),
+        "case {case}: expected an object, got {body:?}"
+    );
+    without(body, &["id"])
 }
 
 #[tokio::test]

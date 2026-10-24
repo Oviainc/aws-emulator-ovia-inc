@@ -151,11 +151,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `name` (1..64, `[\w-.~]+`), `emailAddress` (6..254, `^(.+)@(.+)$`) and the
-        // `tags` map's 0..200 length, key pattern and value length are all modelled
-        // constraints, so the centralized walk has already refused anything outside
-        // them with a 400 `ValidationException` before this body runs.
+        // `name` (1..64), `emailAddress` (6..254, `^(.+)@(.+)$`) and the `tags` map's
+        // 0..200 length and value length are modelled in a form the centralized walk
+        // applies, so a value outside them is already a 400 `ValidationException`
+        // before this body runs. The tag KEY pattern is not: the walk captures no
+        // map-key constraints and could not compile this one anyway, so this handler
+        // applies it (see `crate::state::tag_key_rejection`) before it touches the
+        // store, because a create the shape refuses persists nothing.
         let _ = ctx;
+        if let Some(tags) = input.tags.as_ref() {
+            crate::state::check_tag_keys("tags", tags.keys().map(String::as_str))
+                .map_err(CreateEmailContactErrorModeled::ValidationException)?;
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateEmailContactErrorModeled::InternalServerException(InternalServerException {
                 message: "the email contact store is unavailable".to_string(),

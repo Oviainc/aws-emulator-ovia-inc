@@ -99,6 +99,8 @@ mod image_usage_reports;
 mod images;
 #[path = "all/import_image_tasks.rs"]
 mod import_image_tasks;
+#[path = "all/instance_event_notification_attributes.rs"]
+mod instance_event_notification_attributes;
 #[path = "all/instance_lifecycle.rs"]
 mod instance_lifecycle;
 #[path = "all/instance_type_offerings.rs"]

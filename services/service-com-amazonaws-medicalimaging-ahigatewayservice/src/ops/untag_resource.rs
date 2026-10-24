@@ -161,6 +161,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // Each key named for removal is a `TagKey` too, so it answers to the same
+        // modelled constraints — the boundary validator enforces the LIST's bounds and
+        // each element's `@length`, but never the pattern (its negative lookahead does
+        // not compile). A list element is reported at the position the framework spells
+        // it with, `<member>.<1-based index>.member`.
+        for (position, key) in input.tag_keys.iter().enumerate() {
+            let path = format!("tagKeys.{}.member", position + 1);
+            if let Some(violation) = crate::state::tag_key_violation(&path, key) {
+                return Err(UntagResourceErrorModeled::ValidationException(ValidationException {
+                    message: crate::state::one_validation_error(&violation),
+                })
+                .into());
+            }
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UntagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: "the medical-imaging state store is unavailable".to_string(),

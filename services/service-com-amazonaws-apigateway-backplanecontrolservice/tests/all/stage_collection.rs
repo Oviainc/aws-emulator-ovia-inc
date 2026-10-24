@@ -22,7 +22,10 @@ use crate::rest_api_lifecycle::{
 use crate::stage_lifecycle::{create_deployment, get_stage};
 
 /// `GetStages` for `api`, with `query` appended verbatim (`""` for no filter).
-async fn get_stages(gateway: &Gateway, api: &str, query: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite reads the collection through this one helper rather
+/// than keeping its own copy (the `update_stage_readers` suite does).
+pub(crate) async fn get_stages(gateway: &Gateway, api: &str, query: &str) -> Answer {
     gateway
         .call("GET", &format!("/restapis/{api}/stages{query}"), None)
         .await

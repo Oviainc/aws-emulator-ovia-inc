@@ -528,8 +528,8 @@ async fn an_arn_naming_no_stored_taggable_resource_is_refused() {
         // `@pattern` does not admit, so it is a bad parameter rather than a missing
         // resource.
         (absent_group_wildcard.as_str(), "InvalidParameterException"),
-        // A destination is a taggable kind: `PutDestination` is a stub, so the account
-        // holds none, which is a missing resource rather than a bad parameter.
+        // A destination is a taggable kind: this account was never put one under that
+        // name, which is a missing resource rather than a bad parameter.
         (destination.as_str(), "ResourceNotFoundException"),
         (delivery.as_str(), "ResourceNotFoundException"),
         (log_stream.as_str(), "InvalidParameterException"),

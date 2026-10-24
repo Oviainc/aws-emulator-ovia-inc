@@ -429,8 +429,8 @@ async fn an_arn_naming_no_stored_taggable_resource_is_refused() {
     // missing resource — for the group that EXISTS as much as for one that does not.
     let existing_group_wildcard = log_group_arn(REGION, group, true);
     let absent_group_wildcard = log_group_arn(REGION, "/aws/emulator/never-created", true);
-    // A destination is a taggable kind: `PutDestination` is a stub, so the account holds
-    // none, which is a missing resource rather than a bad parameter.
+    // A destination is a taggable kind: this account was never put one under that name, so
+    // the ARN names a missing resource rather than a bad parameter.
     let destination = format!(
         "arn:aws:logs:{REGION}:{}:destination:vended-logs",
         engine::emulator_account_id()

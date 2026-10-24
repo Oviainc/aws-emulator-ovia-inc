@@ -70,6 +70,90 @@ pub const VALIDATION_REASON_FIELD: &str = "fieldValidationFailed";
 /// merge that would exceed it rather than persisting one.
 pub const MAX_TAGS_PER_CONTACT: usize = 200;
 
+/// The modelled `TagKey` pattern, verbatim
+/// (`smithy_query(query="shape",shape="TagKey")`).
+///
+/// Stated here because it has to be applied by hand: see [`tag_key_rejection`].
+pub const TAG_KEY_PATTERN: &str = r"^(?!aws:).{1,128}$";
+
+/// The tag-key prefix [`TAG_KEY_PATTERN`]'s leading negative lookahead excludes: the
+/// namespace AWS reserves for its own tags.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// The fewest characters [`TAG_KEY_PATTERN`]'s `.{1,128}` admits — an empty key is not
+/// a `TagKey`. `TagKey` carries no separate `@length`, so this bound lives only inside
+/// the pattern.
+pub const MIN_TAG_KEY_LEN: usize = 1;
+
+/// The most characters [`TAG_KEY_PATTERN`]'s `.{1,128}` admits, from the same pattern.
+pub const MAX_TAG_KEY_LEN: usize = 128;
+
+/// Why `key` is not a `TagKey`, or `None` when it satisfies [`TAG_KEY_PATTERN`].
+///
+/// This one modelled constraint cannot be left to the framework's centralized
+/// constraint walk, for two independent reasons, both in
+/// `vendor/smithy-schema-server/src/constraints.rs`: the walk does not capture a map
+/// KEY's constraints at all ("Map *keys* are not covered"), and the pattern opens with
+/// the negative lookahead `(?!aws:)`, which the `regex` crate cannot compile — and a
+/// `@pattern` that fails to compile is treated there as matching EVERY value. So the
+/// pattern is applied here instead, by every operation that accepts a tag key
+/// (`CreateEmailContact` and `TagResource` through `tags`, `UntagResource` through
+/// `tagKeys`), and the 1..128 character bound travels with it because `TagKey` carries
+/// no separate `@length`.
+///
+/// It is applied as the pattern's independent parts rather than by pulling in a
+/// look-around regex engine, because the pattern's ONLY look-around is that leading
+/// `(?!aws:)`, which states exactly "the key does not begin with
+/// [`RESERVED_TAG_KEY_PREFIX`]" — a prefix test, case-SENSITIVE because the pattern is
+/// (`AWS:` is admitted by it). What remains is `.{1,128}` anchored at both ends: 1 to
+/// 128 characters, counted as the Unicode scalar values `.` matches, none of them the
+/// line feed `.` excludes.
+pub fn tag_key_rejection(key: &str) -> Option<String> {
+    if key.starts_with(RESERVED_TAG_KEY_PREFIX) {
+        return Some(format!(
+            "must not begin with the reserved prefix {RESERVED_TAG_KEY_PREFIX}"
+        ));
+    }
+    let len = key.chars().count();
+    if !(MIN_TAG_KEY_LEN..=MAX_TAG_KEY_LEN).contains(&len) {
+        return Some(format!(
+            "must carry between {MIN_TAG_KEY_LEN} and {MAX_TAG_KEY_LEN} characters, not {len}"
+        ));
+    }
+    if key.contains('\n') {
+        return Some("must not carry a line feed".to_string());
+    }
+    None
+}
+
+/// `Ok` when every key in `keys` satisfies [`TAG_KEY_PATTERN`], else the modelled 400
+/// for the offending one.
+///
+/// `member` is the input member the keys arrived through (`tags`, `tagKeys`), so the
+/// refusal blames what the caller named rather than the shape behind it. A request
+/// carrying several bad keys is refused for the lexicographically first of them, so one
+/// request always reads the same way however the map happened to be ordered.
+pub fn check_tag_keys<'a, I>(member: &str, keys: I) -> Result<(), ValidationException>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut refused: Option<(&str, String)> = None;
+    for key in keys {
+        if let Some(why) = tag_key_rejection(key) {
+            if refused.as_ref().is_none_or(|(held, _)| key < *held) {
+                refused = Some((key, why));
+            }
+        }
+    }
+    match refused {
+        Some((_, why)) => Err(field_validation_failure(
+            member,
+            &format!("names a tag key that {why}"),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// The most email contacts this emulator will hold.
 ///
 /// Emulator resource guard, NOT a published AWS quota: every record is created by a

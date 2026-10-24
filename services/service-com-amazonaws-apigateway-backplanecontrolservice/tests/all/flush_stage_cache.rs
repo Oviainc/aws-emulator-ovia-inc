@@ -25,7 +25,7 @@ use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
     CACHE_CLUSTER_FLUSH_IN_PROGRESS, CACHE_CLUSTER_FLUSH_SPAN, CACHE_CLUSTER_NOT_AVAILABLE,
 };
 
-use crate::rest_api_lifecycle::{assert_failure, create_api, Answer, Gateway};
+use crate::rest_api_lifecycle::{assert_failure, create_api, without, Answer, Gateway};
 use crate::stage_lifecycle::{create_deployment, get_stage};
 
 /// A margin on top of a stored span, so a test waiting one out is not racing it.
@@ -54,11 +54,7 @@ pub(crate) fn cluster_status(body: &Value, case: &str) -> String {
 
 /// The stage body with its `cacheClusterStatus` dropped: what a flush must leave alone.
 fn without_cluster_status(body: &Value) -> Value {
-    let mut copy = body.clone();
-    if let Some(object) = copy.as_object_mut() {
-        object.remove("cacheClusterStatus");
-    }
-    copy
+    without(body, &["cacheClusterStatus"])
 }
 
 /// Create `stage_name` on `api` from `extra` (the cache members and whatever else the row

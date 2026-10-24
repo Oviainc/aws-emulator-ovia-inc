@@ -44,7 +44,9 @@ use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
     MAX_DOMAIN_LABEL_CHARS, MAX_DOMAIN_NAME_CHARS,
 };
 
-use crate::rest_api_lifecycle::{assert_failure, page_items, string_member, Answer, Gateway};
+use crate::rest_api_lifecycle::{
+    assert_failure, page_items, string_member, without, Answer, Gateway,
+};
 use crate::tag_reads_by_arn::{apigateway_arn, get_tags};
 
 const BAD_REQUEST: &str = "BadRequestException";
@@ -105,11 +107,7 @@ fn listed_names(body: &Value, case: &str) -> Vec<String> {
 /// may legitimately report different values for it; every OTHER member must be identical.
 /// Each test asserts the status itself under its own rule.
 fn without_status(body: &Value) -> Value {
-    let mut body = body.clone();
-    if let Some(members) = body.as_object_mut() {
-        members.remove("domainNameStatus");
-    }
-    body
+    without(body, &["domainNameStatus"])
 }
 
 /// One row of the endpoint-type table: the case, the `endpointConfiguration.types` the
