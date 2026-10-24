@@ -35,6 +35,8 @@ mod insight_reads;
 mod monitored_resources;
 #[path = "all/mutation_idempotency_and_tenancy.rs"]
 mod mutation_idempotency_and_tenancy;
+#[path = "all/notification_channel_conflict.rs"]
+mod notification_channel_conflict;
 #[path = "all/organization_insight_listing.rs"]
 mod organization_insight_listing;
 #[path = "all/organization_overview.rs"]
