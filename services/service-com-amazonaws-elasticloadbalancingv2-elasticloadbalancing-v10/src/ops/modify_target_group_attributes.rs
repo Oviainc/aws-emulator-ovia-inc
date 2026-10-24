@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyTargetGroupAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyTargetGroupAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyTargetGroupAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the named attributes onto a persisted target group and answers with what it
+//! stored for each one. Only the attributes the request names are touched; every other
+//! attribute keeps the value — or the documented default — it had, and a later
+//! `DescribeTargetGroupAttributes` reports the whole set.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +135,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyTargetGroupAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyTargetGroupAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyTargetGroupAttributes"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("ModifyTargetGroupAttributes")
+        })?;
+
+        let mut guard = state.lock();
+        let Some(group) = guard.target_groups.get_mut(&input.target_group_arn) else {
+            return Err(
+                ModifyTargetGroupAttributesErrorModeled::TargetGroupNotFoundException(
+                    TargetGroupNotFoundException {
+                        message: Some(crate::state::target_groups_not_found_message([
+                            input.target_group_arn.as_str(),
+                        ])),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The whole request is checked before the first write, so a refused call
+        // stores nothing: a caller that sent one bad attribute beside three good ones
+        // can resend the corrected request without wondering which of them landed.
+        let mut writes: Vec<(String, String)> = Vec::with_capacity(input.attributes.len());
+        for attribute in &input.attributes {
+            let key = attribute.key.clone().unwrap_or_default();
+            // The value is stored exactly as the request wrote it, so a read reports
+            // the caller's own value rather than a re-rendered one. An attribute with
+            // no value at all names nothing to store.
+            let value = attribute.value.clone().unwrap_or_default();
+            let Some(spec) = crate::state::target_group_attribute(&key) else {
+                return Err(invalid_configuration(format!(
+                    "'{key}' is not a target group attribute this service supports"
+                )));
+            };
+            if !spec.applies_to(group) {
+                return Err(invalid_configuration(format!(
+                    "The attribute '{key}' is not supported for a target group whose protocol \
+                     is {} and whose target type is {}",
+                    group.protocol.as_deref().unwrap_or("unset"),
+                    group.target_type
+                )));
+            }
+            if let Err(domain) = spec.domain.check(&value) {
+                return Err(invalid_configuration(format!(
+                    "The value '{value}' is not valid for the attribute '{key}': it must be \
+                     {domain}"
+                )));
+            }
+            writes.push((key, value));
+        }
+
+        for (key, value) in &writes {
+            group.attributes.insert(key.clone(), value.clone());
+        }
+
+        // AWS answers with the attributes the call modified, in the order the request
+        // named them — not the whole set, which is what `DescribeTargetGroupAttributes`
+        // reports.
+        Ok(ModifyTargetGroupAttributesOutput {
+            attributes: Some(
+                writes
+                    .into_iter()
+                    .map(|(key, value)| TargetGroupAttribute {
+                        key: Some(key),
+                        value: Some(value),
+                    })
+                    .collect(),
+            ),
+        })
     }
+}
+
+/// The operation's own refusal for an attribute it cannot store: an unknown key, a key
+/// this target group does not carry, or a value outside the set the attribute's
+/// documentation states. The message names the key and the value from the request and
+/// the rule they broke, because that is what the caller has to fix.
+fn invalid_configuration(detail: String) -> ModifyTargetGroupAttributesError {
+    ModifyTargetGroupAttributesErrorModeled::InvalidConfigurationRequestException(
+        InvalidConfigurationRequestException {
+            message: Some(detail),
+        },
+    )
+    .into()
 }

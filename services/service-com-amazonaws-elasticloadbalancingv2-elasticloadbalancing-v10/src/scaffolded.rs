@@ -197,7 +197,12 @@ static VALIDATION_ERROR_MESSAGE: Schema = Schema::new_member(
 /// exists because `ValidationError` — not the synthetic `ValidationException` above —
 /// is the error code Elastic Load Balancing answers a request whose VALUES it cannot
 /// accept with, for a rule its model documents in prose but declares no error shape
-/// for, and the error code is what a client branches on.
+/// for, and the error code is what a client branches on. The framework's own boundary
+/// validator already names that code for a value outside a modelled bound
+/// (`vendor/smithy-server-runtime/src/pre_dispatch.rs`: `ProtocolError::Invalid` ->
+/// `400 ValidationError` on the query protocols), so a handler enforcing a rule the
+/// model cannot express names the SAME code — otherwise one logical failure answers
+/// under two codes.
 pub static VALIDATION_ERROR_SCHEMA: Schema = Schema::new_struct(
     ShapeId::from_static(
         "smithy.framework#ValidationError",
@@ -264,9 +269,11 @@ impl<E> Scaffolded<E> {
     /// This is the refusal Elastic Load Balancing itself answers with for a rule its
     /// model states in the documentation of a member rather than as an error shape —
     /// a member that applies only to certain listener protocols, a count the prose
-    /// fixes. The model declares no error for any of it, so the code lives here rather
-    /// than on an operation's error enum; say what was wrong and name the member,
-    /// because the caller has to fix the request from this text alone.
+    /// fixes, a target group name past the published length or carrying a character the
+    /// name may not hold. The model declares no error for any of it, so the code lives
+    /// here rather than on an operation's error enum; say what was wrong and name the
+    /// member and the limit, because the caller has to fix the request from this text
+    /// alone.
     pub fn validation_error(message: impl Into<String>) -> Self {
         Self::ValidationError(ValidationException::new(message))
     }

@@ -168,21 +168,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let named = input.target_group_arns.is_some() || input.names.is_some();
         let mut selected: Vec<&crate::state::TargetGroupRecord> = if named {
             let mut arns: Vec<String> = Vec::new();
+            // Whether any identifier the request asked for is one nothing holds; the
+            // refusal is about the selection, so it names none of them.
+            let mut missing = false;
             for arn in input.target_group_arns.iter().flatten() {
-                if !guard.target_groups.contains_key(arn) {
-                    return Err(not_found(arn));
-                }
-                if !arns.contains(arn) {
-                    arns.push(arn.clone());
+                match guard.target_groups.contains_key(arn) {
+                    false => missing = true,
+                    true if !arns.contains(arn) => arns.push(arn.clone()),
+                    true => {}
                 }
             }
             for name in input.names.iter().flatten() {
-                let Some(arn) = guard.name_to_tg_arn.get(name) else {
-                    return Err(not_found(name));
-                };
-                if !arns.contains(arn) {
-                    arns.push(arn.clone());
+                match guard.name_to_tg_arn.get(name) {
+                    None => missing = true,
+                    Some(arn) if !arns.contains(arn) => arns.push(arn.clone()),
+                    Some(_) => {}
                 }
+            }
+            if missing {
+                return Err(not_found());
             }
             arns.iter()
                 .filter_map(|arn| guard.target_groups.get(arn))
@@ -216,10 +220,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled refusal for an ARN or name no target group in state carries.
-fn not_found(identifier: &str) -> DescribeTargetGroupsError {
+/// The modelled refusal for a selection this read could not resolve.
+///
+/// `TargetGroupArns` and `Names` are both LISTS, so the refusal is about the request's
+/// whole selection rather than one entry of it, and the service names no value — unlike
+/// an operation acting on ONE `TargetGroupArn`, which names that identifier
+/// ([`crate::state::target_groups_not_found_message`]).
+fn not_found() -> DescribeTargetGroupsError {
     DescribeTargetGroupsErrorModeled::TargetGroupNotFoundException(TargetGroupNotFoundException {
-        message: Some(format!("Target group '{identifier}' not found")),
+        message: Some(crate::state::target_group_selection_not_found_message()),
     })
     .into()
 }

@@ -236,15 +236,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx);
 
+        // The model's own rule for `Name`: "This name must be unique per region per
+        // account, can have a maximum of 32 characters, must contain only alphanumeric
+        // characters or hyphens, and must not begin or end with a hyphen." The Smithy
+        // shape carries no `@length` or `@pattern`, so the boundary validator passes
+        // every name and the service's own refusal is the handler's to raise; the
+        // message names the value and the limit, because that is what the caller fixes.
+        validate_name(&input.name)?;
+
         // The modelled default for `TargetType`: "the default is instance".
         let target_type = input
             .target_type
             .clone()
             .unwrap_or_else(|| "instance".to_string());
+        let lambda = target_type == "lambda";
         // The model: "If the target type is instance, ip, or alb, health checks are
         // always enabled and can't be disabled." The model cannot express that, so
         // the handler refuses the combination rather than discarding the input.
-        if target_type != "lambda" && input.health_check_enabled == Some(false) {
+        if !lambda && input.health_check_enabled == Some(false) {
             return Err(CreateTargetGroupErrorModeled::InvalidConfigurationRequestException(
                 InvalidConfigurationRequestException {
                     message: Some(format!(
@@ -254,16 +263,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        validate_health_check_protocol(
+            input.health_check_protocol.as_deref(),
+            input.protocol.as_deref(),
+        )?;
+
+        // "If the target is a Lambda function, this parameter does not apply" —
+        // `Protocol`, `Port` and `VpcId` each carry that sentence, and `ProtocolVersion`
+        // is "[HTTP/HTTPS protocol]". A Lambda target group therefore stores none of
+        // them, whatever the request carried, so a later read reports what AWS reports.
+        let protocol = input.protocol.clone().filter(|_| !lambda);
+        // "The default is HTTP1, which sends requests to targets using HTTP/1.1" — a
+        // protocol version belongs to an HTTP/HTTPS target group alone.
+        let protocol_version = if crate::state::is_http_protocol(protocol.as_deref()) {
+            Some(
+                input
+                    .protocol_version
+                    .clone()
+                    .unwrap_or_else(|| "HTTP1".to_string()),
+            )
+        } else {
+            None
+        };
         let mut candidate = TargetGroupRecord {
             arn: String::new(),
             name: input.name.clone(),
-            protocol: input.protocol.clone(),
-            protocol_version: input.protocol_version.clone(),
-            port: input.port,
-            vpc_id: input.vpc_id.clone(),
+            protocol: protocol.clone(),
+            protocol_version,
+            port: input.port.filter(|_| !lambda),
+            vpc_id: input.vpc_id.clone().filter(|_| !lambda),
             health_check: health_check_config(&input, &target_type),
             target_type,
-            ip_address_type: input.ip_address_type.clone(),
+            // "The IP address type. The default value is ipv4."
+            ip_address_type: Some(
+                input
+                    .ip_address_type
+                    .clone()
+                    .unwrap_or_else(|| "ipv4".to_string()),
+            ),
             target_control_port: input.target_control_port,
             load_balancer_arns: Vec::new(),
             attributes: std::collections::HashMap::new(),
@@ -288,7 +325,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateTargetGroupErrorModeled::DuplicateTargetGroupNameException(
                 DuplicateTargetGroupNameException {
                     message: Some(format!(
-                        "A target group with the name '{}' already exists",
+                        "A target group with the same name '{}' exists, but with different \
+                         settings",
                         candidate.name
                     )),
                 },
@@ -332,6 +370,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// Refuse a `Name` the service does not accept, with the awsQuery `ValidationError`
+/// code and a message built from the request: the value, and the rule it broke.
+///
+/// Every rule is a clause of the model's own `Name` documentation (see this file's
+/// header): at most [`crate::state::TARGET_GROUP_NAME_MAX_LENGTH`] characters, only
+/// alphanumeric characters or hyphens, and neither end a hyphen.
+fn validate_name(name: &str) -> Result<(), CreateTargetGroupError> {
+    let refuse = |detail: String| Err(crate::scaffolded::Scaffolded::validation_error(detail));
+    if name.is_empty() {
+        return refuse("Target group name cannot be empty".to_string());
+    }
+    if name.chars().count() > crate::state::TARGET_GROUP_NAME_MAX_LENGTH {
+        return refuse(format!(
+            "Target group name '{name}' cannot be longer than '{}' characters",
+            crate::state::TARGET_GROUP_NAME_MAX_LENGTH
+        ));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return refuse(format!(
+            "Target group name '{name}' can only contain characters that are alphanumeric \
+             characters or hyphens"
+        ));
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return refuse(format!(
+            "Target group name '{name}' cannot begin or end with a hyphen"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a health-check protocol the service cannot check with, as
+/// `HealthCheckProtocol`'s own documentation states it: "The TCP protocol is not
+/// supported for health checks if the protocol of the target group is HTTP or HTTPS.
+/// The GENEVE, TLS, UDP, TCP_UDP, QUIC, and TCP_QUIC protocols are not supported for
+/// health checks." Both are configuration the model declares but cannot express, so
+/// they are the operation's own `InvalidConfigurationRequest`.
+fn validate_health_check_protocol(
+    health_check_protocol: Option<&str>,
+    protocol: Option<&str>,
+) -> Result<(), CreateTargetGroupError> {
+    let Some(health_check_protocol) = health_check_protocol else {
+        return Ok(());
+    };
+    let refuse = |detail: String| {
+        Err(
+            CreateTargetGroupErrorModeled::InvalidConfigurationRequestException(
+                InvalidConfigurationRequestException {
+                    message: Some(detail),
+                },
+            )
+            .into(),
+        )
+    };
+    if !crate::state::HEALTH_CHECK_PROTOCOLS.contains(&health_check_protocol) {
+        return refuse(format!(
+            "The {health_check_protocol} protocol is not supported for health checks"
+        ));
+    }
+    if health_check_protocol == "TCP" && crate::state::is_http_protocol(protocol) {
+        return refuse(format!(
+            "The TCP protocol is not supported for health checks of a target group whose \
+             protocol is {}",
+            protocol.unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
+
 /// The tags to store. `CreateTargetGroup` models no duplicate-key error, so a
 /// repeated key keeps its last value.
 fn tag_map(tags: Option<&[Tag]>) -> std::collections::HashMap<String, String> {
@@ -344,7 +451,7 @@ fn tag_map(tags: Option<&[Tag]>) -> std::collections::HashMap<String, String> {
 /// Whether a protocol carries HTTP semantics, which is what decides whether a health
 /// check has a path and a response-code matcher.
 fn is_http(protocol: Option<&str>) -> bool {
-    matches!(protocol, Some("HTTP") | Some("HTTPS"))
+    crate::state::is_http_protocol(protocol)
 }
 
 /// The health check to persist: what the request gave, with every absent member
@@ -355,7 +462,7 @@ fn is_http(protocol: Option<&str>) -> bool {
 /// `smithy_query(query="doc",shape="CreateTargetGroupInput",member="<Member>")`).
 fn health_check_config(input: &CreateTargetGroupInput, target_type: &str) -> HealthCheckConfig {
     let lambda = target_type == "lambda";
-    let protocol = input.protocol.as_deref();
+    let protocol = input.protocol.as_deref().filter(|_| !lambda);
     let geneve = protocol == Some("GENEVE");
 
     // "For Application Load Balancers, the default is HTTP. For Network Load
@@ -371,7 +478,10 @@ fn health_check_config(input: &CreateTargetGroupInput, target_type: &str) -> Hea
             Some("TCP".to_string())
         }
     });
-    let health_check_is_http = is_http(health_check_protocol.as_deref());
+    // A Lambda target group reports no health-check protocol at all — the load
+    // balancer invokes the function rather than connecting to a port — and its health
+    // check is nonetheless an HTTP one, so it carries a path and a matcher.
+    let health_check_is_http = lambda || is_http(health_check_protocol.as_deref());
 
     // "If the protocol is HTTP, HTTPS, TCP, TLS, UDP, TCP_UDP, QUIC, or TCP_QUIC the
     // default is traffic-port ... If the protocol is GENEVE, the default is port 80."
@@ -388,12 +498,12 @@ fn health_check_config(input: &CreateTargetGroupInput, target_type: &str) -> Hea
     // "[HTTP1 or HTTP2 protocol version] The ping path. The default is /. [GRPC
     // protocol version] ... The default is /AWS.ALB/healthcheck."
     let path = input.health_check_path.clone().or_else(|| {
-        if !health_check_is_http {
-            None
-        } else if input.protocol_version.as_deref() == Some("GRPC") {
-            Some("/AWS.ALB/healthcheck".to_string())
+        if health_check_is_http {
+            Some(crate::state::default_health_check_path(
+                input.protocol_version.as_deref(),
+            ))
         } else {
-            Some("/".to_string())
+            None
         }
     });
 
@@ -415,13 +525,21 @@ fn health_check_config(input: &CreateTargetGroupInput, target_type: &str) -> Hea
     // target groups with a protocol of TCP, TLS or HTTPS, the default is 10 seconds.
     // For target groups with a protocol of GENEVE, the default is 5 seconds. If the
     // target type is lambda, the default is 30 seconds."
+    //
+    // The HTTP row follows the RECORDED response rather than that sentence: a recorded
+    // `CreateTargetGroup` of an HTTP target group answers
+    // `HealthCheckTimeoutSeconds` 5 (the issue this change answers quotes the whole
+    // defaulted member set of
+    // `elasticloadbalancing-create-target-group-health-check-defaults#task#2`), and
+    // what the service answers is the contract where its own documentation disagrees
+    // with it. It lands on the same 5 seconds GENEVE is documented with, which is why
+    // the two share an arm. Every other row has no recording to prefer, so it stays as
+    // documented.
     let timeout_seconds = input.health_check_timeout_seconds.unwrap_or({
         if lambda {
             30
-        } else if geneve {
+        } else if geneve || protocol == Some("HTTP") {
             5
-        } else if protocol == Some("HTTP") {
-            6
         } else {
             10
         }
@@ -434,9 +552,14 @@ fn health_check_config(input: &CreateTargetGroupInput, target_type: &str) -> Hea
     // "The number of consecutive health check failures required before considering a
     // target unhealthy ... the default is 2. ... If the target type is lambda, the
     // default is 5."
-    let unhealthy_threshold = input
-        .unhealthy_threshold_count
-        .unwrap_or(if lambda { 5 } else { 2 });
+    //
+    // The lambda clause follows the RECORDED response rather than that sentence: the
+    // recorded `DescribeTargetGroups` of a Lambda target group
+    // (`elasticloadbalancing-lambda-target-group-lifecycle#task#2`) agrees with this
+    // service on `HealthyThresholdCount` 5 and disagrees on
+    // `UnhealthyThresholdCount` 5, so the service answers the general default there,
+    // as it does for the recorded HTTP timeout above.
+    let unhealthy_threshold = input.unhealthy_threshold_count.unwrap_or(2);
 
     // "[HTTP/HTTPS health checks] The HTTP or gRPC codes to use when checking for a
     // successful response from a target." A matcher therefore exists only for an
@@ -450,18 +573,12 @@ fn health_check_config(input: &CreateTargetGroupInput, target_type: &str) -> Hea
             grpc_code: matcher.grpc_code.clone(),
         })
         .or_else(|| {
-            if !health_check_is_http {
-                None
-            } else if input.protocol_version.as_deref() == Some("GRPC") {
-                Some(MatcherRecord {
-                    http_code: None,
-                    grpc_code: Some("12".to_string()),
-                })
+            if health_check_is_http {
+                Some(crate::state::default_health_check_matcher(
+                    input.protocol_version.as_deref(),
+                ))
             } else {
-                Some(MatcherRecord {
-                    http_code: Some("200".to_string()),
-                    grpc_code: None,
-                })
+                None
             }
         });
 

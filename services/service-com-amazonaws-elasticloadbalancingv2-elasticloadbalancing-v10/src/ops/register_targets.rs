@@ -158,10 +158,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(group) = guard.target_groups.get_mut(&input.target_group_arn) else {
             return Err(RegisterTargetsErrorModeled::TargetGroupNotFoundException(
                 TargetGroupNotFoundException {
-                    message: Some(format!(
-                        "Target group '{}' not found",
-                        input.target_group_arn
-                    )),
+                    message: Some(crate::state::target_groups_not_found_message([
+                        input.target_group_arn.as_str(),
+                    ])),
                 },
             )
             .into());
