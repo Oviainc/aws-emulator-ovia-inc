@@ -14,11 +14,19 @@
 //! hold, and the refusal is decided from the removal itself, so a refused call leaves
 //! the store exactly as it was.
 //!
+//! The documented cascade names "the associated anomalies, events and
+//! recommendations": of those, the anomalies ARE held by this store
+//! ([`crate::state::ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::anomalies`]),
+//! so every anomaly whose `AssociatedInsightId` names the deleted insight goes with it
+//! and `DescribeAnomaly` then refuses it as not found. An anomaly associated with no
+//! insight, or with another one, is left alone. Events and recommendations are not held
+//! by this store, so there is nothing of them to reclaim.
+//!
 //! What it does NOT touch is the insight FEEDBACK store
 //! ([`crate::state::ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::insight_feedback`]):
 //! `PutFeedback` accepts feedback about an insight this account has never seen, so a
 //! feedback record is not owned by an insight record, and the documented cascade names
-//! anomalies, events and recommendations — none of which this store holds — not feedback.
+//! anomalies, events and recommendations, not feedback.
 //!
 //! Insights live in
 //! [`crate::state::ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::insights`] —
@@ -171,9 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
 
         // Remove, then decide from the removal: the id either named an insight this
-        // store held — now gone, along with everything its record carries — or it named
-        // none, which is a not-found refusal that changed nothing.
-        if guard.insights.remove(&input.id).is_none() {
+        // store held — now gone, along with everything its record carries and the
+        // anomalies associated with it — or it named none, which is a not-found refusal
+        // that changed nothing.
+        if guard.remove_insight(&input.id).is_none() {
             return Err(DeleteInsightErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: format!("no insight with id {} exists", input.id),
