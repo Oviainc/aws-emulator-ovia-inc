@@ -158,6 +158,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Input before lookup: a value that is not a resource ARN this API addresses is
         // a bad request, not a missing resource.
         crate::state::validate_resource_arn(&input.resource_arn)?;
+        // A tag key in the namespace AWS reserves for its own generated tags cannot
+        // be removed by a caller either, so a `tagKeys` naming one is refused on the
+        // input before the resource is resolved — the reservation covers removal as
+        // much as creation, and the request removes nothing.
+        if let Err(why) = crate::state::validate_tag_keys_unreserved(
+            input.tag_keys.iter().map(String::as_str),
+            "tagKeys",
+        ) {
+            return Err(UntagResourceErrorModeled::ValidationException(why).into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServerException(
                 InternalServerException {

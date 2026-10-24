@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reads the OpenAPI definition carried in `Body` and persists the HTTP api
+//! that definition describes — its name, description and version from `info`, one
+//! [`crate::state::Route`] per operation the document's `paths` declare, and one
+//! [`crate::state::Integration`] per `x-amazon-apigateway-integration` extension those
+//! operations carry, with the route wired to it through its `Target`. This is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Supported only for HTTP APIs" (`ImportApi$Body`), so the api this mints always
+//! carries the `HTTP` protocol type and the route selection expression that protocol
+//! documents.
+//!
+//! The definition reader ([`parse_definition`] and the shapes it answers with) is `pub`
+//! because `ReimportApi` takes the SAME `Body` and `Basepath` members and so has to read
+//! a definition exactly as this operation does; it is still scaffolded, and reaches this
+//! reader as `super::import_api::parse_definition` when it is written.
+//!
+//! The `Body` is read in its JSON spelling, through `serde_json`. API Gateway also accepts
+//! the YAML spelling of a definition; reading that needs a YAML parser this crate does not
+//! carry, so such a body is REFUSED with the modelled `BadRequestException` naming the
+//! spelling this emulator reads, never half-read or guessed at.
 //!
 //! ## Shape of an operation
 //!
@@ -111,6 +122,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::std::collections::{BTreeMap, BTreeSet};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -182,18 +195,977 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportApi"))
+        // The definition is read and bounded BEFORE the store lock is taken, so a body
+        // this operation cannot import never reaches the records at all.
+        let basepath = base_path_mode(input.basepath.as_deref()).map_err(bad_request)?;
+        let definition = parse_definition(&input.body, basepath).map_err(bad_request)?;
+
+        // "Specifies whether to rollback the API creation when a warning is encountered"
+        // (`ImportApi$FailOnWarnings`): nothing is written before this point, so the
+        // rollback is that no record exists at all.
+        if input.fail_on_warnings.unwrap_or(false) && !definition.warnings.is_empty() {
+            return Err(bad_request(format!(
+                "Errors found during import: {}",
+                definition.warnings.join("; ")
+            )));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("ImportApi"));
+        };
+        let mut store = state.lock();
+
+        // The same quotas every other writer of these records enforces, checked against
+        // what the WHOLE definition asks for before any of it is written: an import is
+        // one call, so it either fits or it is refused. `TooManyRequestsException` is the
+        // modelled error for "a limit has been exceeded" and carries the limit's name.
+        if store.apis.len() >= crate::state::MAX_APIS {
+            return Err(too_many_requests(
+                "API",
+                format!(
+                    "The maximum number of APIs ({}) for this account has been reached.",
+                    crate::state::MAX_APIS
+                ),
+            ));
+        }
+        if definition.routes.len() > crate::state::MAX_ROUTES_PER_API {
+            return Err(too_many_requests(
+                "Route",
+                format!(
+                    "The API definition declares {} routes; the maximum number of routes \
+                     for an API is {}.",
+                    definition.routes.len(),
+                    crate::state::MAX_ROUTES_PER_API
+                ),
+            ));
+        }
+        let integrations = definition
+            .routes
+            .iter()
+            .filter(|route| route.integration.is_some())
+            .count();
+        if integrations > crate::state::MAX_INTEGRATIONS_PER_API {
+            return Err(too_many_requests(
+                "Integration",
+                format!(
+                    "The API definition declares {integrations} integrations; the maximum \
+                     number of integrations for an API is {}.",
+                    crate::state::MAX_INTEGRATIONS_PER_API
+                ),
+            ));
+        }
+
+        let api_id = store.mint_api_id();
+        let region = crate::state::request_region(ctx.parts());
+        let record = crate::state::Api {
+            // An imported api speaks HTTP, so its endpoint carries that protocol's
+            // scheme — the same value `CreateApi` reports for an HTTP api.
+            api_endpoint: crate::state::execute_api_endpoint(
+                &api_id,
+                &region,
+                crate::state::HTTP_PROTOCOL_TYPE,
+            ),
+            api_id: api_id.clone(),
+            name: definition.name,
+            protocol_type: crate::state::HTTP_PROTOCOL_TYPE.to_string(),
+            description: definition.description,
+            version: definition.version,
+            route_selection_expression: crate::state::HTTP_ROUTE_SELECTION_EXPRESSION.to_string(),
+            api_key_selection_expression: crate::state::DEFAULT_API_KEY_SELECTION_EXPRESSION
+                .to_string(),
+            cors_configuration: definition.cors_configuration,
+            disable_execute_api_endpoint: definition.disable_execute_api_endpoint,
+            // "Supported only for WebSocket APIs" (`Api$DisableSchemaValidation`), and an
+            // imported api is an HTTP one.
+            disable_schema_validation: false,
+            ip_address_type: crate::state::DEFAULT_IP_ADDRESS_TYPE.to_string(),
+            created_date: ::std::time::SystemTime::now(),
+            // An OpenAPI definition carries no API Gateway tag set, so an imported api
+            // starts untagged; `TagResource` is what tags it afterwards.
+            tags: ::std::collections::BTreeMap::new(),
+            routes: ::std::collections::BTreeMap::new(),
+            route_id_seed: 0,
+            integrations: ::std::collections::BTreeMap::new(),
+            integration_id_seed: 0,
+            stages: ::std::collections::BTreeMap::new(),
+            models: ::std::collections::BTreeMap::new(),
+            model_id_seed: 0,
+            deployments: ::std::collections::BTreeMap::new(),
+            deployment_id_seed: 0,
+            authorizers: ::std::collections::BTreeMap::new(),
+            authorizer_id_seed: 0,
+        };
+
+        // `api_id` comes from the store's own id bijection, so it names no existing api
+        // and this inserts. Taking the entry back gives the STORED record, so the routes
+        // and integrations below are written into the api a later GetApi reports.
+        let stored = store.apis.entry(api_id).or_insert(record);
+        for imported in definition.routes {
+            // The integration the operation declared, minted FIRST: the route's `Target`
+            // is `integrations/{IntegrationId}`, so the integration has to exist before
+            // the route that points at it.
+            let target = imported.integration.map(|integration| {
+                let integration_id = stored.mint_integration_id();
+                stored.integrations.insert(
+                    integration_id.clone(),
+                    integration.into_record(integration_id.clone()),
+                );
+                format!(
+                    "{}{integration_id}",
+                    crate::state::INTEGRATION_TARGET_PREFIX
+                )
+            });
+            let route_id = stored.mint_route_id();
+            stored.routes.insert(
+                route_id.clone(),
+                crate::state::Route {
+                    route_id,
+                    route_key: imported.route_key,
+                    target,
+                    authorization_type: crate::state::DEFAULT_AUTHORIZATION_TYPE.to_string(),
+                    // The caller's own definition asked for this route, so API Gateway
+                    // does not manage it (`Route$ApiGatewayManaged`).
+                    api_gateway_managed: false,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let stored = stored.to_wire();
+        Ok(ImportApiOutput {
+            api_endpoint: stored.api_endpoint,
+            api_gateway_managed: stored.api_gateway_managed,
+            api_id: stored.api_id,
+            api_key_selection_expression: stored.api_key_selection_expression,
+            cors_configuration: stored.cors_configuration,
+            created_date: stored.created_date,
+            description: stored.description,
+            disable_schema_validation: stored.disable_schema_validation,
+            disable_execute_api_endpoint: stored.disable_execute_api_endpoint,
+            // The two members no stored record carries: they report on THIS import —
+            // what of the definition was not carried over — rather than on the api, so
+            // they are assigned from the definition just read and are absent when it
+            // ignored nothing and warned about nothing.
+            import_info: (!definition.import_info.is_empty()).then_some(definition.import_info),
+            ip_address_type: stored.ip_address_type,
+            name: Some(stored.name),
+            protocol_type: Some(stored.protocol_type),
+            route_selection_expression: Some(stored.route_selection_expression),
+            tags: stored.tags,
+            version: stored.version,
+            warnings: (!definition.warnings.is_empty()).then_some(definition.warnings),
+        })
+    }
+}
+
+/// This operation's refusal of a definition it cannot import: the modelled
+/// `BadRequestException` ("The request is not valid, for example, the input is incomplete
+/// or incorrect"), whose message names what the caller has to fix.
+fn bad_request(message: String) -> ImportApiError {
+    ImportApiErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's refusal of a definition that would grow the store past a quota, with
+/// the limit's name in `LimitType`.
+fn too_many_requests(limit_type: &str, message: String) -> ImportApiError {
+    ImportApiErrorModeled::TooManyRequestsException(TooManyRequestsException {
+        limit_type: Some(limit_type.to_string()),
+        message: Some(message),
+    })
+    .into()
+}
+
+// ---------------------------------------------------------------------------
+// The OpenAPI definition reader
+// ---------------------------------------------------------------------------
+
+/// The most bytes one `Body` may carry.
+///
+/// CHOSEN: far past the definition of an api holding this service's per-api route and
+/// integration quotas, and small enough that the tree the reader builds stays bounded by
+/// a constant rather than by what a caller sends. Bounding the BODY is what bounds the
+/// reader's work: `serde_json` reads the document under its own recursion limit, so a
+/// parsed definition is linear in the bytes it was written in and cannot amplify them.
+const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
+
+/// The most messages one response reports in `Warnings` or `ImportInfo`, so a response
+/// stays bounded however many paths a definition declares. The page this service serves
+/// for any caller-sized list ([`crate::state::MAX_PAGE_SIZE`]).
+const MAX_REPORTED_MESSAGES: usize = crate::state::MAX_PAGE_SIZE;
+
+/// The most characters the api's `Name` may carry, from the shape the member targets
+/// (`StringWithLengthBetween1And128`).
+const MAX_NAME_CHARS: usize = 128;
+
+/// The most characters the api's `Description` may carry
+/// (`StringWithLengthBetween0And1024`).
+const MAX_DESCRIPTION_CHARS: usize = 1024;
+
+/// The most characters the api's `Version` may carry
+/// (`StringWithLengthBetween1And64`).
+const MAX_VERSION_CHARS: usize = 64;
+
+/// The keys of an OpenAPI Path Item Object that name an operation this import turns into
+/// a route, mapped to the HTTP method the route key carries.
+///
+/// The keys are the OpenAPI Path Item Object's operation fields, plus API Gateway's own
+/// `x-amazon-apigateway-any-method` extension, which is how a definition spells the
+/// catch-all method an HTTP api's `ANY` route key names.
+const OPERATION_KEYS: &[(&str, &str)] = &[
+    ("get", "GET"),
+    ("put", "PUT"),
+    ("post", "POST"),
+    ("delete", "DELETE"),
+    ("options", "OPTIONS"),
+    ("head", "HEAD"),
+    ("patch", "PATCH"),
+    ("x-amazon-apigateway-any-method", "ANY"),
+];
+
+/// OpenAPI operation keys that name no method an HTTP api route key may carry, so an
+/// operation under one is reported as a warning and imported as nothing.
+const UNSUPPORTED_OPERATION_KEYS: &[&str] = &["trace", "connect"];
+
+/// The extension an OpenAPI operation carries its API Gateway integration in.
+const INTEGRATION_EXTENSION: &str = "x-amazon-apigateway-integration";
+
+/// The document-level extension an OpenAPI definition carries an HTTP api's CORS
+/// configuration in — the `CorsConfiguration` member's counterpart in a definition.
+const CORS_EXTENSION: &str = "x-amazon-apigateway-cors";
+
+/// The document-level extension an OpenAPI definition carries an api's endpoint
+/// configuration in; its `disableExecuteApiEndpoint` member is the
+/// `DisableExecuteApiEndpoint` member's counterpart in a definition.
+const ENDPOINT_CONFIGURATION_EXTENSION: &str = "x-amazon-apigateway-endpoint-configuration";
+
+/// The root members of an OpenAPI 3 / Swagger 2.0 document that describe something this
+/// service holds no resource for, so an import reads none of them. Each one PRESENT in a
+/// definition is reported in `ImportInfo` ("particular properties of your OpenAPI
+/// definition which are ignored during import", `ImportApi$ImportInfo`).
+///
+/// The catalog is the root fields of the OpenAPI 3.0/3.1 Document Object and the Swagger
+/// 2.0 Object that are neither read above nor `info`/`paths`/`openapi`/`swagger`/`servers`
+/// (OpenAPI 3) or `basePath` (Swagger 2.0).
+const IGNORED_DOCUMENT_MEMBERS: &[&str] = &[
+    "components",
+    "consumes",
+    "definitions",
+    "externalDocs",
+    "host",
+    "parameters",
+    "produces",
+    "responses",
+    "schemes",
+    "security",
+    "securityDefinitions",
+    "tags",
+    "webhooks",
+];
+
+/// The `PayloadFormatVersion` an imported integration carries when its extension names
+/// none.
+///
+/// `CreateIntegration$PayloadFormatVersion` is "Required for HTTP APIs", and "Supported
+/// values for Lambda proxy integrations are 1.0 and 2.0. For all other integrations, 1.0
+/// is the only supported value" — so 1.0 is the one value every integration type accepts,
+/// and the one an integration that names no version can be created with.
+const DEFAULT_PAYLOAD_FORMAT_VERSION: &str = "1.0";
+
+/// The smallest `TimeoutInMillis` an integration may carry, from the member's modelled
+/// range (`IntegerWithLengthBetween50And30000`, 50..30000).
+const MIN_TIMEOUT_MILLIS: i64 = 50;
+
+/// The largest `TimeoutInMillis` an integration may carry, from the same range.
+const MAX_TIMEOUT_MILLIS: i64 = 30_000;
+
+/// The smallest `MaxAge` a CORS configuration may carry, from the member's modelled range
+/// (`IntegerWithLengthBetweenMinus1And86400`, -1..86400).
+const MIN_CORS_MAX_AGE: i64 = -1;
+
+/// The largest `MaxAge` a CORS configuration may carry, from the same range.
+const MAX_CORS_MAX_AGE: i64 = 86_400;
+
+/// One node of a parsed API definition: the shapes a JSON document carries.
+///
+/// Every scalar is kept as its TEXT, because a definition is read for strings and for the
+/// SHAPE of everything else; a number or a boolean is read back out of its text by
+/// [`Node::integer_member`] / [`Node::boolean_member`], so a member a document writes
+/// unquoted and one it writes quoted are read the same way.
+#[derive(Debug, Clone, Default)]
+pub enum Node {
+    /// A null, and the value a document writes as an empty one.
+    #[default]
+    Null,
+    /// A scalar, as its text.
+    Scalar(String),
+    /// A sequence, in order.
+    Sequence(Vec<Node>),
+    /// A mapping, in the order [`serde_json`] visited it. A document that repeats a key
+    /// carries the LAST of them, which is what the JSON reader keeps.
+    Mapping(Vec<(String, Node)>),
+}
+
+impl Node {
+    /// A member of this mapping by name; `None` for any other node.
+    fn member(&self, key: &str) -> Option<&Node> {
+        match self {
+            Node::Mapping(entries) => entries
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value),
+            _ => None,
+        }
+    }
+
+    /// This node's text, when it is a scalar.
+    fn text(&self) -> Option<&str> {
+        match self {
+            Node::Scalar(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// A string member of this mapping; `None` when it is absent or not a scalar.
+    fn string_member(&self, key: &str) -> Option<String> {
+        self.member(key).and_then(Node::text).map(str::to_owned)
+    }
+
+    /// This node's mapping entries, when it is a mapping.
+    fn entries(&self) -> Option<&[(String, Node)]> {
+        match self {
+            Node::Mapping(entries) => Some(entries),
+            _ => None,
+        }
+    }
+
+    /// This node's items, when it is a sequence.
+    fn items(&self) -> Option<&[Node]> {
+        match self {
+            Node::Sequence(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// The strings of a sequence member, in order; `None` when the member is absent. A
+    /// non-scalar item carries no string and is skipped.
+    ///
+    /// EVERY entry is read: what a definition declares here is persisted verbatim, so
+    /// truncating it would report a record that quietly differs from the document. The
+    /// count is already bounded by [`MAX_DEFINITION_BYTES`], which bounds the whole
+    /// parsed document.
+    fn string_list_member(&self, key: &str) -> Option<Vec<String>> {
+        self.member(key).and_then(Node::items).map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.text().map(str::to_owned))
+                .collect()
+        })
+    }
+
+    /// This mapping's entries whose values are scalars; empty for any other node. Every
+    /// entry is read, for the reason [`Node::string_list_member`] gives.
+    fn scalar_entries(&self) -> BTreeMap<String, String> {
+        self.entries()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|(name, value)| value.text().map(|text| (name.clone(), text.to_owned())))
+            .collect()
+    }
+
+    /// A map member whose values are scalars; empty when the member is absent or is not a
+    /// mapping.
+    fn string_map_member(&self, key: &str) -> BTreeMap<String, String> {
+        self.member(key).map(Node::scalar_entries).unwrap_or_default()
+    }
+
+    /// An integer member, read out of its text; `Err` names the member when the text is
+    /// not an integer.
+    fn integer_member(&self, key: &str) -> Result<Option<i64>, String> {
+        match self.member(key) {
+            None | Some(Node::Null) => Ok(None),
+            Some(node) => node
+                .text()
+                .and_then(|text| text.trim().parse::<i64>().ok())
+                .map(Some)
+                .ok_or_else(|| {
+                    format!("Unable to parse API definition: '{key}' must be an integer")
+                }),
+        }
+    }
+
+    /// A boolean member, read out of its text the way YAML's core schema spells one;
+    /// `Err` names the member when the text is not a boolean.
+    fn boolean_member(&self, key: &str) -> Result<Option<bool>, String> {
+        match self.member(key) {
+            None | Some(Node::Null) => Ok(None),
+            Some(node) => match node.text().map(str::trim) {
+                Some("true" | "True" | "TRUE") => Ok(Some(true)),
+                Some("false" | "False" | "FALSE") => Ok(Some(false)),
+                _ => Err(format!(
+                    "Unable to parse API definition: '{key}' must be true or false"
+                )),
+            },
+        }
+    }
+}
+
+/// `serde_json`'s tree, as a [`Node`]. The document is read through `serde_json`, which
+/// enforces its own recursion limit, so a nested body cannot drive this conversion deeper
+/// than that however deeply it nests.
+impl From<::serde_json::Value> for Node {
+    fn from(value: ::serde_json::Value) -> Self {
+        match value {
+            ::serde_json::Value::Null => Node::Null,
+            ::serde_json::Value::Bool(value) => Node::Scalar(value.to_string()),
+            ::serde_json::Value::Number(value) => Node::Scalar(value.to_string()),
+            ::serde_json::Value::String(value) => Node::Scalar(value),
+            ::serde_json::Value::Array(items) => {
+                Node::Sequence(items.into_iter().map(Node::from).collect())
+            }
+            ::serde_json::Value::Object(members) => Node::Mapping(
+                members
+                    .into_iter()
+                    .map(|(name, value)| (name, Node::from(value)))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// How to interpret the base path of the API during import, from `ImportApi$Basepath`:
+/// "Valid values are ignore, prepend, and split. The default value is ignore."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BasePathMode {
+    /// The definition's base path is not part of the routes' paths.
+    Ignore,
+    /// The definition's base path is prepended to every route's path.
+    Prepend,
+    /// The FIRST segment of the base path names a stage rather than a path, and only what
+    /// follows it is prepended to every route's path.
+    Split,
+}
+
+/// The base path mode a request asks for; `Ignore` when it names none.
+///
+/// `Err` carries the message for a value outside the documented three, naming the member
+/// and the values it accepts.
+/// The three values are matched EXACTLY, as the member documents them: a spelling the
+/// documented value set does not carry is refused rather than guessed at, so a definition
+/// that imports here imports at API Gateway too.
+pub fn base_path_mode(basepath: Option<&str>) -> Result<BasePathMode, String> {
+    match basepath {
+        None | Some("ignore") => Ok(BasePathMode::Ignore),
+        Some("prepend") => Ok(BasePathMode::Prepend),
+        Some("split") => Ok(BasePathMode::Split),
+        Some(other) => Err(format!(
+            "Invalid value for Basepath: '{other}'. Valid values are: ignore, prepend, split."
+        )),
+    }
+}
+
+/// The integration an operation's `x-amazon-apigateway-integration` extension describes,
+/// as the members `CreateIntegration` would be called with.
+#[derive(Debug, Clone)]
+pub struct ImportedIntegration {
+    /// One of `INTEGRATION_TYPE_VALUES`, upper-cased from the extension's spelling.
+    pub integration_type: String,
+    pub integration_uri: Option<String>,
+    pub integration_method: Option<String>,
+    pub integration_subtype: Option<String>,
+    /// One of `CONNECTION_TYPE_VALUES`, or `None` for an extension that names none.
+    pub connection_type: Option<String>,
+    pub connection_id: Option<String>,
+    pub credentials_arn: Option<String>,
+    pub payload_format_version: String,
+    pub timeout_in_millis: Option<i32>,
+    pub request_parameters: BTreeMap<String, String>,
+    pub response_parameters: BTreeMap<String, BTreeMap<String, String>>,
+    /// `tlsConfig.serverNameToVerify`, the one member `TlsConfig` carries.
+    pub server_name_to_verify: Option<String>,
+}
+
+impl ImportedIntegration {
+    /// The persisted integration this becomes under `integration_id`, resolving the
+    /// members the extension left out to the values the model documents for them —
+    /// exactly as `CreateIntegration` resolves them for a request that omits them.
+    fn into_record(self, integration_id: String) -> crate::state::Integration {
+        crate::state::Integration {
+            integration_id,
+            integration_type: self.integration_type,
+            integration_uri: self.integration_uri,
+            integration_method: self.integration_method,
+            integration_subtype: self.integration_subtype,
+            // "The default value is INTERNET" (`Integration$ConnectionType`).
+            connection_type: self
+                .connection_type
+                .unwrap_or_else(|| crate::state::DEFAULT_CONNECTION_TYPE.to_string()),
+            connection_id: self.connection_id,
+            // "Supported only for WebSocket APIs" — an imported api is an HTTP one, so
+            // nothing here configures them.
+            content_handling_strategy: None,
+            credentials_arn: self.credentials_arn,
+            description: None,
+            passthrough_behavior: None,
+            payload_format_version: Some(self.payload_format_version),
+            request_parameters: self.request_parameters,
+            request_templates: BTreeMap::new(),
+            response_parameters: self.response_parameters,
+            template_selection_expression: None,
+            // "The default timeout is … 30 seconds for HTTP APIs"
+            // (`CreateIntegration$TimeoutInMillis`).
+            timeout_in_millis: self
+                .timeout_in_millis
+                .unwrap_or(crate::state::DEFAULT_HTTP_TIMEOUT_MILLIS),
+            tls_config: self.server_name_to_verify.map(|name| TlsConfig {
+                server_name_to_verify: Some(name),
+            }),
+            // The caller's own definition asked for this integration, so API Gateway does
+            // not manage it (`Integration$ApiGatewayManaged`).
+            api_gateway_managed: false,
+        }
+    }
+}
+
+/// One route an imported operation becomes: its route key, and the integration the
+/// operation declared for it (`None` when it declared none, which the import warns
+/// about).
+#[derive(Debug, Clone)]
+pub struct ImportedRoute {
+    pub route_key: String,
+    pub integration: Option<ImportedIntegration>,
+}
+
+/// What an import reads out of an OpenAPI definition: the api's own members, and one
+/// [`ImportedRoute`] per operation its paths declare.
+#[derive(Debug, Clone)]
+pub struct ImportedApi {
+    /// `info.title`, the api's name.
+    pub name: String,
+    /// `info.description`.
+    pub description: Option<String>,
+    /// `info.version`.
+    pub version: Option<String>,
+    /// [`CORS_EXTENSION`], absent when the document carries none.
+    pub cors_configuration: Option<Cors>,
+    /// [`ENDPOINT_CONFIGURATION_EXTENSION`]'s `disableExecuteApiEndpoint`; `false` when
+    /// the document names none, which is the member's documented default.
+    pub disable_execute_api_endpoint: bool,
+    /// The routes the document's paths declare, in the order they are declared.
+    pub routes: Vec<ImportedRoute>,
+    /// What the import could not carry over — reported in `Warnings`, and what
+    /// `FailOnWarnings` rolls the import back for.
+    pub warnings: Vec<String>,
+    /// Properties of the definition that are ignored during import, reported in
+    /// `ImportInfo`.
+    pub import_info: Vec<String>,
+}
+
+/// Read an OpenAPI definition out of an `ImportApi`/`ReimportApi` `Body`.
+///
+/// "The OpenAPI definition" (`ImportApi$Body`) is read in its JSON spelling, through
+/// `serde_json` under its own recursion limit, so the parse is bounded by
+/// [`MAX_DEFINITION_BYTES`] and cannot amplify what the body carries. A body in any OTHER
+/// spelling (the YAML one API Gateway also accepts) is REFUSED rather than guessed at:
+/// reading it needs a YAML parser this crate does not carry, and a refusal naming the
+/// spelling is the honest answer — never a partial import a caller would have to
+/// second-guess.
+///
+/// `Err` carries the message for a body that is not a definition this service can import:
+/// the caller has to fix the definition from this text alone.
+pub fn parse_definition(body: &str, basepath: BasePathMode) -> Result<ImportedApi, String> {
+    if body.len() > MAX_DEFINITION_BYTES {
+        return Err(format!(
+            "Body may be at most {MAX_DEFINITION_BYTES} bytes, got {}",
+            body.len()
+        ));
+    }
+    let document = ::serde_json::from_str::<::serde_json::Value>(body)
+        .map(Node::from)
+        .map_err(|error| {
+            format!(
+                "Unable to parse API definition: the Body must be an OpenAPI definition in \
+                 JSON, which is the spelling this emulator reads ({error})"
+            )
+        })?;
+    read_definition(&document, basepath)
+}
+
+/// What an import takes out of a parsed definition document.
+fn read_definition(document: &Node, basepath: BasePathMode) -> Result<ImportedApi, String> {
+    if document.entries().is_none() {
+        return Err(
+            "Unable to parse API definition: the definition must be a JSON object".to_string(),
+        );
+    }
+    // Every OpenAPI document declares its version — `openapi` from 3.0 on, `swagger`
+    // before it — so a body carrying neither is not an API definition at all.
+    if document.member("openapi").is_none() && document.member("swagger").is_none() {
+        return Err(
+            "Unable to parse API definition: no 'openapi' or 'swagger' version is declared"
+                .to_string(),
+        );
+    }
+
+    // The `info` object is where an OpenAPI document carries the api's name, description
+    // and version. `info.title` is the api's `Name`, which the modelled `Api` shape
+    // requires, so a definition that names none describes no api this service can hold.
+    let info = document.member("info");
+    let name = info
+        .and_then(|info| info.string_member("title"))
+        .filter(|title| !title.is_empty())
+        .ok_or_else(|| {
+            "Unable to parse API definition: 'info.title' is required and becomes the API's name"
+                .to_string()
+        })?;
+    bound_chars("info.title", &name, MAX_NAME_CHARS)?;
+    let description = info.and_then(|info| info.string_member("description"));
+    if let Some(description) = &description {
+        bound_chars("info.description", description, MAX_DESCRIPTION_CHARS)?;
+    }
+    let version = info.and_then(|info| info.string_member("version"));
+    if let Some(version) = &version {
+        bound_chars("info.version", version, MAX_VERSION_CHARS)?;
+    }
+
+    let mut definition = ImportedApi {
+        name,
+        description,
+        version,
+        cors_configuration: read_cors(document)?,
+        disable_execute_api_endpoint: document
+            .member(ENDPOINT_CONFIGURATION_EXTENSION)
+            .map(|configuration| configuration.boolean_member("disableExecuteApiEndpoint"))
+            .transpose()?
+            .flatten()
+            .unwrap_or(false),
+        routes: Vec::new(),
+        warnings: Vec::new(),
+        // Reported in the document's own member order, so the same definition always
+        // reports the same `ImportInfo`.
+        import_info: IGNORED_DOCUMENT_MEMBERS
+            .iter()
+            .filter(|member| document.member(member).is_some())
+            .map(|member| {
+                format!("Ignoring '{member}': this property of the API definition is not imported")
+            })
+            .collect(),
+    };
+
+    // What every route's path is prefixed with, once the request's `Basepath` is applied
+    // to the base path the definition declares.
+    let prefix = route_prefix(document, basepath);
+
+    // `paths` is optional from OpenAPI 3.1 on, and a document without it describes an api
+    // with no routes rather than a malformed definition.
+    let Some(paths) = document.member("paths") else {
+        return Ok(definition);
+    };
+    if matches!(paths, Node::Null) {
+        return Ok(definition);
+    }
+    let paths = paths.entries().ok_or_else(|| {
+        "Unable to parse API definition: 'paths' must be an object of paths".to_string()
+    })?;
+
+    // A route key is unique within its api, so the first operation to claim one keeps it
+    // and a later collision — which only the base path modes can create — is warned
+    // about rather than written twice.
+    let mut claimed: BTreeSet<String> = BTreeSet::new();
+    for (path, item) in paths {
+        if !path.starts_with('/') {
+            return Err(format!(
+                "Unable to parse API definition: path '{path}' must start with '/'"
+            ));
+        }
+        let route_path = route_path(&prefix, path);
+        // A path whose value is neither a Path Item Object nor the empty one declares no
+        // operation this import can read, so it imports nothing and says so rather than
+        // reporting a success that silently holds fewer routes than the document.
+        if item.entries().is_none() && !matches!(item, Node::Null) {
+            warn(
+                &mut definition.warnings,
+                format!("Path '{path}' declares no operations and was not imported"),
+            );
+            continue;
+        }
+        for (operation, declaration) in item.entries().unwrap_or_default() {
+            let operation = operation.to_ascii_lowercase();
+            let Some((_, method)) = OPERATION_KEYS
+                .iter()
+                .find(|(candidate, _)| *candidate == operation.as_str())
+            else {
+                if UNSUPPORTED_OPERATION_KEYS.contains(&operation.as_str()) {
+                    warn(
+                        &mut definition.warnings,
+                        format!("Unsupported method '{operation}' for path '{path}'"),
+                    );
+                }
+                // Any other key of a path item (`summary`, `parameters`, a vendor
+                // extension) describes the path rather than an operation, so it imports
+                // nothing and warns about nothing.
+                continue;
+            };
+            let route_key = format!("{method} {route_path}");
+            if !claimed.insert(route_key.clone()) {
+                warn(
+                    &mut definition.warnings,
+                    format!("Duplicate route key '{route_key}': the later operation was ignored"),
+                );
+                continue;
+            }
+            let integration = match declaration.member(INTEGRATION_EXTENSION) {
+                Some(extension) => Some(read_integration(extension, &route_key)?),
+                None => {
+                    // The route is still imported: a route with no `Target` is a route an
+                    // HTTP api may hold, and `CreateIntegration`/`UpdateRoute` is what
+                    // wires one up afterwards.
+                    warn(
+                        &mut definition.warnings,
+                        format!("No integration defined for route '{route_key}'"),
+                    );
+                    None
+                }
+            };
+            definition.routes.push(ImportedRoute {
+                route_key,
+                integration,
+            });
+        }
+    }
+    Ok(definition)
+}
+
+/// Record one warning, keeping what a response reports bounded by
+/// [`MAX_REPORTED_MESSAGES`] however many paths the definition declares.
+fn warn(warnings: &mut Vec<String>, message: String) {
+    if warnings.len() < MAX_REPORTED_MESSAGES {
+        warnings.push(message);
+    }
+}
+
+/// Refuse a value longer than the member's modelled length, naming the member and the
+/// bound — the constraint comes from the shape the member targets
+/// (`StringWithLengthBetween1And128` for the api's name, and so on).
+fn bound_chars(member: &str, value: &str, max_chars: usize) -> Result<(), String> {
+    let chars = value.chars().count();
+    if chars > max_chars {
+        return Err(format!(
+            "Unable to parse API definition: '{member}' may be at most {max_chars} characters, \
+             got {chars}"
+        ));
+    }
+    Ok(())
+}
+
+/// The CORS configuration the document's [`CORS_EXTENSION`] declares, projected onto the
+/// modelled `Cors` shape.
+fn read_cors(document: &Node) -> Result<Option<Cors>, String> {
+    let Some(extension) = document.member(CORS_EXTENSION) else {
+        return Ok(None);
+    };
+    if extension.entries().is_none() {
+        return Err(format!(
+            "Unable to parse API definition: '{CORS_EXTENSION}' must be an object"
+        ));
+    }
+    let max_age = extension.integer_member("maxAge")?;
+    if let Some(max_age) = max_age {
+        if !(MIN_CORS_MAX_AGE..=MAX_CORS_MAX_AGE).contains(&max_age) {
+            return Err(format!(
+                "Unable to parse API definition: '{CORS_EXTENSION}.maxAge' must be between \
+                 {MIN_CORS_MAX_AGE} and {MAX_CORS_MAX_AGE}, got {max_age}"
+            ));
+        }
+    }
+    Ok(Some(Cors {
+        allow_credentials: extension.boolean_member("allowCredentials")?,
+        allow_headers: extension.string_list_member("allowHeaders"),
+        allow_methods: extension.string_list_member("allowMethods"),
+        allow_origins: extension.string_list_member("allowOrigins"),
+        expose_headers: extension.string_list_member("exposeHeaders"),
+        max_age: max_age.map(|seconds| i32::try_from(seconds).unwrap_or(i32::MAX)),
+    }))
+}
+
+/// The integration an operation's [`INTEGRATION_EXTENSION`] declares.
+///
+/// Every refusal here is the one `CreateIntegration` answers the same integration with:
+/// an imported integration is held to the rules of the operation that would otherwise
+/// have created it, so no definition can write a record a caller could not.
+fn read_integration(extension: &Node, route_key: &str) -> Result<ImportedIntegration, String> {
+    let refusal = |message: &str| format!("Unable to import route '{route_key}': {message}");
+    if extension.entries().is_none() {
+        return Err(refusal(&format!("'{INTEGRATION_EXTENSION}' must be an object")));
+    }
+    // The extension spells the type in lower case (`http_proxy`), while the modelled
+    // `IntegrationType` is upper case; they are the same catalog.
+    let integration_type = extension
+        .string_member("type")
+        .map(|value| value.to_ascii_uppercase())
+        .ok_or_else(|| refusal(&format!("'{INTEGRATION_EXTENSION}.type' is required")))?;
+    if !INTEGRATION_TYPE_VALUES.contains(&integration_type.as_str()) {
+        return Err(refusal(&format!(
+            "invalid integration type '{integration_type}'. Valid values are: {}.",
+            INTEGRATION_TYPE_VALUES.join(", ")
+        )));
+    }
+    // An imported api speaks HTTP, and three of the five integration types are
+    // documented as supported only for WebSocket APIs, so an integration of one of
+    // those types is refused here exactly as `CreateIntegration` refuses it.
+    let integration_type_member = format!("IntegrationType {integration_type}");
+    let restricted = [crate::state::ProtocolRestrictedMember::websocket_only(
+        &integration_type_member,
+        crate::state::WEBSOCKET_ONLY_INTEGRATION_TYPES.contains(&integration_type.as_str()),
+    )];
+    if let Err(message) = crate::state::validate_protocol_restricted_members(
+        crate::state::HTTP_PROTOCOL_TYPE,
+        &restricted,
+    ) {
+        return Err(refusal(&message));
+    }
+
+    // "For a Lambda integration, specify the URI of a Lambda function. For an HTTP
+    // integration, specify a fully-qualified URL" (`CreateIntegration$IntegrationUri`):
+    // every integration type names an endpoint except `MOCK`, which an HTTP api cannot
+    // carry at all and which the protocol gate above has already refused.
+    let integration_uri = extension.string_member("uri").ok_or_else(|| {
+        refusal(&format!(
+            "'{INTEGRATION_EXTENSION}.uri' is required for an integration of type \
+             {integration_type}"
+        ))
+    })?;
+
+    let connection_type = extension
+        .string_member("connectionType")
+        .map(|value| value.to_ascii_uppercase());
+    if let Some(connection_type) = &connection_type {
+        if !CONNECTION_TYPE_VALUES.contains(&connection_type.as_str()) {
+            return Err(refusal(&format!(
+                "invalid connection type '{connection_type}'. Valid values are: {}.",
+                CONNECTION_TYPE_VALUES.join(", ")
+            )));
+        }
+    }
+    let connection_id = extension.string_member("connectionId");
+    if connection_type.as_deref() == Some(VPC_LINK_CONNECTION_TYPE) && connection_id.is_none() {
+        return Err(refusal(&format!(
+            "'{INTEGRATION_EXTENSION}.connectionId' is required for a connection of type \
+             {VPC_LINK_CONNECTION_TYPE}"
+        )));
+    }
+
+    let timeout_in_millis = extension
+        .integer_member("timeoutInMillis")
+        .map_err(|message| refusal(&message))?;
+    if let Some(timeout) = timeout_in_millis {
+        if !(MIN_TIMEOUT_MILLIS..=MAX_TIMEOUT_MILLIS).contains(&timeout) {
+            return Err(refusal(&format!(
+                "'{INTEGRATION_EXTENSION}.timeoutInMillis' must be between \
+                 {MIN_TIMEOUT_MILLIS} and {MAX_TIMEOUT_MILLIS}, got {timeout}"
+            )));
+        }
+    }
+
+    Ok(ImportedIntegration {
+        integration_type,
+        integration_uri: Some(integration_uri),
+        integration_method: extension.string_member("httpMethod"),
+        integration_subtype: extension.string_member("integrationSubtype"),
+        connection_type,
+        connection_id,
+        credentials_arn: extension.string_member("credentials"),
+        payload_format_version: extension
+            .string_member("payloadFormatVersion")
+            .unwrap_or_else(|| DEFAULT_PAYLOAD_FORMAT_VERSION.to_string()),
+        // The value is inside the modelled range, checked above, so it is an `i32`.
+        timeout_in_millis: timeout_in_millis.map(|timeout| {
+            i32::try_from(timeout).unwrap_or(crate::state::DEFAULT_HTTP_TIMEOUT_MILLIS)
+        }),
+        request_parameters: extension.string_map_member("requestParameters"),
+        response_parameters: extension
+            .member("responseParameters")
+            .and_then(Node::entries)
+            .unwrap_or_default()
+            .iter()
+            .map(|(selection, parameters)| (selection.clone(), parameters.scalar_entries()))
+            .collect(),
+        server_name_to_verify: extension
+            .member("tlsConfig")
+            .and_then(|config| config.string_member("serverNameToVerify")),
+    })
+}
+
+/// The `ConnectionType` of a private integration, from `CONNECTION_TYPE_VALUES`: the one
+/// that connects through a VPC link and so needs the link's id.
+const VPC_LINK_CONNECTION_TYPE: &str = "VPC_LINK";
+
+/// The path every imported route is prefixed with: the base path the definition declares,
+/// read as the request's `Basepath` says to.
+///
+/// "Specifies how to interpret the base path of the API during import"
+/// (`ImportApi$Basepath`): `ignore` leaves the base path out of the routes' paths,
+/// `prepend` puts all of it in front of them, and `split` takes the base path's FIRST
+/// segment to be a stage name — not part of any path — and prepends only what follows it.
+fn route_prefix(document: &Node, basepath: BasePathMode) -> String {
+    if basepath == BasePathMode::Ignore {
+        return String::new();
+    }
+    let base = document_base_path(document).unwrap_or_default();
+    let mut segments = base.split('/').filter(|segment| !segment.is_empty());
+    if basepath == BasePathMode::Split {
+        // The stage name, which names no path segment.
+        let _ = segments.next();
+    }
+    let rest: Vec<&str> = segments.collect();
+    if rest.is_empty() {
+        String::new()
+    } else {
+        format!("/{}", rest.join("/"))
+    }
+}
+
+/// The base path a definition declares: Swagger 2.0's own `basePath` member, or the PATH
+/// of the first server an OpenAPI 3 document lists.
+fn document_base_path(document: &Node) -> Option<String> {
+    if let Some(base) = document.string_member("basePath") {
+        return Some(base);
+    }
+    let url = document
+        .member("servers")
+        .and_then(Node::items)
+        .and_then(<[Node]>::first)
+        .and_then(|server| server.string_member("url"))?;
+    Some(url_path(&url))
+}
+
+/// The path component of a server url: what follows the authority of an absolute url, and
+/// the whole value of a relative one (`/dev`).
+fn url_path(url: &str) -> String {
+    match url.split_once("://") {
+        Some((_, authority_and_path)) => match authority_and_path.find('/') {
+            Some(start) => authority_and_path[start..].to_string(),
+            None => String::new(),
+        },
+        None => url.to_string(),
+    }
+}
+
+/// The path an imported route carries: the prefix and the document's path, re-joined from
+/// their segments so a doubled or trailing separator names the same route as the path
+/// written without it, and a path of only separators is the api's root.
+fn route_path(prefix: &str, path: &str) -> String {
+    let segments: Vec<&str> = prefix
+        .split('/')
+        .chain(path.split('/'))
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
     }
 }

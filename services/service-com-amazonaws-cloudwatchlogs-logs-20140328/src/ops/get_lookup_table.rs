@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLookupTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLookupTable`'s real behaviour. Implement it here — this is
+//! Implemented: reports the lookup table the account holds under the ARN the request
+//! names, with the CSV content it holds verbatim and the metadata derived from it — or
+//! refuses an ARN that is not a lookup table's and an ARN no table is stored under. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLookupTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -152,17 +147,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLookupTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLookupTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLookupTable"))
+        // request metadata, which this reporting operation needs none of: the ARN the
+        // request names carries the region the table was created in.
+        let _ = ctx;
+
+        // A member this operation parses as an ARN and was handed something that is not one
+        // is refused before anything is looked up, with the service's validation-error
+        // message naming the member and the value it could not parse.
+        if let Some(message) =
+            crate::state::unparsable_arn_message("lookupTableArn", &input.lookup_table_arn)
+        {
+            return Err(
+                GetLookupTableErrorModeled::InvalidParameterException(InvalidParameterException {
+                    message: Some(message),
+                })
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetLookupTableError::from(GetLookupTableErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let store = state.lock();
+
+        // The ARN names a region and an account as well as a name, so an ARN naming another
+        // region's or another account's table names a resource this account does not hold
+        // here, even when a stored table happens to share its name — which is why the
+        // stored ARN is compared and not just the name it carries.
+        let table = crate::state::lookup_table_name_from_arn(&input.lookup_table_arn)
+            .and_then(|name| store.lookup_tables.get(name))
+            .filter(|table| table.arn == input.lookup_table_arn);
+        let Some(table) = table else {
+            return Err(
+                GetLookupTableErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message("lookup table")),
+                })
+                .into(),
+            );
+        };
+
+        // Every member is read off the stored record — the body verbatim as the call that
+        // wrote it sent it, the size derived from that body — so this reports the table as
+        // it was created and last updated and nothing the request carried. The members are
+        // taken directly rather than through `LookupTableRecord::reported()`: that shape
+        // carries `tableFields` and `recordsCount`, which this output has no members for, so
+        // building it here would clone a field list only to drop it.
+        Ok(GetLookupTableOutput {
+            lookup_table_arn: Some(table.arn.clone()),
+            lookup_table_name: Some(table.name.clone()),
+            description: table.description.clone(),
+            table_body: Some(table.table_body.clone()),
+            size_bytes: Some(table.size_bytes()),
+            last_updated_time: Some(table.last_updated_time_ms),
+            kms_key_id: table.kms_key_id.clone(),
+        })
     }
 }

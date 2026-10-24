@@ -41,7 +41,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::environment_lifecycle::{call, call_in_region, create, emulator, error_type, Emulator};
+use crate::environment_lifecycle::{
+    call, call_in_region, create_settled, emulator, error_type, Emulator,
+};
 
 /// Every `ConnectorType` the model declares, from the catalog this crate generated
 /// from the model (`smithy_query(query="shape", shape="ConnectorType")`).
@@ -165,7 +167,10 @@ async fn environment_with_connector(
     appliance_fqdn: &str,
     secret_identifier: &str,
 ) -> (String, Value) {
-    let environment = create(router, None).await;
+    // Settled: a list addressed to an environment that is still initializing is
+    // refused (`tests/all/list_while_initializing.rs`), and every test here reads its
+    // connector back through `ListEnvironmentConnectors`.
+    let environment = create_settled(router, None).await;
     let (status, body) = call(
         router,
         "CreateEnvironmentConnector",
@@ -310,7 +315,7 @@ async fn a_connector_is_created_and_read_back_by_list() {
 #[tokio::test]
 async fn one_connector_of_each_type_lives_in_an_environment_and_the_list_pages_over_them() {
     let router = emulator();
-    let environment = create(&router, None).await;
+    let environment = create_settled(&router, None).await;
 
     let mut created_ids = Vec::new();
     for connector_type in CONNECTOR_TYPES {
@@ -383,7 +388,7 @@ async fn one_connector_of_each_type_lives_in_an_environment_and_the_list_pages_o
     }
 
     // An environment with no connector at all is an empty page, not a refusal.
-    let bare = create(&router, None).await;
+    let bare = create_settled(&router, None).await;
     let (status, body) = call(&router, "ListEnvironmentConnectors", &list_request(&bare)).await;
     assert_eq!(
         status, 200,
