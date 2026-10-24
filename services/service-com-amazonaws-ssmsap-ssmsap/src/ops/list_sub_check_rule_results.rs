@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSubCheckRuleResults
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSubCheckRuleResults`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSubCheckRuleResults::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the rule results of ONE sub-check result: the records the configuration check
+//! run that produced that sub-check result filed under it
+//! ([`crate::state::StoredSubCheckResult::rule_results`]), in `RuleResultId` order, one
+//! page at a time. A `SubCheckResultId` that names no sub-check result of this account
+//! and Region is refused with the only client error the model gives this operation, the
+//! 400 `ValidationException` (see
+//! [`crate::state::no_sub_check_result_message`]) — this operation models no 404.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +145,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSubCheckRuleResults` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSubCheckRuleResultsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSubCheckRuleResults"))
+        // The Region this request was signed for: a rule result belongs to the Region
+        // the configuration check that produced it ran in, so it is reported at that
+        // regional endpoint and at no other.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSubCheckRuleResultsErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+        // Materialise what the clock already owed, so this listing agrees with a
+        // `GetConfigurationCheckOperation` or `ListSubCheckResults` made at the same
+        // instant. It changes nothing a caller would not have found changed anyway.
+        state.settle(::std::time::SystemTime::now());
+
+        // `SubCheckResultId` is required and the boundary validator has already refused
+        // anything outside its pattern, so reaching here means the id is well formed —
+        // it just might name nothing, which this operation models as a 400 rather than
+        // as a 404 it has no error for.
+        let Some(sub_check_result) = state.region(&region).sub_check_result(&input.sub_check_result_id)
+        else {
+            return Err(ListSubCheckRuleResultsErrorModeled::ValidationException(
+                crate::state::validation(crate::state::no_sub_check_result_message(
+                    &input.sub_check_result_id,
+                )),
+            )
+            .into());
+        };
+
+        // Every rule result of that sub-check, paired with the key the listing is
+        // ordered and paged by: its own `RuleResultId`.
+        let all: Vec<(String, RuleResult)> = sub_check_result
+            .rule_results_in_id_order()
+            .into_iter()
+            .map(|rule_result| (rule_result.id.clone(), rule_result.view()))
+            .collect();
+
+        let page = crate::state::page(all, input.max_results, input.next_token.as_deref())
+            .map_err(|error| {
+                ListSubCheckRuleResultsErrorModeled::ValidationException(
+                    crate::state::page_validation_exception(&error),
+                )
+            })?;
+
+        Ok(ListSubCheckRuleResultsOutput {
+            rule_results: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

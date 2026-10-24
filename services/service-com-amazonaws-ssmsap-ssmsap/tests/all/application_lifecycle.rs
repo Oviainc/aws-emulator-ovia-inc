@@ -29,7 +29,11 @@ use service_com_amazonaws_ssmsap_ssmsap::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the test signs for; it is the region every expected ARN carries.
-const REGION: &str = "us-east-1";
+///
+/// `pub(crate)` because a suite that reaches the store of the endpoint it drives
+/// (`tests/all/sub_check_results.rs`) has to name the SAME region this harness signs
+/// for.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The account every emulated ARN carries, from the core's single source of truth.
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
@@ -97,6 +101,9 @@ impl Reply {
 /// `pub(crate)` so every suite of this test target drives ONE harness.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The SAME engine the mounted service was built from, so a suite can read or place
+    /// a record in the store the handlers reach. See [`Emulator::with_state`].
+    engine: std::sync::Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -104,8 +111,23 @@ impl Emulator {
         let engine: std::sync::Arc<engine::InMemoryEngine> =
             std::sync::Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(engine.clone()));
+        Self { router, engine }
+    }
+
+    /// Edit the store the mounted service reads.
+    ///
+    /// Every suite drives the wire alone wherever an API of this service can produce the
+    /// record under test; this is for the one record no API produces
+    /// (`tests/all/sub_check_results.rs` says which, and why).
+    pub(crate) fn with_state(
+        &self,
+        edit: impl FnOnce(&mut service_com_amazonaws_ssmsap_ssmsap::state::ComAmazonawsSsmsapSsmsapState),
+    ) {
+        let state = service_com_amazonaws_ssmsap_ssmsap::state::service_state(&*self.engine)
+            .expect("the mounted service's own store");
+        let mut state = state.lock();
+        edit(&mut state);
     }
 
     /// Dispatch to this service's [`REGION`] endpoint — what every suite that cares
