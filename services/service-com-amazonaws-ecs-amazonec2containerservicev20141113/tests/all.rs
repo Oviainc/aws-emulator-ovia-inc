@@ -31,6 +31,8 @@ mod container_instances;
 mod ecs_wire;
 #[path = "all/error_messages.rs"]
 mod error_messages;
+#[path = "all/list_services.rs"]
+mod list_services;
 #[path = "all/load_balancer_target_groups.rs"]
 mod load_balancer_target_groups;
 #[path = "all/service_lifecycle.rs"]

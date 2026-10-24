@@ -17,6 +17,10 @@
 //! `ops/get_prompt_router.rs` reads back, so a router created by one request is the
 //! router every later request sees.
 //!
+//! And it holds the model import jobs `ops/create_model_import_job.rs` mints and
+//! `ops/get_model_import_job.rs` reads back, together with the instant each job's
+//! non-terminal `status` is owed its move to `Completed`.
+//!
 //! And it holds the Bedrock Marketplace model endpoints
 //! `ops/create_marketplace_model_endpoint.rs` mints,
 //! `ops/update_marketplace_model_endpoint.rs` reconfigures and
@@ -45,8 +49,8 @@ use crate::ops::types::{
     GuardrailSensitiveInformationPolicyConfig, GuardrailTopic, GuardrailTopicConfig,
     GuardrailTopicPolicy, GuardrailTopicPolicyConfig, GuardrailTopicsTier,
     GuardrailTopicsTierConfig, GuardrailWord, GuardrailWordConfig, GuardrailWordPolicy,
-    GuardrailWordPolicyConfig, LoggingConfig, MarketplaceModelEndpoint, PromptRouterTargetModel,
-    RoutingCriteria, Tag,
+    GuardrailWordPolicyConfig, LoggingConfig, MarketplaceModelEndpoint, ModelDataSource,
+    PromptRouterTargetModel, RoutingCriteria, Tag, VpcConfig,
 };
 
 /// The working version every guardrail always has, as `GuardrailDraftVersion`
@@ -182,6 +186,41 @@ pub const ENDPOINT_SETTLE_AFTER: Duration = Duration::from_millis(500);
 /// resource): without a server-side cap a caller could grow this part of the store with
 /// nothing but fresh endpoint names.
 pub const MAX_MARKETPLACE_MODEL_ENDPOINTS_PER_ACCOUNT: usize = 100;
+
+/// `ModelImportJobStatus` — the job is running.
+///
+/// The enum is `[InProgress, Completed, Failed]`
+/// (`smithy_query(query="shape",shape="ModelImportJobStatus")`). A job Amazon Bedrock
+/// accepted runs asynchronously, so this is the status it carries from the call that
+/// starts it until the import is done.
+pub const IMPORT_JOB_STATUS_IN_PROGRESS: &str = "InProgress";
+
+/// `ModelImportJobStatus` — the import finished, which is the terminal status the one
+/// above is owed its move to.
+///
+/// `Failed` names a job whose import did not finish; nothing in this emulator makes an
+/// accepted import fail, so no call here mints it.
+pub const IMPORT_JOB_STATUS_COMPLETED: &str = "Completed";
+
+/// How long after `CreateModelImportJob` a job's non-terminal `status` is owed its move
+/// to [`IMPORT_JOB_STATUS_COMPLETED`].
+///
+/// CHOSEN, not documented: AWS publishes no duration for importing a customized model
+/// (the real import takes minutes and depends on the model's size), so this is the
+/// emulator's span. It is non-zero, so a caller that reads the job straight after
+/// creating it still observes the `InProgress` status the real service reports; and it is
+/// materialised from the stored due instant on the next read rather than waited on, so no
+/// handler sleeps.
+pub const IMPORT_JOB_COMPLETE_AFTER: Duration = Duration::from_millis(500);
+
+/// The most model import jobs this account may hold at once, past which a create is
+/// refused with `ServiceQuotaExceededException`.
+///
+/// The emulator's own bound rather than a published quota (AWS publishes a quota for
+/// CONCURRENT import jobs, not for the jobs an account's history holds): without a
+/// server-side cap a caller could grow this part of the store with nothing but fresh job
+/// names.
+pub const MAX_MODEL_IMPORT_JOBS_PER_ACCOUNT: usize = 100;
 
 /// The number of base-36 digits each half of a minted resource id carries.
 ///
@@ -441,6 +480,76 @@ impl MarketplaceModelEndpointRecord {
     }
 }
 
+/// One stored model import job: the identity `CreateModelImportJob` minted, the request
+/// that minted it, the instants a read reports, and the job's own lifecycle status.
+///
+/// `status` is `&'static str` for the same reason [`PromptRouter::status`] is: this
+/// emulator mints only the two values the lifecycle passes through
+/// ([`IMPORT_JOB_STATUS_IN_PROGRESS`], [`IMPORT_JOB_STATUS_COMPLETED`]) rather than
+/// anything a request chooses.
+#[derive(Debug, Clone)]
+pub struct ModelImportJobRecord {
+    /// The `ModelImportJobArn` this job is addressed by, minted by
+    /// [`model_import_job_arn`].
+    pub arn: String,
+    /// `jobName`, as the create request spelled it — the other spelling a
+    /// `ModelImportJobIdentifier` may carry.
+    pub name: String,
+    /// The region the create addressed, which [`Self::arn`] also carries. Kept beside it
+    /// so the name index and the uniqueness checks are per region without re-parsing an
+    /// ARN.
+    pub region: String,
+    /// `importedModelName` — the name of the model this job imports.
+    pub imported_model_name: String,
+    /// The `ImportedModelArn` of the model this job imports, minted by
+    /// [`imported_model_arn`] when the job is accepted: it is the job's target, so it is
+    /// fixed from that call onwards.
+    pub imported_model_arn: String,
+    /// `roleArn` — the service role Amazon Bedrock assumes for the import.
+    pub role_arn: String,
+    /// `modelDataSource` — where the model being imported is read from.
+    pub model_data_source: ModelDataSource,
+    /// `vpcConfig`, as the create request carried it (absent when it carried none).
+    pub vpc_config: Option<VpcConfig>,
+    /// The `importedModelKmsKeyArn` a read reports for the request's
+    /// `importedModelKmsKeyId`, as [`kms_key_arn`] completes it.
+    pub imported_model_kms_key_arn: Option<String>,
+    /// `jobTags` — the tags attached to the import job itself.
+    pub job_tags: Vec<Tag>,
+    /// `importedModelTags` — the tags attached to the model the job imports.
+    pub imported_model_tags: Vec<Tag>,
+    /// `ModelImportJobStatus`.
+    pub status: &'static str,
+    /// When [`Self::status`] is owed its move to [`IMPORT_JOB_STATUS_COMPLETED`], or
+    /// `None` once it is terminal.
+    ///
+    /// The due INSTANT, not a timer, for the same reason
+    /// [`MarketplaceModelEndpointRecord::in_service_due_at`] is one.
+    pub completed_due_at: Option<SystemTime>,
+    pub created_at: SystemTime,
+    /// When the job last changed: the creation instant until the import completes.
+    pub last_modified_at: SystemTime,
+    /// When the job ended, or `None` while it is still running.
+    pub ended_at: Option<SystemTime>,
+}
+
+impl ModelImportJobRecord {
+    /// Materialise the move to [`IMPORT_JOB_STATUS_COMPLETED`] the clock has already made
+    /// due at `now`.
+    ///
+    /// The only write a reporting operation on this resource makes: it was owed at the due
+    /// instant even if nobody had called, which is why that instant — not `now` — is the
+    /// one the job reports as its end.
+    pub fn complete(&mut self, now: SystemTime) {
+        if let Some(due) = self.completed_due_at.filter(|due| now >= *due) {
+            self.status = IMPORT_JOB_STATUS_COMPLETED;
+            self.completed_due_at = None;
+            self.ended_at = Some(due);
+            self.last_modified_at = due;
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-bedrock-amazonbedrockcontrolplaneservice. A handler reaches it through [`service_state`].
 ///
 /// Every map here is bounded, and each bound holds by construction rather than by
@@ -465,6 +574,11 @@ impl MarketplaceModelEndpointRecord {
 ///
 /// * `model_invocation_logging` is a single optional settings record, which a put
 ///   replaces rather than appends to.
+///
+/// * `model_import_jobs` and `model_import_job_names` hold one entry per stored model
+///   import job, capped at [`MAX_MODEL_IMPORT_JOBS_PER_ACCOUNT`] by the quota
+///   `CreateModelImportJob` enforces, and `model_import_job_create_tokens` holds at most
+///   one entry per stored job for the same reason `create_tokens` does.
 ///
 /// * `marketplace_model_endpoints` holds one entry per live marketplace model endpoint,
 ///   capped at [`MAX_MARKETPLACE_MODEL_ENDPOINTS_PER_ACCOUNT`] by the quota
@@ -532,6 +646,23 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// `endpointArn` that token minted. Scoped to that one operation, and to the region
     /// the request addressed, the way the prompt router index is.
     pub marketplace_endpoint_create_tokens: HashMap<(String, String), String>,
+    /// Every stored model import job, keyed by its `ModelImportJobArn` — one of the two
+    /// spellings `GetModelImportJob` addresses a job by.
+    pub model_import_jobs: HashMap<String, ModelImportJobRecord>,
+    /// `(region, jobName)` -> `ModelImportJobArn`, so a duplicate job name is a
+    /// `ConflictException` and the other `ModelImportJobIdentifier` spelling — the bare
+    /// job name — resolves to the job it names.
+    pub model_import_job_names: HashMap<(String, String), String>,
+    /// `CreateModelImportJob` idempotency: `(region, clientRequestToken)` -> the `jobArn`
+    /// that token minted. Scoped to that one operation, and to the region the request
+    /// addressed, the way the prompt router index is.
+    pub model_import_job_create_tokens: HashMap<(String, String), String>,
+    /// How many model import job ids this store has minted; the uniqueness half of a
+    /// minted id.
+    pub minted_model_import_jobs: u64,
+    /// How many imported model ids this store has minted; the uniqueness half of a minted
+    /// id.
+    pub minted_imported_models: u64,
 }
 
 impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
@@ -583,6 +714,70 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         let endpoint = self.marketplace_model_endpoints.get_mut(arn)?;
         endpoint.settle(now);
         Some(endpoint)
+    }
+
+    /// The `ModelImportJobArn` a `ModelImportJobIdentifier` names: the identifier itself
+    /// when it is the ARN of a stored job, otherwise the ARN the job of that NAME in
+    /// `region` carries.
+    ///
+    /// The identifier's pattern is the job ARN OR a bare `JobName`
+    /// (`smithy_query(query="operation",operation="GetModelImportJob")`), so both
+    /// spellings address the same job.
+    #[must_use]
+    pub fn model_import_job_arn_of(&self, identifier: &str, region: &str) -> Option<String> {
+        if self.model_import_jobs.contains_key(identifier) {
+            return Some(identifier.to_string());
+        }
+        self.model_import_job_names
+            .get(&(region.to_string(), identifier.to_string()))
+            .cloned()
+    }
+
+    /// The model import job a `ModelImportJobIdentifier` names, with any status transition
+    /// the clock has made due at `now` materialised first — so every caller reads the
+    /// status the job holds at `now`, whichever operation asked.
+    pub fn model_import_job(
+        &mut self,
+        identifier: &str,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<&mut ModelImportJobRecord> {
+        let arn = self.model_import_job_arn_of(identifier, region)?;
+        let job = self.model_import_jobs.get_mut(&arn)?;
+        job.complete(now);
+        Some(job)
+    }
+
+    /// Whether a stored job in `region` already imports a model under
+    /// `imported_model_name`.
+    ///
+    /// An `ImportedModelIdentifier` is the imported model's ARN or its bare NAME
+    /// (`smithy_query(query="operation",operation="GetImportedModel")`), so a name names
+    /// at most one imported model in an account and region.
+    #[must_use]
+    pub fn imports_model_named(&self, region: &str, imported_model_name: &str) -> bool {
+        self.model_import_jobs
+            .values()
+            .any(|job| job.region == region && job.imported_model_name == imported_model_name)
+    }
+
+    /// Mint a fresh model import job id: the resource half of a `model-import-job/<id>`
+    /// ARN, unique within this store.
+    ///
+    /// Built like a guardrail id, and for the same two reasons; `ModelImportJobArn`
+    /// admits exactly `[a-z0-9]{12}` there, which is what two [`ID_HALF_WIDTH`] base-36
+    /// halves spell.
+    pub fn mint_model_import_job_id(&mut self, now: SystemTime) -> String {
+        self.minted_model_import_jobs += 1;
+        minted_id(self.minted_model_import_jobs, now)
+    }
+
+    /// Mint a fresh imported model id: the resource half of an `imported-model/<id>` ARN,
+    /// unique within this store. `ImportedModelArn` admits `[a-z0-9]{12}` there, as the
+    /// job ARN does.
+    pub fn mint_imported_model_id(&mut self, now: SystemTime) -> String {
+        self.minted_imported_models += 1;
+        minted_id(self.minted_imported_models, now)
     }
 }
 
@@ -691,6 +886,22 @@ pub fn marketplace_model_endpoint_arn(region: &str, name: &str) -> String {
 
 /// The `MarketplaceModelEndpoint` a response reports for a stored endpoint.
 ///
+/// The ARN of a model import job in `region`:
+/// `arn:aws:bedrock:<region>:<account>:model-import-job/<id>`, as `ModelImportJobArn`
+/// (`^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:model-import-job/[a-z0-9]{12}$`)
+/// spells it.
+pub fn model_import_job_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn("bedrock", region, &format!("model-import-job/{id}"))
+}
+
+/// The ARN of an imported model in `region`:
+/// `arn:aws:bedrock:<region>:<account>:imported-model/<id>`, as `ImportedModelArn`
+/// (`^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:imported-model/[a-z0-9]{12}$`)
+/// spells it.
+pub fn imported_model_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn("bedrock", region, &format!("imported-model/{id}"))
+}
+
 /// Lives here rather than in one operation's file because
 /// `Create`/`Get`/`UpdateMarketplaceModelEndpoint` all report this shape, and they must
 /// report it alike: what a create or update answers is exactly what the next read finds.

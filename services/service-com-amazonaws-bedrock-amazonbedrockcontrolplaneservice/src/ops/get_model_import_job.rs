@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetModelImportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetModelImportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetModelImportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! Reports the stored model import job a `jobIdentifier` names — either spelling, the job
+//! ARN or the bare `jobName` — and refuses an identifier no stored job answers to with 404
+//! `ResourceNotFoundException`.
+//!
+//! This operation is `@readonly`, and the ONE write it makes is the status transition the
+//! CLOCK already made due ([`crate::state::ModelImportJobRecord::complete`]): the import
+//! was owed its move to `Completed` at the stored due instant whether or not anybody
+//! called, so materialising it here changes nothing a later caller would not have seen
+//! anyway.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +180,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetModelImportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetModelImportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetModelImportJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetModelImportJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "model import job state is not available on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(job) = store.model_import_job(&input.job_identifier, &region, now) else {
+            return Err(GetModelImportJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no model import job answers to {} in this account in {region}",
+                        input.job_identifier
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetModelImportJobOutput {
+            job_arn: Some(job.arn.clone()),
+            job_name: Some(job.name.clone()),
+            imported_model_name: Some(job.imported_model_name.clone()),
+            imported_model_arn: Some(job.imported_model_arn.clone()),
+            role_arn: Some(job.role_arn.clone()),
+            model_data_source: Some(job.model_data_source.clone()),
+            status: Some(job.status.to_string()),
+            // "Information about why the import job failed": a job that is running or that
+            // completed has no failure to report, and this emulator mints no `Failed` job.
+            failure_message: None,
+            creation_time: Some(crate::state::date_time(job.created_at)),
+            last_modified_time: Some(crate::state::date_time(job.last_modified_at)),
+            // "Time that the resource transitioned to terminal state": absent while the
+            // job is still running.
+            end_time: job.ended_at.map(crate::state::date_time),
+            vpc_config: job.vpc_config.clone(),
+            imported_model_kms_key_arn: job.imported_model_kms_key_arn.clone(),
+        })
     }
 }

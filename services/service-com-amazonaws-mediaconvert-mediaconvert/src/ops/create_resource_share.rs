@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResourceShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResourceShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResourceShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +140,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResourceShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResourceShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResourceShare"))
+        // Nothing here depends on the request's region: the response carries no member,
+        // and the attempt is recorded on the job the request names.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateResourceShareErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("this service's state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "AWS Support case identifier": an identifier of nothing but whitespace names no
+        // support case, so there is no case to share the job's resources with. The member
+        // targets a bare `__string` with no length constraint, so the boundary validator
+        // lets it through and the refusal belongs here — a problem in the request, naming
+        // the member it is in.
+        if input.support_case_id.trim().is_empty() {
+            return Err(CreateResourceShareErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(
+                        "You must specify a value for supportCaseId: the AWS Support case \
+                         to share your job's resources with."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "Specify MediaConvert Job ID or ARN to share": either form resolves to the id
+        // the store holds the job under, exactly as every other resource reference in
+        // this service does.
+        let job_id = crate::state::job_id_from_reference(&input.job_id);
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        // The store owns the attempt, the job's share status and the clock-owed
+        // completion together, so the three cannot disagree.
+        match state.create_resource_share(job_id, &input.support_case_id, now) {
+            // A repeat against the same support case asks for the state the job is
+            // already in, so it answers the same empty 202 and leaves the recorded
+            // attempt exactly as it was. A request naming ANOTHER support case records a
+            // new attempt, whatever status the previous one had reached: the job reports
+            // "the most recent share attempt", so there is nothing for a second case to
+            // conflict with.
+            crate::state::ShareOutcome::Initiated
+            | crate::state::ShareOutcome::AlreadyRecorded => Ok(CreateResourceShareOutput {}),
+            crate::state::ShareOutcome::NotFound => {
+                Err(CreateResourceShareErrorModeled::NotFoundException(
+                    NotFoundException {
+                        // The refusal names the request member the lookup read, `JobId`.
+                        message: Some(crate::state::not_found_message("jobId")),
+                    },
+                )
+                .into())
+            }
+        }
     }
 }
