@@ -33,6 +33,8 @@ mod instrumentation_configurations;
 mod list_services;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/service_dependency_metrics.rs"]
+mod service_dependency_metrics;
 #[path = "all/sli_metric_type.rs"]
 mod sli_metric_type;
 #[path = "all/slo_lifecycle.rs"]

@@ -126,8 +126,10 @@ pub fn standard_metrics() -> BTreeSet<String> {
         .collect()
 }
 
-/// The `Name=Value` dimensions of ONE reference, as a set.
-fn dimensions_of(reference: &Value) -> BTreeSet<String> {
+/// The `Name=Value` dimensions of ONE reference, as a set. Shared with the suite that
+/// asserts the same dimension rule on `ListServiceDependencies`
+/// (`service_dependency_metrics`), so one answer's references are rendered in ONE place.
+pub fn dimensions_of(reference: &Value) -> BTreeSet<String> {
     reference["Dimensions"]
         .as_array()
         .map(|items| {
