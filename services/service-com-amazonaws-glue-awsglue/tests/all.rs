@@ -21,6 +21,10 @@ mod catalog_projections;
 mod crawlers;
 #[path = "all/data_catalog.rs"]
 mod data_catalog;
+#[path = "all/etl_connections.rs"]
+mod etl_connections;
+#[path = "all/etl_jobs_and_connections.rs"]
+mod etl_jobs_and_connections;
 #[path = "all/jobs.rs"]
 mod jobs;
 #[path = "all/state_roundtrip.rs"]

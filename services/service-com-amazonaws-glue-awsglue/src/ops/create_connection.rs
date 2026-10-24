@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: persists the connection definition the request's `ConnectionInput`
+//! describes in the addressed Data Catalog, which is what `GetConnection` reports back.
+//! `CreationTime` and `LastUpdatedTime` are the instant of the create, `LastUpdatedBy` the
+//! principal that issued it, and `ConnectionSchemaVersion` is 2 exactly when the input
+//! carried the per-compute-environment property maps version 2 adds, else 1.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A name already taken in that catalog is refused with the modelled
+//! `AlreadyExistsException`, a `CatalogId` this emulator does not hold with
+//! `InvalidInputException`, and a catalog at its connection ceiling with
+//! `ResourceNumberLimitExceededException`; none of the three writes anything.
+//!
+//! Members this handler stores but does not act on: `ValidateCredentials` and
+//! `ValidateForComputeEnvironments` ask Glue to CONNECT to the data source with the
+//! supplied credentials, which this emulator does not do — so it reports no connection
+//! `Status`, no `StatusReason` and no `LastConnectionValidationTime` rather than a
+//! validation outcome nothing produced.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +160,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConnection"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateConnectionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // A `CatalogId` this emulator does not hold must not be conjured into existence by
+        // the create, exactly as on `CreateDatabase`: this operation models no not-found
+        // error, so the refusal is the modelled client-input error.
+        if !crate::state::is_known_catalog(&catalog_id) {
+            return Err(CreateConnectionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "CatalogId {catalog_id} is not a Data Catalog in this account"
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        let name = input.connection_input.name.clone();
+
+        let mut store = state.lock();
+        // Read the existing catalog rather than `entry(..).or_default()`: a refused create
+        // must leave nothing behind.
+        let existing = store.catalogs.get(&catalog_id);
+        if existing.is_some_and(|catalog| catalog.connections.contains_key(&name)) {
+            return Err(CreateConnectionErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(format!("Connection already exists: {name}")),
+                },
+            )
+            .into());
+        }
+        // The store is resident memory and this create is reachable by any caller, so the
+        // number of records one process will hold is bounded.
+        if existing.is_some_and(|catalog| !catalog.can_store_connection()) {
+            return Err(
+                CreateConnectionErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "Catalog {catalog_id} already holds the maximum of {} connections",
+                            crate::state::MAX_CONNECTIONS_PER_CATALOG
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let entry = crate::state::ConnectionEntry::from_input(
+            &input.connection_input,
+            // `Connection$LastUpdatedBy` is "the user, group, or role that last updated
+            // this connection definition" — the identity this emulator's credentials speak
+            // for, derived the same way `Table$CreatedBy` is and never from the request.
+            Some(crate::state::request_principal()),
+            input.tags.as_ref(),
+            ::std::time::SystemTime::now(),
+        );
+        store
+            .catalogs
+            .entry(catalog_id.clone())
+            .or_default()
+            .connections
+            .insert(name.clone(), entry);
+        ::tracing::info!(
+            operation = "CreateConnection",
+            catalog_id = %catalog_id,
+            connection = %name,
+            "created a Glue connection definition"
+        );
+
+        Ok(CreateConnectionOutput {
+            // `CreateConnectionStatus` reports the progress of a create that "can take
+            // some time for certain authentication types, for example when creating an
+            // OAuth connection with token exchange over VPC". Writing a connection
+            // DEFINITION is synchronous and nothing here exchanges a token, so there is no
+            // in-flight creation to report a status for — which is what the service
+            // answers for such a connection: a 200 with an empty body.
+            create_connection_status: None,
+        })
     }
 }
