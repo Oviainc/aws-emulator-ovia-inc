@@ -2,9 +2,11 @@
 
 //! @op DescribeInstancesHealth
 //! Implemented: reports the per-instance health of the stored environment's instances.
-//! This emulator provisions no EC2 instance, so a found environment reports an empty
-//! instance list rather than an instance nothing launched. This is the ONLY file to touch
-//! for this operation.
+//! Per-instance health is what the enhanced-health agent on an instance measures from the
+//! application it runs; this emulator runs neither, so a found environment reports an
+//! empty instance list rather than health nothing measured — the environment's resource
+//! inventory itself is what `DescribeEnvironmentResources` reports. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -202,9 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         // `AttributeNames` selects which members of each instance's health are
-        // reported. This emulator provisions no EC2 instance for an environment,
-        // so there is no instance health to select from: the list is empty
-        // whatever was asked for, and there is no further page.
+        // reported. This emulator runs no application and no enhanced-health
+        // agent on an environment's instances, so there is no measured
+        // per-instance health to select from: the list is empty whatever was
+        // asked for, and there is no further page.
         let _ = &input.attribute_names;
 
         Ok(DescribeInstancesHealthOutput {

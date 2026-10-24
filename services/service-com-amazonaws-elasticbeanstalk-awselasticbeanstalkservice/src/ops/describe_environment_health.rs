@@ -171,9 +171,11 @@ fn application_metrics() -> ApplicationMetrics {
     }
 }
 
-/// The health summary over this environment's instances. This emulator
-/// provisions no EC2 instance, so every bucket of the summary is zero rather
-/// than a count nothing produced.
+/// The health summary over this environment's instances. Enhanced health is
+/// measured by an agent running on an instance against the application it
+/// serves; this emulator runs neither, so no instance of the environment falls
+/// in any health bucket and every bucket is zero rather than a count nothing
+/// measured.
 fn instance_health_summary() -> InstanceHealthSummary {
     InstanceHealthSummary {
         no_data: Some(0),

@@ -205,9 +205,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
 
         // `TerminateResources` selects whether the environment's AWS resources
-        // are deleted and `ForceTerminate` forces termination of an environment
-        // whose resources are already gone. This emulator provisions no
-        // resources, so neither changes what is stored.
+        // are shut down with it and `ForceTerminate` forces termination of an
+        // environment whose resources are already gone. The resources this
+        // store holds are the INVENTORY ON the environment record, so a request
+        // that asks for them to keep operating outside Elastic Beanstalk's
+        // management names something this store has no owner record for:
+        // neither input changes what is stored, and the environment's inventory
+        // is released when the termination completes either way.
         let _ = (input.terminate_resources, input.force_terminate);
 
         let environment_id = store
