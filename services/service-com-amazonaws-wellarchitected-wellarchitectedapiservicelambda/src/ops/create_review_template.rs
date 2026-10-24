@@ -260,7 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // handler has already bounded, and before the template quota below, so a caller
         // learns that its request named no lens rather than that the account is full.
         let now = std::time::SystemTime::now();
-        match store.unapplicable_lenses_refusal(&input.lenses, now) {
+        match store.unapplicable_lenses_refusal(&input.lenses, crate::state::LENSES_MEMBER, now) {
             Some(crate::state::LensesRefusal::NotFound(exception)) => {
                 return Err(
                     CreateReviewTemplateErrorModeled::ResourceNotFoundException(exception).into(),
