@@ -138,7 +138,10 @@ pub(crate) fn minimal_create() -> Value {
 }
 
 /// The tags `ListTagsForResource` reports, as a map.
-async fn stored_tags(router: &MultiServiceRouter, id: &str) -> BTreeMap<String, String> {
+pub(crate) async fn stored_tags(
+    router: &MultiServiceRouter,
+    id: &str,
+) -> BTreeMap<String, String> {
     let payload = ok(
         router,
         "ListTagsForResource",
