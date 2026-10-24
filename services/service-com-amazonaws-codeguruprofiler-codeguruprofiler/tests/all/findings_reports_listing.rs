@@ -412,10 +412,14 @@ fn range_cases() -> Vec<RangeCase> {
             expected: vec!["11111111-1111-4111-8111-111111111111"],
         },
         RangeCase {
-            label: "an instant range (startTime == endTime) lists every window over it",
+            // The narrowest range the interval rule allows (start strictly before end):
+            // one second over an instant two analysed windows both cover. A range whose
+            // bounds are EQUAL is not an interval at all and is refused — see
+            // `a_listing_refuses_what_it_cannot_answer`.
+            label: "a one-second range lists every window over it",
             group: ANALYSED_GROUP,
             start_secs: DAY1 + 7_300,
-            end_secs: DAY1 + 7_300,
+            end_secs: DAY1 + 7_301,
             daily_only: None,
             expected: vec![
                 "11111111-1111-4111-8111-111111111111",
@@ -623,6 +627,16 @@ async fn a_listing_refuses_what_it_cannot_answer() {
             "a range that ends before it starts",
             ANALYSED_GROUP,
             format!("?startTime={}&endTime={}", iso(DAY1 + DAY), iso(DAY1)),
+            400,
+            "ValidationException",
+        ),
+        (
+            // Equal bounds span no interval, so they are refused the same way a
+            // reversed pair is; `interval_validation.rs` asserts that rule across
+            // every operation of this service that takes a range.
+            "a range whose bounds are equal",
+            ANALYSED_GROUP,
+            format!("?startTime={}&endTime={}", iso(DAY1), iso(DAY1)),
             400,
             "ValidationException",
         ),

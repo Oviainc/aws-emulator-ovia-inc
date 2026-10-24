@@ -124,14 +124,6 @@ const SUPPORTED_LOCALES: &[&str] = &[
     "zh-CN", "zh-TW",
 ];
 
-/// One timestamp in the ISO 8601 form this operation's docs use, for a refusal message
-/// the caller can act on. Falls back to epoch seconds if the instant cannot be rendered,
-/// so a refusal is never lost to a formatting failure.
-fn iso8601(at: ::aws_smithy_types::DateTime) -> String {
-    at.fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .unwrap_or_else(|_| format!("{} (epoch seconds)", at.as_secs_f64()))
-}
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -213,21 +205,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both bounds are modelled required, so a request always names a range; what the
         // model cannot express is that the range must be a window at all. An analysis of
         // `[start, end]` with `start` at or after `end` spans no instant, so it is
-        // refused rather than answered with an analysis of nothing. The two instants are
-        // compared exactly (whole seconds plus sub-second nanoseconds), so a window
-        // narrower than a microsecond is still ordered correctly. The wording is the
-        // service's own for this refusal — "Interval start time (<startTime>) must be
-        // before end time (<endTime>)" — built from the request's own bounds.
-        if crate::state::instant_key(input.start_time) >= crate::state::instant_key(input.end_time)
-        {
+        // refused rather than answered with an analysis of nothing — the service-wide
+        // interval rule, stated once in [`crate::state::validate_interval`], whose
+        // message names the request's own bounds.
+        if let Err(message) = crate::state::validate_interval(input.start_time, input.end_time) {
             return Err(GetRecommendationsErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "Interval start time ({}) must be before end time ({})",
-                        iso8601(input.start_time),
-                        iso8601(input.end_time)
-                    ),
-                },
+                ValidationException { message },
             )
             .into());
         }
