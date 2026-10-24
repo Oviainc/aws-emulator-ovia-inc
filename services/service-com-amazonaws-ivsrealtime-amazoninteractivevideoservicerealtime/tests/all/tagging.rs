@@ -25,6 +25,13 @@
 //! 4. The modelled `Tags` `@length` maximum bounds the RESOURCE's tag set, so a call is
 //!    refused when the set it would LEAVE is over the maximum, even though each request
 //!    is within it.
+//! 5. RESERVED NAMESPACE. Every `Tags`/`TagKeyList` member of this model defers to the
+//!    AWS-wide tagging restrictions ("Amazon IVS has no constraints on tags beyond what
+//!    is documented there"), which reserve the `aws:` key namespace for AWS's own tags: a
+//!    request that would create, change or remove a key claiming that namespace — in any
+//!    casing, on any operation that carries tag keys — is refused with the modelled
+//!    `ValidationException` (HTTP 400) and changes nothing, while a key that merely looks
+//!    like one is an ordinary key.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -76,6 +83,13 @@ const OWN_RESOURCE_TYPES: [&str; 6] = [
     "stage",
     "storage-configuration",
 ];
+
+/// The tag-key namespace AWS reserves for its own tags, written out here so the expected
+/// refusal is stated independently of the service. Source: the "Tag naming limits and
+/// requirements" restrictions every `Tags`/`TagKeyList` member of this model defers to
+/// (`smithy_query(query="doc", shape="TagResourceRequest", member="tags")` and
+/// `smithy_query(query="doc", shape="UntagResourceRequest", member="tagKeys")`).
+const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
 /// One IVS RealTime emulator over one shared engine, reached the way the router reaches
 /// it.
@@ -643,4 +657,349 @@ async fn the_tag_maximum_bounds_the_resource_not_one_request() {
         expected,
         "the replacement must be the only change"
     );
+}
+
+/// The refusal this service states for a request naming keys in the reserved namespace:
+/// the construction every other refusal of this service uses — the operation, the member
+/// the keys arrived in, the requirement, then the offending keys in sorted order.
+fn reserved_refusal(operation: &str, member: &str, keys: &[&str]) -> String {
+    format!(
+        "{operation}.{member} is required to name no key in the reserved \
+         {RESERVED_TAG_KEY_PREFIX} namespace, found {}",
+        keys.join(", ")
+    )
+}
+
+/// Assert that `reply` is the modelled `ValidationException` (HTTP 400) stating `expected`.
+fn assert_validation_refusal(case: &str, operation: &str, reply: &Reply, expected: &str) {
+    assert_eq!(
+        (
+            reply.status,
+            reply.error_code.as_str(),
+            reply.message.as_str()
+        ),
+        (400, "ValidationException", expected),
+        "case {case:?} ({operation}): expected the stated refusal {expected:?}, got {} {} {}",
+        reply.status,
+        reply.error_code,
+        reply.body
+    );
+}
+
+/// Rule 5 on `TagResource`: a key claiming the reserved namespace is refused with the
+/// modelled `ValidationException`, and the resource's tags are left exactly as they were.
+///
+/// The rows differ along what the rule generalises over: the CASING of the prefix, whether
+/// the key carries a qualifier after it (the form AWS's own tags take) or nothing at all,
+/// how many reserved keys one request carries, and whether ordinary keys travel beside
+/// them — a refused request writes none of them either.
+#[tokio::test]
+async fn a_tag_key_in_the_reserved_namespace_is_refused_by_tag_resource() {
+    let realtime = RealTime::new();
+    let stage_arn = realtime
+        .create_stage_in("us-east-1", &json!({ "name": "reserved", "tags": { "env": "prod" } }))
+        .await;
+    let held: HashMap<String, String> =
+        HashMap::from([("env".to_string(), "prod".to_string())]);
+
+    // (case, the tags the request carries, the offending keys the refusal names)
+    let rows: Vec<(&str, Value, Vec<&str>)> = vec![
+        (
+            "a reserved key",
+            json!({ "aws:owner": "platform" }),
+            vec!["aws:owner"],
+        ),
+        (
+            "a qualified reserved key, the form AWS's own tags take",
+            json!({ "aws:cloudformation:stack-name": "prod" }),
+            vec!["aws:cloudformation:stack-name"],
+        ),
+        (
+            "the reserved prefix and nothing after it",
+            json!({ "aws:": "x" }),
+            vec!["aws:"],
+        ),
+        (
+            "the reserved prefix in upper case",
+            json!({ "AWS:owner": "platform" }),
+            vec!["AWS:owner"],
+        ),
+        (
+            "the reserved prefix in mixed case",
+            json!({ "Aws:owner": "platform" }),
+            vec!["Aws:owner"],
+        ),
+        (
+            "a reserved key beside an ordinary one",
+            json!({ "aws:owner": "platform", "team": "video" }),
+            vec!["aws:owner"],
+        ),
+        (
+            "two reserved keys at once",
+            json!({ "aws:a": "1", "aws:b": "2" }),
+            vec!["aws:a", "aws:b"],
+        ),
+    ];
+
+    for (case, tags, offending) in rows {
+        let reply = realtime
+            .tagging("POST", &stage_arn, "", Some(json!({ "tags": tags })))
+            .await;
+        assert_validation_refusal(
+            case,
+            "TagResource",
+            &reply,
+            &reserved_refusal("TagResource", "tags", &offending),
+        );
+        assert_eq!(
+            realtime.tags_of(case, &stage_arn).await,
+            held,
+            "case {case:?}: a refused TagResource must write nothing, not even the keys \
+             travelling beside the reserved one"
+        );
+        assert_eq!(
+            realtime.tags_on_stage(case, &stage_arn).await,
+            held,
+            "case {case:?}: GetStage must report the untouched tag set too"
+        );
+    }
+}
+
+/// Rule 5 on `UntagResource`: the reserved namespace is AWS's own to write, so a caller
+/// cannot DELETE a key claiming it either — the removal is refused and nothing is removed,
+/// including the removable keys named beside it.
+///
+/// The rows differ along the same axes as the `TagResource` table, plus the POSITION of
+/// the reserved key in the `tagKeys` list.
+#[tokio::test]
+async fn a_tag_key_in_the_reserved_namespace_is_refused_by_untag_resource() {
+    let realtime = RealTime::new();
+    let stage_arn = realtime
+        .create_stage_in(
+            "eu-west-1",
+            &json!({ "name": "reserved", "tags": { "env": "prod", "team": "video" } }),
+        )
+        .await;
+    let held: HashMap<String, String> = HashMap::from([
+        ("env".to_string(), "prod".to_string()),
+        ("team".to_string(), "video".to_string()),
+    ]);
+
+    // (case, the keys the request names, the offending keys the refusal names)
+    let rows: Vec<(&str, Vec<&str>, Vec<&str>)> = vec![
+        ("a reserved key", vec!["aws:owner"], vec!["aws:owner"]),
+        (
+            "a qualified reserved key",
+            vec!["aws:cloudformation:stack-name"],
+            vec!["aws:cloudformation:stack-name"],
+        ),
+        (
+            "the reserved prefix in upper case",
+            vec!["AWS:owner"],
+            vec!["AWS:owner"],
+        ),
+        (
+            "a reserved key before a removable one",
+            vec!["aws:owner", "team"],
+            vec!["aws:owner"],
+        ),
+        (
+            "a reserved key after a removable one",
+            vec!["team", "aws:owner"],
+            vec!["aws:owner"],
+        ),
+        (
+            "two reserved keys at once",
+            vec!["aws:b", "aws:a"],
+            vec!["aws:a", "aws:b"],
+        ),
+    ];
+
+    for (case, keys, offending) in rows {
+        let query = keys
+            .iter()
+            .map(|key| format!("tagKeys={key}"))
+            .collect::<Vec<String>>()
+            .join("&");
+        let reply = realtime
+            .tagging("DELETE", &stage_arn, &format!("?{query}"), None)
+            .await;
+        assert_validation_refusal(
+            case,
+            "UntagResource",
+            &reply,
+            &reserved_refusal("UntagResource", "tagKeys", &offending),
+        );
+        assert_eq!(
+            realtime.tags_of(case, &stage_arn).await,
+            held,
+            "case {case:?}: a refused UntagResource must remove nothing, not even the \
+             removable keys named beside the reserved one"
+        );
+    }
+}
+
+/// The other side of rule 5: it is the NAMESPACE that is reserved, so a key that merely
+/// starts with the same letters, or carries the prefix anywhere but at the start, is an
+/// ordinary key — written, read back through both readers, and removed again.
+///
+/// The rows differ along how close the key comes to the prefix without claiming it: the
+/// letters followed by more letters, the letters alone, the prefix after another segment,
+/// and the colon without the letters.
+#[tokio::test]
+async fn a_key_that_only_looks_reserved_is_an_ordinary_key() {
+    let realtime = RealTime::new();
+    let stage_arn = realtime
+        .create_stage_in("ap-southeast-2", &json!({ "name": "lookalike" }))
+        .await;
+
+    let rows: [(&str, &str); 4] = [
+        ("the reserved letters followed by more", "awsome"),
+        ("the reserved letters without the colon", "aws"),
+        ("the prefix after another segment", "team-aws:owner"),
+        ("a colon-led key that is not the namespace", "az:owner"),
+    ];
+
+    for (case, key) in rows {
+        let reply = realtime
+            .tagging(
+                "POST",
+                &stage_arn,
+                "",
+                Some(json!({ "tags": { key: "accepted" } })),
+            )
+            .await;
+        assert_no_content(case, "TagResource", &reply);
+
+        let expected: HashMap<String, String> =
+            HashMap::from([(key.to_string(), "accepted".to_string())]);
+        assert_eq!(
+            realtime.tags_of(case, &stage_arn).await,
+            expected,
+            "case {case:?}: an ordinary key must round-trip through ListTagsForResource"
+        );
+        assert_eq!(
+            realtime.tags_on_stage(case, &stage_arn).await,
+            expected,
+            "case {case:?}: GetStage must report it too"
+        );
+
+        let reply = realtime
+            .tagging("DELETE", &stage_arn, &format!("?tagKeys={key}"), None)
+            .await;
+        assert_no_content(case, "UntagResource", &reply);
+        assert!(
+            realtime.tags_of(case, &stage_arn).await.is_empty(),
+            "case {case:?}: an ordinary key must be removable, got {:?}",
+            realtime.tags_of(case, &stage_arn).await
+        );
+    }
+}
+
+/// Rule 5 at CREATION time: every operation of this service whose request carries a `tags`
+/// map defers to the same documented restrictions, so none of them may persist a key a
+/// `TagResource` would refuse — and a refused create leaves no resource behind.
+///
+/// The rows are every implemented create that accepts tags, each with the rest of its
+/// request filled in minimally; the accepting half of each row proves the create still
+/// stores an ordinary key, read back off the resource the create reports.
+#[tokio::test]
+async fn a_reserved_tag_key_is_refused_by_every_create_that_accepts_tags() {
+    let realtime = RealTime::new();
+
+    // (operation, the member reporting the created resource, the rest of the request)
+    let creates: [(&str, &str, Value); 4] = [
+        ("CreateStage", "stage", json!({ "name": "created" })),
+        (
+            "CreateIngestConfiguration",
+            "ingestConfiguration",
+            json!({ "name": "created", "ingestProtocol": "RTMPS" }),
+        ),
+        (
+            "CreateEncoderConfiguration",
+            "encoderConfiguration",
+            json!({ "name": "created" }),
+        ),
+        (
+            "CreateStorageConfiguration",
+            "storageConfiguration",
+            json!({ "name": "created", "s3": { "bucketName": "recordings" } }),
+        ),
+    ];
+
+    for (operation, member_name, base) in creates {
+        for (case, tags, offending) in [
+            (
+                "a reserved key",
+                json!({ "aws:owner": "platform" }),
+                vec!["aws:owner"],
+            ),
+            (
+                "the reserved prefix in upper case, beside an ordinary key",
+                json!({ "AWS:cloudformation:stack-name": "prod", "team": "video" }),
+                vec!["AWS:cloudformation:stack-name"],
+            ),
+        ] {
+            let mut request = base.clone();
+            request["tags"] = tags;
+            let reply = realtime.call(operation, &request).await;
+            assert_validation_refusal(
+                case,
+                operation,
+                &reply,
+                &reserved_refusal(operation, "tags", &offending),
+            );
+            assert!(
+                reply.body.get(member_name).is_none(),
+                "case {case:?} ({operation}): a refused create must report no resource, got {}",
+                reply.body
+            );
+        }
+
+        // The accepting half: an ordinary key is still persisted, and the create reports
+        // it on the resource it created.
+        let mut request = base.clone();
+        request["tags"] = json!({ "awsome": "yes" });
+        let reply = realtime.call(operation, &request).await;
+        assert_eq!(
+            reply.status, 200,
+            "{operation} with an ordinary key must answer HTTP 200, got {} {}",
+            reply.status, reply.body
+        );
+        let stored: HashMap<String, String> =
+            serde_json::from_value(reply.body[member_name]["tags"].clone()).unwrap_or_default();
+        assert_eq!(
+            stored,
+            HashMap::from([("awsome".to_string(), "yes".to_string())]),
+            "{operation} must persist an ordinary key, got {}",
+            reply.body
+        );
+
+        // Read back through the tagging surface, which reads the stored record rather than
+        // the create's own answer.
+        let created_arn = member(&reply.body[member_name], "arn");
+        assert_eq!(
+            realtime.tags_of(operation, &created_arn).await,
+            stored,
+            "{operation}: the tagging surface must report the tags the create persisted"
+        );
+    }
+
+    // Nothing the refused creates named is in the store: the two resource types whose
+    // listing this service implements report only the resource their accepted create made.
+    // (`ListIngestConfigurations` and `ListEncoderConfigurations` are still stubs, so the
+    // ingest and encoder rows are covered by their creates' answers above.)
+    for (operation, member_name) in [
+        ("ListStages", "stages"),
+        ("ListStorageConfigurations", "storageConfigurations"),
+    ] {
+        let reply = realtime.call(operation, &json!({})).await;
+        let listed = reply.body[member_name].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            listed.len(),
+            1,
+            "{operation} must list only the resource the accepted create made, got {}",
+            reply.body
+        );
+    }
 }
