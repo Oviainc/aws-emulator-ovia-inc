@@ -547,6 +547,18 @@ impl ServiceAccount {
         self.tokens.iter().find(|token| token.id == id)
     }
 
+    /// Release the token `id` names, handing back the record that was removed,
+    /// or `None` when this account holds no such token.
+    ///
+    /// Removing the record is what "disable[s] the key associated with the
+    /// token": the workspace's own Grafana HTTP API recognises a presented key
+    /// only by a digest held on a stored token, so a released token authorizes
+    /// nothing.
+    pub fn remove_token(&mut self, id: &str) -> Option<ServiceAccountToken> {
+        let at = self.tokens.iter().position(|token| token.id == id)?;
+        Some(self.tokens.remove(at))
+    }
+
     /// Mint an id no token of this service account holds.
     ///
     /// Grafana identifies a service account token by a positive integer,
@@ -894,6 +906,20 @@ pub fn service_account_not_found(workspace_id: &str, account_id: &str) -> Resour
         ),
         resource_id: account_id.to_string(),
         resource_type: SERVICE_ACCOUNT_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an id that names no token of a
+/// service account — one never created, or already deleted.
+///
+/// The message names the token id the request asked about, the one part of the
+/// request that tells two refused deletes apart; the workspace and the account are
+/// already named by the path the caller sent.
+pub fn service_account_token_not_found(token_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("Service Account Token with id={token_id} does not exist."),
+        resource_id: token_id.to_string(),
+        resource_type: SERVICE_ACCOUNT_TOKEN_RESOURCE_TYPE.to_string(),
     }
 }
 

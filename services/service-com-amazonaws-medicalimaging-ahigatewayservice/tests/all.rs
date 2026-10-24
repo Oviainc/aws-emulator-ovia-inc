@@ -19,6 +19,8 @@ mod datastore_status_guard;
 mod error_message_texts;
 #[path = "all/image_frames.rs"]
 mod image_frames;
+#[path = "all/image_set_access_time.rs"]
+mod image_set_access_time;
 #[path = "all/image_set_copy.rs"]
 mod image_set_copy;
 #[path = "all/image_set_deletion.rs"]

@@ -195,6 +195,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
+        // `Tags` carries neither a modelled `@length` nor a `@pattern`, on the map or on
+        // either half of an entry, so every tagging rule is this handler's to enforce. It is
+        // checked BEFORE anything is looked up or collected, so a request carrying a tag no
+        // caller may set is refused for that, costs nothing, and leaves no record behind.
+        if let Some(why) = crate::state::tags_rejection(
+            input
+                .tags
+                .iter()
+                .flatten()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        ) {
+            return Err(CreateConnectorErrorModeled::ValidationException(ValidationException {
+                message: why,
+                // "The service doesn't return a reason for every validation exception"
+                // (`Reason`'s own doc), and `ValidationExceptionReason` carries no member
+                // for a tag a caller may not set.
+                reason: None,
+            })
+            .into());
+        }
+
         // The resource-defining inputs of this call, so a retry carrying the same
         // `ClientToken` can be checked to be the same request.
         let request = crate::state::connector_request(
@@ -252,20 +273,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `Tags` carries no modelled `@length`, so the per-resource tag limit is enforced
-        // here, on the request's own entry count and BEFORE anything is collected, so an
-        // oversized map costs nothing and duplicate keys cannot collapse under the limit.
-        let tag_count = input.tags.as_ref().map(|tags| tags.len()).unwrap_or_default();
-        if tag_count > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(CreateConnectorErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "Tags carries {tag_count} entries; a resource may have at most {}",
-                    crate::state::MAX_TAGS_PER_RESOURCE
-                ),
-                reason: None,
-            })
-            .into());
-        }
+        // `Tags` carries no modelled `@length`, so the per-resource tag limit and every other
+        // tagging rule is enforced above, on the request's own entries.
         let tags: ::std::collections::BTreeMap<String, String> =
             input.tags.unwrap_or_default().into_iter().collect();
 

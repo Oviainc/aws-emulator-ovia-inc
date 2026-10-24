@@ -284,6 +284,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sap_instance_number: input.sap_instance_number,
             instances: input.instances,
             credentials: input.credentials.unwrap_or_default(),
+            // The SAP HANA database the registration named by ARN: one of this
+            // application's databases, which `ListDatabases` reports under that ARN
+            // (`crate::state::StoredApplication::databases`).
             database_arn: input.database_arn,
             // Registration is asynchronous: the application becomes ACTIVATED with a
             // SUCCESS discovery one `TRANSITION_SPAN` from now, and the first request at

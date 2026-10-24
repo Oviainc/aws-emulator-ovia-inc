@@ -9,8 +9,14 @@
 //! It does call [`crate::state::ComAmazonawsMedicalimagingAhigatewayserviceState::advance_clock`]
 //! first, like every handler, which materialises only a transition the CLOCK already
 //! owed at that instant — the release of a copy's lock, say. A read never moves a
-//! status that was not already due, and never records that the image set was read:
-//! `lastAccessedAt` is left absent rather than written by the reader.
+//! status that was not already due.
+//!
+//! `lastAccessedAt` is REPORTED here and recorded elsewhere: it is the instant the DICOM
+//! content this image set holds was last accessed ([`crate::state::ImageSet::last_accessed_at`]),
+//! which is the instant the image set came into existence until something reads that
+//! content or writes content into it. Reporting an image set's properties is not an
+//! access of the content it holds, so this handler reports the stored instant without
+//! moving it, and two reads answer identically.
 //!
 //! ---
 //!
@@ -208,9 +214,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // will contain the forced flag" — so it is present only when it was.
             overrides: version.forced.then_some(Overrides { forced: Some(true) }),
             is_primary: Some(image_set.is_primary),
-            // Absent, deliberately: recording when an image set was last read would be
-            // a reporting operation writing a change no clock owed.
-            last_accessed_at: None,
+            // The image SET's last access, like `createdAt`: content belongs to the
+            // image set rather than to one version of it, so every version reports the
+            // same instant. Read here, never written: the writers are the calls that
+            // actually touch the content (`GetImageFrame`, the copy that reads a source
+            // and delivers into a destination).
+            last_accessed_at: Some(crate::state::to_date_time(image_set.last_accessed_at)),
             storage_tier: Some(crate::state::DEFAULT_STORAGE_TIER.to_string()),
         })
     }

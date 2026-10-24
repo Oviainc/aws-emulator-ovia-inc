@@ -32,7 +32,15 @@ pub struct ListProvisionedModelThroughputsOutput {
     pub provisioned_model_summaries: Option<Vec<ProvisionedModelSummary>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#ProvisionedModelSummary")]
+/// `ProvisionedModelSummary`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `commitmentExpirationTime`, `creationTime` and `lastModifiedTime` all carry
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape",shape="ProvisionedModelSummary")`), which the derive does
+/// not put on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct ProvisionedModelSummary {
     pub provisioned_model_name: String,
@@ -48,4 +56,87 @@ pub struct ProvisionedModelSummary {
     pub creation_time: ::aws_smithy_types::DateTime,
     pub last_modified_time: ::aws_smithy_types::DateTime,
 }
+
+bedrock_schema_and_codec!(
+    ProvisionedModelSummary,
+    PROVISIONED_MODEL_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrock#ProvisionedModelSummary",
+    "com.amazonaws.bedrock",
+    "ProvisionedModelSummary",
+    (
+        M_PROVISIONED_MODEL_NAME,
+        provisioned_model_name,
+        "provisionedModelName",
+        0,
+        req,
+        string
+    ),
+    (
+        M_PROVISIONED_MODEL_ARN,
+        provisioned_model_arn,
+        "provisionedModelArn",
+        1,
+        req,
+        string
+    ),
+    (M_MODEL_ARN, model_arn, "modelArn", 2, req, string),
+    (
+        M_DESIRED_MODEL_ARN,
+        desired_model_arn,
+        "desiredModelArn",
+        3,
+        req,
+        string
+    ),
+    (
+        M_FOUNDATION_MODEL_ARN,
+        foundation_model_arn,
+        "foundationModelArn",
+        4,
+        req,
+        string
+    ),
+    (M_MODEL_UNITS, model_units, "modelUnits", 5, req, integer),
+    (
+        M_DESIRED_MODEL_UNITS,
+        desired_model_units,
+        "desiredModelUnits",
+        6,
+        req,
+        integer
+    ),
+    (M_STATUS, status, "status", 7, req, string),
+    (
+        M_COMMITMENT_DURATION,
+        commitment_duration,
+        "commitmentDuration",
+        8,
+        opt,
+        string
+    ),
+    (
+        M_COMMITMENT_EXPIRATION_TIME,
+        commitment_expiration_time,
+        "commitmentExpirationTime",
+        9,
+        opt,
+        date_time
+    ),
+    (
+        M_CREATION_TIME,
+        creation_time,
+        "creationTime",
+        10,
+        req,
+        date_time
+    ),
+    (
+        M_LAST_MODIFIED_TIME,
+        last_modified_time,
+        "lastModifiedTime",
+        11,
+        req,
+        date_time
+    ),
+);
 

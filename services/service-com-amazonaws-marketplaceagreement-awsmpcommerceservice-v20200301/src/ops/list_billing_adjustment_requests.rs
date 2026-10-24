@@ -166,6 +166,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // Every selector whose value set this service fixes is RESOLVED before
+        // anything is selected: a `catalog` that is not the one AWS Marketplace
+        // exposes and an `agreementType` outside the documented pair name
+        // nothing this service holds
+        // (`crate::state::selector_value_refusal`).
+        if let Some(refusal) = crate::state::selector_value_refusal(
+            input.agreement_type.as_deref(),
+            input.catalog.as_deref(),
+        ) {
+            return Err(
+                ListBillingAdjustmentRequestsErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+
         let created_after = input.created_after.map(|bound| bound.as_secs_f64());
         let created_before = input.created_before.map(|bound| bound.as_secs_f64());
         // The token resumes THIS listing: one minted for a different set of
@@ -205,15 +219,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing. This operation models no `ResourceNotFoundException`, so the
         // refusal is its modelled `ValidationException` carrying the
         // `INVALID_AGREEMENT_ID` reason a client branches on.
-        if let Some(agreement_id) = input.agreement_id.as_deref() {
-            if !store.agreements.contains_key(agreement_id) {
-                return Err(
-                    ListBillingAdjustmentRequestsErrorModeled::ValidationException(
-                        crate::state::validation_exception("INVALID_AGREEMENT_ID", "agreementId"),
-                    )
-                    .into(),
-                );
-            }
+        if let Some(refusal) = store.unknown_agreement_refusal(input.agreement_id.as_deref()) {
+            return Err(
+                ListBillingAdjustmentRequestsErrorModeled::ValidationException(refusal).into(),
+            );
         }
 
         // A report, so the only write is the status change the clock had already

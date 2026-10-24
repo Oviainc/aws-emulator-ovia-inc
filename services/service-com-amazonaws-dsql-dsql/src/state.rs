@@ -1064,6 +1064,71 @@ pub fn invalid_resource_arn(member: &str, value: &str) -> ValidationException {
     )
 }
 
+/// The prefix that marks a tag key as belonging to AWS rather than to the caller.
+///
+/// A tag under this prefix is written and maintained by AWS itself, so a caller can
+/// neither create nor change nor remove one, and such tags are not counted against
+/// a resource's tag ceiling ([`MAX_TAGS_PER_RESOURCE`]) either. `TagKey`'s modelled
+/// pattern admits `:` (`smithy_query(query="shape", shape="TagKey")`), so the model
+/// cannot express the rule and every operation that accepts tag keys enforces it
+/// here instead.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// The member name a tag MAP's refusal names, as the operations that accept one
+/// spell it on the wire (`smithy_query(query="operation",
+/// operation="TagResource,CreateCluster,CreateStream")`: `tags`).
+pub const TAGS_MEMBER: &str = "tags";
+
+/// The member name a tag KEY LIST's refusal names, as `UntagResource` spells it on
+/// the wire (`smithy_query(query="operation", operation="UntagResource")`:
+/// `tagKeys`).
+pub const TAG_KEYS_MEMBER: &str = "tagKeys";
+
+/// The requirement a caller-supplied tag key has to satisfy, as the refusal words
+/// it: the subject is the MEMBER the refusal names, so the sentence reads about the
+/// key the member carries, and it names the prefix and why it is refused, so the
+/// caller can fix the request from the message alone.
+const RESERVED_TAG_KEY_REQUIREMENT: &str = "must not contain a key beginning with \
+     the prefix aws:, which is reserved for tags created and maintained by AWS";
+
+/// Whether `key` lies in the namespace [`RESERVED_TAG_KEY_PREFIX`] reserves.
+///
+/// The prefix is matched ignoring ASCII case: it names a namespace rather than one
+/// literal spelling, so accepting a differently-cased spelling of it would let a
+/// caller write a tag that reads as an AWS-owned one.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.as_bytes()
+        .get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX.as_bytes()))
+}
+
+/// Check the tag keys a request carries against the reserved namespace, refusing
+/// the WHOLE request when any one of them lies in it.
+///
+/// `member` is the input member the keys came from ([`TAGS_MEMBER`] for a map a
+/// request writes, [`TAG_KEYS_MEMBER`] for the keys a request removes), so the
+/// refusal names what the caller has to fix. Every key is inspected before any is
+/// applied, which is what leaves a refused call's resource exactly as it was, and
+/// the key the message names is the lexicographically first reserved one, so a
+/// request whose keys arrive in any order is refused identically.
+pub fn validate_tag_keys<'a, K>(member: &str, keys: K) -> Result<(), ValidationException>
+where
+    K: IntoIterator<Item = &'a str>,
+{
+    match keys
+        .into_iter()
+        .filter(|key| is_reserved_tag_key(key))
+        .min()
+    {
+        Some(reserved) => Err(invalid_member_value(
+            member,
+            RESERVED_TAG_KEY_REQUIREMENT,
+            reserved,
+        )),
+        None => Ok(()),
+    }
+}
+
 /// The member a witness-Region refusal names, spelled with its path from the
 /// request root the way the operation's own documentation spells it
 /// (`multiRegionProperties.witnessRegion`), so a caller reading `fieldList` knows

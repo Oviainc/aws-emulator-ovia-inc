@@ -233,6 +233,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateClusterErrorModeled::ValidationException(invalid).into());
         }
 
+        // The `tags` a create carries are written exactly as `TagResource` writes
+        // them, so they are held to the same rule: a key under the prefix AWS
+        // reserves for its own tags is not the caller's to write, and the request is
+        // refused with the modelled 400 before any cluster is minted.
+        if let Err(invalid) = crate::state::validate_tag_keys(
+            crate::state::TAGS_MEMBER,
+            input
+                .tags
+                .iter()
+                .flat_map(|tags| tags.keys().map(String::as_str)),
+        ) {
+            return Err(CreateClusterErrorModeled::ValidationException(invalid).into());
+        }
+
         // `@idempotencyToken`: a repeat of the SAME request returns the result of
         // the original call and has no additional effect; the same token with
         // DIFFERENT parameters is a different request wearing a used token, which

@@ -233,8 +233,14 @@ async fn create_stack(
     template: &str,
     parameters: &[(&str, &str)],
 ) -> String {
-    let mut members: Vec<(&str, &str)> =
-        vec![("StackName", stack_name), ("TemplateBody", template)];
+    let mut members: Vec<(&str, &str)> = vec![
+        ("StackName", stack_name),
+        ("TemplateBody", template),
+        // A row's template declares the IAM role its stream writes as, so the request
+        // acknowledges the template's IAM resources; `CAPABILITY_NAMED_IAM` covers a role
+        // the template names as well as one CloudFormation names.
+        ("Capabilities.member.1", "CAPABILITY_NAMED_IAM"),
+    ];
     // `Parameters.member.N.ParameterKey` / `.ParameterValue`, as an SDK flattens the list.
     let flattened: Vec<(String, String)> = parameters
         .iter()

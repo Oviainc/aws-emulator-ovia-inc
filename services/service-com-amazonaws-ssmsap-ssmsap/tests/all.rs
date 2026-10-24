@@ -27,6 +27,8 @@ mod list_databases;
 mod pattern_violation_messages;
 #[path = "all/register_application_conditional_requirements.rs"]
 mod register_application_conditional_requirements;
+#[path = "all/registered_database_arn.rs"]
+mod registered_database_arn;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
 #[path = "all/resource_permissions.rs"]

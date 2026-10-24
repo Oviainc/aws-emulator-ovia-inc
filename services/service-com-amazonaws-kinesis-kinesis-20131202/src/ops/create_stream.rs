@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts the stream into `crate::state`'s `streams` store under the region the request
+//! was signed for and the `StreamName` it carried ([`crate::state::RegionalName`]), and
+//! answers with the modelled empty body. The create lays down the stream's whole shard
+//! map — one shard per unit of provisioned capacity, partitioning the hash key space —
+//! and the instant its `CREATING` -> `ACTIVE` transition falls due; `DescribeStream` and
+//! `DescribeStreamSummary` project that stored record onto their output shapes.
+//!
+//! A stream is identified by its name inside one region, so a create for a name that
+//! region already holds a stream under is refused with the modelled
+//! `ResourceInUseException` and leaves the stored stream untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -129,6 +131,8 @@
 //! * `ValidationException` (HTTP 400) — Specifies that you tried to invoke this API for a
 //!   data stream with the on-demand capacity mode. This API is only supported for data
 //!   streams with the provisioned capacity mode.
+//! * `InternalFailureException` (HTTP 500) — widened in through `extra_errors` (see below):
+//!   the SERVICE models it, the operation shape does not list it.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -163,13 +167,21 @@ impl ::aws_smithy_schema::serde::SerializableStruct for CreateStreamOutput {
 // here — hence the `CreateStreamError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#CreateStream")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#CreateStream",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models
+    // it ("The processing of the request failed because of an unknown error, exception, or
+    // failure"), the operation shape does not list it, and it is the only honest answer
+    // for a service mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum CreateStreamErrorModeled {
     InvalidArgumentException(InvalidArgumentException),
     LimitExceededException(LimitExceededException),
     ResourceInUseException(ResourceInUseException),
     ValidationException(ValidationException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -195,6 +207,40 @@ impl From<CreateStreamErrorModeled> for CreateStreamError {
 /// concrete engine where it mounts the service, not here.
 pub struct CreateStream<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// Record this state-changing call for attribution: the access key id the caller
+/// presented (a public identifier, never a secret), the region the stream was created in,
+/// and how the call ended. No stream name and no ARN: a log sink needs neither to
+/// attribute the change.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "CreateStream",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
+/// Refuse the request with the error this operation models for a parameter that "exceeds
+/// its restrictions, is not supported, or can't be used".
+fn invalid_argument(message: String) -> CreateStreamError {
+    CreateStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the request because serving it would take this emulator past a ceiling it keeps
+/// on itself — the error the operation's own doc names for a create that would "create
+/// more shards than are authorized for your account".
+fn limit_exceeded(message: String) -> CreateStreamError {
+    CreateStreamErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
 }
 
 impl<Eng> CreateStream<Eng> {
@@ -223,18 +269,215 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStream"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region this stream is created in, since
+        // a stream name "is also scoped by Amazon Web Services Region".
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            CreateStreamError::from(CreateStreamErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the stream store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // `StreamMode` is a modelled enum, so a value outside `STREAM_MODE_VALUES` is a
+        // client error rather than a stored record. The model's own constraint walk
+        // refuses one before this handler runs; this line states the same refusal for a
+        // caller that reaches the handler another way.
+        let stream_mode = input
+            .stream_mode_details
+            .as_ref()
+            .map_or(crate::state::DEFAULT_STREAM_MODE, |details| {
+                details.stream_mode.as_str()
+            })
+            .to_string();
+        if !STREAM_MODE_VALUES.contains(&stream_mode.as_str()) {
+            audit(&akid, &region, "refused");
+            return Err(invalid_argument(format!(
+                "StreamModeDetails.StreamMode {stream_mode} is not supported; the supported \
+                 values are {}",
+                STREAM_MODE_VALUES.join(" | ")
+            )));
+        }
+        let on_demand = stream_mode == crate::state::STREAM_MODE_ON_DEMAND;
+
+        // Which member carries the shard count depends on the capacity mode: "For the data
+        // streams with a provisioned mode, you must specify the number of shards for the
+        // data stream", while an on-demand stream's shard count is the service's to manage
+        // ("Kinesis Data Streams automatically manages the shards").
+        let shard_count = match (on_demand, input.shard_count) {
+            (true, Some(_)) => {
+                audit(&akid, &region, "refused");
+                return Err(invalid_argument(format!(
+                    "ShardCount cannot be specified for a {} stream; its shard count is \
+                     managed by the service",
+                    crate::state::STREAM_MODE_ON_DEMAND
+                )));
+            }
+            (true, None) => crate::state::ON_DEMAND_INITIAL_SHARDS,
+            (false, None) => {
+                audit(&akid, &region, "refused");
+                return Err(invalid_argument(format!(
+                    "ShardCount is required for a {} stream",
+                    crate::state::STREAM_MODE_PROVISIONED
+                )));
+            }
+            // Modelled `range 1..`, so the boundary validator has already refused a
+            // non-positive count; a value past this emulator's shard ceiling is refused
+            // below, BEFORE the shard map is allocated from it.
+            (false, Some(requested)) => u32::try_from(requested).unwrap_or(u32::MAX),
+        };
+
+        if shard_count > crate::state::MAX_SHARDS_PER_STREAM {
+            audit(&akid, &region, "refused");
+            return Err(limit_exceeded(format!(
+                "a stream of {shard_count} shards exceeds the {} shards one stream of this \
+                 emulator may hold",
+                crate::state::MAX_SHARDS_PER_STREAM
+            )));
+        }
+
+        // "A set of up to 50 key-value pairs to use to create the tags"
+        // (`CreateStreamInput$Tags`) — narrower than the `TagMap` `@length` of 1..200 the
+        // boundary validator enforces, so the documented ceiling is applied here.
+        if input
+            .tags
+            .as_ref()
+            .is_some_and(|tags| tags.len() > crate::state::MAX_STREAM_TAGS)
+        {
+            audit(&akid, &region, "refused");
+            return Err(invalid_argument(format!(
+                "a stream carries at most {} tags",
+                crate::state::MAX_STREAM_TAGS
+            )));
+        }
+
+        // "The record distribution strategy is only supported for streams that use the
+        // on-demand capacity mode" (`CreateStreamInput$RecordDistributionStrategy`).
+        if input.record_distribution_strategy.is_some() && !on_demand {
+            audit(&akid, &region, "refused");
+            return Err(invalid_argument(format!(
+                "RecordDistributionStrategy is only supported for a {} stream",
+                crate::state::STREAM_MODE_ON_DEMAND
+            )));
+        }
+
+        let created_at = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A stream is addressed by its name inside its region, so a name the region
+        // already holds a stream under is a conflict rather than a second record, and the
+        // stored stream is left exactly as it was.
+        if store.stream_in(&region, &input.stream_name).is_some() {
+            drop(store);
+            audit(&akid, &region, "conflict");
+            return Err(CreateStreamErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "stream {} already exists in this account and region; delete it \
+                         before creating another under that name",
+                        input.stream_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded, so a create past a ceiling is refused rather than grown
+        // into. The region's own quotas are the ones AWS publishes per account and region;
+        // and because that region is the one the CALLER's credential scope names, the two
+        // ceilings no request can partition are checked beside them — together they are what
+        // keeps a caller from making this emulator's memory grow without end.
+        let streams_in_region = store.streams_held_in(&region);
+        let shards_in_region = store.shards_held_in(&region);
+        if streams_in_region >= crate::state::MAX_STREAMS_PER_REGION
+            || shards_in_region.saturating_add(shard_count) > crate::state::MAX_SHARDS_PER_REGION
+        {
+            drop(store);
+            audit(&akid, &region, "refused");
+            return Err(limit_exceeded(format!(
+                "this region holds {streams_in_region} streams of {shards_in_region} shards, \
+                 and {shard_count} more shards would exceed the {} streams and {} shards \
+                 authorized for this account and region",
+                crate::state::MAX_STREAMS_PER_REGION,
+                crate::state::MAX_SHARDS_PER_REGION
+            )));
+        }
+        if store.streams.len() >= crate::state::MAX_STREAMS_TOTAL
+            || store
+                .shards_held()
+                .saturating_add(shard_count)
+                > crate::state::MAX_SHARDS_TOTAL
+        {
+            drop(store);
+            audit(&akid, &region, "refused");
+            return Err(limit_exceeded(format!(
+                "this emulator already holds the maximum of {} streams or {} shards across \
+                 every region; delete one before creating another",
+                crate::state::MAX_STREAMS_TOTAL,
+                crate::state::MAX_SHARDS_TOTAL
+            )));
+        }
+
+        // The shard map: one shard per unit of capacity, covering the hash key space in
+        // contiguous equal slices. `shard_count` is bounded above, so this allocation is
+        // never sized by an unclamped request field.
+        let shards = crate::state::hash_key_ranges(shard_count)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (starting_hash_key, ending_hash_key))| {
+                let index = u32::try_from(index).unwrap_or(u32::MAX);
+                crate::state::ShardRecord {
+                    shard_id: crate::state::shard_id(index),
+                    starting_hash_key,
+                    ending_hash_key,
+                    starting_sequence_number: crate::state::starting_sequence_number(
+                        created_at, index,
+                    ),
+                    // A shard a create laid down is OPEN, so it has no ending sequence
+                    // number.
+                    ending_sequence_number: None,
+                }
+            })
+            .collect();
+
+        let stream = crate::state::Stream {
+            name: input.stream_name.clone(),
+            region: region.clone(),
+            arn: crate::state::stream_arn(&region, &input.stream_name),
+            stream_mode,
+            shards,
+            retention_period_hours: crate::state::DEFAULT_RETENTION_PERIOD_HOURS,
+            created_at,
+            // CREATING is not terminal: the stream is owed ACTIVE, and the instant that
+            // is due is stored rather than slept on.
+            active_at: created_at + crate::state::ACTIVATION_DELAY,
+            encryption_type: crate::state::ENCRYPTION_TYPE_NONE.to_string(),
+            // Encryption is `StartStreamEncryption`'s to turn on, so a new stream names
+            // no KMS key.
+            key_id: None,
+            // Shard-level metrics are `EnableEnhancedMonitoring`'s to turn on.
+            shard_level_metrics: Vec::new(),
+            warm_throughput_mi_bps: input.warm_throughput_mi_bps,
+            max_record_size_in_ki_b: input.max_record_size_in_ki_b,
+            record_distribution_strategy: input.record_distribution_strategy,
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        store.streams.insert(
+            crate::state::RegionalName::new(&region, &input.stream_name),
+            stream,
+        );
+        drop(store);
+
+        audit(&akid, &region, "created");
+        // `CreateStream` models no output members: "CreateStream is an asynchronous
+        // operation. Upon receiving a CreateStream request, Kinesis Data Streams
+        // immediately returns".
+        Ok(CreateStreamOutput)
     }
 }

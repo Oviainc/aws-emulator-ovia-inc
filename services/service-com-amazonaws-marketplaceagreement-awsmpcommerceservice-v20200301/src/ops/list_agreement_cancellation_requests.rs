@@ -186,9 +186,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // Every other selector is RESOLVED before anything is selected: a
+        // `catalog` that is not the one AWS Marketplace exposes and an
+        // `agreementType` outside the documented pair name nothing this service
+        // holds, so they are refused rather than reported as an empty page
+        // (`crate::state::selector_value_refusal`).
+        if let Some(refusal) = crate::state::selector_value_refusal(
+            input.agreement_type.as_deref(),
+            input.catalog.as_deref(),
+        ) {
+            return Err(
+                ListAgreementCancellationRequestsErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+
         // A pure report: it reads the stored cancellation requests and writes
         // nothing.
         let store = state.lock();
+
+        // "An optional parameter to filter cancellation requests for a specific
+        // agreement": an `agreementId` the store holds no agreement for names no
+        // agreement of this account, so it is refused with the same
+        // `INVALID_AGREEMENT_ID` reason the sibling listings of this service
+        // answer the member with.
+        if let Some(refusal) = store.unknown_agreement_refusal(input.agreement_id.as_deref()) {
+            return Err(
+                ListAgreementCancellationRequestsErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+
         let mut matched: Vec<&crate::state::AgreementCancellationRequest> = Vec::new();
         // Keyed by a zero-padded counter, so the map's order is creation order:
         // a total order a page token can index into on every call.
