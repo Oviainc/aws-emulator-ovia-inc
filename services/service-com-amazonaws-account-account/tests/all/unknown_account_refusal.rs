@@ -134,6 +134,14 @@ fn rows() -> Vec<Row> {
             |id| json!({"AccountId": id}),
         ),
         (
+            // The account this one names is its `StandardAccountId`, which is
+            // the same optional "the account to operate on" member under
+            // another name — so the rule covers it too.
+            "GetGovCloudAccountInformation".to_string(),
+            "/getGovCloudAccountInformation",
+            |id| json!({"StandardAccountId": id}),
+        ),
+        (
             "GetRegionOptStatus".to_string(),
             "/getRegionOptStatus",
             |id| json!({"AccountId": id, "RegionName": CATALOGUED_REGION}),
