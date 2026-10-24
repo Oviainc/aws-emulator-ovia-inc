@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: resolves the environment the request names, refuses the combinations the
+//! model documents as refused, applies the new release and the new configuration to the
+//! stored environment, and starts the update — `Updating`, abortable, with the return to
+//! `Ready` owed by the clock. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What this operation does NOT model: the DRAFT configuration the model's own
+//! description mentions ("a draft configuration is created and
+//! DescribeConfigurationSettings for this environment returns two setting descriptions
+//! with different DeploymentStatus values"). The new configuration becomes the
+//! environment's deployed configuration when the update starts, so
+//! `DescribeConfigurationSettings` reports the one `deployed` description it has always
+//! reported rather than a second, `pending` one.
 //!
 //! ## Shape of an operation
 //!
@@ -231,18 +234,274 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEnvironment"))
+        let region = crate::state::request_region(ctx);
+
+        // A statement about the REQUEST is answered BEFORE any resource it names
+        // is resolved: it does not depend on what this account holds.
+
+        // "Attempting to update both the release and configuration is not
+        // allowed and Elastic Beanstalk returns an InvalidParameterCombination
+        // error." The release is the application version `VersionLabel` deploys;
+        // the configuration is the template `TemplateName` deploys.
+        if input.version_label.is_some() && input.template_name.is_some() {
+            return Err(UpdateEnvironmentError::invalid_parameter_combination(
+                "You cannot specify both VersionLabel and TemplateName: updating the \
+                 application version and the configuration of an environment in one call \
+                 is not allowed.",
+            ));
+        }
+
+        // How many option settings one configuration may carry is a bound on the
+        // REQUEST; the merged result is checked against it again below, so
+        // neither the stored record nor the merge's own work is unbounded.
+        let requested_settings = input.option_settings.as_deref().unwrap_or_default();
+        if requested_settings.len() > crate::state::MAX_CONFIGURATION_OPTION_SETTINGS {
+            return Err(UpdateEnvironmentError::invalid_parameter_value(
+                crate::state::too_many_option_settings_message(requested_settings.len()),
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateEnvironmentError::internal_failure("the Elastic Beanstalk store is unavailable")
+        })?;
+        let mut store = state.lock();
+        // Every event this call records belongs to this one request's activity.
+        let request_id = crate::state::new_request_id();
+        // A status change the clock has already made due is settled before this
+        // environment's own status is read.
+        store.materialize_due_transitions();
+
+        // "The ID of the environment to update. If no environment with this ID
+        // exists, Elastic Beanstalk returns an InvalidParameterValue error. …
+        // You must specify either this or an EnvironmentName, or both. If you do
+        // not specify either, Elastic Beanstalk returns MissingRequiredParameter
+        // error." `GroupName` names an environment through an env.yaml manifest
+        // this emulator never reads, so a request carrying only that names none.
+        let environment_id = store
+            .environment_id_for(
+                input.environment_id.as_deref(),
+                input.environment_name.as_deref(),
+            )
+            .map_err(|refusal| match refusal {
+                crate::state::EnvironmentRefusal::NoIdentifier => {
+                    UpdateEnvironmentError::missing_required_parameter(
+                        "Must specify either EnvironmentId or EnvironmentName.",
+                    )
+                }
+                crate::state::EnvironmentRefusal::NotFound(message) => {
+                    UpdateEnvironmentError::invalid_parameter_value(message)
+                }
+            })?;
+        let environment = store.environments.get(&environment_id).ok_or_else(|| {
+            UpdateEnvironmentError::invalid_parameter_value(
+                crate::state::missing_environment_message(Some(environment_id.as_str()), None),
+            )
+        })?;
+
+        // "ApplicationName: The name of the application with which the
+        // environment is associated" — so a request that names a different
+        // application names an environment that is not the one it describes.
+        if let Some(requested_application) = input.application_name.as_deref() {
+            if requested_application != environment.application_name {
+                return Err(UpdateEnvironmentError::invalid_parameter_value(format!(
+                    "Environment {} is not associated with application '{requested_application}'.",
+                    environment.environment_name
+                )));
+            }
+        }
+
+        // "Ready: Environment is available to have an action performed on it,
+        // such as update or terminate." An environment that is launching,
+        // updating, aborting or on its way out is in no state to take an update —
+        // the refusal `RebuildEnvironment` and `RestartAppServer` answer in too.
+        if !environment.is_ready() {
+            return Err(UpdateEnvironmentError::invalid_parameter_value(format!(
+                "Environment {} is not in a state from which it can be updated. \
+                 Current status: {}.",
+                environment.environment_name, environment.status
+            )));
+        }
+
+        // "Tier: This specifies the tier to use to update the environment.
+        // Condition: At this time, if you change the tier version, name, or
+        // type, Elastic Beanstalk returns InvalidParameterValue error." A member
+        // the request repeats unchanged changes nothing and is accepted; one it
+        // leaves out says nothing about that member. The environment's tier is
+        // read through the same defaulting `CreateEnvironment` stored it with, so
+        // a member defaulted at creation compares against the reported value.
+        let current_tier = crate::state::environment_tier_with_defaults(environment.tier.as_ref());
+        if let Some(requested_tier) = input.tier.as_ref() {
+            for (member, requested_value, current_value) in [
+                ("Name", &requested_tier.name, &current_tier.name),
+                ("Type", &requested_tier.r#type, &current_tier.r#type),
+                ("Version", &requested_tier.version, &current_tier.version),
+            ] {
+                let Some(requested_value) = requested_value.as_deref() else {
+                    continue;
+                };
+                if Some(requested_value) != current_value.as_deref() {
+                    return Err(UpdateEnvironmentError::invalid_parameter_value(format!(
+                        "Environment tier {member} cannot be changed from '{}' to \
+                         '{requested_value}'.",
+                        current_value.as_deref().unwrap_or_default()
+                    )));
+                }
+            }
+        }
+
+        let application_name = environment.application_name.clone();
+
+        // "VersionLabel: If this parameter is specified, Elastic Beanstalk
+        // deploys the named application version to the environment. If no such
+        // application version is found, returns an InvalidParameterValue error."
+        // A version belongs to one application: the environment's own.
+        if let Some(version_label) = input.version_label.as_ref() {
+            let key = (application_name.clone(), version_label.clone());
+            if !store.application_versions.contains_key(&key) {
+                return Err(UpdateEnvironmentError::invalid_parameter_value(format!(
+                    "No Application Version named '{version_label}' found."
+                )));
+            }
+        }
+
+        // "TemplateName: If this parameter is specified, Elastic Beanstalk
+        // deploys this configuration template to the environment. If no such
+        // configuration template is found, Elastic Beanstalk returns an
+        // InvalidParameterValue error." A template name is unique per
+        // application, so the pair resolves one record, whose settings and
+        // platform version are what gets deployed.
+        let template = match input.template_name.as_ref() {
+            Some(template_name) => {
+                let Some(template) = store
+                    .configuration_templates
+                    .get(&(application_name.clone(), template_name.clone()))
+                else {
+                    return Err(UpdateEnvironmentError::invalid_parameter_value(
+                        crate::state::missing_configuration_template_message(template_name),
+                    ));
+                };
+                Some(template.clone())
+            }
+            None => None,
+        };
+
+        // "PlatformArn: The ARN of the platform, if used." A platform version is
+        // either CUSTOM — created in this account by `CreatePlatformVersion` — or
+        // MANAGED, one this service publishes; an ARN answering to neither names
+        // nothing to move onto, and a custom version still being built cannot be
+        // run. The same resolution `CreateEnvironment` makes for the member.
+        if let Some(platform_arn) = input.platform_arn.as_ref() {
+            match store.platform_versions.get(platform_arn) {
+                Some(platform_version) if !platform_version.is_ready() => {
+                    return Err(UpdateEnvironmentError::invalid_parameter_value(format!(
+                        "Platform '{platform_arn}' is not ready to be used; its status is {}.",
+                        platform_version.status
+                    )));
+                }
+                Some(_) => {}
+                None if crate::state::managed_platform_version(&region, platform_arn).is_some() => {}
+                None => {
+                    return Err(UpdateEnvironmentError::invalid_parameter_value(format!(
+                        "No Platform named '{platform_arn}' found."
+                    )));
+                }
+            }
+        }
+
+        // The configuration this update deploys: it starts from the template the
+        // request names ("updates the configuration settings to an entirely new
+        // configuration template") else from the configuration the environment
+        // runs; `OptionsToRemove` takes out the options it names ("a list of
+        // custom user-defined configuration options to remove from the
+        // configuration set for this environment") and `OptionSettings` sets the
+        // ones it carries ("sets the specified configuration options to the
+        // requested value"), so an option both removed and set ends up set.
+        let base = match template.as_ref() {
+            Some(template) => template.option_settings.clone(),
+            None => environment.option_settings.clone(),
+        };
+        let retained = crate::state::remove_option_settings(
+            &base,
+            input.options_to_remove.as_deref().unwrap_or_default(),
+        );
+        let option_settings = crate::state::merge_option_settings(&retained, requested_settings);
+        if option_settings.len() > crate::state::MAX_CONFIGURATION_OPTION_SETTINGS {
+            return Err(UpdateEnvironmentError::invalid_parameter_value(
+                crate::state::too_many_option_settings_message(option_settings.len()),
+            ));
+        }
+
+        // The platform version the environment runs "after the environment is
+        // updated": the one the request names, else the deployed template's, else
+        // the one it already runs. An environment reports that version BOTH ways,
+        // so the form the source did not carry is resolved from the service's
+        // published catalog exactly as `CreateEnvironment` resolves it; a version
+        // the catalog does not publish (a CUSTOM one has no solution stack name)
+        // leaves the other form absent rather than carrying the old platform's.
+        let (requested_stack, requested_platform_arn) =
+            match (&input.solution_stack_name, &input.platform_arn) {
+                (None, None) => match template.as_ref() {
+                    Some(template) => (
+                        template.solution_stack_name.clone(),
+                        template.platform_arn.clone(),
+                    ),
+                    None => (
+                        environment.solution_stack_name.clone(),
+                        environment.platform_arn.clone(),
+                    ),
+                },
+                (solution_stack_name, platform_arn) => {
+                    (solution_stack_name.clone(), platform_arn.clone())
+                }
+            };
+        let resolved_stack = requested_stack
+            .as_deref()
+            .and_then(crate::state::solution_stack_named)
+            .or_else(|| {
+                requested_platform_arn
+                    .as_deref()
+                    .and_then(|arn| crate::state::managed_platform_version(&region, arn))
+            });
+        let platform_arn = requested_platform_arn
+            .or_else(|| resolved_stack.map(|stack| stack.platform_arn(&region)));
+        let solution_stack_name =
+            requested_stack.or_else(|| resolved_stack.map(|stack| stack.name()));
+
+        // Everything the request named resolved, so the update is written to the
+        // one stored record every reader of this environment reads.
+        let environment = store.environments.get_mut(&environment_id).ok_or_else(|| {
+            UpdateEnvironmentError::internal_failure("the environment was resolved but is gone")
+        })?;
+        // "If this parameter is specified, Elastic Beanstalk updates the
+        // description of this environment." The modelled minimum length is 0, so
+        // an empty description is one the caller set, not an absent member.
+        if let Some(description) = input.description.clone() {
+            environment.description = Some(description);
+        }
+        // "Elastic Beanstalk deploys the named application version to the
+        // environment", which is the version it then reports running.
+        if let Some(version_label) = input.version_label.clone() {
+            environment.version_label = Some(version_label);
+        }
+        // `EnvironmentDescription$TemplateName` is "the name of the
+        // configuration template used to ORIGINALLY LAUNCH this environment", so
+        // deploying a template's settings does not rename the template the
+        // environment was launched from.
+        environment.option_settings = option_settings;
+        environment.solution_stack_name = solution_stack_name;
+        environment.platform_arn = platform_arn;
+        // The resources the environment runs on follow the configuration it now
+        // carries, keeping the identity of every resource that configuration
+        // still calls for: an update is not a reprovision.
+        environment.reconfigure_resources();
+        environment.begin_update(&request_id);
+
+        let output = crate::state::environment_description!(UpdateEnvironmentOutput, environment);
+        let subject = environment.event_subject();
+        // The update has STARTED here; the event for its completion is recorded
+        // when the clock makes that completion due.
+        store.record_activity_start(&request_id, "updateEnvironment", subject);
+
+        Ok(output)
     }
 }

@@ -16,12 +16,12 @@
 //! this same test target rather than being copied here; the emulator is driven
 //! over HTTP exactly as a client drives it.
 //!
-//! One precondition cannot be produced over HTTP yet: `UpdateEnvironment` and
-//! every other operation that STARTS an update (`RebuildEnvironment`,
-//! `RestartAppServer`, `ApplyEnvironmentManagedAction`) still carries the
-//! scaffold's `SCAFFOLDED, NOT IMPLEMENTED` marker, so no implemented operation
-//! can put an environment into an abortable state. [`begin_update`] seeds that
-//! starting state in the very store the handler reads — the behaviour under
+//! One precondition is still seeded rather than produced by a call: an update that is
+//! in flight with NOTHING owed by the clock. `UpdateEnvironment` is implemented now,
+//! but the update it starts carries its own completion to `Ready` one transition span
+//! later, so an abort driven after it would race that completion. [`begin_update`]
+//! writes the same starting state — `Updating`, abortable, health checks suspended —
+//! with no pending completion, in the very store the handler reads; the behaviour under
 //! test is still the HTTP call and the HTTP read-back.
 
 use service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice as eb;
@@ -32,9 +32,10 @@ use crate::lifecycle::{Emulator, PAST_DUE, SOLUTION_STACK};
 /// update or an application-version deployment is in flight: "Updating:
 /// Environment is in the process of updating its configuration settings or
 /// application version" (the modelled value set is
-/// `eb::ops::types::ENVIRONMENT_STATUS_VALUES`). The emulator's state module
-/// names no constant for it because no implemented operation writes it yet.
-const STATUS_UPDATING: &str = "Updating";
+/// `eb::ops::types::ENVIRONMENT_STATUS_VALUES`). Read from the state module's
+/// own constant — the value `UpdateEnvironment` writes — so the seeded
+/// precondition cannot drift from the status an update really leaves.
+const STATUS_UPDATING: &str = eb::state::STATUS_UPDATING;
 
 /// Put the environment named `environment_name` into the state an in-flight
 /// update leaves it in — `Updating`, with `AbortableOperationInProgress` true
