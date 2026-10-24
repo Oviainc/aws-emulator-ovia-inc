@@ -571,6 +571,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::STATE_CREATED,
                 crate::state::STATE_CREATED,
             )),
+            // No Custom Addon depot token has been issued for this environment yet:
+            // `GetDepotUrl` is the action that issues one and the action that rotates it.
+            depot_token: None,
         };
 
         let transition_due_at = environment.pending.as_ref().map(|pending| pending.due_at);

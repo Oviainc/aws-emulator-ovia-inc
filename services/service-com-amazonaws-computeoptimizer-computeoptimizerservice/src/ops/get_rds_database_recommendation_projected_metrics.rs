@@ -1,15 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRDSDatabaseRecommendationProjectedMetrics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRDSDatabaseRecommendationProjectedMetrics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRDSDatabaseRecommendationProjectedMetrics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns the projected metrics of Aurora and RDS database recommendations.
+//!
+//! A REPORTING operation: it reads the findings catalog row this service holds for the
+//! database the request names ([`crate::state::AnalysedResource`]) and writes nothing.
+//! Compute Optimizer's own analysis of an observed workload is what records such a row, so
+//! this handler invents no recommendation and no observation: the option it reports is the
+//! one the recommendation reader reports for the same row
+//! ([`crate::state::rds_changes_instance_configuration`]), and each metric it projects is
+//! computed from a utilization the analysis actually observed on that database.
+//!
+//! ## The projection
+//!
+//! "To determine the performance difference between your current Amazon Aurora and RDS
+//! database and the recommended option, compare the metric data of your service against its
+//! projected metric data" (`RDSDatabaseProjectedMetric`): a projected metric is the OBSERVED
+//! metric as it would read on the recommended option. A metric that measures a resource the
+//! DB instance class sizes (the instance's vCPU or its memory) is scaled by the ratio of the
+//! two classes' capacities, because the same work on half the capacity runs at twice the
+//! utilization; a metric that measures the workload itself or the database's storage is
+//! projected unchanged, because moving the instance class resizes neither
+//! ([`crate::state::rds_projected_metric_value`]).
+//!
+//! The analysis records ONE utilization figure per metric and statistic over its look-back
+//! period (`RDSDBUtilizationMetric`), so the series reported over the requested window
+//! carries that one projected value at each of its data points: nothing finer-grained was
+//! observed, and a varying series would be invented rather than computed. `stat` ("The
+//! statistic of the projected metrics") selects WHICH observations are projected: a metric
+//! the analysis observed under another statistic is not reported under the requested one.
+//!
+//! `recommendationPreferences` "Describes the recommendation preferences to return in the
+//! response", and this response carries no preference member: the analysis records ONE
+//! configuration it would move a database to, so the CPU vendor architecture a request asks
+//! for selects no option away and the projection is the same under either value.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +194,168 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRDSDatabaseRecommendationProjectedMetrics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRDSDatabaseRecommendationProjectedMetricsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetRDSDatabaseRecommendationProjectedMetricsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The Compute Optimizer findings store is unavailable.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A malformed request is refused BEFORE the store is read, so
+        // InvalidParameterValueException takes precedence over the opt-in gate below, as it
+        // does in this service's other readers.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRDSDatabaseRecommendationProjectedMetrics"))
+        // `resourceArn`: "The ARN that identifies the Amazon Aurora or RDS database" — so the
+        // value is an ARN. WHICH resource it names is not checked here: a well-formed ARN
+        // this service holds no database analysis for is reported as a missing resource
+        // below, not refused.
+        if crate::state::parse_arn(&input.resource_arn).is_none() {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter resourceArn is not valid: {} is not an \
+                 Amazon Resource Name (ARN).",
+                input.resource_arn
+            )));
+        }
+        // `period` is "The granularity, in seconds, of the projected metrics data points", so
+        // it is a span of time: the member's modelled default `0` — which a request omitting
+        // it carries — divides the window into no data points at all.
+        if input.period <= 0 {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter period is not valid: the granularity of the \
+                 projected metrics data points must be a positive number of seconds, not {}.",
+                input.period
+            )));
+        }
+        // `startTime` is "the first projected metrics data point to return" and `endTime`
+        // "the last", so the window runs forwards and holds at least one data point.
+        let start = input.start_time.as_secs_f64();
+        let end = input.end_time.as_secs_f64();
+        if end <= start {
+            return Err(invalid_parameter(
+                "The value supplied for parameter startTime is not valid: it must be earlier \
+                 than endTime."
+                    .to_string(),
+            ));
+        }
+        // The data points of the window, at the requested granularity. Capped at
+        // `MAX_PROJECTED_METRIC_DATA_POINTS`, so no number a request carries can size the
+        // response or the allocation that builds it.
+        let Some(timestamps) =
+            crate::state::projected_metric_timestamps(start, end, f64::from(input.period))
+        else {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter period is not valid: a window of {} seconds \
+                 at a granularity of {} seconds covers more than {} projected metrics data \
+                 points; ask for a coarser period or a shorter window.",
+                end - start,
+                input.period,
+                crate::state::MAX_PROJECTED_METRIC_DATA_POINTS
+            )));
+        };
+
+        let guard = state.lock();
+        // "The account is not opted in to Compute Optimizer": the service analyses an
+        // account's resources only once it has opted in, so an account that never did — or
+        // that opted back out — reads no recommendation and no projection of one.
+        if !guard.enrollment.is_opted_in() {
+            return Err(
+                GetRDSDatabaseRecommendationProjectedMetricsErrorModeled::OptInRequiredException(
+                    OptInRequiredException {
+                        message: Some(
+                            "The account is not opted in to Compute Optimizer.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Compute Optimizer is a regional service, so the request addresses ONE region's
+        // endpoint: the database it asks about is that region's, and a resource named by the
+        // ARN of another region is one this endpoint holds no analysis for.
+        let region = crate::state::request_region(ctx);
+        let Some(resource) = guard.analysed_resources.iter().find(|resource| {
+            resource.resource_type == crate::state::SOURCE_TYPE_RDS_DB_INSTANCE
+                && resource.arn_in(&region) == input.resource_arn
+        }) else {
+            // This operation reports one resource's projection and models no per-resource
+            // error list, so a resource it holds no database analysis for is "a resource that
+            // is required for the action doesn't exist".
+            return Err(
+                GetRDSDatabaseRecommendationProjectedMetricsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            "Compute Optimizer has no Amazon Aurora or RDS database \
+                             recommendation for the resource this identifier names."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A row whose instance configuration the analysis would not change carries no
+        // recommendation option, so there is nothing to project metrics onto.
+        let options = if crate::state::rds_changes_instance_configuration(resource) {
+            let detail = resource.rds_database.clone().unwrap_or_default();
+            let recommended_class = detail.recommended_db_instance_class.clone();
+            let projected: Vec<RDSDatabaseProjectedMetric> = detail
+                .utilization_metrics
+                .iter()
+                // `stat` is "The statistic of the projected metrics": the observations
+                // projected are the ones the analysis recorded under that statistic.
+                .filter(|metric| metric.statistic.as_deref() == Some(input.stat.as_str()))
+                .filter_map(|metric| {
+                    let name = metric.name.clone()?;
+                    let value = crate::state::rds_projected_metric_value(
+                        &name,
+                        metric.value,
+                        detail.current_db_instance_class.as_deref(),
+                        recommended_class.as_deref(),
+                    );
+                    Some(RDSDatabaseProjectedMetric {
+                        name: Some(name),
+                        timestamps: Some(timestamps.clone()),
+                        values: Some(vec![value; timestamps.len()]),
+                    })
+                })
+                .collect();
+            vec![RDSDatabaseRecommendedOptionProjectedMetric {
+                recommended_db_instance_class: recommended_class,
+                rank: FIRST_RANK,
+                // Where the analysis observed nothing under the requested statistic there is
+                // no series to report, rather than an empty one.
+                projected_metrics: (!projected.is_empty()).then_some(projected),
+            }]
+        } else {
+            Vec::new()
+        };
+
+        Ok(GetRDSDatabaseRecommendationProjectedMetricsOutput {
+            recommended_option_projected_metrics: Some(options),
+        })
     }
+}
+
+/// The rank of the one recommendation option this service reports: "The rank identifier of
+/// the Amazon Aurora or RDS DB instance recommendation option" — the analysis records one
+/// configuration it would move the database to, so that option is the first-ranked one, under
+/// the same rank `GetRDSDatabaseRecommendations` reports it with.
+const FIRST_RANK: i32 = 1;
+
+/// The 400 `InvalidParameterValueException` this operation refuses a bad request with: "The
+/// value supplied for the input parameter is out of range or not valid."
+fn invalid_parameter(message: String) -> GetRDSDatabaseRecommendationProjectedMetricsError {
+    GetRDSDatabaseRecommendationProjectedMetricsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

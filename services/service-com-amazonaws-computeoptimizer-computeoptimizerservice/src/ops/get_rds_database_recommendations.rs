@@ -431,21 +431,26 @@ fn recommendation_for(
         changes_configuration
             && finding.is_some_and(|finding| finding != crate::state::FINDING_OPTIMIZED)
     };
-    let instance_recommendation_options = changes(instance_finding).then(|| {
-        vec![RDSDBInstanceRecommendationOption {
-            db_instance_class: detail.recommended_db_instance_class.clone(),
-            // Nothing is recorded about the utilization the recommended class would run
-            // at, nor about the risk it would carry, so the projected metrics are
-            // omitted and `performanceRisk` reports the member's modelled default.
-            projected_utilization_metrics: None,
-            performance_risk: 0.0,
-            rank: FIRST_RANK,
-            savings_opportunity: Some(savings_opportunity(resource)),
-            // A saving after discounts needs the account's discounts, which this service
-            // holds none of.
-            savings_opportunity_after_discounts: None,
-        }]
-    });
+    // The INSTANCE side of that condition is
+    // [`crate::state::rds_changes_instance_configuration`], stated there so the metrics
+    // `GetRDSDatabaseRecommendationProjectedMetrics` projects for an option are projected for
+    // exactly the rows that report one here.
+    let instance_recommendation_options =
+        crate::state::rds_changes_instance_configuration(resource).then(|| {
+            vec![RDSDBInstanceRecommendationOption {
+                db_instance_class: detail.recommended_db_instance_class.clone(),
+                // Nothing is recorded about the utilization the recommended class would run
+                // at, nor about the risk it would carry, so the projected metrics are
+                // omitted and `performanceRisk` reports the member's modelled default.
+                projected_utilization_metrics: None,
+                performance_risk: 0.0,
+                rank: FIRST_RANK,
+                savings_opportunity: Some(savings_opportunity(resource)),
+                // A saving after discounts needs the account's discounts, which this service
+                // holds none of.
+                savings_opportunity_after_discounts: None,
+            }]
+        });
     let storage_recommendation_options = changes(storage_finding).then(|| {
         vec![RDSDBStorageRecommendationOption {
             storage_configuration: detail.recommended_storage_configuration.clone(),
