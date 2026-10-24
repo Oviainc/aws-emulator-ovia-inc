@@ -45,6 +45,8 @@ mod model_template;
 mod portal_lifecycle;
 #[path = "all/portal_product_lifecycle.rs"]
 mod portal_product_lifecycle;
+#[path = "all/portal_product_update.rs"]
+mod portal_product_update;
 #[path = "all/protocol_type_gating.rs"]
 mod protocol_type_gating;
 #[path = "all/quick_create_servable_set.rs"]
