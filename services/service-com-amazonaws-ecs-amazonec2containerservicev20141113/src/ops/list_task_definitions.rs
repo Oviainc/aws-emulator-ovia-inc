@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTaskDefinitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTaskDefinitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTaskDefinitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the ARNs of the STORED task-definition revisions whose status and family the
+//! request selects, ordered by family name and revision and paged in that order. A
+//! reporting operation: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -177,20 +171,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTaskDefinitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTaskDefinitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTaskDefinitions"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTaskDefinitionsErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // "This value can be between 1 and 100."
+        if let Some(max_results) = input.max_results {
+            if !(1..=crate::state::MAX_LIST_PAGE_SIZE).contains(&max_results) {
+                return Err(ListTaskDefinitionsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "maxResults must be between 1 and {}; got {max_results}",
+                            crate::state::MAX_LIST_PAGE_SIZE
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "By default, only ACTIVE task definitions are listed. By setting this parameter
+        // to INACTIVE, you can view task definitions that are INACTIVE" — one status per
+        // listing, whichever of `TaskDefinitionStatus` the request names.
+        let status = input
+            .status
+            .as_deref()
+            .unwrap_or(crate::state::TASK_DEFINITION_ACTIVE);
+
+        // "By default, (ASC) task definitions are listed lexicographically by family name
+        // and in ascending numerical order by revision ... Setting this parameter to DESC
+        // reverses the sort order on family name and revision."
+        let descending = input.sort.as_deref() == Some(crate::state::SORT_ORDER_DESC);
+
+        let guard = state.lock();
+
+        // `nextToken`: "The nextToken value returned from a ListTaskDefinitions request
+        // indicating that more results are available ... This token should be treated as
+        // an opaque identifier that is only used to retrieve the next items in a list".
+        // This operation mints it as the `family:revision` of the revision the next page
+        // starts at, so a value that does not name a revision this account holds is an
+        // identifier that names no page — a `ClientException`, the error for a request
+        // "specifying an identifier that isn't valid" — rather than being read as some
+        // insertion point in the sequence. The revision itself only has to be STORED, in
+        // any status: a token minted mid-walk still resumes after the revision it names
+        // has been deregistered out of the listing.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::parse_task_definition_reference(token) {
+                Some((family, Some(revision)))
+                    if guard
+                        .task_definitions
+                        .contains_key(&(family.clone(), revision)) =>
+                {
+                    Some((family, revision))
+                }
+                _ => {
+                    return Err(ListTaskDefinitionsErrorModeled::ClientException(
+                        ClientException {
+                            message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        // "Returns a list of task definitions that are registered to your account" —
+        // every stored revision, narrowed by the filters the request sets. Each entry
+        // carries the sort key (family, revision) beside the ARN the listing reports, so
+        // the order and the token are computed from the same stored values.
+        let mut matching: Vec<(String, i32, String)> = guard
+            .task_definitions
+            .values()
+            .filter(|record| record.status == status)
+            // "The FULL family name to filter the ListTaskDefinitions results with.
+            // Specifying a familyPrefix limits the listed task definitions to task
+            // definition revisions that belong to that family" — one family, named in
+            // full, not a leading fragment of several.
+            .filter(|record| {
+                input
+                    .family_prefix
+                    .as_deref()
+                    .is_none_or(|family| record.family == family)
+            })
+            .map(|record| (record.family.clone(), record.revision, record.arn.clone()))
+            .collect();
+        matching.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
+        if descending {
+            matching.reverse();
+        }
+
+        let page_size = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(crate::state::DEFAULT_LIST_PAGE_SIZE);
+        // The token names the revision the next page starts at, so a page is unaffected
+        // by revisions registered or deregistered before it — and it resumes the walk in
+        // whichever direction this request's `sort` runs.
+        let start = match resume_at.as_ref() {
+            Some((family, revision)) => matching.partition_point(|(entry_family, entry, _)| {
+                let entry = (entry_family.as_str(), *entry);
+                let resume = (family.as_str(), *revision);
+                if descending {
+                    entry > resume
+                } else {
+                    entry < resume
+                }
+            }),
+            None => 0,
+        };
+        // `start` is either 0 or a `partition_point` result, so it never exceeds the
+        // length and the slice below is always in range.
+        let end = start.saturating_add(page_size).min(matching.len());
+        let task_definition_arns: Vec<String> = matching[start..end]
+            .iter()
+            .map(|(_, _, arn)| arn.clone())
+            .collect();
+        // "This value is null when there are no more results to return."
+        let next_token = matching
+            .get(end)
+            .map(|(family, revision, _)| format!("{family}:{revision}"));
+
+        Ok(ListTaskDefinitionsOutput {
+            task_definition_arns: Some(task_definition_arns),
+            next_token,
+        })
     }
 }
