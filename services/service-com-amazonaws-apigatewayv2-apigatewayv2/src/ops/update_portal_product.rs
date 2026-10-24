@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePortalProduct
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePortalProduct`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePortalProduct::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: patches a persisted [`crate::state::PortalProduct`] — a member the request
+//! carries replaces the stored one, a member it omits leaves the stored value as it was —
+//! advances the record's `LastModified` when it carries a member to apply, and answers 200
+//! with the stored record. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +152,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePortalProduct` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePortalProductErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePortalProduct"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdatePortalProduct",
+            ));
+        };
+
+        // `DisplayName` (1..255) and `Description` (0..1024) carry modelled length
+        // constraints, which the boundary validator refuses before this handler runs.
+        // Beyond them, and for the same reason `CreatePortalProduct` does it, this
+        // refuses a `DisplayName` of nothing but whitespace: the display name is the
+        // product's only human-readable name in a published portal, so a patch cannot
+        // leave it naming nothing. Checked BEFORE anything is written, so a refused patch
+        // leaves the product exactly as it was.
+        if input
+            .display_name
+            .as_deref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            return Err(bad_request(
+                "Invalid value for DisplayName: the display name must not be blank.",
+            ));
+        }
+
+        let mut store = state.lock();
+
+        let Some(existing) = store.portal_products.get(&input.portal_product_id) else {
+            return Err(UpdatePortalProductErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Invalid PortalProduct identifier specified {}:{}",
+                        ::engine::emulator_account_id(),
+                        input.portal_product_id
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // The update is a PATCH (`PATCH /v2/portalproducts/{PortalProductId}`): a member
+        // the request carries replaces the stored one, and a member it omits leaves the
+        // stored value exactly as it was. `DisplayOrder` is a VALUE like any other, so
+        // one the request carries replaces the stored ordering wholesale. The product's
+        // id, its ARN and its tags are not inputs of this operation, so the clone carries
+        // them over untouched: an ARN names the Region its resource was created in, and
+        // tags are moved by the tagging operations.
+        let mut updated = existing.clone();
+        let mut modified = false;
+        if let Some(display_name) = input.display_name {
+            updated.display_name = display_name;
+            modified = true;
+        }
+        if let Some(description) = input.description {
+            updated.description = Some(description);
+            modified = true;
+        }
+        if let Some(display_order) = input.display_order {
+            updated.display_order = Some(display_order);
+            modified = true;
+        }
+
+        // "The timestamp when the portal product was last modified"
+        // (`PortalProduct$LastModified`) — it advances only when this request carried a
+        // member to apply, so a patch that configures nothing is not recorded as a
+        // modification of the record.
+        if modified {
+            updated.last_modified = ::std::time::SystemTime::now();
+        }
+
+        // Read the response back out of the STORE, so what the caller gets is what a
+        // later GetPortalProduct will report. The product exists (checked above), so this
+        // replaces its record rather than inserting a second one.
+        store
+            .portal_products
+            .insert(input.portal_product_id.clone(), updated);
+        let stored = store.portal_products[&input.portal_product_id].to_wire();
+        Ok(UpdatePortalProductOutput {
+            description: stored.description,
+            display_name: stored.display_name,
+            display_order: stored.display_order,
+            last_modified: stored.last_modified,
+            portal_product_arn: stored.portal_product_arn,
+            portal_product_id: stored.portal_product_id,
+            tags: stored.tags,
+        })
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the member and the constraint. Takes
+/// the same `&str` the sibling helper in `create_portal_product` does.
+fn bad_request(message: &str) -> UpdatePortalProductError {
+    UpdatePortalProductErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

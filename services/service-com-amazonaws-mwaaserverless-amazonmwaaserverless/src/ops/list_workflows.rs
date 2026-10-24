@@ -2,9 +2,10 @@
 
 //! @op ListWorkflows
 //! IMPLEMENTED: one `WorkflowSummary` per workflow persisted in this service's store
-//! (`crate::state`), in ARN order, at most `MaxResults` per page. A read NEVER changes
-//! what a later caller sees. The `NextToken` this operation returns is the only one it
-//! accepts back; anything else is refused as a `ValidationException`.
+//! (`crate::state`) FOR THE REGION the request is signed for, in ARN order, at most
+//! `MaxResults` per page. A read NEVER changes what a later caller sees. The
+//! `NextToken` this operation returns is the only one it accepts back; anything else is
+//! refused as a `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -168,8 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; a read needs none of it.
-        let _ = ctx;
+        // The endpoint this request was signed for: a regional endpoint lists only the
+        // workflows created through it.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListWorkflowsErrorModeled::InternalServerException(InternalServerException {
@@ -202,16 +204,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before this handler runs, so the value is already a usable page size.
         let page_size = usize::try_from(input.max_results).unwrap_or(0);
 
-        let lower = match after.as_deref() {
-            Some(last) => std::ops::Bound::Excluded(last),
-            None => std::ops::Bound::Unbounded,
-        };
-        let mut page = store
-            .workflows
-            .range::<str, _>((lower, std::ops::Bound::Unbounded));
+        let lower = after.as_deref();
+        let mut page = store.workflows_in_after(&region, lower);
 
         let mut workflows: Vec<WorkflowSummary> = Vec::new();
-        for (_, workflow) in page.by_ref().take(page_size) {
+        for workflow in page.by_ref().take(page_size) {
             let snapshot = workflow.current_snapshot();
             workflows.push(WorkflowSummary {
                 workflow_arn: workflow.arn.clone(),

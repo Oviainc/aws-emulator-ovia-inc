@@ -66,7 +66,7 @@ pub(crate) async fn create_cluster(
     created["id"].as_str().unwrap_or_default().to_string()
 }
 
-async fn create_group(
+pub(crate) async fn create_group(
     router: &MultiServiceRouter,
     cluster: &str,
     body: Value,
@@ -90,7 +90,7 @@ pub(crate) async fn created(
     group
 }
 
-async fn describe_group(
+pub(crate) async fn describe_group(
     router: &MultiServiceRouter,
     cluster: &str,
     id: &str,
@@ -141,8 +141,9 @@ fn channels_of(group: &Value) -> Vec<String> {
 
 /// Create a channel, optionally placed in a cluster's channel placement group,
 /// and answer its id. `pub(crate)` for the same reason as the group helpers
-/// above: the LISTING suite ([`crate::channel_placement_group_listing`]) asserts
-/// the same derived `Channels` member from the same kind of channel.
+/// above: the LISTING suite ([`crate::channel_placement_group_listing`]) and the
+/// DELETION suite ([`crate::channel_placement_group_deletion`]) assert the same
+/// derived `Channels` member from the same kind of channel.
 pub(crate) async fn create_channel(
     router: &MultiServiceRouter,
     case: &str,

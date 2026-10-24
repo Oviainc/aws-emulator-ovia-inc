@@ -43,3 +43,5 @@ mod notification_lifecycle;
 mod service_owned_budget_members;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/subscriber_creation.rs"]
+mod subscriber_creation;

@@ -85,7 +85,7 @@ const MAX_EDGE_LOCATIONS: usize = 50;
 /// `^arn:[^:]{1,63}:directconnect::[^:]{0,63}:dx-gateway\/[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$`
 /// (`smithy_query shape=DirectConnectGatewayArn`) — note the EMPTY region segment — so
 /// every row below satisfies the pattern and reaches the handler.
-fn gateway_arn(index: usize) -> String {
+pub(crate) fn gateway_arn(index: usize) -> String {
     format!(
         "arn:aws:directconnect::{}:dx-gateway/{index:08x}-0000-0000-0000-{index:012x}",
         engine::emulator_account_id()

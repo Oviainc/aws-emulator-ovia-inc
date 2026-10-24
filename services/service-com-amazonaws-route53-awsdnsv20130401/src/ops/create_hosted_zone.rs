@@ -432,6 +432,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             private_zone,
             name_servers,
             vpcs: vpc.cloned().into_iter().collect(),
+            // A zone is created with no authorizations; another account's VPC
+            // is authorized afterwards, through
+            // CreateVPCAssociationAuthorization.
+            vpc_authorizations: Vec::new(),
             records,
             // CreateHostedZone takes no tags; a zone is tagged afterwards,
             // through ChangeTagsForResource.

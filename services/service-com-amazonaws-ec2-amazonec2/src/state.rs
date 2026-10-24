@@ -1843,6 +1843,31 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// stored.
     pub local_gateway_virtual_interface_groups:
         BTreeMap<String, crate::ops::types::LocalGatewayVirtualInterfaceGroup>,
+    /// Every Client VPN endpoint the account holds, by `ClientVpnEndpointId`, as the
+    /// modelled [`crate::ops::types::ClientVpnEndpoint`] shape itself — so a member a writer
+    /// sets round-trips through `DescribeClientVpnEndpoints` without a field-by-field copy
+    /// that can silently drop one. Ordered by id, the stable order a report of them pages
+    /// over.
+    ///
+    /// Starts EMPTY: a Client VPN endpoint exists only because `CreateClientVpnEndpoint`
+    /// made one. It is this map that separates "this account holds no such endpoint"
+    /// ([`invalid_client_vpn_endpoint_id_not_found`]) from "that endpoint has no target
+    /// network associated yet" — an empty report — so every operation that takes a
+    /// `ClientVpnEndpointId` resolves it here, through
+    /// [`require_known_client_vpn_endpoint`].
+    pub client_vpn_endpoints: BTreeMap<String, crate::ops::types::ClientVpnEndpoint>,
+    /// Every target network associated with one of those endpoints, by the association's own
+    /// id, as the modelled [`crate::ops::types::TargetNetwork`] shape plus the move the clock
+    /// owes it ([`ClientVpnTargetNetworkRecord`]).
+    ///
+    /// One map keyed by association id rather than one per endpoint: an association is named
+    /// by its own `AssociationId` ("The ID of the association" —
+    /// `TargetNetwork$AssociationId`) by every operation that acts on one, and the endpoint
+    /// it belongs to is a member of the record, so `DescribeClientVpnTargetNetworks` narrows
+    /// this map by that member. The key order is the order that describe reports and pages
+    /// over. [`ComAmazonawsEc2Amazonec2State::insert_client_vpn_target_network`] is the one
+    /// way an association is stored.
+    pub client_vpn_target_networks: BTreeMap<String, ClientVpnTargetNetworkRecord>,
     /// Every Reserved Instance the account holds, by `ReservedInstancesId`, as the modelled
     /// [`crate::ops::types::ReservedInstances`] shape itself — for the same reason
     /// [`Self::vpcs`] holds [`Vpc`]s: every member a writer sets round-trips through a
@@ -2429,6 +2454,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // A local gateway route table lives on an Outpost, which no EC2 call creates.
             local_gateway_route_tables: BTreeMap::new(),
             local_gateway_virtual_interface_groups: BTreeMap::new(),
+            // A fresh account has created no Client VPN endpoint, so it holds none and no
+            // target network is associated with one either.
+            client_vpn_endpoints: BTreeMap::new(),
+            client_vpn_target_networks: BTreeMap::new(),
             // A fresh account has bought nothing, so it holds no Reserved Instances.
             reserved_instances: BTreeMap::new(),
             network_insights_access_scopes: BTreeMap::new(),
@@ -4247,7 +4276,8 @@ impl ComAmazonawsEc2Amazonec2State {
     /// calls. So is a NAT gateway address an association left `associating` reaching
     /// `succeeded` ([`NatGatewayAddressTransition`]), and a `running` Network Access Scope
     /// analysis reaching its terminal `AnalysisStatus`. So is an `associating` local gateway
-    /// route table / VPC association reaching `associated`.
+    /// route table / VPC association reaching `associated`, and a Client VPN target network
+    /// association moving `associating` -> `associated`.
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
         // A volume whose Recycle Bin retention period has run out was permanently deleted
@@ -4298,6 +4328,10 @@ impl ComAmazonawsEc2Amazonec2State {
             // The transition is applied once; nothing is owed on this subnet any more.
             false
         });
+        // A target network association `AssociateClientVpnTargetNetwork` answered as
+        // `associating` is `associated` once its due instant has passed, whether or not
+        // anybody called again — the same contract as a `pending` VPC's move above.
+        self.materialize_due_client_vpn_target_networks(now);
         // An IPAM pool `CreateIpamPool` answered as `create-in-progress` reaches
         // `create-complete` once its due instant has passed, whether or not anybody called —
         // the same contract as the `pending` VPC above, and the reason the pool's due
@@ -24356,6 +24390,14 @@ pub fn ipam_routing_policy_registration_delta_payload_bytes(
         .saturating_add(view.delta_json.as_deref().map_or(0, str::len))
         .saturating_add(view.state_message.as_deref().map_or(0, str::len))
 }
+
+/// Client VPN endpoints and their target network associations: the two stores' id forms,
+/// refusals, records and writers, in a file of their own rather than as more lines here.
+/// Everything it declares is re-exported below, so a handler reaches it as
+/// `crate::state::require_known_client_vpn_endpoint` like any helper of this module.
+mod client_vpn;
+
+pub use client_vpn::*;
 
 impl ComAmazonawsEc2Amazonec2State {
     /// Whether another IPAM internet registry association fits inside the store's ceiling

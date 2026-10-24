@@ -51,14 +51,15 @@ use crate::ops::types::{
 };
 
 /// How long after the call that starts it a data store's pending lifecycle
-/// transition (`CREATING` -> `ACTIVE`, `DELETING` -> `DELETED`) falls due.
+/// transition (`CREATING` -> `ACTIVE`, `UPDATING` -> `ACTIVE`,
+/// `DELETING` -> `DELETED`) falls due.
 ///
-/// AWS documents no duration for either transition, so this span is CHOSEN: it is
-/// non-zero, so a caller that describes the store immediately after creating it
-/// still observes the transient status (and the state errors that go with it),
-/// and short enough that nothing has to wait long for the settled one. It is
-/// never slept on — the due instant is stored on the record and materialised by
-/// the next call that reads it.
+/// AWS documents no duration for any of these transitions, so this span is
+/// CHOSEN: it is non-zero, so a caller that describes the store immediately
+/// after creating, updating or deleting it still observes the transient status
+/// (and the state errors that go with it), and short enough that nothing has to
+/// wait long for the settled one. It is never slept on — the due instant is
+/// stored on the record and materialised by the next call that reads it.
 pub const LIFECYCLE_TRANSITION: Duration = Duration::from_millis(500);
 
 /// How long a `DELETED` data store stays readable before it is reaped.
@@ -145,7 +146,7 @@ pub fn export_not_transmitted_message(resources: usize) -> String {
 
 /// The sentence this service refuses an operation with when the target data
 /// store exists but its `DatastoreStatus` is a lifecycle TRANSITION state
-/// (`CREATING` or `DELETING`).
+/// (`CREATING`, `UPDATING` or `DELETING`).
 ///
 /// It is the text beside the `ConflictException` (HTTP 409) the model documents
 /// as "The data store is in a transition state and the user requested action
@@ -406,13 +407,17 @@ pub const MAX_PROFILE_CLIENT_TOKENS: usize = MAX_PROFILES;
 
 /// The states a data store moves through in this slice, as the modelled
 /// `DatastoreStatus` enum names them on the wire. The states the enum also
-/// declares (`CREATE_FAILED`, `UPDATING`, `UPDATE_FAILED`) describe a failure,
-/// or work that outlives its own call, and nothing in this slice produces
-/// either, so nothing here produces them.
+/// declares (`CREATE_FAILED`, `UPDATE_FAILED`) describe a FAILURE of the
+/// asynchronous work, and nothing in this slice fails, so nothing here produces
+/// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatastoreStatus {
     Creating,
     Active,
+    /// A configuration change is being applied to a data store that was
+    /// `ACTIVE`: the transient status of `UpdateFHIRDatastore`, which settles
+    /// back to [`Self::Active`] when the transition the clock owes falls due.
+    Updating,
     Deleting,
     Deleted,
 }
@@ -423,6 +428,7 @@ impl DatastoreStatus {
         match self {
             Self::Creating => "CREATING",
             Self::Active => "ACTIVE",
+            Self::Updating => "UPDATING",
             Self::Deleting => "DELETING",
             Self::Deleted => "DELETED",
         }

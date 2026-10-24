@@ -171,13 +171,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Every addressed resource is named in the URI, so the reset needs nothing else
-        // from the request: the ARN it reports is the one persisted at create time rather
-        // than one recomputed from this request's credential scope. Authorization is the
+        // Every addressed resource is named in the URI and resolved within the Region the
+        // request was signed for; the ARN the reset reports is the one persisted at create
+        // time rather than one recomputed from this request's credential scope.
+        // Authorization is the
         // emulator's, not this handler's — the framework verifies the request signature
         // before a handler runs, so the modelled `AccessDeniedException` is deliberately
         // unused here, as it is in every other handler of this service.
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 ResetOriginEndpointStateErrorModeled::InternalServerException(
@@ -192,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The containment chain is resolved one level at a time, so the refusal names the
         // level that is actually missing, as the sibling handlers on this hierarchy do.
-        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+        let Some(group) = store.channel_group_mut(&region, &input.channel_group_name) else {
             return Err(
                 ResetOriginEndpointStateErrorModeled::ResourceNotFoundException(
                     crate::state::ResourceKind::ChannelGroup.not_found(),

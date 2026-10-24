@@ -4,9 +4,12 @@
 //! Stores the whole create request under a freshly minted `connectorArn` and answers with
 //! the identity the service assigned it. A name identifies at most one connector, so a
 //! repeat of a stored name is a `ConflictException`; a `plugins` entry naming a
-//! custom-plugin ARN or revision no stored plugin carries is a `NotFoundException`; a
-//! request the model cannot constrain (a `plugins` list that is not a single element, a
-//! `capacity` naming neither or both of its two forms) is a `BadRequestException`. The
+//! custom-plugin ARN or revision no stored plugin carries, or a `workerConfiguration`
+//! naming a worker-configuration ARN or revision no stored configuration carries, is a
+//! `NotFoundException`; a request the model cannot constrain (a `plugins` list that is not
+//! a single element, a `capacity` naming neither or both of its two forms, an `mcuCount`
+//! outside the documented value set, or auto-scaling worker and task counts that do not
+//! bound each other the way their documentation says) is a `BadRequestException`. The
 //! connector is answered `CREATING` and becomes `RUNNING` once the clock says so
 //! (`crate::state::TRANSITION_SPAN`), which every later read materialises.
 //!
@@ -230,6 +233,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The counts inside the named form. Each member's own documentation
+        // states relations the model cannot: `mcuCount`'s valid value set, and —
+        // for the auto-scaled form — the worker window and the task ceiling
+        // above it. The check is `crate::state::capacity_refusal`, the one an
+        // update's capacity answers to as well.
+        if let Some(message) = crate::state::capacity_refusal(&input.capacity) {
+            return Err(CreateConnectorErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into());
+        }
+
         // The connector runs under an IAM role the request names by ARN; a
         // value that is not an ARN at all names no role. The model types the
         // member as a plain `__string`, so the framework cannot refuse it at
@@ -307,6 +322,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(CreateConnectorErrorModeled::NotFoundException(NotFoundException {
                         message: Some(crate::state::invalid_parameter_because(
                             "customPluginArn",
+                            crate::state::RESOURCE_DOES_NOT_EXIST,
+                        )),
+                    })
+                    .into());
+                }
+            }
+        }
+
+        // A connector's `workerConfiguration` names a worker configuration of
+        // this account by ARN and revision. A reference the service never
+        // minted names no configuration, so it cannot back a connector: the
+        // create is refused rather than stored as a dangling reference the read
+        // operations would then echo back.
+        if let Some(reference) = &input.worker_configuration {
+            match state
+                .worker_configurations
+                .get(&reference.worker_configuration_arn)
+            {
+                Some(stored) if stored.state != crate::state::WORKER_CONFIGURATION_ACTIVE => {
+                    // A configuration the service is deleting is on its way out
+                    // of the account, so a connector cannot take it on.
+                    return Err(CreateConnectorErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(crate::state::invalid_parameter_because(
+                                "workerConfigurationArn",
+                                "The worker configuration is not ACTIVE.",
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                Some(stored) if stored.revision == reference.revision => {}
+                Some(_) => {
+                    return Err(CreateConnectorErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(crate::state::invalid_parameter_because(
+                            "revision",
+                            crate::state::RESOURCE_DOES_NOT_EXIST,
+                        )),
+                    })
+                    .into());
+                }
+                None => {
+                    return Err(CreateConnectorErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(crate::state::invalid_parameter_because(
+                            "workerConfigurationArn",
                             crate::state::RESOURCE_DOES_NOT_EXIST,
                         )),
                     })

@@ -67,7 +67,7 @@ fn get_uri(attachment_id: &str) -> String {
 /// `^arn:[^:]{1,63}:ec2:[^:]{0,63}:[^:]{0,63}:vpn-connection\/vpn-[0-9a-f]{8,17}$`
 /// (`smithy_query shape=VpnConnectionArn`), so every row below satisfies the pattern and
 /// reaches the handler.
-fn vpn_arn(partition: &str, region: &str, account: &str, vpn_id: &str) -> String {
+pub(crate) fn vpn_arn(partition: &str, region: &str, account: &str, vpn_id: &str) -> String {
     format!("arn:{partition}:ec2:{region}:{account}:vpn-connection/vpn-{vpn_id}")
 }
 

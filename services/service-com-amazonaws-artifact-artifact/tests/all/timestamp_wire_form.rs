@@ -19,8 +19,9 @@
 //!    queries: an inquiry whose queries all reached their terminal state without failing
 //!    completes with `InquiryStatusMessage`'s "Compliance inquiry processing is complete.",
 //!    the "One or more queries encountered errors during processing." value is reported
-//!    only when a query failed, and an inquiry whose processing enumerated no query at all
-//!    ends `FAILED`. No `response` is ever reported for a query — a compliance answer is
+//!    only when a query failed, and an inquiry whose submitted content carried nothing to
+//!    process — so it owns no query at all — ends `FAILED`. No `response` is ever reported
+//!    for a query — a compliance answer is
 //!    model-generated text and no such engine runs in this emulator — and that absence,
 //!    not a query-level error that never happened, is what says so.
 //!
@@ -131,11 +132,11 @@ fn text_body(name: &str, query: &str) -> Value {
     json!({ "name": name, "inquiryContent": { "query": query }, "supportMode": "AI_ONLY" })
 }
 
-/// A `CreateComplianceInquiry` body carrying an uploaded document.
-fn file_body(name: &str) -> Value {
+/// A `CreateComplianceInquiry` body carrying an uploaded document of `content` bytes.
+fn file_body(name: &str, content: &str) -> Value {
     json!({
         "name": name,
-        "inquiryContent": { "fileContent": { "content": FILE_CONTENT } },
+        "inquiryContent": { "fileContent": { "content": content } },
     })
 }
 
@@ -437,9 +438,9 @@ fn every_modelled_timestamp_member_carries_the_date_time_format() {
 /// An inquiry's terminal `status`/`statusMessage` are derived from its queries, so the
 /// modelled clean-completion value is what a successfully processed inquiry reports.
 ///
-/// The rows differ along what the rule generalises over: whether the submitted content
-/// yields a query at all (a single submitted query versus an uploaded document, whose
-/// queries this emulator never read out), and the submitted text.
+/// The rows differ along what the rule generalises over: the form of the submitted
+/// content (a single submitted query versus an uploaded document), whether the content
+/// carries anything to process at all, and the submitted text.
 #[tokio::test]
 async fn an_inquiry_completes_cleanly_when_no_query_of_it_failed() {
     let cases: Vec<(&str, Value, &str, &str, usize)> = vec![
@@ -458,8 +459,15 @@ async fn an_inquiry_completes_cleanly_when_no_query_of_it_failed() {
             1,
         ),
         (
-            "an uploaded document, whose queries were never read",
-            file_body("Vendor questionnaire"),
+            "an uploaded document processed as one unit",
+            file_body("Vendor questionnaire", FILE_CONTENT),
+            "COMPLETED",
+            INQUIRY_COMPLETE,
+            1,
+        ),
+        (
+            "an upload carrying no bytes, so nothing to process",
+            file_body("Empty questionnaire", ""),
             "FAILED",
             INQUIRY_INTERNAL_ERROR,
             0,
@@ -516,8 +524,8 @@ async fn an_inquiry_completes_cleanly_when_no_query_of_it_failed() {
                     json!("COMPLETED"),
                     json!("Query processing is complete.")
                 ),
-                "case {case:?}: query {position} came from the request itself, so its \
-                 processing is over without error, got {query:?}"
+                "case {case:?}: query {position} is reviewed by the service's own model, so \
+                 its processing is over without error, got {query:?}"
             );
             assert!(
                 query["response"].is_null(),

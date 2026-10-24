@@ -399,10 +399,13 @@ async fn update_applies_its_members_to_the_active_record_and_leaves_the_rest() {
             );
         }
         // What the update did not carry is untouched — including the members
-        // only `CreateFHIRDatastore` can set.
+        // only `CreateFHIRDatastore` can set. The status is the one exception:
+        // applying the change is asynchronous work, so the record is in the
+        // transient `UPDATING` state until the clock settles it back (see
+        // `datastore_update_transition`).
         assert_eq!(
-            properties["DatastoreStatus"], "ACTIVE",
-            "case {case:?}: an applied update leaves the data store ACTIVE, got {properties}"
+            properties["DatastoreStatus"], "UPDATING",
+            "case {case:?}: an applied update puts the data store in UPDATING, got {properties}"
         );
         assert_eq!(
             properties["DatastoreId"], id,
@@ -439,6 +442,26 @@ async fn update_applies_its_members_to_the_active_record_and_leaves_the_rest() {
             created["Tags"],
             "case {case:?}: the tags must survive an update, got {listed}"
         );
+
+        // The record settles back to ACTIVE, so the next row's update is not
+        // refused for being in a transition, and the write the settled record
+        // holds is still the one this row made.
+        tokio::time::sleep(PAST_TRANSITION).await;
+        let settled = service
+            .ok("DescribeFHIRDatastore", &json!({ "DatastoreId": &id }))
+            .await;
+        let settled = &settled["DatastoreProperties"];
+        assert_eq!(
+            settled["DatastoreStatus"], "ACTIVE",
+            "case {case:?}: the update must settle the data store back to ACTIVE, got {settled}"
+        );
+        for (member, value) in expected.as_object().expect("the expectation is an object") {
+            assert_eq!(
+                &settled[member], value,
+                "case {case:?}: the settled record must still report {member} as {value}, \
+                 got {settled}"
+            );
+        }
     }
 }
 

@@ -164,8 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A read needs nothing from the request beyond its deserialized input.
-        let _ = ctx;
+        // The Region the request was signed for: a channel group name is unique per
+        // account per Region, so it is resolved only among that Region's groups.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetChannelGroupErrorModeled::InternalServerException(
                 InternalServerException {
@@ -176,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let store = state.lock();
 
-        let Some(group) = store.channel_groups.get(&input.channel_group_name) else {
+        let Some(group) = store.channel_group(&region, &input.channel_group_name) else {
             return Err(GetChannelGroupErrorModeled::ResourceNotFoundException(
                 crate::state::ResourceKind::ChannelGroup.not_found(),
             )

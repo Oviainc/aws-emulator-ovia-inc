@@ -247,10 +247,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match crate::state::match_client_token(
             input.client_token.as_deref(),
             &fingerprint,
+            // Only this Region's groups: a token is matched against the siblings the
+            // create would join, and a group of another Region is not one of them.
             store
-                .channel_groups
-                .values()
-                .map(|group| {
+                .channel_groups_in(&region)
+                .map(|(_, group)| {
                     (
                         group.name.as_str(),
                         group.client_token.as_deref(),
@@ -259,7 +260,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
         ) {
             crate::state::TokenMatch::Replay(name) => {
-                return Ok(group_output(&store.channel_groups[&name]));
+                let replayed = store
+                    .channel_group(&region, &name)
+                    .expect("the token matched a group stored in this region");
+                return Ok(group_output(replayed));
             }
             crate::state::TokenMatch::Mismatch => {
                 return Err(CreateChannelGroupErrorModeled::ConflictException(
@@ -274,7 +278,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than replacing the group that is already there. MediaPackage states the
         // collision without naming the resource it collided with — see
         // `crate::state::resource_already_exists`.
-        if store.channel_groups.contains_key(&input.channel_group_name) {
+        if store.has_channel_group(&region, &input.channel_group_name) {
             return Err(CreateChannelGroupErrorModeled::ConflictException(
                 crate::state::resource_already_exists(),
             )
@@ -282,10 +286,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The store only shrinks on an explicit delete, so the number of groups it holds
-        // is bounded here rather than by how many requests arrive: past the ceiling the
+        // is bounded here rather than by how many requests arrive: past either ceiling the
         // create is refused with the quota error the model declares, and nothing is
-        // stored.
-        if store.channel_groups.len() >= crate::state::MAX_CHANNEL_GROUPS {
+        // stored. TWO ceilings, because the Region a create is served in comes from the
+        // request's own credential scope: the per-Region one is the quota AWS bounds an
+        // account with, and the store-wide one is what keeps a caller naming a fresh
+        // Region each time from growing the store by a record per request anyway.
+        if store.channel_group_count(&region) >= crate::state::MAX_CHANNEL_GROUPS
+            || store.channel_group_total() >= crate::state::MAX_CHANNEL_GROUPS_TOTAL
+        {
             return Err(
                 CreateChannelGroupErrorModeled::ServiceQuotaExceededException(
                     crate::state::quota_exceeded(crate::state::ResourceKind::ChannelGroup),
@@ -301,6 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut group = crate::state::ChannelGroup {
             name: name.clone(),
+            region: region.clone(),
             arn,
             egress_domain,
             description: input.description,
@@ -319,9 +329,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // One derivation of the ETag, shared with every update path.
         group.recompute_etag();
-        store.channel_groups.insert(name.clone(), group);
+        store.insert_channel_group(group);
         // Answer from what was stored, so the response can only carry what a later
         // `GetChannelGroup` will read.
-        Ok(group_output(&store.channel_groups[&name]))
+        Ok(group_output(
+            store
+                .channel_group(&region, &name)
+                .expect("the group just stored in this region"),
+        ))
     }
 }

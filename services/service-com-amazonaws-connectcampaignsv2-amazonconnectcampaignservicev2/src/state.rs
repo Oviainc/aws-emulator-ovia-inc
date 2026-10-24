@@ -377,6 +377,35 @@ impl StoredCampaign {
         *window = None;
     }
 
+    /// Remove the communication-limits block this campaign's override holds for the
+    /// config `config_type` names.
+    ///
+    /// `config_type` is a `CommunicationLimitsConfigType` value — the catalog
+    /// `COMMUNICATION_LIMITS_CONFIG_TYPE_VALUES` in [`crate::ops::types`], whose one
+    /// entry `ALL_CHANNEL_SUBTYPES` is the `CommunicationLimitsConfig$allChannelSubtypes`
+    /// block; the caller refuses a value outside that catalog before reaching here, so a
+    /// value naming no block removes nothing.
+    ///
+    /// Only the named block goes: `instanceLimitsHandling` is not a config type any
+    /// request can name, so a campaign that set it keeps it. An override left carrying
+    /// no member at all carries nothing, so the record holds no override rather than an
+    /// empty one — a campaign with no override to begin with is left exactly as it was,
+    /// which is what makes the operation idempotent, as the model declares.
+    pub fn clear_communication_limits(&mut self, config_type: &str) {
+        let Some(config) = self.communication_limits_override.as_mut() else {
+            return;
+        };
+        match config_type {
+            "ALL_CHANNEL_SUBTYPES" => config.all_channel_subtypes = None,
+            // A catalog value with no block on `CommunicationLimitsConfig` is a config
+            // this emulator cannot be configured for, so it holds nothing to remove.
+            _ => return,
+        }
+        if config.all_channel_subtypes.is_none() && config.instance_limits_handling.is_none() {
+            self.communication_limits_override = None;
+        }
+    }
+
     /// This record as the modelled `Campaign` shape `DescribeCampaign` returns.
     pub fn to_campaign(&self) -> Campaign {
         Campaign {

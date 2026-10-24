@@ -52,11 +52,12 @@ const TERMINATION_MEMBERS: &[&str] = &["status", "statusReason", "stoppedAt", "i
 /// FAILED, PENDING, RUNNABLE, RUNNING, SCHEDULED, STARTING, SUBMITTED, SUCCEEDED
 /// (`smithy_query(query="shape", shape="ServiceJobStatus")`); the terminal pair is the
 /// two completed ones, which is what the handler's state helper keys off.
-const TERMINAL_STATUSES: &[&str] = &[state::SERVICE_JOB_SUCCEEDED, state::SERVICE_JOB_FAILED];
+pub(crate) const TERMINAL_STATUSES: &[&str] =
+    &[state::SERVICE_JOB_SUCCEEDED, state::SERVICE_JOB_FAILED];
 
 /// How much optional detail a seeded service job carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Filled {
+pub(crate) enum Filled {
     /// Only the members `DescribeServiceJob` models as required.
     Required,
     /// Every member a service job record can carry.
@@ -82,7 +83,7 @@ fn retry_strategy() -> ServiceJobRetryStrategy {
 /// it has been dispatched (`SCHEDULED` onwards) and `startedAt` only once it is running
 /// (`STARTING` onwards), and a terminal one also carries the instant and reason it ended
 /// with, so the "leave a terminal job alone" rows have something to lose.
-fn seed(batch: &Batch, status: &str, filled: Filled) -> ServiceJob {
+pub(crate) fn seed(batch: &Batch, status: &str, filled: Filled) -> ServiceJob {
     let store = batch.store();
     let mut store = store.lock();
     let id = store.new_uuid();
@@ -140,14 +141,14 @@ fn seed(batch: &Batch, status: &str, filled: Filled) -> ServiceJob {
 }
 
 /// `DescribeServiceJob` over the wire: the status and the decoded body.
-async fn describe(batch: &Batch, job_id: &str) -> (u16, Value) {
+pub(crate) async fn describe(batch: &Batch, job_id: &str) -> (u16, Value) {
     batch
         .call("/v1/describeservicejob", json!({"jobId": job_id}))
         .await
 }
 
 /// `DescribeServiceJob` over the wire, requiring the 200.
-async fn described(batch: &Batch, case: &str, job_id: &str) -> Value {
+pub(crate) async fn described(batch: &Batch, case: &str, job_id: &str) -> Value {
     let (status, body) = describe(batch, job_id).await;
     assert_eq!(
         status, 200,
@@ -158,7 +159,7 @@ async fn described(batch: &Batch, case: &str, job_id: &str) -> Value {
 
 /// `TerminateServiceJob` on `job_id` with `reason`, asserting the 200 and the empty body
 /// the operation models (`TerminateServiceJobResponse` has no members).
-async fn terminate(batch: &Batch, case: &str, job_id: &str, reason: &str) {
+pub(crate) async fn terminate(batch: &Batch, case: &str, job_id: &str, reason: &str) {
     let (status, body) = batch
         .call(
             "/v1/terminateservicejob",
@@ -189,7 +190,7 @@ fn untouched(detail: &Value) -> Value {
 }
 
 /// The non-terminal `ServiceJobStatus` values, from the model's own enum.
-fn live_statuses() -> Vec<&'static str> {
+pub(crate) fn live_statuses() -> Vec<&'static str> {
     SERVICE_JOB_STATUS_VALUES
         .iter()
         .copied()

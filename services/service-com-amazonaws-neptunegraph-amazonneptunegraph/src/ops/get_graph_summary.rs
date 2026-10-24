@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGraphSummary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGraphSummary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGraphSummary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the summary of a graph's DATA: the counts, labels, properties and — in
+//! `DETAILED` mode — structures computed from the nodes and edges the graph holds
+//! (`crate::state::GraphData`). The report is computed on every call from the stored
+//! data, so it cannot disagree with what a query over the same graph would see, and
+//! an empty graph summarises as an empty graph rather than as nothing at all.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +70,8 @@
 //! * `ResourceNotFoundException` (HTTP 404) — A specified resource could not be located.
 //! * `ThrottlingException` (HTTP 429) — The exception was interrupted by throttling.
 //! * `ValidationException` (HTTP 400) — A resource could not be validated.
+
+use ::std::collections::{BTreeMap, HashMap};
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -149,18 +148,244 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGraphSummary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGraphSummaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGraphSummary"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetGraphSummaryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `BASIC` is the default: "The summary mode can take one of two values: basic
+        // (the default), and detailed"
+        // (`smithy_query(query="operation",operation="GetGraphSummary")` -> input.mode).
+        let mode = input.mode.as_deref().unwrap_or(BASIC_MODE);
+        let detailed = mode == DETAILED_MODE;
+
+        // A graph lives in exactly one Region, so the Region this request was signed
+        // for is part of the lookup: a graph of another Region is not found here.
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // Reporting only: the sole write the lookup makes is materialising the status
+        // transition the clock had already made due at this instant, which was owed
+        // whether or not anybody asked for a summary.
+        let Some(graph) = store.settled_graph(&input.graph_identifier, &region, now) else {
+            return Err(GetGraphSummaryErrorModeled::ResourceNotFoundException(
+                crate::state::graph_not_found(&input.graph_identifier),
+            )
+            .into());
+        };
+
+        // A summary is read from the graph's OWN data endpoint — the operation is
+        // bound to the host prefix `{graphIdentifier}.`
+        // (`smithy_query(query="operation",operation="GetGraphSummary")` -> endpoint) —
+        // and that endpoint serves only while the graph is serving. A graph that is
+        // provisioning, reconfiguring, importing, snapshotting, stopped or on its way
+        // out has no data plane to summarise, which this operation reports with the
+        // one client error it models for a request it cannot serve: it declares no
+        // `ConflictException` (`smithy_query` -> errors), so the refusal is the
+        // modelled `ValidationException` (400) naming the status that was read.
+        if graph.status != crate::state::GraphStatus::Available {
+            return Err(GetGraphSummaryErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "graph {} is in status {} and has no serving data plane to summarise",
+                        graph.id,
+                        graph.status.as_wire()
+                    ),
+                    reason: Some("BAD_REQUEST".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The report is computed from a SNAPSHOT of the graph's data, taken here and
+        // read after the store's guard is dropped: the arithmetic below walks every
+        // node, edge and property of one graph, and no other caller of this service
+        // waits on it.
+        let statistics_computed_at = graph.data.statistics_computed_at;
+        let data = graph.data.clone();
+        drop(store);
+
+        // Every member is computed from the data the graph holds, so a summary and a
+        // later read of the same graph cannot disagree.
+        Ok(GetGraphSummaryOutput {
+            version: Some(SUMMARY_REPORT_VERSION.to_string()),
+            last_statistics_computation_time: Some(::aws_smithy_types::DateTime::from(
+                statistics_computed_at,
+            )),
+            graph_summary: Some(summarise(&data, detailed)),
+        })
     }
+}
+
+/// The default `mode`, from the modelled `GraphSummaryMode` values
+/// (`crate::ops::types::GRAPH_SUMMARY_MODE_VALUES`).
+const BASIC_MODE: &str = "BASIC";
+
+/// The `mode` that asks for the node and edge STRUCTURES as well, from the same
+/// modelled value set as [`BASIC_MODE`].
+const DETAILED_MODE: &str = "DETAILED";
+
+/// The version of the summary report this operation renders, reported in the
+/// output's `version`.
+///
+/// The model documents that member only as "Display the version of this tool"
+/// (`smithy_query(query="operation",operation="GetGraphSummary")` -> output) and
+/// states no value, so what is reported is the version of the REPORT this emulator
+/// renders, not a property of the graph: the member set rendered below is the first
+/// version of it, so every call reports the same version until that set changes.
+const SUMMARY_REPORT_VERSION: &str = "v1.0";
+
+/// The summary of `data`: every member of the modelled `GraphDataSummary`, computed
+/// from the nodes and edges the graph holds.
+///
+/// `detailed` renders the two members the model marks as `DETAILED`-only: "This
+/// field is only present when the requested mode is DETAILED"
+/// (`smithy_query(query="shape",shape="GraphDataSummary")` -> nodeStructures,
+/// edgeStructures), so a `BASIC` summary leaves both absent rather than empty.
+fn summarise(data: &crate::state::GraphData, detailed: bool) -> GraphDataSummary {
+    let node_labels: Vec<String> = data
+        .nodes
+        .values()
+        .flat_map(|node| node.labels.iter().cloned())
+        .collect::<::std::collections::BTreeSet<String>>()
+        .into_iter()
+        .collect();
+    let edge_labels: Vec<String> = data
+        .edges
+        .values()
+        .map(|edge| edge.label.clone())
+        .collect::<::std::collections::BTreeSet<String>>()
+        .into_iter()
+        .collect();
+
+    // "A list of the distinct node properties in the graph, along with the count of
+    // nodes where each property is used", and the same for the edges
+    // (`smithy_query(query="shape",shape="GraphDataSummary")`).
+    let node_properties = property_usage(data.nodes.values().map(|node| &node.properties));
+    let edge_properties = property_usage(data.edges.values().map(|edge| &edge.properties));
+
+    GraphDataSummary {
+        num_nodes: Some(count(data.nodes.len())),
+        num_edges: Some(count(data.edges.len())),
+        num_node_labels: Some(count(node_labels.len())),
+        num_edge_labels: Some(count(edge_labels.len())),
+        node_labels: Some(node_labels),
+        edge_labels: Some(edge_labels),
+        num_node_properties: Some(count(node_properties.len())),
+        num_edge_properties: Some(count(edge_properties.len())),
+        // "The total number of usages of all node properties": one usage per
+        // property set on one element, which is what each entry counts.
+        total_node_property_values: Some(node_properties.values().sum()),
+        total_edge_property_values: Some(edge_properties.values().sum()),
+        node_properties: Some(usage_list(&node_properties)),
+        edge_properties: Some(usage_list(&edge_properties)),
+        node_structures: detailed.then(|| node_structures(data)),
+        edge_structures: detailed.then(|| edge_structures(data)),
+    }
+}
+
+/// How many elements carry each distinct property key, over the property maps of
+/// the elements (nodes or edges) being summarised.
+fn property_usage<'a>(
+    elements: impl Iterator<Item = &'a BTreeMap<String, ::serde_json::Value>>,
+) -> BTreeMap<String, i64> {
+    let mut usage: BTreeMap<String, i64> = BTreeMap::new();
+    for properties in elements {
+        for key in properties.keys() {
+            *usage.entry(key.clone()).or_default() += 1;
+        }
+    }
+    usage
+}
+
+/// A property-usage table in the modelled `LongValuedMapList` form: one
+/// single-entry map per distinct property, in property-key order.
+fn usage_list(usage: &BTreeMap<String, i64>) -> Vec<HashMap<String, i64>> {
+    usage
+        .iter()
+        .map(|(key, used_by)| HashMap::from([(key.clone(), *used_by)]))
+        .collect()
+}
+
+/// The node structures of `data`: the distinct shapes a node takes — its property
+/// keys and the distinct labels of the edges leaving it — with how many nodes take
+/// each ("The number of instances of this node",
+/// `smithy_query(query="shape",shape="NodeStructure")`).
+///
+/// The edges are indexed ONCE, by the node each leaves, and every node is then a
+/// lookup in that index: the work is one pass over the edges plus one over the
+/// nodes, never a pass over the edges per node.
+///
+/// Ordered by descending count and then by the shape itself, so the commonest
+/// structure comes first and the list has one stable total order.
+fn node_structures(data: &crate::state::GraphData) -> Vec<NodeStructure> {
+    let mut outgoing: BTreeMap<&str, ::std::collections::BTreeSet<&str>> = BTreeMap::new();
+    for edge in data.edges.values() {
+        outgoing
+            .entry(edge.from_node.as_str())
+            .or_default()
+            .insert(edge.label.as_str());
+    }
+    let mut shapes: BTreeMap<(Vec<String>, Vec<String>), i64> = BTreeMap::new();
+    for (id, node) in &data.nodes {
+        let properties: Vec<String> = node.properties.keys().cloned().collect();
+        let labels: Vec<String> = outgoing
+            .get(id.as_str())
+            .into_iter()
+            .flatten()
+            .map(|label| (*label).to_string())
+            .collect();
+        *shapes.entry((properties, labels)).or_default() += 1;
+    }
+    by_commonest(shapes)
+        .into_iter()
+        .map(|((properties, outgoing), instances)| NodeStructure {
+            count: Some(instances),
+            node_properties: Some(properties),
+            distinct_outgoing_edge_labels: Some(outgoing),
+        })
+        .collect()
+}
+
+/// The edge structures of `data`: the distinct shapes an edge takes — its property
+/// keys — with how many edges take each, ordered as [`node_structures`] orders the
+/// node shapes.
+fn edge_structures(data: &crate::state::GraphData) -> Vec<EdgeStructure> {
+    let mut shapes: BTreeMap<Vec<String>, i64> = BTreeMap::new();
+    for edge in data.edges.values() {
+        let properties: Vec<String> = edge.properties.keys().cloned().collect();
+        *shapes.entry(properties).or_default() += 1;
+    }
+    by_commonest(shapes)
+        .into_iter()
+        .map(|(properties, instances)| EdgeStructure {
+            count: Some(instances),
+            edge_properties: Some(properties),
+        })
+        .collect()
+}
+
+/// A table of shapes and their instance counts, commonest first, ties broken by the
+/// shape so the order is total.
+fn by_commonest<Shape: Ord>(shapes: BTreeMap<Shape, i64>) -> Vec<(Shape, i64)> {
+    let mut ordered: Vec<(Shape, i64)> = shapes.into_iter().collect();
+    ordered.sort_by(|(left_shape, left_count), (right_shape, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_shape.cmp(right_shape))
+    });
+    ordered
+}
+
+/// A stored count as the modelled `Long` it is reported in. A store this size
+/// cannot overflow an `i64` — both maps are bounded well below it
+/// (`crate::state::MAX_NODES_PER_GRAPH`) — so the saturating fallback is
+/// unreachable rather than a choice about what to report.
+fn count(stored: usize) -> i64 {
+    i64::try_from(stored).unwrap_or(i64::MAX)
 }

@@ -39,6 +39,8 @@ mod scheduling_policies;
 mod scheduling_policy_teardown_and_conflicts;
 #[path = "all/service_environment.rs"]
 mod service_environment;
+#[path = "all/service_job_priority_updates.rs"]
+mod service_job_priority_updates;
 #[path = "all/service_job_submission.rs"]
 mod service_job_submission;
 #[path = "all/service_job_termination.rs"]

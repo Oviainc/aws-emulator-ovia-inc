@@ -4,10 +4,11 @@
 //! PARTLY IMPLEMENTED — REFUSALS ONLY: both ARNs are read and resolved against stored
 //! state, so a malformed pair answers the modelled `BadRequestException` (400) and a
 //! well-formed pair naming records this emulator does not hold answers the modelled
-//! `NotFoundException` (404). The SUCCESS path is still the scaffold's 501: nothing can
-//! store a domain-name access association while `CreateDomainNameAccessAssociation` is a
-//! stub, so what a rejection removes is written by the change that lands that create —
-//! which is also the change that removes the 501 below.
+//! `NotFoundException` (404). The SUCCESS path is still the scaffold's 501: a rejection
+//! removes an access association REQUESTED BY ANOTHER ACCOUNT ("To remove a domain name
+//! access association with an access association source in your own account, use the
+//! DeleteDomainNameAccessAssociation operation"), which is this operation's own question
+//! and its own issue — not something the create that stores an association answers.
 //!
 //! ## Shape of an operation
 //!
@@ -234,18 +235,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         // "Rejects a domain name access association with a private custom domain name":
         // the call resolves the domain name the association was requested on and the
-        // association itself, and both must name records this emulator holds. A domain
-        // name can be one (`CreateDomainName` stores it); an access association cannot
-        // yet, because `CreateDomainNameAccessAssociation` is still a scaffold. The lookup
-        // is the SAME one the tag operations resolve an ARN with, so when that create
-        // lands this operation resolves its records with no change here.
+        // association itself, and both must name records this emulator holds. The lookup
+        // is the SAME one the tag operations resolve an ARN with, so what this operation
+        // says a pair names is what every other reader of those ARNs says.
         store.holds(&domain_name).map_err(not_found)?;
         store.holds(&association).map_err(not_found)?;
-        // Unreachable while nothing can store an access association, which is why it is
-        // the scaffold's 501 rather than a success: what a rejection REMOVES belongs with
-        // the record, so it is written by the change that stores one instead of guessed
-        // at here. Every request a caller can make today is answered above, by this
-        // operation's own modelled errors.
+        // Reached only by a pair that names records this emulator holds. It is the
+        // scaffold's 501 rather than a success because a REJECTION is not a deletion: it
+        // answers another account's association request, which this operation's own issue
+        // settles. Every request a caller can make against records it does not hold is
+        // answered above, by this operation's own modelled errors.
         drop(store);
         Err(crate::scaffolded::Scaffolded::not_implemented(
             "RejectDomainNameAccessAssociation",

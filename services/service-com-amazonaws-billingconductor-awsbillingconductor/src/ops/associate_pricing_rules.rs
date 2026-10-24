@@ -231,11 +231,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // What the plan already associates, as full rule ARNs: read through the one
-        // state method every other reader of the association uses, so this decision
-        // cannot drift from what `ListPricingRulesAssociatedToPricingPlan` reports.
+        // What the plan already associates NOW, as full rule ARNs: read through the
+        // one state method every other reader of the association uses, so this
+        // decision cannot drift from what `ListPricingRulesAssociatedToPricingPlan`
+        // reports for the current billing period — the period this call takes effect
+        // in.
+        let billing_period = crate::state::current_billing_period();
         let associated: std::collections::BTreeSet<String> = state
-            .associated_pricing_rule_arns(&plan_arn)
+            .associated_pricing_rule_arns(&plan_arn, &billing_period)
             .unwrap_or_default()
             .into_iter()
             .collect();
@@ -287,7 +290,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Every check passed, so the whole request applies: the plan's associations
-        // grow by exactly the requested rules, stored as full ARNs, and the plan's
+        // grow by exactly the requested rules, stored as full ARNs and in force from
+        // the billing period this call is made in onward, and the plan's
         // `LastModifiedTime` moves because the plan changed. Nothing else about the
         // plan — its name, its description, its tags, its creation time — is this
         // operation's to touch.
@@ -301,7 +305,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        plan.pricing_rule_arns.extend(requested.iter().cloned());
+        plan.pricing_rule_associations.extend(
+            requested
+                .iter()
+                .map(|arn| crate::state::PricingRuleAssociationRecord::started_now(arn)),
+        );
         plan.last_modified_time_millis = crate::state::now_millis();
 
         // The audit record for a state-changing call: who asked, what changed and that

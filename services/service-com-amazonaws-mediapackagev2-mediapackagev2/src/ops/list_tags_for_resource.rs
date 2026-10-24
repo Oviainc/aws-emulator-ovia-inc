@@ -137,8 +137,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A read needs nothing from the request beyond its deserialized input.
-        let _ = ctx;
+        // The Region the request was signed for: a resource ARN names a resource in one
+        // Region, so from this endpoint only that Region's resources are reachable.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 "InternalServerException",
@@ -158,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
-        let Some(tags) = store.tags_of(&target) else {
+        let Some(tags) = store.tags_of(&region, &target) else {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::RESOURCE_NOT_FOUND_CODE,
                 404,

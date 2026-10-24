@@ -65,6 +65,24 @@ impl Harness {
         operation: &str,
         body: serde_json::Value,
     ) -> (u16, serde_json::Value) {
+        self.call_in(self.region, operation, body).await
+    }
+
+    /// The credential-scope region this harness signs for: the regional endpoint
+    /// [`Harness::call`] reaches.
+    pub(crate) fn region(&self) -> &'static str {
+        self.region
+    }
+
+    /// Call one operation at `region`'s endpoint against the SAME store, so a suite can
+    /// show what one region's endpoint does and does not serve. The credential scope is
+    /// the only difference from [`Harness::call`].
+    pub(crate) async fn call_in(
+        &self,
+        region: &str,
+        operation: &str,
+        body: serde_json::Value,
+    ) -> (u16, serde_json::Value) {
         let payload = serde_json::to_vec(&body).expect("serialize the request body");
         let request = http::Request::builder()
             .method("POST")
@@ -76,9 +94,9 @@ impl Harness {
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEMULATOR/20240101/{}/airflow-serverless/\
-                     aws4_request, SignedHeaders=host;x-amz-target, Signature=00",
-                    self.region
+                    "AWS4-HMAC-SHA256 Credential=AKIDEMULATOR/20240101/{region}/\
+                     airflow-serverless/aws4_request, SignedHeaders=host;x-amz-target, \
+                     Signature=00"
                 ),
             )
             .body(bytes::Bytes::from(payload))
@@ -132,7 +150,10 @@ impl Harness {
 /// out from the modelled `WorkflowArn` pattern
 /// (`smithy_query(query="shape", shape="WorkflowArn")`):
 /// `^arn:aws…:airflow-serverless:([a-z]{2}-[a-z]+-[0-9]{1}):([0-9]{12}):workflow/([a-zA-Z0-9][a-zA-Z0-9\.\-_]{0,254}-[a-zA-Z0-9]{10})$`
-fn is_workflow_arn(arn: &str, region: &str) -> bool {
+///
+/// `pub(crate)` so `region_isolation` checks a minted ARN the same way rather than
+/// writing a second matcher.
+pub(crate) fn is_workflow_arn(arn: &str, region: &str) -> bool {
     let prefix = format!("arn:aws:airflow-serverless:{region}:");
     let Some(rest) = arn.strip_prefix(&prefix) else {
         return false;

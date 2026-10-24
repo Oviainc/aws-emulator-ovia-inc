@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PurchaseReservedInstanceOffering
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PurchaseReservedInstanceOffering`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PurchaseReservedInstanceOffering::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Buys a Reserved Instance from a published offering: a MUTATION, which is what
+//! makes a reservation exist for `DescribeReservedInstances` to report. The
+//! reservation is priced from the catalog entry the store itself published, so
+//! the offering and the reservation bought from it cannot disagree.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +83,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    is_guid, NewReservation, ReservedInstanceRecord, DEFAULT_INSTANCE_COUNT,
+    RESERVED_INSTANCE_QUOTA,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +161,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PurchaseReservedInstanceOffering` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PurchaseReservedInstanceOfferingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PurchaseReservedInstanceOffering"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // `GUID` is `@length(36, 36)` with its own pattern, and the request
+        // boundary enforces only the length, so a value that is not a `GUID` is
+        // refused here rather than treated as an id that merely names nothing.
+        let offering_id = input.reserved_instance_offering_id;
+        if !is_guid(&offering_id) {
+            return Err(
+                PurchaseReservedInstanceOfferingErrorModeled::ValidationException(
+                    crate::state::malformed_guid("ReservedInstanceOfferingId", &offering_id),
+                )
+                .into(),
+            );
+        }
+        // `InstanceCount` is `@range(min: 1)`, so the request boundary has already
+        // refused a count below one; a request that named none reserves the
+        // documented default.
+        let instance_count = input.instance_count.unwrap_or(DEFAULT_INSTANCE_COUNT);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The offering has to be one the published catalog holds — "the ID of the
+        // Reserved Instance offering to purchase" — and an id it does not hold is
+        // refused with the modelled `ValidationException`, which this model
+        // documents with the very sentence it documents `ResourceNotFoundException`
+        // with ("an exception for accessing or deleting a resource that doesn't
+        // exist") and which this service answers a purchase naming an offering
+        // nothing publishes with. The entry is cloned out of the catalog so the
+        // reservation below is priced from what the store itself published.
+        let Some(offering) = store.reserved_instance_offering(&offering_id).cloned() else {
+            return Err(
+                PurchaseReservedInstanceOfferingErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "Reserved Instance offering not found: {offering_id}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `ReservationName` is "a customer-specified identifier to track this
+        // reservation", so a name this account already tracks a reservation under
+        // is the modelled already-exists rather than a second record the caller
+        // can no longer tell apart from the first.
+        if store
+            .reserved_instances
+            .values()
+            .any(|reservation| reservation.reservation_name == input.reservation_name)
+        {
+            return Err(
+                PurchaseReservedInstanceOfferingErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!(
+                            "A reservation named {} already exists.",
+                            input.reservation_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is BOUNDED: past the quota a purchase is refused rather than
+        // reserving another instance, so a caller looping with fresh reservation
+        // names cannot grow the state (or the describe's answer) without end. The
+        // check counts the instances already reserved PLUS the ones this purchase
+        // asks for, so neither many small purchases nor one large one passes it.
+        if store.reserved_instance_count() + i64::from(instance_count) > RESERVED_INSTANCE_QUOTA {
+            return Err(
+                PurchaseReservedInstanceOfferingErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "Reserving {instance_count} more instance(s) would exceed this \
+                             account's maximum of {RESERVED_INSTANCE_QUOTA} reserved instances"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let billing_subscription_id = store.mint_billing_subscription_id();
+        let record = ReservedInstanceRecord::from_offering(
+            &offering,
+            NewReservation {
+                reserved_instance_id: crate::state::new_reserved_instance_id(),
+                reservation_name: input.reservation_name,
+                instance_count,
+                billing_subscription_id,
+                now,
+            },
+        );
+        // The answer is read back out of the store, so it reports the reservation
+        // this service persisted rather than a copy beside it.
+        let stored = store.insert_reserved_instance(record);
+
+        Ok(PurchaseReservedInstanceOfferingOutput {
+            reserved_instance_id: Some(stored.reserved_instance_id.clone()),
+            reservation_name: Some(stored.reservation_name.clone()),
+        })
     }
 }

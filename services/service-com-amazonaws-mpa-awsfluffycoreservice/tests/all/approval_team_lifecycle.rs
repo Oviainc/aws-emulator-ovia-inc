@@ -935,8 +935,11 @@ async fn update_applies_the_supplied_fields_and_records_a_new_version() {
             version_changes: true,
         },
         UpdateCase {
-            label: "nothing to apply leaves the version alone",
-            patch: json!({ "UpdateActions": ["SYNCHRONIZE_MFA_DEVICES"] }),
+            label: "an empty UpdateActions asks for nothing, so the version is left alone",
+            // `UpdateActions` is `length(min: 0, max: 100)`, so an empty list is a legal
+            // request that names no action to apply. The action itself is exercised in
+            // `approver_mfa_synchronization.rs`.
+            patch: json!({ "UpdateActions": [] }),
             description: "final",
             min_approvals: 1,
             approver_ids: vec![original_ids[0].clone()],

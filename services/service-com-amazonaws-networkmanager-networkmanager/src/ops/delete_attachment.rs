@@ -1,34 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAttachment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAttachment`'s real behaviour. Implement it here — this is
+//! Deletes an attachment of ANY kind from the one attachment map every attachment
+//! operation reads
+//! (`crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::attachments`). This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAttachment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Deletes an attachment. Supports all attachment types" (`smithy_query query="doc"
+//! shape="DeleteAttachment"`): one id space holds every kind, so this operation removes a
+//! VPC, Connect or site-to-site VPN attachment alike and reports the record it removed as
+//! `DELETING`, the state the clock no longer decides for it.
 //!
-//! ## Shape of an operation
-//!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `DeleteAttachment::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! A Connect attachment is carried over ANOTHER attachment as its transport
+//! (`crate::state::AttachmentDetail::Connect`), so deleting that transport would orphan
+//! it. Like every other delete of this service that still holds dependents, the delete is
+//! refused until the caller removes them (`crate::state::dependents_block_delete`, HTTP
+//! 400 `ValidationException`) and the store is left untouched.
 //!
 //! ## Reaching this service's state
 //!
-//! The engine is held on `self` (constructor-injected), NOT passed per request — so
-//! engine access is guaranteed by the time any request runs. Reach the store through
-//! [`crate::state::service_state`] and read and write it through the guard it hands back:
-//!
-//! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
-//!         .ok_or(/* a modelled server error */)?;
-//!     state.lock().your_field = /* ... */;
-//! ```
+//! The engine is held on `self` (constructor-injected), NOT passed per request. Reach the
+//! store through [`crate::state::service_state`] and read and write it through the guard
+//! it hands back.
 //!
 //! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
 //! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
@@ -147,18 +140,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAttachment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAttachmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAttachment"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAttachmentErrorModeled::InternalServerException(InternalServerException {
+                message: "the networkmanager store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let mut store = state.lock();
+
+        // A Connect attachment is built on the attachment named as its transport, so
+        // removing that transport would leave it pointing at nothing. The dependency
+        // refusal is computed only for an attachment that IS stored, so the one not-found
+        // answer below stays the single path for an id that names nothing.
+        if store.attachments.contains_key(&input.attachment_id) {
+            let carried = store.connect_attachment_count_over_transport(&input.attachment_id);
+            if let Some(refusal) = crate::state::dependents_block_delete(
+                crate::state::ATTACHMENT_KIND,
+                &[(crate::state::ATTACHMENT_KIND, carried)],
+            ) {
+                return Err(DeleteAttachmentErrorModeled::ValidationException(refusal).into());
+            }
+        }
+
+        // One id space holds every attachment kind and this operation "supports all
+        // attachment types", so the kind of the record removed is never checked: an id
+        // that names no stored attachment is the service's not-found refusal.
+        let removed = store
+            .attachments
+            .remove(&input.attachment_id)
+            .ok_or_else(|| {
+                DeleteAttachmentErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::ATTACHMENT_KIND,
+                        &input.attachment_id,
+                    ),
+                )
+            })?;
+
+        // The instant the record was removed, taken on the path that removes it: the
+        // delete is the change the answer's `UpdatedAt` reports, and a refusal above
+        // changed nothing and needs no clock.
+        Ok(DeleteAttachmentOutput {
+            attachment: Some(removed.to_deleted_attachment(::std::time::SystemTime::now())),
+        })
     }
 }

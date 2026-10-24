@@ -72,16 +72,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The `resourceOwner` that selects the domain names of ANOTHER account — one of the two
-/// values the modelled `ResourceOwner` enum declares
-/// (`smithy_query(query="shape", shape="ResourceOwner")`: `SELF`, `OTHER_ACCOUNTS`).
-///
-/// A domain name of another account becomes visible to this one through a domain name
-/// ACCESS ASSOCIATION, and this emulator serves exactly one account
-/// (`::emulator_server::emulator_account_id`), so no stored domain name has another
-/// owner: the page a request for this owner gets is empty, rather than this account's own
-/// records reported as somebody else's.
-const OTHER_ACCOUNTS_RESOURCE_OWNER: &str = "OTHER_ACCOUNTS";
+use crate::state::OTHER_ACCOUNTS_RESOURCE_OWNER;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -158,6 +149,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
         let store = state.lock();
+        // A domain name of another account becomes visible to this one through a domain
+        // name ACCESS ASSOCIATION; see `OTHER_ACCOUNTS_RESOURCE_OWNER` for why this
+        // emulator's one account owns every record it holds.
         let ordered = if input.resource_owner.as_deref() == Some(OTHER_ACCOUNTS_RESOURCE_OWNER) {
             Vec::new()
         } else {

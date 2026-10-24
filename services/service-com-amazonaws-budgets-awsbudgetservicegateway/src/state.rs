@@ -771,6 +771,31 @@ pub fn find_notification<'a>(
         .find(|held| same_notification(&held.notification, wanted))
 }
 
+/// As [`find_notification`], for the write paths that change a notification or the
+/// subscribers held with it (`CreateSubscriber`, …): the same identity
+/// ([`same_notification`]), handed back by mutable reference.
+pub fn find_notification_mut<'a>(
+    stored: &'a mut StoredBudget,
+    wanted: &Notification,
+) -> Option<&'a mut StoredNotification> {
+    stored
+        .notifications
+        .iter_mut()
+        .find(|held| same_notification(&held.notification, wanted))
+}
+
+/// Whether `left` and `right` name the SAME subscriber of a notification.
+///
+/// A subscriber carries no id either: every operation that acts on one
+/// (`CreateSubscriber`, `DeleteSubscriber`, `UpdateSubscriber`) names it by passing the
+/// whole `Subscriber` shape back, and that shape "consists of a subscription type and
+/// either an Amazon SNS topic or an email address" (`Subscriber`) — both of its members,
+/// both `@required`, so both are its identity. The same address reached over a different
+/// `SubscriptionType` is a different subscriber.
+pub fn same_subscriber(left: &Subscriber, right: &Subscriber) -> bool {
+    left.subscription_type == right.subscription_type && left.address == right.address
+}
+
 /// "A budget can have up to ten notifications" (`Notification`). `CreateNotification`
 /// answers `CreationLimitExceededException` ("You've exceeded the notification or
 /// subscriber limit") once a budget already holds this many.
@@ -804,21 +829,35 @@ const SUBSCRIPTION_TYPE_EMAIL: &str = "EMAIL";
 /// sentence that goes in the refusal's `Message`; `Ok` means the set is within both
 /// halves of [`MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION`] /
 /// [`MAX_EMAIL_SUBSCRIBERS_PER_NOTIFICATION`].
-pub fn subscriber_limit_violation(subscribers: &[Subscriber]) -> Result<(), String> {
-    let count = |kind: &str| {
-        subscribers
-            .iter()
-            .filter(|subscriber| subscriber.subscription_type == kind)
-            .count()
-    };
-    for (kind, limit) in [
-        (SUBSCRIPTION_TYPE_SNS, MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION),
+///
+/// Takes any iterator of subscribers, so a caller that grows a stored set by one
+/// (`CreateSubscriber`) checks the set it would leave behind without building it.
+pub fn subscriber_limit_violation<'a>(
+    subscribers: impl IntoIterator<Item = &'a Subscriber>,
+) -> Result<(), String> {
+    let mut sns = 0_usize;
+    let mut email = 0_usize;
+    for subscriber in subscribers {
+        match subscriber.subscription_type.as_str() {
+            SUBSCRIPTION_TYPE_SNS => sns += 1,
+            SUBSCRIPTION_TYPE_EMAIL => email += 1,
+            // A subscription type the model does not list cannot reach here: the member
+            // is a modelled enum, refused at request validation.
+            _ => {}
+        }
+    }
+    for (kind, limit, supplied) in [
+        (
+            SUBSCRIPTION_TYPE_SNS,
+            MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION,
+            sns,
+        ),
         (
             SUBSCRIPTION_TYPE_EMAIL,
             MAX_EMAIL_SUBSCRIBERS_PER_NOTIFICATION,
+            email,
         ),
     ] {
-        let supplied = count(kind);
         if supplied > limit {
             return Err(format!(
                 "A set of subscribers can have at most {limit} {kind} subscriber(s), and \

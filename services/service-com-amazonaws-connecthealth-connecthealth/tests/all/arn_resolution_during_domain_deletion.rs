@@ -56,7 +56,10 @@ fn past_the_deletion_span() -> Duration {
 /// The `webAppSetupConfiguration` that makes a domain own a resource provisioned OUTSIDE
 /// this service, which is what keeps its deletion from completing inside the
 /// `DeleteDomain` call.
-fn web_app_setup() -> Value {
+///
+/// `pub(crate)` so a sibling suite that needs a domain observable in `DELETING` sets one
+/// up the same way rather than growing a second copy.
+pub(crate) fn web_app_setup() -> Value {
     json!({
         "ehrRole": "arn:aws:iam::000000000000:role/ehr-operations",
         "idcInstanceId": "ssoins-72230ed02aa4b4ea",

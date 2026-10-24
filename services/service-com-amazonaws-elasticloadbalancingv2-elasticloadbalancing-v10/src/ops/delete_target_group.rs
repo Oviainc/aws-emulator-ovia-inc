@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTargetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTargetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTargetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the persisted target group `TargetGroupArn` names, with its health check and
+//! its registrations — "deleting a target group also deletes any associated health
+//! checks" — unless a listener still forwards to it, which is the modelled
+//! `ResourceInUseException` ("you can delete a target group if it is not referenced by
+//! any actions"). A target group this store does not hold is a success that removes
+//! nothing: the operation models no not-found error, exactly as `DeleteLoadBalancer`
+//! does.
 //!
 //! ## Shape of an operation
 //!
@@ -134,18 +133,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTargetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTargetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTargetGroup"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("DeleteTargetGroup")
+        })?;
+
+        let mut guard = state.lock();
+        // "You can delete a target group if it is not referenced by any actions": a
+        // listener that forwards to it still needs it, so the delete is refused before
+        // anything is removed.
+        let referenced_by = guard.listeners_in_order().iter().find_map(|listener| {
+            crate::state::action_target_group_arns(&listener.default_actions)
+                .contains(&input.target_group_arn)
+                .then(|| listener.arn.clone())
+        });
+        if let Some(listener_arn) = referenced_by {
+            return Err(DeleteTargetGroupErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "Target group '{}' is currently in use by listener '{listener_arn}'",
+                        input.target_group_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The registrations and the health check live on the record, so removing it
+        // removes them with it. A target group this store does not hold is a success
+        // that removes nothing: the operation models no not-found error.
+        if let Some(removed) = guard.target_groups.remove(&input.target_group_arn) {
+            guard.name_to_tg_arn.remove(&removed.name);
+        }
+
+        Ok(DeleteTargetGroupOutput {})
     }
 }

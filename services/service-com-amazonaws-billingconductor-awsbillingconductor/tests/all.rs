@@ -47,6 +47,8 @@ mod pricing_plan_list;
 mod pricing_plan_update;
 #[path = "all/pricing_plans_associated_with_pricing_rule.rs"]
 mod pricing_plans_associated_with_pricing_rule;
+#[path = "all/pricing_rule_association_periods.rs"]
+mod pricing_rule_association_periods;
 #[path = "all/pricing_rule_core_loop.rs"]
 mod pricing_rule_core_loop;
 #[path = "all/pricing_rule_lifecycle.rs"]

@@ -10,10 +10,11 @@
 //! published tagging limits, and answers 204 with no content. The write is then visible
 //! through `ListTagsForResource` and through `DescribeProfilingGroup`, because there is
 //! one stored map and not a second copy. A write carrying no tag at all is refused by
-//! the REST front door (400 `BadRequestException`) ahead of every other check; a
-//! `resourceArn` that is not a profiling-group ARN of this service is a bad input (400
-//! `ValidationException`); a well-formed ARN this store holds no resource for is 404
-//! `ResourceNotFoundException`; and a request outside the tagging limits is refused
+//! this operation's own tags validation (400 `BadRequestException`, naming the member
+//! and the constraint) ahead of every other check; a `resourceArn` that is not a
+//! profiling-group ARN of this service is a bad input (400 `ValidationException`); a
+//! well-formed ARN this store holds no resource for is the tagging surface's 404
+//! `NotFoundException`; and a request outside the tagging limits is refused
 //! before anything is stored (400 `ValidationException`).
 //!
 //! The harness is the one [`crate::profiling_group_lifecycle`] already builds and the
@@ -30,9 +31,19 @@ use std::collections::BTreeMap;
 use crate::profiling_group_lifecycle::{group_arn, Answer, Harness, ACCOUNT, REGION};
 use crate::untag_resource::encode;
 
+/// The sentence this operation's own tags validation refuses an empty map with: it names
+/// the member the map arrived in and the constraint it broke. Restated here so this suite
+/// pins the wire text rather than importing the value it compares against
+/// (`state::empty_tag_map_message`).
+const EMPTY_TAGS_MAP: &str = "Invalid request input, expected non-empty tags map";
+
+/// The sentence the ARN-addressed tagging surface reports a resource that is not there
+/// with (`state::TAGGING_RESOURCE_NOT_FOUND`), restated for the same reason.
+const RESOURCE_NOT_FOUND: &str = "Resource was not found";
+
 /// The sentence the shared REST front door refuses a request body with
-/// (`service_common::front_door::INVALID_REQUEST_BODY`), restated here so this suite
-/// pins the wire text rather than importing the value it compares against.
+/// (`service_common::front_door::INVALID_REQUEST_BODY`), restated for the same reason: an
+/// empty tags map must NOT be answered with it.
 const INVALID_REQUEST_BODY: &str = "Invalid request body";
 
 /// AWS's published tagging limits, restated here for the same reason: the most tags one
@@ -568,11 +579,12 @@ async fn a_tag_write_touches_only_the_resource_its_arn_names() {
     }
 }
 
-/// A write carrying no tag at all is refused by the REST front door — ahead of both the
-/// input check on the ARN and the lookup, so the SAME refusal answers an ARN that is
-/// malformed and one that names nothing — and it persists nothing.
+/// A write carrying no tag at all is refused by this operation's OWN tags validation —
+/// ahead of both the input check on the ARN and the lookup, so the SAME refusal answers an
+/// ARN that is malformed and one that names nothing — naming the member and the constraint
+/// rather than stating the body parser's fixed sentence, and it persists nothing.
 #[tokio::test]
-async fn a_tag_write_with_no_tags_is_refused_as_a_bad_request_body() {
+async fn a_tag_write_with_no_tags_is_refused_by_the_tags_validation() {
     let harness = Harness::new();
     let existing = create(&harness, "tagged-group", &tag_map([("env", "dev")]), "tok-0").await;
 
@@ -603,9 +615,15 @@ async fn a_tag_write_with_no_tags_is_refused_as_a_bad_request_body() {
         );
         assert_eq!(
             error_message(&refused),
-            INVALID_REQUEST_BODY,
-            "case {case:?}: expected the front door's sentence, got {}",
+            EMPTY_TAGS_MAP,
+            "case {case:?}: expected the tags-validation sentence, got {}",
             String::from_utf8_lossy(&refused.body)
+        );
+        assert_ne!(
+            error_message(&refused),
+            INVALID_REQUEST_BODY,
+            "case {case:?}: an empty tags map must not be answered with the body parser's \
+             fixed sentence, which names no member"
         );
     }
 
@@ -689,10 +707,9 @@ async fn an_arn_that_names_no_profiling_group_is_refused_on_the_input() {
     );
 }
 
-/// A well-formed profiling-group ARN that names no stored group is 404
-/// `ResourceNotFoundException`, carrying the service's own sentence for the group it
-/// could not find — whether the group was never created, has been deleted, or lives in
-/// another account, Region or partition.
+/// A well-formed profiling-group ARN that names no stored group is the tagging surface's
+/// 404 `NotFoundException`, carrying that surface's own sentence — whether the group was
+/// never created, has been deleted, or lives in another account, Region or partition.
 #[tokio::test]
 async fn a_tag_write_to_an_arn_naming_no_stored_group_is_not_found() {
     let harness = Harness::new();
@@ -751,14 +768,19 @@ async fn a_tag_write_to_an_arn_naming_no_stored_group_is_not_found() {
         );
         assert_eq!(
             answer.error_code(),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {}",
+            "NotFoundException",
+            "case {case:?}: expected NotFoundException, got {}",
             String::from_utf8_lossy(&answer.body)
         );
         let message = error_message(&answer);
+        assert_eq!(
+            message, RESOURCE_NOT_FOUND,
+            "case {case:?}: expected the tagging surface's sentence, got {message:?}"
+        );
+        // The sentence is this surface's own and carries nothing from the request.
         assert!(
-            message.contains(&named) && message.contains("was not found"),
-            "case {case:?}: the refusal must name the group it could not find, got {message:?}"
+            !message.contains(&named),
+            "case {case:?}: the tagging refusal must not name the group, got {message:?}"
         );
     }
 

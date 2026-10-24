@@ -199,6 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_health_check_port(port)
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         }
+        // `HealthCheckPath` is likewise bounded only in length by the model, so the same
+        // rule — and the same refusal — `CreateTargetGroup` applies to the member applies
+        // here: a path the load balancer cannot request is a probe that can never match.
+        if let Some(path) = input.health_check_path.as_deref() {
+            crate::state::check_health_check_path(path)
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
         // "If the target type is instance, ip, or alb, health checks are always enabled
         // and can't be disabled" — the same rule `CreateTargetGroup` enforces, on the
         // target type the group was created with.

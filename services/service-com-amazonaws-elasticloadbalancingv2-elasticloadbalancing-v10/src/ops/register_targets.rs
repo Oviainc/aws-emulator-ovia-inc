@@ -9,6 +9,16 @@
 //! one target replaces that registration. `DescribeTargetHealth` reports what this
 //! stored.
 //!
+//! Every target is RESOLVED before any of them is stored, so a refusal registers none of
+//! them: what an id names depends on the group's target type, and an `ip` group's address
+//! or an `instance` group's instance is matched against the account's network, which EC2
+//! owns ([`crate::state::network`]). An address that is no address of the group's address
+//! type, one no subnet of its VPC holds and no zone was named for, and a publicly routable
+//! one are refused `ValidationError`; an instance EC2 does not hold, or holds in another
+//! VPC, is the modelled `InvalidTargetException`. A registration in a subnet of the
+//! group's VPC takes that subnet's Availability Zone, which is what `DescribeTargetHealth`
+//! then reports for it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -146,66 +156,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // Only reachable on an engine that is not the shared `InMemoryEngine`,
             // which this service has no store on — so nothing is implemented for it.
             crate::scaffolded::Scaffolded::not_implemented("RegisterTargets")
         })?;
+        let region = crate::state::request_region(ctx);
         let now = std::time::SystemTime::now();
+
+        // What the group is, read and released before anything is resolved against
+        // another service: the store's guard is never held across a call out of this
+        // handler.
+        //
+        // The group's QUOTA is answered here too, and the request is refused against it
+        // BEFORE any target is resolved: `Targets` is a caller-chosen list the model puts
+        // no length on, so nothing else bounds how much work a request can ask for, and
+        // past the quota no work at all is owed. Every step before that refusal is linear
+        // in the list the body already carried.
+        let (target_type, vpc_id, ip_address_type, requested) = {
+            let guard = state.lock();
+            let Some(group) = guard.target_groups.get(&input.target_group_arn) else {
+                return Err(group_not_found(&input.target_group_arn));
+            };
+            // The registration keys this request asks for: the target's own port, else
+            // the group's ("by default, the load balancer routes requests to registered
+            // targets using the protocol and port for the target group. Alternatively,
+            // you can override the port for a target when you register it").
+            let requested: Vec<(String, Option<i32>)> = input
+                .targets
+                .iter()
+                .map(|target| (target.id.clone(), target.port.or(group.port)))
+                .collect();
+            check_quota(group, &requested)?;
+            (
+                group.target_type.clone(),
+                group.vpc_id.clone(),
+                group.ip_address_type.clone(),
+                requested,
+            )
+        };
+
+        // Every target is resolved against the service that OWNS it before any of them
+        // is stored, so a refusal registers nothing — and the zone an `ip` target takes
+        // comes back from the subnet that holds it. The quota above has already bounded
+        // how many targets this walks.
+        let zones = resolve_targets(
+            ctx,
+            &region,
+            &target_type,
+            vpc_id.as_deref(),
+            ip_address_type.as_deref(),
+            &input.targets,
+        )
+        .await?;
 
         let mut guard = state.lock();
         let Some(group) = guard.target_groups.get_mut(&input.target_group_arn) else {
-            return Err(RegisterTargetsErrorModeled::TargetGroupNotFoundException(
-                TargetGroupNotFoundException {
-                    message: Some(crate::state::target_groups_not_found_message([
-                        input.target_group_arn.as_str(),
-                    ])),
-                },
-            )
-            .into());
+            return Err(group_not_found(&input.target_group_arn));
         };
+        // Asked again on the record as it is NOW: the store is unlocked while the targets
+        // are resolved, so another request may have filled the group in between, and the
+        // bound is on what is stored rather than on what was stored when this one started.
+        check_quota(group, &requested)?;
 
-        // The registration keys this request asks for: the target's own port, else
-        // the group's ("by default, the load balancer routes requests to registered
-        // targets using the protocol and port for the target group. Alternatively,
-        // you can override the port for a target when you register it").
-        let requested: Vec<(String, Option<i32>)> = input
-            .targets
-            .iter()
-            .map(|target| (target.id.clone(), target.port.or(group.port)))
-            .collect();
-
-        // The target group's own bound, checked for the WHOLE request before the
-        // first insert, so a refusal stores nothing: past it the emulator answers
-        // the modelled quota error instead of growing without end. Re-registering a
-        // target the group already holds replaces it, so it does not count.
-        let mut added: std::collections::BTreeSet<&(String, Option<i32>)> =
-            std::collections::BTreeSet::new();
-        for key in &requested {
-            if !group.targets.contains_key(key) {
-                added.insert(key);
-            }
-        }
-        if group.targets.len() + added.len() > crate::state::TARGETS_PER_TARGET_GROUP {
-            return Err(RegisterTargetsErrorModeled::TooManyTargetsException(
-                TooManyTargetsException {
-                    message: Some(format!(
-                        "This emulator holds at most {} targets per target group",
-                        crate::state::TARGETS_PER_TARGET_GROUP
-                    )),
-                },
-            )
-            .into());
-        }
-
-        for (target, (id, port)) in input.targets.iter().zip(requested) {
+        for ((target, (id, port)), zone) in input.targets.iter().zip(requested).zip(zones) {
             group.targets.insert(
                 (id.clone(), port),
                 crate::state::RegisteredTarget {
                     id,
                     port,
-                    availability_zone: target.availability_zone.clone(),
+                    // The zone the address resolved to, else what the request named:
+                    // "if the target type is ip and the IP address is in a subnet of the
+                    // VPC for the target group, the Availability Zone is automatically
+                    // detected".
+                    availability_zone: zone.or_else(|| target.availability_zone.clone()),
                     registered_at: now,
                     healthy_at: now + crate::state::SETTLE_AFTER,
                 },
@@ -213,5 +237,175 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         Ok(RegisterTargetsOutput {})
+    }
+}
+
+/// The modelled refusal for a `TargetGroupArn` this store holds no target group for.
+fn group_not_found(arn: &str) -> RegisterTargetsError {
+    RegisterTargetsErrorModeled::TargetGroupNotFoundException(TargetGroupNotFoundException {
+        message: Some(crate::state::target_groups_not_found_message([arn])),
+    })
+    .into()
+}
+
+/// Refuse the WHOLE request when the registrations it asks for would take `group` past
+/// its quota, so nothing is stored and no further work is owed:
+/// `TooManyTargetsException`, the number of targets a group of this kind holds
+/// ([`crate::state::targets_per_target_group`]).
+///
+/// Re-registering a target the group already holds REPLACES that registration, so it does
+/// not count — and neither does one key asked for twice in the same request, which is the
+/// same single registration. Both are answered by sorting the keys this request would add
+/// and dropping the repeats, which is O(n log n) in the requested count rather than a scan
+/// per element.
+fn check_quota(
+    group: &crate::state::TargetGroupRecord,
+    requested: &[(String, Option<i32>)],
+) -> Result<(), RegisterTargetsError> {
+    let quota = crate::state::targets_per_target_group(group);
+    let mut added: Vec<&(String, Option<i32>)> = requested
+        .iter()
+        .filter(|key| !group.targets.contains_key(*key))
+        .collect();
+    added.sort();
+    added.dedup();
+    let held = group.targets.len() + added.len();
+    if held <= quota {
+        return Ok(());
+    }
+    Err(
+        RegisterTargetsErrorModeled::TooManyTargetsException(TooManyTargetsException {
+            message: Some(format!(
+                "A target group of this kind holds at most {quota} targets, and this \
+                 request would take it to {held}"
+            )),
+        })
+        .into(),
+    )
+}
+
+/// The modelled refusal for a target this target group cannot carry — the error whose own
+/// documentation states the rule: "the specified target does not exist, is not in the
+/// same VPC as the target group, or has an unsupported instance type".
+///
+/// What this is NOT raised for: a request that names one target id twice on two different
+/// ports. The issue behind this validation reported such a request as one AWS refuses, and
+/// the model documents the opposite — "you can register each EC2 instance or IP address
+/// with the same target group multiple times using different ports" — while the recording
+/// it cites shows the refusal was about the target id not being an IP address, which is
+/// what [`resolve_targets`] answers. A registration is keyed by target id AND port, so two
+/// ports for one id are two registrations whether they arrive in one request or in two.
+fn invalid_target(detail: String) -> RegisterTargetsError {
+    RegisterTargetsErrorModeled::InvalidTargetException(InvalidTargetException {
+        message: Some(detail),
+    })
+    .into()
+}
+
+/// Resolve every target of the request against the service that owns it, answering the
+/// Availability Zone each registration takes (`None` where nothing resolved one) or the
+/// refusal the request earns.
+///
+/// What a target id NAMES depends on the group's target type (`TargetDescription$Id`: "if
+/// the target type of the target group is `instance`, specify an instance ID. If the
+/// target type is `ip`, specify an IP address"), and neither an instance nor a VPC is a
+/// resource of this service — so both are resolved against EC2
+/// ([`crate::state::network`]), and a target EC2 does not hold, or holds somewhere other
+/// than the target group's own VPC, is refused rather than registered.
+///
+/// A target type whose targets belong to no VPC (`lambda`, `alb`) resolves nothing here:
+/// what such an id names is a resource of another service again, and its own quota — one
+/// per target group — is what bounds it.
+async fn resolve_targets(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    target_type: &str,
+    vpc_id: Option<&str>,
+    ip_address_type: Option<&str>,
+    targets: &[TargetDescription],
+) -> Result<Vec<Option<String>>, RegisterTargetsError> {
+    let unresolved = || Ok(vec![None; targets.len()]);
+    match target_type {
+        "ip" => {
+            // What the ids ARE is decided by this request alone, so it is answered before
+            // anything is asked of EC2 — and for every target, so a refusal registers
+            // none of them.
+            let addresses = targets
+                .iter()
+                .map(|target| {
+                    crate::state::network::parse_ip_target(&target.id, ip_address_type)
+                        .map_err(crate::scaffolded::Scaffolded::validation_error)
+                })
+                .collect::<Result<Vec<std::net::IpAddr>, RegisterTargetsError>>()?;
+            let Some(vpc_id) = vpc_id else {
+                return unresolved();
+            };
+            // One read of the VPC and one of its subnets serves the whole request.
+            let (Some(cidrs), Some(subnets)) = (
+                crate::state::network::vpc_cidrs(ctx, region, vpc_id).await,
+                crate::state::network::subnets_of_vpc(ctx, region, vpc_id).await,
+            ) else {
+                // No EC2 answered, so nothing is known about the VPC: a refusal would
+                // be assumed from silence rather than grounded in what EC2 reported.
+                return unresolved();
+            };
+            if cidrs.is_empty() && subnets.is_empty() {
+                return unresolved();
+            }
+            let mut zones: Vec<Option<String>> = Vec::with_capacity(targets.len());
+            for (target, address) in targets.iter().zip(addresses) {
+                let zone = crate::state::network::resolve_ip_target(
+                    address,
+                    target.availability_zone.as_deref(),
+                    vpc_id,
+                    &cidrs,
+                    &subnets,
+                )
+                // What is wrong here is the VALUE of a member — the address, or the zone
+                // the request did not name for it — rather than a target that cannot be
+                // found, so it is this service's own `ValidationError`, the refusal every
+                // other member whose rule the model states but cannot express earns.
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+                zones.push(zone);
+            }
+            Ok(zones)
+        }
+        "instance" => {
+            // The distinct ids, so one read of EC2 serves repeats of one instance. A set
+            // rather than a scan per element: the count is bounded by the group's quota,
+            // checked before this runs, and the work stays O(n log n) in it either way.
+            let ids: Vec<String> = targets
+                .iter()
+                .map(|target| target.id.clone())
+                .collect::<std::collections::BTreeSet<String>>()
+                .into_iter()
+                .collect();
+            match crate::state::network::resolve_instance_targets(ctx, region, &ids).await {
+                crate::state::network::InstanceTargets::Absent(id) => Err(invalid_target(format!(
+                    "The target '{id}' is not valid: this account holds no instance with \
+                     that id"
+                ))),
+                crate::state::network::InstanceTargets::Resolved(instances) => {
+                    // "... is not in the same VPC as the target group": compared only
+                    // where both VPCs are known, because a value neither side reports
+                    // cannot disagree.
+                    if let Some(vpc_id) = vpc_id {
+                        if let Some((id, elsewhere)) = instances.iter().find_map(|(id, vpc)| {
+                            vpc.as_deref()
+                                .filter(|holding| *holding != vpc_id)
+                                .map(|holding| (id, holding))
+                        }) {
+                            return Err(invalid_target(format!(
+                                "The target '{id}' is in VPC {elsewhere}, not in VPC \
+                                 {vpc_id} of the target group"
+                            )));
+                        }
+                    }
+                    unresolved()
+                }
+                crate::state::network::InstanceTargets::Unknown => unresolved(),
+            }
+        }
+        _ => unresolved(),
     }
 }

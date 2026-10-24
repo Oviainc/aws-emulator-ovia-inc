@@ -23,9 +23,7 @@ use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state
     self, AnswerRecord,
 };
 
-use super::workload_harness::{
-    answered, encode_path_segment, review_template as template, Answer, Client,
-};
+use super::workload_harness::{answered, review_template as template, Answer, Client};
 
 /// The published question numbering of the AWS Well-Architected Framework lens, pillar
 /// by pillar in the order the framework presents them: OPS 1-11, SEC 1-11, REL 1-13,
@@ -88,30 +86,16 @@ fn absent_template_arn(template_id: &str) -> String {
     )
 }
 
-/// `GET /reviewTemplates/{TemplateArn}/lensReviews/{LensAlias}/answers`: both labels are
-/// non-greedy, so each travels percent-encoded in one path segment, exactly as an SDK
-/// sends it.
+/// `ListReviewTemplateAnswers` with the query members this suite's cases name, through
+/// the one request builder the crate's suites share.
 async fn list_answers(
     client: &Client,
     template_arn: &str,
     lens: &str,
     query: &[String],
 ) -> Answer {
-    let suffix = if query.is_empty() {
-        String::new()
-    } else {
-        format!("?{}", query.join("&"))
-    };
     client
-        .send(
-            "GET",
-            &format!(
-                "/reviewTemplates/{}/lensReviews/{}/answers{suffix}",
-                encode_path_segment(template_arn),
-                encode_path_segment(lens)
-            ),
-            None,
-        )
+        .list_review_template_answers(template_arn, lens, &query.join("&"))
         .await
 }
 

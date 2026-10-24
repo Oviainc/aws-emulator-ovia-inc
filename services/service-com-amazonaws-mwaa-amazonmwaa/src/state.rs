@@ -7,6 +7,7 @@
 //! and nothing is echoed straight back out of a request without being stored first.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ops::RangeInclusive;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -182,20 +183,58 @@ const LOG_TYPE_WEBSERVER: &str = "WebServer";
 /// Worker log type — see [`LOG_TYPE_DAG_PROCESSING`].
 const LOG_TYPE_WORKER: &str = "Worker";
 
+/// The only number of schedulers / web servers an [`MICRO_ENVIRONMENT_CLASS`] environment
+/// runs: it is the class "larger than mw1.micro" excludes from the documented 2-to-5
+/// range, and the class whose documented default count is 1. See [`unit_count_range`].
+pub const MICRO_UNIT_COUNT: i32 = 1;
+
+/// The smallest number of schedulers / web servers an environment larger than
+/// [`MICRO_ENVIRONMENT_CLASS`] runs — the floor of the documented "values from 2 to 5".
+/// See [`unit_count_range`].
+pub const MIN_UNIT_COUNT: i32 = 2;
+
+/// The largest number of schedulers / web servers ANY environment runs — the ceiling of
+/// the documented "values from 2 to 5". See [`unit_count_range`].
+pub const MAX_UNIT_COUNT: i32 = 5;
+
+/// Every number of schedulers (or of minimum / maximum web servers) an environment of
+/// `environment_class` may run, smallest first.
+///
+/// `Schedulers`, `MinWebservers` and `MaxWebservers` state the same accepted set in their
+/// own member docs — "For environments larger than mw1.micro, accepts values from 2 to 5.
+/// Defaults to 2 for all environment sizes except mw1.micro, which defaults to 1."
+/// (`smithy_query(query="doc", shape="CreateEnvironmentInput", member="Schedulers")`) — so
+/// the class an environment ends up on decides the range: the single-instance
+/// [`MICRO_ENVIRONMENT_CLASS`], which that sentence excludes, runs exactly
+/// [`MICRO_UNIT_COUNT`]; every larger class runs [`MIN_UNIT_COUNT`] through
+/// [`MAX_UNIT_COUNT`]. (`Schedulers` adds "v1 - Accepts 1", which selects the Apache
+/// Airflow 1.x line that [`SUPPORTED_AIRFLOW_VERSIONS`] does not carry, so no supported
+/// version reaches that clause.)
+///
+/// The model states only part of this — `Schedulers` is `@range(max: 5)` with no minimum,
+/// the web-server counts are `@range(min: 1)` with no maximum — so the accepted set is a
+/// business rule the handlers enforce ([`EnvironmentSpec::validate`]) rather than one the
+/// boundary validator can.
+pub fn unit_count_range(environment_class: &str) -> RangeInclusive<i32> {
+    if environment_class == MICRO_ENVIRONMENT_CLASS {
+        MICRO_UNIT_COUNT..=MICRO_UNIT_COUNT
+    } else {
+        MIN_UNIT_COUNT..=MAX_UNIT_COUNT
+    }
+}
+
 /// The number of schedulers (and of minimum / maximum web servers) an environment runs
 /// when the create names none.
 ///
 /// The `Schedulers`, `MinWebservers` and `MaxWebservers` docs all state the same rule:
-/// "Defaults to 2 for all environment sizes except mw1.micro, which defaults to 1."
+/// "Defaults to 2 for all environment sizes except mw1.micro, which defaults to 1." — in
+/// both cases the smallest count the class accepts, so the default is the floor of
+/// [`unit_count_range`].
 ///
 /// The class is the one the environment ends up on, which for a create that named none is
 /// [`DEFAULT_ENVIRONMENT_CLASS`].
 pub fn default_unit_count(environment_class: &str) -> i32 {
-    if environment_class == MICRO_ENVIRONMENT_CLASS {
-        1
-    } else {
-        2
-    }
+    *unit_count_range(environment_class).start()
 }
 
 /// One Apache Airflow log type's logging settings, as a create or update supplied them —
@@ -358,9 +397,10 @@ pub struct EnvironmentSpec {
 
 impl EnvironmentSpec {
     /// Every rule the RESOLVED environment configuration must satisfy that the Smithy
-    /// model cannot state — a value set the member's doc fixes, and a bound one member
-    /// places on another — as one check both `CreateEnvironment` and `UpdateEnvironment`
-    /// run before anything is stored.
+    /// model cannot state — a value set the member's doc fixes, the per-class count range
+    /// a sizing member's doc fixes, and a bound one member places on another — as one
+    /// check both `CreateEnvironment` and `UpdateEnvironment` run before anything is
+    /// stored.
     ///
     /// It is run on the configuration the request WOULD store: for an update that is the
     /// stored record with the request's members merged in, so a patch naming only one side
@@ -385,6 +425,33 @@ impl EnvironmentSpec {
                 return Err(format!(
                     "{value} is not a supported {member}. Valid values: {}.",
                     valid.join(", ")
+                ));
+            }
+        }
+        // Each count of a service-scaled unit whose own doc fixes a per-class accepted
+        // range has to lie in the range of the class the environment ends up on: a count
+        // outside it describes a fleet the service does not run. Judged on the RESOLVED
+        // class, so a request that moves the class is judged by the range of the class it
+        // moves to. (`MinWorkers` / `MaxWorkers` are not in this table: their docs fix no
+        // such range, and their only per-member bound is the modelled `@range(min: 1)` the
+        // boundary validator already enforces.)
+        let accepted = unit_count_range(&self.environment_class);
+        for (member, value) in [
+            ("Schedulers", self.schedulers),
+            ("MinWebservers", self.min_webservers),
+            ("MaxWebservers", self.max_webservers),
+        ] {
+            if !accepted.contains(&value) {
+                let (floor, ceiling) = (accepted.start(), accepted.end());
+                let valid = if floor == ceiling {
+                    floor.to_string()
+                } else {
+                    format!("{floor} to {ceiling}")
+                };
+                return Err(format!(
+                    "{value} is not a valid {member} for an environment of class {}. \
+                     Valid values: {valid}.",
+                    self.environment_class
                 ));
             }
         }

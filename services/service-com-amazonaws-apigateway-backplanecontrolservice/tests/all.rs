@@ -146,3 +146,5 @@ mod delete_deployment;
 mod rest_api_create_from_import;
 #[path = "all/usage_plan_collection.rs"]
 mod usage_plan_collection;
+#[path = "all/domain_name_access_associations.rs"]
+mod domain_name_access_associations;

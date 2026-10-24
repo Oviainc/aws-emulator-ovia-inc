@@ -285,6 +285,16 @@ pub const APPLICATION_STATUS_ENABLED: &str = "ENABLED";
 /// `"default": "ENABLED"`.
 pub const APPLICATION_VISIBILITY_ENABLED: &str = "ENABLED";
 
+/// The assignment configuration an application carries before any
+/// `PutApplicationAssignmentConfiguration` sets one.
+///
+/// The MODEL's default, not a choice: `AssignmentRequired` carries `"default": true` on
+/// both the put's input and the get's output, and the member's own documentation states
+/// it — "If AssignmentsRequired is true (default value), users don't have access to the
+/// application unless an assignment is created using the CreateApplicationAssignment
+/// API."
+pub const APPLICATION_ASSIGNMENT_REQUIRED_DEFAULT: bool = true;
+
 /// `SignInOrigin::APPLICATION` — the origin that redirects the user to the application's
 /// own URL, which is why `SignInOptions$ApplicationUrl` is required with it.
 pub const SIGN_IN_ORIGIN_APPLICATION: &str = "APPLICATION";
@@ -1461,6 +1471,15 @@ pub struct ApplicationRecord {
     pub description: Option<String>,
     /// `ApplicationStatus`: `ENABLED` or `DISABLED`.
     pub status: String,
+    /// `AssignmentRequired` — whether a principal needs a direct assignment to this
+    /// application to reach it, as the last `PutApplicationAssignmentConfiguration` set
+    /// it and as `GetApplicationAssignmentConfiguration` reports it.
+    ///
+    /// It lives ON the application record rather than in a second map, so an application
+    /// that no longer exists holds no configuration and the configuration operations
+    /// resolve the same application every other read resolves. An application nothing has
+    /// configured carries [`APPLICATION_ASSIGNMENT_REQUIRED_DEFAULT`].
+    pub assignment_required: bool,
     /// `PortalOptions`, normalised so the stored visibility is always explicit (see
     /// [`APPLICATION_VISIBILITY_ENABLED`]).
     pub portal_options: PortalOptions,

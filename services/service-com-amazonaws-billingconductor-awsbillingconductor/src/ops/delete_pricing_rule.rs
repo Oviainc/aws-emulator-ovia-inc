@@ -180,8 +180,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "inconsistent state by updating or deleting a resource" the modelled
         // `ConflictException` describes, and `ConflictExceptionReason` enumerates the
         // case by name (`PRICING_RULE_ATTACHED_TO_PRICING_PLAN_DELETE_CONFLICT`). The
-        // caller disassociates the rule from its plans first.
-        let holders = state.pricing_plans_referencing_rule(&rule_arn);
+        // caller disassociates the rule from its plans first. The delete takes effect
+        // in the current billing period, so the associations that block it are the
+        // ones in force then.
+        let holders = state
+            .pricing_plans_referencing_rule(&rule_arn, &crate::state::current_billing_period());
         if let Some(plan_arn) = holders.first() {
             return Err(DeletePricingRuleErrorModeled::ConflictException(
                 ConflictException {

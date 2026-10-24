@@ -8,8 +8,8 @@
 //! operation's modelled resource-state error — the `ConflictException` the model
 //! documents as "The data store is in a transition state and the user requested
 //! action cannot be performed." while the record is in a non-terminal transition
-//! (`CREATING`, `DELETING`), and `ResourceNotFoundException` once it has reached
-//! the terminal `DELETED` — and never the authorization-shaped
+//! (`CREATING`, `UPDATING`, `DELETING`), and `ResourceNotFoundException` once it
+//! has reached the terminal `DELETED` — and never the authorization-shaped
 //! `AccessDeniedException`, which this service raises for an authorization
 //! failure alone.
 //!
@@ -87,13 +87,14 @@ fn mutations() -> Vec<(&'static str, Value, DatastoreAction)> {
 /// once the transition the clock owes has fallen due.
 ///
 /// Source: `smithy_query(query="shape", shape="DatastoreStatus")` for the value
-/// set; the states the enum also declares (`CREATE_FAILED`, `UPDATING`,
-/// `UPDATE_FAILED`) describe work or a failure nothing in this slice produces,
+/// set; the states the enum also declares (`CREATE_FAILED`, `UPDATE_FAILED`)
+/// describe a FAILURE of the asynchronous work nothing in this slice fails at,
 /// so no row can reach them through the lifecycle.
 fn states() -> Vec<(DatastoreStatus, &'static str)> {
     vec![
         (DatastoreStatus::Creating, "ACTIVE"),
         (DatastoreStatus::Active, "ACTIVE"),
+        (DatastoreStatus::Updating, "ACTIVE"),
         (DatastoreStatus::Deleting, "DELETED"),
         (DatastoreStatus::Deleted, "DELETED"),
     ]
@@ -108,6 +109,14 @@ async fn datastore_in(service: &HealthLake, status: DatastoreStatus) -> String {
         // The create's own transition is still pending.
         DatastoreStatus::Creating => {}
         DatastoreStatus::Active => tokio::time::sleep(PAST_TRANSITION).await,
+        // An update of its own, carrying no member, so the record is in
+        // `UPDATING` without the name this suite watches having changed.
+        DatastoreStatus::Updating => {
+            tokio::time::sleep(PAST_TRANSITION).await;
+            service
+                .ok("UpdateFHIRDatastore", &json!({ "DatastoreId": &id }))
+                .await;
+        }
         DatastoreStatus::Deleting => {
             tokio::time::sleep(PAST_TRANSITION).await;
             service

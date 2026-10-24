@@ -6,11 +6,14 @@
 //!
 //! RULE: the operation REPORTS, for the pricing plan the request names (in either
 //! spelling the modelled `PricingPlanArn` pattern allows), exactly the set of
-//! pricing rules persisted as that plan's associations — each as its FULL rule ARN,
-//! deduplicated, in ARN order, bounded by the request's `MaxResults` with a
-//! `NextToken` naming the rest — while a plan this account does not hold is refused
-//! with the modelled 404. Nothing is written: a later caller sees exactly what an
-//! earlier one did.
+//! pricing rules whose association with that plan is in force in the `BillingPeriod`
+//! asked about — each as its FULL rule ARN, deduplicated, in ARN order, bounded by
+//! the request's `MaxResults` with a `NextToken` naming the rest — while a plan this
+//! account does not hold is refused with the modelled 404. Nothing is written: a
+//! later caller sees exactly what an earlier one did.
+//!
+//! The period dimension itself — which periods report an association that started in
+//! a given one — is the subject of `tests/all/pricing_rule_association_periods.rs`.
 //!
 //! Every table's rows differ along what the rule generalises over: how many rules a
 //! plan associates (0, 1, 2, 3, 30 — the modelled input maximum), the spelling each
@@ -197,6 +200,30 @@ fn is_billing_period(value: &str) -> bool {
         && (1..=2).contains(&month.len())
 }
 
+/// The billing period the service calls current: the period an association made by
+/// this test starts in, read from the same clock the service answers from so the
+/// expectation holds whatever month the test runs in.
+fn current_period() -> String {
+    service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period()
+}
+
+/// A `BillingPeriod` as a comparable `(year, month)`, so `2026-7` and `2026-07` are
+/// the same period.
+fn period_key(value: &str) -> (u32, u32) {
+    let (year, month) = value
+        .split_once('-')
+        .expect("a test period is spelled YYYY-MM");
+    (
+        year.parse().expect("a test period has a numeric year"),
+        month.parse().expect("a test period has a numeric month"),
+    )
+}
+
+/// Is `period` the period `start` or a later one?
+fn period_at_or_after(period: &str, start: &str) -> bool {
+    period_key(period) >= period_key(start)
+}
+
 /// One row of the association table: the spellings a plan was created with, and the
 /// full rule ARNs the service owes back for it.
 struct AssociationRow {
@@ -322,6 +349,12 @@ async fn the_reported_period_is_the_one_the_request_named_and_otherwise_absent()
         .create_plan("period-plan", &["AAAAAAAAA1".to_string()])
         .await;
 
+    // The association this test made starts in the billing period the create ran in,
+    // so a period before that reports it not at all and a period from it onward
+    // reports it — whatever month the clock says, which is why the expectation is
+    // derived rather than written down.
+    let started_in = current_period();
+
     // Rows differ along the period asked for: months at each end of the modelled
     // `BillingPeriod` pattern, a past year and a future one.
     for period in ["2020-01", "2026-09", "2026-10", "2031-12"] {
@@ -341,10 +374,16 @@ async fn the_reported_period_is_the_one_the_request_named_and_otherwise_absent()
             "case {period:?}: the reported period must satisfy the modelled YYYY-MM form, \
              got {body:?}"
         );
+        let expected: Vec<String> = if period_at_or_after(period, &started_in) {
+            vec![rule_arn("AAAAAAAAA1")]
+        } else {
+            vec![]
+        };
         assert_eq!(
             reported(&body),
-            vec![rule_arn("AAAAAAAAA1")],
-            "case {period:?}: the associations must not depend on the period, got {body:?}"
+            expected,
+            "case {period:?}: an association that started in {started_in} must be reported \
+             from that period onward and not before; expected {expected:?}, got {body:?}"
         );
     }
 

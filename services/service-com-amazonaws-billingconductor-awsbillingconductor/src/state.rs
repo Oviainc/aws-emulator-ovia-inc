@@ -332,10 +332,70 @@ pub struct PricingPlanRecord {
     pub arn: String,
     pub name: String,
     pub description: Option<String>,
-    pub pricing_rule_arns: Vec<String>,
+    /// The rules this plan associates, each with the billing period its association
+    /// started in — see [`PricingRuleAssociationRecord`].
+    pub pricing_rule_associations: Vec<PricingRuleAssociationRecord>,
     pub tags: BTreeMap<String, String>,
     pub creation_time_millis: i64,
     pub last_modified_time_millis: i64,
+}
+
+impl PricingPlanRecord {
+    /// The FULL ARNs of the rules this plan associates IN `billing_period`,
+    /// deduplicated and in ARN order.
+    ///
+    /// The association is to the RULE, not to the spelling it was recorded with, so
+    /// two spellings of one rule collapse to one association.
+    pub fn associated_rule_arns(&self, billing_period: &str) -> Vec<String> {
+        self.pricing_rule_associations
+            .iter()
+            .filter(|association| association.covers(billing_period))
+            .map(|association| normalize_pricing_rule_arn(&association.arn))
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect()
+    }
+}
+
+/// One pricing rule association on a pricing plan, with the billing period it
+/// started in.
+///
+/// A Billing Conductor association is scoped to a billing period — every read of one
+/// names the period it is asking about (`BillingPeriod`: "the billing period for which
+/// the pricing rule associations are to be listed") — so the record keeps the period
+/// from which the association is in force rather than only the rule. The period an
+/// association starts in is the one the associating call was made in, the same
+/// `InclusiveStartBillingPeriod` sense a custom line item's billing period range
+/// carries (see [`billing_period_range_covers`]).
+/// `Default` is deliberately NOT derived: an empty start period is not a billing
+/// period, and a record that carried one would be read as unbounded. Every
+/// association is built through [`Self::started_now`].
+#[derive(Debug, Clone)]
+pub struct PricingRuleAssociationRecord {
+    /// The FULL pricing rule ARN ([`normalize_pricing_rule_arn`]).
+    pub arn: String,
+    /// The first billing period this association is in force for.
+    pub inclusive_start_billing_period: String,
+}
+
+impl PricingRuleAssociationRecord {
+    /// An association made NOW: in force from the current billing period onward.
+    pub fn started_now(rule_arn: &str) -> Self {
+        Self {
+            arn: normalize_pricing_rule_arn(rule_arn),
+            inclusive_start_billing_period: current_billing_period(),
+        }
+    }
+
+    /// Is this association in force in `billing_period`? An association has no end
+    /// while it stands, so every period from the one it started in onward is covered.
+    pub fn covers(&self, billing_period: &str) -> bool {
+        billing_period_range_covers(
+            Some(&self.inclusive_start_billing_period),
+            None,
+            billing_period,
+        )
+    }
 }
 
 /// A pricing rule as `CreatePricingRule` persisted it.
@@ -1036,25 +1096,31 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             .collect()
     }
 
-    /// The ARNs of every stored pricing plan whose `PricingRuleArns` names this
-    /// pricing rule. A plan may name a rule in either spelling the
-    /// `PricingRuleArn` pattern allows, so both sides are normalised.
-    pub fn pricing_plans_referencing_rule(&self, rule_arn: &str) -> Vec<String> {
+    /// The ARNs of every stored pricing plan that associates this pricing rule IN
+    /// `billing_period`. A plan may name a rule in either spelling the
+    /// `PricingRuleArn` pattern allows, so both sides are normalised, and an
+    /// association that had not started by `billing_period` is not in force then.
+    pub fn pricing_plans_referencing_rule(
+        &self,
+        rule_arn: &str,
+        billing_period: &str,
+    ) -> Vec<String> {
         self.pricing_plans
             .iter()
             .filter(|(_, plan)| {
-                plan.pricing_rule_arns
+                plan.associated_rule_arns(billing_period)
                     .iter()
-                    .any(|arn| normalize_pricing_rule_arn(arn) == rule_arn)
+                    .any(|arn| arn == rule_arn)
             })
             .map(|(arn, _)| arn.clone())
             .collect()
     }
 
     /// `AssociatedPricingPlanCount`: "The pricing plans count that this pricing rule
-    /// is associated with."
-    pub fn associated_pricing_plan_count(&self, rule_arn: &str) -> i64 {
-        i64::try_from(self.pricing_plans_referencing_rule(rule_arn).len()).unwrap_or(i64::MAX)
+    /// is associated with" — in `billing_period`, the period the read is scoped to.
+    pub fn associated_pricing_plan_count(&self, rule_arn: &str, billing_period: &str) -> i64 {
+        i64::try_from(self.pricing_plans_referencing_rule(rule_arn, billing_period).len())
+            .unwrap_or(i64::MAX)
     }
 
     /// True when the pricing plan ARN can be used by a billing group: either the
@@ -1085,26 +1151,24 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         self.billing_groups.contains_key(&group_arn).then_some(group_arn)
     }
 
-    /// The pricing rules associated with the plan `plan_arn` names: FULL rule ARNs,
-    /// deduplicated and in ARN order, or `None` when this account has no such plan.
+    /// The pricing rules associated with the plan `plan_arn` names IN
+    /// `billing_period`: FULL rule ARNs, deduplicated and in ARN order, or `None`
+    /// when this account has no such plan.
     ///
-    /// The association is to the RULE, not to the spelling the association was
-    /// recorded with, so each stored value is normalised
-    /// ([`normalize_pricing_rule_arn`]) and two spellings of one rule collapse to
-    /// one association. An AWS-managed plan exists without the caller creating it
-    /// and carries no rule of the caller's, so it associates an EMPTY set rather
-    /// than being unknown. The order is the ARN order the ids are minted in, so a
-    /// `NextToken` cut over this sequence names the same point on the next call.
-    pub fn associated_pricing_rule_arns(&self, plan_arn: &str) -> Option<Vec<String>> {
+    /// An association is in force from the billing period it was made in onward, so a
+    /// period before it started reports it not at all — see
+    /// [`PricingPlanRecord::associated_rule_arns`]. An AWS-managed plan exists without
+    /// the caller creating it and carries no rule of the caller's, so it associates an
+    /// EMPTY set rather than being unknown. The order is the ARN order the ids are
+    /// minted in, so a `NextToken` cut over this sequence names the same point on the
+    /// next call.
+    pub fn associated_pricing_rule_arns(
+        &self,
+        plan_arn: &str,
+        billing_period: &str,
+    ) -> Option<Vec<String>> {
         match self.pricing_plans.get(plan_arn) {
-            Some(plan) => Some(
-                plan.pricing_rule_arns
-                    .iter()
-                    .map(|arn| normalize_pricing_rule_arn(arn))
-                    .collect::<BTreeSet<String>>()
-                    .into_iter()
-                    .collect(),
-            ),
+            Some(plan) => Some(plan.associated_rule_arns(billing_period)),
             None => is_aws_managed_pricing_plan(plan_arn).then(Vec::new),
         }
     }

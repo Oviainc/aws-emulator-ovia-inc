@@ -33,32 +33,16 @@
 //!   walk, the KEY by the handler, since that walk reads a map entry's key as the path
 //!   its value is reported under rather than checking it.
 
-use crate::harness::{call, output_config, past_the_transition_span, router, tags_path};
+use crate::harness::{
+    call, create_tagged_resource, expected_tags, pair, past_the_transition_span, read_resource,
+    router, tag_object, tags_of, tags_path, unresolvable_arns, TAGGABLE_KINDS,
+};
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
     invalid_tag_key_message, too_many_tags_message, MAX_TAGS_PER_RESOURCE, NOT_FOUND_MESSAGE,
     TAG_KEY_MAX_LENGTH, TAG_KEY_MIN_LENGTH,
 };
 use smithy_server_runtime::MultiServiceRouter;
-use std::collections::BTreeMap;
-
-/// The two kinds of resource this service tags, as the modelled `resourceArn` pattern
-/// spells them (`…:(feed|dictionary)/[a-zA-Z0-9]{1,19}$`). Every rule below is asserted
-/// on both, since the rule is about a RESOURCE and not about either kind.
-const KINDS: [&str; 2] = ["feed", "dictionary"];
-
-// The path a `TagResource` request goes to, with the ARN percent-encoded, comes from
-// the one encoder every suite that drives a tagging route shares
-// (`crate::harness::tags_path`).
-
-/// A `TagMap` body member built from a list of pairs.
-fn tag_object(tags: &[(String, String)]) -> Value {
-    Value::Object(
-        tags.iter()
-            .map(|(key, value)| (key.clone(), json!(value)))
-            .collect(),
-    )
-}
 
 /// `POST /v1/tags/{resourceArn}` carrying `tags`.
 async fn tag_resource(
@@ -73,75 +57,6 @@ async fn tag_resource(
         Some(json!({"tags": tag_object(tags)})),
     )
     .await
-}
-
-/// The `tags` member of a resource response, as a map so a comparison does not depend
-/// on key order.
-fn tags_of(resource: &Value) -> BTreeMap<String, String> {
-    resource["tags"]
-        .as_object()
-        .unwrap_or_else(|| panic!("a resource response carries a tags map, got {resource}"))
-        .iter()
-        .map(|(key, value)| {
-            (
-                key.clone(),
-                value
-                    .as_str()
-                    .unwrap_or_else(|| panic!("a tag value is a string, got {value}"))
-                    .to_string(),
-            )
-        })
-        .collect()
-}
-
-/// The expected tag set of a row, as a map.
-fn expected_map(tags: &[(String, String)]) -> BTreeMap<String, String> {
-    tags.iter().cloned().collect()
-}
-
-/// Create one resource of `kind` carrying `tags`, and return its id and its ARN.
-async fn create_resource(
-    router: &MultiServiceRouter,
-    kind: &str,
-    name: &str,
-    tags: &[(String, String)],
-) -> (String, String) {
-    let body = match kind {
-        "feed" => json!({
-            "name": name,
-            "outputs": [
-                {"name": "crop1", "outputConfig": output_config("cropping"), "status": "ENABLED"}
-            ],
-            "tags": tag_object(tags),
-        }),
-        "dictionary" => json!({"name": name, "language": "eng", "tags": tag_object(tags)}),
-        other => panic!("no such resource kind: {other}"),
-    };
-    let (status, created) = call(router, "POST", &format!("/v1/{kind}"), Some(body)).await;
-    assert_eq!(
-        status, 202,
-        "creating a {kind} named {name:?} answers 202, got {status} with {created}"
-    );
-    let id = created["id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("a created {kind} carries an id, got {created}"))
-        .to_string();
-    let arn = created["arn"]
-        .as_str()
-        .unwrap_or_else(|| panic!("a created {kind} carries an arn, got {created}"))
-        .to_string();
-    (id, arn)
-}
-
-/// Read one resource of `kind` back through its own implemented reader (`GetFeed` /
-/// `GetDictionary`), which is where the tags this operation writes have to show up.
-async fn read_resource(router: &MultiServiceRouter, kind: &str, id: &str) -> (u16, Value) {
-    call(router, "GET", &format!("/v1/{kind}/{id}"), None).await
-}
-
-/// A pair, from two `&str`s.
-fn pair(key: &str, value: &str) -> (String, String) {
-    (key.to_string(), value.to_string())
 }
 
 /// One row of the merge table: what the resource already carried, what the request
@@ -228,11 +143,12 @@ fn merge_cases() -> Vec<MergeCase> {
 async fn tags_merge_into_the_resource_and_are_visible_to_the_next_read() {
     let router = router();
 
-    for kind in KINDS {
+    for kind in TAGGABLE_KINDS {
         for (index, case) in merge_cases().into_iter().enumerate() {
             let label = format!("{} on a {kind}", case.label);
             let (id, arn) =
-                create_resource(&router, kind, &format!("tag{kind}{index}"), &case.initial).await;
+                create_tagged_resource(&router, kind, &format!("tag{kind}{index}"), &case.initial)
+                    .await;
 
             let (status, body) = tag_resource(&router, &arn, &case.request).await;
             assert_eq!(
@@ -252,7 +168,7 @@ async fn tags_merge_into_the_resource_and_are_visible_to_the_next_read() {
             );
             assert_eq!(
                 tags_of(&stored),
-                expected_map(&case.expected),
+                expected_tags(&case.expected),
                 "case {label:?}: the merged tag set is what the next read reports, got {stored}"
             );
 
@@ -265,54 +181,11 @@ async fn tags_merge_into_the_resource_and_are_visible_to_the_next_read() {
             let (_, repeated) = read_resource(&router, kind, &id).await;
             assert_eq!(
                 tags_of(&repeated),
-                expected_map(&case.expected),
+                expected_tags(&case.expected),
                 "case {label:?}: repeating the tag write changes nothing, got {repeated}"
             );
         }
     }
-}
-
-/// One row of the unresolvable-ARN table: how the ARN differs from the one the resource
-/// carries.
-struct ArnCase {
-    label: &'static str,
-    arn: String,
-}
-
-/// ARNs that satisfy the modelled `resourceArn` pattern but name no resource of this
-/// store, built by moving each field of a real resource's ARN in turn: the resource
-/// kind, the id, the region and the account.
-fn unresolvable_arns(kind: &str, arn: &str) -> Vec<ArnCase> {
-    let other_kind = if kind == "feed" { "dictionary" } else { "feed" };
-    let fields: Vec<&str> = arn.split(':').collect();
-    let (region, account, resource) = (fields[3], fields[4], fields[5]);
-    let id = resource.split('/').next_back().expect("the ARN carries an id");
-    let rebuilt = |region: &str, account: &str, resource: &str| {
-        format!(
-            "{}:{}:{}:{region}:{account}:{resource}",
-            fields[0], fields[1], fields[2]
-        )
-    };
-    vec![
-        ArnCase {
-            label: "an id no resource of this kind holds",
-            arn: rebuilt(region, account, &format!("{kind}/aaaaaaaaaaaaaaaaaaa")),
-        },
-        ArnCase {
-            label: "this resource's id under the other resource kind",
-            arn: rebuilt(region, account, &format!("{other_kind}/{id}")),
-        },
-        ArnCase {
-            label: "the right resource in another region",
-            arn: rebuilt("eu-west-1", account, resource),
-        },
-        ArnCase {
-            label: "the right resource in another account",
-            // Any 12-digit account that is not the one this emulator serves
-            // (`engine::EMULATOR_ACCOUNT_ID`), which the stored ARN carries.
-            arn: rebuilt(region, "123456789012", resource),
-        },
-    ]
 }
 
 /// A `resourceArn` that is not the ARN a stored resource carries names nothing, and
@@ -321,9 +194,10 @@ fn unresolvable_arns(kind: &str, arn: &str) -> Vec<ArnCase> {
 async fn an_arn_that_names_no_stored_resource_is_not_found() {
     let router = router();
 
-    for kind in KINDS {
+    for kind in TAGGABLE_KINDS {
         let initial = vec![pair("env", "dev")];
-        let (id, arn) = create_resource(&router, kind, &format!("miss{kind}"), &initial).await;
+        let (id, arn) =
+            create_tagged_resource(&router, kind, &format!("miss{kind}"), &initial).await;
 
         for case in unresolvable_arns(kind, &arn) {
             let label = format!("{} ({kind})", case.label);
@@ -349,7 +223,7 @@ async fn an_arn_that_names_no_stored_resource_is_not_found() {
             let (_, stored) = read_resource(&router, kind, &id).await;
             assert_eq!(
                 tags_of(&stored),
-                expected_map(&initial),
+                expected_tags(&initial),
                 "case {label:?}: a refused tag write leaves the real resource untouched, got \
                  {stored}"
             );
@@ -363,9 +237,10 @@ async fn an_arn_that_names_no_stored_resource_is_not_found() {
 async fn a_resource_being_deleted_takes_no_tag() {
     let router = router();
 
-    for kind in KINDS {
+    for kind in TAGGABLE_KINDS {
         let initial = vec![pair("env", "dev")];
-        let (id, arn) = create_resource(&router, kind, &format!("gone{kind}"), &initial).await;
+        let (id, arn) =
+            create_tagged_resource(&router, kind, &format!("gone{kind}"), &initial).await;
         let (status, deleted) = call(&router, "DELETE", &format!("/v1/{kind}/{id}"), None).await;
         assert_eq!(
             status, 202,
@@ -387,7 +262,7 @@ async fn a_resource_being_deleted_takes_no_tag() {
         let (_, pending) = read_resource(&router, kind, &id).await;
         assert_eq!(
             tags_of(&pending),
-            expected_map(&initial),
+            expected_tags(&initial),
             "case {kind:?}: the refused write left the tag set alone, got {pending}"
         );
 
@@ -409,10 +284,11 @@ async fn the_tag_set_is_bounded_at_the_published_cap() {
     let router = router();
     let tag = |index: usize| pair(&format!("key{index}"), &format!("value{index}"));
 
-    for kind in KINDS {
+    for kind in TAGGABLE_KINDS {
         // One short of the cap, so the next single tag lands exactly on it.
         let initial: Vec<(String, String)> = (0..MAX_TAGS_PER_RESOURCE - 1).map(tag).collect();
-        let (id, arn) = create_resource(&router, kind, &format!("cap{kind}"), &initial).await;
+        let (id, arn) =
+            create_tagged_resource(&router, kind, &format!("cap{kind}"), &initial).await;
 
         let at_the_cap = vec![tag(MAX_TAGS_PER_RESOURCE - 1)];
         let (status, body) = tag_resource(&router, &arn, &at_the_cap).await;
@@ -554,8 +430,8 @@ fn bound_cases() -> Vec<BoundCase> {
 async fn tag_keys_and_values_follow_the_modelled_bounds() {
     let router = router();
 
-    for kind in KINDS {
-        let (id, arn) = create_resource(&router, kind, &format!("bound{kind}"), &[]).await;
+    for kind in TAGGABLE_KINDS {
+        let (id, arn) = create_tagged_resource(&router, kind, &format!("bound{kind}"), &[]).await;
 
         for case in bound_cases() {
             let label = format!("{} on a {kind}", case.label);

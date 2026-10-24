@@ -78,6 +78,11 @@ mod ecs_service_target_group_association;
 // those appends.
 #[path = "all/elb_classic_and_v2_signing_name_routing.rs"]
 mod elb_classic_and_v2_signing_name_routing;
+// Declared in this span of the sorted list for the reason the note above gives: the tail
+// of this file is where every concurrent router suite appends, so a line added there
+// conflicts with every other landing in the same window.
+#[path = "all/elbv2_network_resolution.rs"]
+mod elbv2_network_resolution;
 // Declared HERE too, in the sorted list rather than appended at the tail, for the reason
 // the note above gives: the appended region at the end of this file is where every
 // concurrent router suite lands, so a line added there conflicts with every other suite

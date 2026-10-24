@@ -17,8 +17,8 @@
 //!
 //! A virtual machine is not created by any operation of this model: it is part of the
 //! inventory of the hypervisor it runs on, which reaches the service out of band
-//! (`state::record_virtual_machine`) — the same out-of-band channel
-//! `gateway_lifecycle::issue_activation_keys` uses for an activation key. The tables
+//! (`state::record_virtual_machine`) — the same kind of out-of-band channel an
+//! activation key reaches the service through. The tables
 //! below span the class the rule generalises over: machines differing in name length
 //! (each published bound of the modelled `Name`), spelling and case, host name, path form
 //! and length (each published bound of the modelled `Path`), and whether they have ever

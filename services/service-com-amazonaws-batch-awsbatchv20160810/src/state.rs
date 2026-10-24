@@ -320,6 +320,13 @@ pub const SERVICE_ENVIRONMENTS_NOT_ATTACHABLE: &str =
 /// detail AWS is recorded to state.
 pub const NEXT_TOKEN_NOT_PROCESSABLE: &str = "Error processing next token";
 
+/// What `UpdateServiceJob` answers for a service job that has already completed — the
+/// bare detail AWS is recorded to state, which names the precondition rather than the
+/// job, so the one refusal covers either terminal `ServiceJobStatus`
+/// ([`is_terminal_service_job_status`]).
+pub const SERVICE_JOB_COMPLETED_NOT_UPDATABLE: &str =
+    "UpdateServiceJob cannot be called on a service job which is completed.";
+
 /// `statusReason` of a job whose container could not be run here.
 pub const NO_CONTAINER_RUNTIME_REASON: &str =
     "This emulator has no container runtime, so the job's container was never started";

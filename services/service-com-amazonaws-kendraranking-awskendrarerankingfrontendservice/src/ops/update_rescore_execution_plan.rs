@@ -249,8 +249,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(description) = input.description {
             plan.description = Some(description);
         }
+        // An explicit `CapacityUnits` is what takes a plan from unconfigured to
+        // configured; an absent member leaves the stored configuration (or its absence)
+        // as it was.
         if let Some(capacity_units) = input.capacity_units {
-            plan.capacity_units = capacity_units;
+            plan.capacity_units = Some(capacity_units);
         }
         plan.updated_at_millis = now;
         // The plan is re-provisioned after this call returns: it leaves `ACTIVE` for

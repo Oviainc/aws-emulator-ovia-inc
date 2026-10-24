@@ -6,9 +6,10 @@
 //! serves (`state::SUPPORTED_CATALOGS`) is refused with the modelled
 //! `ValidationException` (HTTP 400) BEFORE any product or agreement is resolved,
 //! however well-formed the value is and whatever else the request carries — so a
-//! client reading the error code can tell a wrong catalog (a permanent 400-class
-//! input error) from a target the account does not hold (the 404
-//! `ResourceNotFoundException`).
+//! wrong catalog is a permanent 400-class input error and nothing is written for
+//! it, while a product and an agreement inside a catalog this service serves are
+//! written against whether or not anything recorded them first (the
+//! `put_deployment_parameter_target` suite owns that rule).
 //!
 //! Where the set comes from: `PutDeploymentParameterRequest$catalog` is documented
 //! as "The catalog related to the request. Fixed value: `AWSMarketplace`"

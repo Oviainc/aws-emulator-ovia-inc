@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateApprovalRuleTemplateFromRepository
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateApprovalRuleTemplateFromRepository`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateApprovalRuleTemplateFromRepository::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Releases the stored association between an approval rule template and a
+//! repository, so neither `ListAssociatedApprovalRuleTemplatesForRepository` nor
+//! `ListRepositoriesForApprovalRuleTemplate` reports it afterwards and
+//! `DeleteApprovalRuleTemplate` stops refusing the template as in use. A name
+//! either side never held is refused with that side's modelled does-not-exist
+//! error and nothing is released.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +185,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateApprovalRuleTemplateFromRepository` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateApprovalRuleTemplateFromRepositoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateApprovalRuleTemplateFromRepository"))
+        let _ = ctx;
+        // The modelled length of `approvalRuleTemplateName` is already refused before
+        // this handler runs (`crate::service::refusal_for`). What is left is the part
+        // of "template names must be between 1 and 100 valid characters in length"
+        // the model cannot express, decided in the one place this crate decides it.
+        if !crate::state::is_approval_rule_template_name(&input.approval_rule_template_name) {
+            return Err(
+                DisassociateApprovalRuleTemplateFromRepositoryErrorModeled::InvalidApprovalRuleTemplateNameException(
+                    InvalidApprovalRuleTemplateNameException {
+                        message: Some(crate::state::invalid_approval_rule_template_name_message(
+                            &input.approval_rule_template_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+
+        // Both sides the request names have to exist, and both are decided BEFORE
+        // anything is written, so a refused call leaves the repository with exactly
+        // the associations it had. The order mirrors
+        // `AssociateApprovalRuleTemplateWithRepository`, the operation this one
+        // reverses.
+        if !store
+            .approval_rule_templates
+            .contains_key(&input.approval_rule_template_name)
+        {
+            return Err(
+                DisassociateApprovalRuleTemplateFromRepositoryErrorModeled::ApprovalRuleTemplateDoesNotExistException(
+                    ApprovalRuleTemplateDoesNotExistException {
+                        message: Some(
+                            crate::state::approval_rule_template_does_not_exist_message(
+                                &input.approval_rule_template_name,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        let repository = store
+            .repositories
+            .get_mut(&input.repository_name)
+            .ok_or_else(|| {
+                DisassociateApprovalRuleTemplateFromRepositoryErrorModeled::RepositoryDoesNotExistException(
+                    RepositoryDoesNotExistException {
+                        message: Some(crate::state::repository_does_not_exist_message(
+                            &input.repository_name,
+                        )),
+                    },
+                )
+            })?;
+
+        // "Removes the association between a template and a repository": the ONE
+        // stored record of the association is dropped, which is what takes the
+        // template out of both listings and what stops `DeleteApprovalRuleTemplate`
+        // refusing it as in use. The model declares no error for a template this
+        // repository was never associated with, so releasing an association that is
+        // not there is the no-op the set makes it. Nothing else on either side is
+        // touched — "this does not delete any approval rules previously created for
+        // pull requests through the template association" — and no other
+        // repository's associations are reached.
+        repository
+            .associated_templates
+            .remove(&input.approval_rule_template_name);
+
+        Ok(DisassociateApprovalRuleTemplateFromRepositoryOutput)
     }
 }

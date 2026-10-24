@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateServiceJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateServiceJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates the `schedulingPriority` of a persisted service job: the next
+//! `DescribeServiceJob` reports the priority this call set, and NOTHING else about the
+//! record changes. The bound the member documents (0 to 9999) is applied here, the same
+//! way `SubmitServiceJob` applies it to the same member; a `jobId` the service holds no
+//! service job for answers the modelled `ClientException` (HTTP 400), and so does a
+//! service job that has reached a terminal `ServiceJobStatus` — a priority only decides
+//! when a job still waiting in its queue is placed, so one that has finished has nothing
+//! left to schedule.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateServiceJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +147,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateServiceJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateServiceJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateServiceJob"))
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(
+                UpdateServiceJobErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        let region = batch::request_region(ctx);
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        // Materialise what the clock already owed BEFORE the update, so the status this
+        // call judges the service job by is the one a read at the same instant reports.
+        state.materialize_due(now);
+
+        // `schedulingPriority`: "The minimum supported value is 0 and the maximum
+        // supported value is 9999." The model types it as a plain `Integer`, so the
+        // framework admits anything and the bound is applied here — the same bound
+        // `SubmitServiceJob` applies to the same member.
+        if !(batch::MIN_SCHEDULING_PRIORITY..=batch::MAX_SCHEDULING_PRIORITY)
+            .contains(&input.scheduling_priority)
+        {
+            return Err(UpdateServiceJobErrorModeled::ClientException(batch::client_exception(
+                format!(
+                    "schedulingPriority {} must be between {} and {}",
+                    input.scheduling_priority,
+                    batch::MIN_SCHEDULING_PRIORITY,
+                    batch::MAX_SCHEDULING_PRIORITY
+                ),
+            ))
+            .into());
+        }
+
+        let Some(job) = state.service_jobs.get_mut(&input.job_id) else {
+            // The resolver's refusal, worded as `DescribeServiceJob` answers it: the ARN
+            // the requested id resolves to, then ` does not exist`. No service job is
+            // stored for the id, so that ARN can only be built from the request.
+            return Err(UpdateServiceJobErrorModeled::ClientException(
+                batch::does_not_exist_exception(&batch::resolved_arn(&input.job_id, |job_id| {
+                    batch::service_job_arn(&region, job_id)
+                })),
+            )
+            .into());
+        };
+
+        // A priority only decides when a job still waiting in its queue is placed, so a
+        // service job that has reached a terminal `ServiceJobStatus` — one it never
+        // leaves — has nothing left to schedule and is refused, with the precondition
+        // AWS states for exactly this ([`batch::SERVICE_JOB_COMPLETED_NOT_UPDATABLE`]).
+        if batch::is_terminal_service_job_status(&job.status) {
+            return Err(UpdateServiceJobErrorModeled::ClientException(
+                batch::client_exception(batch::SERVICE_JOB_COMPLETED_NOT_UPDATABLE),
+            )
+            .into());
+        }
+
+        // The ONLY member this operation changes: everything else the record carries is
+        // left exactly as it is, so a later `DescribeServiceJob` differs in the priority
+        // alone.
+        job.scheduling_priority = Some(input.scheduling_priority);
+
+        Ok(UpdateServiceJobOutput {
+            job_arn: Some(job.job_arn.clone()),
+            job_id: Some(job.job_id.clone()),
+            job_name: Some(job.job_name.clone()),
+        })
     }
 }
+

@@ -34,8 +34,8 @@ use crate::ops::types::{
     IdentityCenterOptionsInput, IdentityCenterOptionsStatus, JWTOptionsOutput, LogPublishingOption,
     LogPublishingOptionsStatus, NaturalLanguageQueryGenerationOptionsOutput,
     NodeToNodeEncryptionOptions, NodeToNodeEncryptionOptionsStatus, OffPeakWindowOptions,
-    OffPeakWindowOptionsStatus, OptionStatus, RecurringCharge, ReservedInstanceOffering,
-    ResourceNotFoundException,
+    OffPeakWindowOptionsStatus, OptionStatus, RecurringCharge, ReservedInstance,
+    ReservedInstanceOffering, ResourceNotFoundException,
     RollbackServiceSoftwareOptions, SAMLOptionsOutput, ServiceSoftwareOptions, SnapshotOptions,
     SnapshotOptionsStatus, SoftwareUpdateOptions, SoftwareUpdateOptionsStatus, Tag, UseCaseStatus,
     VPCDerivedInfo, VPCDerivedInfoStatus, VPCOptions, ValidationException, VersionStatus,
@@ -1405,15 +1405,29 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// `GetDefaultApplicationSetting` reports it, so the two cannot disagree about
     /// which application is the default.
     pub default_application_arn: Option<String>,
+    /// Every purchased Reserved Instance, keyed by its `ReservedInstanceId` — "the
+    /// unique identifier for the reservation", so the id IS the key.
+    /// `PurchaseReservedInstanceOffering` mints one and
+    /// `DescribeReservedInstances` reports it, from THIS one record.
+    pub reserved_instances: BTreeMap<String, ReservedInstanceRecord>,
+    /// Drives
+    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_billing_subscription_id`].
+    pub billing_subscription_seq: i64,
 }
 
 impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
+    /// The store a fresh engine hands this service: no account resources at all,
+    /// and the published Reserved Instance offering catalog already seeded,
+    /// because the catalog is service content rather than something a call
+    /// creates.
     fn default() -> Self {
         Self {
             domains: BTreeMap::new(),
             endpoint_suffix_seq: 0,
             reserved_instance_offerings: seed_reserved_instance_offerings(),
             default_application_arn: None,
+            reserved_instances: BTreeMap::new(),
+            billing_subscription_seq: 0,
         }
     }
 }
@@ -1471,6 +1485,55 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     pub fn settle_all(&mut self, now: SystemTime) {
         for domain in self.domains.values_mut() {
             domain.settle(now);
+        }
+    }
+
+    /// The published offering whose `ReservedInstanceOfferingId` is `offering_id`.
+    ///
+    /// The catalog is keyed by that id, so this is the one lookup both the
+    /// offerings listing and a purchase resolve an offering by.
+    pub fn reserved_instance_offering(
+        &self,
+        offering_id: &str,
+    ) -> Option<&ReservedInstanceOffering> {
+        self.reserved_instance_offerings.get(offering_id)
+    }
+
+    /// Mint the `BillingSubscriptionId` a purchase is billed under: "the unique
+    /// identifier of the billing subscription".
+    ///
+    /// A counter, so no two purchases share one and the id is stable for the
+    /// reservation it was minted for.
+    pub fn mint_billing_subscription_id(&mut self) -> i64 {
+        self.billing_subscription_seq = self.billing_subscription_seq.saturating_add(1);
+        self.billing_subscription_seq
+    }
+
+    /// The number of OpenSearch instances this account currently has reserved, which
+    /// is what [`RESERVED_INSTANCE_QUOTA`] bounds.
+    pub fn reserved_instance_count(&self) -> i64 {
+        self.reserved_instances
+            .values()
+            .map(|reservation| i64::from(reservation.instance_count))
+            .sum()
+    }
+
+    /// Store `record` and hand back the stored copy, so the purchase answers with
+    /// the record this service persisted rather than a copy beside it.
+    pub fn insert_reserved_instance(
+        &mut self,
+        record: ReservedInstanceRecord,
+    ) -> &ReservedInstanceRecord {
+        let id = record.reserved_instance_id.clone();
+        self.reserved_instances.insert(id.clone(), record);
+        &self.reserved_instances[&id]
+    }
+
+    /// Materialise every state change the clock owes the stored reservations, for a
+    /// caller about to report on them.
+    pub fn settle_reserved_instances(&mut self, now: SystemTime) {
+        for reservation in self.reserved_instances.values_mut() {
+            reservation.settle(now);
         }
     }
 }
@@ -1622,7 +1685,20 @@ pub fn stored_auto_tune_options(input: AutoTuneOptionsInput) -> AutoTuneOptions 
 /// exactly a hyphenated UUID — so the id comes from the `uuid` crate's v4 generator
 /// rather than from a hand-rolled layout, and no two changes share one.
 fn new_change_id() -> String {
+    new_guid()
+}
+
+/// A fresh `GUID`, for whichever resource this service addresses by one; see
+/// [`new_change_id`] for why that is a v4 UUID.
+fn new_guid() -> String {
     ::uuid::Uuid::new_v4().to_string()
+}
+
+/// The `ReservedInstanceId` a purchase mints: the unique identifier for the
+/// reservation, a `GUID` like every other id this service hands out
+/// ([`new_guid`]).
+pub fn new_reserved_instance_id() -> String {
+    new_guid()
 }
 
 /// `DomainStatus$DomainId`: the account the domain belongs to and its name.
@@ -1817,4 +1893,213 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsOpensearchAmazonopensearchserviceState>)
+}
+
+// ---------------------------------------------------------------------------
+// Reserved Instances
+//
+// A Reserved Instance IS an account resource, unlike the offering it is bought
+// from: `PurchaseReservedInstanceOffering` mints one from a catalog entry above
+// and `DescribeReservedInstances` reports it, from the one record below.
+// ---------------------------------------------------------------------------
+
+/// The number of instances a purchase reserves when the request names none.
+///
+/// `PurchaseReservedInstanceOffering$InstanceCount` is optional with
+/// `@range(min: 1)`, so a purchase that names no count reserves the fewest it
+/// could have named: one instance.
+pub const DEFAULT_INSTANCE_COUNT: i32 = 1;
+
+/// The states a reservation is reported in.
+///
+/// `ReservedInstance$State` is "the state of the Reserved Instance" and the model
+/// declares no enum for it, so these are the states a reserved-instance purchase
+/// passes through: it is `payment-pending` until its payment settles, `active`
+/// for the term it was bought for, and `retired` once that term has elapsed.
+pub const RESERVATION_STATE_PAYMENT_PENDING: &str = "payment-pending";
+/// See [`RESERVATION_STATE_PAYMENT_PENDING`].
+pub const RESERVATION_STATE_ACTIVE: &str = "active";
+/// See [`RESERVATION_STATE_PAYMENT_PENDING`].
+pub const RESERVATION_STATE_RETIRED: &str = "retired";
+
+/// How long a reservation stays `payment-pending` before the clock owes it
+/// `active`.
+///
+/// The same reasoning as [`PROVISIONING`]: AWS takes as long as the payment
+/// takes, the emulator chooses a span, and it is deliberately NOT zero so a
+/// caller describing straight after the purchase still observes the transient
+/// state. The due instant is stored on the record and materialised by whichever
+/// later call reads it — nothing sleeps.
+pub const RESERVATION_SETTLEMENT: Duration = Duration::from_millis(500);
+
+/// How many OpenSearch instances this account may hold reserved before
+/// `PurchaseReservedInstanceOffering` refuses with the modelled
+/// `LimitExceededException`.
+///
+/// Like [`DOMAIN_QUOTA`] this is the emulator's OWN bound on the store — it
+/// models neither Service Quotas nor an account's adjustments — and it is what
+/// stops a caller looping with fresh reservation names from growing the state
+/// (and the describe's answer) without end.
+pub const RESERVED_INSTANCE_QUOTA: i64 = 100;
+
+/// The values a new reservation carries that do NOT come from the offering it is
+/// bought from — one argument, so [`ReservedInstanceRecord::from_offering`] does
+/// not take a row of positional values.
+#[derive(Debug, Clone)]
+pub struct NewReservation {
+    /// The `GUID` the reservation is addressed by, from
+    /// [`new_reserved_instance_id`].
+    pub reserved_instance_id: String,
+    /// `ReservationName`: "the customer-specified identifier to track this
+    /// reservation".
+    pub reservation_name: String,
+    /// `InstanceCount`: how many instances the purchase reserved.
+    pub instance_count: i32,
+    /// `BillingSubscriptionId`, from
+    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_billing_subscription_id`].
+    pub billing_subscription_id: i64,
+    /// The instant of the purchase, which is the reservation's `StartTime`.
+    pub now: SystemTime,
+}
+
+/// One Reserved Instance, as this emulator persists it.
+///
+/// Every priced member is COPIED out of the catalog entry the reservation was
+/// bought from, which is what makes a reservation a record of what WAS bought
+/// rather than a second view of the live catalog.
+#[derive(Debug, Clone)]
+pub struct ReservedInstanceRecord {
+    pub reservation_name: String,
+    /// "The unique identifier for the reservation", which is this record's
+    /// identity in the store.
+    pub reserved_instance_id: String,
+    pub billing_subscription_id: i64,
+    /// The offering it was bought from.
+    pub reserved_instance_offering_id: String,
+    pub instance_type: Option<String>,
+    /// "The date and time when the reservation was purchased."
+    pub start_time: SystemTime,
+    /// "The duration, in seconds, for which the OpenSearch instance is
+    /// reserved", from the offering's term.
+    pub duration_seconds: i32,
+    pub fixed_price: Option<f64>,
+    pub usage_price: Option<f64>,
+    pub currency_code: Option<String>,
+    /// "The number of OpenSearch instances that have been reserved."
+    pub instance_count: i32,
+    /// One of [`RESERVATION_STATE_PAYMENT_PENDING`],
+    /// [`RESERVATION_STATE_ACTIVE`] or [`RESERVATION_STATE_RETIRED`].
+    pub state: String,
+    /// When the clock owes this reservation its move out of `payment-pending`;
+    /// `None` once that move has been materialised.
+    pub active_due: Option<SystemTime>,
+    pub payment_option: Option<String>,
+    /// "The recurring charge to your account, regardless of whether you create
+    /// any domains using the Reserved Instance offering", from the offering.
+    pub recurring_charges: Vec<RecurringCharge>,
+}
+
+impl ReservedInstanceRecord {
+    /// The reservation `new` buys from `offering`.
+    pub fn from_offering(offering: &ReservedInstanceOffering, new: NewReservation) -> Self {
+        Self {
+            reservation_name: new.reservation_name,
+            reserved_instance_id: new.reserved_instance_id,
+            billing_subscription_id: new.billing_subscription_id,
+            reserved_instance_offering_id: offering
+                .reserved_instance_offering_id
+                .clone()
+                .unwrap_or_default(),
+            instance_type: offering.instance_type.clone(),
+            start_time: new.now,
+            duration_seconds: offering.duration,
+            // The offering's prices are per reserved instance — "the upfront
+            // fixed charge you will paid to purchase the specific Reserved
+            // Instance offering" and "the hourly rate at which you're charged
+            // for the domain using this Reserved Instance" — so a multi-instance
+            // reservation reports the same per-instance prices beside its
+            // `InstanceCount` rather than a total no member of this shape
+            // documents.
+            fixed_price: offering.fixed_price,
+            usage_price: offering.usage_price,
+            currency_code: offering.currency_code.clone(),
+            instance_count: new.instance_count,
+            state: RESERVATION_STATE_PAYMENT_PENDING.to_string(),
+            active_due: Some(new.now + RESERVATION_SETTLEMENT),
+            payment_option: offering.payment_option.clone(),
+            recurring_charges: offering.recurring_charges.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Materialise every state change the clock owes this reservation — the only
+    /// write a reporting operation makes, and only what was already owed at this
+    /// instant had nobody called.
+    pub fn settle(&mut self, now: SystemTime) {
+        self.settle_payment(now);
+        self.settle_term(now);
+    }
+
+    /// `payment-pending` becomes `active` once the payment's due instant has
+    /// passed.
+    fn settle_payment(&mut self, now: SystemTime) {
+        let Some(due) = self.active_due else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.state = RESERVATION_STATE_ACTIVE.to_string();
+        self.active_due = None;
+    }
+
+    /// An `active` reservation becomes `retired` once the term it was bought for
+    /// has elapsed: it runs for its offering's `Duration` from its `StartTime`,
+    /// and that span is the offering's own rather than one the emulator chose.
+    fn settle_term(&mut self, now: SystemTime) {
+        if self.state != RESERVATION_STATE_ACTIVE {
+            return;
+        }
+        let Ok(seconds) = u64::try_from(self.duration_seconds) else {
+            return;
+        };
+        if now < self.start_time + Duration::from_secs(seconds) {
+            return;
+        }
+        self.state = RESERVATION_STATE_RETIRED.to_string();
+    }
+
+    /// This record as the modelled `ReservedInstance`.
+    pub fn to_modeled(&self) -> ReservedInstance {
+        ReservedInstance {
+            reservation_name: Some(self.reservation_name.clone()),
+            reserved_instance_id: Some(self.reserved_instance_id.clone()),
+            billing_subscription_id: Some(self.billing_subscription_id),
+            reserved_instance_offering_id: Some(self.reserved_instance_offering_id.clone()),
+            instance_type: self.instance_type.clone(),
+            start_time: Some(datetime(self.start_time)),
+            duration: self.duration_seconds,
+            fixed_price: self.fixed_price,
+            usage_price: self.usage_price,
+            currency_code: self.currency_code.clone(),
+            instance_count: self.instance_count,
+            state: Some(self.state.clone()),
+            payment_option: self.payment_option.clone(),
+            recurring_charges: Some(self.recurring_charges.clone()),
+        }
+    }
+}
+
+/// The refusal of a `GUID` that names no stored Reserved Instance.
+///
+/// The modelled `ValidationException` (HTTP 400) rather than
+/// `ResourceNotFoundException`: both are documented in this model with the very
+/// same sentence — "an exception for accessing or deleting a resource that
+/// doesn't exist" — and this is the refusal the service answers an identifier
+/// that resolves to no reservation with.
+pub fn reserved_instance_not_found(reserved_instance_id: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "Reserved instance not found: {reserved_instance_id}"
+        )),
+    }
 }

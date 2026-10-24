@@ -1637,13 +1637,33 @@ impl AttachmentRecord {
 
     /// The modelled `Attachment` envelope of this record, as of `now`.
     pub fn to_attachment(&self, now: SystemTime) -> Attachment {
+        self.to_attachment_at(self.state_at(now), self.updated_at(now))
+    }
+
+    /// The modelled `Attachment` envelope of the record a delete at `now` just removed:
+    /// [`STATE_DELETING`], which the clock no longer decides for it, and `now` as the
+    /// instant it last changed — the delete IS that change.
+    ///
+    /// The sibling `to_shape_with_state` of the records above forces only the state because
+    /// their shapes carry no `UpdatedAt` member at all (`GlobalNetwork`, `Site`, `Link`,
+    /// `Device`, `Connection`, `CoreNetwork` each carry `CreatedAt` only); `Attachment` is
+    /// the one shape of this service that reports when the resource last changed
+    /// (`smithy_query shape=Attachment`), so it is the one delete that has an instant to
+    /// report.
+    pub fn to_deleted_attachment(&self, now: SystemTime) -> Attachment {
+        self.to_attachment_at(STATE_DELETING, now)
+    }
+
+    /// The shared body of the two above: the envelope with `state` and `updated_at`
+    /// supplied, so neither spelling of a read can disagree with the other about the rest.
+    fn to_attachment_at(&self, state: &str, updated_at: SystemTime) -> Attachment {
         Attachment {
             core_network_id: Some(self.core_network_id.clone()),
             core_network_arn: Some(self.core_network_arn.clone()),
             attachment_id: Some(self.id.clone()),
             owner_account_id: Some(::engine::emulator_account_id().to_string()),
             attachment_type: Some(self.attachment_type.to_string()),
-            state: Some(self.state_at(now).to_string()),
+            state: Some(state.to_string()),
             // Exactly ONE of the two edge members is reported, and which one is a function
             // of the kind: a Direct Connect gateway attachment spans several edges and
             // reports them as `EdgeLocations`, every other kind sits at one and reports it
@@ -1677,7 +1697,7 @@ impl AttachmentRecord {
             proposed_segment_change: None,
             proposed_network_function_group_change: None,
             created_at: Some(epoch_seconds(self.created_at)),
-            updated_at: Some(epoch_seconds(self.updated_at(now))),
+            updated_at: Some(epoch_seconds(updated_at)),
             // No modification of this attachment has failed: the list is empty rather than
             // carrying an error nothing produced.
             last_modification_errors: Some(Vec::new()),
@@ -2149,6 +2169,27 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
         self.attachments
             .values()
             .filter(|attachment| attachment.core_network_id == core_network_id)
+            .count()
+    }
+
+    /// How many Connect attachments are carried over the attachment `attachment_id` as
+    /// their transport, for the attachment delete refusal.
+    ///
+    /// A Connect attachment is built on another attachment rather than on a resource of its
+    /// own ([`AttachmentDetail::Connect::transport_attachment_id`]), so that transport is a
+    /// dependent of exactly the kind every other delete of this service refuses to orphan.
+    pub fn connect_attachment_count_over_transport(&self, attachment_id: &str) -> usize {
+        self.attachments
+            .values()
+            .filter(|attachment| match &attachment.detail {
+                AttachmentDetail::Connect {
+                    transport_attachment_id,
+                    ..
+                } => transport_attachment_id == attachment_id,
+                AttachmentDetail::Vpc { .. }
+                | AttachmentDetail::SiteToSiteVpn
+                | AttachmentDetail::DirectConnectGateway { .. } => false,
+            })
             .count()
     }
 

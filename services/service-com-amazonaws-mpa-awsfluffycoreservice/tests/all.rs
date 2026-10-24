@@ -15,6 +15,8 @@
 mod approval_sessions;
 #[path = "all/approval_team_lifecycle.rs"]
 mod approval_team_lifecycle;
+#[path = "all/approver_mfa_synchronization.rs"]
+mod approver_mfa_synchronization;
 #[path = "all/authorization_gate.rs"]
 mod authorization_gate;
 #[path = "all/baseline_session_minting.rs"]

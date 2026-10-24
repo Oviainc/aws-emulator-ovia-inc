@@ -168,11 +168,22 @@ fn text_body(name: &str, query: &str) -> Value {
 }
 
 /// A `CreateComplianceInquiry` body for an uploaded document — a FILE inquiry, which owns
-/// no query at all, because nothing reads queries out of an uploaded document.
-fn file_body(name: &str) -> Value {
+/// one query per unit of work it is processed in: the sections it names, or the document
+/// as a whole under the submitted title when it names none.
+fn file_body(name: &str, sections: &[&str]) -> Value {
+    let mut file = json!({ "content": FILE_CONTENT });
+    if !sections.is_empty() {
+        file["fileSections"] = json!(sections);
+    }
+    json!({ "name": name, "inquiryContent": { "fileContent": file } })
+}
+
+/// A `CreateComplianceInquiry` body for an upload carrying no bytes — an inquiry with
+/// nothing to process, which therefore owns no query at all.
+fn empty_file_body(name: &str) -> Value {
     json!({
         "name": name,
-        "inquiryContent": { "fileContent": { "content": FILE_CONTENT } }
+        "inquiryContent": { "fileContent": { "content": "" } }
     })
 }
 
@@ -406,10 +417,10 @@ fn cases() -> Vec<Case> {
         },
         Case {
             label: "an uploaded document, rated as a whole after it went terminal",
-            inquiry: file_body("Questionnaire"),
+            inquiry: file_body("Questionnaire", &[]),
             submission: Submission::rated(RATINGS[1])
                 .because(&[REASON_CODES[0]])
-                .commenting("No queries were read out of the upload.")
+                .commenting("The upload was processed as one unit.")
                 .with_token("token-file-inquiry"),
             after_terminal: true,
         },
@@ -649,8 +660,9 @@ async fn a_query_identifier_the_inquiry_does_not_own_is_refused_with_a_validatio
     const CLAUSE: &str = "Value at 'queryIdentifier' failed to satisfy constraint: every query \
                           identifier must name a query of the compliance inquiry";
 
-    // A TEXT inquiry owns exactly query 1; a FILE inquiry owns none at all. The rows
-    // differ along the identifier named and along which of the two the inquiry is.
+    // A TEXT inquiry owns exactly query 1; an upload owns one query per unit of work it
+    // was submitted in, and an upload carrying no bytes owns none at all. The rows differ
+    // along the identifier named and along which of those the inquiry is.
     let cases: Vec<(&str, Value, i32)> = vec![
         (
             "one past the queries a text inquiry owns",
@@ -673,8 +685,13 @@ async fn a_query_identifier_the_inquiry_does_not_own_is_refused_with_a_validatio
             i32::MAX,
         ),
         (
+            "one past the sections an upload was submitted in",
+            file_body("Questionnaire", &["Sheet 1", "Sheet 2"]),
+            3,
+        ),
+        (
             "the first identifier on an inquiry that owns no query",
-            file_body("Questionnaire"),
+            empty_file_body("Empty questionnaire"),
             1,
         ),
     ];

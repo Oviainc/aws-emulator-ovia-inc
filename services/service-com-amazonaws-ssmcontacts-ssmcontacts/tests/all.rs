@@ -39,6 +39,8 @@ mod rotation_override_listing;
 mod rotation_overrides;
 #[path = "all/rotation_reads.rs"]
 mod rotation_reads;
+#[path = "all/rotation_updates.rs"]
+mod rotation_updates;
 #[path = "all/start_engagement.rs"]
 mod start_engagement;
 #[path = "all/state_roundtrip.rs"]

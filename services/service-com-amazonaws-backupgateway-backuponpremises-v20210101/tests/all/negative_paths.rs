@@ -7,32 +7,26 @@
 //! `MultiServiceRouter`, reusing the harness of `gateway_lifecycle`, so what is asserted
 //! is the wire behaviour.
 //!
-//! Three rules, each asserted over a table that spans its class rather than over the one
+//! Two rules, each asserted over a table that spans its class rather than over the one
 //! request that exposed it:
 //!
-//! 1. `CreateGateway` registers a gateway only for an activation key this service
-//!    ISSUED; any other key is refused with HTTP 400 `ValidationException` carrying
-//!    `ErrorCode` `ActivationKeyNotFound`, and nothing is written — so the read side
-//!    reports no gateway for a create that was refused.
-//! 2. A constraint-violation message for a `@sensitive` member names the member and the
+//! 1. A constraint-violation message for a `@sensitive` member names the member and the
 //!    constraint it failed and nothing of the value it held; a member that is not
 //!    sensitive still reports its value.
-//! 3. An operation that takes a `ResourceARN` resolves it as the resource type the ARN
+//! 2. An operation that takes a `ResourceARN` resolves it as the resource type the ARN
 //!    NAMES: a hypervisor ARN with no hypervisor behind it is refused with HTTP 400
 //!    `ValidationException` / `ErrorCode` `HypervisorNotFound`, and every other
 //!    resource type with the modelled 404 `ResourceNotFoundException`.
+//!
+//! What `CreateGateway` does with the `ActivationKey` it is handed lives in
+//! `gateway_activation`.
 
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gateway;
-
-use backup_gateway::state::service_state;
-
 use crate::gateway_lifecycle::{
-    build_engine, build_router, call, create, create_body, issue_activation_keys,
-    never_created_arn, Reply, REGION,
+    build_engine, build_router, call, create, never_created_arn, Reply, REGION,
 };
 
 /// An ARN of this service naming `resource_type`/`id`, in the region the harness signs
@@ -56,132 +50,7 @@ fn message_of(reply: &Reply) -> String {
         .to_string()
 }
 
-/// Rule 1: an activation key is ISSUED to a gateway appliance, so `CreateGateway` can
-/// only find one in this service's registry — a key the registry does not hold is
-/// refused, whatever it looks like, and the refused call writes nothing.
-#[tokio::test]
-async fn an_activation_key_the_service_never_issued_is_refused() {
-    let engine = build_engine();
-    let router = build_router(&engine);
-
-    // (case, the ActivationKey as the client sends it). Every row satisfies the modelled
-    // `ActivationKey` constraints — len 1..50, pattern `^[0-9a-zA-Z\-]+$`
-    // (`smithy_query(query="shape",shape="ActivationKey")`) — so each one reaches the
-    // handler rather than the boundary validator, and none of them was ever issued. The
-    // rows differ in length, case and hyphenation: the refusal keys on none of that.
-    let rows: [(&str, String); 6] = [
-        ("a single character", "k".to_string()),
-        ("digits only", "0123456789".to_string()),
-        (
-            "five hyphenated groups",
-            "ABCDE-FGHIJ-KLMNO-PQRST-UVWXY".to_string(),
-        ),
-        ("mixed case and hyphens", "aB3-dE6".to_string()),
-        ("at the 50-character maximum", "K".repeat(50)),
-        ("the shape another gateway service issues", "activation-key-0001".to_string()),
-    ];
-
-    for (case, key) in &rows {
-        let refused = call(
-            &router,
-            "CreateGateway",
-            &create_body("gw-unissued", key, &BTreeMap::new()),
-        )
-        .await;
-        assert_eq!(
-            (
-                refused.status,
-                refused.code.as_deref(),
-                refused.str_at("/ErrorCode"),
-            ),
-            (400, Some("ValidationException"), Some("ActivationKeyNotFound")),
-            "case {case:?}: an activation key this service never issued must be refused \
-             with 400 ValidationException / ErrorCode ActivationKeyNotFound, got {} {:?}",
-            refused.status,
-            refused.body
-        );
-        assert!(
-            refused
-                .str_at("/Message")
-                .is_some_and(|stated| !stated.is_empty()),
-            "case {case:?}: the refusal must state a message, got {:?}",
-            refused.body
-        );
-        assert!(
-            refused.str_at("/GatewayArn").is_none(),
-            "case {case:?}: a refused create must hand back no GatewayArn, got {:?}",
-            refused.body
-        );
-    }
-
-    // And nothing was written: the read side cannot report a gateway that a refused
-    // create would have minted.
-    let listed = call(&router, "ListGateways", &json!({})).await;
-    assert_eq!(
-        (listed.status, listed.gateway_arns()),
-        (200, Vec::new()),
-        "a refused CreateGateway must leave no gateway for ListGateways to report, got \
-         {:?}",
-        listed.body
-    );
-    assert_eq!(
-        service_state(&*engine)
-            .expect("the in-memory engine must expose this service's state")
-            .lock()
-            .gateway_count(),
-        0,
-        "a refused CreateGateway must leave the store empty"
-    );
-
-    // The SAME request succeeds once the key is issued, and the gateway it mints reads
-    // back: the refusal above is a fact about the registry, not about the key's spelling.
-    let (case, key) = &rows[2];
-    issue_activation_keys(&engine, &[key.as_str()]);
-    let created = call(
-        &router,
-        "CreateGateway",
-        &create_body("gw-issued", key, &BTreeMap::new()),
-    )
-    .await;
-    assert_eq!(
-        created.status, 200,
-        "case {case:?}: once issued, the same activation key must create a gateway, got \
-         {} {:?}",
-        created.status, created.body
-    );
-    let arn = created.gateway_arn().to_string();
-    let fetched = call(&router, "GetGateway", &json!({ "GatewayArn": arn })).await;
-    assert_eq!(
-        (
-            fetched.status,
-            fetched.str_at("/Gateway/GatewayDisplayName")
-        ),
-        (200, Some("gw-issued")),
-        "case {case:?}: the created gateway must read back through GetGateway, got {} \
-         {:?}",
-        fetched.status,
-        fetched.body
-    );
-    let listed = call(&router, "ListGateways", &json!({})).await;
-    assert_eq!(
-        (listed.status, listed.gateway_arns()),
-        (200, vec![arn.clone()]),
-        "case {case:?}: ListGateways must report exactly the gateway that was created, \
-         got {:?}",
-        listed.body
-    );
-
-    // An issued key stays issued: it is a registry entry, not a one-request fact.
-    assert!(
-        service_state(&*engine)
-            .expect("the in-memory engine must expose this service's state")
-            .lock()
-            .activation_key_issued(key),
-        "case {case:?}: the issued key must still be in the registry after the create"
-    );
-}
-
-/// Rule 2: a constraint-violation message for a `@sensitive` member must not reproduce
+/// Rule 1: a constraint-violation message for a `@sensitive` member must not reproduce
 /// the value that was rejected.
 ///
 /// The sensitive members of this model are the `Password` and `Username` shapes
@@ -331,7 +200,7 @@ async fn a_constraint_violation_on_a_sensitive_member_never_echoes_the_value() {
     }
 }
 
-/// Rule 3: an operation that takes a `ResourceARN` answers for the resource type the ARN
+/// Rule 2: an operation that takes a `ResourceARN` answers for the resource type the ARN
 /// names — a missing hypervisor is the modelled `ResourceNotFoundException` answered at
 /// HTTP 400 and carrying `ErrorCode` `HypervisorNotFound`, every other type the same
 /// shape at the 404 its `@httpError` declares and with no `ErrorCode`.

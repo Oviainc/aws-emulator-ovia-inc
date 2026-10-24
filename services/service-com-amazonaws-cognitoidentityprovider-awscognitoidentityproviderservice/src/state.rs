@@ -323,6 +323,33 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         token
     }
 
+    /// Resolve the `Session` token a challenge response carries.
+    ///
+    /// Sessions the clock has already expired are swept first — the expiry was
+    /// owed at this instant whether or not anybody called — which is what tells
+    /// an expired session apart from one this emulator never handed out. The
+    /// session stays stored: answering its challenge is what ends it
+    /// ([`Self::end_session`]), so a caller whose response was refused can send
+    /// a corrected one while the session still lives.
+    pub fn session(&mut self, token: &str, now: SystemTime) -> SessionLookup {
+        let expired = self
+            .auth_sessions
+            .get(token)
+            .is_some_and(|stored| stored.expires_at <= now);
+        self.auth_sessions.retain(|_, stored| stored.expires_at > now);
+        match self.auth_sessions.get(token) {
+            Some(stored) => SessionLookup::Found(stored.clone()),
+            None if expired => SessionLookup::Expired,
+            None => SessionLookup::Unknown,
+        }
+    }
+
+    /// Forget the challenge session `token` names: a session answers its
+    /// challenge once.
+    pub fn end_session(&mut self, token: &str) {
+        self.auth_sessions.remove(token);
+    }
+
     /// The token record for `token`, or `None` when this emulator never issued it.
     pub fn token(&self, token: &str) -> Option<&TokenRecord> {
         self.issued_tokens.get(token)
@@ -773,15 +800,45 @@ impl UserPool {
             .cloned()
     }
 
+    /// Whether this pool's schema lets `name`'s stored value be CHANGED:
+    /// `SchemaAttributeType.Mutable` — "Specifies whether the value of the
+    /// attribute can be changed" (this service's model). An attribute the
+    /// schema does not declare has no entry to read, so it is reported
+    /// unchangeable.
+    pub fn attribute_mutable(&self, name: &str) -> bool {
+        self.schema
+            .iter()
+            .find(|entry| entry.name.as_deref() == Some(name))
+            .and_then(|entry| entry.mutable)
+            .unwrap_or(false)
+    }
+
+    /// Whether this pool's schema marks `name` a required attribute.
+    pub fn attribute_required(&self, name: &str) -> bool {
+        self.schema
+            .iter()
+            .find(|entry| entry.name.as_deref() == Some(name))
+            .and_then(|entry| entry.required)
+            .unwrap_or(false)
+    }
+
     /// The names of the attributes this pool's schema marks required that `user`
     /// has no value for: what a `NEW_PASSWORD_REQUIRED` challenge asks the user
     /// to supply. `sub` is never among them — the pool mints it.
     pub fn missing_required_attributes(&self, user: &User) -> Vec<String> {
+        self.unset_required_attributes(&user.attributes)
+    }
+
+    /// The names of the attributes this pool's schema marks required that
+    /// `attributes` holds no value for — the same rule as
+    /// [`UserPool::missing_required_attributes`], asked of an attribute set that
+    /// is not stored yet.
+    pub fn unset_required_attributes(&self, attributes: &BTreeMap<String, String>) -> Vec<String> {
         self.schema
             .iter()
             .filter(|entry| entry.required == Some(true))
             .filter_map(|entry| entry.name.clone())
-            .filter(|name| name != "sub" && !user.attributes.contains_key(name))
+            .filter(|name| name != "sub" && !attributes.contains_key(name))
             .collect()
     }
 
@@ -1238,6 +1295,20 @@ pub struct AuthSession {
     pub username: String,
     pub challenge_name: String,
     pub expires_at: SystemTime,
+}
+
+/// What resolving a `Session` token found
+/// ([`ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::session`]).
+/// An expired session is told apart from an unknown one because a challenge
+/// response owes a different refusal for each.
+#[derive(Debug, Clone)]
+pub enum SessionLookup {
+    /// The stored session, still inside its validity window.
+    Found(AuthSession),
+    /// A stored session whose validity window had already closed.
+    Expired,
+    /// No session of that token: this emulator never handed it out.
+    Unknown,
 }
 
 /// Which token of the triple a [`TokenRecord`] records.

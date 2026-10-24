@@ -859,7 +859,8 @@ async fn a_change_against_an_existing_entity_updates_it() {
 }
 
 /// An entity's `Visibility` is the one its applied details named, over the whole set the
-/// model's `*VisibilityString` enums publish — and a value outside that set is refused.
+/// model's `*VisibilityString` enums publish — and a value outside that set is not
+/// applied at all.
 #[tokio::test]
 async fn an_entity_reports_the_visibility_its_details_named() {
     let router = emulator();
@@ -924,23 +925,37 @@ async fn an_entity_reports_the_visibility_its_details_named() {
         );
     }
 
-    // A visibility the model has no value for is refused rather than stored.
+    // A visibility the model has no value for is not refused when the change set is
+    // accepted — it is inside the details document, which the model constrains nothing
+    // inside — but it is not stored either: applying the change set is what finds it, so
+    // the change set fails and the entity it would have created never exists.
     let router = emulator();
-    let refused = start_change_set(
+    let accepted = start_change_set(
         &router,
         create_change("AmiProduct", json!({"Visibility": "Sideways"})),
     )
     .await;
     assert_eq!(
-        refused.status, 422,
-        "an unmodelled Visibility must be refused, got {} with {:?}",
-        refused.status, refused.body
+        accepted.status, 200,
+        "an unmodelled Visibility is judged by applying, not by the start, got {} with {:?}",
+        accepted.status, accepted.body
     );
+    let unapplied = accepted.text("/ChangeSetId");
+    wait_for_success();
+    let failed = describe_change_set(&router, &unapplied).await;
     assert_eq!(
-        refused.error_code(),
-        "ValidationException",
-        "an unmodelled Visibility must answer ValidationException, got {:?}",
-        refused.body
+        (failed.text("/Status"), failed.text("/FailureCode")),
+        ("FAILED".to_string(), "CLIENT_ERROR".to_string()),
+        "an unmodelled Visibility must fail the change set, got {:?}",
+        failed.body
+    );
+    let entities = list_entities(&router, json!({"Catalog": CATALOG, "EntityType": "AmiProduct"}))
+        .await;
+    assert_eq!(
+        entities.list("/EntitySummaryList"),
+        Vec::<Value>::new(),
+        "a failed change set must create no entity, got {:?}",
+        entities.body
     );
 }
 

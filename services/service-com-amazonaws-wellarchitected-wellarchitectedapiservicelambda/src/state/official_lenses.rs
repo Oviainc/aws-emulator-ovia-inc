@@ -274,6 +274,18 @@ pub fn lens_question_count(lens: &str) -> usize {
     lens_questions(lens).len()
 }
 
+/// The ONE question a lens asks under `question_id`, when it asks it.
+///
+/// `QuestionId` is how every operation that reads or writes a single answer names the
+/// question, so this is the one lookup they share — and a lens this emulator holds no
+/// question set for asks nothing here ([`lens_questions`]), so no `QuestionId` of such a
+/// lens resolves.
+pub fn lens_question(lens: &str, question_id: &str) -> Option<&'static FrameworkQuestion> {
+    lens_questions(lens)
+        .iter()
+        .find(|question| question.question_id == question_id)
+}
+
 /// The pillars the named lens is organized into, in the framework's pillar order, each
 /// with its `PillarName` and the number of questions that pillar asks — the pillar half of
 /// [`lens_questions`].

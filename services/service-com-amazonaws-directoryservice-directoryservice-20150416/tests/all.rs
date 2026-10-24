@@ -37,3 +37,5 @@ mod microsoft_ad;
 mod snapshots;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/trusts.rs"]
+mod trusts;

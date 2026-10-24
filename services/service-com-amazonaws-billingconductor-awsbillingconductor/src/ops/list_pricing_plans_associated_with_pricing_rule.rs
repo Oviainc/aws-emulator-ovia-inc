@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPricingPlansAssociatedWithPricingRule
-//! REPORTS, for the pricing rule the request names, the pricing plans whose
-//! `PricingRuleArns` associate that rule, and writes nothing (`@readonly`). The
-//! association is held on the PLAN record
-//! (`crate::state::PricingPlanRecord::pricing_rule_arns`), so this is the inverse
-//! index of `ListPricingRulesAssociatedToPricingPlan`, derived from the same stored
-//! associations through `pricing_plans_referencing_rule` — the very set
+//! REPORTS, for the pricing rule the request names, the pricing plans that associate
+//! that rule IN THE BILLING PERIOD the request asks about, and writes nothing
+//! (`@readonly`). The association is held on the PLAN record
+//! (`crate::state::PricingPlanRecord::pricing_rule_associations`), so this is the
+//! inverse index of `ListPricingRulesAssociatedToPricingPlan`, derived from the same
+//! stored associations through `pricing_plans_referencing_rule` — the very set
 //! `AssociatedPricingPlanCount` counts.
 //!
 //! ## Shape of an operation
@@ -194,11 +194,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The plans that associate this rule, as FULL plan ARNs: `pricing_plans` is
-        // keyed by that ARN and ordered by it, so the sequence is already in ARN order
-        // and holds each plan once however many spellings of the rule its record
-        // carries. This is the same set `AssociatedPricingPlanCount` counts.
-        let plan_arns = state.pricing_plans_referencing_rule(&pricing_rule_arn);
+        // "The pricing plan billing period for which associations will be listed":
+        // the read is scoped to ONE period, and an association is in force only from
+        // the period it was made in onward. A request that names no period asks about
+        // the current one.
+        let billing_period = input
+            .billing_period
+            .clone()
+            .unwrap_or_else(crate::state::current_billing_period);
+
+        // The plans that associate this rule in that period, as FULL plan ARNs:
+        // `pricing_plans` is keyed by that ARN and ordered by it, so the sequence is
+        // already in ARN order and holds each plan once however many spellings of the
+        // rule its record carries. This is the same set `AssociatedPricingPlanCount`
+        // counts for the period.
+        let plan_arns = state.pricing_plans_referencing_rule(&pricing_rule_arn, &billing_period);
 
         // The plan ARN is both the element and its page key: the sequence is ordered
         // by ARN, so the `NextToken` handed back names the first plan left out and
@@ -209,12 +219,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::paginate(keyed, input.next_token.as_deref(), input.max_results);
 
         Ok(ListPricingPlansAssociatedWithPricingRuleOutput {
-            // "The pricing plan billing period for which associations will be listed."
-            // This emulator keeps no per-billing-period history, so every period
-            // reports the rule's current associations and the answer names the period
-            // the request asked about; a request that named none leaves it absent
-            // rather than inventing one — the same rule
-            // `ListPricingRulesAssociatedToPricingPlan` applies to this member.
+            // "The pricing plan billing period for which associations will be
+            // listed." The answer names the period the request asked about; a request
+            // that named none leaves it absent rather than inventing one — the same
+            // rule `ListPricingRulesAssociatedToPricingPlan` applies to this member.
             billing_period: input.billing_period,
             pricing_rule_arn: Some(pricing_rule_arn),
             // `PricingPlanArns` is modelled `@length(min: 1)`, so a rule no plan

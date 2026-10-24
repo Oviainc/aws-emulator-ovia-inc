@@ -295,6 +295,10 @@ pub const INQUIRY_STATUS_COMPLETED: &str = "COMPLETED";
 /// `InquiryStatus`'s value for an inquiry whose processing could not be performed.
 pub const INQUIRY_STATUS_FAILED: &str = "FAILED";
 
+/// `InquiryStatus`'s value for an inquiry whose own processing is over and whose queries
+/// are waiting on the human expert review `SUPPORT_MODE_FULL_SUPPORT` asked for.
+pub const INQUIRY_STATUS_HUMAN_REVIEW: &str = "HUMAN_REVIEW";
+
 /// `InquiryStatusMessage`'s value for an inquiry that is still being processed.
 pub const INQUIRY_MESSAGE_IN_PROGRESS: &str = "Compliance inquiry processing is in-progress.";
 
@@ -311,6 +315,9 @@ pub const INQUIRY_MESSAGE_COMPLETE_WITH_QUERY_ERRORS: &str =
 /// `InquiryStatusMessage`'s value for an inquiry whose processing itself failed.
 pub const INQUIRY_MESSAGE_INTERNAL_ERROR: &str =
     "An internal error occurred while processing the inquiry. Try again at a later time.";
+
+/// `InquiryStatusMessage`'s value for an inquiry waiting on a human expert review.
+pub const INQUIRY_MESSAGE_HUMAN_REVIEW: &str = "Human review is in progress.";
 
 /// `QueryStatus`'s non-terminal value.
 pub const QUERY_STATUS_PROCESSING: &str = "PROCESSING";
@@ -331,6 +338,10 @@ pub const QUERY_MESSAGE_COMPLETE: &str = "Query processing is complete.";
 pub const QUERY_MESSAGE_INTERNAL_ERROR: &str =
     "An internal error occurred while processing the query. Try again at a later time.";
 
+/// `QueryStatusMessage`'s value for a query whose own processing is over and which is
+/// waiting on the human expert review it was submitted for.
+pub const QUERY_MESSAGE_PENDING_HUMAN_REVIEW: &str = "Query is pending human review.";
+
 /// `InputSource`'s value for an inquiry submitted as a single query.
 pub const INPUT_SOURCE_TEXT: &str = "TEXT";
 
@@ -341,8 +352,52 @@ pub const INPUT_SOURCE_FILE: &str = "FILE";
 /// (`CreateComplianceInquiryRequest$supportMode`).
 pub const SUPPORT_MODE_AI_ONLY: &str = "AI_ONLY";
 
+/// `InquirySupportMode`'s value that "includes human expert review" and is "[o]nly
+/// supported for file upload mode" (`CreateComplianceInquiryRequest$supportMode`).
+pub const SUPPORT_MODE_FULL_SUPPORT: &str = "FULL_SUPPORT";
+
 /// `ReviewType`'s value for a response reviewed by the service's own model.
 pub const REVIEW_TYPE_AI: &str = "AI";
+
+/// `ReviewType`'s value for a response a human expert reviews.
+pub const REVIEW_TYPE_HUMAN: &str = "HUMAN";
+
+/// The longest `query` text a `QuerySummary` can report: `QuerySummary$query` targets
+/// `LongStringAttribute`, which is `@length(min: 1, max: 2048)`.
+pub const QUERY_TEXT_LIMIT: usize = 2048;
+
+/// `label` as `QuerySummary$query` can report it, or `None` when nothing reportable
+/// remains of it.
+///
+/// The member targets `LongStringAttribute` — `@length(min: 1, max: 2048)`, `@pattern
+/// ^[^<>]*$` — so the characters that pattern excludes are dropped and the text is
+/// clipped to the modelled maximum. Submitted query text already satisfies the shape
+/// (the request carried it through the same one), so this only ever bites on a handle
+/// read off a member with looser constraints, such as the inquiry's title.
+pub fn reportable_query_text(label: &str) -> Option<String> {
+    let text: String = label
+        .chars()
+        .filter(|character| *character != '<' && *character != '>')
+        .take(QUERY_TEXT_LIMIT)
+        .collect();
+    (!text.is_empty()).then_some(text)
+}
+
+/// The `ReviewType` the queries of one submission carry.
+///
+/// `FULL_SUPPORT` "includes human expert review" and is "[o]nly supported for file upload
+/// mode" (`CreateComplianceInquiryRequest$supportMode`), so it selects human review for an
+/// uploaded document and for nothing else: a submission the mode does not cover is
+/// reviewed by the service's own model, whatever the request asked for.
+pub fn review_type_for(support_mode: &str, content: &InquiryContentRecord) -> &'static str {
+    if support_mode == SUPPORT_MODE_FULL_SUPPORT
+        && content.input_source() == INPUT_SOURCE_FILE
+    {
+        REVIEW_TYPE_HUMAN
+    } else {
+        REVIEW_TYPE_AI
+    }
+}
 
 /// How many tags one resource carries at most.
 ///
@@ -685,6 +740,38 @@ impl InquiryContentRecord {
             Self::File { .. } => None,
         }
     }
+
+    /// The units of work this content submits, in the order they are processed — one
+    /// query each, reported under the handle the submission gave it.
+    ///
+    /// A text submission submits exactly ONE: the query it carries, which IS the unit of
+    /// work. An uploaded document is processed SECTION BY SECTION —
+    /// `InquiryFileContent$fileSections` is the "[l]ist of file sections/sheets to
+    /// process" — so it submits one unit per section it names, and the document as a
+    /// whole, under the `title` the submission carries, when it names none.
+    ///
+    /// A unit is reported under its own handle and nothing more: the questions a section
+    /// holds are written INSIDE the document, no document understanding runs in this
+    /// emulator, and no question text is invented for them (nor any response — see
+    /// [`InquiryQuery::response`]).
+    ///
+    /// An upload carrying NO BYTES submits nothing: there is no document to process, so
+    /// the inquiry owns no query and [`ComplianceInquiry::materialise`] reports its
+    /// processing as failed.
+    pub fn work_units(&self, title: &str) -> Vec<String> {
+        match self {
+            Self::Text(query) => vec![query.clone()],
+            Self::File { sections, content } => {
+                if content.is_empty() {
+                    Vec::new()
+                } else if sections.is_empty() {
+                    vec![title.to_string()]
+                } else {
+                    sections.clone()
+                }
+            }
+        }
+    }
 }
 
 /// One query within one compliance inquiry — the `QuerySummary` projection
@@ -694,7 +781,9 @@ impl InquiryContentRecord {
 pub struct InquiryQuery {
     /// "Sequential identifier of the query within the inquiry", 1-based.
     pub identifier: i32,
-    /// "The actual query text", as the inquiry's content carried it.
+    /// "The actual query text" — the handle the submitted content gave this unit of
+    /// work (see [`InquiryContentRecord::work_units`]), rendered inside the modelled
+    /// bounds of the member that reports it ([`reportable_query_text`]).
     pub query: String,
     /// "Generated response to the query."
     ///
@@ -704,7 +793,10 @@ pub struct InquiryQuery {
     /// is the honest signal; the query's own status still reports that its processing is
     /// over, because the query itself was received and recorded.
     pub response: Option<String>,
-    /// One of `ReviewType`'s values — the review the inquiry was submitted for.
+    /// One of `ReviewType`'s values — the review the inquiry was submitted for
+    /// ([`review_type_for`]). A query awaiting [`REVIEW_TYPE_HUMAN`] stays non-terminal:
+    /// a human expert's review is not the clock's to finish (see
+    /// [`ComplianceInquiry::materialise`]).
     pub review_type: Option<String>,
     /// One of `QueryStatus`'s values.
     pub status: String,
@@ -835,22 +927,30 @@ impl ComplianceInquiry {
     /// calling it on every read is idempotent.
     ///
     /// The terminal status is DERIVED from the queries': an inquiry is over when its
-    /// queries are, and the inquiry-level message says whether any of them errored.
+    /// queries are, and the inquiry-level message says what became of them.
     ///
-    /// * a TEXT inquiry's one query is enumerated — its text IS the submitted query, so
-    ///   nothing had to be read or generated to know it — and its processing is over at
-    ///   the due instant, so it reaches `COMPLETED` and the inquiry reaches the modelled
-    ///   clean-completion message. NO RESPONSE is reported for it: a compliance answer is
-    ///   model-generated text and no such engine runs in-process, so the `response` member
-    ///   stays absent (see [`InquiryQuery::response`]) rather than carrying prose nothing
-    ///   produced. The absent member is the honest signal, not a query-level error that
-    ///   never happened;
-    /// * a FILE inquiry's queries would have to be read out of the uploaded document,
-    ///   which this emulator does not parse, so its processing never got as far as a
-    ///   query and the inquiry ends in the modelled FAILED state instead;
-    /// * a query that did reach `FAILED` is what selects the inquiry-level
-    ///   "One or more queries encountered errors" message, so the two enum values are
-    ///   told apart by the queries rather than one of them being unreachable.
+    /// * a query the service's own model reviews ([`REVIEW_TYPE_AI`]) is processed by the
+    ///   due instant, so it reaches `COMPLETED`, and an inquiry whose queries all did
+    ///   reaches the modelled clean-completion message. NO RESPONSE is reported for one:
+    ///   a compliance answer is model-generated text and no such engine runs in-process,
+    ///   so the `response` member stays absent (see [`InquiryQuery::response`]) rather
+    ///   than carrying prose nothing produced. The absent member is the honest signal,
+    ///   not a query-level error that never happened;
+    /// * a query submitted for HUMAN expert review ([`REVIEW_TYPE_HUMAN`]) is not the
+    ///   CLOCK's to finish — a human has to look at it, and nothing in this emulator
+    ///   stands in for one — so it stays non-terminal and reports that it is waiting,
+    ///   and the inquiry RESTS in `HUMAN_REVIEW` while any of its queries does, rather
+    ///   than being moved on as though a review had happened. Nothing reads an inquiry
+    ///   only once it is terminal: every reader of one (`GetComplianceInquiryMetadata`,
+    ///   `ListComplianceInquiries`, `ListComplianceInquiryQueries`,
+    ///   `ExportComplianceInquiry`, `PutComplianceInquiryFeedback`) reports or records
+    ///   against it in whatever status it is in;
+    /// * a query that reached `FAILED` is what selects the inquiry-level "One or more
+    ///   queries encountered errors" message, so the two completion values are told
+    ///   apart by the queries rather than one of them being unreachable;
+    /// * an inquiry that owns NO query never got as far as one — a submission with
+    ///   nothing to process (see [`InquiryContentRecord::work_units`]) — and ends in the
+    ///   modelled FAILED state.
     pub fn materialise(&mut self, now: SystemTime) {
         let Some(due) = self.processing_due_at else {
             return;
@@ -863,11 +963,20 @@ impl ComplianceInquiry {
         // not the instant some caller happened to look.
         self.updated_at = due;
         for query in &mut self.queries {
-            if query.status == QUERY_STATUS_PROCESSING {
+            if query.status != QUERY_STATUS_PROCESSING {
+                continue;
+            }
+            if query.review_type.as_deref() == Some(REVIEW_TYPE_HUMAN) {
+                query.status_message = QUERY_MESSAGE_PENDING_HUMAN_REVIEW.to_string();
+            } else {
                 query.status = QUERY_STATUS_COMPLETED.to_string();
                 query.status_message = QUERY_MESSAGE_COMPLETE.to_string();
             }
         }
+        let awaiting_human_review = self
+            .queries
+            .iter()
+            .any(|query| query.status == QUERY_STATUS_PROCESSING);
         let any_query_failed = self
             .queries
             .iter()
@@ -875,6 +984,9 @@ impl ComplianceInquiry {
         if self.queries.is_empty() {
             self.status = INQUIRY_STATUS_FAILED.to_string();
             self.status_message = INQUIRY_MESSAGE_INTERNAL_ERROR.to_string();
+        } else if awaiting_human_review {
+            self.status = INQUIRY_STATUS_HUMAN_REVIEW.to_string();
+            self.status_message = INQUIRY_MESSAGE_HUMAN_REVIEW.to_string();
         } else if any_query_failed {
             self.status = INQUIRY_STATUS_COMPLETED.to_string();
             self.status_message = INQUIRY_MESSAGE_COMPLETE_WITH_QUERY_ERRORS.to_string();

@@ -89,6 +89,16 @@ impl HealthLake {
         )
     }
 
+    /// The `DatastoreProperties` `DescribeFHIRDatastore` reports for `id`.
+    ///
+    /// `pub(crate)` so every suite in `tests/all/` reads a data store back
+    /// through the same helper rather than each growing its own copy.
+    pub(crate) async fn describe(&self, id: &str) -> Value {
+        self.ok("DescribeFHIRDatastore", &json!({ "DatastoreId": id }))
+            .await["DatastoreProperties"]
+            .clone()
+    }
+
     /// Every data store the service reports, in `ListFHIRDatastores` order.
     pub(crate) async fn list_all(&self, filter: &Value) -> Vec<Value> {
         let mut request = json!({});

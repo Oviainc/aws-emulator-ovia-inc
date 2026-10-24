@@ -29,10 +29,14 @@ mod layer_part_uploads;
 mod layer_upload_completion;
 #[path = "all/layer_upload_convergence.rs"]
 mod layer_upload_convergence;
+#[path = "all/layer_upload_refusal_messages.rs"]
+mod layer_upload_refusal_messages;
 #[path = "all/layer_upload_sessions.rs"]
 mod layer_upload_sessions;
 #[path = "all/pagination_token_refusal.rs"]
 mod pagination_token_refusal;
+#[path = "all/put_image_layer_resolution.rs"]
+mod put_image_layer_resolution;
 #[path = "all/region_gate.rs"]
 mod region_gate;
 #[path = "all/registry_catalog_data.rs"]

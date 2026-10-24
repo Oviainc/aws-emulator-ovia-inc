@@ -189,6 +189,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         );
 
+        // `Size` is a count of the plan's rule ASSOCIATIONS, and an association is in
+        // force only from the billing period it was made in onward, so the count is
+        // taken for the period the read is scoped to. A request that names no period
+        // asks about the current one.
+        let billing_period = input
+            .billing_period
+            .clone()
+            .unwrap_or_else(crate::state::current_billing_period);
+
         // `pricing_plans` is ordered by ARN, and an ARN carries the monotonic id this
         // service mints, so the sequence is creation order and a `NextToken` names the
         // same cut point on the next call. The AWS-managed plans belong to no account
@@ -199,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|(arn, _)| wanted.as_ref().is_none_or(|wanted| wanted.contains(arn)))
             .map(|(arn, plan)| {
                 let size = state
-                    .associated_pricing_rule_arns(arn)
+                    .associated_pricing_rule_arns(arn, &billing_period)
                     .map(|arns| i64::try_from(arns.len()).unwrap_or(i64::MAX))
                     .unwrap_or_default();
                 (arn.clone(), element(plan, size))
@@ -211,11 +220,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListPricingPlansOutput {
             // "The billing period for which the described pricing plans are applicable."
-            // This emulator keeps no per-billing-period history of a plan, so every
-            // period reports the plans as they stand now and the answer names the period
-            // the request asked about; a request that named none leaves it absent rather
-            // than inventing one -- the same choice the sibling readers
-            // (`ListPricingRules`, `ListPricingRulesAssociatedToPricingPlan`) make.
+            // The answer names the period the request asked about; a request that named
+            // none leaves it absent rather than inventing one -- the same choice the
+            // sibling readers (`ListPricingRules`,
+            // `ListPricingRulesAssociatedToPricingPlan`) make.
             billing_period: input.billing_period,
             pricing_plans: Some(pricing_plans),
             next_token,

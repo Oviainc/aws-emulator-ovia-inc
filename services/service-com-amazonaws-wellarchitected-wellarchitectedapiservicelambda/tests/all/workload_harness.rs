@@ -142,8 +142,8 @@ impl Client {
     /// Record an answer to one question of one REVIEW TEMPLATE's lens review straight
     /// through the shared state, so a test has a stored answer for the reads to report.
     /// `UpdateReviewTemplateAnswer` — the operation that answers a template question
-    /// over the wire — is still a stub with its own issue; the READ under test still
-    /// crosses the HTTP boundary.
+    /// over the wire — is exercised over HTTP by `super::review_template_answer_updates`;
+    /// this seed is for the reads that need many answered questions at once.
     pub(crate) fn record_template_answer(
         &self,
         template_arn: &str,
@@ -329,6 +329,78 @@ impl Client {
         .await
     }
 
+    /// `UpdateReviewTemplateAnswer`:
+    /// `PATCH /reviewTemplates/{TemplateArn}/lensReviews/{LensAlias}/answers/{QuestionId}`.
+    /// Every label is non-greedy, so each travels percent-encoded in one path segment,
+    /// exactly as an SDK sends it.
+    pub(crate) async fn update_review_template_answer(
+        &self,
+        template_arn: &str,
+        lens: &str,
+        question_id: &str,
+        body: Value,
+    ) -> Answer {
+        self.send(
+            "PATCH",
+            &format!(
+                "/reviewTemplates/{}/lensReviews/{}/answers/{}",
+                encode_path_segment(template_arn),
+                encode_path_segment(lens),
+                encode_path_segment(question_id)
+            ),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `GetReviewTemplateAnswer`:
+    /// `GET /reviewTemplates/{TemplateArn}/lensReviews/{LensAlias}/answers/{QuestionId}`.
+    pub(crate) async fn get_review_template_answer(
+        &self,
+        template_arn: &str,
+        lens: &str,
+        question_id: &str,
+    ) -> Answer {
+        self.send(
+            "GET",
+            &format!(
+                "/reviewTemplates/{}/lensReviews/{}/answers/{}",
+                encode_path_segment(template_arn),
+                encode_path_segment(lens),
+                encode_path_segment(question_id)
+            ),
+            None,
+        )
+        .await
+    }
+
+    /// `ListReviewTemplateAnswers`:
+    /// `GET /reviewTemplates/{TemplateArn}/lensReviews/{LensAlias}/answers`, with every
+    /// filter and paging member bound to the query string. `query` is passed as sent,
+    /// empty for a request that names none.
+    pub(crate) async fn list_review_template_answers(
+        &self,
+        template_arn: &str,
+        lens: &str,
+        query: &str,
+    ) -> Answer {
+        let suffix = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{query}")
+        };
+        self.send(
+            "GET",
+            &format!(
+                "/reviewTemplates/{}/lensReviews/{}/answers{suffix}",
+                encode_path_segment(template_arn),
+                encode_path_segment(lens)
+            ),
+            None,
+        )
+        .await
+    }
+
     /// `CreateProfile`: `POST /profiles`.
     pub(crate) async fn create_profile(&self, body: Value) -> Answer {
         self.send("POST", "/profiles", Some(body)).await
@@ -506,7 +578,9 @@ pub(crate) async fn review_template(client: &Client, name: &str, lenses: &[&str]
 
 /// An `AnswerRecord` that records `selected` as the best practices in place, `choices` as
 /// the status of each choice it speaks about, whether the question applies and the reason
-/// it does not — the one answer builder the suites in this crate share.
+/// it does not — the one answer builder the suites in this crate share. The answer's own
+/// notes and each choice's notes are what `UpdateReviewTemplateAnswer` writes over the
+/// wire, so a seeded answer carries none.
 pub(crate) fn answered(
     selected: &[&str],
     choices: &[(&str, &str)],
@@ -523,12 +597,14 @@ pub(crate) fn answered(
                     ChoiceAnswerRecord {
                         status: (*status).to_string(),
                         reason: None,
+                        notes: None,
                     },
                 )
             })
             .collect(),
         is_applicable,
         reason: reason.map(ToString::to_string),
+        notes: None,
     }
 }
 

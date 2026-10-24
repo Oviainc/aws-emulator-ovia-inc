@@ -24,7 +24,9 @@
 //! An accepted map round-trips through the resource's own implemented reader
 //! (`GetFeed` / `GetDictionary`).
 
-use crate::harness::{call, output_config, router};
+use crate::harness::{
+    call, pair, router, tag_object, tagged_create_body, tags_of, tags_path, TAGGABLE_KINDS,
+};
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
     invalid_tag_key_message, reserved_tag_key_message, too_many_tags_message,
@@ -33,10 +35,6 @@ use service_com_amazonaws_elementalinference_elementalinference::state::{
 use smithy_server_runtime::MultiServiceRouter;
 use std::collections::BTreeMap;
 
-/// The two kinds of resource this service mints and tags, as the modelled `resourceArn`
-/// pattern spells them (`…:(feed|dictionary)/[a-zA-Z0-9]{1,19}$`).
-const KINDS: [&str; 2] = ["feed", "dictionary"];
-
 /// One row: a tag map a request may carry, whether this service stores it, and the
 /// refusal it earns when it does not.
 struct TagCase {
@@ -44,11 +42,6 @@ struct TagCase {
     tags: Vec<(String, String)>,
     admitted: bool,
     message: Option<String>,
-}
-
-/// A pair, from two `&str`s.
-fn pair(key: &str, value: &str) -> (String, String) {
-    (key.to_string(), value.to_string())
 }
 
 /// `count` distinct ordinary tags, for the rows about HOW MANY tags a request carries.
@@ -178,49 +171,6 @@ fn tag_cases() -> Vec<TagCase> {
     ]
 }
 
-/// A `TagMap` body member built from a list of pairs.
-fn tag_object(tags: &[(String, String)]) -> Value {
-    Value::Object(
-        tags.iter()
-            .map(|(key, value)| (key.clone(), json!(value)))
-            .collect(),
-    )
-}
-
-/// The `tags` member of a resource response, as a map so a comparison does not depend on
-/// key order.
-fn tags_of(resource: &Value) -> BTreeMap<String, String> {
-    resource["tags"]
-        .as_object()
-        .unwrap_or_else(|| panic!("a resource response carries a tags map, got {resource}"))
-        .iter()
-        .map(|(key, value)| {
-            (
-                key.clone(),
-                value
-                    .as_str()
-                    .unwrap_or_else(|| panic!("a tag value is a string, got {value}"))
-                    .to_string(),
-            )
-        })
-        .collect()
-}
-
-/// The create body of `kind`, named `name` and carrying `tags`.
-fn create_body(kind: &str, name: &str, tags: &[(String, String)]) -> Value {
-    match kind {
-        "feed" => json!({
-            "name": name,
-            "outputs": [
-                {"name": "crop1", "outputConfig": output_config("cropping"), "status": "ENABLED"}
-            ],
-            "tags": tag_object(tags),
-        }),
-        "dictionary" => json!({"name": name, "language": "eng", "tags": tag_object(tags)}),
-        other => panic!("no such resource kind: {other}"),
-    }
-}
-
 /// The path the collection of `kind` is listed under (`ListFeeds` / `ListDictionaries`).
 fn list_path(kind: &str) -> &'static str {
     match kind {
@@ -280,7 +230,7 @@ fn assert_refusal(label: &str, case: &TagCase, status: u16, body: &Value) {
 /// resource behind.
 #[tokio::test]
 async fn a_create_stores_only_a_tag_map_the_service_admits() {
-    for kind in KINDS {
+    for kind in TAGGABLE_KINDS {
         for (index, case) in tag_cases().into_iter().enumerate() {
             let router = router();
             let label = format!("{} on a created {kind}", case.label);
@@ -289,7 +239,7 @@ async fn a_create_stores_only_a_tag_map_the_service_admits() {
                 &router,
                 "POST",
                 &format!("/v1/{kind}"),
-                Some(create_body(kind, &name, &case.tags)),
+                Some(tagged_create_body(kind, &name, &case.tags)),
             )
             .await;
 
@@ -335,7 +285,7 @@ async fn a_create_stores_only_a_tag_map_the_service_admits() {
 /// onto the resource, a refused one leaves the stored set alone.
 #[tokio::test]
 async fn a_tag_write_stores_only_a_tag_map_the_service_admits() {
-    for kind in KINDS {
+    for kind in TAGGABLE_KINDS {
         for (index, case) in tag_cases().into_iter().enumerate() {
             let router = router();
             let label = format!("{} written onto a {kind}", case.label);
@@ -347,7 +297,7 @@ async fn a_tag_write_stores_only_a_tag_map_the_service_admits() {
                 &router,
                 "POST",
                 &format!("/v1/{kind}"),
-                Some(create_body(kind, &name, &[])),
+                Some(tagged_create_body(kind, &name, &[])),
             )
             .await;
             assert_eq!(
@@ -363,19 +313,10 @@ async fn a_tag_write_stores_only_a_tag_map_the_service_admits() {
                 .unwrap_or_else(|| panic!("case {label:?}: a created {kind} carries an arn, got {created}"))
                 .to_string();
 
-            let encoded: String = arn
-                .bytes()
-                .map(|byte| match byte {
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                        char::from(byte).to_string()
-                    }
-                    other => format!("%{other:02X}"),
-                })
-                .collect();
             let (status, body) = call(
                 &router,
                 "POST",
-                &format!("/v1/tags/{encoded}"),
+                &tags_path(&arn),
                 Some(json!({"tags": tag_object(&case.tags)})),
             )
             .await;

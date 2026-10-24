@@ -190,8 +190,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; the listing is identified by its input.
-        let _ = ctx;
+        // The endpoint this request was signed for: a regional endpoint resolves only
+        // the workflows created through it.
+        let region = crate::state::request_region(ctx.parts());
 
         // A member value that fails the constraint its model declares is refused
         // first, with the modelled `ValidationException` — `Message`,
@@ -238,15 +239,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The entity this listing walks is the workflow its `@httpLabel` names: one the
         // store does not hold has no runs to page over, and an empty page for it would
-        // claim the workflow exists.
-        let workflow = store.workflows.get_mut(&input.workflow_arn).ok_or_else(|| {
-            crate::state::lookup_miss(ListWorkflowRunsErrorModeled::ResourceNotFoundException(
-                crate::state::unresolved(
-                    crate::state::UnresolvedEntity::Workflow,
-                    &input.workflow_arn,
-                ),
-            ))
-        })?;
+        // claim the workflow exists. A workflow of ANOTHER region is not one this
+        // endpoint holds either.
+        let workflow = store
+            .workflow_in_mut(&region, &input.workflow_arn)
+            .ok_or_else(|| {
+                crate::state::lookup_miss(
+                    ListWorkflowRunsErrorModeled::ResourceNotFoundException(
+                        crate::state::unresolved(
+                            crate::state::UnresolvedEntity::Workflow,
+                            &input.workflow_arn,
+                        ),
+                    ),
+                )
+            })?;
 
         // The ONE further write a read may make: every status change the clock already
         // owed, applied to each run so this listing reports what `GetWorkflowRun` would.

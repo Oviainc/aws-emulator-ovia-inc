@@ -162,10 +162,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A reset addresses an already-stored channel by name, and the ARN it answers
-        // with is the one that channel was created with, so nothing else about the
-        // request (its region included) takes part in it.
-        let _ = ctx;
+        // A reset addresses an already-stored channel by name within the Region the
+        // request was signed for, and the ARN it answers with is the one that channel was
+        // created with rather than one recomputed here.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ResetChannelStateErrorModeled::InternalServerException(
                 InternalServerException {
@@ -178,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A channel only exists inside its group, so an unresolved parent is reported as
         // the resource that is actually missing rather than as a missing channel.
-        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+        let Some(group) = store.channel_group_mut(&region, &input.channel_group_name) else {
             return Err(ResetChannelStateErrorModeled::ResourceNotFoundException(
                 crate::state::ResourceKind::ChannelGroup.not_found(),
             )

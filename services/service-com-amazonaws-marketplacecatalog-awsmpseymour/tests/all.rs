@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/assessments.rs"]
 mod assessments;
+#[path = "all/change_set_failures.rs"]
+mod change_set_failures;
 #[path = "all/change_set_lifecycle.rs"]
 mod change_set_lifecycle;
 #[path = "all/entity_reads.rs"]

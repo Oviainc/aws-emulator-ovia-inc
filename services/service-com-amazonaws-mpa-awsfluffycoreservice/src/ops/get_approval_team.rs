@@ -10,7 +10,9 @@
 //! [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] first, which applies only what the
 //! CLOCK already owed at this instant (an invitation response that has come due, a
 //! pending deletion window that has run out) — changes a caller who never polled would
-//! have seen anyway.
+//! have seen anyway. Each approver's `MfaMethods` is reported off the stored record too,
+//! so a read never synchronizes an MFA device: `UpdateApprovalTeam`'s
+//! `SYNCHRONIZE_MFA_DEVICES` action is what does.
 //!
 //! ## Shape of an operation
 //!
@@ -251,11 +253,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .last_activity_time
                             .map(::aws_smithy_types::DateTime::from),
                         // The baseline session this approver still has to answer, read
-                        // off the stored sessions; this service stores no MFA devices.
+                        // off the stored sessions.
                         pending_baseline_session_arn: pending_baselines
                             .get(approver.approver_id.as_str())
                             .cloned(),
-                        mfa_methods: None,
+                        // The approver's MFA devices, each with the synchronization
+                        // state the stored record carries. A read never synchronizes
+                        // one: `UpdateApprovalTeam`'s update action is what does.
+                        mfa_methods: Some(
+                            approver
+                                .mfa_methods
+                                .iter()
+                                .map(|method| MfaMethod {
+                                    r#type: method.mfa_type.as_wire().to_string(),
+                                    sync_status: method.sync_status.as_wire().to_string(),
+                                })
+                                .collect(),
+                        ),
                     })
                     .collect(),
             ),

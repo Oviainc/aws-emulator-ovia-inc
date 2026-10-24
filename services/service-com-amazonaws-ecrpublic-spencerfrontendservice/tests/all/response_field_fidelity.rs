@@ -33,14 +33,19 @@ use serde_json::{json, Value};
 use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::MAX_MANIFEST_LIST_ENTRIES;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::harness::{blob_digest, given_manifest_blobs};
 use crate::repository_image_lifecycle::{call, digest_of, ok, service};
 
 /// An OCI/Docker content descriptor, which is what both `layers[*]` and `manifests[*]`
 /// entries are: a media type, a digest and the size of the blob it points at.
+///
+/// The digest is minted through [`blob_digest`], so [`push`] can put the layer blob behind
+/// it into the repository before the manifest that names it is pushed — a manifest is only
+/// committed over blobs the repository already holds.
 fn descriptor(media_type: &str, body: &str, size: i64) -> Value {
     json!({
         "mediaType": media_type,
-        "digest": digest_of(body),
+        "digest": blob_digest(body),
         "size": size,
     })
 }
@@ -102,7 +107,8 @@ async fn repository(router: &MultiServiceRouter, name: &str) {
     .await;
 }
 
-/// Push `manifest` under `repository_name` with an optional tag.
+/// Push `manifest` under `repository_name` with an optional tag, after putting every layer
+/// blob it names into the repository.
 async fn push(
     router: &MultiServiceRouter,
     repository_name: &str,
@@ -110,6 +116,7 @@ async fn push(
     tag: Option<&str>,
     case: &str,
 ) -> String {
+    given_manifest_blobs(router, repository_name, manifest, case).await;
     let mut body = json!({"repositoryName": repository_name, "imageManifest": manifest});
     if let Some(tag) = tag {
         body["imageTag"] = json!(tag);

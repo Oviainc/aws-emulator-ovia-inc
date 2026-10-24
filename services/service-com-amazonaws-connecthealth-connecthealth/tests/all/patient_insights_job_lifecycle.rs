@@ -55,13 +55,16 @@ const ENCOUNTER_REASON_LEN: (usize, usize) = (1, 256);
 const MAX_S3_SOURCES: usize = 10;
 
 /// `POST /domain/{domainId}/patient-insights-job` — `StartPatientInsightsJob`'s route.
-fn start_path(domain_id: &str) -> String {
+///
+/// `pub(crate)` so the sibling suites of this test target address this operation the way
+/// this one does, rather than each growing its own copy of the route.
+pub(crate) fn start_path(domain_id: &str) -> String {
     format!("/domain/{domain_id}/patient-insights-job")
 }
 
 /// `GET /domain/{domainId}/patient-insights-job/{jobId}` — `GetPatientInsightsJob`'s
 /// route.
-fn job_path(domain_id: &str, job_id: &str) -> String {
+pub(crate) fn job_path(domain_id: &str, job_id: &str) -> String {
     format!("/domain/{domain_id}/patient-insights-job/{job_id}")
 }
 
@@ -139,7 +142,12 @@ async fn start_job(emulator: &Emulator, case: &str, domain_id: &str, body: &Valu
 }
 
 /// `GetPatientInsightsJob`, asserting the modelled success and returning its body.
-async fn get_job(emulator: &Emulator, case: &str, domain_id: &str, job_id: &str) -> Value {
+pub(crate) async fn get_job(
+    emulator: &Emulator,
+    case: &str,
+    domain_id: &str,
+    job_id: &str,
+) -> Value {
     let (status, fetched) = emulator
         .send("GET", &job_path(domain_id, job_id), None)
         .await;

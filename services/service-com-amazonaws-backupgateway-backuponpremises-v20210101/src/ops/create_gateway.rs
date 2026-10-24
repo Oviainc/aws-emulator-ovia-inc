@@ -5,9 +5,13 @@
 //! [`crate::state`], and returns the ARN read back out of the store. This is the ONLY
 //! file to touch for this operation.
 //!
-//! A gateway is minted only for an `ActivationKey` this service ISSUED (the registry in
-//! [`crate::state`]); any other key is refused with the modelled `ValidationException`
-//! carrying `ErrorCode` `ActivationKeyNotFound`, before anything is written.
+//! Every `ActivationKey` the modelled constraints accept (len 1..50, pattern
+//! `^[0-9a-zA-Z\-]+$`) mints a gateway: the key is issued to a deployed appliance OUTSIDE
+//! this API — no operation of this model, and nothing a client can send, produces one —
+//! so the service has no record of its own to resolve the key against and accepts the key
+//! the request carries, recording it on the gateway it mints. A key the modelled
+//! constraints refuse never reaches `handle`: the boundary validator answers it with the
+//! modelled `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -173,25 +177,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The record is read back OUT of the store after the insert, so the ARN below is
         // the key the store now holds — not a string built from this request.
         //
-        // One guard spans the activation-key lookup, the ceiling check and the insert,
-        // so two concurrent creates cannot both pass a check that only one of them
-        // should: this operation is the only thing that grows the store, so the store is
-        // bounded here.
+        // One guard spans the ceiling check and the insert, so two concurrent creates
+        // cannot both pass a check that only one of them should: this operation is the
+        // only thing that grows the store, so the store is bounded here.
         let mut store = state.lock();
 
-        // An activation key is ISSUED to a deployed gateway appliance; it is not
-        // something a caller can choose. So a gateway is minted only for a key this
-        // service's registry really holds, and a key it does not hold is refused BEFORE
-        // anything is written — otherwise a client would hold an ARN for a gateway that
-        // does not exist, and every later read would report it.
-        if !store.activation_key_issued(&input.activation_key) {
-            return Err(CreateGatewayErrorModeled::ValidationException(ValidationException {
-                error_code: Some(crate::state::ACTIVATION_KEY_NOT_FOUND.to_string()),
-                message: Some(crate::state::ACTIVATION_KEY_NOT_FOUND_MESSAGE.to_string()),
-            })
-            .into());
-        }
-
+        // The `ActivationKey` is NOT resolved against anything the service holds. It is
+        // minted out of band, by the activation handshake of the appliance the customer
+        // deployed, which no operation of this model performs — so there is no registry a
+        // client could have populated, and gating the create on one would refuse every
+        // request a client can make. The key the request carries is what identifies the
+        // appliance, and it is persisted on the record below; the only thing that can be
+        // said about its WELL-FORMEDNESS is what the model states, and the boundary
+        // validator has already refused anything that violates it.
         if store.gateway_count() >= crate::state::MAX_STORED_GATEWAYS {
             return Err(CreateGatewayErrorModeled::ValidationException(ValidationException {
                 error_code: None,

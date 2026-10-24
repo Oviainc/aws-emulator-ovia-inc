@@ -25,6 +25,7 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::harness::{blob_digest, given_manifest_blobs};
 use crate::repository_image_lifecycle::{digest_of, ok, refused, service, REGISTRY_ID};
 
 /// Create one repository, named for the case.
@@ -39,6 +40,9 @@ async fn repository(router: &MultiServiceRouter, name: &str) {
 }
 
 /// Push `manifest` under `repository_name`, optionally tagged, and return its digest.
+///
+/// Every layer blob the manifest names is put into the repository first: a manifest is
+/// only committed over blobs the repository already holds.
 async fn push(
     router: &MultiServiceRouter,
     repository_name: &str,
@@ -46,6 +50,7 @@ async fn push(
     tag: Option<&str>,
     case: &str,
 ) -> String {
+    given_manifest_blobs(router, repository_name, manifest, case).await;
     let mut body = json!({"repositoryName": repository_name, "imageManifest": manifest});
     if let Some(tag) = tag {
         body["imageTag"] = json!(tag);
@@ -138,8 +143,11 @@ const SHARED_IMAGE_MEMBERS: [&str; 5] = [
 ];
 
 /// An OCI content descriptor: a media type, a digest and the size of the blob it names.
+///
+/// The digest is minted through [`blob_digest`], so [`push`] can put the layer blob behind
+/// it into the repository before the manifest that names it is pushed.
 fn descriptor(media_type: &str, body: &str, size: i64) -> Value {
-    json!({"mediaType": media_type, "digest": digest_of(body), "size": size})
+    json!({"mediaType": media_type, "digest": blob_digest(body), "size": size})
 }
 
 /// An image manifest referencing `layer_sizes` layer blobs.

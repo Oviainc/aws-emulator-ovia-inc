@@ -20,14 +20,23 @@
 //! its group in `AnywhereSettings$ChannelPlacementGroupId` — and `State` comes
 //! from the group's own lifecycle, which the clock moves.
 //!
-//! The lifecycle has TWO clock-owed steps, because a group's node association
-//! can be both made and unmade: `UpdateChannelPlacementGroup` ("Change the
-//! settings for a ChannelPlacementGroup") can give a group a node, swap the one
-//! it has, or take its last one away, so a group that now names a node is
-//! `ASSIGNING` until `ASSIGNED` comes due and one whose nodes have just been
-//! emptied is `UNASSIGNING` until `UNASSIGNED` does
-//! ([`ChannelPlacementGroupRecord::begin_assignment`]). The instant is stored
-//! and never slept on.
+//! A DELETE never drops the record, exactly as the channel's and the input's do
+//! not: the group enters the transient `DELETING` state its own enum models and
+//! the clock owes it the terminal `DELETED`, which it then keeps, so a reader
+//! goes on reporting the group there instead of losing it. A group a delete has
+//! been accepted for is on its way out of the account, so it reserves its name
+//! no longer (the record stays readable under the name it was created with) and
+//! associates no node (see
+//! [`ChannelPlacementGroupRecord::is_delete_accepted`]).
+//!
+//! The ASSIGNMENT has two clock-owed steps of its own, because a group's node
+//! association can be both made and unmade: `UpdateChannelPlacementGroup`
+//! ("Change the settings for a ChannelPlacementGroup") can give a group a node,
+//! swap the one it has, or take its last one away, so a group that now names a
+//! node is `ASSIGNING` until `ASSIGNED` comes due and one whose nodes have just
+//! been emptied is `UNASSIGNING` until `UNASSIGNED` does
+//! ([`ChannelPlacementGroupRecord::begin_assignment`]). Every such instant is
+//! stored and never slept on.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -50,8 +59,8 @@ pub mod channel_placement_group_state {
     /// clock owes [`UNASSIGNED`]. Reached by an update that empties `Nodes`.
     pub const UNASSIGNING: &str = "UNASSIGNING";
     /// A group whose delete has been accepted; the clock owes [`DELETED`].
-    /// Used by `DeleteChannelPlacementGroup` when its own issue lands; the
-    /// read path already reports whatever state the record carries.
+    /// What `DeleteChannelPlacementGroup` writes, and what the read path then
+    /// reports until the deletion comes due.
     pub const DELETING: &str = "DELETING";
     /// A group whose delete has completed. Terminal.
     pub const DELETED: &str = "DELETED";
@@ -122,6 +131,33 @@ pub enum ChannelPlacementGroupRefusal {
     StoreFull,
 }
 
+/// Why [`ComAmazonawsMedialiveMedialiveState::delete_channel_placement_group`]
+/// accepted no delete. Each variant leaves the store exactly as it was.
+#[derive(Debug)]
+pub enum ChannelPlacementGroupDeleteRefusal {
+    /// The `ClusterId`/`ChannelPlacementGroupId` pair the request's path carried
+    /// names no group in this store.
+    NotFound,
+    /// Channels are still placed in the group, so it is in use: deleting it
+    /// would leave those channels naming a group the account no longer has.
+    InUse,
+}
+
+/// The message a group delete refused because channels are still placed in the
+/// group carries.
+///
+/// It names the identifier the CALLER supplied and the state it must reach —
+/// the channels holding the group are state the caller did not name (they are
+/// what the group's own `Channels` reports), so they are not interpolated, for
+/// the same reason [`super::busy_input_message`] leaves the attaching channels
+/// out of an input's refusal.
+pub fn channel_placement_group_in_use_message(group_id: &str) -> String {
+    format!(
+        "ChannelPlacementGroup {group_id} still has channels placed in it, \
+         it cannot be deleted"
+    )
+}
+
 /// Why
 /// [`ComAmazonawsMedialiveMedialiveState::apply_channel_placement_group_changes`]
 /// changed nothing. Each variant is one refusal the update answers with, and
@@ -174,9 +210,9 @@ pub struct ChannelPlacementGroupRecord {
     /// The state the group is in NOW, one of
     /// [`channel_placement_group_state`]'s values.
     state: String,
-    /// The transition the clock owes this group while its node association is
-    /// still going through. STORED, never slept on; `None` once nothing is
-    /// owed.
+    /// The transition the clock owes this group — the association still going
+    /// through, or the deletion that has been accepted. STORED, never slept on;
+    /// `None` once nothing is owed.
     pending: Option<PendingAssignment>,
 }
 
@@ -199,7 +235,9 @@ impl ChannelPlacementGroupRecord {
     /// Materialise the transition the clock has already made due as of `now`.
     ///
     /// A group created with a node is `ASSIGNING` and becomes `ASSIGNED` once
-    /// [`TRANSIENT_STATE_SPAN`] has passed, whether or not anybody called, so
+    /// [`TRANSIENT_STATE_SPAN`] has passed, and a group whose delete has been
+    /// accepted is `DELETING` and becomes the terminal `DELETED` the same span
+    /// after the call that accepted it — whether or not anybody called, so
     /// running this on a read never changes what a later caller would otherwise
     /// have seen. An update that changed the node set owes the same kind of
     /// step, into whichever state the new set implies.
@@ -214,13 +252,36 @@ impl ChannelPlacementGroupRecord {
         self.pending = None;
     }
 
+    /// Accept a delete for this group: it enters the transient `DELETING` state
+    /// and the clock owes it the terminal `DELETED` one
+    /// [`TRANSIENT_STATE_SPAN`] later.
+    ///
+    /// IDEMPOTENT — a group a delete has already been accepted for keeps the
+    /// instant the first call set, so a repeat can neither restart the clock nor
+    /// revive a deleted group.
+    ///
+    /// An association still in flight is REPLACED rather than carried: the group
+    /// is leaving the account, so nothing is going to finish associating it with
+    /// a node, and the one transition the clock still owes it is the deletion.
+    fn begin_delete(&mut self, now: SystemTime) {
+        if self.is_delete_accepted() {
+            return;
+        }
+        self.state = channel_placement_group_state::DELETING.to_string();
+        self.pending = Some(PendingAssignment {
+            due: now + TRANSIENT_STATE_SPAN,
+            settled: channel_placement_group_state::DELETED,
+        });
+    }
+
     /// Start the association the clock owes a group whose node set has just
     /// become [`Self::nodes`]: the group reports the transient state now and
     /// settles into the one that node set implies once
     /// [`TRANSIENT_STATE_SPAN`] has passed.
     ///
-    /// The one writer of [`Self::state`] after the insert, so the state a group
-    /// is in can never disagree with the node set it was computed from.
+    /// One of the two writers of [`Self::state`] after the insert (the other
+    /// being [`Self::begin_delete`]), so the state a group is in can never
+    /// disagree with the node set it was computed from.
     fn begin_assignment(&mut self, now: SystemTime) {
         let (transient, settled) = assignment_states(&self.nodes);
         self.state = transient.to_string();
@@ -232,8 +293,9 @@ impl ChannelPlacementGroupRecord {
 }
 
 /// A transition the clock owes a group: the instant it comes due and the
-/// `ChannelPlacementGroupState` it settles into. Stored, never slept on — the
-/// same shape as the cluster and multiplex slices' own, for the same reason.
+/// `ChannelPlacementGroupState` it settles into — the association a create or an
+/// update started, or the deletion a delete accepted. Stored, never slept on —
+/// the same shape as the cluster and multiplex slices' own, for the same reason.
 #[derive(Debug, Clone, Copy)]
 struct PendingAssignment {
     due: SystemTime,
@@ -279,8 +341,8 @@ pub struct ChannelPlacementGroupChanges {
 /// record plus the two members derived from the rest of the state.
 ///
 /// Every operation that reports a group (`CreateChannelPlacementGroup`,
-/// `DescribeChannelPlacementGroup`, `UpdateChannelPlacementGroup`, and the
-/// delete when its own issue lands) is modelled with its OWN flat output shape
+/// `DescribeChannelPlacementGroup`, `UpdateChannelPlacementGroup` and
+/// `DeleteChannelPlacementGroup`) is modelled with its OWN flat output shape
 /// carrying the same seven members, so the projection is built once here and the
 /// `channel_placement_group_output` macro below moves it onto whichever shape
 /// the operation declares.
@@ -420,10 +482,29 @@ impl ComAmazonawsMedialiveMedialiveState {
             .filter(|group| group.cluster_id == cluster_id)
     }
 
+    /// The same group, to write through — the one place a group is resolved
+    /// mutably, so the "both path labels have to match" rule of
+    /// [`Self::channel_placement_group`] is stated once however many mutations
+    /// this slice grows, exactly as the node slice's own `node_mut` does.
+    fn channel_placement_group_mut(
+        &mut self,
+        cluster_id: &str,
+        id: &str,
+    ) -> Option<&mut ChannelPlacementGroupRecord> {
+        self.channel_placement_groups
+            .get_mut(id)
+            .filter(|group| group.cluster_id == cluster_id)
+    }
+
     /// The group called `name` in `cluster_id`, if one exists. `Name` is
     /// documented "Specify a name that is unique in the Cluster. You can't
     /// change the name. Names are case-sensitive", so at most one group answers
     /// and the comparison is case-sensitive.
+    ///
+    /// A group whose delete has been accepted reserves its name no longer: it
+    /// is on its way out of the account, so the name it carried is free for a
+    /// new group, the same rule [`super::nodes`]' own derivation applies to a
+    /// group that is leaving. Its record stays readable, under that name.
     ///
     /// The uniqueness is what both the create and the UPDATE resolve against:
     /// `UpdateChannelPlacementGroup`'s own `Name` is documented "Include this
@@ -437,7 +518,9 @@ impl ComAmazonawsMedialiveMedialiveState {
         name: &str,
     ) -> Option<&ChannelPlacementGroupRecord> {
         self.channel_placement_groups.values().find(|group| {
-            group.cluster_id == cluster_id && group.name.as_deref() == Some(name)
+            group.cluster_id == cluster_id
+                && !group.is_delete_accepted()
+                && group.name.as_deref() == Some(name)
         })
     }
 
@@ -567,6 +650,58 @@ impl ComAmazonawsMedialiveMedialiveState {
         })
     }
 
+    /// Accept a delete for the group `id` names in `cluster_id` and answer the
+    /// group as the acceptance left it, or refuse.
+    ///
+    /// The precondition, the state write and the projection live together here,
+    /// so the response reports the state that was stored rather than one a
+    /// handler assembled: `State` is `DELETING` as of this call (or the terminal
+    /// `DELETED` on a repeat whose clock has already run) and every other member
+    /// is the stored record's.
+    ///
+    /// Both path labels name the resource, so an id that names no group of THIS
+    /// cluster is [`ChannelPlacementGroupDeleteRefusal::NotFound`] exactly as it
+    /// is for a read.
+    ///
+    /// A group that still holds channels is IN USE and refused: a channel placed
+    /// in a group names it in `AnywhereSettings$ChannelPlacementGroupId`, so
+    /// deleting the group under it would leave that channel naming a resource
+    /// the account no longer has. The holders are derived from the channel store
+    /// ([`Self::channels_in_channel_placement_group`]), so deleting the channels
+    /// first is what clears the refusal.
+    ///
+    /// A delete already accepted is accepted again rather than refused: the
+    /// state the caller is asking for is the one the group is already heading
+    /// for or in, so nothing about the request conflicts with the stored group —
+    /// the same answer [`Self::deregister_node_description`] gives a repeated
+    /// node delete. The in-use precondition is therefore evaluated once, at the
+    /// call that accepts the delete: from then on the group is leaving the
+    /// account and a repeat cannot un-accept that, so what a later channel
+    /// create does with its `AnywhereSettings` is that create's concern rather
+    /// than this delete's.
+    pub fn delete_channel_placement_group(
+        &mut self,
+        cluster_id: &str,
+        id: &str,
+        now: SystemTime,
+    ) -> Result<ChannelPlacementGroupDescription, ChannelPlacementGroupDeleteRefusal> {
+        // The holders are derived before the record is taken mutably, so the
+        // precondition and the write are decided from one resolution of the
+        // pair: an id that names no group derives no holders and the mutable
+        // lookup below is what refuses it.
+        let holders = self.channels_in_channel_placement_group(cluster_id, id);
+        let group = self
+            .channel_placement_group_mut(cluster_id, id)
+            .ok_or(ChannelPlacementGroupDeleteRefusal::NotFound)?;
+        if !group.is_delete_accepted() && !holders.is_empty() {
+            return Err(ChannelPlacementGroupDeleteRefusal::InUse);
+        }
+        group.begin_delete(now);
+
+        self.channel_placement_group_description(cluster_id, id)
+            .ok_or(ChannelPlacementGroupDeleteRefusal::NotFound)
+    }
+
     /// Record `token`, as presented for `cluster_id`, as having created the
     /// group `group_id`, evicting the oldest token first if that would push the
     /// map past [`MAX_CHANNEL_PLACEMENT_GROUP_TOKENS`].
@@ -619,8 +754,8 @@ fn channel_placement_group_token_key(cluster_id: &str, token: &str) -> String {
 /// identical per-operation flat group output shapes
 /// (`CreateChannelPlacementGroupOutput`,
 /// `DescribeChannelPlacementGroupOutput`, `UpdateChannelPlacementGroupOutput`,
-/// the listing's own `DescribeChannelPlacementGroupSummary`, and the delete's
-/// when its own issue lands).
+/// `DeleteChannelPlacementGroupOutput` and the listing's own
+/// `DescribeChannelPlacementGroupSummary`).
 ///
 /// One macro rather than a hand-written copy of the same seven-member move per
 /// operation, so a create, an update, the listing and the read that follows any

@@ -63,7 +63,7 @@ fn layer_bytes(len: usize, seed: usize) -> Vec<u8> {
 
 /// One `UploadLayerPart` call: the status and body of uploading `bytes` as the part that
 /// claims to start at `first_byte` and end at `last_byte`.
-async fn upload_part(
+pub(crate) async fn upload_part(
     router: &MultiServiceRouter,
     repository: &str,
     upload_id: &str,

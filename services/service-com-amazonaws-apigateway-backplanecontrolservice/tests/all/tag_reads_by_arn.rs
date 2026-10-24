@@ -361,8 +361,8 @@ async fn get_tags_answers_not_found_for_a_taggable_arn_no_record_answers_to() {
 
     // Every row is a well-formed ARN of a taggable API Gateway resource that no stored
     // record answers to: an unknown identifier of a kind this emulator stores, a stage
-    // name no stage of an existing API has, and the kinds whose creates are still
-    // scaffolds, which can therefore hold no record at all.
+    // name no stage of an existing API has, and a kind whose create is still a scaffold,
+    // which can therefore hold no record at all.
     let cases: Vec<(&str, String)> = vec![
         ("an unknown rest api", apigateway_arn("/restapis/zzzzz99999")),
         (
@@ -391,7 +391,7 @@ async fn get_tags_answers_not_found_for_a_taggable_arn_no_record_answers_to() {
             apigateway_arn("/vpclinks/zzzzz99999"),
         ),
         (
-            "a domain name access association, a kind with no records",
+            "an unknown domain name access association",
             apigateway_arn("/domainnameaccessassociations/zzzzz99999"),
         ),
     ];

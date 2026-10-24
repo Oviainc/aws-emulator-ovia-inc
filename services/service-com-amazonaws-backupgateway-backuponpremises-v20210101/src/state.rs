@@ -8,11 +8,11 @@
 //! the ARN a create returns is read back out of [`StoredGateway`] after the insert, so
 //! a response can only describe a record that is really in the store.
 //!
-//! Beside the gateways the store keeps the ACTIVATION KEYS this service has issued.
-//! `CreateGateway` resolves its `ActivationKey` there and refuses a key the registry
-//! does not hold, so a gateway is only ever minted for an appliance the service really
-//! activated — the read side (`ListGateways`, `GetGateway`) then cannot report a
-//! gateway that a refused create left behind.
+//! The `ActivationKey` a create carries is kept ON the record
+//! ([`StoredGateway::activation_key`]): it identifies the appliance the gateway stands
+//! for, and it is minted out of band by that appliance's activation handshake, which no
+//! operation of this model performs — so the store holds no registry of keys to resolve
+//! it against, and every well-formed key names an appliance the service cannot verify.
 //!
 //! The record carries the members of the later slices too (hypervisor association,
 //! maintenance window, bandwidth schedule), so those operations extend this one struct
@@ -42,7 +42,8 @@
 //! ([`StoredVirtualMachine`]), keyed by its own ARN. A virtual machine is not minted by
 //! this API — no operation of this model creates one; it is part of the INVENTORY of the
 //! hypervisor it runs on, which reaches the service out of band when the hypervisor's
-//! metadata is synced (the same out-of-band channel `activation_keys` describes). So
+//! metadata is synced (the same out-of-band channel an activation key reaches the
+//! service through). So
 //! [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::record_virtual_machine`] is
 //! the one way a record gets here, it records a machine only on a hypervisor this store
 //! holds, and `ListVirtualMachines` reports exactly those records — a hypervisor whose
@@ -122,18 +123,6 @@ pub const HYPERVISOR_RESOURCE_TYPE: &str = "hypervisor";
 /// (`smithy_query(query="shape",shape="VirtualMachine")`: "For example,
 /// `arn:aws:backup-gateway:us-west-1:0000000000000:vm/vm-0000ABCDEFGIJKL`").
 pub const VIRTUAL_MACHINE_RESOURCE_TYPE: &str = "vm";
-
-/// `ValidationException$ErrorCode` for a `CreateGateway` whose activation key this
-/// service never issued, and the sentence that states it.
-///
-/// `ValidationException$ErrorCode` is documented as "A description of what caused the
-/// validation error" (`smithy_query(query="shape",shape="ValidationException")`), and
-/// the code AWS answers an unissued activation key with is `ActivationKeyNotFound` —
-/// the same name the sibling gateway service spells in its own `ErrorCode` vocabulary.
-pub const ACTIVATION_KEY_NOT_FOUND: &str = "ActivationKeyNotFound";
-
-/// See [`ACTIVATION_KEY_NOT_FOUND`].
-pub const ACTIVATION_KEY_NOT_FOUND_MESSAGE: &str = "The specified activation key was not found.";
 
 /// `ErrorCode` for a well-formed hypervisor ARN that names no hypervisor, and the
 /// sentence that states it. See [`MissingResource`].
@@ -239,7 +228,7 @@ pub const MAPPINGS_NOT_CONFIGURED_MESSAGE: &str =
 /// `ValidationException$ErrorCode` is documented as "A description of what caused the
 /// validation error" (`smithy_query(query="shape",shape="ValidationException")`) and AWS
 /// publishes no vocabulary for that member, so this value names the condition the way
-/// [`ACTIVATION_KEY_NOT_FOUND`] names its own.
+/// [`HYPERVISOR_NOT_FOUND`] names its own.
 pub const GATEWAY_OUT_OF_DATE: &str = "GatewayOutOfDate";
 
 /// See [`GATEWAY_OUT_OF_DATE`]: the sentence AWS is recorded stating for that refusal
@@ -863,16 +852,6 @@ pub struct ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// Monotonic counter behind the `gateway/<id>` ARN suffix, so every minted ARN is
     /// unique within a run and the sequence is reproducible.
     next_gateway_id: u64,
-    /// The activation keys this service has ISSUED, each with the instant it was issued
-    /// at — the registry `CreateGateway` resolves its `ActivationKey` in.
-    ///
-    /// A gateway's activation key is not minted by this API: it reaches the service out
-    /// of band, when the gateway appliance a customer deployed completes its activation
-    /// handshake, which is not an operation of the SDK surface (no operation in this
-    /// model issues one). So on AWS, as here, `CreateGateway` can only ever find a key
-    /// something OUTSIDE the API put in this registry, and a key nothing issued is
-    /// refused — see [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::activation_key_issued`].
-    activation_keys: BTreeMap<String, SystemTime>,
     /// Hypervisors by ARN. A `BTreeMap` for the same reason as `gateways`: the key order
     /// is total and stable, and it is the order `ListHypervisors` reports them in —
     /// "ordered by their Amazon Resource Names (ARNs)"
@@ -896,27 +875,6 @@ pub struct ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
 }
 
 impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
-    /// Record `key` as an activation key this service has issued, and hand back the
-    /// instant it is now registered under — read back out of the map after the insert.
-    ///
-    /// This is the out-of-band channel described on `activation_keys`: the appliance
-    /// handshake that issues a key on AWS has no operation in this model, so nothing
-    /// a client can send over the wire reaches here. Re-issuing a key that is already
-    /// registered keeps the instant it was first issued at: one key, one issuance.
-    pub fn issue_activation_key(&mut self, key: &str, now: SystemTime) -> SystemTime {
-        *self.activation_keys.entry(key.to_string()).or_insert(now)
-    }
-
-    /// Whether this service issued `key`.
-    ///
-    /// `CreateGateway` registers a gateway only for a key this answers `true` for; for
-    /// anything else it raises the modelled `ValidationException` carrying
-    /// [`ACTIVATION_KEY_NOT_FOUND`], rather than minting a gateway for an appliance the
-    /// service never activated. The answer comes from the registry alone — never from
-    /// the key's length, spelling or shape, none of which AWS discloses.
-    pub fn activation_key_issued(&self, key: &str) -> bool {
-        self.activation_keys.contains_key(key)
-    }
     /// Mint and persist a gateway, and hand back the record as it is now STORED —
     /// read out of the map after the insert, so the ARN a caller gets is the key the
     /// store holds rather than anything derived from the request.

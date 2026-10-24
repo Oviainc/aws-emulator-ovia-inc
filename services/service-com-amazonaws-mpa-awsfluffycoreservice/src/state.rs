@@ -60,6 +60,15 @@
 //! ([`ComAmazonawsMpaAwsfluffycoreserviceState::pending_baseline_session_arn`]), so the
 //! two reads cannot disagree.
 //!
+//! # Approver MFA devices
+//!
+//! Each approver carries the MFA devices they authenticate with
+//! ([`Approver::mfa_methods`]), which is what `GetApprovalTeam` reports per approver.
+//! A device is `OUT_OF_SYNC` until it is read back off the identity source
+//! ([`Approver::synchronize_mfa_devices`]), and `UpdateApprovalTeam`'s
+//! [`SYNCHRONIZE_MFA_DEVICES_ACTION`] is what asks for that, for every approver on the
+//! team ([`ApprovalTeam::synchronize_mfa_devices`]). No read synchronizes one.
+//!
 //! # Identity sources
 //!
 //! The identity source is this service's other caller-created resource:
@@ -132,6 +141,14 @@ pub const SERVICE_ACTION_PREFIX: &str = "mpa";
 /// Longest `AccessDeniedException$Message` this service emits, from that member's
 /// modelled `@length(max: 1000)`.
 const MAX_ACCESS_DENIED_MESSAGE: usize = 1000;
+
+/// The `UpdateAction` token that asks for every approver's MFA devices to be
+/// synchronized with the identity source — the one value `UpdateAction` declares
+/// (`smithy_query(query="shape",shape="UpdateAction")`), and so the whole catalog
+/// `UpdateApprovalTeam` has to apply. The generated catalog
+/// (`crate::ops::types::shared_types::UPDATE_ACTION_VALUES`) is the authority this is
+/// read off, and a test asserts the two agree.
+pub const SYNCHRONIZE_MFA_DEVICES_ACTION: &str = "SYNCHRONIZE_MFA_DEVICES";
 
 /// How long after an approver is invited the emulator reports their invitation
 /// response (and therefore how long a new team stays `PENDING`).
@@ -400,6 +417,67 @@ impl StoredApprovalStrategy {
     }
 }
 
+/// Type of MFA device an approver authenticates with, in the tokens `MfaType`
+/// declares (`smithy_query(query="shape",shape="MfaType")`: `EMAIL_OTP`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MfaType {
+    EmailOtp,
+}
+
+impl MfaType {
+    /// The wire token, as `MfaType` spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::EmailOtp => "EMAIL_OTP",
+        }
+    }
+}
+
+/// Whether an approver's MFA device is in sync with the identity source that manages
+/// their authentication, in the tokens `MfaSyncStatus` declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MfaSyncStatus {
+    InSync,
+    OutOfSync,
+}
+
+impl MfaSyncStatus {
+    /// The wire token, as `MfaSyncStatus` spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::InSync => "IN_SYNC",
+            Self::OutOfSync => "OUT_OF_SYNC",
+        }
+    }
+}
+
+/// One MFA device of one approver: the configuration the wire `MfaMethod` reports, and
+/// the synchronization state [`Approver::synchronize_mfa_devices`] moves. Named for the
+/// STORED record, as [`StoredApprovalStrategy`] is, so it is never mistaken for the
+/// generated wire type of the same shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredMfaMethod {
+    pub mfa_type: MfaType,
+    pub sync_status: MfaSyncStatus,
+}
+
+/// The MFA configuration an approver starts with: the one device type this model
+/// declares, not yet read back from the identity source.
+///
+/// A device is `OUT_OF_SYNC` until a synchronization reads it back off the identity
+/// source, which is what the `SYNCHRONIZE_MFA_DEVICES` update action asks for; nothing
+/// else in this model synchronizes one. The list stays within `MfaMethods`' modelled
+/// `@length(max: 5)`. Private, so [`Approver::invited`] stays the one place an
+/// approver's MFA state is seeded.
+fn initial_mfa_methods() -> Vec<StoredMfaMethod> {
+    vec![StoredMfaMethod {
+        mfa_type: MfaType::EmailOtp,
+        sync_status: MfaSyncStatus::OutOfSync,
+    }]
+}
+
 /// One approver on a team.
 #[derive(Debug, Clone)]
 pub struct Approver {
@@ -415,6 +493,9 @@ pub struct Approver {
     /// Instant at which this approver's invitation response becomes due. `None`
     /// once it has been materialised.
     pub invitation_response_due: Option<SystemTime>,
+    /// MFA devices this approver authenticates with, each with its synchronization
+    /// state, as `GetApprovalTeamResponseApprover$MfaMethods` reports them.
+    pub mfa_methods: Vec<StoredMfaMethod>,
 }
 
 impl Approver {
@@ -435,6 +516,15 @@ impl Approver {
             last_activity: None,
             last_activity_time: None,
             invitation_response_due: Some(now + INVITATION_RESPONSE_DELAY),
+            mfa_methods: initial_mfa_methods(),
+        }
+    }
+
+    /// Synchronize this approver's MFA devices with the identity source: every device
+    /// is read back, so each one is in sync afterwards.
+    pub fn synchronize_mfa_devices(&mut self) {
+        for method in &mut self.mfa_methods {
+            method.sync_status = MfaSyncStatus::InSync;
         }
     }
 }
@@ -478,6 +568,14 @@ impl ApprovalTeam {
     #[must_use]
     pub fn number_of_approvers(&self) -> i32 {
         i32::try_from(self.approvers.len()).unwrap_or(i32::MAX)
+    }
+
+    /// Synchronize the MFA devices of EVERY approver on the team — the effect the
+    /// `SYNCHRONIZE_MFA_DEVICES` update action asks for.
+    pub fn synchronize_mfa_devices(&mut self) {
+        for approver in &mut self.approvers {
+            approver.synchronize_mfa_devices();
+        }
     }
 }
 

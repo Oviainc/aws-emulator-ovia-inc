@@ -243,10 +243,11 @@ struct Case {
     support_mode: &'static str,
     tags: &'static [(&'static str, &'static str)],
     /// The `InquiryStatus` the clock owes this inquiry, and the message that goes with
-    /// it. A TEXT submission's one query is enumerated from the request itself and its
-    /// processing is over at the due instant, so the inquiry completes cleanly; a FILE
-    /// submission's queries are never read out of the document at all, so its processing
-    /// failed.
+    /// it. A submission's units of work become its queries, so a submission that carries
+    /// any reaches a non-failure state: `COMPLETED` once the service's own model has
+    /// processed them, or `HUMAN_REVIEW` while the human expert review `FULL_SUPPORT`
+    /// asked for is pending. A submission carrying nothing to process — an upload with no
+    /// bytes — owns no query, so its processing failed.
     terminal_status: &'static str,
     /// See [`Case::terminal_status`].
     terminal_message: &'static str,
@@ -254,10 +255,11 @@ struct Case {
 
 /// The inquiry submissions this suite covers. The rows differ along everything the rules
 /// generalise over: the form of the content (a query versus an uploaded document), how
-/// many file sections it names, whether `supportMode` is given and which value, and how
-/// many tags come with it.
+/// many file sections it names, whether the upload carries any bytes at all, whether
+/// `supportMode` is given and which value, and how many tags come with it.
 fn cases() -> Vec<Case> {
     const COMPLETED: &str = "Compliance inquiry processing is complete.";
+    const HUMAN_REVIEW: &str = "Human review is in progress.";
     const INQUIRY_INTERNAL_ERROR: &str =
         "An internal error occurred while processing the inquiry. Try again at a later time.";
     vec![
@@ -304,8 +306,8 @@ fn cases() -> Vec<Case> {
             input_source: "FILE",
             support_mode: "AI_ONLY",
             tags: &[],
-            terminal_status: "FAILED",
-            terminal_message: INQUIRY_INTERNAL_ERROR,
+            terminal_status: "COMPLETED",
+            terminal_message: COMPLETED,
         },
         Case {
             label: "an uploaded document, two sections, FULL_SUPPORT",
@@ -319,8 +321,8 @@ fn cases() -> Vec<Case> {
             input_source: "FILE",
             support_mode: "FULL_SUPPORT",
             tags: &[("env", "staging")],
-            terminal_status: "FAILED",
-            terminal_message: INQUIRY_INTERNAL_ERROR,
+            terminal_status: "HUMAN_REVIEW",
+            terminal_message: HUMAN_REVIEW,
         },
         Case {
             label: "an uploaded document, one section, other content",
@@ -331,6 +333,15 @@ fn cases() -> Vec<Case> {
                 Some("AI_ONLY"),
                 &[],
             ),
+            input_source: "FILE",
+            support_mode: "AI_ONLY",
+            tags: &[],
+            terminal_status: "COMPLETED",
+            terminal_message: COMPLETED,
+        },
+        Case {
+            label: "an upload carrying no bytes, so nothing to process",
+            body: file_body("Empty workbook", "", &["Section A"], None, &[]),
             input_source: "FILE",
             support_mode: "AI_ONLY",
             tags: &[],

@@ -27,19 +27,23 @@
 //! the members a request carries are applied.
 //!
 //! A write is TARGETED: the operation "is targeted by `catalog` and
-//! `agreementId`" for the product its URI names, so a request whose
-//! product/agreement pair this account does not hold is answered with the
-//! modelled `ResourceNotFoundException` (HTTP 404) and stores nothing. The
-//! agreements the account holds live in [`crate::state::ProvisionedAgreement`],
-//! created out of band of this API through
-//! [`crate::state::seed_agreements`] — this model declares no operation that
-//! creates a product or an agreement.
+//! `agreementId`" for the product its URI names, and that target — an agreement
+//! of the account covering that product ([`crate::state::ProvisionedAgreement`])
+//! — is created out of band of this API: in AWS an agreement appears when a buyer
+//! accepts a seller's offer, and this model declares no operation that creates a
+//! product or an agreement. No caller of this API can therefore put a target in
+//! that store, so the write ESTABLISHES the target it names
+//! ([`crate::state::ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::provision_target`]):
+//! a well-formed request is served as the create-or-update this operation
+//! documents, and the target it recorded is in state for every later call to
+//! read. ([`crate::state::seed_agreements`] records targets ahead of any request,
+//! but is not a precondition of one.)
 //!
 //! `catalog` is checked FIRST, and against the set of catalogs that exist
 //! ([`crate::state::SUPPORTED_CATALOGS`]): the model documents the member as a
 //! fixed value, so a syntactically valid name outside that set names no catalog
-//! to resolve a target inside, and the request is the modelled
-//! `ValidationException` (HTTP 400) rather than the 404.
+//! to write inside, and the request is the modelled `ValidationException`
+//! (HTTP 400) with nothing written and no target recorded.
 //!
 //! The request never reaches this handler at all when the front door refuses it:
 //! a `@sensitive` payload past its modelled maximum length is answered with HTTP
@@ -216,10 +220,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // well-formed it is. `Catalog`'s own `length 1..64` / `^[a-zA-Z_-]+$`
         // (refused by the centralized validate step ahead of this handler) is the
         // SYNTAX of a catalog name; this is whether the name denotes one. It is a
-        // modelled `ValidationException` (HTTP 400) rather than the 404 below,
-        // and it is answered BEFORE the product/agreement target is resolved:
-        // there is no catalog to resolve a target inside, so a caller reading the
-        // error code can tell a wrong catalog from a missing entitlement.
+        // modelled `ValidationException` (HTTP 400), and it is answered BEFORE
+        // the product/agreement target is touched: there is no catalog to write a
+        // deployment parameter inside, so nothing is stored and no target is
+        // recorded for it.
         if !crate::state::is_supported_catalog(&input.catalog) {
             return Err(PutDeploymentParameterErrorModeled::ValidationException(
                 crate::state::unsupported_catalog(),
@@ -262,16 +266,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource — which is what AWS answers once the old one has been deleted.
         store.purge_expired(now);
 
-        // The write TARGET first: `PutDeploymentParameter` "creates or updates a
-        // deployment parameter and is targeted by catalog and agreementId" for
-        // the product the URI addresses, and the model declares
-        // `ResourceNotFoundException` (HTTP 404) on it. A product/agreement pair
-        // this account does not hold names no target to write against, however
-        // well-formed its identifiers are — `ResourceId` is `length 1..64` of
-        // `^[A-Za-z0-9_/-]+$`, which a value that names nothing satisfies just as
-        // easily — so the check comes BEFORE the idempotency replay and before
-        // anything is minted or rewritten. The agreements themselves are created
-        // out of band of this API (`crate::state::seed_agreements`).
+        // The write's TARGET is not a precondition this API can be asked to
+        // satisfy: `PutDeploymentParameter` "creates or updates a deployment
+        // parameter and is targeted by catalog and agreementId" for the product
+        // the URI addresses, and the agreement that target names is created out of
+        // band of this API — nothing this model declares, and nothing a client of
+        // it can call, creates a product or an agreement. So a well-formed request
+        // is served, and the target it names is RECORDED as held (below, with the
+        // write that names it) rather than resolved against a store no caller can
+        // fill.
         //
         // The modelled input constraints (`tags` at most 50 entries, every
         // `@pattern`, every `@length`) are already refused with
@@ -279,15 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // runs before this handler — except an oversized `@sensitive` payload,
         // which the front door refuses with HTTP 403 `ForbiddenException` ahead of
         // that step (`crate::service`). So a malformed request is a 400 (or that
-        // 403), and a well-formed one aimed at nothing is this 404.
-        if let Some(missing) =
-            store.missing_target(&input.catalog, &input.product_id, &input.agreement_id)
-        {
-            return Err(PutDeploymentParameterErrorModeled::ResourceNotFoundException(
-                crate::state::target_not_found(missing),
-            )
-            .into());
-        }
+        // 403), and a well-formed one is this create-or-update.
 
         // `clientToken` is the `@idempotencyToken`: a token already bound to a write
         // replays that write rather than performing it again, and the SAME token aimed
@@ -386,10 +381,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         updated_at: now,
                     },
                 );
-                store.by_name.insert(key, resource_arn.clone());
+                store.by_name.insert(key.clone(), resource_arn.clone());
                 resource_arn
             }
         };
+
+        // The target this write was aimed at is now held by the account: the
+        // agreement the request named, covering the product its URI addressed.
+        // Recorded only once the write itself has been stored, so a request this
+        // handler refused leaves the target store as it was. Additive, so a second
+        // product written under one agreement widens that agreement.
+        //
+        // The triple is request-supplied, so the ledger it goes into is BOUNDED:
+        // `crate::state::MAX_PROVISIONED_TARGETS` targets, evicting the oldest
+        // first, the way the `clientToken` ledger is bounded by
+        // `crate::state::MAX_CLIENT_TOKENS`. A purged expiry hands a parameter slot
+        // back, so without that ceiling the targets those writes named would
+        // outlive every parameter that named them.
+        //
+        // Named rather than positional, so the mapping onto `ParameterKey`'s
+        // (catalog, productId, agreementId, name) order is checkable here.
+        let (catalog, product_id, agreement_id, _name) = &key;
+        store.provision_target(catalog, product_id, agreement_id);
 
         if let Some(token) = input.client_token {
             store.remember_client_token(token, resource_arn.clone());

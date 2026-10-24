@@ -596,19 +596,25 @@ pub(crate) fn stored_content(
 
 /// `Ok` when the data store `datastore_id` names is serving its FHIR endpoint.
 ///
-/// A data store serves only from `ACTIVE`: while it is still `CREATING`, and once it
-/// is `DELETING` or `DELETED`, its endpoint holds nothing a caller may read or write,
-/// and an id no data store carries is the same answer — so a caller cannot tell a data
-/// store that is not ready from one that does not exist by probing the data plane.
+/// A data store serves once it has been created and until it is destroyed: while it
+/// is still `CREATING`, and once it is `DELETING` or `DELETED`, its endpoint holds
+/// nothing a caller may read or write, and an id no data store carries is the same
+/// answer — so a caller cannot tell a data store that is not ready from one that does
+/// not exist by probing the data plane. A store applying a configuration change
+/// (`UPDATING`) is neither: the resources it holds are untouched by that change, so
+/// it keeps serving them rather than taking the endpoint down for the span of an
+/// update.
 fn serving(
     store: &crate::state::ComAmazonawsHealthlakeHealthlakeState,
     datastore_id: &str,
 ) -> Result<(), Failure> {
-    let active = store
-        .datastores
-        .get(datastore_id)
-        .is_some_and(|datastore| datastore.status == crate::state::DatastoreStatus::Active);
-    if active {
+    let serving = store.datastores.get(datastore_id).is_some_and(|datastore| {
+        matches!(
+            datastore.status,
+            crate::state::DatastoreStatus::Active | crate::state::DatastoreStatus::Updating
+        )
+    });
+    if serving {
         return Ok(());
     }
     Err(Failure::new(

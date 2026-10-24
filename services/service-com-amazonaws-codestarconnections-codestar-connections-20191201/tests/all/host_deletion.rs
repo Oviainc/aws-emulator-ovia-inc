@@ -655,12 +655,12 @@ async fn a_host_arn_outside_the_modeled_pattern_is_refused_as_invalid() {
 /// ANOTHER service is not served by this one, so nothing is deleted here for it.
 ///
 /// This service's own SDK prefix is the dotted Coral name
-/// (`com.amazonaws.codestar.connections.CodeStar_connections_20191201`), which the
-/// framework resolves to no modeled operation at all — a SERVICE-WIDE dispatch gap filed
-/// as `issues/things-that-do-not-work/20261023T122922Z-codestar-connections-implemented-\
-/// connection-operations-answer-501-notimplemented-instead-of.md` and fixed once for all
-/// 27 operations there, not per operation; see the note in `src/service.rs`. Every call
-/// in this suite therefore uses the short prefix, which the framework routes today.
+/// (`com.amazonaws.codestar.connections.CodeStar_connections_20191201`). The framework
+/// resolves an awsJson routing key at the FIRST dot, so that prefix once reached no
+/// modeled operation at all; the service's routing seams now read the target through
+/// `service_common::rpc_target` (see `src/service.rs`), so both prefix forms reach the
+/// operation named after the LAST dot. The calls in this suite use the short prefix,
+/// which the framework routes on its own; `sync_blocker_summary.rs` pins both forms.
 #[tokio::test]
 async fn a_target_naming_another_service_does_not_delete_anything_here() {
     // (case, target) — the sibling CodeConnections service publishes the same operation

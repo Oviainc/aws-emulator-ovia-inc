@@ -224,6 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // the one sentence every operation on this resource states a
                 // transition state with.
                 crate::state::DatastoreStatus::Creating
+                | crate::state::DatastoreStatus::Updating
                 | crate::state::DatastoreStatus::Deleting => {
                     return Err(StartFHIRExportJobErrorModeled::ValidationException(
                         ValidationException {

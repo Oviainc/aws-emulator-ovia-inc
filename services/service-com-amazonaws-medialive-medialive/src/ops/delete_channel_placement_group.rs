@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteChannelPlacementGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteChannelPlacementGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteChannelPlacementGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Delete one channel placement group of one cluster, out of this service's
+//! channel-placement-group state (`crate::state::channel_placement_groups`),
+//! which owns the precondition, the state write and the projection the response
+//! is read out of.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +160,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteChannelPlacementGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteChannelPlacementGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteChannelPlacementGroup"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // Clock-owed work first, so this call acts on the same state a caller
+        // that had not called would have seen.
+        state.settle(now);
+
+        // The precondition, the acceptance and the projection all live in the
+        // slice, so the body reports the state that was STORED rather than one
+        // assembled here: `State` is `DELETING` as of this call and the clock
+        // owes the group the terminal `DELETED`, which the record then keeps so
+        // a reader goes on reporting the group there.
+        let group = state
+            .delete_channel_placement_group(
+                &input.cluster_id,
+                &input.channel_placement_group_id,
+                now,
+            )
+            .map_err(|refusal| refused(refusal, &input.channel_placement_group_id))?;
+
+        Ok(crate::state::channel_placement_group_output!(
+            DeleteChannelPlacementGroupOutput,
+            group
+        ))
     }
+}
+
+/// The modelled error a delete refusal is answered with.
+///
+/// The refusal and its message come from the slice that owns the resource
+/// (`crate::state::channel_placement_groups`), named through the slice module
+/// rather than added to the parent module's re-export list.
+///
+/// A pair of path labels that names no group is `NotFoundException` (404), as it
+/// is for the read of the same resource. A group channels are still placed in is
+/// `ConflictException` (409) — the refusal this delete models and the read of
+/// the same resource does not, which is how every delete in this service refuses
+/// a resource something still holds.
+fn refused(
+    refusal: crate::state::channel_placement_groups::ChannelPlacementGroupDeleteRefusal,
+    group_id: &str,
+) -> DeleteChannelPlacementGroupError {
+    use crate::state::channel_placement_groups::ChannelPlacementGroupDeleteRefusal as Refusal;
+
+    match refusal {
+        Refusal::NotFound => {
+            DeleteChannelPlacementGroupErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    "ChannelPlacementGroup",
+                    group_id,
+                )),
+            })
+        }
+        Refusal::InUse => {
+            DeleteChannelPlacementGroupErrorModeled::ConflictException(ConflictException {
+                message: Some(
+                    crate::state::channel_placement_groups::channel_placement_group_in_use_message(
+                        group_id,
+                    ),
+                ),
+            })
+        }
+    }
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to delete the group from. A modelled server error, never
+/// a fresh engine (which would drop the deletion on return).
+fn unavailable() -> DeleteChannelPlacementGroupError {
+    DeleteChannelPlacementGroupErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }

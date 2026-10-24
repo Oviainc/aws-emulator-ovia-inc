@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTrust
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTrust`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTrust::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Tears down a stored trust relationship, and with it the conditional forwarder the
+//! request asks to take away. Implemented here — this is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +141,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTrust` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTrustErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTrust"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // A trust id naming no stored relationship is refused with the modelled "specified
+        // entity could not be found" and changes nothing.
+        let Some(trust) = store.trusts.get_mut(&input.trust_id) else {
+            return Err(DeleteTrustErrorModeled::EntityDoesNotExistException(
+                crate::state::refusal(crate::state::no_such_trust(&input.trust_id)),
+            )
+            .into());
+        };
+
+        // The delete answers while the Amazon Web Services side is still being torn down,
+        // so the relationship is recorded in the modelled transient `Deleting` state and
+        // the clock is what finishes the job: a caller reading straight afterwards still
+        // sees the teardown, and once it falls due the trust is gone from this service.
+        // A repeat of the delete is therefore not a refusal: it names a relationship that
+        // is still being deleted, and reports the same id.
+        let trust_id = trust.trust_id.clone();
+        let directory_id = trust.directory_id.clone();
+        let remote_domain_name = trust.remote_domain_name.clone();
+        if trust.trust_state != crate::state::TRUST_STATE_DELETING {
+            trust.trust_state = crate::state::TRUST_STATE_DELETING.to_string();
+            trust.trust_state_due_at = Some(now + crate::state::TRANSITION_SPAN);
+            trust.state_last_updated = now;
+            trust.last_updated = now;
+        }
+
+        // `DeleteAssociatedConditionalForwarder` is what "deletes a conditional forwarder
+        // as part of a DeleteTrustRequest": the forwarder it takes away is the directory's
+        // one for the trust's own remote domain, and only when the request asked for it —
+        // a request that did not leaves the directory's DNS as it is, for
+        // `DeleteConditionalForwarder` to change.
+        if input.delete_associated_conditional_forwarder {
+            let key = crate::state::Directory::conditional_forwarder_key(&remote_domain_name);
+            if let Some(directory) = store.directories.get_mut(&directory_id) {
+                directory.conditional_forwarders.remove(&key);
+            }
+        }
+
+        Ok(DeleteTrustOutput {
+            trust_id: Some(trust_id),
+        })
     }
 }

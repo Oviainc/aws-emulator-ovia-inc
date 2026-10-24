@@ -35,7 +35,7 @@ const REPLICATION_SCOPE_DOMAIN: &str = "Domain";
 
 /// The published upper length bound of the modelled `RemoteDomainName` shape,
 /// `length 0..1024`.
-const REMOTE_DOMAIN_NAME_MAX_LEN: usize = 1024;
+pub(crate) const REMOTE_DOMAIN_NAME_MAX_LEN: usize = 1024;
 
 /// This emulator's documented per-directory forwarder guard
 /// (`state::MAX_CONDITIONAL_FORWARDERS_PER_DIRECTORY`).
@@ -48,7 +48,7 @@ const REMOTE_DOMAIN_NAMES_GUARD: usize = 100;
 /// A domain name of exactly `len` characters that the modelled `RemoteDomainName` pattern
 /// `^([a-zA-Z0-9]+[\.-])+([a-zA-Z0-9])+[.]?$` admits: dot-separated two-letter labels,
 /// closed by a label of one to three letters so the total lands on `len`.
-fn domain_of_length(len: usize) -> String {
+pub(crate) fn domain_of_length(len: usize) -> String {
     let mut name = String::new();
     while name.len() + 3 < len {
         name.push_str("ab.");

@@ -620,6 +620,167 @@ async fn disassociate_link_removes_the_association_a_later_read_would_list() {
     );
 }
 
+/// One row of the `DisassociateLink` table: how far the pair's device and link are each
+/// fanned out to OTHER partners, and whether the association has settled out of `PENDING`
+/// by the time it is removed.
+struct RemovalCase {
+    name: &'static str,
+    extra_links: usize,
+    extra_devices: usize,
+    settled_first: bool,
+}
+
+#[tokio::test]
+async fn disassociate_link_removes_only_the_addressed_pair_whatever_its_fan_out_or_state() {
+    let emulator = Emulator::new();
+
+    // "Disassociates an existing device from a link" (`smithy_query query="doc"
+    // shape="DisassociateLink"`): the request addresses ONE device/link pair, so the rows
+    // differ in how many other associations share that pair's device or its link, and in
+    // the state the pair is in when the call lands — the removal is of the pair, not of
+    // anything the fan-out or the clock reached.
+    let cases = [
+        RemovalCase {
+            name: "a lone pair, still pending",
+            extra_links: 0,
+            extra_devices: 0,
+            settled_first: false,
+        },
+        RemovalCase {
+            name: "a lone pair, settled",
+            extra_links: 0,
+            extra_devices: 0,
+            settled_first: true,
+        },
+        RemovalCase {
+            name: "a device fanned out to more links",
+            extra_links: 3,
+            extra_devices: 0,
+            settled_first: false,
+        },
+        RemovalCase {
+            name: "a link fanned out to more devices",
+            extra_links: 0,
+            extra_devices: 3,
+            settled_first: false,
+        },
+        RemovalCase {
+            name: "both fan-outs, settled",
+            extra_links: 2,
+            extra_devices: 1,
+            settled_first: true,
+        },
+    ];
+
+    for case in &cases {
+        let RemovalCase {
+            name,
+            extra_links,
+            extra_devices,
+            settled_first,
+        } = case;
+        let network = emulator.create_global_network(name).await;
+        let site = emulator.create_site(&network, "hq").await;
+        let device = create_device_ok(&emulator, &network, json!({ "SiteId": site })).await;
+        let link = create_link_ok(&emulator, &network, &site, &plain_link()).await;
+        associate_ok(&emulator, &network, &device, &link).await;
+
+        // The associations that must survive the removal: the same device tied to other
+        // links, and the same link tied to other devices.
+        let mut survives_on_device: Vec<(String, String)> = Vec::new();
+        for _ in 0..*extra_links {
+            let other_link = create_link_ok(&emulator, &network, &site, &plain_link()).await;
+            associate_ok(&emulator, &network, &device, &other_link).await;
+            survives_on_device.push((device.clone(), other_link));
+        }
+        let mut survives_on_link: Vec<(String, String)> = Vec::new();
+        for _ in 0..*extra_devices {
+            let other_device =
+                create_device_ok(&emulator, &network, json!({ "SiteId": site })).await;
+            associate_ok(&emulator, &network, &other_device, &link).await;
+            survives_on_link.push((other_device, link.clone()));
+        }
+        survives_on_device.sort();
+        survives_on_link.sort();
+
+        if *settled_first {
+            // The transition is owed by the clock, not by a poll, so the test waits it out.
+            tokio::time::sleep(PAST_SETTLE).await;
+        }
+
+        let (status, removed) = disassociate(&emulator, &network, &device, &link).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: DisassociateLink expected 200, got {status} with {removed}"
+        );
+        let reported = removed["LinkAssociation"].clone();
+        assert_eq!(
+            (
+                reported["GlobalNetworkId"].clone(),
+                reported["DeviceId"].clone(),
+                reported["LinkId"].clone(),
+                reported["LinkAssociationState"].clone(),
+            ),
+            (
+                json!(network),
+                json!(device),
+                json!(link),
+                json!("DELETING"),
+            ),
+            "case {name:?}: DisassociateLink must report the removed pair as DELETING, got {reported}"
+        );
+
+        // The removal is readable: neither selector lists the pair any more, and every
+        // other association of that device and of that link is untouched.
+        let (_, by_device) =
+            get_associations(&emulator, &network, &format!("deviceId={device}")).await;
+        let mut actual = pairs_of(&by_device);
+        actual.sort();
+        assert_eq!(
+            actual, survives_on_device,
+            "case {name:?}: deviceId={device} expected {survives_on_device:?}, got {actual:?}"
+        );
+        let (_, by_link) = get_associations(&emulator, &network, &format!("linkId={link}")).await;
+        let mut actual = pairs_of(&by_link);
+        actual.sort();
+        assert_eq!(
+            actual, survives_on_link,
+            "case {name:?}: linkId={link} expected {survives_on_link:?}, got {actual:?}"
+        );
+
+        // The pair holds no association now, so a second removal has nothing to address.
+        let (status, body) = disassociate(&emulator, &network, &device, &link).await;
+        assert_eq!(
+            status, 404,
+            "case {name:?}: a repeated DisassociateLink expected 404, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {name:?}: a repeated DisassociateLink expected a ResourceNotFoundException, got {body}"
+        );
+
+        // The record is gone rather than hidden: associating the pair again makes a NEW
+        // association, which starts the settle span over at `PENDING`.
+        let remade = associate_ok(&emulator, &network, &device, &link).await;
+        assert_eq!(
+            remade["LinkAssociationState"],
+            json!("PENDING"),
+            "case {name:?}: a re-made association expected PENDING, got {remade}"
+        );
+        let (_, relisted) = get_associations(&emulator, &network, &format!("linkId={link}")).await;
+        let mut actual = pairs_of(&relisted);
+        actual.sort();
+        let mut expected = survives_on_link.clone();
+        expected.push((device.clone(), link.clone()));
+        expected.sort();
+        assert_eq!(
+            actual, expected,
+            "case {name:?}: after re-association linkId={link} expected {expected:?}, got {actual:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn get_link_associations_pages_the_selected_associations_exactly_once() {
     let emulator = Emulator::new();

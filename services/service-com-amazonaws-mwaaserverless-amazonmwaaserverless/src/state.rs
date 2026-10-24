@@ -7,6 +7,12 @@
 //! idempotency ledger that lets a repeated `ClientToken` replay its first answer.
 //! Every handler reads and writes THIS struct through [`service_state`]; nothing in
 //! `src/ops/` keeps a store of its own.
+//!
+//! The store is PARTITIONED BY REGION: a workflow belongs to the endpoint it was
+//! created through ([`request_region`], recorded as [`Workflow::region`]), and every
+//! lookup, listing, name-uniqueness check and idempotency token is scoped to the
+//! region of the calling request, because a regional AWS endpoint serves only the
+//! resources created through it.
 
 //! Every collection here is BOUNDED, because all three grow from caller requests:
 //! `workflows` is capped at [`MAX_WORKFLOWS`], a workflow's `runs` at
@@ -353,6 +359,14 @@ fn duration_in_seconds(elapsed: Duration) -> i32 {
 #[derive(Debug, Clone)]
 pub struct Workflow {
     pub arn: String,
+    /// The region whose endpoint this workflow was created through: the credential
+    /// scope of the `CreateWorkflow` request ([`request_region`]), which is also the
+    /// region segment of [`Workflow::arn`].
+    ///
+    /// A regional endpoint serves only the resources created through it, so this is
+    /// the partition key EVERY lookup, listing and name-uniqueness check of this
+    /// store is scoped by ([`ComAmazonawsMwaaserverlessAmazonmwaaserverlessState::workflow_in`]).
+    pub region: String,
     pub name: String,
     pub status: String,
     pub created_at: SystemTime,
@@ -505,11 +519,19 @@ pub struct ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
     /// Every persisted workflow, keyed by its ARN. A `BTreeMap` so `ListWorkflows`
     /// has one total order to paginate over. At most [`MAX_WORKFLOWS`] entries, and at
     /// most [`MAX_RUNS_PER_WORKFLOW`] runs inside each.
+    ///
+    /// A `WorkflowArn` embeds the region it was minted for, so one map holds every
+    /// region's workflows without collision; a handler reaches only the ones the
+    /// caller's endpoint serves, through [`Self::workflow_in`],
+    /// [`Self::workflow_in_mut`] and [`Self::workflows_in_after`].
     pub workflows: BTreeMap<String, Workflow>,
-    /// `Name` -> `WorkflowArn`, the uniqueness index `CreateWorkflow` conflicts on. One
-    /// key per stored workflow — including one that is `DELETING`, whose name stays
-    /// taken until its teardown completes — so [`MAX_WORKFLOWS`] bounds this map too.
-    pub workflow_names: BTreeMap<String, String>,
+    /// `(region, Name)` -> `WorkflowArn`, the uniqueness index `CreateWorkflow`
+    /// conflicts on. The region is part of the key because a name is taken only at the
+    /// endpoint the workflow was created through, so the same name is free in every
+    /// other region. One key per stored workflow — including one that is `DELETING`,
+    /// whose name stays taken until its teardown completes — so [`MAX_WORKFLOWS`]
+    /// bounds this map too.
+    pub workflow_names: BTreeMap<(String, String), String>,
     /// `<operation>:<ClientToken>` -> what that token already produced. Capped and
     /// evicted on its own terms; see [`IdempotencyLedger`].
     pub idempotency: IdempotencyLedger,
@@ -549,22 +571,78 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
     /// workflow never outlives its teardown just because the next request happened
     /// to be a different operation.
     pub fn reap_deleted_workflows(&mut self, now: SystemTime) -> bool {
-        let due: Vec<(String, String)> = self
+        let due: Vec<(String, String, String)> = self
             .workflows
             .values()
             .filter(|workflow| workflow.deletion_due_at.is_some_and(|at| now >= at))
-            .map(|workflow| (workflow.arn.clone(), workflow.name.clone()))
+            .map(|workflow| {
+                (
+                    workflow.arn.clone(),
+                    workflow.region.clone(),
+                    workflow.name.clone(),
+                )
+            })
             .collect();
-        for (arn, name) in &due {
+        for (arn, region, name) in &due {
             self.workflows.remove(arn);
             // Only if the name still points at THIS workflow: the index is keyed by
-            // name, and a workflow removed earlier may have freed it already.
-            if self.workflow_names.get(name).is_some_and(|held| held == arn) {
-                self.workflow_names.remove(name);
+            // region and name, and a workflow removed earlier may have freed it already.
+            let name_key = (region.clone(), name.clone());
+            if self.workflow_names.get(&name_key).is_some_and(|held| held == arn) {
+                self.workflow_names.remove(&name_key);
             }
             self.forget_tokens_for(arn);
         }
         !due.is_empty()
+    }
+
+    /// The workflow `arn` names AS SEEN FROM `region`'s endpoint: the stored record
+    /// when it lives in that region, and `None` otherwise.
+    ///
+    /// An AWS regional endpoint resolves only the resources created through it, so a
+    /// reference to a workflow of another region is unresolvable here — the same miss
+    /// as an ARN the store never held.
+    pub fn workflow_in(&self, region: &str, arn: &str) -> Option<&Workflow> {
+        self.workflows
+            .get(arn)
+            .filter(|workflow| workflow.region == region)
+    }
+
+    /// [`Self::workflow_in`], for a caller that has to write the record it resolves.
+    pub fn workflow_in_mut(&mut self, region: &str, arn: &str) -> Option<&mut Workflow> {
+        self.workflows
+            .get_mut(arn)
+            .filter(|workflow| workflow.region == region)
+    }
+
+    /// The workflows `region`'s endpoint holds, in ARN order, starting after the ARN
+    /// `after` names — the walk a region-scoped listing pages over.
+    pub fn workflows_in_after<'a>(
+        &'a self,
+        region: &'a str,
+        after: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a Workflow> + 'a {
+        let lower = match after {
+            Some(last) => std::ops::Bound::Excluded(last),
+            None => std::ops::Bound::Unbounded,
+        };
+        self.workflows
+            .range::<str, _>((lower, std::ops::Bound::Unbounded))
+            .map(|(_, workflow)| workflow)
+            .filter(move |workflow| workflow.region == region)
+    }
+
+    /// The ARN of the workflow holding `name` at `region`'s endpoint, if one does.
+    /// A name taken in one region says nothing about any other.
+    pub fn workflow_arn_named(&self, region: &str, name: &str) -> Option<&String> {
+        self.workflow_names
+            .get(&(region.to_string(), name.to_string()))
+    }
+
+    /// Record that `arn` holds `name` at `region`'s endpoint.
+    pub fn claim_workflow_name(&mut self, region: &str, name: &str, arn: &str) {
+        self.workflow_names
+            .insert((region.to_string(), name.to_string()), arn.to_string());
     }
 }
 
@@ -579,9 +657,12 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsMwaaserverlessAmazonmwaaserverlessState>)
 }
 
-/// The region an ARN minted for this request carries: the SigV4 credential
-/// scope's region when it is one the modelled `WorkflowArn` pattern accepts,
-/// else [`DEFAULT_REGION`].
+/// The region this request is scoped to: the SigV4 credential scope's region when it
+/// is one the modelled `WorkflowArn` pattern accepts, else [`DEFAULT_REGION`].
+///
+/// It is both the region segment of an ARN minted for the request and the partition
+/// every lookup, listing and name-uniqueness check is scoped by, because a regional
+/// endpoint serves only the resources created through it.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)

@@ -495,6 +495,8 @@ pub const OPERATION_TYPE_ATTACH_DISK: &str = "AttachDisk";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DETACH_DISK: &str = "DetachDisk";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_DELETE_DISK: &str = "DeleteDisk";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DETACH_STATIC_IP: &str = "DetachStaticIp";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DETACH_INSTANCES_FROM_LOAD_BALANCER: &str =
@@ -8524,6 +8526,20 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// this handle; no operation in this slice renames a disk.
     pub fn disk_mut(&mut self, name: &str) -> Option<&mut StoredDisk> {
         self.disks.get_mut(name)
+    }
+
+    /// Remove the block storage disk `name` names, answering the record that was
+    /// removed. `None` when nothing matched.
+    ///
+    /// A disk is removable only while it is attached to nothing (the modelled
+    /// `DeleteDisk` documentation: "The disk must be in the available state (not
+    /// attached to a Lightsail instance)"), which the caller is what enforces,
+    /// so there is no attachment left for this removal to release — unlike
+    /// [`Self::remove_instance`], whose resource other records do hold
+    /// attachments to. A snapshot taken of the disk is a resource of its own and
+    /// keeps the source name and ARN it recorded, so it outlives the disk.
+    pub fn remove_disk(&mut self, name: &str) -> Option<StoredDisk> {
+        self.disks.remove(name)
     }
 
     /// The instance `name` names as the modelled `Instance`, with every block
