@@ -1,22 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreCoreNetworkPolicyVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreCoreNetworkPolicyVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreCoreNetworkPolicyVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
-//! ## Shape of an operation
-//!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `RestoreCoreNetworkPolicyVersion::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! Restores a previous policy version of a core network as a NEW, immutable policy
+//! version: the stored document of the named version is submitted again under the next
+//! `PolicyVersionId`, which starts the change set that version has to go through before it
+//! can be put in force. The LIVE policy is NOT touched — restoring submits a version, it
+//! does not execute one — so the core network keeps answering from the document in force
+//! until a change set execution replaces it. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Reaching this service's state
 //!
@@ -150,18 +141,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreCoreNetworkPolicyVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreCoreNetworkPolicyVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreCoreNetworkPolicyVersion"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RestoreCoreNetworkPolicyVersionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the networkmanager store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // A policy version belongs to a core network, so an unknown core network is
+        // answered as not found before any version of it is looked for.
+        let core_network = store
+            .core_networks
+            .get_mut(&input.core_network_id)
+            .ok_or_else(|| {
+                RestoreCoreNetworkPolicyVersionErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::CORE_NETWORK_KIND,
+                        &input.core_network_id,
+                    ),
+                )
+            })?;
+
+        // The version to restore has to be one this core network still holds: its stored
+        // document is what the call submits, so a version id it holds none for — never
+        // minted, or since deleted — is answered with the modelled
+        // `ResourceNotFoundException` (HTTP 404) naming that version.
+        let restored = core_network
+            .policy_versions
+            .get(&input.policy_version_id)
+            .ok_or_else(|| {
+                RestoreCoreNetworkPolicyVersionErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::CORE_NETWORK_POLICY_KIND,
+                        &crate::state::policy_version_resource_id(
+                            &input.core_network_id,
+                            input.policy_version_id,
+                        ),
+                    ),
+                )
+            })?;
+        let document = restored.document.clone();
+        // The description travels with the document: restoring reproduces that version's
+        // submission, and this call carries no description of its own to replace it with.
+        let description = restored.description.clone();
+
+        // Like a put, a restore APPENDS to an immutable history, so it is bounded by the
+        // history's own cap. This operation models no `ServiceQuotaExceededException`
+        // (`smithy_query query="operation" operation="RestoreCoreNetworkPolicyVersion"`),
+        // so the refusal is its modelled `ValidationException` carrying `Other` and no
+        // `Fields` entry — every member of the request is valid, it is the resulting
+        // version COUNT the core network cannot have — and it stores nothing.
+        if core_network.policy_versions.len() >= crate::state::MAX_POLICY_VERSIONS_PER_CORE_NETWORK
+        {
+            return Err(
+                RestoreCoreNetworkPolicyVersionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "core network {} already holds the maximum of {} policy version(s); delete one before restoring another",
+                            input.core_network_id,
+                            crate::state::MAX_POLICY_VERSIONS_PER_CORE_NETWORK
+                        ),
+                        reason: Some(crate::state::VALIDATION_REASON_OTHER.to_string()),
+                        fields: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Restores a previous policy version as a new, immutable version of a core network
+        // policy. A subsequent change set is created showing the differences between the
+        // LIVE policy and restored policy": like a put, a restore only PREPARES that change
+        // set, so the new version is stored UNexecuted — the version restored from stays
+        // exactly as it was, the LIVE policy and the topology derived from it are left
+        // alone, and the new version reports `PENDING_GENERATION` until the span the clock
+        // owes falls due and `READY_TO_EXECUTE` after it. It carries no `ClientToken`: this
+        // operation models none (`smithy_query
+        // query="operation" operation="RestoreCoreNetworkPolicyVersion"`).
+        let stored = core_network.add_policy_version(document, description, None, now, false);
+
+        Ok(RestoreCoreNetworkPolicyVersionOutput {
+            core_network_policy: Some(stored),
+        })
     }
 }
