@@ -15,6 +15,8 @@
 mod error_message_wording;
 #[path = "all/forecast_data.rs"]
 mod forecast_data;
+#[path = "all/forecast_datapoints.rs"]
+mod forecast_datapoints;
 #[path = "all/scaling_instruction_validation.rs"]
 mod scaling_instruction_validation;
 #[path = "all/scaling_plan_lifecycle.rs"]
