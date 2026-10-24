@@ -184,8 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let mut state = state.lock();
-        // The identity store the request names must exist; one that does not is refused
-        // rather than vivified by a create that names it.
+        // A well-formed `IdentityStoreId` of this account names the store the client has;
+        // an identifier naming no store this emulator serves is refused. Both ENDS of the
+        // membership must already exist in that store, so a store with no record yet
+        // holds neither: the GROUP is then what is missing, and no record is registered
+        // for a create that cannot be served.
         let group_not_found = || {
             CreateGroupMembershipErrorModeled::ResourceNotFoundException(crate::state::not_found(
                 crate::state::ResourceKind::Group,
@@ -193,8 +196,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         };
         let store = state
-            .resolve_store_mut(&input.identity_store_id)
-            .map_err(CreateGroupMembershipErrorModeled::ResourceNotFoundException)?;
+            .resolve_recorded_store_mut(&input.identity_store_id)
+            .map_err(CreateGroupMembershipErrorModeled::ResourceNotFoundException)?
+            .ok_or_else(group_not_found)?;
 
         // Both ends of the membership must already exist in this identity store. The
         // modelled `MemberId` union declares exactly one variant, `UserId`, so the
@@ -259,8 +263,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             member_user_id: member_key,
             created_at: now,
             updated_at: now,
-            created_by: Some(created_by),
-            updated_by: None,
+            created_by: Some(created_by.clone()),
+            // `UpdatedBy` reports the LAST write, which for a membership is the create
+            // that made it — as its `UpdatedAt` already reports.
+            updated_by: Some(created_by),
         };
 
         let output = CreateGroupMembershipOutput {

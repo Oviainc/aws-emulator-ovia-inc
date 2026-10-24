@@ -286,7 +286,7 @@ async fn a_pair_with_no_membership_is_reported_as_not_found() {
     // group, the member, or the pairing itself.
     let rows = [
         (
-            "an identity store that does not exist",
+            "an identity store of another account",
             json!({
                 "IdentityStoreId": MISSING_STORE,
                 "GroupId": group.clone(),
@@ -348,8 +348,8 @@ async fn a_pair_with_no_membership_is_reported_as_not_found() {
             Some(expected_type),
             "case {row_case:?}: expected the refusal to name {expected_type}, got {refusal}"
         );
-        // A membership has no id to report — the pair is what was asked about — while a
-        // store that does not exist is reported by the id the request itself named.
+        // A membership has no id to report — the pair is what was asked about — while an
+        // identifier naming no store this emulator serves is reported as the store.
         if expected_type == "GROUP_MEMBERSHIP" {
             assert!(
                 refusal["ResourceId"].is_null(),

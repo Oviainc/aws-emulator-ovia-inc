@@ -29,28 +29,31 @@ use crate::document_extraction::{
 };
 
 /// The side of one glyph cell of the embedded font.
-const CELL: usize = 8;
+pub(crate) const CELL: usize = 8;
 
 /// Baseline-to-baseline distance, in glyph cells: tall enough to leave blank rows
 /// between two lines of ink, which is what makes them two lines.
-const PITCH: usize = 12;
+pub(crate) const PITCH: usize = 12;
 
 /// How a page is drawn. Each knob is one axis the recognition rule must hold along.
+///
+/// `pub(crate)` knobs: the geometry suite draws its own pages with these same axes, so
+/// one renderer serves both rather than each suite growing its own.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Paper {
     /// Pixels per font pixel: the size the text is rendered at.
-    scale: usize,
+    pub(crate) scale: usize,
     /// Blank pixels around the text block.
-    margin: usize,
+    pub(crate) margin: usize,
     /// The page's background level.
-    background: u8,
+    pub(crate) background: u8,
     /// The ink's level. Darker or lighter than the background, either way.
-    ink: u8,
+    pub(crate) ink: u8,
     /// Grow every stroke by one pixel downwards, for a heavier weight than the font's.
-    thicken: bool,
+    pub(crate) thicken: bool,
     /// Draw a two-pixel rule across the page under the text: a border, not a line of
     /// text.
-    rule: bool,
+    pub(crate) rule: bool,
 }
 
 impl Paper {
@@ -135,7 +138,7 @@ fn texts_of(blocks: &[Value], kind: &str) -> Vec<String> {
         .collect()
 }
 
-/// The one confidence every block of an answer reports.
+/// The confidence of the first block of an answer that reports one.
 fn confidence_of(blocks: &[Value]) -> Option<f64> {
     blocks
         .iter()

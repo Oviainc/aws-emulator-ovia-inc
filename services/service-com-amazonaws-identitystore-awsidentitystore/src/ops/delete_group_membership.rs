@@ -159,13 +159,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
         let membership_key = crate::state::resource_key(&input.membership_id);
-        // The identity store the request names must exist; a delete against one that
-        // does not is refused rather than answered as a no-op success, and no store
-        // springs into being because a request named one.
-        let store = state
-            .resolve_store_mut(&input.identity_store_id)
-            .map_err(DeleteGroupMembershipErrorModeled::ResourceNotFoundException)?;
-        let removed = store.remove_membership(&membership_key);
+        // The store is RESOLVED but never REGISTERED: a delete stores nothing, so a store
+        // this emulator holds no record of holds no such membership either and the
+        // MEMBERSHIP is what is missing (below). Only an identifier naming no store this
+        // emulator serves is refused for the store's own sake.
+        let removed = state
+            .resolve_recorded_store_mut(&input.identity_store_id)
+            .map_err(DeleteGroupMembershipErrorModeled::ResourceNotFoundException)?
+            .and_then(|store| store.remove_membership(&membership_key));
 
         // A membership this store does not hold cannot be deleted: the operation models
         // `ResourceNotFoundException` for exactly that, so the id is reported as not

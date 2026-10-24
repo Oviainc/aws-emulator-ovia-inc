@@ -174,21 +174,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request whether or not the named store exists.
         let lookup = GroupLookup::from_identifier(&input.alternate_identifier)?;
 
-        // A read: the store is looked up rather than vivified and nothing is written,
-        // so resolving a group id can never change what a later caller sees.
+        // A read: the store is RESOLVED and nothing is written, so resolving a group id
+        // can never change what a later caller sees — a store with no record yet
+        // resolves to the empty store and holds no group to report.
         let state = state.lock();
         let not_found = || {
             GetGroupIdErrorModeled::ResourceNotFoundException(
                 crate::state::not_found_by_alternate_identifier(crate::state::ResourceKind::Group),
             )
         };
-        // The identity store the request names must exist; one that does not is the
-        // missing resource, reported as `IDENTITY_STORE` rather than as a missing group
-        // of a store that is not there either.
+        // The identity store the request names: every well-formed `IdentityStoreId` of
+        // this account names a store this emulator serves, and an identifier that names
+        // no store it can serve at all (another account's) is the missing resource,
+        // reported as `IDENTITY_STORE` rather than as a missing group.
         let store = state
             .resolve_store(&input.identity_store_id)
             .map_err(GetGroupIdErrorModeled::ResourceNotFoundException)?;
-        let group = lookup.find(store).ok_or_else(not_found)?;
+        let group = lookup.find(&store).ok_or_else(not_found)?;
 
         Ok(GetGroupIdOutput {
             identity_store_id: store.identity_store_id.clone(),

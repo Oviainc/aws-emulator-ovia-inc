@@ -12,10 +12,12 @@
 //!
 //! The same holds for every other resource kind this store carries — a key value store, a
 //! response headers policy, an origin request policy, a cache policy, an origin access
-//! control: each record is put there by the call that creates it and is what every later
-//! read of that resource answers from. None of a response headers policy, an origin
-//! request policy, a cache policy or an origin access control has a status member or a
-//! propagation deadline, so nothing about one is owed by the clock.
+//! control, a CloudFront function: each record is put there by the call that creates it
+//! and is what every later read of that resource answers from. None of a response headers
+//! policy, an origin request policy, a cache policy or an origin access control has a
+//! status member or a propagation deadline, so nothing about one is owed by the clock;
+//! neither is anything about a function, which reaches its `LIVE` stage through a
+//! `PublishFunction` CALL rather than by waiting.
 //!
 //! Two things in here are owed by the CLOCK rather than by a call:
 //!
@@ -64,6 +66,14 @@ use crate::ops::types::{
     SessionStickinessConfig, Signer, StringSchemaConfig, Tag, Tags, TrafficConfig,
     TrustedKeyGroups, TrustedSigners, ViewerCertificate,
 };
+
+/// The CloudFront FUNCTION slice of this store: the function record, its two stages,
+/// their quotas, the ARN and path a function is addressed by, and the modelled errors the
+/// function operations answer with. Declared as a SUBMODULE so that surface grows without
+/// touching the parts of this file the other resource kinds own; `pub use` keeps every
+/// name reachable as `crate::state::<name>`, which is where each handler names it.
+pub mod functions;
+pub use functions::*;
 
 /// `Distribution$Status` while a configuration is still propagating to the edge
 /// locations. The model documents the terminal value — "When the status is `Deployed`,
@@ -1525,6 +1535,12 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// for the same reason as `distributions`: one stable total order for a listing to
     /// page through.
     pub response_headers_policies: BTreeMap<String, StoredResponseHeadersPolicy>,
+    /// Every CloudFront function this emulator holds, keyed by its name — "A function
+    /// with the same name already exists in this Amazon Web Services account" is what
+    /// makes the name the key and a repeated name a `FunctionAlreadyExists`. A `BTreeMap`
+    /// for the same reason as `distributions`: one stable total order for a listing to
+    /// page through. Everything that reads or writes it lives in [`functions`].
+    pub functions: BTreeMap<String, StoredFunction>,
     /// Every origin access control this emulator holds, keyed by its minted id — the
     /// identifier every origin access control operation addresses one by. A `BTreeMap`
     /// for the same reason as `distributions`: one stable total order for a listing to
@@ -1787,8 +1803,11 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         {
             return Some(&distribution.tags);
         }
-        if let Some(store) = self.key_value_stores.values().find(|store| store.arn == arn) {
+        if let Some(store) = self.key_value_store_by_arn(arn) {
             return Some(&store.tags);
+        }
+        if let Some(function) = self.function_by_arn(arn) {
+            return Some(&function.tags);
         }
         self.distribution_tenants
             .values()
@@ -1811,10 +1830,20 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         {
             return Some(&mut distribution.tags);
         }
-        self.key_value_stores
+        if let Some(store) = self
+            .key_value_stores
             .values_mut()
             .find(|store| store.arn == arn)
-            .map(|store| &mut store.tags)
+        {
+            return Some(&mut store.tags);
+        }
+        // The FIELD rather than the [`Self::function_by_arn`] lookup the tag READ goes
+        // through: a method taking `&mut self` would borrow the whole store, which the
+        // arms above already borrow a field of. The comparison is the same one.
+        self.functions
+            .values_mut()
+            .find(|function| function.arn == arn)
+            .map(|function| &mut function.tags)
     }
 
     /// Persist a new distribution carrying `config` and `tags`, and report the record

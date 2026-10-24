@@ -17,15 +17,24 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The `X-Amz-Target` prefix from OPERATIONS.md, "Wire protocol".
 const TARGET_PREFIX: &str = "AWSIdentityStore";
 
-/// The one identity store that EXISTS: the store IAM Identity Center provisioned for
-/// the instance `sso-admin` seeds, which is what `ListInstances` points a client at
-/// (`identitystore::state::SEED_IDENTITY_STORE_ID`). Every suite addresses this one,
-/// because it is the only one a call can be addressed to.
+/// The identity store this emulator ADVERTISES: the store IAM Identity Center
+/// provisioned for the instance `sso-admin` seeds, which is what `ListInstances` points a
+/// client at (`identitystore::state::SEED_IDENTITY_STORE_ID`). Most suites address this
+/// one, but it is not privileged: this API creates no identity store, so every
+/// well-formed `IdentityStoreId` of this account names the store its caller has and is
+/// served.
 pub const STORE: &str = identitystore::state::SEED_IDENTITY_STORE_ID;
 
-/// A well-formed `IdentityStoreId` that names NO identity store, so a call addressed to
-/// it is refused rather than served.
-pub const MISSING_STORE: &str = "d-9999999999";
+/// An `IdentityStoreId` the model admits that names NO identity store this emulator
+/// serves, so a call addressed to it is refused rather than served.
+///
+/// It is an ARN, because the ARN form is what carries the OWNING ACCOUNT: this one names
+/// a store of ANOTHER account (`210987654321`, which is not
+/// `engine::emulator_account_id()`), which is not a store this emulator holds however its
+/// id ends. A bare `d-…` id would NOT do: the modelled pattern is all that decides
+/// well-formedness, and a well-formed id of this account names the caller's own store.
+pub const MISSING_STORE: &str =
+    "arn:aws:identitystore::210987654321:identitystore/d-9999999999";
 
 /// The access key id a call is signed with when a case does not care which caller
 /// makes it.

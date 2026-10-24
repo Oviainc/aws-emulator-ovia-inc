@@ -226,13 +226,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let mut state = state.lock();
-        // The identity store must EXIST: `IdentityStoreId` is caller-chosen, and a
-        // well-formed id that names no store is refused with the modelled
-        // `ResourceNotFoundException` rather than answered — nothing is created, and no
-        // store springs into being because a request named one.
+        // `IdentityStoreId` is CALLER-CHOSEN and no modelled operation creates an
+        // identity store, so a well-formed id of this account names the store the client
+        // has and the create is served in it, its record registered on first use. Two
+        // refusals, both modelled: an identifier naming no store this emulator serves
+        // (another account's) is the 404, and one more store than this emulator records
+        // is the 402 — neither creates anything.
         let store = state
-            .resolve_store_mut(&input.identity_store_id)
-            .map_err(CreateUserErrorModeled::ResourceNotFoundException)?;
+            .register_store_mut(&input.identity_store_id)
+            .map_err(|refusal| match refusal {
+                crate::state::StoreWriteRefusal::NotFound(not_found) => {
+                    CreateUserErrorModeled::ResourceNotFoundException(not_found)
+                }
+                crate::state::StoreWriteRefusal::AtCapacity(quota) => {
+                    CreateUserErrorModeled::ServiceQuotaExceededException(quota)
+                }
+            })?;
 
         // The store holds a bounded number of users. The operation models
         // `ServiceQuotaExceededException` for "the request would cause the number of
@@ -297,9 +306,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             extensions: input.extensions.unwrap_or_default(),
             created_at: now,
             updated_at: now,
-            created_by: Some(created_by),
-            // Nothing has updated this user yet, so it carries no `UpdatedBy`.
-            updated_by: None,
+            created_by: Some(created_by.clone()),
+            // `UpdatedBy` reports the LAST write, and a create is one: the user's
+            // `UpdatedAt` is its `CreatedAt` for the same reason, so the principal that
+            // wrote it last is the one that created it until something updates it.
+            updated_by: Some(created_by),
         };
 
         let output = CreateUserOutput {

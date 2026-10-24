@@ -389,11 +389,11 @@ async fn a_store_or_member_the_check_cannot_resolve_is_refused() {
     let router = emulator();
     let (user, groups) = store_with_groups(&router, STORE, 1, &[0], case).await;
 
-    // An identity store that does not exist holds no membership to report, and naming
-    // it does not bring it into being.
+    // An identity store this emulator does not serve holds no membership to report, and
+    // naming it does not bring it into being.
     let unknown_store = MISSING_STORE;
     for attempt in ["first", "repeated"] {
-        let row_case = format!("{case}: an identity store that does not exist ({attempt})");
+        let row_case = format!("{case}: another account's identity store ({attempt})");
         let refusal = refused(
             &router,
             "IsMemberInGroups",
