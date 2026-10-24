@@ -86,8 +86,10 @@
 //! * `InsufficientPrivilegesException` (HTTP 403) — The specified account does not have
 //!   sufficient privileges for one or more Amazon Web Services services.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
+use crate::state::ListedPlatformVersion;
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -194,13 +196,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // disagree about the version's status.
         store.materialize_due_transitions();
         let mut available =
-            crate::state::managed_platform_summaries(&region, &store.platform_branches);
+            crate::state::managed_platform_listings(&region, &store.platform_branches);
         available.extend(
             store
                 .platform_versions
                 .values()
                 .filter(|version| arn_region(&version.arn) == Some(region.as_str()))
-                .map(crate::state::PlatformVersion::to_summary),
+                .map(crate::state::PlatformVersion::to_listing),
         );
         drop(store);
 
@@ -216,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then_with(|| arn_of(left).cmp(arn_of(right)))
         });
 
-        let matching: Vec<PlatformSummary> = available
+        let matching: Vec<ListedPlatformVersion> = available
             .into_iter()
             .filter(|version| terms.iter().all(|term| term.matches(version)))
             .collect();
@@ -253,28 +255,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(ListPlatformVersionsOutput {
-            platform_summary_list: Some(page.to_vec()),
+            platform_summary_list: Some(
+                page.iter()
+                    .map(|version| version.summary.clone())
+                    .collect::<Vec<PlatformSummary>>(),
+            ),
             next_token,
         })
     }
 }
 
-/// The `PlatformArn` of one summary — what a page boundary is named by.
-fn arn_of(summary: &PlatformSummary) -> &str {
-    summary.platform_arn.as_deref().unwrap_or_default()
+/// The `PlatformArn` of one platform version — what a page boundary is named by.
+fn arn_of(version: &ListedPlatformVersion) -> &str {
+    version.summary.platform_arn.as_deref().unwrap_or_default()
 }
 
-/// The `PlatformVersion` of one summary, or the empty string when it carries
-/// none.
-fn version_of(summary: &PlatformSummary) -> &str {
-    summary.platform_version.as_deref().unwrap_or_default()
+/// The `PlatformVersion` of one platform version, or the empty string when it
+/// carries none.
+fn version_of(version: &ListedPlatformVersion) -> &str {
+    version
+        .summary
+        .platform_version
+        .as_deref()
+        .unwrap_or_default()
 }
 
-/// The platform name a summary's ARN carries (`…:platform/<name>/<version>`) —
+/// The platform name a version's ARN carries (`…:platform/<name>/<version>`) —
 /// the attribute the `PlatformName` filter type is applied to, which
 /// `PlatformSummary` reports only inside `PlatformArn`.
-fn platform_name(summary: &PlatformSummary) -> &str {
-    let resource = arn_of(summary).split(':').next_back().unwrap_or_default();
+fn platform_name(version: &ListedPlatformVersion) -> &str {
+    let resource = arn_of(version).split(':').next_back().unwrap_or_default();
     let after_kind = resource.strip_prefix("platform/").unwrap_or(resource);
     match after_kind.rfind('/') {
         Some(at) => &after_kind[..at],
@@ -325,13 +335,15 @@ impl Attribute {
         }
     }
 
-    /// This attribute's value(s) on `summary`. Three of the attributes are
+    /// This attribute's value(s) on `version`. Three of the attributes are
     /// multi-valued (the tiers and the addons a version supports, the languages
-    /// it runs); the rest carry exactly one value. A member the summary does not
+    /// it runs); the rest carry exactly one value. A member the version does not
     /// carry reads as NO value, so an `=` term on it selects nothing and a `!=`
     /// term selects everything — the honest answer for an attribute only a built
-    /// platform's definition archive states, which this service does not read.
-    fn values_of(self, summary: &PlatformSummary) -> Vec<&str> {
+    /// platform's definition archive states, which this service does not read
+    /// (every attribute of a version the PUBLISHED catalog states is reported,
+    /// so for those the term is answered from the catalog).
+    fn values_of(self, version: &ListedPlatformVersion) -> Vec<&str> {
         /// The member's one value, or no value at all when it is absent.
         fn one(member: Option<&String>) -> Vec<&str> {
             member.map(String::as_str).into_iter().collect()
@@ -342,8 +354,9 @@ impl Attribute {
                 .map(|values| values.iter().map(String::as_str).collect())
                 .unwrap_or_default()
         }
+        let summary = &version.summary;
         match self {
-            Self::PlatformName => vec![platform_name(summary)],
+            Self::PlatformName => vec![platform_name(version)],
             Self::PlatformVersion => one(summary.platform_version.as_ref()),
             Self::PlatformStatus => one(summary.platform_status.as_ref()),
             Self::PlatformBranchName => one(summary.platform_branch_name.as_ref()),
@@ -352,11 +365,28 @@ impl Attribute {
             Self::OperatingSystemName => one(summary.operating_system_name.as_ref()),
             Self::SupportedTier => many(summary.supported_tier_list.as_ref()),
             Self::SupportedAddon => many(summary.supported_addon_list.as_ref()),
-            // A summary carries no programming language at all: the languages a
-            // platform runs are read off its definition archive, which this
-            // service does not read.
-            Self::ProgrammingLanguageName => Vec::new(),
+            // The one attribute `PlatformSummary` models no member for: the
+            // languages a version runs are the catalog's, carried beside the
+            // summary so a term on them is answered rather than ignored.
+            Self::ProgrammingLanguageName => version
+                .programming_language_names
+                .iter()
+                .map(String::as_str)
+                .collect(),
         }
+    }
+
+    /// Whether this attribute's values are compared WITHOUT regard to case.
+    ///
+    /// Only the version's life-cycle state is: the model documents the value a
+    /// filter term carries for it in lower case (`PlatformFilter$Values`:
+    /// "`PlatformLifecycleState`: `recommended`") while the service REPORTS the
+    /// state capitalized (`PlatformDescription$PlatformLifecycleState`:
+    /// "`Recommended`", which is also what the recorded responses carry), so a
+    /// term that spells it either way names the same state. Every other
+    /// attribute is compared exactly, as a name, a version or an ARN must be.
+    fn is_case_insensitive(self) -> bool {
+        self == Self::PlatformLifecycleState
     }
 }
 
@@ -480,18 +510,33 @@ impl FilterTerm {
     }
 
     /// Whether `version` satisfies this term.
-    fn matches(&self, version: &PlatformSummary) -> bool {
+    fn matches(&self, version: &ListedPlatformVersion) -> bool {
+        /// One value as this term compares it: folded when the attribute is
+        /// compared without regard to case
+        /// ([`Attribute::is_case_insensitive`]), so every operator below sees
+        /// one comparable pair, and borrowed as it stands otherwise — a name, a
+        /// version or an ARN is matched exactly, and nothing is copied for it.
+        fn fold(value: &str, case_insensitive: bool) -> Cow<'_, str> {
+            if case_insensitive {
+                Cow::Owned(value.to_ascii_lowercase())
+            } else {
+                Cow::Borrowed(value)
+            }
+        }
+        let case_insensitive = self.attribute.is_case_insensitive();
+        let value = fold(&self.value, case_insensitive);
         let candidates = self.attribute.values_of(version);
         match self.operator {
             // Over a multi-valued attribute "not equal" holds when NO value of
             // the attribute equals the term's — over a single-valued one that is
             // the same test.
-            Operator::NotEqual => !candidates
-                .iter()
-                .any(|candidate| Operator::Equal.holds(candidate, &self.value)),
-            _ => candidates
-                .iter()
-                .any(|candidate| self.operator.holds(candidate, &self.value)),
+            Operator::NotEqual => !candidates.iter().any(|candidate| {
+                Operator::Equal.holds(&fold(candidate, case_insensitive), &value)
+            }),
+            _ => candidates.iter().any(|candidate| {
+                self.operator
+                    .holds(&fold(candidate, case_insensitive), &value)
+            }),
         }
     }
 }
