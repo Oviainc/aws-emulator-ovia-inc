@@ -21,6 +21,8 @@ mod benefit_allocations;
 mod benefit_application_lifecycle;
 #[path = "all/entitlement_denial.rs"]
 mod entitlement_denial;
+#[path = "all/get_benefit_allocation.rs"]
+mod get_benefit_allocation;
 #[path = "all/recall_benefit_application.rs"]
 mod recall_benefit_application;
 #[path = "all/resource_tagging.rs"]

@@ -66,8 +66,10 @@ const UNKNOWN_BENEFIT: &str = "ben-00000000000000";
 /// The allocations the store holds for `catalog`, in the order it keys them.
 ///
 /// Read straight from the engine, so an assertion can compare the REPORT against the
-/// stored record rather than against another report.
-fn stored_allocations(harness: &Harness, catalog: &str) -> Vec<BenefitAllocation> {
+/// stored record rather than against another report. Shared with
+/// `crate::get_benefit_allocation`, which compares the single-allocation report against the
+/// same records.
+pub(crate) fn stored_allocations(harness: &Harness, catalog: &str) -> Vec<BenefitAllocation> {
     service_state(&**harness.engine())
         .expect("the in-memory engine carries this service's state")
         .lock()
@@ -103,7 +105,7 @@ fn grant(
 }
 
 /// `grant`, for a grant that must succeed.
-fn granted(
+pub(crate) fn granted(
     harness: &Harness,
     catalog: &str,
     benefit_identifier: &str,

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBenefitAllocation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBenefitAllocation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports ONE benefit allocation of one catalog from this service's state — this is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBenefitAllocation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The allocations are service-owned data, like the benefit catalog they draw from (AWS
+//! grants one when it fulfills a benefit for a partner and this API models no operation
+//! that creates one), so they live in `crate::state` and this operation reports the one the
+//! request names. `ListBenefitAllocations` reports the same records as summaries; what this
+//! operation adds is the detail a summary does not carry: `Description`, `StartsAt`,
+//! `UpdatedAt`, the one `FulfillmentType` the allocation is fulfilled with, and the
+//! `FulfillmentDetail` behind it.
+//!
+//! `FulfillmentDetail` is the modelled `FulfillmentDetails` union, whose member is decided
+//! by the allocation's fulfillment type: `CASH` is disbursed (`DisbursementDetails`),
+//! `CREDITS` is issued as credit codes (`CreditDetails`), `ACCESS` grants a privilege
+//! (`AccessDetails`). The union's `ConsumableDetails` member is produced by no
+//! `FulfillmentType` the model declares, so no stored allocation carries one — see
+//! [`crate::state::AllocationFulfillment`], which is where those records live.
 //!
 //! ## Shape of an operation
 //!
@@ -142,6 +150,60 @@ impl From<GetBenefitAllocationErrorModeled> for GetBenefitAllocationError {
     }
 }
 
+/// The `FulfillmentDetail` of one stored allocation: the member of the modelled
+/// `FulfillmentDetails` union its fulfillment record names, or `None` when the store holds
+/// no fulfillment record for it (see [`crate::state::AllocationFulfillment`]).
+fn fulfillment_detail(allocation: &crate::state::BenefitAllocation) -> Option<FulfillmentDetails> {
+    match allocation.fulfillment.as_ref()? {
+        crate::state::AllocationFulfillment::Disbursement {
+            disbursed,
+            issuance,
+        } => Some(FulfillmentDetails::DisbursementDetails(DisbursementDetails {
+            disbursed_amount: Some(disbursed.to_monetary_value()),
+            issuance_details: issuance.as_ref().map(issuance_detail),
+        })),
+        crate::state::AllocationFulfillment::Credits {
+            allocated,
+            issued,
+            codes,
+        } => Some(FulfillmentDetails::CreditDetails(CreditDetails {
+            allocated_amount: allocated.to_monetary_value(),
+            issued_amount: issued.to_monetary_value(),
+            // Modelled `@required`, so an allocation with nothing issued yet reports an
+            // EMPTY list rather than omitting the member.
+            codes: codes.iter().map(credit_code).collect(),
+        })),
+        // The privilege this allocation grants is described by the allocation's own
+        // `Description`, which is the benefit's; the store keeps no second copy of it.
+        crate::state::AllocationFulfillment::Access => {
+            Some(FulfillmentDetails::AccessDetails(AccessDetails {
+                description: allocation.description.clone(),
+            }))
+        }
+    }
+}
+
+/// One stored issuance as the modelled `IssuanceDetail`.
+fn issuance_detail(issuance: &crate::state::Issuance) -> IssuanceDetail {
+    IssuanceDetail {
+        issuance_id: Some(issuance.id.clone()),
+        issuance_amount: Some(issuance.amount.to_monetary_value()),
+        issued_at: Some(crate::state::timestamp(issuance.issued_at_millis)),
+    }
+}
+
+/// One stored credit code as the modelled `CreditCode`.
+fn credit_code(code: &crate::state::AllocatedCreditCode) -> CreditCode {
+    CreditCode {
+        aws_account_id: code.aws_account_id.clone(),
+        value: code.value.to_monetary_value(),
+        aws_credit_code: code.code.clone(),
+        status: code.status.clone(),
+        issued_at: crate::state::timestamp(code.issued_at_millis),
+        expires_at: crate::state::timestamp(code.expires_at_millis),
+    }
+}
+
 /// The `GetBenefitAllocation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -178,26 +240,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // The entitlement gate is a service-wide stage, so it sits ahead of this
-        // (unwritten) body too: a caller whose account holds no active AWS partner
-        // benefit is refused with the modelled `AccessDeniedException`, which is the
-        // WHOLE answer the service gives such a request — no unimplemented behaviour is
-        // involved. An entitled caller still gets the 501 below.
+        // The entitlement gate, ahead of everything else this handler does — see
+        // [`crate::state::entitlement_refusal`].
         if let Some(denied) = crate::state::entitlement_refusal(&*self.engine) {
             return Err(GetBenefitAllocationErrorModeled::AccessDeniedException(denied).into());
         }
-        // Implement `GetBenefitAllocation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBenefitAllocationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBenefitAllocation"))
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetBenefitAllocationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `Catalog`'s and `Identifier`'s own patterns are refused by the centralized walk
+        // before this body runs.
+        let region = crate::state::request_region(ctx);
+        let now_millis = crate::state::now_millis();
+
+        let mut store = state.lock();
+        if !store.catalogs.contains_key(&input.catalog) {
+            return Err(GetBenefitAllocationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::not_found_message(
+                        crate::state::CATALOG_KIND,
+                        &input.catalog,
+                    ),
+                },
+            )
+            .into());
+        }
+        // An allocation past its `ExpiresAt` is no longer usable whether or not anybody has
+        // looked at it, so this report first materialises the expiries the clock has ALREADY
+        // made due; it writes nothing else, and a later caller sees exactly what this one
+        // did. See `crate::state::BenefitAllocation::expire_due`.
+        store.expire_allocations_due(&input.catalog, now_millis);
+
+        // Either form the modelled `BenefitAllocationIdentifier` admits names the same
+        // record; an ARN of another catalog, service or resource type names none.
+        let Some(allocation) = store.allocation(&input.catalog, &input.identifier) else {
+            return Err(GetBenefitAllocationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::not_found_message(
+                        crate::state::ALLOCATION_KIND,
+                        &input.identifier,
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Every member is read off the stored record, except the ARN, which carries the
+        // region this request was signed for (the store keeps none, exactly as for a
+        // benefit).
+        Ok(GetBenefitAllocationOutput {
+            id: Some(allocation.id.clone()),
+            catalog: Some(allocation.catalog.clone()),
+            arn: Some(crate::state::allocation_arn(
+                &region,
+                &allocation.catalog,
+                &allocation.id,
+            )),
+            name: Some(allocation.name.clone()),
+            description: allocation.description.clone(),
+            status: Some(allocation.status.clone()),
+            status_reason: allocation.status_reason.clone(),
+            benefit_application_id: allocation.benefit_application_id.clone(),
+            benefit_id: Some(allocation.benefit_id.clone()),
+            fulfillment_type: Some(allocation.fulfillment_type.clone()),
+            applicable_benefit_ids: crate::state::optional_list(&allocation.applicable_benefit_ids),
+            fulfillment_detail: fulfillment_detail(allocation),
+            created_at: Some(crate::state::timestamp(allocation.created_at_millis)),
+            updated_at: Some(crate::state::timestamp(allocation.updated_at_millis)),
+            starts_at: Some(crate::state::timestamp(allocation.starts_at_millis)),
+            expires_at: Some(crate::state::timestamp(allocation.expires_at_millis)),
+        })
     }
 }

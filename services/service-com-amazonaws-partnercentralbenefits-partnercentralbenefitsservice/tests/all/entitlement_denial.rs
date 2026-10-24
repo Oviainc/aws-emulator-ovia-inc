@@ -143,8 +143,9 @@ async fn every_error_carries_the_status_this_service_serves_its_shape_with() {
 
     // (expected error shape, the caller is entitled, operation, body)
     let rows: Vec<(&str, bool, &str, Value)> = vec![
-        // AccessDeniedException: the gate, on a read, a write, a stub and the tag-reading
-        // operation — the last two being the recorded steps of the issue's fixture.
+        // AccessDeniedException: the gate, on a read, a write, an allocation read and the
+        // tag-reading operation — the last two being the recorded steps of the issue's
+        // fixture.
         (
             "AccessDeniedException",
             false,
@@ -240,7 +241,20 @@ async fn every_error_carries_the_status_this_service_serves_its_shape_with() {
     }
 
     // And a stub still answers 501, which is not a modelled shape at all: the override is
-    // over the modelled errors only.
+    // over the modelled errors only. `GetBenefit` is one of the operations still carrying
+    // the scaffold marker (`grep -l '^//! SCAFFOLDED, NOT IMPLEMENTED:' src/ops/`);
+    // `GetBenefitAllocation` above is implemented, so its entitled answer is the lookup's
+    // own 404 rather than a 501.
+    let (status, out) = entitled
+        .call(
+            "GetBenefit",
+            &json!({ "Catalog": CATALOG, "Identifier": UNKNOWN_BENEFIT }),
+        )
+        .await;
+    assert_eq!(
+        status, 501,
+        "case \"an unimplemented operation, entitled\": expected 501, got {status} {out:?}"
+    );
     let (status, out) = entitled
         .call(
             "GetBenefitAllocation",
@@ -248,8 +262,10 @@ async fn every_error_carries_the_status_this_service_serves_its_shape_with() {
         )
         .await;
     assert_eq!(
-        status, 501,
-        "case \"an unimplemented operation, entitled\": expected 501, got {status} {out:?}"
+        status,
+        served_status("ResourceNotFoundException"),
+        "case \"an implemented get of an allocation that does not exist, entitled\": \
+         expected the lookup's own refusal, got {status} {out:?}"
     );
 }
 

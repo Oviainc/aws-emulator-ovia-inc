@@ -104,6 +104,11 @@ pub const BENEFIT_KIND: &str = "Benefit";
 /// (`smithy_query(query="shape",shape="BenefitApplication")`).
 pub const APPLICATION_KIND: &str = "BenefitApplication";
 
+/// The name a `ResourceNotFoundException` message gives a benefit allocation: the
+/// modelled resource shape `com.amazonaws.partnercentralbenefits#BenefitAllocation`
+/// (`smithy_query(query="shape",shape="BenefitAllocation")`).
+pub const ALLOCATION_KIND: &str = "BenefitAllocation";
+
 /// The prefix a benefit id carries, from the modelled `BenefitSummary$Id` pattern
 /// `^ben-[0-9a-z]{14}$`.
 pub const BENEFIT_ID_PREFIX: &str = "ben-";
@@ -184,6 +189,15 @@ pub const BENEFIT_STATUS_ACTIVE: &str = "ACTIVE";
 /// See [`BENEFIT_STATUS_ACTIVE`].
 pub const BENEFIT_STATUS_INACTIVE: &str = "INACTIVE";
 
+/// The `FulfillmentType` of a benefit fulfilled by paying the partner money; one of the
+/// three values the model declares for that enum (`CREDITS | CASH | ACCESS`, see
+/// `crate::ops::types::FULFILLMENT_TYPE_VALUES`).
+pub const FULFILLMENT_TYPE_CASH: &str = "CASH";
+/// The `FulfillmentType` of a benefit fulfilled with AWS promotional credits.
+pub const FULFILLMENT_TYPE_CREDITS: &str = "CREDITS";
+/// The `FulfillmentType` of a benefit fulfilled by granting access rather than value.
+pub const FULFILLMENT_TYPE_ACCESS: &str = "ACCESS";
+
 /// The `BenefitAllocationStatus` of an allocation inside its term and not yet consumed;
 /// one of the three values the model declares for that enum (`ACTIVE | INACTIVE |
 /// FULFILLED`, see `crate::ops::types::BENEFIT_ALLOCATION_STATUS_VALUES`).
@@ -194,6 +208,29 @@ pub const ALLOCATION_STATUS_INACTIVE: &str = "INACTIVE";
 /// The `BenefitAllocationStatus` of an allocation whose benefit has been delivered in
 /// full. Terminal: an expiry does not move it, because there is nothing left to expire.
 pub const ALLOCATION_STATUS_FULFILLED: &str = "FULFILLED";
+
+/// The `CurrencyCode` every monetary amount this service holds is denominated in; a value
+/// of the model's own `CurrencyCode` enum (see `crate::ops::types::CURRENCY_CODE_VALUES`).
+///
+/// AWS partner funding benefits are granted in US dollars and no input member carries a
+/// currency, so this is the one currency the store uses — and the one whose minor unit is
+/// [`MINOR_UNITS_PER_UNIT`].
+pub const ALLOCATION_CURRENCY: &str = "USD";
+
+/// Minor units in one unit of [`ALLOCATION_CURRENCY`]: USD is an ISO-4217 currency with two
+/// decimal digits, so an amount is stored as cents and rendered with two decimals (see
+/// [`Money::amount_text`]).
+pub const MINOR_UNITS_PER_UNIT: i64 = 100;
+
+/// The amount a granted allocation is created with, in minor units of
+/// [`ALLOCATION_CURRENCY`].
+///
+/// CHOSEN, not an AWS amount: AWS decides what it allocates when it fulfills a benefit and
+/// this API models no member that carries the amount, so a grant needs a figure and this is
+/// it. Nothing is issued against a fresh grant — the issuance is a later act of AWS's
+/// fulfillment workflow — so a granted allocation reports this as allocated and zero as
+/// issued.
+pub const GRANTED_ALLOCATION_AMOUNT_MINOR: i64 = 25_000 * MINOR_UNITS_PER_UNIT;
 
 /// The `StatusReason` an expired allocation reports (`BenefitAllocationSummary$StatusReason`:
 /// "additional information explaining the current status of the benefit allocation").
@@ -429,6 +466,17 @@ struct SeededAllocation {
     status: &'static str,
     /// `BenefitAllocationSummary$StatusReason`, where the status has one to explain.
     status_reason: Option<&'static str>,
+    /// The one `FulfillmentType` this allocation is fulfilled with, which must be one of
+    /// the types its benefit offers (a benefit offering two is fulfilled with one of them).
+    /// It is what decides which member of the modelled `FulfillmentDetails` union
+    /// `GetBenefitAllocation` reports — see [`AllocationFulfillment`].
+    fulfillment_type: &'static str,
+    /// What AWS allocated, in minor units of [`ALLOCATION_CURRENCY`]; zero for an `ACCESS`
+    /// allocation, which fulfills no money.
+    allocated_amount_minor: i64,
+    /// How much of [`Self::allocated_amount_minor`] has been issued (disbursed, or handed
+    /// over as credit codes) as of state init. Never more than what was allocated.
+    issued_amount_minor: i64,
     /// How long before state init the allocation was created, in days.
     created_days_ago: i64,
     /// The term, in days, from `StartsAt` (= creation) to `ExpiresAt`.
@@ -443,17 +491,25 @@ struct SeededAllocation {
 ///
 /// Each `status` is a value of the model's `BenefitAllocationStatus` enum
 /// (`crate::ops::types::BENEFIT_ALLOCATION_STATUS_VALUES`, i.e. `ACTIVE | INACTIVE |
-/// FULFILLED`) and each `benefit_name` names a row of [`SEEDED_BENEFITS`]. The set
-/// deliberately spans every `FulfillmentType` (`CASH`, `CREDITS`, `ACCESS`, and a benefit
-/// carrying two of them), an allocation inside its term, one already fulfilled, and one
-/// whose term closed before state init — so a filtered `ListBenefitAllocations` has
-/// something to include and something to exclude whichever filter it is given.
+/// FULFILLED`), each `fulfillment_type` a value of its `FulfillmentType` enum
+/// (`crate::ops::types::FULFILLMENT_TYPE_VALUES`) that the named benefit offers, and each
+/// `benefit_name` names a row of [`SEEDED_BENEFITS`]. The set deliberately spans every
+/// `FulfillmentType` (`CASH`, `CREDITS`, `ACCESS`, and a benefit carrying two of them,
+/// fulfilled with the second), an allocation inside its term, one already fulfilled, one
+/// whose term closed before state init, an allocation partly issued and one with nothing
+/// issued yet — so a filtered `ListBenefitAllocations` has something to include and
+/// something to exclude whichever filter it is given, and `GetBenefitAllocation` has one
+/// allocation per member of the modelled `FulfillmentDetails` union to report.
 const SEEDED_ALLOCATIONS: &[SeededAllocation] = &[
     SeededAllocation {
         benefit_name: "Marketing Development Funds",
         name: "Marketing Development Funds allocation",
         status: ALLOCATION_STATUS_ACTIVE,
         status_reason: None,
+        fulfillment_type: FULFILLMENT_TYPE_CASH,
+        allocated_amount_minor: 25_000 * MINOR_UNITS_PER_UNIT,
+        // Part of the funding has been disbursed, so this allocation carries an issuance.
+        issued_amount_minor: 10_000 * MINOR_UNITS_PER_UNIT,
         created_days_ago: 30,
         term_days: 365,
     },
@@ -462,6 +518,10 @@ const SEEDED_ALLOCATIONS: &[SeededAllocation] = &[
         name: "Promotional Credits allocation",
         status: ALLOCATION_STATUS_FULFILLED,
         status_reason: Some("The allocated credits were issued in full."),
+        fulfillment_type: FULFILLMENT_TYPE_CREDITS,
+        allocated_amount_minor: 5_000 * MINOR_UNITS_PER_UNIT,
+        // Issued in full, which is what `FULFILLED` says: the credit code carries all of it.
+        issued_amount_minor: 5_000 * MINOR_UNITS_PER_UNIT,
         created_days_ago: 60,
         term_days: 365,
     },
@@ -470,6 +530,10 @@ const SEEDED_ALLOCATIONS: &[SeededAllocation] = &[
         name: "Partner Training Access allocation",
         status: ALLOCATION_STATUS_ACTIVE,
         status_reason: None,
+        fulfillment_type: FULFILLMENT_TYPE_ACCESS,
+        // An `ACCESS` allocation fulfills a privilege, not an amount.
+        allocated_amount_minor: 0,
+        issued_amount_minor: 0,
         // Granted more than a term ago, so its `ExpiresAt` is already past: the expiry is
         // what moves it to `INACTIVE`, rather than a status seeded as already moved.
         created_days_ago: 400,
@@ -480,6 +544,13 @@ const SEEDED_ALLOCATIONS: &[SeededAllocation] = &[
         name: "Migration Acceleration Funding allocation",
         status: ALLOCATION_STATUS_ACTIVE,
         status_reason: None,
+        // The benefit offers `CASH` and `CREDITS`; this allocation is fulfilled with the
+        // second of them, so the type is the allocation's own choice rather than the
+        // benefit's first.
+        fulfillment_type: FULFILLMENT_TYPE_CREDITS,
+        allocated_amount_minor: 10_000 * MINOR_UNITS_PER_UNIT,
+        // Nothing issued yet, so the credit-code list is empty.
+        issued_amount_minor: 0,
         created_days_ago: 10,
         term_days: 365,
     },
@@ -531,6 +602,178 @@ pub struct Benefit {
     pub status: String,
 }
 
+/// A monetary amount as the store holds it: minor units of its currency, so an amount is
+/// an integer in the store and is rendered into the modelled `MonetaryValue$Amount` once,
+/// on the way out (see [`Self::amount_text`]).
+#[derive(Debug, Clone)]
+pub struct Money {
+    /// The amount in minor units (cents, for [`ALLOCATION_CURRENCY`]). Never negative:
+    /// [`Self::new`] is the only constructor and clamps at zero.
+    minor_units: i64,
+    /// A `CurrencyCode` value.
+    pub currency_code: String,
+}
+
+impl Money {
+    /// `minor_units` of [`ALLOCATION_CURRENCY`]. A negative figure is not an amount this
+    /// service allocates, so it clamps to zero rather than rendering a signed amount.
+    pub fn new(minor_units: i64) -> Self {
+        Self {
+            minor_units: minor_units.max(0),
+            currency_code: ALLOCATION_CURRENCY.to_string(),
+        }
+    }
+
+    /// This amount in minor units of [`Self::currency_code`].
+    pub fn minor_units(&self) -> i64 {
+        self.minor_units
+    }
+
+    /// The modelled `MonetaryValue$Amount` text: the units, then the currency's minor units
+    /// as its decimal digits (`"25000.00"` for 2_500_000 cents of USD).
+    pub fn amount_text(&self) -> String {
+        let units = self.minor_units / MINOR_UNITS_PER_UNIT;
+        let fraction = self.minor_units % MINOR_UNITS_PER_UNIT;
+        format!("{units}.{fraction:02}")
+    }
+
+    /// This amount as the modelled `MonetaryValue`.
+    pub fn to_monetary_value(&self) -> crate::ops::types::MonetaryValue {
+        crate::ops::types::MonetaryValue {
+            amount: self.amount_text(),
+            currency_code: self.currency_code.clone(),
+        }
+    }
+}
+
+/// One issuance of value against a benefit allocation: the record the modelled
+/// `IssuanceDetail` reports.
+#[derive(Debug, Clone)]
+pub struct Issuance {
+    /// The issuance's own identifier, derived from the allocation's id so it is stable
+    /// across reads and distinct per allocation (see [`issuance_id`]).
+    pub id: String,
+    /// What this issuance handed over.
+    pub amount: Money,
+    /// When it was processed.
+    pub issued_at_millis: i64,
+}
+
+/// One AWS promotional credit code issued against a benefit allocation: the record the
+/// modelled `CreditCode` reports.
+#[derive(Debug, Clone)]
+pub struct AllocatedCreditCode {
+    /// The AWS account the code can be applied to: the one account this emulator presents.
+    pub aws_account_id: String,
+    /// The code itself, derived from the allocation's id and this code's index in the
+    /// allocation (see [`credit_code_text`]).
+    pub code: String,
+    /// The code's value.
+    pub value: Money,
+    /// A `BenefitAllocationStatus` value: `ACTIVE` while the code can still be redeemed,
+    /// `FULFILLED` once it has been, `INACTIVE` once it has expired.
+    pub status: String,
+    pub issued_at_millis: i64,
+    /// When the code expires and can no longer be redeemed.
+    pub expires_at_millis: i64,
+}
+
+impl AllocatedCreditCode {
+    /// Materialise the expiry the clock has already made due on this code, exactly as
+    /// [`BenefitAllocation::expire_due`] does for the allocation: a code past its own
+    /// `ExpiresAt` can no longer be redeemed, so it is `INACTIVE` whether or not anybody
+    /// has looked at it. A redeemed (`FULFILLED`) code is terminal.
+    fn expire_due(&mut self, now_millis: i64) -> bool {
+        if self.status != ALLOCATION_STATUS_ACTIVE || now_millis < self.expires_at_millis {
+            return false;
+        }
+        self.status = ALLOCATION_STATUS_INACTIVE.to_string();
+        true
+    }
+}
+
+/// How a benefit allocation is fulfilled, as the store holds it.
+///
+/// The allocation's `FulfillmentType` decides the shape of this record, which is what the
+/// modelled `FulfillmentDetails` union is: one member per kind of fulfillment
+/// (`smithy_query(query="shape",shape="FulfillmentDetails")`). `CASH` is fulfilled by
+/// disbursing money (`DisbursementDetails`, "direct payments or reimbursements"), `CREDITS`
+/// by issuing AWS promotional credits (`CreditDetails`), and `ACCESS` by granting a
+/// privilege (`AccessDetails`, "service permissions or feature access"), whose description
+/// is the allocation's own — so the variant carries nothing.
+///
+/// The union's fourth member, `ConsumableDetails` ("usage quotas or service limits"), is
+/// produced by no `FulfillmentType` the model declares, so nothing in this store holds one;
+/// a fulfillment type with no record here leaves `FulfillmentDetail` absent rather than
+/// reporting a kind of fulfillment that did not happen.
+#[derive(Debug, Clone)]
+pub enum AllocationFulfillment {
+    /// `CASH`: what has been disbursed so far, and the issuance that disbursed it (absent
+    /// while nothing has been).
+    Disbursement {
+        disbursed: Money,
+        issuance: Option<Issuance>,
+    },
+    /// `CREDITS`: what was allocated, what has been issued as credit codes, and those
+    /// codes (empty while nothing has been issued).
+    Credits {
+        allocated: Money,
+        issued: Money,
+        codes: Vec<AllocatedCreditCode>,
+    },
+    /// `ACCESS`: the privilege itself, described by the allocation's `Description`.
+    Access,
+}
+
+impl AllocationFulfillment {
+    /// The fulfillment record of an allocation of `fulfillment_type` that was granted
+    /// `allocated_minor` and has had `issued_minor` of it issued, or `None` for a
+    /// fulfillment type this store holds no record shape for.
+    ///
+    /// `allocation_id` seeds the issuance id and the credit codes, and the allocation's own
+    /// `issued_at`/`expires_at` are what an issuance and a code carry: a code expires with
+    /// the allocation it was issued against.
+    fn new(
+        fulfillment_type: &str,
+        allocated_minor: i64,
+        issued_minor: i64,
+        allocation_id: &str,
+        issued_at_millis: i64,
+        expires_at_millis: i64,
+    ) -> Option<Self> {
+        let issued = Money::new(issued_minor.clamp(0, allocated_minor.max(0)));
+        match fulfillment_type {
+            FULFILLMENT_TYPE_CASH => Some(Self::Disbursement {
+                issuance: (issued.minor_units() > 0).then(|| Issuance {
+                    id: issuance_id(allocation_id),
+                    amount: issued.clone(),
+                    issued_at_millis,
+                }),
+                disbursed: issued,
+            }),
+            FULFILLMENT_TYPE_CREDITS => Some(Self::Credits {
+                allocated: Money::new(allocated_minor),
+                // One issuance, so one code carrying what has been issued; nothing issued
+                // means no codes rather than a zero-valued one.
+                codes: Vec::from_iter((issued.minor_units() > 0).then(|| AllocatedCreditCode {
+                    aws_account_id: ::engine::emulator_account_id().to_string(),
+                    code: credit_code_text(allocation_id, 0),
+                    value: issued.clone(),
+                    // A code is handed over REDEEMABLE: nothing in this emulator
+                    // redeems one, and its own expiry is what moves it to
+                    // `INACTIVE` (see [`AllocatedCreditCode::expire_due`]).
+                    status: ALLOCATION_STATUS_ACTIVE.to_string(),
+                    issued_at_millis,
+                    expires_at_millis,
+                })),
+                issued,
+            }),
+            FULFILLMENT_TYPE_ACCESS => Some(Self::Access),
+            _ => None,
+        }
+    }
+}
+
 /// One benefit allocation the service has granted: the record every allocation operation
 /// reads.
 ///
@@ -558,6 +801,14 @@ pub struct BenefitAllocation {
     pub status_reason: Option<String>,
     /// `FulfillmentType` values: the ones the benefit this allocation is based on offers.
     pub fulfillment_types: Vec<String>,
+    /// The one `FulfillmentType` this allocation is fulfilled with, which is always one of
+    /// [`Self::fulfillment_types`]: a benefit may offer two, and the allocation is fulfilled
+    /// with one of them.
+    pub fulfillment_type: String,
+    /// How this allocation is fulfilled: the amounts, issuances and credit codes behind
+    /// [`Self::fulfillment_type`]. `None` for a fulfillment type this store holds no record
+    /// shape for — see [`AllocationFulfillment`].
+    pub fulfillment: Option<AllocationFulfillment>,
     /// The `ben-...` ids of the benefits this allocation can be applied to.
     pub applicable_benefit_ids: Vec<String>,
     pub created_at_millis: i64,
@@ -583,13 +834,24 @@ impl BenefitAllocation {
     /// `INACTIVE` whether or not anybody has looked at it: the change was owed at that
     /// instant, which is why a reporting operation may apply it. `FULFILLED` is terminal —
     /// the benefit was delivered, so there is nothing left to expire — and an allocation
-    /// already `INACTIVE` has nowhere to move.
+    /// already `INACTIVE` has nowhere to move. Each credit code the allocation has issued
+    /// expires on the same rule, against its own `ExpiresAt` (see
+    /// [`AllocatedCreditCode::expire_due`]).
     pub fn expire_due(&mut self, now_millis: i64) -> bool {
-        if self.status != ALLOCATION_STATUS_ACTIVE || !self.has_expired(now_millis) {
+        let mut changed = false;
+        if self.status == ALLOCATION_STATUS_ACTIVE && self.has_expired(now_millis) {
+            self.status = ALLOCATION_STATUS_INACTIVE.to_string();
+            self.status_reason = Some(ALLOCATION_EXPIRED_REASON.to_string());
+            changed = true;
+        }
+        if let Some(AllocationFulfillment::Credits { codes, .. }) = self.fulfillment.as_mut() {
+            for code in codes.iter_mut() {
+                changed |= code.expire_due(now_millis);
+            }
+        }
+        if !changed {
             return false;
         }
-        self.status = ALLOCATION_STATUS_INACTIVE.to_string();
-        self.status_reason = Some(ALLOCATION_EXPIRED_REASON.to_string());
         self.updated_at_millis = bump_millis(self.updated_at_millis, now_millis);
         true
     }
@@ -823,16 +1085,24 @@ impl Catalog {
             })
             .collect();
         // Each seeded allocation names the benefit it is based on, so a row whose benefit
-        // is not in the catalog seeds nothing rather than an allocation pointing at a
-        // benefit no read can resolve.
+        // is not in the catalog — or one naming a fulfillment type that benefit does not
+        // offer — seeds nothing rather than an allocation no read can make sense of.
         let allocations = SEEDED_ALLOCATIONS
             .iter()
             .filter_map(|seed| {
                 let benefit = benefits
                     .values()
                     .find(|benefit| benefit.name == seed.benefit_name)?;
+                if !benefit
+                    .fulfillment_types
+                    .iter()
+                    .any(|offered| offered == seed.fulfillment_type)
+                {
+                    return None;
+                }
                 let created_at_millis =
                     seeded_at_millis - seed.created_days_ago * MILLIS_PER_DAY;
+                let expires_at_millis = created_at_millis + seed.term_days * MILLIS_PER_DAY;
                 let id = allocation_id(catalog, seed.name);
                 let allocation = BenefitAllocation {
                     id: id.clone(),
@@ -846,13 +1116,22 @@ impl Catalog {
                     status: seed.status.to_string(),
                     status_reason: seed.status_reason.map(str::to_string),
                     fulfillment_types: benefit.fulfillment_types.clone(),
+                    fulfillment_type: seed.fulfillment_type.to_string(),
+                    fulfillment: AllocationFulfillment::new(
+                        seed.fulfillment_type,
+                        seed.allocated_amount_minor,
+                        seed.issued_amount_minor,
+                        &id,
+                        created_at_millis,
+                        expires_at_millis,
+                    ),
                     applicable_benefit_ids: applicable_benefit_ids(&benefits, benefit),
                     created_at_millis,
                     // Nothing has changed a seeded allocation since it was granted; an
                     // expiry that falls due is what moves this on.
                     updated_at_millis: created_at_millis,
                     starts_at_millis: created_at_millis,
-                    expires_at_millis: created_at_millis + seed.term_days * MILLIS_PER_DAY,
+                    expires_at_millis,
                 };
                 Some((id, allocation))
             })
@@ -869,17 +1148,35 @@ impl Catalog {
     /// `BenefitId` pattern allows (`^(arn:.+|ben-[0-9a-z]{14})$`): the bare id, or a
     /// benefit ARN of this catalog. `None` when this catalog holds no such benefit.
     pub fn resolve_benefit_id(&self, catalog: &str, identifier: &str) -> Option<String> {
-        let id = if identifier.starts_with("arn:") {
-            let (arn_catalog, arn_id) = parse_resource_arn(identifier, BENEFIT_RESOURCE)?;
-            if arn_catalog != catalog {
-                return None;
-            }
-            arn_id.to_string()
-        } else {
-            identifier.to_string()
-        };
+        let id = resolve_identifier(catalog, identifier, BENEFIT_RESOURCE)?;
         self.benefits.contains_key(&id).then_some(id)
     }
+
+    /// The id of the benefit allocation `identifier` names, accepting either form the
+    /// modelled `BenefitAllocationIdentifier` pattern allows
+    /// (`^(arn:.+|benalloc-[0-9a-z]{14})$`): the bare id, or an allocation ARN of this
+    /// catalog. `None` when this catalog holds no such allocation — which is also the
+    /// answer for an ARN of another catalog, another service or another resource type.
+    pub fn resolve_allocation_id(&self, catalog: &str, identifier: &str) -> Option<String> {
+        let id = resolve_identifier(catalog, identifier, ALLOCATION_RESOURCE)?;
+        self.allocations.contains_key(&id).then_some(id)
+    }
+}
+
+/// The resource id `identifier` names inside `catalog`, for a resource of `resource`'s
+/// type: `identifier` itself when it is a bare id, or the ARN's id segment when it is an
+/// ARN of that resource type IN that catalog.
+///
+/// One construction for every identifier member whose modelled pattern admits both forms
+/// (`^(arn:.+|<prefix>-[0-9a-z]{14})$`), so an ARN naming another catalog, another service
+/// or another resource type resolves to nothing rather than to the record that happens to
+/// share its id segment. Whether a record of that id EXISTS is the caller's own check.
+fn resolve_identifier(catalog: &str, identifier: &str, resource: &str) -> Option<String> {
+    if !identifier.starts_with("arn:") {
+        return Some(identifier.to_string());
+    }
+    let (arn_catalog, arn_id) = parse_resource_arn(identifier, resource)?;
+    (arn_catalog == catalog).then(|| arn_id.to_string())
 }
 
 /// The `ben-...` ids of the benefits an allocation based on `base` can be applied to: the
@@ -1012,6 +1309,17 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
         self.catalogs.get(catalog)?.applications.get(&id)
     }
 
+    /// The allocation `identifier` names inside `catalog`, for a reporting operation.
+    ///
+    /// Resolved as [`Catalog::resolve_allocation_id`] does, so both forms the modelled
+    /// `BenefitAllocationIdentifier` admits name the same record. `None` when the catalog
+    /// does not exist or holds no such allocation.
+    pub fn allocation(&self, catalog: &str, identifier: &str) -> Option<&BenefitAllocation> {
+        let stored = self.catalogs.get(catalog)?;
+        let id = stored.resolve_allocation_id(catalog, identifier)?;
+        stored.allocations.get(&id)
+    }
+
     /// The application `identifier` names, for an operation the spec says mutates it.
     ///
     /// `id`, `arn` and `catalog` are this record's identity — the store is keyed on the
@@ -1063,7 +1371,10 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     ///
     /// The allocation runs for [`ALLOCATION_TERM_MILLIS`] from `now_millis`, and its
     /// description, fulfillment types and applicable benefits are the benefit's own rather
-    /// than values the caller supplies.
+    /// than values the caller supplies. It is fulfilled with the FIRST type its benefit
+    /// offers — a benefit offering two is fulfilled with one of them and nothing here names
+    /// which — for [`GRANTED_ALLOCATION_AMOUNT_MINOR`], of which nothing has been issued
+    /// yet.
     pub fn grant_allocation(
         &mut self,
         catalog: &str,
@@ -1087,6 +1398,8 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
         let benefit = stored.benefits.get(&benefit_id)?.clone();
         let applicable_benefit_ids = applicable_benefit_ids(&stored.benefits, &benefit);
         let id = self.mint_allocation_id(now_millis);
+        let fulfillment_type = benefit.fulfillment_types.first().cloned();
+        let expires_at_millis = now_millis.saturating_add(ALLOCATION_TERM_MILLIS);
         let allocation = BenefitAllocation {
             id: id.clone(),
             catalog: catalog.to_string(),
@@ -1097,11 +1410,22 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
             status: ALLOCATION_STATUS_ACTIVE.to_string(),
             status_reason: None,
             fulfillment_types: benefit.fulfillment_types.clone(),
+            fulfillment: fulfillment_type.as_deref().and_then(|fulfillment_type| {
+                AllocationFulfillment::new(
+                    fulfillment_type,
+                    GRANTED_ALLOCATION_AMOUNT_MINOR,
+                    0,
+                    &id,
+                    now_millis,
+                    expires_at_millis,
+                )
+            }),
+            fulfillment_type: fulfillment_type.unwrap_or_default(),
             applicable_benefit_ids,
             created_at_millis: now_millis,
             updated_at_millis: now_millis,
             starts_at_millis: now_millis,
-            expires_at_millis: now_millis.saturating_add(ALLOCATION_TERM_MILLIS),
+            expires_at_millis,
         };
         self.catalogs
             .get_mut(catalog)?
@@ -1437,6 +1761,25 @@ fn allocation_id(catalog: &str, name: &str) -> String {
     format!("{ALLOCATION_ID_PREFIX}{}", id_body(seed))
 }
 
+/// The `IssuanceDetail$IssuanceId` of the issuance made against the allocation `id`.
+///
+/// The member is an unconstrained `String` and AWS publishes no format for it, so the id is
+/// DERIVED from the allocation's own id: stable across reads, and distinct per allocation
+/// because the allocation ids are.
+fn issuance_id(id: &str) -> String {
+    format!("issuance-{}", id_body(fnv1a64(id.as_bytes())))
+}
+
+/// The `CreditCode$AwsCreditCode` of code `index` of the allocation `id`.
+///
+/// The member is an unconstrained `String` and AWS publishes no format for a promotional
+/// credit code, so the code is DERIVED from the allocation's id and the code's index within
+/// it: [`ID_BODY_LEN`] upper-case characters, stable across reads and distinct per code.
+fn credit_code_text(id: &str, index: usize) -> String {
+    let seed = fnv1a64(format!("{id}/{index}").as_bytes());
+    id_body(seed).to_ascii_uppercase()
+}
+
 /// [`ID_BODY_LEN`] characters drawn from [`ID_ALPHABET`] by mixing `seed`.
 fn id_body(seed: u64) -> String {
     let mut state = seed;
@@ -1608,7 +1951,8 @@ pub fn parse_resource_arn<'a>(arn: &'a str, resource: &str) -> Option<(&'a str, 
 ///
 /// One construction for every lookup this service does, so a client reading the message
 /// learns WHICH resource was missing from the one place the sentence is written.
-/// `resource` is [`CATALOG_KIND`], [`BENEFIT_KIND`] or [`APPLICATION_KIND`].
+/// `resource` is [`CATALOG_KIND`], [`BENEFIT_KIND`], [`APPLICATION_KIND`] or
+/// [`ALLOCATION_KIND`].
 pub fn not_found_message(resource: &str, identifier: &str) -> String {
     format!("{resource} `{identifier}` not found")
 }
