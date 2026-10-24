@@ -312,6 +312,22 @@ pub const COMPLIANCE_SUMMARY_RULE_CAP: i32 = 25;
 /// counts resources, so it is reported up to this cap.
 pub const COMPLIANCE_RESOURCE_CAP: i32 = 100;
 
+/// `ConfigRuleComplianceSummaryGroupKey` values
+/// (`com.amazonaws.configservice#ConfigRuleComplianceSummaryGroupKey`), which are what
+/// an aggregate compliance summary names its groups by, and so what
+/// `AggregateComplianceCount$GroupName` carries ("The 12-digit account ID or region
+/// based on the GroupByKey value").
+pub const COMPLIANCE_SUMMARY_GROUP_BY_ACCOUNT_ID: &str = "ACCOUNT_ID";
+/// See [`COMPLIANCE_SUMMARY_GROUP_BY_ACCOUNT_ID`].
+pub const COMPLIANCE_SUMMARY_GROUP_BY_AWS_REGION: &str = "AWS_REGION";
+
+/// The largest `Limit` a grouped aggregate read may ask for, and the page size it
+/// serves a request that asks for none (`GroupByAPILimit`, `@range(min: 0, max: 1000)`;
+/// `GetAggregateConfigRuleComplianceSummaryRequest$Limit`: "The maximum number of
+/// evaluation results returned on each page. The default is 1000. You cannot specify a
+/// number greater than 1000. If you specify 0, Config uses the default").
+pub const GROUP_BY_API_MAX_LIMIT: usize = 1000;
+
 /// `Owner` value for a Custom Policy rule (`com.amazonaws.configservice#Owner`).
 pub const OWNER_CUSTOM_POLICY: &str = "CUSTOM_POLICY";
 
