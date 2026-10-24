@@ -208,19 +208,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         for name in &names {
-            match crate::state::check_instance_name(name) {
+            match crate::state::check_on_premises_instance_name(name) {
                 Ok(()) => {}
                 Err(crate::state::NameRefusal::Missing) => {
                     return Err(name_required());
                 }
-                Err(crate::state::NameRefusal::Malformed) => {
+                Err(refusal) => {
                     return Err(
                         AddTagsToOnPremisesInstancesErrorModeled::InvalidInstanceNameException(
                             InvalidInstanceNameException {
-                                message: Some(format!(
-                                    "The on-premises instance name {name} was specified in an \
-                                     invalid format"
-                                )),
+                                message: Some(
+                                    crate::state::invalid_instance_name_message(refusal)
+                                        .to_string(),
+                                ),
                             },
                         )
                         .into(),
@@ -287,9 +287,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         AddTagsToOnPremisesInstancesErrorModeled::InstanceNotRegisteredException(
                             InstanceNotRegisteredException {
-                                message: Some(format!(
-                                    "No on-premises instance found for name: {name}"
-                                )),
+                                message: Some(crate::state::host_not_registered(name)),
                             },
                         ),
                     );

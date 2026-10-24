@@ -32,11 +32,28 @@ fn session_arn(role: &str, session: &str) -> String {
     format!("arn:aws:sts::{}:assumed-role/{role}/{session}", account())
 }
 
-/// The `instanceArn` the emulator reports for `name`:
-/// `arn:aws:codedeploy:<region>:<account>:instance/<name>`. The harness signs
-/// nothing, so the region is the emulator's default.
-fn expected_instance_arn(name: &str) -> String {
-    format!("arn:aws:codedeploy:us-east-1:{}:instance/{name}", account())
+/// The prefix of the `instanceArn` the emulator mints for `name`:
+/// `arn:aws:codedeploy:<region>:<account>:instance/<name>_`. What follows it is
+/// the id of the REGISTRATION the ARN names, which the service mints per
+/// registration. The harness signs nothing, so the region is the emulator's
+/// default.
+fn instance_arn_prefix(name: &str) -> String {
+    format!("arn:aws:codedeploy:us-east-1:{}:instance/{name}_", account())
+}
+
+/// The registration id carried by the `instanceArn` of `info`, asserting the ARN
+/// is this service's, names `name`, and carries a registration id after it.
+fn registration_id_of(case: &str, name: &str, info: &Value) -> String {
+    let arn = info["instanceArn"].as_str().unwrap_or_default();
+    let prefix = instance_arn_prefix(name);
+    let id = arn.strip_prefix(prefix.as_str()).unwrap_or_else(|| {
+        panic!("case {case:?}: expected an instanceArn starting {prefix:?}, got {info:?}")
+    });
+    assert!(
+        !id.is_empty(),
+        "case {case:?}: expected a registration id after {prefix:?}, got {info:?}"
+    );
+    id.to_string()
 }
 
 /// Read `name` back, requiring the read to succeed.
@@ -99,11 +116,7 @@ async fn a_registration_reads_back_as_it_was_made() {
             info[other].is_null(),
             "case {name:?}: expected no {other}, got {info:?}"
         );
-        assert_eq!(
-            info["instanceArn"].as_str(),
-            Some(expected_instance_arn(name).as_str()),
-            "case {name:?}: expected the instance ARN, got {info:?}"
-        );
+        let _registration = registration_id_of(name, name, &info);
         assert!(
             info["registerTime"].as_f64().unwrap_or_default() > 0.0,
             "case {name:?}: expected a registerTime, got {info:?}"
@@ -420,7 +433,7 @@ async fn the_registry_is_bounded() {
 
 /// RULE: a registration is recorded per name, so instances registered in one
 /// store do not borrow each other's identity — each reads back its own IAM ARN
-/// and its own ARN.
+/// and its own ARN, whose registration id is its own.
 #[tokio::test]
 async fn registrations_are_independent_records() {
     let emulator = Emulator::new();
@@ -435,6 +448,7 @@ async fn registrations_are_independent_records() {
             .await;
     }
 
+    let mut registrations: Vec<String> = Vec::new();
     for name in names {
         let info = get_instance(&emulator, name).await;
         assert_eq!(
@@ -442,12 +456,15 @@ async fn registrations_are_independent_records() {
             Some(user_arn(name).as_str()),
             "case {name:?}: expected its own iamUserArn, got {info:?}"
         );
-        assert_eq!(
-            info["instanceArn"].as_str(),
-            Some(expected_instance_arn(name).as_str()),
-            "case {name:?}: expected its own instanceArn, got {info:?}"
-        );
+        registrations.push(registration_id_of(name, name, &info));
     }
+    // The ARN names a registration, so no two of them carry the same id.
+    let unique: std::collections::BTreeSet<&String> = registrations.iter().collect();
+    assert_eq!(
+        unique.len(),
+        registrations.len(),
+        "expected one registration id per registration, got {registrations:?}"
+    );
 
     // A name nobody registered is not registered, however many are.
     let (status, body) = emulator

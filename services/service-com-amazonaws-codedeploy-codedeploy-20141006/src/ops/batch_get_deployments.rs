@@ -61,19 +61,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// How many deployment ids one `BatchGetDeployments` request may carry.
-///
-/// The model documents the bound on the member itself:
-/// `smithy_query(query="doc",shape="BatchGetDeploymentsInput",member="deploymentIds")`
-/// reads "A list of deployment IDs, separated by spaces. The maximum number of
-/// deployment IDs you can specify is 25.", so this is CodeDeploy's own published
-/// limit for THIS operation rather than a chosen one. Exceeding it is what
-/// `BatchLimitExceededException` states; the "(100)" in that shape's own doc is
-/// the generic ceiling of a shape several batch operations share, and a batch
-/// that exceeds 100 exceeds this bound too. It lives here, beside the one
-/// operation that enforces it, so no other operation can drift from it.
-const MAX_BATCH_DEPLOYMENT_IDS: usize = 25;
-
 /// Whether `value` has the form of a CodeDeploy deployment id: delegated to
 /// `crate::state::deployment_id_is_well_formed`, the crate's one gate for that
 /// format, so this reader and the single-id readers
@@ -155,15 +142,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The batch bound is a property of the REQUEST as a whole, so it is
         // answered before any id in it is examined: a caller that sent too many
         // ids learns that, rather than learning that one of them is malformed.
-        if deployment_ids.len() > MAX_BATCH_DEPLOYMENT_IDS {
+        // The quota is the one `BatchLimitExceededException` states for every
+        // batch reader of this service (`crate::state::MAX_BATCH_SIZE`), so this
+        // reader and the on-premises one accept the same batch sizes.
+        if deployment_ids.len() > crate::state::MAX_BATCH_SIZE {
             return Err(BatchGetDeploymentsErrorModeled::BatchLimitExceededException(
                 BatchLimitExceededException {
-                    message: Some(format!(
-                        "The maximum number of deployment IDs allowed for this request ({}) was \
-                         exceeded: {} were specified",
-                        MAX_BATCH_DEPLOYMENT_IDS,
-                        deployment_ids.len()
-                    )),
+                    message: Some(crate::state::batch_limit_exceeded_message()),
                 },
             )
             .into());
