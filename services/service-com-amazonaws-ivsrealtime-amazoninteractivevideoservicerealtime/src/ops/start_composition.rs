@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartComposition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartComposition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartComposition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +87,29 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The resource a composition quota refusal names, as
+/// `crate::state::quota_exceeded_message` states it.
+const COMPOSITION_QUOTA_RESOURCE: &str = "composition";
+
+/// The two members of `DestinationConfiguration` that say WHERE a destination publishes,
+/// exactly one of which describes one destination.
+///
+/// `destinations` is a list of destination configurations, each of which is one place the
+/// stage is composited to (`@length(1..2)`, `@uniqueItems`); a configuration naming
+/// neither names no place at all, and one naming both describes two. The model cannot say
+/// "exactly one of these", so it is refused here, in the construction
+/// `crate::state::mutually_exclusive_members_message` words every such refusal of this
+/// service with.
+const DESTINATION_TARGET_MEMBERS: [&str; 2] = ["channel", "s3"];
+
+/// The two members of `LayoutConfiguration`, exactly one of which configures the one
+/// layout a composition runs with.
+///
+/// `LayoutConfiguration$grid` documents the fallback ("Default: Grid layout"), so a
+/// request that configures neither gets a grid; a request that configures both asks for
+/// two layouts at once, which is refused the same way a destination naming two places is.
+const LAYOUT_MEMBERS: [&str; 2] = ["grid", "pip"];
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -170,18 +184,243 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartComposition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartCompositionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartComposition"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(
+                StartCompositionErrorModeled::InternalServerException,
+            )
+        })?;
+
+        // A composition runs ONE layout. Refused before anything is minted or persisted,
+        // so a refused request starts no composition.
+        if let Some(layout) = input.layout.as_ref() {
+            let supplied: Vec<&str> = LAYOUT_MEMBERS
+                .iter()
+                .zip([layout.grid.is_some(), layout.pip.is_some()])
+                .filter_map(|(member, given)| given.then_some(*member))
+                .collect();
+            if supplied.len() > 1 {
+                return Err(crate::state::validation_failed(
+                    StartCompositionErrorModeled::ValidationException,
+                    crate::state::mutually_exclusive_members_message(
+                        &format!("{}.layout", Self::NAME),
+                        &supplied,
+                        &LAYOUT_MEMBERS,
+                    ),
+                ));
+            }
+        }
+
+        // Each destination publishes to exactly one place. The path names the list
+        // position the way this service's other list refusals do.
+        for (index, destination) in input.destinations.iter().enumerate() {
+            let supplied: Vec<&str> = DESTINATION_TARGET_MEMBERS
+                .iter()
+                .zip([destination.channel.is_some(), destination.s3.is_some()])
+                .filter_map(|(member, given)| given.then_some(*member))
+                .collect();
+            if supplied.len() == 1 {
+                continue;
+            }
+            return Err(crate::state::validation_failed(
+                StartCompositionErrorModeled::ValidationException,
+                crate::state::exactly_one_member_message(
+                    &format!("{}.destinations.{}.member", Self::NAME, index + 1),
+                    &supplied,
+                    &DESTINATION_TARGET_MEMBERS,
+                ),
+            ));
+        }
+
+        // A tag key in the reserved `aws:` namespace is AWS's own to write (see
+        // [`crate::state::RESERVED_TAG_KEY_PREFIX`]): the same rule, enforced the same
+        // way, as the one every other create of this service applies, so a start cannot
+        // persist a key a later `TagResource` would refuse.
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tag_keys_unreserved(
+            Self::NAME,
+            "tags",
+            tags.keys().map(String::as_str),
+        )
+        .map_err(|message| {
+            crate::state::validation_failed(
+                StartCompositionErrorModeled::ValidationException,
+                message,
+            )
+        })?;
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // The layout the composition will run with: what the request asked for, with the
+        // model's documented default for every member it left out, applied in the one
+        // place this service applies them (`crate::state::effective_layout`).
+        let layout = crate::state::effective_layout(input.layout);
+        // What this request asks for, as one comparable value, so a token offered again
+        // is only treated as a retry when the request really is the same one.
+        let fingerprint = crate::state::composition_fingerprint(
+            &input.stage_arn,
+            &layout,
+            &input.destinations,
+            &tags,
+        );
+
+        let mut store = state.lock();
+
+        // `idempotencyToken` carries the `@idempotencyToken` trait, so a retry of one
+        // start request must not start a second composition: the composition the first
+        // call created is answered again, with whatever state the clock has since owed
+        // it. A token offered again for a DIFFERENT request names two things at once,
+        // which is the inconsistent state this operation's `ConflictException` (HTTP 409)
+        // covers. Both are decided before anything is minted, so neither grows the store.
+        if let Some(token) = input.idempotency_token.as_deref() {
+            let started = store
+                .composition_by_idempotency_token(token)
+                .map(|composition| (composition.arn.clone(), composition.request_fingerprint.clone()));
+            if let Some((arn, started_fingerprint)) = started {
+                if started_fingerprint != fingerprint {
+                    return Err(crate::state::conflict(
+                        StartCompositionErrorModeled::ConflictException,
+                        crate::state::idempotency_token_reused_message(Self::NAME, token),
+                    ));
+                }
+                store.materialize_due_compositions(now);
+                // The ARN was found under this same lock, so the record is there; a miss
+                // is answered as the modelled server fault rather than as an empty 200,
+                // which a client could not tell from a real composition.
+                let composition = store
+                    .compositions
+                    .get(&arn)
+                    .map(crate::state::CompositionRecord::to_composition)
+                    .ok_or_else(|| {
+                        crate::state::store_unavailable(
+                            StartCompositionErrorModeled::InternalServerException,
+                        )
+                    })?;
+                return Ok(StartCompositionOutput {
+                    composition: Some(composition),
+                });
+            }
+        }
+
+        // The stage being composited has to exist: a composition is "a Composition from
+        // a stage", so there is nothing to composite otherwise.
+        if !store.stages.contains_key(&input.stage_arn) {
+            return Err(crate::state::resource_not_found(
+                StartCompositionErrorModeled::ResourceNotFoundException,
+                &input.stage_arn,
+            ));
+        }
+
+        // So does every resource a destination REFERS to and this endpoint owns: an
+        // encoder configuration (either kind of destination) and a storage configuration
+        // (an S3 destination). `channelArn` is deliberately not checked — it names a
+        // low-latency channel of the sibling `ivs` endpoint, which this store does not
+        // hold (see `crate::service`'s `OWN_RESOURCE_TYPES`).
+        for destination in &input.destinations {
+            if let Some(channel) = destination.channel.as_ref() {
+                if let Some(arn) = channel.encoder_configuration_arn.as_deref() {
+                    if !store.encoder_configurations.contains_key(arn) {
+                        return Err(crate::state::resource_not_found(
+                            StartCompositionErrorModeled::ResourceNotFoundException,
+                            arn,
+                        ));
+                    }
+                }
+            }
+            if let Some(s3) = destination.s3.as_ref() {
+                if !store
+                    .storage_configurations
+                    .contains_key(&s3.storage_configuration_arn)
+                {
+                    return Err(crate::state::resource_not_found(
+                        StartCompositionErrorModeled::ResourceNotFoundException,
+                        &s3.storage_configuration_arn,
+                    ));
+                }
+                for arn in &s3.encoder_configuration_arns {
+                    if !store.encoder_configurations.contains_key(arn) {
+                        return Err(crate::state::resource_not_found(
+                            StartCompositionErrorModeled::ResourceNotFoundException,
+                            arn,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // The store grows only here, and a record is reclaimed only by an explicit stop
+        // or by the stage going away, so the bound is checked before anything is minted
+        // or persisted.
+        if store.compositions.len() >= crate::state::MAX_COMPOSITIONS {
+            return Err(crate::state::quota_exceeded(
+                StartCompositionErrorModeled::ServiceQuotaExceededException,
+                COMPOSITION_QUOTA_RESOURCE,
+                crate::state::MAX_COMPOSITIONS,
+            ));
+        }
+
+        // A fresh id per start, re-minted on the (vanishingly unlikely) chance the digest
+        // already names a live composition, so one ARN never denotes two of them — the
+        // uniqueness rule every other mint of this service applies.
+        let sequence = store.next_sequence();
+        let mut composition_id = crate::state::mint_id(sequence, crate::state::COMPOSITION_ID_LEN);
+        let mut arn = crate::state::composition_arn(&region, &composition_id);
+        while store.compositions.contains_key(&arn) {
+            let retry = store.next_sequence();
+            composition_id = crate::state::mint_id(retry, crate::state::COMPOSITION_ID_LEN);
+            arn = crate::state::composition_arn(&region, &composition_id);
+        }
+
+        let destinations: Vec<crate::state::DestinationRecord> = input
+            .destinations
+            .into_iter()
+            .map(|configuration| {
+                let id = crate::state::mint_id(
+                    store.next_sequence(),
+                    crate::state::DESTINATION_ID_LEN,
+                );
+                // Only an S3 destination records anything, so only it has a prefix to
+                // report; a channel destination broadcasts and stores nothing.
+                let detail = configuration.s3.as_ref().map(|_| DestinationDetail {
+                    s3: Some(S3Detail {
+                        recording_prefix: crate::state::recording_prefix(&composition_id, &id),
+                    }),
+                });
+                crate::state::DestinationRecord {
+                    id,
+                    state: crate::state::DESTINATION_STATE_STARTING.to_string(),
+                    started_at: now,
+                    ended_at: None,
+                    configuration,
+                    detail,
+                }
+            })
+            .collect();
+
+        let record = crate::state::CompositionRecord {
+            arn: arn.clone(),
+            composition_id,
+            stage_arn: input.stage_arn,
+            // "A Composition is an ephemeral resource that exists after this operation
+            // returns successfully": it exists, and it is not running yet — the clock
+            // owes it `ACTIVE` at `active_at`.
+            state: crate::state::COMPOSITION_STATE_STARTING.to_string(),
+            layout,
+            destinations,
+            tags,
+            idempotency_token: input.idempotency_token,
+            request_fingerprint: fingerprint,
+            started_at: now,
+            ended_at: None,
+            active_at: now + crate::state::COMPOSITION_ACTIVATION_SPAN,
+            sequence,
+        };
+
+        let composition = record.to_composition();
+        store.compositions.insert(arn, record);
+
+        Ok(StartCompositionOutput {
+            composition: Some(composition),
+        })
     }
 }

@@ -169,6 +169,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for replicas in store.participant_replicas.values_mut() {
             replicas.retain(|replica| replica.destination_stage_arn != input.arn);
         }
+        // So does every composition of this stage: a composition composites one stage,
+        // and this operation shuts the stage down "disconnecting all participants", which
+        // is one of the conditions the model's own `StartComposition` doc ends a
+        // composition on ("Composition stops and the resource is deleted … when all
+        // participants are disconnected from the stage"). A composition cannot outlive
+        // the only stage it has to composite.
+        store
+            .compositions
+            .retain(|_, composition| composition.stage_arn != input.arn);
         Ok(DeleteStageOutput {})
     }
 }
