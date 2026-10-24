@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServiceLevelObjectiveExclusionWindows
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServiceLevelObjectiveExclusionWindows`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServiceLevelObjectiveExclusionWindows::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the persisted exclusion-window set of the service level objective an `Id` names.
 //!
 //! ## Shape of an operation
 //!
@@ -143,23 +135,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_SERVICE_LEVEL_OBJECTIVE_EXCLUSION_WINDOWS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report one page of the exclusion windows configured on the SLO the `Id` names, in the
+    /// order they were added.
+    ///
+    /// A read (`@readonly`): it projects what the store holds for that SLO and persists
+    /// nothing. An `Id` that names no stored SLO is refused with the modelled
+    /// `ResourceNotFoundException` — an SLO holding no windows and an SLO that does not exist
+    /// are different answers — and either id form the modelled `ServiceLevelObjectiveId`
+    /// admits resolves to the same record, as every other operation taking an `Id` resolves
+    /// it.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServiceLevelObjectiveExclusionWindows` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServiceLevelObjectiveExclusionWindowsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServiceLevelObjectiveExclusionWindows"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListServiceLevelObjectiveExclusionWindowsErrorModeled::ThrottlingException(
+                    ThrottlingException {
+                        message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let region = crate::state::region_of(ctx.parts());
+        let windows = {
+            let store = state.lock();
+            if store.resolve(&input.id).is_none() {
+                return Err(
+                    ListServiceLevelObjectiveExclusionWindowsErrorModeled::ResourceNotFoundException(
+                        crate::state::slo_not_found(&region, &input.id),
+                    )
+                    .into(),
+                );
+            }
+            store.exclusion_windows_of(&input.id).to_vec()
+        };
+
+        // `MaxResults` declares no `@default`, so an omitted bound takes this service's own
+        // default page (`crate::state::DEFAULT_EXCLUSION_WINDOW_PAGE`); its modelled
+        // `range 1..10` is refused before this handler runs, so a stated bound is read
+        // straight off the input.
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::DEFAULT_EXCLUSION_WINDOW_PAGE)
+            .max(0) as usize;
+        let (exclusion_windows, next_token) = crate::state::page_of(
+            windows,
+            crate::state::EXCLUSION_WINDOWS_TOKEN_TAG,
+            input.next_token.as_deref(),
+            page_size,
+        )
+        .map_err(refused)?;
+
+        Ok(ListServiceLevelObjectiveExclusionWindowsOutput {
+            exclusion_windows,
+            next_token,
+        })
     }
+}
+
+/// This operation's modelled refusal of a request it will not serve: `ValidationException`
+/// (HTTP 400), which is what a `NextToken` this service did not issue earns.
+fn refused(message: String) -> ListServiceLevelObjectiveExclusionWindowsError {
+    ListServiceLevelObjectiveExclusionWindowsErrorModeled::ValidationException(
+        ValidationException {
+            message: Some(message),
+        },
+    )
+    .into()
 }
