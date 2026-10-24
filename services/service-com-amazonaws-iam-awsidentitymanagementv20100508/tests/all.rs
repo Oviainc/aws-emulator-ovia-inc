@@ -23,6 +23,8 @@ mod instance_profile_role_removal;
 mod instance_profile_roles;
 #[path = "all/instance_profiles.rs"]
 mod instance_profiles;
+#[path = "all/login_profiles.rs"]
+mod login_profiles;
 #[path = "all/managed_policies.rs"]
 mod managed_policies;
 #[path = "all/role_attached_policies.rs"]

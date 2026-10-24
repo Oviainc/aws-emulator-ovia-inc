@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLoginProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLoginProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLoginProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +163,167 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLoginProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLoginProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateLoginProfileErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // A mutation: the operation "creates a password for the specified IAM user",
+        // so the lock is held for write across the existence checks and the insert.
+        let mut store = state.lock();
+
+        // The access key id the request was signed with: the caller's identity when
+        // the request names no user, and the acting principal every audit record
+        // below is attributed to.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // With no `UserName` the password is created for whoever signed the request,
+        // resolved from that access key id exactly as `GetUser` and
+        // `CreateAccessKey` resolve it. A caller whose credentials belong to no IAM
+        // user is refused rather than having an identity invented for it: IAM itself
+        // serves the nameless form from an AssumeRoot session, which this emulator
+        // has no principal for, so that path is declined rather than guessed at.
+        let user_key = match &input.user_name {
+            Some(user_name) => crate::state::name_key(user_name),
+            None => match store.access_keys.get(&caller_akid) {
+                Some(record) => record.user_key.clone(),
+                None => {
+                    ::tracing::info!(
+                        audit = true,
+                        operation = "CreateLoginProfile",
+                        outcome = "refused_no_caller_identity",
+                        caller_akid = %caller_akid,
+                        "no login profile was created"
+                    );
+                    // Neither modelled client error fits: the request named no
+                    // entity to be missing and no quota was reached, so the refusal
+                    // goes through the crate's generic client-input channel (HTTP
+                    // 400, code `ValidationException`), exactly as `GetUser` refuses
+                    // the same request.
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Must specify userName when calling with non-User credentials",
+                    ));
+                }
+            },
+        };
+
+        // "The user must already exist" (`CreateLoginProfile$UserName`): a password
+        // belongs to an IAM user the account holds, so a create naming an absent
+        // entity is not found and persists nothing.
+        if !store.users.contains_key(&user_key) {
+            ::tracing::info!(
+                audit = true,
+                operation = "CreateLoginProfile",
+                outcome = "refused_no_such_user",
+                caller_akid = %caller_akid,
+                "no login profile was created"
+            );
+            return Err(CreateLoginProfileErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name.as_deref().unwrap_or(&user_key)
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A user has at most one login profile, so a second create attempts "to
+        // create a resource that already exists" and is refused, leaving the
+        // password the user already has in place: replacing it is
+        // `UpdateLoginProfile`'s job, not this operation's.
+        if store.login_profiles.contains_key(&user_key) {
+            ::tracing::info!(
+                audit = true,
+                operation = "CreateLoginProfile",
+                outcome = "refused_already_exists",
+                caller_akid = %caller_akid,
+                "no login profile was created"
+            );
+            return Err(CreateLoginProfileErrorModeled::EntityAlreadyExistsException(
+                EntityAlreadyExistsException {
+                    message: Some(format!(
+                        "Login Profile for user {} already exists.",
+                        input.user_name.as_deref().unwrap_or(&user_key)
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `Password` "must be omitted when you make the request with an AssumeRoot
+        // session. It is required in all other cases" — so for every principal this
+        // emulator can serve it is required, and a request carrying none creates no
+        // password at all. The model cannot mark the member required (the AssumeRoot
+        // form exists), so this is the handler's check, refused through the generic
+        // client-input channel because no modelled error covers a missing member.
+        let Some(password) = input.password else {
+            ::tracing::info!(
+                audit = true,
+                operation = "CreateLoginProfile",
+                outcome = "refused_password_missing",
+                caller_akid = %caller_akid,
+                "no login profile was created"
+            );
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Password must be specified unless the request is made with an AssumeRoot session",
+            ));
+        };
+        // The password is accepted and then DROPPED here, the one place the value is
+        // consumed: no shape reports it back (`LoginProfile` carries only the user
+        // name, the create date and the reset flag), the model marks it sensitive,
+        // and this emulator serves no console sign-in, so keeping it would be
+        // holding a secret nothing may ever hand out. It is never stored, logged or
+        // echoed.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLoginProfile"))
+        // `PasswordPolicyViolationException` is DECLINED for the reason it cannot
+        // arise: it refuses a password that "did not meet the requirements imposed
+        // by the account password policy", and no account password policy can exist
+        // while `UpdateAccountPasswordPolicy` is unimplemented; `passwordType`'s own
+        // length and alphabet constraints are enforced before this handler runs.
+        // `LimitExceededException` is declined too: a login profile is bounded by
+        // its user (at most one each), so the account's user quota — enforced by
+        // `CreateUser` — is the only limit there is.
+        drop(password);
+
+        store.login_profiles.insert(
+            user_key.clone(),
+            crate::state::LoginProfileRecord {
+                create_date: crate::state::now(),
+                // "Specifies whether the user is required to set a new password on
+                // next sign-in" — the modelled member defaults to false, so a
+                // request that omits it creates a profile that does not demand one.
+                password_reset_required: input.password_reset_required,
+            },
+        );
+
+        // Audit record for a state-changing, credential-creating operation: who
+        // asked, which user got a password, how it ended. Only wire metadata and the
+        // entity key — NEVER the password, which no log may carry.
+        ::tracing::info!(
+            audit = true,
+            operation = "CreateLoginProfile",
+            outcome = "created",
+            caller_akid = %caller_akid,
+            user_key = %user_key,
+            "login profile created"
+        );
+
+        // The response is read back out of the state just written, so the user name
+        // it reports is the one the account holds (not the case the request spelled)
+        // and the create date is the persisted one every later read answers with.
+        let Some(login_profile) = store.login_profile_report(&user_key) else {
+            return Err(CreateLoginProfileErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the new login profile could not be read back".to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(CreateLoginProfileOutput { login_profile })
     }
 }

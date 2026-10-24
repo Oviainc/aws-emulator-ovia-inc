@@ -218,6 +218,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // So is the user's console password: this operation's own documentation
+        // lists "Password (DeleteLoginProfile)" among the items to remove before
+        // deleting a user, so a user that still has a login profile is refused
+        // rather than having its password removed behind the caller's back.
+        // `CreateLoginProfile` is what fills that map.
+        if store.login_profiles.contains_key(&key) {
+            return Err(DeleteUserErrorModeled::DeleteConflictException(
+                DeleteConflictException {
+                    message: Some(
+                        "Cannot delete entity, must delete login profile first.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
 
         store.users.remove(&key);
         // The user held no policies, so this only drops an empty leftover entry.
