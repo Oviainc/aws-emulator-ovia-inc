@@ -5,7 +5,8 @@
 //! [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::workloads`],
 //! so `GetWorkload`, `ListWorkloads`, `UpdateWorkload` and `DeleteWorkload` all see it.
 //! A `ReviewTemplateArns` entry is resolved against the stored review templates, and the
-//! lenses (and notes) of an applied template carry over to the new workload.
+//! lenses (and notes) of an applied template carry over to the new workload. Every lens
+//! the request names is resolved against the service's lens catalog first.
 //!
 //! ## Shape of an operation
 //!
@@ -265,6 +266,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateWorkloadErrorModeled::ValidationException(exception).into());
         }
 
+        // How many lenses one workload may attach is a QUOTA this emulator sets, not a
+        // modelled constraint: `WorkloadLenses` publishes no `@length`, so the boundary
+        // validator does not bound the list, and the number this emulator holds to is the
+        // one the service publishes for a workload lens list elsewhere ("Up to 10 lenses
+        // can be specified", the `LensAliases` doc). It is answered with the modelled
+        // `ServiceQuotaExceededException` — "The user has reached their resource quota" —
+        // rather than a `ValidationException`, so a caller is not told the model refused a
+        // list the model allows. It is what keeps a STORED workload's lens list, the lens
+        // resolution below and the per-lens work of every read of its lens reviews bounded
+        // by something other than the request body size.
+        if input.lenses.len() > crate::state::MAX_LENSES_PER_WORKLOAD {
+            return Err(CreateWorkloadErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The quota of {} lenses per workload has been reached",
+                        crate::state::MAX_LENSES_PER_WORKLOAD
+                    ),
+                    resource_id: None,
+                    resource_type: Some(crate::state::WORKLOAD_RESOURCE_TYPE.to_string()),
+                    // `QuotaCode` and `ServiceCode` are modelled `@required`. The service
+                    // code is this service's own (`OPERATIONS.md`: signing name
+                    // `wellarchitected`); the model publishes no numeric Service Quotas
+                    // code for the lens quota, so the quota is named by what it meters.
+                    quota_code: "LensesPerWorkload".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                },
+            )
+            .into());
+        }
+
         // A profile named here has to exist to be associated, and no profile can be
         // created in this emulator yet (`CreateProfile` is still a stub), so no profile
         // ARN a caller passes resolves. A review template ARN is resolved against the
@@ -341,6 +372,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     workload_arn: Some(existing.workload_arn.clone()),
                 });
             }
+        }
+
+        // "The list of lenses associated with the workload. Each lens is identified by its
+        // `LensSummary$LensAlias`" (`WorkloadLenses` doc): a lens is attached BY NAME, so
+        // every name has to resolve to a lens — one AWS publishes, or a custom lens this
+        // account holds and has published a version of ("The lens cannot be applied to
+        // workloads … until it's published with CreateLensVersion", `ImportLens` doc).
+        // Resolved before the workload is minted, so the store never holds a workload with
+        // a lens review no lens backs. The lenses an applied review template contributes
+        // below were resolved the same way when the template was created.
+        //
+        // It runs after the idempotency replay above, so a genuine retry is still answered
+        // with the original request's result, and over a list the lens quota above has
+        // already bounded, so the work it costs is bounded too.
+        let now = std::time::SystemTime::now();
+        match store.unapplicable_lenses_refusal(&input.lenses, now) {
+            Some(crate::state::LensesRefusal::NotFound(exception)) => {
+                return Err(
+                    CreateWorkloadErrorModeled::ResourceNotFoundException(exception).into(),
+                );
+            }
+            Some(crate::state::LensesRefusal::Unapplicable(exception)) => {
+                return Err(CreateWorkloadErrorModeled::ValidationException(exception).into());
+            }
+            None => {}
         }
 
         // "The name must be unique within an account within an Amazon Web Services Region.
