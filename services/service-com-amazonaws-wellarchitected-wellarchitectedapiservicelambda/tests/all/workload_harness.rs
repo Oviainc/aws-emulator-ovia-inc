@@ -303,6 +303,30 @@ impl Client {
         .await
     }
 
+    /// `CreateProfile`: `POST /profiles`.
+    pub(crate) async fn create_profile(&self, body: Value) -> Answer {
+        self.send("POST", "/profiles", Some(body)).await
+    }
+
+    /// `GetProfile`: `GET /profiles/{ProfileArn}`, with the optional `ProfileVersion`
+    /// bound to the query string. The ARN is a non-greedy `@httpLabel`, so it travels
+    /// percent-encoded in one path segment, exactly as an SDK sends it.
+    pub(crate) async fn get_profile(
+        &self,
+        profile_arn: &str,
+        profile_version: Option<&str>,
+    ) -> Answer {
+        let encoded = encode_path_segment(profile_arn);
+        let uri = match profile_version {
+            Some(version) => format!(
+                "/profiles/{encoded}?ProfileVersion={}",
+                encode_path_segment(version)
+            ),
+            None => format!("/profiles/{encoded}"),
+        };
+        self.send("GET", &uri, None).await
+    }
+
     /// `CreateWorkloadShare`: `POST /workloads/{WorkloadId}/shares`.
     pub(crate) async fn create_share(&self, workload_id: &str, body: Value) -> Answer {
         self.send(
