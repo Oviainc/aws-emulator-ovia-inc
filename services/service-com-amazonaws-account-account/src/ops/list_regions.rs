@@ -8,6 +8,14 @@
 //! A REPORTING operation (`@readonly`): the store is read and never written, so the
 //! Regions a later caller sees are exactly the ones this call saw.
 //!
+//! `RegionOptStatusContains` is modelled as `RegionOptStatusList`, whose member targets
+//! the `RegionOptStatus` enum, so an element outside that enum's value set is refused
+//! with the modelled `ValidationException` (HTTP 400) by the centralized validating
+//! walk BEFORE this handler runs — never served as a filter that matched nothing. The
+//! value set is therefore not re-checked here; `tests/all/enum_input_validation.rs`
+//! pins that refusal over the forms a client gets wrong, and over the service's other
+//! enum-valued member. Every value the handler below sees is one the enum admits.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -250,7 +258,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The filter is applied BEFORE the page is cut, so a page carries up to
         // `MaxResults` MATCHING Regions rather than up to `MaxResults` candidates. An
         // absent `RegionOptStatusContains` filters nothing; a Region is reported when
-        // its status is one of the listed ones.
+        // its status is one of the listed ones. Every listed value is one the
+        // `RegionOptStatus` enum admits: the validating walk refused anything else with
+        // the modelled `ValidationException` before this handler was reached, so an
+        // empty page here means no Region carries a listed status — never that the
+        // request named a status that does not exist.
         let wanted = input.region_opt_status_contains.as_deref();
         // One page, plus one lookahead Region: the token is present exactly when a
         // matching Region follows the last one on this page, so the final page carries
