@@ -1531,7 +1531,8 @@ pub struct AccountSettingsRecord {
     pub protection_period_in_minutes: i32,
     /// Whether vended metrics are enabled, or `None` while nobody has set them: the
     /// model states no default for `VendedMetricsSettings$Enabled`, so none is
-    /// substituted and the member is not reported until it has been written.
+    /// substituted and that MEMBER is not reported until it has been written. The
+    /// `VendedMetrics` group itself is still reported — see [`Self::vended_metrics`].
     pub vended_metrics_enabled: Option<bool>,
 }
 
@@ -1558,14 +1559,18 @@ impl AccountSettingsRecord {
         }
     }
 
-    /// This record's vended metrics as the model's `VendedMetricsSettings`, or `None`
-    /// while nobody has set them: the model states no default for
-    /// `VendedMetricsSettings$Enabled`, so reporting one would be fabricating it.
-    pub fn vended_metrics(&self) -> Option<VendedMetricsSettings> {
-        self.vended_metrics_enabled
-            .map(|enabled| VendedMetricsSettings {
-                enabled: Some(enabled),
-            })
+    /// This record's vended metrics as the model's `VendedMetricsSettings`.
+    ///
+    /// Always a structure: every account HAS a vended-metrics configuration, so the
+    /// `VendedMetrics` group of the account-settings document is reported whether or not
+    /// anything has been written to it — an account that has set nothing reports the
+    /// empty group `{}`. Only `Enabled` is absent until it holds a value, because the
+    /// model states no default for `VendedMetricsSettings$Enabled` and substituting one
+    /// would be fabricating it.
+    pub fn vended_metrics(&self) -> VendedMetricsSettings {
+        VendedMetricsSettings {
+            enabled: self.vended_metrics_enabled,
+        }
     }
 
     /// Apply one `UpdateAccountSettings` request to this record.
