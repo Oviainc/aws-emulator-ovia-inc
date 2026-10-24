@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMultiplexAlerts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMultiplexAlerts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMultiplexAlerts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a pure READ of the alerts the multiplex the request names has
+//! raised (the `alerts` of its own record in [`crate::state`]), cut into pages
+//! and filtered by the `StateFilter` the request carried. The alerts themselves
+//! are raised and cleared by the service as it observes its own state, in the
+//! `settle` every operation runs first, so this listing reports them and never
+//! raises one of its own.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +153,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMultiplexAlerts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMultiplexAlertsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMultiplexAlerts"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // `MaxResults` is a page size, so a non-positive one asks for nothing
+        // and is a bad request. It is clamped to a finite ceiling, and an absent
+        // one uses that ceiling, so no single request can ask the service to
+        // project an unbounded number of alerts in one response. The same rule,
+        // and the same ceiling, `ListMultiplexPrograms` applies to the other
+        // page this multiplex serves.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(bad_request(format!(
+                    "maxResults must be at least 1, got {max_results}"
+                )));
+            }
+            Some(max_results) => (max_results as usize).min(crate::state::MAX_LIST_PAGE_SIZE),
+            None => crate::state::MAX_LIST_PAGE_SIZE,
+        };
+
+        // `StateFilter` "Specifies the set of alerts to return based on their
+        // state. SET - Return only alerts with SET state. CLEARED - Return only
+        // alerts with CLEARED state. ALL - Return all alerts." It targets the
+        // free-form `__string`, so the request boundary refuses no value and a
+        // value outside that documented set — which names no set of alerts — is
+        // refused here, naming the member and the values it accepts, exactly as
+        // `ListClusterAlerts` refuses it against the same shared set. A request
+        // carrying none asks for the unfiltered listing, which is every alert.
+        let state_filter = input.state_filter.as_deref();
+        if let Some(filter) = state_filter {
+            if !crate::state::MULTIPLEX_ALERT_STATE_FILTERS.contains(&filter) {
+                return Err(bad_request(format!(
+                    "stateFilter must be one of {}, got {filter:?}",
+                    crate::state::MULTIPLEX_ALERT_STATE_FILTERS.join(", ")
+                )));
+            }
+        }
+
+        // `NextToken` is the `Id` of the alert the next page starts at, which is
+        // the form this operation hands out, so a value that is not an alert id
+        // at all cannot be one of its tokens and is a bad request rather than an
+        // empty page. A token whose own alert has since been evicted from the
+        // bounded store resumes at the next surviving alert instead of failing,
+        // the same tolerance `ListMultiplexPrograms` has for a token naming a
+        // program deleted since the previous page.
+        let first = match input.next_token.as_deref() {
+            None => None,
+            Some(next_token) => Some(next_token.parse::<u64>().map_err(|_| {
+                bad_request(format!(
+                    "nextToken must be the alert id this operation hands out a page's token as, \
+                     got {next_token:?}"
+                ))
+            })?),
+        };
+
+        let mut state = state.lock();
+        // Reporting only: `settle` materialises the transitions the clock had
+        // already made due and the alerts the state they left behind had already
+        // called for, both of which were owed at this instant whether or not
+        // anybody listed.
+        state.settle(::std::time::SystemTime::now());
+
+        // No such multiplex is the 404 this operation models; a multiplex that
+        // exists and has raised no alert is an EMPTY page, not a refusal. A
+        // deleted multiplex keeps its record, so it goes on reporting the alerts
+        // it raised while it ran, exactly as `DescribeMultiplex` goes on
+        // reporting the multiplex itself.
+        let Some((alerts, next_token)) =
+            state.multiplex_alert_page(&input.multiplex_id, state_filter, first, page_size)
+        else {
+            return Err(ListMultiplexAlertsErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::not_found_message(
+                        "Multiplex",
+                        &input.multiplex_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListMultiplexAlertsOutput {
+            alerts: Some(alerts),
+            next_token,
+        })
     }
+}
+
+/// A request this operation cannot serve as asked, as the 400
+/// `BadRequestException` it models. The message names the member, the rule and
+/// the value the request carried, so a caller can fix the request from that text
+/// alone.
+fn bad_request(message: String) -> ListMultiplexAlertsError {
+    ListMultiplexAlertsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no multiplex store to read. A modelled server error, never a
+/// fresh engine (which would answer from an empty store nobody ever wrote to).
+fn unavailable() -> ListMultiplexAlertsError {
+    ListMultiplexAlertsErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }

@@ -27,7 +27,16 @@ pub struct ListMultiplexAlertsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.medialive#MultiplexAlert")]
+/// `MultiplexAlert`, with its schema written out instead of derived because
+/// `SetTimestamp` and `ClearedTimestamp` target `__timestampIso8601`, which is
+/// `@timestampFormat("date-time")`; the note in `shared_types` says why that cannot be
+/// derived here. Member for member this is the model's shape
+/// (`smithy_query(query="shape", shape="MultiplexAlert")`): same ids, same order, same
+/// indices, and every member is optional, exactly as the derive has them.
+///
+/// Like `SignalMapSummary` it DOES carry a deserializer: it is the element of
+/// `ListMultiplexAlertsResponse$Alerts`, and the derive on that shape reads each element
+/// through `DeserializableStruct`.
 #[derive(Debug, Clone, Default)]
 pub struct MultiplexAlert {
     pub alert_type: Option<String>,
@@ -37,5 +46,106 @@ pub struct MultiplexAlert {
     pub pipeline_id: Option<String>,
     pub set_timestamp: Option<::aws_smithy_types::DateTime>,
     pub state: Option<String>,
+}
+
+impl MultiplexAlert {
+    const M_ALERT_TYPE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("MultiplexAlert", "AlertType", "alertType", String, 0);
+    const M_CLEARED_TIMESTAMP: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!(
+            "MultiplexAlert",
+            "ClearedTimestamp",
+            "clearedTimestamp",
+            1
+        );
+    const M_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("MultiplexAlert", "Id", "id", String, 2);
+    const M_MESSAGE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("MultiplexAlert", "Message", "message", String, 3);
+    const M_PIPELINE_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("MultiplexAlert", "PipelineId", "pipelineId", String, 4);
+    const M_SET_TIMESTAMP: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("MultiplexAlert", "SetTimestamp", "setTimestamp", 5);
+    // `MultiplexAlertState` is an enum shape, which the generator writes as
+    // `ShapeType::String`.
+    const M_STATE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("MultiplexAlert", "State", "state", String, 6);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.medialive#MultiplexAlert",
+            shared_types::NAMESPACE,
+            "MultiplexAlert",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ALERT_TYPE,
+            &Self::M_CLEARED_TIMESTAMP,
+            &Self::M_ID,
+            &Self::M_MESSAGE,
+            &Self::M_PIPELINE_ID,
+            &Self::M_SET_TIMESTAMP,
+            &Self::M_STATE,
+        ],
+    );
+}
+
+pub static MULTIPLEX_ALERT_SCHEMA: &::aws_smithy_schema::Schema = &MultiplexAlert::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for MultiplexAlert {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.alert_type.as_ref() {
+            serializer.write_string(&Self::M_ALERT_TYPE, value.as_str())?;
+        }
+        if let Some(value) = self.cleared_timestamp.as_ref() {
+            serializer.write_timestamp(&Self::M_CLEARED_TIMESTAMP, value)?;
+        }
+        if let Some(value) = self.id.as_ref() {
+            serializer.write_string(&Self::M_ID, value.as_str())?;
+        }
+        if let Some(value) = self.message.as_ref() {
+            serializer.write_string(&Self::M_MESSAGE, value.as_str())?;
+        }
+        if let Some(value) = self.pipeline_id.as_ref() {
+            serializer.write_string(&Self::M_PIPELINE_ID, value.as_str())?;
+        }
+        if let Some(value) = self.set_timestamp.as_ref() {
+            serializer.write_timestamp(&Self::M_SET_TIMESTAMP, value)?;
+        }
+        if let Some(value) = self.state.as_ref() {
+            serializer.write_string(&Self::M_STATE, value.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for MultiplexAlert {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut alert = Self::default();
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, reader| {
+            match member.member_index() {
+                Some(0) => alert.alert_type = Some(reader.read_string(&Self::M_ALERT_TYPE)?),
+                Some(1) => {
+                    alert.cleared_timestamp =
+                        Some(reader.read_timestamp(&Self::M_CLEARED_TIMESTAMP)?);
+                }
+                Some(2) => alert.id = Some(reader.read_string(&Self::M_ID)?),
+                Some(3) => alert.message = Some(reader.read_string(&Self::M_MESSAGE)?),
+                Some(4) => alert.pipeline_id = Some(reader.read_string(&Self::M_PIPELINE_ID)?),
+                Some(5) => {
+                    alert.set_timestamp = Some(reader.read_timestamp(&Self::M_SET_TIMESTAMP)?);
+                }
+                Some(6) => alert.state = Some(reader.read_string(&Self::M_STATE)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(alert)
+    }
 }
 

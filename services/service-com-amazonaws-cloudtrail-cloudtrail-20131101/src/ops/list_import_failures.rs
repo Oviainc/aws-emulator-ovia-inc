@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListImportFailures
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListImportFailures`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListImportFailures::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one page of the failures an import recorded, from the shared import
+//! registry (`crate::state`).
 //!
 //! ## Shape of an operation
 //!
@@ -138,6 +131,43 @@ impl<Eng> ListImportFailures<Eng> {
     }
 }
 
+/// The separator between the two halves of a page token, `<import id>/<offset>`.
+///
+/// An import id is a `UUID` (`^[a-f0-9\-]+$`), so it can hold no `/`: the halves are
+/// always told apart.
+const PAGE_TOKEN_SEPARATOR: char = '/';
+
+/// The token that resumes the listing of `import_id` at `offset`.
+fn encode_page_token(import_id: &str, offset: usize) -> String {
+    format!("{import_id}{PAGE_TOKEN_SEPARATOR}{offset}")
+}
+
+/// Read a caller-supplied `NextToken` as the offset the next page starts at.
+///
+/// A token carries the import it was minted for, so one presented with a different
+/// `ImportId` is refused: the model documents `InvalidNextTokenException` as "a token
+/// that is not valid, or a token that was previously used in a request with different
+/// parameters".
+fn decode_page_token(token: &str, import_id: &str) -> Result<usize, ListImportFailuresError> {
+    let reject = || {
+        ListImportFailuresErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+            message: Some(format!(
+                "The pagination token '{token}' is not valid for a ListImportFailures \
+                 request for import '{import_id}': a token is valid only for a request \
+                 carrying the same ImportId it was returned for"
+            )),
+        })
+    };
+
+    let Some((token_import_id, offset)) = token.rsplit_once(PAGE_TOKEN_SEPARATOR) else {
+        return Err(reject().into());
+    };
+    if token_import_id != import_id {
+        return Err(reject().into());
+    }
+    offset.parse::<usize>().map_err(|_| reject().into())
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListImportFailures<Eng>
 {
@@ -155,18 +185,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListImportFailures` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListImportFailuresErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListImportFailures"))
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListImportFailuresErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "ListImportFailures needs the CloudTrail import registry, which \
+                         this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        // Where this page starts: the offset the caller's token names, or the head of
+        // the list for a first page.
+        let start = match input.next_token.as_deref() {
+            Some(token) => decode_page_token(token, &input.import_id)?,
+            None => 0,
+        };
+        // `MaxResults` is modelled `range 1..1000`, so a value outside those bounds is
+        // refused before this handler runs and neither arm below is reachable today:
+        // the `try_from` fallback covers only a negative value the model no longer
+        // bounds, and the clamp only pins the conversion into the model's own range.
+        // Both keep the page inside the modelled bounds rather than panicking, so a
+        // later model change widens the page size instead of aborting a request.
+        let page_size = input.max_results.map_or(
+            crate::state::LIST_IMPORT_FAILURES_DEFAULT_MAX_RESULTS,
+            |requested| {
+                usize::try_from(requested)
+                    .unwrap_or(crate::state::LIST_IMPORT_FAILURES_MAX_RESULTS_MIN)
+                    .clamp(
+                        crate::state::LIST_IMPORT_FAILURES_MAX_RESULTS_MIN,
+                        crate::state::LIST_IMPORT_FAILURES_MAX_RESULTS_MAX,
+                    )
+            },
+        );
+
+        // This operation models no not-found error, so an `ImportId` naming no import
+        // of the caller's Region is answered the same way as an import that recorded
+        // nothing: a page of no failures.
+        let failures = store.import_failures(&input.import_id, &region);
+
+        let page: Vec<ImportFailureListItem> = failures
+            .iter()
+            .skip(start)
+            .take(page_size)
+            .map(crate::state::ImportFailureRecord::to_failure_list_item)
+            .collect();
+        // A token is handed out only while failures are left past this page, so the
+        // last page of a listing carries none.
+        let resume_at = start.saturating_add(page.len());
+        let next_token = (resume_at < failures.len())
+            .then(|| encode_page_token(&input.import_id, resume_at));
+
+        Ok(ListImportFailuresOutput {
+            failures: Some(page),
+            next_token,
+        })
     }
 }

@@ -11,6 +11,16 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+//
+// Declared here, ahead of the sorted list, ON PURPOSE: every apigateway fix that lands
+// inserts its suite into that list or appends after it, so both of those regions collide
+// with whatever else lands in the same window — this fix lost several serialized squash
+// merges to exactly that, as the `update_deployment` note at the end of this file records
+// for another. Fold it into the sorted list whenever the list is next touched for another
+// reason; the suite itself is an ordinary `tests/all/<name>.rs` file.
+#[path = "all/documentation_part_creation.rs"]
+mod documentation_part_creation;
+
 #[path = "all/account_settings.rs"]
 mod account_settings;
 #[path = "all/api_key_collection_members.rs"]

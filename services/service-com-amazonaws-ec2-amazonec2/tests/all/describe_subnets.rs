@@ -161,7 +161,7 @@ fn seed(engine: &engine::InMemoryEngine) -> Seeded {
         .and_then(|vpc| vpc.vpc_id.clone())
         .expect("a fresh account has its default VPC");
     let fixture_vpc_id =
-        guard.insert_vpc("10.0.0.0/16", false, "default", "available", Vec::new());
+        guard.insert_vpc("10.0.0.0/16", false, "default", "available", REGION, Vec::new());
 
     let zones = availability_zones_in_region(REGION);
     let mut fixture_ids = Vec::new();
@@ -382,7 +382,14 @@ async fn available_ip_address_count_is_the_block_less_the_five_reserved_addresse
     let vpc_id = engine
         .state::<Ec2State>()
         .lock()
-        .insert_vpc("192.168.0.0/16", false, "default", "available", Vec::new());
+        .insert_vpc(
+            "192.168.0.0/16",
+            false,
+            "default",
+            "available",
+            REGION,
+            Vec::new(),
+        );
     for (cidr_block, expected_count) in cases {
         let subnet_id = engine.state::<Ec2State>().lock().insert_subnet(SubnetSpec {
             vpc_id: vpc_id.clone(),

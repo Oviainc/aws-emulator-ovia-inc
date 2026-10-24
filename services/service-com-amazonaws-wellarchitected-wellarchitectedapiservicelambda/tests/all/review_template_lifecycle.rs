@@ -283,13 +283,25 @@ async fn the_lens_ceiling_bounds_a_stored_review_template() {
     const MAX_LENSES: usize = state::MAX_LENSES_PER_REVIEW_TEMPLATE;
 
     let client = Client::new();
+    // The rows need MAX_LENSES + 1 lenses that all resolve, so the quota is what the
+    // over-the-ceiling row meets rather than lens resolution.
+    assert!(
+        state::AWS_OFFICIAL_LENS_ALIASES.len() > MAX_LENSES,
+        "the AWS-official lens catalog must carry more than {MAX_LENSES} aliases to test the ceiling, got {}",
+        state::AWS_OFFICIAL_LENS_ALIASES.len()
+    );
     for (case, count) in [
         ("one-lens", 1usize),
         ("at-the-ceiling", MAX_LENSES),
         ("one-past-the-ceiling", MAX_LENSES + 1),
     ] {
-        // Distinct aliases, so the row varies the COUNT and nothing else.
-        let lenses: Vec<String> = (0..count).map(|index| format!("lens-{index}")).collect();
+        // Distinct aliases of lenses that exist, so the row varies the COUNT and nothing
+        // else.
+        let lenses: Vec<String> = state::AWS_OFFICIAL_LENS_ALIASES
+            .iter()
+            .take(count)
+            .map(|alias| (*alias).to_string())
+            .collect();
         let mut request = minimal_template(&format!("lenses-{case}"), &format!("tok-lenses-{case}"));
         request["Lenses"] = json!(lenses);
 

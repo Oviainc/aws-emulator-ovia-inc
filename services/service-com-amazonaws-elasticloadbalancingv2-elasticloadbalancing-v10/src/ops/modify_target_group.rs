@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyTargetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyTargetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyTargetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the health-check members the request names onto a persisted target group and
+//! answers with the stored record. Only the members the request carries are changed —
+//! the model documents each one as the new setting for that member alone — and the
+//! members that exist only for an HTTP-semantic health check are re-settled afterwards,
+//! so a group whose check becomes a TCP one stops reporting a path and a matcher and
+//! one whose check becomes HTTP starts reporting their documented defaults.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +170,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyTargetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyTargetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("ModifyTargetGroup")
+        })?;
+
+        let mut guard = state.lock();
+        let Some(group) = guard.target_groups.get_mut(&input.target_group_arn) else {
+            return Err(ModifyTargetGroupErrorModeled::TargetGroupNotFoundException(
+                TargetGroupNotFoundException {
+                    message: Some(crate::state::target_groups_not_found_message([
+                        input.target_group_arn.as_str(),
+                    ])),
+                },
+            )
+            .into());
+        };
+
+        // Every refusal is raised before the first write, so a refused modify leaves
+        // the stored health check exactly as it was.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyTargetGroup"))
+        // "If the target type is instance, ip, or alb, health checks are always enabled
+        // and can't be disabled" — the same rule `CreateTargetGroup` enforces, on the
+        // target type the group was created with.
+        if !group.is_lambda() && input.health_check_enabled == Some(false) {
+            return Err(invalid_configuration(format!(
+                "Health checks cannot be disabled for a target group whose target type is {}",
+                group.target_type
+            )));
+        }
+        // The protocol rules of `HealthCheckProtocol`: "The GENEVE, TLS, UDP, TCP_UDP,
+        // QUIC, and TCP_QUIC protocols are not supported for health checks", and "the
+        // TCP protocol is not supported for health checks if the protocol of the target
+        // group is HTTP or HTTPS".
+        if let Some(health_check_protocol) = input.health_check_protocol.as_deref() {
+            if !crate::state::HEALTH_CHECK_PROTOCOLS.contains(&health_check_protocol) {
+                return Err(invalid_configuration(format!(
+                    "The {health_check_protocol} protocol is not supported for health checks"
+                )));
+            }
+            if health_check_protocol == "TCP"
+                && crate::state::is_http_protocol(group.protocol.as_deref())
+            {
+                return Err(invalid_configuration(format!(
+                    "The TCP protocol is not supported for health checks of a target group \
+                     whose protocol is {}",
+                    group.protocol.as_deref().unwrap_or_default()
+                )));
+            }
+        }
+        // `HealthCheckPath` and `Matcher` are both documented "[HTTP/HTTPS health
+        // checks]", so naming either for a health check that will not be an HTTP one is
+        // a configuration that cannot hold together.
+        let health_check_will_be_http = match input.health_check_protocol.as_deref() {
+            Some(protocol) => group.is_lambda() || crate::state::is_http_protocol(Some(protocol)),
+            None => group.health_check_is_http(),
+        };
+        if !health_check_will_be_http {
+            for (member, named) in [
+                ("HealthCheckPath", input.health_check_path.is_some()),
+                ("Matcher", input.matcher.is_some()),
+            ] {
+                if named {
+                    return Err(invalid_configuration(format!(
+                        "{member} is only supported for an HTTP or HTTPS health check"
+                    )));
+                }
+            }
+        }
+
+        // Each member the request carries replaces the stored one; each it omits keeps
+        // the value the target group already had.
+        if let Some(protocol) = input.health_check_protocol.clone() {
+            group.health_check.protocol = Some(protocol);
+        }
+        if let Some(port) = input.health_check_port.clone() {
+            group.health_check.port = Some(port);
+        }
+        if let Some(path) = input.health_check_path.clone() {
+            group.health_check.path = Some(path);
+        }
+        if let Some(enabled) = input.health_check_enabled {
+            // Only a Lambda target group can reach a `false` here; for every other
+            // target type health checks are always enabled.
+            group.health_check.enabled = enabled;
+        }
+        if let Some(interval) = input.health_check_interval_seconds {
+            group.health_check.interval_seconds = interval;
+        }
+        if let Some(timeout) = input.health_check_timeout_seconds {
+            group.health_check.timeout_seconds = timeout;
+        }
+        if let Some(healthy) = input.healthy_threshold_count {
+            group.health_check.healthy_threshold = healthy;
+        }
+        if let Some(unhealthy) = input.unhealthy_threshold_count {
+            group.health_check.unhealthy_threshold = unhealthy;
+        }
+        if let Some(matcher) = input.matcher.as_ref() {
+            group.health_check.matcher = Some(crate::state::MatcherRecord {
+                http_code: matcher.http_code.clone(),
+                grpc_code: matcher.grpc_code.clone(),
+            });
+        }
+        group.settle_health_check_http_members();
+
+        Ok(ModifyTargetGroupOutput {
+            target_groups: Some(vec![group.to_shape()]),
+        })
     }
+}
+
+/// The operation's own refusal for a health check that cannot hold together: a
+/// combination the model documents but cannot express. The message names the member and
+/// the rule, because that is what the caller has to fix.
+fn invalid_configuration(detail: String) -> ModifyTargetGroupError {
+    ModifyTargetGroupErrorModeled::InvalidConfigurationRequestException(
+        InvalidConfigurationRequestException {
+            message: Some(detail),
+        },
+    )
+    .into()
 }

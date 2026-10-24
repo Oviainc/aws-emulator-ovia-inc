@@ -18,6 +18,32 @@ Issue-Commit: 6d7833292dd9d4a45d8e52e2aa7ee7e5a822f7f5
 
 > _Note: this issue was identified against the code base at commit `6d7833292dd9d4a45d8e52e2aa7ee7e5a822f7f5`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+All three of this issue's replay keys remain `still_failing` BY DECISION — this file's
+move does not record a replay pass. What was found and what was done:
+
+* `$.DescribeSubnetsResponse.subnetSet.item.dhcpOptionsId` and
+  `…dhcpOptionsSource` — DECLINED. `smithy_query` shows `com.amazonaws.ec2#Subnet`
+  declares no `DhcpOptionsId` member, and the model declares no `DhcpOptionsSource`
+  member or shape at all (on `Subnet` or on `Vpc`). The responses are serialised from
+  that schema, so the recording comes from a newer EC2 surface than the model this
+  crate is generated from; rendering them would mean editing the vendored model.
+* `$.DescribeVpcsResponse.vpcSet.item.state` — DECLINED. The reported defect ("left in
+  state 'pending' forever", "the state never advances") no longer exists: `CreateVpc`
+  and `CreateSubnet` record a due instant and `materialize_due_transitions` moves
+  `pending` -> `available` once the clock has passed it, pinned by
+  `vpc_lifecycle::a_vpc_becomes_available_once_the_clock_owes_the_transition` and
+  `vpc_network_lifecycle::create_subnet_settles_to_available_when_the_clock_owes_it`.
+  What is left is a per-run timing difference: a read in the same millisecond as the
+  create legitimately still sees the modelled non-terminal state.
+* FIXED instead, from the same root the issue names ("record the inherited DHCP option
+  set"): a VPC's `dhcpOptionsId` was a fresh id minted per VPC that named no resource
+  the account held. The store now holds DHCP option sets by `DhcpOptionsId`, with one
+  default set per Region (carrying `domain-name` and `domain-name-servers`) that every
+  VPC of the Region inherits, and `DescribeDhcpOptions` is implemented so the id reads
+  back. See `services/service-com-amazonaws-ec2-amazonec2/tests/all/dhcp_options.rs`.
+
 ## Operation
 DescribeSubnets
 

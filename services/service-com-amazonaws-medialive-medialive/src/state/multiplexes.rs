@@ -30,17 +30,36 @@
 //! The instants are stored and never slept on —
 //! [`ComAmazonawsMedialiveMedialiveState::settle`], which every operation runs
 //! first, is what materialises the ones the clock has already made due.
+//!
+//! A multiplex's ALERTS live in the same slice too, on the [`MultiplexRecord`]
+//! they are about: one [`MultiplexAlertRecord`] per alert instance, keyed by the
+//! minted alert id so a walk over them is in the order they were raised. An
+//! alert is not something a caller creates — the service raises it when it
+//! observes a condition on the multiplex and clears it when that condition stops
+//! holding (the model's `MultiplexAlertState`: "SET - The alert is actively
+//! happening. CLEARED - The alert is no longer happening.") — so the conditions
+//! are observed out of the stored state (`multiplex_alert_conditions`), from the
+//! same `settle` every operation runs first, and never out of the request being
+//! served.
+//!
+//! The only conditions observed are the ones this emulator's CONTROL PLANE
+//! determines ([`multiplex_alert_type`]). The alerts the real service's
+//! transport-stream multiplexer raises out of the media it is carrying — a
+//! pipeline that lost its source, a bitrate it could not fit — are NOT claimed
+//! here, for the same reason this slice reports no `Destinations` and no
+//! `PipelineDetails`: this emulator does not run that multiplexer, so it has
+//! nothing to report about it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    Multiplex, MultiplexProgram, MultiplexProgramSettings, MultiplexProgramSummary,
-    MultiplexSettings,
+    Multiplex, MultiplexAlert, MultiplexProgram, MultiplexProgramSettings,
+    MultiplexProgramSummary, MultiplexSettings,
 };
 
-use super::{ComAmazonawsMedialiveMedialiveState, TRANSIENT_STATE_SPAN};
+use super::{ChannelRecord, ComAmazonawsMedialiveMedialiveState, TRANSIENT_STATE_SPAN};
 
 /// The `MultiplexState` values this slice uses, spelled exactly as the model
 /// declares them (`smithy_query(query="shape", shape="MultiplexState")`:
@@ -100,6 +119,138 @@ pub const MAX_MULTIPLEX_PROGRAMS: usize = 100;
 /// The most `RequestId` entries kept for `CreateMultiplexProgram` idempotency —
 /// the same bound, for the same reason, as [`MAX_MULTIPLEX_TOKENS`].
 pub const MAX_MULTIPLEX_PROGRAM_TOKENS: usize = MAX_MULTIPLEX_PROGRAMS;
+
+/// The `MultiplexAlertState` values, spelled exactly as the model declares them
+/// (`smithy_query(query="shape", shape="MultiplexAlertState")`: SET | CLEARED,
+/// documented as "SET - The alert is actively happening. CLEARED - The alert is
+/// no longer happening.").
+///
+/// The same two values every alert-state enum of this service declares, so they
+/// live once in [`super::alerts`] and this is the multiplex slice's name for
+/// them.
+pub use super::alerts::alert_state as multiplex_alert_state;
+
+/// The alert types this emulator raises on a multiplex.
+///
+/// `MultiplexAlert$AlertType` ("The type of the alert") targets the free-form
+/// `__string` (`smithy_query(query="shape", shape="MultiplexAlert")`), so the
+/// model publishes no catalog of values: each constant here NAMES the condition
+/// this emulator observed, and nothing is raised for a condition it cannot
+/// observe. One type so far, because the control plane determines exactly one
+/// thing about a multiplex that is worth alerting on: a program of a RUNNING
+/// multiplex whose output nothing is feeding, i.e. no MediaLive channel with a
+/// healthy pipeline sends its output to that program
+/// (`MultiplexProgramChannelDestinationSettings` is how a channel's
+/// `OutputDestination` names the multiplex and program it feeds).
+pub mod multiplex_alert_type {
+    pub const PROGRAM_NO_RUNNING_CHANNEL: &str = "MULTIPLEX_PROGRAM_NO_RUNNING_CHANNEL";
+}
+
+/// The `StateFilter` values `ListMultiplexAlerts` accepts, from the member's own
+/// documentation: "Specifies the set of alerts to return based on their state.
+/// SET - Return only alerts with SET state. CLEARED - Return only alerts with
+/// CLEARED state. ALL - Return all alerts." The member targets `__string`, so
+/// the request boundary cannot refuse any other value and this is what the
+/// operation refuses against: the shared
+/// [`super::alerts::ALERT_STATE_FILTERS`], because every alert listing of this
+/// service documents the same set and must accept the same values.
+pub const MULTIPLEX_ALERT_STATE_FILTERS: [&str; 3] = super::alerts::ALERT_STATE_FILTERS;
+
+/// The `StateFilter` value that asks for every alert whatever its state ("ALL -
+/// Return all alerts"), which is NOT one of the two states an alert can be in.
+pub const MULTIPLEX_ALERT_STATE_FILTER_ALL: &str = super::alerts::ALERT_STATE_FILTER_ALL;
+
+/// The most alert instances this emulator keeps for ONE multiplex.
+///
+/// A ceiling on the store, not an AWS quota: a condition that keeps holding,
+/// stopping and holding again raises one alert instance each time, so without a
+/// bound a long-lived multiplex would grow the emulator's heap without end. Once
+/// it is reached, the oldest alert that has already CLEARED is dropped first —
+/// a `SET` alert is still happening, so it is the last thing to go.
+pub const MAX_MULTIPLEX_ALERTS: usize = 200;
+
+/// The id the first alert of a process gets.
+///
+/// `MultiplexAlert$Id` is "The unique ID for this alert instance", and it is
+/// also the `NextToken` a page of alerts resumes at, so it is minted from a
+/// monotonic counter: the ids a later alert gets are greater than the ones an
+/// earlier alert got, which is what makes the token a resume point.
+const FIRST_MULTIPLEX_ALERT_ID: u64 = 7_000_000;
+
+/// One alert instance on a multiplex, as the service raised it.
+///
+/// The members mirror the model's `MultiplexAlert` shape minus the one it does
+/// not report: `PipelineId` is "The ID of the pipeline this alert is associated
+/// with", and every condition this emulator observes is a property of the
+/// multiplex and its program rather than of one of the multiplex's pipelines, so
+/// there is no pipeline to name. `State` is derived from
+/// [`MultiplexAlertRecord::cleared_at`] rather than stored beside it, so an
+/// alert cannot report `SET` and carry a `ClearedTimestamp`.
+#[derive(Debug, Clone)]
+pub struct MultiplexAlertRecord {
+    /// The minted id, "The unique ID for this alert instance", which is also the
+    /// key this alert is stored at and the `NextToken` a page resumes from.
+    id: u64,
+    /// Which condition was observed, one of [`multiplex_alert_type`]'s values.
+    alert_type: &'static str,
+    /// The program the condition was observed on. Part of the condition's
+    /// identity, together with [`Self::alert_type`]: one program's alert is not
+    /// another's, so a multiplex carries at most one SET alert of a given type
+    /// per program.
+    program_name: String,
+    /// "The user facing alert message which can have more context" — built from
+    /// the state observed when the alert was raised, so it names the program and
+    /// what was (or was not) feeding it.
+    message: String,
+    /// "The time when the alert was set": the instant the condition was first
+    /// observed to hold.
+    set_at: SystemTime,
+    /// "The time when the alert was cleared": the instant the condition was
+    /// first observed NOT to hold any more, or `None` while the alert is still
+    /// happening.
+    cleared_at: Option<SystemTime>,
+}
+
+impl MultiplexAlertRecord {
+    /// Whether this alert is still happening, which is what makes its `State`
+    /// `SET` rather than `CLEARED`.
+    fn is_set(&self) -> bool {
+        self.cleared_at.is_none()
+    }
+
+    /// This alert's `MultiplexAlertState`, derived from whether it has been
+    /// cleared, through the one derivation every alert surface of this service
+    /// shares.
+    fn state(&self) -> &'static str {
+        super::alerts::alert_state_of(self.cleared_at)
+    }
+
+    /// Whether `ListMultiplexAlerts`' `StateFilter` admits this alert — the one
+    /// predicate every alert listing of this service shares, so a `SET` filter
+    /// means the same thing on a multiplex as it does on a cluster.
+    fn admitted_by(&self, filter: Option<&str>) -> bool {
+        super::alerts::alert_admitted_by(self.cleared_at, filter)
+    }
+
+    /// Whether this alert is the one `condition` would raise: the same type, on
+    /// the same program.
+    fn is_about(&self, condition: &MultiplexAlertCondition) -> bool {
+        self.alert_type == condition.alert_type && self.program_name == condition.program_name
+    }
+}
+
+/// One alert condition observed on a multiplex as of some instant: which alert
+/// it would raise, the program it is about, and the message naming what was
+/// observed.
+///
+/// Observed out of the stored state and thrown away again on every `settle`; the
+/// records it raises are what persist.
+#[derive(Debug)]
+struct MultiplexAlertCondition {
+    alert_type: &'static str,
+    program_name: String,
+    message: String,
+}
 
 /// The longest `ProviderName` or `ServiceName` a program's
 /// `MultiplexProgramServiceDescriptor` may carry: both members target
@@ -491,6 +642,12 @@ pub struct MultiplexRecord {
     /// counts. A `BTreeMap`, so a walk over them is in name order on every
     /// call.
     programs: BTreeMap<String, MultiplexProgramRecord>,
+    /// The alerts raised on this multiplex, keyed by the minted alert id, so a
+    /// walk over them is in the order they were raised on every call and a
+    /// `NextToken` means the same thing on the next one. They live on the
+    /// multiplex because that is what they are about: a deleted multiplex takes
+    /// its alerts with it, exactly as it takes its programs.
+    alerts: BTreeMap<u64, MultiplexAlertRecord>,
 }
 
 impl MultiplexRecord {
@@ -550,6 +707,13 @@ impl MultiplexRecord {
         self.state == multiplex_state::RUNNING
     }
 
+    /// Whether any alert on this multiplex is still happening, so a condition of
+    /// its could still have to be CLEARED. Bounded by [`MAX_MULTIPLEX_ALERTS`],
+    /// and short-circuiting, so it is cheap enough to ask on every call.
+    fn has_set_alert(&self) -> bool {
+        self.alerts.values().any(MultiplexAlertRecord::is_set)
+    }
+
     /// Move this multiplex into `DELETING`, owing the terminal `DELETED` state
     /// it then keeps once [`TRANSIENT_STATE_SPAN`] has passed: the record stays
     /// in the account, so a reader goes on reporting the multiplex in that state
@@ -586,6 +750,85 @@ impl MultiplexRecord {
         });
     }
 
+    /// Bring this multiplex's alerts in line with the conditions `observed`
+    /// says hold as of `now`: raise one for a condition that is not already
+    /// alerted, clear the alerts whose condition no longer holds, and keep the
+    /// store bounded.
+    ///
+    /// An alert instance is one OCCURRENCE of its condition: while the condition
+    /// goes on holding, the alert it raised stays `SET` with the message and the
+    /// `SetTimestamp` it was raised with, and a condition that holds again after
+    /// clearing raises a NEW instance with a new id.
+    ///
+    /// `next_alert_id` is the store's mint counter, passed in because an alert's
+    /// id is unique across the account rather than within one multiplex.
+    fn apply_alerts(
+        &mut self,
+        observed: &[MultiplexAlertCondition],
+        now: SystemTime,
+        next_alert_id: &mut u64,
+    ) {
+        // Clear first, so a condition that stopped holding frees its alert
+        // before this instant's conditions are matched against what is SET.
+        for alert in self.alerts.values_mut().filter(|alert| alert.is_set()) {
+            if !observed.iter().any(|condition| alert.is_about(condition)) {
+                alert.cleared_at = Some(now);
+            }
+        }
+
+        for condition in observed {
+            if self
+                .alerts
+                .values()
+                .any(|alert| alert.is_set() && alert.is_about(condition))
+            {
+                continue;
+            }
+            let id = FIRST_MULTIPLEX_ALERT_ID + *next_alert_id;
+            *next_alert_id += 1;
+            self.alerts.insert(
+                id,
+                MultiplexAlertRecord {
+                    id,
+                    alert_type: condition.alert_type,
+                    program_name: condition.program_name.clone(),
+                    message: condition.message.clone(),
+                    set_at: now,
+                    cleared_at: None,
+                },
+            );
+        }
+
+        // Bounded, evicting store, in ONE pass over the id-ordered map: the
+        // alerts that have already cleared go first, oldest first, because a
+        // `SET` alert is still happening and dropping it would hide a condition
+        // that holds right now; only if dropping every cleared alert is not
+        // enough does the oldest still-set one go too.
+        if self.alerts.len() > MAX_MULTIPLEX_ALERTS {
+            let excess = self.alerts.len() - MAX_MULTIPLEX_ALERTS;
+            let mut evicted: Vec<u64> = self
+                .alerts
+                .iter()
+                .filter(|(_, alert)| !alert.is_set())
+                .map(|(id, _)| *id)
+                .take(excess)
+                .collect();
+            if evicted.len() < excess {
+                let still_over = excess - evicted.len();
+                evicted.extend(
+                    self.alerts
+                        .iter()
+                        .filter(|(_, alert)| alert.is_set())
+                        .map(|(id, _)| *id)
+                        .take(still_over),
+                );
+            }
+            for id in evicted {
+                self.alerts.remove(&id);
+            }
+        }
+    }
+
     /// Materialise the transition the clock has already made due: a multiplex
     /// AWS answers `CREATING` becomes `IDLE` once the span has passed, a
     /// `STARTING` one becomes `RUNNING`, a `STOPPING` one becomes `IDLE` again,
@@ -612,12 +855,138 @@ struct MultiplexTransition {
 
 impl ComAmazonawsMedialiveMedialiveState {
     /// Materialise every multiplex transition the clock had already made due as
-    /// of `now`. Called from [`ComAmazonawsMedialiveMedialiveState::settle`],
-    /// which every operation runs first.
+    /// of `now`, then every alert the state it left behind calls for. Called
+    /// from [`ComAmazonawsMedialiveMedialiveState::settle`], which every
+    /// operation runs first.
+    ///
+    /// Raising and clearing alerts here is what keeps them owed to the STATE
+    /// rather than to the call that happens to notice them: the condition was
+    /// true, and the alert owed, from the instant the mutation that created it
+    /// ran, whether or not anybody called afterwards. So a reporting operation
+    /// may run this — it never changes what a later caller would otherwise have
+    /// seen — and `ListMultiplexAlerts` is a pure read of the result.
+    ///
+    /// WORK PER CALL, which every request of this service pays while it holds
+    /// the state lock, is a SUM of the stored collections rather than a product
+    /// of them:
+    ///
+    /// * one walk of the multiplexes to settle their transitions, at most
+    ///   [`MAX_MULTIPLEXES`];
+    /// * nothing more at all unless some multiplex is transmitting or carries an
+    ///   alert that is still set — a store nothing runs in pays only the walk
+    ///   above;
+    /// * otherwise ONE pass over the live channels' multiplex destinations to
+    ///   index the feeders ([`Self::multiplex_program_feeders`]), at most
+    ///   [`super::MAX_CHANNELS`] × [`super::MAX_CHANNEL_DESTINATIONS`] = 3 200
+    ///   entries, and then ONE hash lookup per program of each such multiplex,
+    ///   at most [`MAX_MULTIPLEXES`] × [`MAX_MULTIPLEX_PROGRAMS`] = 10 000.
+    ///
+    /// So the ceiling is 13 200 compare-and-hash steps and one short string per
+    /// condition that holds, whatever a caller stores: the index is what keeps
+    /// the channel scan OUT of the per-program loop, where it would otherwise
+    /// have multiplied the two bounds together.
     pub(super) fn settle_multiplexes(&mut self, now: SystemTime) {
         for multiplex in self.multiplexes.values_mut() {
             multiplex.settle(now);
         }
+
+        // Every condition is observed BEFORE anything is written, because a
+        // condition reads the channel store as well as the multiplex it is
+        // about: an alert on one multiplex can therefore not be raised out of a
+        // store another alert has already changed.
+        //
+        // Only a multiplex that is transmitting can have a condition hold, and
+        // only one carrying a set alert can have one stop holding, so no other
+        // multiplex is observed and the feeder index is not even built unless
+        // one of them is.
+        let observed: Vec<(String, Vec<MultiplexAlertCondition>)> = {
+            let alerting: Vec<&MultiplexRecord> = self
+                .multiplexes
+                .values()
+                .filter(|multiplex| multiplex.is_running() || multiplex.has_set_alert())
+                .collect();
+            if alerting.is_empty() {
+                return;
+            }
+            let feeders = self.multiplex_program_feeders();
+            alerting
+                .into_iter()
+                .map(|multiplex| {
+                    (
+                        multiplex.id.clone(),
+                        multiplex_alert_conditions(multiplex, &feeders),
+                    )
+                })
+                .collect()
+        };
+
+        let mut next_alert_id = self.next_multiplex_alert_id;
+        for (id, conditions) in observed {
+            if let Some(multiplex) = self.multiplexes.get_mut(&id) {
+                multiplex.apply_alerts(&conditions, now, &mut next_alert_id);
+            }
+        }
+        self.next_multiplex_alert_id = next_alert_id;
+    }
+
+    /// The channel feeding each multiplex program the live channels name, in ONE
+    /// pass over their destinations: the batch form of
+    /// [`Self::channel_feeding_multiplex_program`], which resolves one program at
+    /// a time.
+    ///
+    /// Both answer the same channel for the same program — the first in channel
+    /// id order whose destinations name it, since the walk is in that order and
+    /// an entry already indexed is kept — so an alert about a program cannot
+    /// disagree with the `ChannelId` that program's own describe reports.
+    fn multiplex_program_feeders(&self) -> HashMap<(&str, &str), &ChannelRecord> {
+        let mut feeders: HashMap<(&str, &str), &ChannelRecord> = HashMap::new();
+        for channel in self.channels.values().filter(|channel| !channel.is_deleted()) {
+            for fed in multiplex_program_destinations(channel) {
+                feeders.entry(fed).or_insert(channel);
+            }
+        }
+        feeders
+    }
+
+    /// One page of the alerts raised on the multiplex `multiplex_id`, as the
+    /// `MultiplexAlert` list `ListMultiplexAlerts` reports: the alerts the
+    /// `StateFilter` `filter` admits whose id is at or after `first`, in the
+    /// order they were raised, at most `page_size` of them, together with the id
+    /// the next page starts at when an alert is left over after this one.
+    ///
+    /// `filter` is the `StateFilter` the request carried, which the operation has
+    /// already refused unless it is one of [`MULTIPLEX_ALERT_STATE_FILTERS`], and
+    /// `None` when it carried none — the unfiltered listing, which is every
+    /// alert.
+    ///
+    /// `None` when the store holds no multiplex with that id — the one thing
+    /// that distinguishes "this multiplex has no alerts" (an empty page) from
+    /// "there is no such multiplex" (the caller's `NotFoundException`), exactly
+    /// as it does for
+    /// [`ComAmazonawsMedialiveMedialiveState::multiplex_program_summaries`].
+    pub fn multiplex_alert_page(
+        &self,
+        multiplex_id: &str,
+        filter: Option<&str>,
+        first: Option<u64>,
+        page_size: usize,
+    ) -> Option<(Vec<MultiplexAlert>, Option<String>)> {
+        let multiplex = self.multiplexes.get(multiplex_id)?;
+        let first = first.map_or(Bound::Unbounded, Bound::Included);
+        let mut remaining = multiplex
+            .alerts
+            .range((first, Bound::Unbounded))
+            .map(|(_, alert)| alert)
+            .filter(|alert| alert.admitted_by(filter));
+        let alerts: Vec<MultiplexAlert> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(multiplex_alert_output)
+            .collect();
+        // Absent on the last page: a token is handed out only when an alert the
+        // same filter admits is left over after the ones this page carries.
+        let next_token = remaining.next().map(|alert| alert.id.to_string());
+        Some((alerts, next_token))
     }
 
     /// The next multiplex id, as AWS shapes MediaLive resource ids: a numeric
@@ -678,6 +1047,7 @@ impl ComAmazonawsMedialiveMedialiveState {
                     to: multiplex_state::IDLE,
                 }),
                 programs: BTreeMap::new(),
+                alerts: BTreeMap::new(),
             },
         );
         Ok(id)
@@ -1038,21 +1408,122 @@ impl ComAmazonawsMedialiveMedialiveState {
         multiplex_id: &str,
         program_name: &str,
     ) -> Option<String> {
+        self.channel_feeding_multiplex_program(multiplex_id, program_name)
+            .map(|channel| channel.id.clone())
+    }
+
+    /// The channel [`Self::channel_in_multiplex_program`] reports, as its
+    /// record: one definition of "the channel that feeds this program", so the
+    /// channel a program's `ChannelId` names is the channel an alert about that
+    /// program looks at.
+    fn channel_feeding_multiplex_program(
+        &self,
+        multiplex_id: &str,
+        program_name: &str,
+    ) -> Option<&ChannelRecord> {
         self.channels
             .values()
             .filter(|channel| !channel.is_deleted())
             .find(|channel| {
-                channel.destinations.iter().any(|destination| {
-                    destination
-                        .multiplex_settings
-                        .as_ref()
-                        .is_some_and(|settings| {
-                            settings.multiplex_id.as_deref() == Some(multiplex_id)
-                                && settings.program_name.as_deref() == Some(program_name)
-                        })
-                })
+                multiplex_program_destinations(channel)
+                    .any(|fed| fed == (multiplex_id, program_name))
             })
-            .map(|channel| channel.id.clone())
+    }
+}
+
+/// The alert conditions that hold on `multiplex` as of the state `feeders`
+/// indexes.
+///
+/// Only a RUNNING multiplex has any: in every other state its pipelines are not
+/// up ([`MultiplexRecord::pipelines_running_count`] is 0), so nothing it holds
+/// is being transmitted and there is nothing to be wrong. That is also why
+/// stopping a multiplex clears the alerts a run raised.
+///
+/// The one condition observed is
+/// [`multiplex_alert_type::PROGRAM_NO_RUNNING_CHANNEL`]: a program of that
+/// running multiplex that no channel with a healthy pipeline feeds, which the
+/// control plane determines on its own — either no channel's `OutputDestination`
+/// names the program at all, or the one that does is not running. Conditions
+/// about the media itself are not observed here at all; see this module's own
+/// documentation.
+///
+/// `feeders` is the index [`ComAmazonawsMedialiveMedialiveState::multiplex_program_feeders`]
+/// built once for the whole store, so this is one hash lookup per program rather
+/// than a scan of the channels per program.
+fn multiplex_alert_conditions(
+    multiplex: &MultiplexRecord,
+    feeders: &HashMap<(&str, &str), &ChannelRecord>,
+) -> Vec<MultiplexAlertCondition> {
+    if !multiplex.is_running() {
+        return Vec::new();
+    }
+    multiplex
+        .programs
+        .values()
+        .filter_map(|program| {
+            let message = match feeders
+                .get(&(multiplex.id.as_str(), program.program_name.as_str()))
+            {
+                // Fed: at least one of the channel's pipelines is up, so its
+                // output is reaching this program.
+                Some(channel) if !channel.healthy_pipelines().is_empty() => return None,
+                Some(channel) => format!(
+                    "Multiplex program {} is fed by channel {}, which is in state {} and \
+                     has no healthy pipeline",
+                    program.program_name, channel.id, channel.state
+                ),
+                None => format!(
+                    "Multiplex program {} has no MediaLive channel sending its output to it",
+                    program.program_name
+                ),
+            };
+            Some(MultiplexAlertCondition {
+                alert_type: multiplex_alert_type::PROGRAM_NO_RUNNING_CHANNEL,
+                program_name: program.program_name.clone(),
+                message,
+            })
+        })
+        .collect()
+}
+
+/// The multiplex programs one channel's output destinations name, as
+/// (multiplex id, program name) pairs.
+///
+/// `OutputDestination$MultiplexSettings` is a
+/// `MultiplexProgramChannelDestinationSettings` carrying exactly that pair, and
+/// this is the ONE definition of "this channel sends its output to that
+/// program": both the per-program lookup and the batch index below read the
+/// destinations through it.
+fn multiplex_program_destinations(
+    channel: &ChannelRecord,
+) -> impl Iterator<Item = (&str, &str)> + '_ {
+    channel.destinations.iter().filter_map(|destination| {
+        let settings = destination.multiplex_settings.as_ref()?;
+        Some((
+            settings.multiplex_id.as_deref()?,
+            settings.program_name.as_deref()?,
+        ))
+    })
+}
+
+/// One stored alert as the model's `MultiplexAlert` shape, so every reader of an
+/// alert reports it the same way.
+fn multiplex_alert_output(alert: &MultiplexAlertRecord) -> MultiplexAlert {
+    MultiplexAlert {
+        alert_type: Some(alert.alert_type.to_string()),
+        cleared_timestamp: alert
+            .cleared_at
+            .map(::aws_smithy_types::DateTime::from),
+        id: Some(alert.id.to_string()),
+        message: Some(alert.message.clone()),
+        // ABSENT: `PipelineId` is "The ID of the pipeline this alert is
+        // associated with", and the conditions this emulator observes are
+        // properties of the multiplex and its program rather than of one
+        // pipeline, so there is no pipeline to name. Naming one would claim an
+        // observation of a pipeline this emulator does not run.
+        pipeline_id: None,
+        set_timestamp: Some(::aws_smithy_types::DateTime::from(alert.set_at)),
+        state: Some(alert.state().to_string()),
     }
 }
 

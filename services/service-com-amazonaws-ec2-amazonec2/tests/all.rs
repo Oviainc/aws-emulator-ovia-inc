@@ -65,6 +65,10 @@ mod describe_subnets;
 mod describe_vpc_attribute;
 #[path = "all/describe_vpcs.rs"]
 mod describe_vpcs;
+// The DHCP option set a VPC inherits: the Region's one default set, and what
+// `DescribeDhcpOptions` reports for it.
+#[path = "all/dhcp_options.rs"]
+mod dhcp_options;
 #[path = "all/dry_run_and_unknown_ids.rs"]
 mod dry_run_and_unknown_ids;
 // The shared ec2Query plumbing every suite drives the service through.

@@ -5,7 +5,9 @@
 //! `TableDescription` with `TableStatus=DELETING`. Deletion is asynchronous, so the
 //! table (and its items) are removed once [`crate::state::STATUS_TRANSITION`] has
 //! elapsed: until then `DescribeTable` reports `DELETING` and every item operation
-//! answers `ResourceNotFoundException`, and afterwards so does `DescribeTable`.
+//! answers `ResourceNotFoundException`, and afterwards so does `DescribeTable`. A
+//! stream the table had enabled goes to `DISABLED` in the streams service's store,
+//! as the doc below states.
 //!
 //! A table that is still `CREATING` or `UPDATING` is refused with
 //! `ResourceInUseException` — "You tried to delete a table currently in the CREATING
@@ -237,6 +239,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The clock owes the removal; the response reports the table as it stands at
         // this instant, which is DELETING.
         table.removed_at = Some(now + crate::state::STATUS_TRANSITION);
+        // "If you have DynamoDB Streams enabled on the table, then the corresponding
+        // stream on that table goes into the DISABLED state" (the doc above): the
+        // stream is the streams service's resource, so the disable is applied there.
+        // The table's own `StreamSpecification` is NOT rewritten — the description
+        // below reports how the table was configured, while the stream resource is
+        // what changes status.
+        if let Some(stream) = table.stream.clone().filter(|stream| stream.enabled) {
+            // The delete itself cannot fail on the stream: the table is going away
+            // either way. But a registry that does not hold the table's enabled
+            // stream is a broken invariant — the same one `UpdateTable` reports as a
+            // server fault — so it is logged rather than swallowed, which is also
+            // what a streams store this process cannot reach looks like from here.
+            if !crate::state::disable_table_stream(&*self.engine, &stream.arn, now) {
+                ::tracing::warn!(
+                    stream_arn = %stream.arn,
+                    table_name = %name,
+                    "the deleted table's enabled stream was not in the DynamoDB Streams registry"
+                );
+            }
+        }
         let description = table.describe(now);
 
         Ok(DeleteTableOutput {

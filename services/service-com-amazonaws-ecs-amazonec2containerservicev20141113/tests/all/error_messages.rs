@@ -5,12 +5,14 @@
 //!
 //! The rules under test:
 //!
-//! * A refusal whose condition is that a resource the request NAMES does not exist
-//!   carries ONE fixed sentence for that condition — the same text for every request
-//!   that meets it, naming neither the resource nor any other value the request carried.
-//!   Each table below therefore varies the reference (short name, name with digits, the
-//!   longest name the member accepts, a full ARN) and the operation it is sent to, and
-//!   asserts the SAME sentence comes back every time.
+//! * A refusal whose condition is that a CLUSTER, SERVICE, TASK or TASK DEFINITION the
+//!   request names does not exist carries ONE fixed sentence for that condition — the
+//!   same text for every request that meets it, naming neither the resource nor any
+//!   other value the request carried. Each table below therefore varies the reference
+//!   (short name, name with digits, the longest name the member accepts, a full ARN) and
+//!   the operation it is sent to, and asserts the SAME sentence comes back every time.
+//!   The container-instance refusal is NOT one of these: ECS builds it from the request,
+//!   which [`crate::container_instance_not_found`] pins.
 //! * A refusal the service derives from the request names the ONE member the caller has
 //!   to change, and the first such member when more than one is wrong: the task-level
 //!   members Fargate requires (`cpu` before `memory`), and the members of an EC2
@@ -40,10 +42,6 @@ const SERVICE_NOT_FOUND: &str = "Service not found.";
 const TASK_NOT_FOUND: &str = "The referenced task was not found";
 /// The fixed sentence for a `taskDefinition` that names no stored revision.
 const TASK_DEFINITION_NOT_FOUND: &str = "Unable to describe task definition.";
-/// The fixed sentence for a container-instance reference that names no registered
-/// instance. No recording fixes this wording; what the rule fixes is that it is the same
-/// for every request meeting the condition.
-const CONTAINER_INSTANCE_NOT_FOUND: &str = "The referenced container instance was not found";
 
 /// One row of an operation table: the operation's name and the request a row builds for
 /// it from the reference it is given.
@@ -316,43 +314,6 @@ async fn a_task_definition_that_does_not_exist_is_refused_with_one_fixed_sentenc
                 answered,
                 "ClientException",
                 TASK_DEFINITION_NOT_FOUND,
-                reference,
-                &case,
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn a_container_instance_that_is_not_registered_is_refused_with_one_fixed_sentence() {
-    let router = fixture().await;
-
-    let references = [
-        ("32-character id", "d".repeat(32)),
-        (
-            "full ARN",
-            format!(
-                "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:container-instance/{CLUSTER}/{}",
-                "e".repeat(32)
-            ),
-        ),
-    ];
-    let requests: [OperationRow; 2] = [
-        ("RegisterContainerInstance", |reference| {
-            json!({ "cluster": CLUSTER, "containerInstanceArn": reference })
-        }),
-        ("ListTasks", |reference| {
-            json!({ "cluster": CLUSTER, "containerInstance": reference })
-        }),
-    ];
-    for (operation, build) in requests {
-        for (form, reference) in &references {
-            let case = format!("{operation} with a {form} container instance");
-            let answered = refusal(&router, operation, build(reference), &case).await;
-            assert_refusal(
-                answered,
-                "InvalidParameterException",
-                CONTAINER_INSTANCE_NOT_FOUND,
                 reference,
                 &case,
             );

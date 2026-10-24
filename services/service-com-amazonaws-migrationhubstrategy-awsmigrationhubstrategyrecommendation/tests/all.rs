@@ -32,6 +32,9 @@ mod refusal_messages;
 #[path = "all/server_config.rs"]
 mod server_config;
 
+#[path = "all/server_details.rs"]
+mod server_details;
+
 #[path = "all/server_inventory.rs"]
 mod server_inventory;
 

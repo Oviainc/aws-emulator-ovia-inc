@@ -33,3 +33,5 @@ mod transcription_jobs;
 mod vocabularies;
 #[path = "all/vocabulary_delete_and_tag_sets.rs"]
 mod vocabulary_delete_and_tag_sets;
+#[path = "all/vocabulary_file_uri.rs"]
+mod vocabulary_file_uri;

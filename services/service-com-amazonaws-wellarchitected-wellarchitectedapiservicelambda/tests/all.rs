@@ -26,6 +26,9 @@ mod custom_lens_versions;
 #[path = "all/lens_listing.rs"]
 mod lens_listing;
 
+#[path = "all/lens_resolution.rs"]
+mod lens_resolution;
+
 #[path = "all/lens_review_answers.rs"]
 mod lens_review_answers;
 

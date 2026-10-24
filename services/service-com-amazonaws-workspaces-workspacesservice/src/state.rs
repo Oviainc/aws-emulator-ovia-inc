@@ -857,6 +857,45 @@ pub const DEFAULT_ACCOUNT_LINK_PAGE_SIZE: usize = 25;
 pub const ACCOUNT_LINK_ACCESS_DENIED_MESSAGE: &str =
     "Please ensure both accounts to be linked exist and belong to the same parent AWS Organization.";
 
+/// The message every account-link `ValidationException` carries.
+///
+/// The account-link API states a refusal by its ERROR CLASS, not by the request:
+/// recorded responses show three different operations refusing two different
+/// members (`CreateAccountLinkInvitation$TargetAccountId`, `GetAccountLink$LinkId`,
+/// `DeleteAccountLinkInvitation$LinkId`), each with a value of its own, all
+/// answering ONE sentence that names neither the member, nor the value, nor the
+/// constraint. What is load-bearing is that the text is the same for every such
+/// request — this particular sentence is the one a recording carried.
+pub const ACCOUNT_LINK_INVALID_REQUEST_MESSAGE: &str = "The request is invalid.";
+
+/// The message every account-link `ResourceNotFoundException` carries.
+///
+/// Request-independent for the same reason: two different link ids produce one
+/// identical sentence in the recordings. The identifier the caller sent is
+/// reported in the shape's own `ResourceId` member ("The ID of the resource that
+/// could not be found"), which is where this API carries resource identity —
+/// never in the prose.
+pub const ACCOUNT_LINK_NOT_FOUND_MESSAGE: &str = "Requested AccountLink could not be found.";
+
+/// The message a `ConflictException` carries when the target account already
+/// holds a link or an invitation.
+///
+/// The sentence the model itself documents for `ConflictException` ("The
+/// TargetAccountId is already linked or invited."), and request-independent as
+/// every account-link message is.
+pub const ACCOUNT_LINK_ALREADY_LINKED_MESSAGE: &str =
+    "The TargetAccountId is already linked or invited.";
+
+/// The message a `ConflictException` carries when the stored link's current
+/// status forbids the change asked for — answering an invitation that was already
+/// answered, or deleting a link that is established.
+///
+/// AWS publishes no wording for this case, so what is load-bearing is the error
+/// SHAPE and that the text is a property of the class rather than of the request:
+/// it names neither the link the caller asked about nor the status it is in.
+pub const ACCOUNT_LINK_STATUS_CONFLICT_MESSAGE: &str =
+    "The account link's current status does not allow this change.";
+
 /// The most account links this emulator stores at once.
 ///
 /// This is the emulator's OWN bound on an in-memory store, not an AWS quota: a
@@ -1202,11 +1241,23 @@ impl AccountLinkFailure {
 
     /// The `ResourceNotFoundException` for a link identifier that names no
     /// stored link.
+    ///
+    /// The identifier travels in `resource_id`, which the handler renders into
+    /// the shape's `ResourceId` member; the message is the class's fixed
+    /// [`ACCOUNT_LINK_NOT_FOUND_MESSAGE`], so two requests naming two unknown
+    /// links are refused with one identical sentence.
     fn not_found(resource_id: &str) -> Self {
         Self::NotFound {
             resource_id: resource_id.to_string(),
-            message: format!("The account link {resource_id} could not be found."),
+            message: ACCOUNT_LINK_NOT_FOUND_MESSAGE.to_string(),
         }
+    }
+
+    /// The `ValidationException` for an account-link request this service
+    /// refuses as invalid, worded as the class's fixed
+    /// [`ACCOUNT_LINK_INVALID_REQUEST_MESSAGE`].
+    fn invalid() -> Self {
+        Self::Validation(ACCOUNT_LINK_INVALID_REQUEST_MESSAGE.to_string())
     }
 }
 
@@ -2169,9 +2220,7 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
         // (A missing `TargetAccountId` is refused before a handler runs — the
         // member is `required`.)
         if target_account_id == source_account_id {
-            return Err(AccountLinkFailure::Validation(format!(
-                "TargetAccountId {target_account_id} must not be the same value as SourceAccountId."
-            )));
+            return Err(AccountLinkFailure::invalid());
         }
 
         // Both accounts have to exist and share one parent organization. The
@@ -2196,23 +2245,22 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
                 if existing.target_account_id == target_account_id {
                     return Ok(existing.clone());
                 }
-                return Err(AccountLinkFailure::Validation(format!(
-                    "ClientToken {token} was already used to invite TargetAccountId {}.",
-                    existing.target_account_id
-                )));
+                // A token already spent on another target is an invalid
+                // request, stated as the class's one sentence: the token the
+                // caller sent, and the target it was spent on, stay out of it.
+                return Err(AccountLinkFailure::invalid());
             }
         }
 
         // `ConflictException`: "The TargetAccountId is already linked or invited."
-        if let Some(existing) = self.account_links.values().find(|record| {
+        if self.account_links.values().any(|record| {
             record.source_account_id == source_account_id
                 && record.target_account_id == target_account_id
                 && record.status.holds_target_account()
         }) {
-            return Err(AccountLinkFailure::Conflict(format!(
-                "The TargetAccountId {target_account_id} is already linked or invited by account link {}.",
-                existing.account_link_id
-            )));
+            return Err(AccountLinkFailure::Conflict(
+                ACCOUNT_LINK_ALREADY_LINKED_MESSAGE.to_string(),
+            ));
         }
 
         // The store is bounded: refuse rather than grow without end.
@@ -2245,7 +2293,7 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
         &mut self,
         account_link_id: &str,
     ) -> Result<AccountLinkRecord, AccountLinkFailure> {
-        self.answer_invitation(account_link_id, AccountLinkStatus::Linked, "accepted")
+        self.answer_invitation(account_link_id, AccountLinkStatus::Linked)
     }
 
     /// Reject the invitation `account_link_id` names: the link becomes `REJECTED`.
@@ -2253,7 +2301,7 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
         &mut self,
         account_link_id: &str,
     ) -> Result<AccountLinkRecord, AccountLinkFailure> {
-        self.answer_invitation(account_link_id, AccountLinkStatus::Rejected, "rejected")
+        self.answer_invitation(account_link_id, AccountLinkStatus::Rejected)
     }
 
     /// Delete the invitation `account_link_id` names.
@@ -2269,10 +2317,9 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
     ) -> Result<AccountLinkRecord, AccountLinkFailure> {
         let record = self.account_link_mut(account_link_id)?;
         if record.status == AccountLinkStatus::Linked {
-            return Err(AccountLinkFailure::Conflict(format!(
-                "The account link {account_link_id} is in status {} and cannot be deleted.",
-                record.status.as_wire()
-            )));
+            return Err(AccountLinkFailure::Conflict(
+                ACCOUNT_LINK_STATUS_CONFLICT_MESSAGE.to_string(),
+            ));
         }
         let mut removed = record.clone();
         self.remove_account_link(account_link_id);
@@ -2289,14 +2336,12 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
         &mut self,
         account_link_id: &str,
         answered: AccountLinkStatus,
-        action: &str,
     ) -> Result<AccountLinkRecord, AccountLinkFailure> {
         let record = self.account_link_mut(account_link_id)?;
         if record.status != AccountLinkStatus::PendingAcceptanceByTargetAccount {
-            return Err(AccountLinkFailure::Conflict(format!(
-                "The account link {account_link_id} is in status {} and cannot be {action}.",
-                record.status.as_wire()
-            )));
+            return Err(AccountLinkFailure::Conflict(
+                ACCOUNT_LINK_STATUS_CONFLICT_MESSAGE.to_string(),
+            ));
         }
         record.status = answered;
         Ok(record.clone())

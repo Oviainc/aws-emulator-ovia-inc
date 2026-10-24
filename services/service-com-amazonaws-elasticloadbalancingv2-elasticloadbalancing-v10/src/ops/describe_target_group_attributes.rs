@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTargetGroupAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTargetGroupAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTargetGroupAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the attributes of a persisted target group: every attribute the model
+//! documents for a group of its shape, carrying what a caller set through
+//! `ModifyTargetGroupAttributes` or, failing that, the default that attribute's own
+//! documentation states. A read only — nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +134,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTargetGroupAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTargetGroupAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTargetGroupAttributes"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("DescribeTargetGroupAttributes")
+        })?;
+
+        let guard = state.lock();
+        let Some(group) = guard.target_groups.get(&input.target_group_arn) else {
+            return Err(
+                DescribeTargetGroupAttributesErrorModeled::TargetGroupNotFoundException(
+                    TargetGroupNotFoundException {
+                        message: Some(crate::state::target_groups_not_found_message([
+                            input.target_group_arn.as_str(),
+                        ])),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(DescribeTargetGroupAttributesOutput {
+            attributes: Some(group.attribute_shapes()),
+        })
     }
 }

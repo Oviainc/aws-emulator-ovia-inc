@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutKeyPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutKeyPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Attaches a key policy to a KMS key: the document the request carries REPLACES the
+//! one the key holds under the only name KMS serves a policy under
+//! (`crate::state::KEY_POLICY_NAME_DEFAULT`), and `GetKeyPolicy` reads it back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutKeyPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The document is judged by `crate::state::validate_key_policy` — the criteria the
+//! `Policy` member states, shared with `CreateKey` — and bounded by KMS's key policy
+//! quota (`crate::state::MAX_KEY_POLICY_BYTES`). `BypassPolicyLockoutSafetyCheck` is
+//! accepted and has no effect, for the reason `create_key.rs` records: the lockout
+//! check asks whether the policy lets the CALLING PRINCIPAL make a subsequent
+//! `PutKeyPolicy` request, which needs the caller's IAM identity this emulator does
+//! not model. A refused request persists nothing: the key keeps the policy it had.
 //!
 //! ## Shape of an operation
 //!
@@ -212,18 +214,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutKeyPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutKeyPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutKeyPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutKeyPolicyErrorModeled::KMSInternalException(KMSInternalException {
+                message: Some("the KMS state store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        // "If no policy name is specified, the default value is default. The only
+        // valid value is default."
+        // (`smithy_query(query="doc",shape="PutKeyPolicyRequest",member="PolicyName")`)
+        let policy_name = input
+            .policy_name
+            .clone()
+            .unwrap_or_else(|| crate::state::KEY_POLICY_NAME_DEFAULT.to_string());
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        let key = match state.resolve_mut(&region, &input.key_id) {
+            crate::state::KeyRefMut::Found(key) => key,
+            crate::state::KeyRefMut::MalformedArn => {
+                return Err(PutKeyPolicyErrorModeled::InvalidArnException(InvalidArnException {
+                    message: Some(crate::state::invalid_arn_message(&input.key_id)),
+                })
+                .into());
+            }
+            crate::state::KeyRefMut::NotFound => {
+                return Err(PutKeyPolicyErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                })
+                .into());
+            }
+        };
+
+        // A key holds a policy under one name only, so any other name asks for a
+        // policy the key does not have. This precedence is deliberate: the name is
+        // about WHICH resource the request addresses, so it is judged before the key
+        // state, which is about whether this call may change that resource.
+        if policy_name != crate::state::KEY_POLICY_NAME_DEFAULT {
+            return Err(PutKeyPolicyErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::policy_not_found_message(key, &policy_name)),
+            })
+            .into());
+        }
+
+        // A key scheduled for deletion is not in a key state this operation accepts:
+        // its policy stays as it was until `CancelKeyDeletion` restores the key.
+        // Reading the policy back is still allowed, as `GetKeyPolicy` and
+        // `DescribeKey` show.
+        if key.key_state == crate::state::KEY_STATE_PENDING_DELETION {
+            return Err(PutKeyPolicyErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    message: Some(crate::state::invalid_state_message(key)),
+                },
+            )
+            .into());
+        }
+
+        // The document is judged LAST, and nothing is written until it passes, so a
+        // refusal leaves the key with exactly the policy it had.
+        if input.policy.len() > crate::state::MAX_KEY_POLICY_BYTES {
+            return Err(PutKeyPolicyErrorModeled::LimitExceededException(LimitExceededException {
+                message: Some(format!(
+                    "A key policy document can be at most {} bytes, but the request carried {}.",
+                    crate::state::MAX_KEY_POLICY_BYTES,
+                    input.policy.len()
+                )),
+            })
+            .into());
+        }
+        if let Err(reason) = crate::state::validate_key_policy(&input.policy) {
+            return Err(PutKeyPolicyErrorModeled::MalformedPolicyDocumentException(
+                MalformedPolicyDocumentException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+
+        // "Attaches a key policy to the specified KMS key"
+        // (`smithy_query(query="doc",shape="PutKeyPolicy")`): the document the request
+        // carries REPLACES the one the key held, whatever it was, and is what
+        // `GetKeyPolicy` reports from then on. It is stored verbatim — KMS serves the
+        // document as it was attached, not a re-rendering of it.
+        key.policy = input.policy;
+
+        Ok(PutKeyPolicyOutput)
     }
 }

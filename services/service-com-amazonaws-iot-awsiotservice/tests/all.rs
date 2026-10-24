@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/authorizer_registry.rs"]
 mod authorizer_registry;
+#[path = "all/command_execution_listing.rs"]
+mod command_execution_listing;
 #[path = "all/command_registry.rs"]
 mod command_registry;
 #[path = "all/describe_endpoint.rs"]

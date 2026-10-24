@@ -3,11 +3,12 @@
 //! @op StartCostEstimation
 //! Starts the account's single cost estimation ([`crate::state::CostEstimationRecord`]).
 //!
-//! A cost estimate prices the resources DevOps Guru analyses, so the collection is
-//! resolved against the analysis coverage `UpdateResourceCollection` maintains: a
-//! CloudFormation stack or an app-boundary tag value that coverage does not hold
-//! selects no resource this estimate could be made for, and is refused with
-//! `ResourceNotFoundException` naming it. The estimate is created asynchronously — it
+//! A cost estimate prices the resources the collection THIS request submits selects,
+//! which is why the operation takes its own `CostEstimationResourceCollectionFilter`
+//! instead of reading the analysis coverage `UpdateResourceCollection` maintains: the
+//! estimate exists so a customer can price analysis of resources BEFORE enabling
+//! analysis for them, so a collection outside the account's coverage is estimated
+//! exactly like one inside it. The estimate is created asynchronously — it
 //! is due [`crate::state::COST_ESTIMATION_DURATION`] after this call, and
 //! `GetCostEstimation` reports `ONGOING` until then — so a second start while one is
 //! still running is a `ConflictException`, except for a retry under the same
@@ -244,59 +245,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // What the estimate prices: the resources the account's analysis coverage holds
-        // for the collection this request names. This emulator performs none of AWS's
-        // own per-service resource discovery, so the coverage a client declared through
-        // `UpdateResourceCollection` is the whole inventory there is to count.
-        let coverage = &guard.resource_collection;
+        // What the estimate prices: the resource boundaries the SUBMITTED collection
+        // names — never the account's analysis coverage, which this operation does not
+        // read. The estimate is the price of analysing what the collection selects,
+        // whether or not analysis has been enabled for it, so a pre-onboarding start
+        // (`StartCostEstimation` → `GetCostEstimation` → `UpdateResourceCollection`)
+        // prices the same collection an onboarded one does. This emulator performs
+        // none of AWS's own per-service resource discovery, so the countable unit is
+        // the boundary entry the request names: one CloudFormation stack, one
+        // app-boundary tag value.
         let mut costs: Vec<crate::state::ResourceCostRecord> = Vec::new();
 
-        // A stack is a named resource: an estimate for a stack the coverage does not
-        // contain is an estimate for a resource DevOps Guru does not analyse.
-        if let Some(stack_names) = stack_names.as_ref() {
-            if let Some(missing) = stack_names
-                .iter()
-                .find(|name| !coverage.cloudformation_stack_names.contains(*name))
-            {
-                return Err(uncovered_resource(
-                    format!(
-                        "no CloudFormation stack named '{missing}' is in the resource collection DevOps Guru analyzes"
-                    ),
-                    missing.clone(),
-                    crate::state::COST_ESTIMATION_STACK_TYPE,
-                ));
-            }
-            if let Some(count) = positive_count(stack_names.len()) {
-                costs.push(resource_cost(
-                    crate::state::COST_ESTIMATION_STACK_TYPE,
-                    count,
-                ));
-            }
+        if let Some(count) = stack_names
+            .as_ref()
+            .and_then(|stack_names| positive_count(stack_names.len()))
+        {
+            costs.push(resource_cost(
+                crate::state::COST_ESTIMATION_STACK_TYPE,
+                count,
+            ));
         }
 
-        // A tag identifies resources the same way: an app-boundary key and value no
-        // covered resource carries selects nothing DevOps Guru analyses, so there is no
-        // resource for the estimate to price.
-        if let Some(tags) = tags.as_ref() {
-            let named: usize = tags.iter().map(|(_, tag_values)| tag_values.len()).sum();
-            for (app_boundary_key, tag_values) in tags {
-                let covered = coverage.tag_collections.get(app_boundary_key);
-                if let Some(missing) = tag_values
-                    .iter()
-                    .find(|value| covered.is_none_or(|values| !values.contains(*value)))
-                {
-                    // `key`/`value` is the model's own notation for a tag.
-                    let tag = format!("{app_boundary_key}/{missing}");
-                    return Err(uncovered_resource(
-                        INVALID_TAG_MESSAGE.to_string(),
-                        tag,
-                        crate::state::COST_ESTIMATION_TAG_TYPE,
-                    ));
-                }
-            }
-            if let Some(count) = positive_count(named) {
-                costs.push(resource_cost(crate::state::COST_ESTIMATION_TAG_TYPE, count));
-            }
+        if let Some(count) = tags
+            .as_ref()
+            .and_then(|tags| positive_count(tags.iter().map(|(_, values)| values.len()).sum()))
+        {
+            costs.push(resource_cost(crate::state::COST_ESTIMATION_TAG_TYPE, count));
         }
 
         // The estimate is created asynchronously: the record is stored now, due at an
@@ -315,29 +289,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The message DevOps Guru answers a tag that selects no analysed resource with.
-///
-/// A FIXED string, not built from the request: the recorded AWS response for exactly
-/// this refusal carries this text and names no tag, so the identity of the tag travels
-/// in the error's `ResourceId` instead. The stack refusal keeps a message built from
-/// the request, which names the stack and the rule it broke, because no recorded AWS
-/// wording for that one is known.
-const INVALID_TAG_MESSAGE: &str = "Invalid tag in the request";
-
-/// A `ResourceNotFoundException` (HTTP 404) refusing a collection that names a
-/// resource the account's analysis coverage does not hold, naming that resource.
-fn uncovered_resource(
-    message: String,
-    resource_id: String,
-    resource_type: &str,
-) -> StartCostEstimationError {
-    StartCostEstimationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message,
-        resource_id,
-        resource_type: resource_type.to_string(),
-    })
-    .into()
-}
+// `ResourceNotFoundException` (HTTP 404) stays modelled for this operation but is
+// never answered here: AWS reserves it for a collection whose named resources do not
+// exist at all, and this emulator holds no cross-service resource inventory to decide
+// that. It is NOT the answer to a collection outside the account's analysis coverage,
+// which this operation does not consult.
 
 /// A `ValidationException` (HTTP 400) refusing a resource collection no estimate can
 /// be made for, naming the member and the rule it broke.

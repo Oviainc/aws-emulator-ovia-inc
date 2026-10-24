@@ -7940,6 +7940,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810",
  "sha2 0.10.9",
  "tokio",
  "tracing",

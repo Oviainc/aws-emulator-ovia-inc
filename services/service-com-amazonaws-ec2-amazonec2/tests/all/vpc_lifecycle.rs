@@ -213,8 +213,8 @@ async fn create_vpc_canonicalises_the_cidr_block_and_round_trips_through_describ
     );
     assert_eq!(
         dhcp_option_sets.len(),
-        ids.len(),
-        "every VPC this store creates carries a DHCP option set id of its own, got \
+        1,
+        "every VPC of one Region inherits that Region's one default DHCP option set, got \
          {dhcp_option_sets:?}"
     );
 

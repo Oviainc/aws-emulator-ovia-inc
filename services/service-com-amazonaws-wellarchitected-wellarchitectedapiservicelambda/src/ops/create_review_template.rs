@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReviewTemplate
-//! IMPLEMENTED: mints a review template and stores the whole record in
+//! IMPLEMENTED: resolves every lens the request applies against the service's lens
+//! catalog, then mints a review template and stores the whole record in
 //! [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::review_templates`],
 //! so `GetReviewTemplate` and a `CreateWorkload` that applies the template both see it.
 //!
@@ -244,6 +245,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .forget(&input.client_request_token);
         }
 
+        // "Lenses applied to the review template" (`CreateReviewTemplateInput$Lenses`
+        // doc), and "Each lens is identified by its `LensSummary$LensAlias`" (`LensAlias`
+        // doc): a lens is applied BY NAME, so every name has to resolve to a lens — one
+        // AWS publishes, or a custom lens this account holds and has published a version
+        // of ("The lens cannot be applied to workloads … until it's published with
+        // CreateLensVersion", `ImportLens` doc). Resolved before the template is minted,
+        // so the store never holds a template whose lens review no lens backs — which
+        // `GetReviewTemplate`, `ListReviewTemplateAnswers` and a `CreateWorkload` that
+        // applies the template would all then report.
+        //
+        // It runs after the idempotency replay above, so a genuine retry is still answered
+        // with the original request's result, over a list the lens quota at the top of this
+        // handler has already bounded, and before the template quota below, so a caller
+        // learns that its request named no lens rather than that the account is full.
+        let now = std::time::SystemTime::now();
+        match store.unapplicable_lenses_refusal(&input.lenses, now) {
+            Some(crate::state::LensesRefusal::NotFound(exception)) => {
+                return Err(
+                    CreateReviewTemplateErrorModeled::ResourceNotFoundException(exception).into(),
+                );
+            }
+            Some(crate::state::LensesRefusal::Unapplicable(exception)) => {
+                return Err(
+                    CreateReviewTemplateErrorModeled::ValidationException(exception).into(),
+                );
+            }
+            None => {}
+        }
+
         // Review templates are metered, and this operation models
         // `ServiceQuotaExceededException` for the case. Refusing here is also what keeps
         // the store bounded: the create tokens are 1:1 with a live template. The ceiling
@@ -280,7 +310,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The account that created the template owns it (`ReviewTemplate$Owner` is an
             // `AwsAccountId`), and this emulator serves one account.
             owner: ::engine::emulator_account_id().to_string(),
-            updated_at: std::time::SystemTime::now(),
+            // The instant this request is being served at — the one the lenses above were
+            // resolved as of, so the record carries one instant rather than two readings of
+            // the clock.
+            updated_at: now,
             tags,
             // A new template's lens reviews carry no answers yet: every question of
             // every applied lens is `UNANSWERED` until one is recorded.

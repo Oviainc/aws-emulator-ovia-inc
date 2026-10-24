@@ -150,6 +150,10 @@ impl StoredAddress {
 
 /// One stored job: the state the service minted for it plus every `CreateJob` input it
 /// was given, so `DescribeJob` and `ListJobs` report what was persisted.
+///
+/// A record is either a plain job, the *main* job of an export order, or one of that
+/// order's *job parts* — the three things this API's job ids name. [`Self::job_part_ids`]
+/// is what tells them apart.
 #[derive(Debug, Clone)]
 pub struct StoredJob {
     pub job_id: String,
@@ -178,15 +182,35 @@ pub struct StoredJob {
     pub remote_management: Option<String>,
     pub impact_level: Option<String>,
     pub pickup_details: Option<PickupDetails>,
+    /// This job's job parts, in the order they were created: the device-bearing jobs an
+    /// export order was split into. Empty for a job part and for every job that is not an
+    /// export order's main job.
+    pub job_part_ids: Vec<String>,
 }
 
 impl StoredJob {
+    /// Whether this record is a main job.
+    ///
+    /// `JobListEntry$IsMaster`: "A main job represents a successful request to create an
+    /// export job. Main jobs aren't associated with any Snowballs. Instead, each main job
+    /// will have at least one job part, and each job part is associated with a Snowball."
+    /// Holding at least one job part is therefore exactly what makes a job a main job,
+    /// which is why this is derived from [`Self::job_part_ids`] rather than stored beside
+    /// it: a main job with no parts, or a part-bearing job that reports itself as a plain
+    /// job, cannot be represented.
+    pub fn is_master(&self) -> bool {
+        !self.job_part_ids.is_empty()
+    }
+
     /// This record as the modelled `JobMetadata` `DescribeJob` reports.
     ///
     /// The members that describe work no device has done yet are absent rather than
     /// zeroed: `DataTransferProgress` is documented as available only while a job is
     /// `InProgress`, `JobLogInfo` only once a transfer has produced a report, and
-    /// `SnowballId` only once a device is associated with the job.
+    /// `SnowballId` only once a device is associated with the job — which for a main job
+    /// is never ("Main jobs aren't associated with any Snowballs") and for every other
+    /// job, job parts included, is once an appliance has been prepared for it, i.e. once
+    /// it has left `New`.
     pub fn to_job_metadata(&self) -> JobMetadata {
         JobMetadata {
             job_id: Some(self.job_id.clone()),
@@ -228,11 +252,9 @@ impl StoredJob {
         JobListEntry {
             job_id: Some(self.job_id.clone()),
             job_state: Some(self.job_state.as_wire().to_string()),
-            // A main job represents a successful request to create an EXPORT job and is
-            // the parent of the job parts (`JobListEntry$IsMaster`). A job this service
-            // mints is a job in its own right — its id carries the `JID` form, not the
-            // `MID` one — so it is never a main job.
-            is_master: false,
+            // The main job of an export order is reported as the main job; its job parts
+            // and every plain job are not (`JobListEntry$IsMaster`).
+            is_master: self.is_master(),
             job_type: self.job_type.clone(),
             snowball_type: self.snowball_type.clone(),
             creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
@@ -319,9 +341,13 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
         self.addresses.len() < MAX_STORED_ADDRESSES
     }
 
-    /// Whether this store can hold another job, i.e. is below [`MAX_STORED_JOBS`].
-    pub fn can_store_another_job(&self) -> bool {
-        self.jobs.len() < MAX_STORED_JOBS
+    /// Whether this store can hold `additional` more jobs without passing
+    /// [`MAX_STORED_JOBS`].
+    ///
+    /// An order is stored whole or not at all — an export order is a main job plus its
+    /// job parts — so the ceiling is asked about the whole order rather than one record.
+    pub fn can_store_jobs(&self, additional: usize) -> bool {
+        self.jobs.len() + additional <= MAX_STORED_JOBS
     }
 
     /// Mint the next `AddressId`: the 40-character form the modelled pattern
@@ -332,14 +358,19 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     }
 
     /// Mint the next `JobId`: the 39-character form the modelled pattern
-    /// `^(M|J)ID[0-9a-f]{8}-…$` admits.
-    ///
-    /// The `MID` form is a main job's id — the parent of the job parts an export job is
-    /// split into — and this service mints none, so every job it creates gets the `JID`
-    /// form.
+    /// `^(M|J)ID[0-9a-f]{8}-…$` admits, in the `JID` form a job associated with a device
+    /// carries — a plain job, or one job part of an export order.
     pub fn mint_job_id(&mut self) -> String {
         self.next_job_seq += 1;
         mint_id("JID", self.next_job_seq, SystemTime::now())
+    }
+
+    /// Mint the next main job's `JobId`: the same 39-character form in the `MID` variant
+    /// the modelled pattern's `M` alternative is for — the id of the main job an export
+    /// order's job parts hang off, which is associated with no device.
+    pub fn mint_main_job_id(&mut self) -> String {
+        self.next_job_seq += 1;
+        mint_id("MID", self.next_job_seq, SystemTime::now())
     }
 
     /// Store `address` under its minted id, or answer `false` when this store is at
@@ -355,15 +386,38 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
         true
     }
 
-    /// Store `job` as the newest job, or answer `false` when this store is at
-    /// [`MAX_STORED_JOBS`] — enforced at the insertion point for the same reason.
-    pub fn insert_job(&mut self, job: StoredJob) -> bool {
-        if !self.can_store_another_job() {
+    /// Store a whole order as the newest jobs — one plain job, or an export order's main
+    /// job followed by its job parts — or answer `false`, storing nothing, when this store
+    /// cannot hold all of it without passing [`MAX_STORED_JOBS`].
+    ///
+    /// The ceiling is enforced HERE, at the insertion point, and over the whole order, so
+    /// a create can neither exceed it by forgetting to ask [`Self::can_store_jobs`] first
+    /// nor leave a main job behind with the parts it needs unstored.
+    pub fn insert_job_order(&mut self, jobs: Vec<StoredJob>) -> bool {
+        if !self.can_store_jobs(jobs.len()) {
             return false;
         }
-        self.job_order.push(job.job_id.clone());
-        self.jobs.insert(job.job_id.clone(), job);
+        for job in jobs {
+            self.job_order.push(job.job_id.clone());
+            self.jobs.insert(job.job_id.clone(), job);
+        }
         true
+    }
+
+    /// The job parts of `job_id`, in the order they were created, or an empty slice's
+    /// worth when that job has none (a job part, or any job that is not a main job).
+    ///
+    /// A part id a main job names always resolves: nothing in this API removes a job.
+    pub fn job_parts(&self, job_id: &str) -> Vec<&StoredJob> {
+        self.jobs
+            .get(job_id)
+            .map(|job| {
+                job.job_part_ids
+                    .iter()
+                    .filter_map(|part_id| self.jobs.get(part_id))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Every stored job in creation order — the order `ListJobs` pages over.

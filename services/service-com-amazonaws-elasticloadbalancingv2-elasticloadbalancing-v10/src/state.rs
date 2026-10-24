@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Action, AvailabilityZone, Certificate, Listener, LoadBalancer, LoadBalancerAddress,
-    LoadBalancerState, Matcher, TargetDescription, TargetGroup, TargetHealth,
+    LoadBalancerState, Matcher, TargetDescription, TargetGroup, TargetGroupAttribute, TargetHealth,
     TargetHealthDescription, TrustStore,
 };
 
@@ -229,6 +229,416 @@ impl MatcherRecord {
     }
 }
 
+/// The path an HTTP-semantic health check checks when the request names none, from
+/// `HealthCheckPath`'s own documentation: "[HTTP1 or HTTP2 protocol version] The ping
+/// path. The default is /. [GRPC protocol version] The path of a custom health check
+/// method with the format /package.service/method. The default is
+/// /AWS.ALB/healthcheck."
+pub fn default_health_check_path(protocol_version: Option<&str>) -> String {
+    if protocol_version == Some("GRPC") {
+        "/AWS.ALB/healthcheck".to_string()
+    } else {
+        "/".to_string()
+    }
+}
+
+/// The response codes an HTTP-semantic health check accepts when the request names
+/// none: `200` for an HTTP target group, and the gRPC success code `12` for a gRPC one
+/// (`Matcher`: "[HTTP/HTTPS health checks] The HTTP or gRPC codes to use when checking
+/// for a successful response from a target").
+pub fn default_health_check_matcher(protocol_version: Option<&str>) -> MatcherRecord {
+    if protocol_version == Some("GRPC") {
+        MatcherRecord {
+            http_code: None,
+            grpc_code: Some("12".to_string()),
+        }
+    } else {
+        MatcherRecord {
+            http_code: Some("200".to_string()),
+            grpc_code: None,
+        }
+    }
+}
+
+/// The message Elastic Load Balancing answers a `TargetGroupNotFound` with for an
+/// operation naming the target group it acts on — one `TargetGroupArn`: the identifier
+/// the request carried, quoted, under a PLURAL noun whatever its number.
+///
+/// Built from the request, because the identifier it names is the only thing the caller
+/// can act on. The recorded answer to a `DescribeTargetGroupAttributes` of a deleted
+/// target group is `Target groups
+/// 'arn:aws:elasticloadbalancing:…:targetgroup/…/…' not found` — one identifier under
+/// the plural noun.
+pub fn target_groups_not_found_message<'a>(
+    identifiers: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let named: Vec<&str> = identifiers.into_iter().collect();
+    format!("Target groups '{}' not found", named.join(", "))
+}
+
+/// The message Elastic Load Balancing answers a `TargetGroupNotFound` with for a read
+/// over a LIST of identifiers (`DescribeTargetGroups`, whose `TargetGroupArns` and
+/// `Names` are both lists).
+///
+/// There the refusal is about the request's whole selection rather than one entry of it,
+/// and the service names no value — the same shape of message its sibling list reads
+/// answer ('One or more listeners not found'), and what the recorded
+/// `DescribeTargetGroups` of an absent ARN answers (a replay of that step accepts this
+/// sentence and rejects one naming the ARN, which is why the two wordings differ).
+pub fn target_group_selection_not_found_message() -> String {
+    "One or more target groups not found".to_string()
+}
+
+/// Whether a protocol carries HTTP semantics, which is what decides whether a health
+/// check has a path and a response-code matcher and whether a target group reports a
+/// `ProtocolVersion`.
+pub fn is_http_protocol(protocol: Option<&str>) -> bool {
+    matches!(protocol, Some("HTTP") | Some("HTTPS"))
+}
+
+/// The protocols a HEALTH CHECK may use, from `HealthCheckProtocol`'s own
+/// documentation: "The GENEVE, TLS, UDP, TCP_UDP, QUIC, and TCP_QUIC protocols are not
+/// supported for health checks" — leaving HTTP, HTTPS and TCP.
+pub const HEALTH_CHECK_PROTOCOLS: &[&str] = &["HTTP", "HTTPS", "TCP"];
+
+/// The published maximum length of a target group name, from `CreateTargetGroup`'s
+/// `Name` documentation: "can have a maximum of 32 characters".
+pub const TARGET_GROUP_NAME_MAX_LENGTH: usize = 32;
+
+/// Which family of load balancer a target group serves, which is what decides WHICH
+/// attributes it carries (the families the model's `TargetGroupAttribute$Key`
+/// documentation groups the attributes by) and what its health check defaults to.
+///
+/// Derived from the target group's own protocol, as the model's `Protocol`
+/// documentation pairs them: "For Application Load Balancers, the supported protocols
+/// are HTTP and HTTPS. For Network Load Balancers, the supported protocols are TCP,
+/// TLS, UDP, TCP_UDP, QUIC, or TCP_QUIC. For Gateway Load Balancers, the supported
+/// protocol is GENEVE." A `lambda` target group has no protocol at all and is an
+/// Application Load Balancer's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadBalancerFamily {
+    Application,
+    Network,
+    Gateway,
+}
+
+/// The set of values one target group attribute accepts, as its own documentation
+/// states it (`smithy_query(query="doc",shape="TargetGroupAttribute",member="Key")`).
+#[derive(Debug, Clone, Copy)]
+pub enum AttributeDomain {
+    /// "The value is `true` or `false`."
+    Boolean,
+    /// An integer in the documented inclusive range.
+    Integer { min: i64, max: i64 },
+    /// The literal `off`, or an integer in the documented inclusive range.
+    IntegerOrOff { min: i64, max: i64 },
+    /// `0` (the documented "disabled"), or an integer in the documented range.
+    ZeroOrInteger { min: i64, max: i64 },
+    /// One of a documented set of literals.
+    OneOf(&'static [&'static str]),
+    /// A cookie name: any value whose prefix is not one the load balancer reserves.
+    CookieName,
+}
+
+/// The cookie-name prefixes `stickiness.app_cookie.cookie_name` may not carry:
+/// "Names that start with the following prefixes are not allowed: AWSALB, AWSALBAPP,
+/// and AWSALBTG; they're reserved for use by the load balancer."
+const RESERVED_COOKIE_PREFIXES: &[&str] = &["AWSALB", "AWSALBAPP", "AWSALBTG"];
+
+impl AttributeDomain {
+    /// Whether `value` is in this domain, and — when it is not — the domain stated the
+    /// way the attribute's documentation states it, so a refusal can name it.
+    pub fn check(&self, value: &str) -> Result<(), String> {
+        let integer = |min: i64, max: i64| -> Result<(), String> {
+            match value.parse::<i64>() {
+                Ok(parsed) if parsed >= min && parsed <= max => Ok(()),
+                _ => Err(format!("an integer from {min} to {max}")),
+            }
+        };
+        match *self {
+            Self::Boolean => match value {
+                "true" | "false" => Ok(()),
+                _ => Err("'true' or 'false'".to_string()),
+            },
+            Self::Integer { min, max } => integer(min, max),
+            Self::IntegerOrOff { min, max } => {
+                if value == "off" {
+                    return Ok(());
+                }
+                integer(min, max).map_err(|domain| format!("'off' or {domain}"))
+            }
+            Self::ZeroOrInteger { min, max } => {
+                if value == "0" {
+                    return Ok(());
+                }
+                integer(min, max).map_err(|domain| format!("0 or {domain}"))
+            }
+            Self::OneOf(values) => {
+                if values.contains(&value) {
+                    return Ok(());
+                }
+                Err(format!("one of {}", values.join(", ")))
+            }
+            Self::CookieName => {
+                if RESERVED_COOKIE_PREFIXES
+                    .iter()
+                    .any(|prefix| value.starts_with(prefix))
+                {
+                    return Err(format!(
+                        "a name not starting with {}",
+                        RESERVED_COOKIE_PREFIXES.join(", ")
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// One target group attribute: which target groups carry it, what it accepts, and the
+/// value it reports until something sets it.
+pub struct AttributeSpec {
+    pub key: &'static str,
+    pub domain: AttributeDomain,
+    /// Whether a target group of this shape carries the attribute at all.
+    applies: fn(&TargetGroupRecord) -> bool,
+    /// The documented default, or `None` for an attribute the model documents no
+    /// default for — which is then reported only once a caller has set it.
+    default: fn(&TargetGroupRecord) -> Option<String>,
+}
+
+impl std::fmt::Debug for AttributeSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttributeSpec")
+            .field("key", &self.key)
+            .field("domain", &self.domain)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AttributeSpec {
+    /// Whether `group` carries this attribute.
+    pub fn applies_to(&self, group: &TargetGroupRecord) -> bool {
+        (self.applies)(group)
+    }
+
+    /// The value `group` reports for this attribute until something sets it.
+    pub fn default_for(&self, group: &TargetGroupRecord) -> Option<String> {
+        (self.default)(group)
+    }
+}
+
+/// Every target group attribute this service models, with the family it belongs to,
+/// the values it accepts and its default — each one a sentence of the model's own
+/// `TargetGroupAttribute$Key` documentation
+/// (`smithy_query(query="doc",shape="TargetGroupAttribute",member="Key")`), which is
+/// the only catalog of them; the Smithy shape itself is an unconstrained key/value
+/// pair, so nothing else in the model lists them.
+pub static TARGET_GROUP_ATTRIBUTES: &[AttributeSpec] = &[
+    // Supported by all load balancers.
+    AttributeSpec {
+        key: "deregistration_delay.timeout_seconds",
+        domain: AttributeDomain::Integer { min: 0, max: 3600 },
+        // "If the target is a Lambda function, this attribute is not supported."
+        applies: |group| !group.is_lambda(),
+        default: |_| Some("300".to_string()),
+    },
+    AttributeSpec {
+        key: "stickiness.enabled",
+        domain: AttributeDomain::Boolean,
+        applies: |group| !group.is_lambda(),
+        default: |_| Some("false".to_string()),
+    },
+    AttributeSpec {
+        key: "stickiness.type",
+        domain: AttributeDomain::OneOf(&[
+            "lb_cookie",
+            "app_cookie",
+            "source_ip",
+            "source_ip_dest_ip",
+            "source_ip_dest_ip_proto",
+        ]),
+        applies: |group| !group.is_lambda(),
+        // "lb_cookie and app_cookie for Application Load Balancers. source_ip for
+        // Network Load Balancers. source_ip_dest_ip and source_ip_dest_ip_proto for
+        // Gateway Load Balancers."
+        default: |group| {
+            Some(
+                match group.family() {
+                    LoadBalancerFamily::Application => "lb_cookie",
+                    LoadBalancerFamily::Network => "source_ip",
+                    LoadBalancerFamily::Gateway => "source_ip_dest_ip",
+                }
+                .to_string(),
+            )
+        },
+    },
+    // Supported by Application Load Balancers and Network Load Balancers — and so by
+    // neither a Gateway Load Balancer's target group nor a Lambda one (see
+    // [`TargetGroupRecord::carries_connection_attributes`]).
+    AttributeSpec {
+        key: "load_balancing.cross_zone.enabled",
+        domain: AttributeDomain::OneOf(&["true", "false", "use_load_balancer_configuration"]),
+        applies: TargetGroupRecord::carries_connection_attributes,
+        default: |_| Some("use_load_balancer_configuration".to_string()),
+    },
+    AttributeSpec {
+        key: "target_group_health.dns_failover.minimum_healthy_targets.count",
+        domain: AttributeDomain::IntegerOrOff { min: 1, max: i64::MAX },
+        applies: TargetGroupRecord::carries_connection_attributes,
+        default: |_| Some("1".to_string()),
+    },
+    AttributeSpec {
+        key: "target_group_health.dns_failover.minimum_healthy_targets.percentage",
+        domain: AttributeDomain::IntegerOrOff { min: 1, max: 100 },
+        applies: TargetGroupRecord::carries_connection_attributes,
+        default: |_| Some("off".to_string()),
+    },
+    AttributeSpec {
+        key: "target_group_health.unhealthy_state_routing.minimum_healthy_targets.count",
+        domain: AttributeDomain::Integer { min: 1, max: i64::MAX },
+        applies: TargetGroupRecord::carries_connection_attributes,
+        default: |_| Some("1".to_string()),
+    },
+    AttributeSpec {
+        key: "target_group_health.unhealthy_state_routing.minimum_healthy_targets.percentage",
+        domain: AttributeDomain::IntegerOrOff { min: 1, max: 100 },
+        applies: TargetGroupRecord::carries_connection_attributes,
+        default: |_| Some("off".to_string()),
+    },
+    // Supported only if the load balancer is an Application Load Balancer and the
+    // target is an instance or an IP address.
+    AttributeSpec {
+        key: "load_balancing.algorithm.type",
+        domain: AttributeDomain::OneOf(&[
+            "round_robin",
+            "least_outstanding_requests",
+            "weighted_random",
+        ]),
+        applies: TargetGroupRecord::is_application_with_addressable_targets,
+        default: |_| Some("round_robin".to_string()),
+    },
+    AttributeSpec {
+        key: "load_balancing.algorithm.anomaly_mitigation",
+        domain: AttributeDomain::OneOf(&["on", "off"]),
+        applies: TargetGroupRecord::is_application_with_addressable_targets,
+        default: |_| Some("off".to_string()),
+    },
+    AttributeSpec {
+        key: "slow_start.duration_seconds",
+        // "The range is 30-900 seconds (15 minutes). The default is 0 seconds
+        // (disabled)."
+        domain: AttributeDomain::ZeroOrInteger { min: 30, max: 900 },
+        applies: TargetGroupRecord::is_application_with_addressable_targets,
+        default: |_| Some("0".to_string()),
+    },
+    AttributeSpec {
+        key: "stickiness.app_cookie.cookie_name",
+        domain: AttributeDomain::CookieName,
+        applies: TargetGroupRecord::is_application_with_addressable_targets,
+        // The model documents no default: the attribute is reported once set.
+        default: |_| None,
+    },
+    AttributeSpec {
+        key: "stickiness.app_cookie.duration_seconds",
+        domain: AttributeDomain::Integer { min: 1, max: 604_800 },
+        applies: TargetGroupRecord::is_application_with_addressable_targets,
+        default: |_| Some("86400".to_string()),
+    },
+    AttributeSpec {
+        key: "stickiness.lb_cookie.duration_seconds",
+        domain: AttributeDomain::Integer { min: 1, max: 604_800 },
+        applies: TargetGroupRecord::is_application_with_addressable_targets,
+        default: |_| Some("86400".to_string()),
+    },
+    // Supported only if the load balancer is an Application Load Balancer and the
+    // target is a Lambda function.
+    AttributeSpec {
+        key: "lambda.multi_value_headers.enabled",
+        domain: AttributeDomain::Boolean,
+        applies: TargetGroupRecord::is_lambda,
+        default: |_| Some("false".to_string()),
+    },
+    // Supported only by Network Load Balancers.
+    AttributeSpec {
+        key: "deregistration_delay.connection_termination.enabled",
+        domain: AttributeDomain::Boolean,
+        applies: |group| group.family() == LoadBalancerFamily::Network,
+        // "For new UDP/TCP_UDP target groups the default is true. Otherwise, the
+        // default is false."
+        default: |group| {
+            Some(
+                match group.protocol.as_deref() {
+                    Some("UDP") | Some("TCP_UDP") => "true",
+                    _ => "false",
+                }
+                .to_string(),
+            )
+        },
+    },
+    AttributeSpec {
+        key: "preserve_client_ip.enabled",
+        domain: AttributeDomain::Boolean,
+        applies: |group| group.family() == LoadBalancerFamily::Network,
+        // "The default is disabled if the target group type is IP address and the
+        // target group protocol is TCP or TLS. Otherwise, the default is enabled."
+        default: |group| {
+            let ip_tcp = group.target_type == "ip"
+                && matches!(group.protocol.as_deref(), Some("TCP") | Some("TLS"));
+            Some(if ip_tcp { "false" } else { "true" }.to_string())
+        },
+    },
+    AttributeSpec {
+        key: "proxy_protocol_v2.enabled",
+        domain: AttributeDomain::Boolean,
+        applies: |group| group.family() == LoadBalancerFamily::Network,
+        default: |_| Some("false".to_string()),
+    },
+    AttributeSpec {
+        key: "target_health_state.unhealthy.connection_termination.enabled",
+        domain: AttributeDomain::Boolean,
+        applies: |group| group.family() == LoadBalancerFamily::Network,
+        default: |_| Some("true".to_string()),
+    },
+    AttributeSpec {
+        key: "target_health_state.unhealthy.draining_interval_seconds",
+        domain: AttributeDomain::Integer { min: 0, max: 360_000 },
+        applies: |group| group.family() == LoadBalancerFamily::Network,
+        default: |_| Some("0".to_string()),
+    },
+    // Supported only by Gateway Load Balancers.
+    AttributeSpec {
+        key: "target_failover.on_deregistration",
+        domain: AttributeDomain::OneOf(&["rebalance", "no_rebalance"]),
+        applies: |group| group.family() == LoadBalancerFamily::Gateway,
+        default: |_| Some("no_rebalance".to_string()),
+    },
+    AttributeSpec {
+        key: "target_failover.on_unhealthy",
+        domain: AttributeDomain::OneOf(&["rebalance", "no_rebalance"]),
+        applies: |group| group.family() == LoadBalancerFamily::Gateway,
+        default: |_| Some("no_rebalance".to_string()),
+    },
+    AttributeSpec {
+        key: "send_tcp_reset.on_unhealthy.enabled",
+        domain: AttributeDomain::Boolean,
+        applies: |group| group.family() == LoadBalancerFamily::Gateway,
+        default: |_| Some("false".to_string()),
+    },
+    AttributeSpec {
+        key: "send_tcp_reset.on_deregistration.enabled",
+        domain: AttributeDomain::Boolean,
+        applies: |group| group.family() == LoadBalancerFamily::Gateway,
+        default: |_| Some("false".to_string()),
+    },
+];
+
+/// The attribute `key` names, or `None` when no target group attribute carries that
+/// name.
+pub fn target_group_attribute(key: &str) -> Option<&'static AttributeSpec> {
+    TARGET_GROUP_ATTRIBUTES.iter().find(|spec| spec.key == key)
+}
+
 /// One target registered with a target group.
 #[derive(Debug, Clone)]
 pub struct RegisteredTarget {
@@ -265,6 +675,112 @@ pub struct TargetGroupRecord {
 }
 
 impl TargetGroupRecord {
+    /// Whether this target group's targets are Lambda functions, which is what several
+    /// defaults and one whole attribute family key on.
+    pub fn is_lambda(&self) -> bool {
+        self.target_type == "lambda"
+    }
+
+    /// Which load balancer family this target group serves — see
+    /// [`LoadBalancerFamily`].
+    pub fn family(&self) -> LoadBalancerFamily {
+        match self.protocol.as_deref() {
+            Some("GENEVE") => LoadBalancerFamily::Gateway,
+            Some("TCP") | Some("TLS") | Some("UDP") | Some("TCP_UDP") | Some("QUIC")
+            | Some("TCP_QUIC") => LoadBalancerFamily::Network,
+            // HTTP, HTTPS, and a `lambda` target group, which carries no protocol.
+            _ => LoadBalancerFamily::Application,
+        }
+    }
+
+    /// Whether the attributes documented "only if the load balancer is an Application
+    /// Load Balancer and the target is an instance or an IP address" apply here.
+    pub fn is_application_with_addressable_targets(&self) -> bool {
+        self.family() == LoadBalancerFamily::Application
+            && matches!(self.target_type.as_str(), "instance" | "ip")
+    }
+
+    /// Whether the attributes that describe how the load balancer CONNECTS to this
+    /// group's targets — stickiness, cross-zone load balancing, the target-group-health
+    /// thresholds — apply here.
+    ///
+    /// They are documented for an Application or a Network Load Balancer, which rules
+    /// out a Gateway Load Balancer's group; and they presume a target the load balancer
+    /// opens connections to, which a Lambda function is not. The model documents
+    /// exactly ONE attribute for a Lambda target
+    /// (`lambda.multi_value_headers.enabled`), and the recorded
+    /// `DescribeTargetGroupAttributes` of a Lambda target group answers a set this
+    /// service matched only once the rest were left out of it.
+    pub fn carries_connection_attributes(&self) -> bool {
+        self.family() != LoadBalancerFamily::Gateway && !self.is_lambda()
+    }
+
+    /// Whether this target group's health check has a path and a response-code matcher.
+    ///
+    /// The model binds both to an HTTP/HTTPS health check ("[HTTP/HTTPS health checks]
+    /// The destination for health checks on the targets"). A `lambda` target group
+    /// reports no health-check protocol at all — the load balancer invokes the function
+    /// rather than connecting to a port — and its health check is an HTTP one, so it
+    /// carries them too.
+    pub fn health_check_is_http(&self) -> bool {
+        self.is_lambda() || is_http_protocol(self.health_check.protocol.as_deref())
+    }
+
+    /// Materialize the health-check members that exist only for an HTTP-semantic health
+    /// check: fill the documented default of each one nothing has set, and drop both
+    /// when the health check is not an HTTP one (a TCP check has neither a path nor a
+    /// response-code matcher to report).
+    ///
+    /// Called after a create or a modify resolves the health check, so the stored
+    /// record \u2014 and therefore every later read of it \u2014 carries exactly the members AWS
+    /// reports for a group of this shape.
+    pub fn settle_health_check_http_members(&mut self) {
+        if self.health_check_is_http() {
+            let protocol_version = self.protocol_version.clone();
+            if self.health_check.path.is_none() {
+                self.health_check.path = Some(default_health_check_path(protocol_version.as_deref()));
+            }
+            if self.health_check.matcher.is_none() {
+                self.health_check.matcher =
+                    Some(default_health_check_matcher(protocol_version.as_deref()));
+            }
+        } else {
+            self.health_check.path = None;
+            self.health_check.matcher = None;
+        }
+    }
+
+    /// Every attribute this target group reports: each one the model documents for a
+    /// group of this shape, carrying what a caller set or, failing that, its documented
+    /// default. Keyed in a stable order so two reads of one target group answer alike.
+    pub fn effective_attributes(&self) -> Vec<(String, String)> {
+        let mut reported: Vec<(String, String)> = TARGET_GROUP_ATTRIBUTES
+            .iter()
+            .filter(|spec| spec.applies_to(self))
+            .filter_map(|spec| {
+                let value = self
+                    .attributes
+                    .get(spec.key)
+                    .cloned()
+                    .or_else(|| spec.default_for(self))?;
+                Some((spec.key.to_string(), value))
+            })
+            .collect();
+        reported.sort_by(|left, right| left.0.cmp(&right.0));
+        reported
+    }
+
+    /// [`Self::effective_attributes`] as the modelled shape.
+    pub fn attribute_shapes(&self) -> Vec<TargetGroupAttribute> {
+        self.effective_attributes()
+            .into_iter()
+            .map(|(key, value)| TargetGroupAttribute {
+                key: Some(key),
+                value: Some(value),
+            })
+            .collect()
+    }
+
     /// The settings `CreateTargetGroup` is idempotent over — see
     /// [`LoadBalancerRecord::has_settings_of`].
     pub fn has_settings_of(&self, other: &TargetGroupRecord) -> bool {

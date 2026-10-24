@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/pipe_lifecycle.rs"]
 mod pipe_lifecycle;
+#[path = "all/pipe_update.rs"]
+mod pipe_update;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

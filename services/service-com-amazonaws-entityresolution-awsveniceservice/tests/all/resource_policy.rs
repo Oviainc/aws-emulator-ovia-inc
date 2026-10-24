@@ -65,7 +65,14 @@ fn policy_path(arn: &str) -> String {
     format!("/policies/{}", arn.replace('/', "%2F"))
 }
 
-async fn put_policy(emulator: &Emulator, arn: &str, policy: &str, token: Option<&str>) -> Reply {
+/// `pub(crate)` so a sibling suite can assert that deleting a resource detaches its
+/// policy without cloning a second policy helper.
+pub(crate) async fn put_policy(
+    emulator: &Emulator,
+    arn: &str,
+    policy: &str,
+    token: Option<&str>,
+) -> Reply {
     let mut request = json!({ "policy": policy });
     if let Some(token) = token {
         request
@@ -78,7 +85,7 @@ async fn put_policy(emulator: &Emulator, arn: &str, policy: &str, token: Option<
         .await
 }
 
-async fn get_policy(emulator: &Emulator, arn: &str) -> Reply {
+pub(crate) async fn get_policy(emulator: &Emulator, arn: &str) -> Reply {
     emulator.call("GET", &policy_path(arn), None).await
 }
 
@@ -671,9 +678,9 @@ async fn a_resource_that_was_deleted_and_created_again_carries_no_policy() {
     let emulator = Emulator::new();
     let document = policy_documents()[2].document.clone();
 
-    // The two resource types whose delete operation is implemented; the rule is about
-    // the resource going away, not about which type it was.
-    for resource_type in ["schemamapping", "matchingworkflow"] {
+    // The resource types whose delete operation is implemented; the rule is about the
+    // resource going away, not about which type it was.
+    for resource_type in ["schemamapping", "matchingworkflow", "idnamespace"] {
         let name = "recreated";
         let arn = create_resource(&emulator, resource_type, name).await;
         let written = put_policy(&emulator, &arn, &document, None).await;
@@ -681,6 +688,7 @@ async fn a_resource_that_was_deleted_and_created_again_carries_no_policy() {
 
         let deleted = match resource_type {
             "schemamapping" => emulator.delete_schema_mapping(name).await,
+            "idnamespace" => emulator.delete_id_namespace(name).await,
             _ => emulator.delete_matching_workflow(name).await,
         };
         assert_eq!(

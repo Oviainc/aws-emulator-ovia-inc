@@ -20,7 +20,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use streams::ops::types::{AttributeValue, KeySchemaElement};
 use streams::state::{
     AttributeMap, ComAmazonawsDynamodbstreamsDynamodbstreams20120810State as StreamsState,
-    OperationType, RecordAppend, StreamRegistration, StreamViewType,
+    OperationType, RecordAppend, RegistrationRejected, StreamRegistration, StreamViewType,
+    MAX_LIVE_ITERATORS, MAX_STREAMS_PER_TABLE,
 };
 
 /// A SigV4 credential scope naming `dynamodb`, which is how both DynamoDB and
@@ -106,15 +107,19 @@ fn register(
     stream_view_type: StreamViewType,
     at: SystemTime,
 ) -> String {
-    engine.state::<StreamsState>().lock().register_stream(
-        &StreamRegistration {
-            table_name: table_name.to_string(),
-            stream_view_type,
-            key_schema: key_schema(),
-            region: REGION.to_string(),
-        },
-        at,
-    )
+    engine
+        .state::<StreamsState>()
+        .lock()
+        .register_stream(
+            &StreamRegistration {
+                table_name: table_name.to_string(),
+                stream_view_type,
+                key_schema: key_schema(),
+                region: REGION.to_string(),
+            },
+            at,
+        )
+        .expect("the registry accepts the registration")
 }
 
 fn keys_of(id: &str) -> AttributeMap {
@@ -579,9 +584,23 @@ async fn every_shard_iterator_type_positions_where_the_model_says() {
             "case {iterator_type}: ShardIterator is modelled len 1..2048, got {}",
             token.len()
         );
+        // A DynamoDB Streams shard iterator is `<stream ARN>|<format version>|<opaque
+        // blob>` — the shape of the `ShardIterator` in the `GetShardIterator` example
+        // of the Amazon DynamoDB Streams API Reference — so the STREAM an iterator
+        // belongs to is readable off the token (the DynamoDB Streams Kinesis adapter
+        // reads it there) while the POSITION it names is not: the shard and the
+        // offset stay in the service's own iterator table.
+        let (named, blob) = token
+            .rsplit_once('|')
+            .unwrap_or_else(|| panic!("case {iterator_type}: {token} is not an iterator token"));
+        assert_eq!(
+            named,
+            format!("{stream_arn}|1"),
+            "case {iterator_type}: the token must name its stream and format version, got {token}"
+        );
         assert!(
-            !token.contains(&shard_id) && !token.contains(&stream_arn),
-            "case {iterator_type}: the token must be opaque, not an echo of the input: {token}"
+            !blob.is_empty() && !blob.contains(&shard_id),
+            "case {iterator_type}: the token's blob must be opaque, not an echo of the input: {token}"
         );
 
         let (status, body) = call(
@@ -1014,7 +1033,7 @@ async fn unknown_resources_and_tokens_get_the_modelled_errors() {
             "GetRecords with a fabricated token",
             "GetRecords",
             serde_json::json!({ "ShardIterator": "not-a-token-this-service-ever-issued" }),
-            "ExpiredIteratorException",
+            "ValidationException",
         ),
         (
             "GetShardIterator AT_SEQUENCE_NUMBER with no SequenceNumber",
@@ -1057,6 +1076,292 @@ async fn unknown_resources_and_tokens_get_the_modelled_errors() {
             code.ends_with(expected),
             "case {case}: expected error code {expected}, got {code} ({response})"
         );
+    }
+}
+
+/// A `ShardIterator` is classified by WHAT IT IS, not by one lookup failing: the
+/// token is an opaque digest, so the only thing that makes a value an iterator is
+/// that this service minted it.
+///
+/// `ExpiredIteratorException` tells a client to re-acquire an iterator and retry
+/// ("the shard iterator has expired and can no longer be used to retrieve stream
+/// records"), which is only true of an iterator that really was one; a value this
+/// service never issued names no position and can never work, so it is refused as a
+/// `ValidationException` (HTTP 400). The rows below span the class: tokens of every
+/// shape a client might send, a live token, and one this service minted whose
+/// lifetime has passed.
+#[tokio::test]
+async fn a_shard_iterator_is_classified_by_whether_this_service_minted_it() {
+    let (engine, router) = build();
+    let base = seconds_ago(3600);
+    let stream_arn = register(&engine, "ledger", StreamViewType::KeysOnly, base);
+    append(&engine, &stream_arn, OperationType::Insert, "item-0", base);
+    let shard_id = only_shard_id(&router, &stream_arn).await;
+
+    // Minted directly against the store so the issue instant can be chosen; both
+    // tokens are of exactly the form `GetShardIterator` hands out.
+    let live = engine.state::<StreamsState>().lock().mint_iterator(
+        &stream_arn,
+        &shard_id,
+        0,
+        SystemTime::now(),
+    );
+    let retired = engine.state::<StreamsState>().lock().mint_iterator(
+        &stream_arn,
+        &shard_id,
+        0,
+        seconds_ago(16 * 60),
+    );
+    // The same length as a real token but never issued, so it is as unattributable
+    // as any other string a client invents.
+    let forged = "f".repeat(live.len());
+
+    // Each row: what the token IS, the token, and the HTTP status plus error code
+    // (empty for a success) the rule requires.
+    let cases: [(&str, String, u16, &str); 7] = [
+        ("an iterator this service just issued", live.clone(), 200, ""),
+        (
+            "an iterator issued 16 minutes ago",
+            retired,
+            400,
+            "ExpiredIteratorException",
+        ),
+        (
+            "a word that is not a token",
+            "not-a-token-this-service-ever-issued".to_string(),
+            400,
+            "ValidationException",
+        ),
+        (
+            "a token of the right shape that was never issued",
+            forged,
+            400,
+            "ValidationException",
+        ),
+        (
+            "a live token with one character cut off",
+            live[..live.len() - 1].to_string(),
+            400,
+            "ValidationException",
+        ),
+        (
+            "a live token with trailing whitespace",
+            format!("{live} "),
+            400,
+            "ValidationException",
+        ),
+        (
+            "a live token upper-cased",
+            live.to_uppercase(),
+            400,
+            "ValidationException",
+        ),
+    ];
+
+    for (case, token, expected_status, expected_code) in cases {
+        let (status, body) = call(
+            &router,
+            "GetRecords",
+            serde_json::json!({ "ShardIterator": token }),
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case}: expected HTTP {expected_status}, got {status} with {body}"
+        );
+        if expected_code.is_empty() {
+            assert_eq!(
+                body["Records"].as_array().map(Vec::len),
+                Some(1),
+                "case {case}: a live iterator delivers the record it stands at, got {body}"
+            );
+        } else {
+            let code = error_code(&body);
+            assert!(
+                code.ends_with(expected_code),
+                "case {case}: expected error code {expected_code}, got {code} ({body})"
+            );
+        }
+    }
+}
+
+/// A DISABLED stream is drainable for the documented window and then reclaimed:
+/// "the corresponding stream on that table goes into the DISABLED state, and the
+/// stream is automatically deleted after 24 hours" (the `DeleteTable` doc). The rows
+/// straddle that bound as tightly as a live clock allows, the way the retention rows
+/// above do.
+#[tokio::test]
+async fn a_disabled_stream_is_deleted_after_the_documented_day() {
+    for (case, disabled_seconds_ago, still_registered) in [
+        ("disabled a minute ago", 60_u64, true),
+        ("disabled just inside 24h", 24 * 60 * 60 - 10, true),
+        ("disabled just past 24h", 24 * 60 * 60 + 1, false),
+        ("disabled 25h ago", 25 * 60 * 60, false),
+    ] {
+        let (engine, router) = build();
+        let stream_arn = register(
+            &engine,
+            "ledger",
+            StreamViewType::KeysOnly,
+            seconds_ago(disabled_seconds_ago + 3600),
+        );
+        assert!(
+            engine
+                .state::<StreamsState>()
+                .lock()
+                .disable_stream(&stream_arn, seconds_ago(disabled_seconds_ago)),
+            "case {case}: the registered stream must be disabled"
+        );
+
+        let (status, body) = call(&router, "ListStreams", serde_json::json!({})).await;
+        assert_eq!(status, 200, "case {case}: ListStreams answered {status}: {body}");
+        let listed = body["Streams"].as_array().map_or(0, Vec::len);
+        assert_eq!(
+            listed,
+            usize::from(still_registered),
+            "case {case}: wrong number of streams listed, got {body}"
+        );
+
+        let (status, body) = call(
+            &router,
+            "DescribeStream",
+            serde_json::json!({ "StreamArn": stream_arn }),
+        )
+        .await;
+        if still_registered {
+            assert_eq!(status, 200, "case {case}: DescribeStream answered {status}: {body}");
+            assert_eq!(
+                body["StreamDescription"]["StreamStatus"].as_str(),
+                Some("DISABLED"),
+                "case {case}: a stream disabled in the past is DISABLED, got {body}"
+            );
+        } else {
+            assert_eq!(status, 400, "case {case}: DescribeStream answered {status}: {body}");
+            assert!(
+                error_code(&body).ends_with("ResourceNotFoundException"),
+                "case {case}: a deleted stream is not found, got {body}"
+            );
+        }
+    }
+}
+
+/// The registry holds at most [`MAX_STREAMS_PER_TABLE`] streams for one table, so a
+/// caller that turns a stream off and on again cannot grow it without limit: past
+/// the cap the registration is REFUSED and the control plane answers its own
+/// `LimitExceededException`.
+#[test]
+fn the_registry_refuses_more_streams_than_a_table_may_hold() {
+    let engine = engine::InMemoryEngine::new();
+    let registration = StreamRegistration {
+        table_name: "ledger".to_string(),
+        stream_view_type: StreamViewType::KeysOnly,
+        key_schema: key_schema(),
+        region: REGION.to_string(),
+    };
+    let state = engine.state::<StreamsState>();
+    let mut store = state.lock();
+
+    // Each registration is disabled at once, so the next one cannot be the
+    // idempotent hit and has to take a new label — exactly the enable/disable cycle
+    // a caller drives through UpdateTable.
+    let base = SystemTime::now();
+    for index in 0..MAX_STREAMS_PER_TABLE {
+        let arn = store
+            .register_stream(&registration, base)
+            .unwrap_or_else(|rejected| {
+                panic!("case stream {index}: the registry must accept it, got {rejected}")
+            });
+        store.disable_stream(&arn, base);
+    }
+    assert_eq!(
+        store.streams().len(),
+        MAX_STREAMS_PER_TABLE,
+        "case the cap: every accepted registration is one stream"
+    );
+
+    let rejected = store
+        .register_stream(&registration, base)
+        .expect_err("case past the cap: the registration must be refused");
+    assert_eq!(
+        rejected,
+        RegistrationRejected::TooManyStreamsForTable {
+            table_name: "ledger".to_string(),
+            limit: MAX_STREAMS_PER_TABLE,
+        },
+        "case past the cap: wrong refusal, got {rejected}"
+    );
+
+    // A DIFFERENT table is unaffected: the cap is per table, and it is read off
+    // that table's own ARN prefix.
+    let other = StreamRegistration {
+        table_name: "payments".to_string(),
+        ..registration.clone()
+    };
+    store
+        .register_stream(&other, base)
+        .expect("case another table: its own first stream is accepted");
+}
+
+/// The LIVE iterator table is capped too: a client that keeps asking for
+/// iterators cannot grow the store without limit, and the token the cap evicts
+/// answers as the expired iterator it now is rather than as a value that was never
+/// one.
+#[tokio::test]
+async fn the_live_iterator_table_is_capped_and_evicts_the_oldest() {
+    let (engine, router) = build();
+    let base = seconds_ago(3600);
+    let stream_arn = register(&engine, "ledger", StreamViewType::KeysOnly, base);
+    append(&engine, &stream_arn, OperationType::Insert, "item-0", base);
+    let shard_id = only_shard_id(&router, &stream_arn).await;
+
+    // Mint past the cap, all at the SAME instant, so nothing is retired by the
+    // clock and only the cap can be what evicts a token.
+    let minted_at = SystemTime::now();
+    let state = engine.state::<StreamsState>();
+    let mut first = String::new();
+    let mut last = String::new();
+    for index in 0..=MAX_LIVE_ITERATORS {
+        let token = state
+            .lock()
+            .mint_iterator(&stream_arn, &shard_id, 0, minted_at);
+        if index == 0 {
+            first = token.clone();
+        }
+        last = token;
+    }
+    assert!(
+        state.lock().live_iterator_count() <= MAX_LIVE_ITERATORS,
+        "case past the cap: the live table must stay bounded, got {}",
+        state.lock().live_iterator_count()
+    );
+
+    // Each row: which token, and the status plus error code the rule requires.
+    for (case, token, expected_status, expected_code) in [
+        (
+            "the oldest iterator, evicted by the cap",
+            first,
+            400,
+            "ExpiredIteratorException",
+        ),
+        ("the newest iterator", last, 200, ""),
+    ] {
+        let (status, body) = call(
+            &router,
+            "GetRecords",
+            serde_json::json!({ "ShardIterator": token }),
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case}: expected HTTP {expected_status}, got {status} with {body}"
+        );
+        if !expected_code.is_empty() {
+            let code = error_code(&body);
+            assert!(
+                code.ends_with(expected_code),
+                "case {case}: expected error code {expected_code}, got {code} ({body})"
+            );
+        }
     }
 }
 

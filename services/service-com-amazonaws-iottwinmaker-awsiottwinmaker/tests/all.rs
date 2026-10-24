@@ -26,6 +26,9 @@ mod execute_query;
 #[path = "all/harness.rs"]
 mod harness;
 
+#[path = "all/metadata_transfer_job.rs"]
+mod metadata_transfer_job;
+
 #[path = "all/pricing_plan.rs"]
 mod pricing_plan;
 

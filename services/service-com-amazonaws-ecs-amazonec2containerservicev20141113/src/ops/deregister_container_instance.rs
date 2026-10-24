@@ -191,12 +191,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resolve_container_instance(&region, &cluster_name, &input.container_instance)
             .map(|instance| instance.arn.clone());
         let Some(arn) = resolved else {
+            // The refusal is DERIVED from the request: it quotes the `containerInstance`
+            // the caller sent, so a client deregistering a batch can tell which entry
+            // was rejected.
             return Err(
                 DeregisterContainerInstanceErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(
-                            crate::state::CONTAINER_INSTANCE_NOT_FOUND_MESSAGE.to_string(),
-                        ),
+                        message: Some(crate::state::container_instance_not_found_message(
+                            &input.container_instance,
+                        )),
                     },
                 )
                 .into(),

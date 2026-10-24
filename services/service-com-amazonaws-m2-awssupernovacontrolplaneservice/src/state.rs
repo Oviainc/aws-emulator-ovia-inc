@@ -63,6 +63,148 @@ pub const MAX_VERSIONS_PER_APPLICATION: usize = 100;
 /// that range.
 pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
 
+/// This service's ARN namespace, which is also its SigV4 signing name and endpoint
+/// prefix: `smithy_query(query="service_info")` -> `arnNamespace: m2`.
+pub const ARN_SERVICE: &str = "m2";
+
+/// The region a minted value carries when the request names none the emulator can
+/// read; the emulator's documented default region.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The region this request was signed for, when the SigV4 credential scope names one
+/// shaped like the region segment of the modelled `Arn` pattern, else
+/// [`DEFAULT_REGION`].
+///
+/// The ONE region read in this crate: an ARN is minted from it (and persisted, so a
+/// resource's ARN never changes) and so is the single-sign-on URL
+/// [`signed_bluinsights_url`] builds, and neither may carry a value that is not
+/// shaped like a region.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| is_arn_region(region))
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Whether `region` matches the region segment of the m2 `Arn` pattern,
+/// `[a-z]{2}-((iso[a-z]{0,1}-)|(gov-)){0,1}[a-z]+-[0-9]` (from `smithy_query`'s
+/// `Arn` pattern), so a minted ARN satisfies the shape the model declares.
+pub(crate) fn is_arn_region(region: &str) -> bool {
+    let Some((prefix, mut rest)) = region.split_once('-') else {
+        return false;
+    };
+    if prefix.len() != 2 || !prefix.bytes().all(|b| b.is_ascii_lowercase()) {
+        return false;
+    }
+    // The optional partition segment: `gov-`, `iso-`, or `iso<letter>-`.
+    if let Some(stripped) = rest.strip_prefix("gov-") {
+        rest = stripped;
+    } else if let Some(after_iso) = rest.strip_prefix("iso") {
+        if let Some(stripped) = after_iso.strip_prefix('-') {
+            rest = stripped;
+        } else if after_iso
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_lowercase)
+        {
+            if let Some(stripped) = after_iso[1..].strip_prefix('-') {
+                rest = stripped;
+            }
+        }
+    }
+    let Some((name, number)) = rest.rsplit_once('-') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.bytes().all(|b| b.is_ascii_lowercase())
+        && number.len() == 1
+        && number.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The base URL the AWS Blu Insights single-sign-on URL is built on: the emulator's
+/// OWN endpoint — the authority this request arrived on — falling back to this
+/// service's regional endpoint when the request carries no authority at all.
+///
+/// It names the emulator rather than `bluinsights.aws`, the host the real web
+/// application is published under, because a URL this emulator computes has to be
+/// honest about what it addresses: the emulator serves no Blu Insights application, so
+/// a URL pointing at AWS would send a caller out of the emulator entirely. Same rule,
+/// and same reading of the request, as `kinesisvideo`'s `request_endpoint`.
+///
+/// The authority is taken only when it IS one ([`is_authority`]), so a `Host` header
+/// carrying a URL delimiter cannot change how a client reads the URL this is
+/// interpolated into.
+pub fn request_endpoint(parts: &::http::request::Parts, region: &str) -> String {
+    let authority = parts
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .filter(|host| is_authority(host))
+        .map(ToString::to_string)
+        .or_else(|| {
+            parts
+                .uri
+                .authority()
+                .map(ToString::to_string)
+                .filter(|authority| is_authority(authority))
+        });
+    match authority {
+        Some(authority) => format!("https://{authority}"),
+        None => format!("https://{ARN_SERVICE}.{region}.amazonaws.com"),
+    }
+}
+
+/// Whether `value` is an HTTP authority — `host[:port]`.
+///
+/// Decided by `http::uri::Authority`, the maintained parse this crate already depends
+/// on, rather than by a charset test of our own; the two extra conditions are that the
+/// parse consumed the WHOLE value (`Authority` stops at a delimiter, so a value
+/// carrying `/`, `?` or `#` parses as its prefix) and that it carries no `user@`
+/// userinfo, which has no place in a URL this emulator hands to a caller.
+fn is_authority(value: &str) -> bool {
+    ::http::uri::Authority::try_from(value)
+        .is_ok_and(|authority| authority.as_str() == value && !value.contains('@'))
+}
+
+/// The path the single-sign-on URL carries under that endpoint, named once so the URL
+/// this emulator computes has one spelling.
+pub const BLUINSIGHTS_SSO_PATH: &str = "/bluinsights/sso";
+
+/// The single-sign-on AWS Blu Insights URL for the account and region a request was
+/// signed for, under the endpoint it arrived on.
+///
+/// Computed, never stored: the URL names the account and the region the caller signed
+/// for, plus a federation token derived from exactly those two values, so two reads in
+/// one region answer the same URL (the operation is `@readonly` — nothing about it may
+/// change what a later caller sees) and a caller signing for another region gets
+/// another URL. The token is [`derived_token`] over this service's namespace, the
+/// account and the region: it carries no request data and no secret of this emulator,
+/// and nothing may authenticate on it. `account` is this emulator's own fixed 12-digit
+/// id (`engine::emulator_account_id`) and `region` is shape-checked by
+/// [`request_region`], so neither can carry a URL delimiter.
+pub fn signed_bluinsights_url(endpoint: &str, account: &str, region: &str) -> String {
+    let token = derived_token(&[ARN_SERVICE, "bluinsights", account, region]);
+    format!("{endpoint}{BLUINSIGHTS_SSO_PATH}?account={account}&region={region}&token={token}")
+}
+
+/// A stable, opaque token derived from `parts`: the first 16 bytes of the SHA-256 digest
+/// of the parts, each NUL-terminated, rendered as lowercase hexadecimal.
+///
+/// The crate's ONE derivation for a value that must be the same every time the same
+/// inputs are reported — the same `sha2`/`hex` pair [`ComAmazonawsM2Awssupernovacontrolplaneservice
+/// State::mint_identifier`](ComAmazonawsM2AwssupernovacontrolplaneserviceState::mint_identifier)
+/// already mints ids with, differing only in carrying no counter and no clock, which is
+/// what makes it stable. The NUL terminator is what keeps two different splittings of
+/// the same text (`["ab", "c"]` and `["a", "bc"]`) from deriving one token.
+fn derived_token(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update([0u8]);
+    }
+    hex::encode(&hasher.finalize()[..16])
+}
+
 /// One recorded version of an application: the definition text Create/Update
 /// persisted, and when that version was recorded.
 #[derive(Debug, Clone)]

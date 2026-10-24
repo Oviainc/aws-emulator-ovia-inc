@@ -279,11 +279,12 @@ struct World {
 fn world(engine: &engine::InMemoryEngine) -> World {
     let state = engine.state::<Ec2State>();
     let mut store = state.lock();
-    let vpc = store.insert_vpc("10.0.0.0/16", false, "default", "available", Vec::new());
+    let vpc = store.insert_vpc("10.0.0.0/16", false, "default", "available", REGION, Vec::new());
     // Every VPC comes with its default group, whose inbound rule references the group
     // ITSELF: a live reference, so that group must never be reported.
     store.insert_default_security_group(&vpc, REGION);
-    let other_vpc = store.insert_vpc("10.1.0.0/16", false, "default", "available", Vec::new());
+    let other_vpc =
+        store.insert_vpc("10.1.0.0/16", false, "default", "available", REGION, Vec::new());
     store.insert_default_security_group(&other_vpc, REGION);
 
     let mut group = |vpc_id: &str, name: &str, description: &str| {
@@ -615,7 +616,8 @@ async fn a_vpc_the_account_does_not_have_is_refused() {
     let removed = {
         let state = engine.state::<Ec2State>();
         let mut store = state.lock();
-        let vpc_id = store.insert_vpc("10.9.0.0/16", false, "default", "available", Vec::new());
+        let vpc_id =
+            store.insert_vpc("10.9.0.0/16", false, "default", "available", REGION, Vec::new());
         store.remove_vpc(&vpc_id).expect("the VPC is removable");
         vpc_id
     };

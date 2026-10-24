@@ -271,9 +271,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(ListTasksErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(
-                            crate::state::CONTAINER_INSTANCE_NOT_FOUND_MESSAGE.to_string(),
-                        ),
+                        message: Some(crate::state::container_instance_not_found_message(
+                            reference,
+                        )),
                     },
                 )
                 .into());

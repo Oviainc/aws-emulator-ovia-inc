@@ -129,6 +129,16 @@ pub async fn create_ok(router: &MultiServiceRouter, name: &str, attributes: &Val
         .to_string()
 }
 
+/// The `Messages` of a receive reply, as a list — empty when the member is absent,
+/// which is how a reply that hands over nothing answers.
+pub fn messages(reply: &Value) -> Vec<Value> {
+    reply
+        .get("Messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Every attribute the queue at `url` has a value for (`AttributeNames: ["All"]`).
 pub async fn all_attributes(
     router: &MultiServiceRouter,

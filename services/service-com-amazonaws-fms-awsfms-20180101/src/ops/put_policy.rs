@@ -14,6 +14,25 @@
 //!   successful update rotates it. An unknown id is `ResourceNotFoundException`;
 //!   a stale or absent token is `InvalidOperationException`.
 //!
+//! Either way the document itself is checked FIRST — before the `PolicyId` is
+//! resolved and before the token is judged, so an update that carries both an
+//! unknown id and an invalid document reports the document's refusal — against
+//! the rules the model
+//! states but cannot express as a constraint (so the boundary validator passes a
+//! document that breaks them) — see [`validate_policy_document`] and
+//! [`validate_resource_set_ids`]:
+//!
+//! * every resource type in the policy's scope must be valid for the policy's
+//!   `SecurityServicePolicyData.Type` → `InvalidTypeException`;
+//! * a `ResourceType` of `ResourceTypeList` must have a non-empty
+//!   `ResourceTypeList` behind it → `InvalidInputException`;
+//! * `ResourceSetIds` must name resource sets that exist → `InvalidInputException`;
+//! * `IncludeMap` and `ExcludeMap` cannot both scope the policy →
+//!   `InvalidInputException`.
+//!
+//! Every one of them is decided before anything is written, so a refused call
+//! leaves the store exactly as it was.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -163,6 +182,248 @@ impl From<PutPolicyErrorModeled> for PutPolicyError {
 /// bound untestable (and unobservable to a client).
 const MAX_POLICIES: usize = 250;
 
+/// The shape the generated `Policy` models `IncludeMap` / `ExcludeMap` as: a
+/// `CustomerPolicyScopeMap`, keyed by `CustomerPolicyScopeIdType` (`ACCOUNT` /
+/// `ORG_UNIT`), each key holding a list of ids.
+///
+/// Named here so the predicate below reads as the modelled shape rather than as
+/// a bare `HashMap`.
+type CustomerPolicyScopeMap = ::std::collections::HashMap<String, Vec<String>>;
+
+/// The `ResourceType` value that says "this policy's scope is the resource types
+/// in `ResourceTypeList`" rather than naming a resource type itself.
+///
+/// `Policy$ResourceType`'s own documentation: "To apply this policy to multiple
+/// resource types, specify a resource type of `ResourceTypeList` and then specify
+/// the resource types in a `ResourceTypeList`." So the sentinel is not checked
+/// against the catalog below — the entries of `ResourceTypeList` are.
+const RESOURCE_TYPE_LIST_SENTINEL: &str = "ResourceTypeList";
+
+/// The resource types a policy may be scoped to, per
+/// `SecurityServicePolicyData.Type`.
+///
+/// The catalog is the model's own, from the `Policy$ResourceType` documentation
+/// ("The following are valid resource types for each Firewall Manager policy
+/// type"), read with
+///
+/// ```text
+/// smithy_query(query="doc",shape="com.amazonaws.fms#Policy",member="ResourceType",model_path="services/service-com-amazonaws-fms-awsfms-20180101/smithy-model/com-amazonaws-fms-awsfms-20180101.json")
+/// ```
+///
+/// mapping each policy type the doc names to the `SecurityServiceType` value it
+/// is: "Amazon Web Services WAF Classic" is `WAF`, "WAF" is `WAFV2`, "Network
+/// ACL" is `NETWORK_ACL_COMMON`, and "DNS Firewall, Network Firewall, and
+/// third-party firewall" are `DNS_FIREWALL`, `NETWORK_FIREWALL` and
+/// `THIRD_PARTY_FIREWALL`.
+///
+/// The two `SecurityServiceType` values the doc's list does NOT name —
+/// `SECURITY_GROUPS_COMMON` and `IMPORT_NETWORK_FIREWALL` — are deliberately
+/// absent rather than guessed at: a type the model enumerates no resource types
+/// for is left unconstrained (see [`permitted_resource_types`]), so this check
+/// refuses only what the model itself says is invalid.
+///
+/// The catalog is only as current as the model snapshot in `smithy-model/`: AWS
+/// adds resource types to a policy type over time (and the doc text lags), so
+/// RE-DERIVE this table from the `Policy$ResourceType` doc whenever that model is
+/// refreshed. The `policy_document_validation` suite asserts the table covers
+/// every `SecurityServiceType` the model declares, which catches a new POLICY
+/// type but not a new resource type for an existing one.
+const RESOURCE_TYPES_BY_SECURITY_SERVICE_TYPE: &[(&str, &[&str])] = &[
+    (
+        // "Amazon Web Services WAF Classic"
+        "WAF",
+        &[
+            "AWS::ApiGateway::Stage",
+            "AWS::CloudFront::Distribution",
+            "AWS::ElasticLoadBalancingV2::LoadBalancer",
+        ],
+    ),
+    (
+        // "WAF"
+        "WAFV2",
+        &[
+            "AWS::ApiGateway::Stage",
+            "AWS::ElasticLoadBalancingV2::LoadBalancer",
+            "AWS::CloudFront::Distribution",
+        ],
+    ),
+    (
+        "SHIELD_ADVANCED",
+        &[
+            "AWS::ElasticLoadBalancingV2::LoadBalancer",
+            "AWS::ElasticLoadBalancing::LoadBalancer",
+            "AWS::EC2::EIP",
+            "AWS::CloudFront::Distribution",
+        ],
+    ),
+    (
+        // "Network ACL"
+        "NETWORK_ACL_COMMON",
+        &["AWS::EC2::Subnet"],
+    ),
+    (
+        // "Security group usage audit"
+        "SECURITY_GROUPS_USAGE_AUDIT",
+        &["AWS::EC2::SecurityGroup"],
+    ),
+    (
+        // "Security group content audit"
+        "SECURITY_GROUPS_CONTENT_AUDIT",
+        &[
+            "AWS::EC2::SecurityGroup",
+            "AWS::EC2::NetworkInterface",
+            "AWS::EC2::Instance",
+        ],
+    ),
+    // "DNS Firewall, Network Firewall, and third-party firewall"
+    ("DNS_FIREWALL", &["AWS::EC2::VPC"]),
+    ("NETWORK_FIREWALL", &["AWS::EC2::VPC"]),
+    ("THIRD_PARTY_FIREWALL", &["AWS::EC2::VPC"]),
+];
+
+/// The resource types valid for a policy of `security_service_type`, or `None`
+/// when the model enumerates none for it — in which case the resource type is
+/// not constrained here and any value the boundary validator accepted stands.
+fn permitted_resource_types(security_service_type: &str) -> Option<&'static [&'static str]> {
+    RESOURCE_TYPES_BY_SECURITY_SERVICE_TYPE
+        .iter()
+        .find(|(policy_type, _)| *policy_type == security_service_type)
+        .map(|(_, resource_types)| *resource_types)
+}
+
+/// Every resource type this policy document puts in the policy's scope: the
+/// `ResourceType` member unless it is the [`RESOURCE_TYPE_LIST_SENTINEL`], plus
+/// every entry of `ResourceTypeList`.
+fn scoped_resource_types(policy: &Policy) -> Vec<&str> {
+    let mut scoped: Vec<&str> = Vec::new();
+    if policy.resource_type != RESOURCE_TYPE_LIST_SENTINEL {
+        scoped.push(policy.resource_type.as_str());
+    }
+    scoped.extend(policy.resource_type_list.iter().flatten().map(String::as_str));
+    scoped
+}
+
+/// Whether a `CustomerPolicyScopeMap` member actually scopes the policy to
+/// anything: a map with no entry, or whose every entry is an empty id list,
+/// names no account and no organizational unit, so it does not.
+fn scopes_anything(map: Option<&CustomerPolicyScopeMap>) -> bool {
+    map.is_some_and(|map| map.values().any(|ids| !ids.is_empty()))
+}
+
+/// The checks on a policy document that need nothing but the document itself.
+///
+/// All three are rules the model states but cannot express as a constraint, so
+/// the boundary validator passes a document that breaks them:
+///
+/// * every resource type in the policy's scope must be one the model lists as
+///   valid for the policy's `SecurityServicePolicyData.Type`
+///   ([`RESOURCE_TYPES_BY_SECURITY_SERVICE_TYPE`]) — the mismatch is between the
+///   two `Type`-ish members, so it is the modelled `InvalidTypeException` ("The
+///   value of the `Type` parameter is invalid");
+/// * a `ResourceType` of [`RESOURCE_TYPE_LIST_SENTINEL`] says the scope is in
+///   `ResourceTypeList`, so that member has to carry it: a sentinel with no
+///   resource type behind it scopes the policy to nothing, which is a bad
+///   combination of parameters — `InvalidInputException`;
+/// * `IncludeMap` and `ExcludeMap` cannot both scope the policy — "You can
+///   specify inclusions or exclusions, but not both" (both members' own
+///   documentation) — which is a bad combination of parameters rather than a bad
+///   `Type`, so it is `InvalidInputException`.
+///
+/// Decided BEFORE anything is written, so a refused document leaves the store as
+/// it was. The one rule that cannot be decided from the document alone is in
+/// [`validate_resource_set_ids`].
+fn validate_policy_document(policy: &Policy) -> Result<(), PutPolicyError> {
+    let security_service_type = policy.security_service_policy_data.r#type.as_str();
+    if policy.resource_type == RESOURCE_TYPE_LIST_SENTINEL
+        && policy
+            .resource_type_list
+            .as_ref()
+            .is_none_or(|list| list.is_empty())
+    {
+        return Err(PutPolicyErrorModeled::InvalidInputException(
+            InvalidInputException {
+                message: Some(format!(
+                    "a ResourceType of {RESOURCE_TYPE_LIST_SENTINEL} puts the resource types \
+                     in scope of the policy in ResourceTypeList, so ResourceTypeList must \
+                     name at least one resource type"
+                )),
+            },
+        )
+        .into());
+    }
+    if let Some(permitted) = permitted_resource_types(security_service_type) {
+        for resource_type in scoped_resource_types(policy) {
+            if !permitted.contains(&resource_type) {
+                return Err(PutPolicyErrorModeled::InvalidTypeException(
+                    InvalidTypeException {
+                        message: Some(format!(
+                            "the resource type {resource_type} is not valid for a \
+                             {security_service_type} policy; the valid resource types for \
+                             {security_service_type} are {}",
+                            permitted.join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+    }
+
+    if scopes_anything(policy.include_map.as_ref()) && scopes_anything(policy.exclude_map.as_ref()) {
+        return Err(PutPolicyErrorModeled::InvalidInputException(
+            InvalidInputException {
+                message: Some(
+                    "a policy can specify inclusions or exclusions, but not both: IncludeMap \
+                     and ExcludeMap cannot both scope the policy"
+                        .to_string(),
+                ),
+            },
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+/// The one rule on a policy document that needs the STORE: `ResourceSetIds` are
+/// "the unique identifiers of the resource sets used by the policy"
+/// (`Policy$ResourceSetIds`), so each one must resolve to a resource set this
+/// organisation holds right now; an id that resolves to nothing is invalid
+/// input, not a policy scoped to a set that might appear later.
+///
+/// Beside [`validate_policy_document`] and, like it, decided before anything is
+/// written.
+fn validate_resource_set_ids(
+    policy: &Policy,
+    store: &crate::state::ComAmazonawsFmsAwsfms20180101State,
+) -> Result<(), PutPolicyError> {
+    let Some(ids) = policy.resource_set_ids.as_ref() else {
+        return Ok(());
+    };
+    let unknown: Vec<&str> = ids
+        .iter()
+        .filter(|id| !store.resource_sets.contains_key(id.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        return Err(PutPolicyErrorModeled::InvalidInputException(
+            InvalidInputException {
+                message: Some(format!(
+                    "ResourceSetIds names {} no resource set exists for: {}",
+                    if unknown.len() == 1 {
+                        "an identifier"
+                    } else {
+                        "identifiers"
+                    },
+                    unknown.join(", ")
+                )),
+            },
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// The `PutPolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -226,7 +487,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy.policy_status = Some(crate::state::POLICY_STATUS_ACTIVE.to_string());
         }
 
+        // The semantic rules on the document the model states but cannot
+        // express as a constraint. Refused before the store is even reached, so
+        // a document the service would not have created is never persisted —
+        // on an UPDATE as much as on a create: both write the same `Policy`.
+        validate_policy_document(&policy)?;
+
         let mut store = state.lock();
+
+        // The rule that needs the store, decided before either branch writes.
+        validate_resource_set_ids(&policy, &store)?;
 
         let record = match requested_id {
             // UPDATE: the id names an existing policy version, and the token must

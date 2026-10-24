@@ -177,6 +177,69 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic `ResourceInUseException` error shape.
+static RESOURCE_IN_USE_EXCEPTION_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#ResourceInUseException$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `ResourceInUseException` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the
+/// shape is NOT in this service's model, so it must not collide with a modeled one.
+/// The wire `__type` comes from [`OperationError::shape_name`] below, which answers the
+/// bare `ResourceInUseException` a client matches on.
+pub static RESOURCE_IN_USE_EXCEPTION_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#ResourceInUseException",
+        "smithy.framework",
+        "ResourceInUseException",
+    ),
+    ShapeType::Structure,
+    &[&RESOURCE_IN_USE_EXCEPTION_MESSAGE],
+);
+
+/// The payload of a `ResourceInUseException`: which resource is busy, and with what.
+#[derive(Debug, Clone)]
+pub struct ResourceInUseException {
+    pub message: String,
+}
+
+impl ResourceInUseException {
+    /// A `ResourceInUseException` carrying `message`.
+    ///
+    /// Say which resource is busy and what it is busy with — the caller's only recourse
+    /// is to wait for that work to finish and call again, so the text has to say what it
+    /// is waiting for.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ResourceInUseException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ResourceInUseException: {}", self.message)
+    }
+}
+
+impl std::error::Error for ResourceInUseException {}
+
+impl SerializableStruct for ResourceInUseException {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&RESOURCE_IN_USE_EXCEPTION_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +248,17 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// The resource the request names is busy with work that is already in flight.
+    /// Renders as HTTP 400 with the error code `ResourceInUseException`.
+    ///
+    /// This is the code Amazon Keyspaces' own documentation names for the one case it
+    /// spells out: `DeleteTable` — "If a table is either in the `CREATING` or `UPDATING`
+    /// states, then Amazon Keyspaces returns a `ResourceInUseException`"
+    /// (`smithy_query(query="doc",shape="com.amazonaws.keyspaces#DeleteTable")`). The
+    /// model declares no such shape, and this wrapper is the only place a handler can
+    /// answer an error its own model does not declare, which is why the synthetic shape
+    /// lives here beside [`NotImplemented`] rather than in `src/ops/types/`.
+    ResourceInUseException(ResourceInUseException),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -221,6 +295,18 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Refuse the request because the resource it names is busy with work already in
+    /// flight, with HTTP 400 `ResourceInUseException`.
+    ///
+    /// Reach for this ONLY where this service's documentation names that code for the
+    /// case — today that is `DeleteTable` against a table in `CREATING` or `UPDATING`.
+    /// Everywhere else the in-flight case is the modeled `ConflictException` ("you try
+    /// to perform an action and the same or a different action is already in
+    /// progress"), which is what every other operation here answers.
+    pub fn resource_in_use(message: impl Into<String>) -> Self {
+        Self::ResourceInUseException(ResourceInUseException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -228,6 +314,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::ResourceInUseException(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +327,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::ResourceInUseException(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +342,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::ResourceInUseException(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +351,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::ResourceInUseException(_) => &RESOURCE_IN_USE_EXCEPTION_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +364,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            Self::ResourceInUseException(_) => "ResourceInUseException",
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +377,11 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            // 400: the shape is unmodeled here, so there is no `httpError` trait to
+            // honour, and 400 is both Smithy's default status for an `@error("client")`
+            // shape and the status every AWS model that DOES declare
+            // `ResourceInUseException` carries for it.
+            Self::ResourceInUseException(_) => 400,
             Self::ValidationException(_) => 400,
         }
     }
@@ -297,7 +393,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
-            // Same reason: the synthetic shape carries no `awsQueryError` trait.
+            // Same reason: neither synthetic shape carries an `awsQueryError` trait.
+            Self::ResourceInUseException(_) => None,
             Self::ValidationException(_) => None,
         }
     }

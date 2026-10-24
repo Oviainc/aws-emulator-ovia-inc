@@ -34,11 +34,11 @@ use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ApplicationPreferences, AssessmentTarget, DataCollectionDetails, DatabasePreferences,
-    GetImportFileTaskOutput, GetPortfolioPreferencesOutput, Group, ImportFileTaskInformation,
-    OSInfo, PrioritizeBusinessGoals, RecommendationReportDetails, RecommendationSet,
-    ResourceNotFoundException, ServerDetail, ServerError, ServerStrategy, StrategyOption,
-    SystemInfo, TransformationTool, ValidationException,
+    ApplicationPreferences, AssessmentTarget, AssociatedApplication, DataCollectionDetails,
+    DatabasePreferences, GetImportFileTaskOutput, GetPortfolioPreferencesOutput, Group,
+    ImportFileTaskInformation, OSInfo, PrioritizeBusinessGoals, RecommendationReportDetails,
+    RecommendationSet, ResourceNotFoundException, ServerDetail, ServerError, ServerStrategy,
+    StrategyOption, SystemInfo, TransformationTool, ValidationException,
 };
 
 /// `ImportFileTaskStatus`'s non-terminal import status: the status a task carries from
@@ -260,6 +260,14 @@ pub const IMPORT_TASK_PAGE_MARKER: &str = "migrationhubstrategy:import-file-task
 /// issued for another list is foreign here — the two never resolve against each other's
 /// records.
 pub const SERVER_PAGE_MARKER: &str = "migrationhubstrategy:servers:";
+
+/// The marker a `GetServerDetails` cursor carries.
+///
+/// That operation pages over ONE server's associated applications rather than over the
+/// inventory, so it has its own marker: a `ListServers` token handed to it (or one of its
+/// own handed to `ListServers`) is foreign and refused instead of resolving against the
+/// other list's records.
+pub const SERVER_DETAIL_PAGE_MARKER: &str = "migrationhubstrategy:server-applications:";
 
 /// Encode the key a page stopped at as an opaque `nextToken` carrying `marker`.
 ///
@@ -535,6 +543,16 @@ pub struct ServerRecord {
     /// reports both, and `ServerStrategy$isPreferred` is the member the model gives the
     /// distinction to.
     pub preferred_strategy: Option<StrategyOption>,
+    /// The applications this server belongs to — `AssociatedApplication` is "Object
+    /// containing details about applications as defined in Application Discovery Service"
+    /// — as the import that brought the server in stored them, in the order it stored
+    /// them.
+    ///
+    /// Not a member of `ServerDetail`: it is the list `GetServerDetails` reports BESIDE
+    /// the detail, and the one that operation pages over. Empty for a server no
+    /// application was recorded for, so that read answers an empty list rather than an
+    /// application nothing holds.
+    pub associated_applications: Vec<AssociatedApplication>,
 }
 
 impl ServerRecord {

@@ -1012,28 +1012,29 @@ pub const COST_ESTIMATION_STATUS_ONGOING: &str = "ONGOING";
 /// `CostEstimationStatus` as the model spells "finished".
 pub const COST_ESTIMATION_STATUS_COMPLETED: &str = "COMPLETED";
 
-/// `CostEstimationServiceResourceState` for a resource the client declared for
-/// analysis — see `COST_ESTIMATION_SERVICE_RESOURCE_STATE_VALUES` in
+/// `CostEstimationServiceResourceState` for a resource a cost estimation's collection
+/// names — see `COST_ESTIMATION_SERVICE_RESOURCE_STATE_VALUES` in
 /// `ops/types/shared_types.rs`.
 ///
 /// A resource is `ACTIVE` when it produces metrics, events or logs, and only active
-/// resource hours are charged. A resource inside the account's analysis coverage is
-/// exactly what the estimate is being made for, and this emulator has no metric
-/// stream that could show one quiet, so a covered resource is counted active.
+/// resource hours are charged. The resources a submitted collection names are exactly
+/// what the estimate is being made for, and this emulator has no metric stream that
+/// could show one quiet, so a named resource is counted active.
 pub const COST_ESTIMATION_RESOURCE_ACTIVE: &str = "ACTIVE";
 
 /// The `ServiceResourceCost.Type` for the CloudFormation half of a cost estimation's
 /// collection.
 ///
-/// This emulator's resource inventory is the coverage the client declared through
-/// `UpdateResourceCollection` — it performs none of AWS's own per-service resource
-/// discovery — so what it can count for a stack-defined boundary is the covered
-/// stacks the request names.
+/// A cost estimation prices the collection the request submits, not the account's
+/// analysis coverage (that is the whole point of `StartCostEstimation` taking its own
+/// filter), and this emulator performs none of AWS's own per-service resource
+/// discovery — so what it can count for a stack-defined boundary is the stacks the
+/// request names.
 pub const COST_ESTIMATION_STACK_TYPE: &str = "AWS::CloudFormation::Stack";
 
 /// The `ServiceResourceCost.Type` for the tag half of a cost estimation's collection:
-/// one covered app-boundary tag value. See [`COST_ESTIMATION_STACK_TYPE`] for why the
-/// unit counted is a coverage entry.
+/// one app-boundary tag value the request names. See [`COST_ESTIMATION_STACK_TYPE`]
+/// for why the unit counted is a submitted boundary entry.
 pub const COST_ESTIMATION_TAG_TYPE: &str = "AWS::Tag";
 
 /// The `ResourceType` a cost-estimation-shaped `ConflictException` reports.

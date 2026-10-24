@@ -297,7 +297,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The logging configuration AWS reports (`PipeLogConfiguration`) for the one the caller
 /// supplied (`PipeLogConfigurationParameters`): the same destinations, as the read shape.
-fn log_configuration_of(params: &PipeLogConfigurationParameters) -> PipeLogConfiguration {
+///
+/// `pub(crate)` because `UpdatePipe` stores a replacement `LogConfiguration` through the
+/// same conversion; the mapping between the write and read shapes belongs to whichever
+/// handler persists one, and there is only one of it.
+pub(crate) fn log_configuration_of(
+    params: &PipeLogConfigurationParameters,
+) -> PipeLogConfiguration {
     PipeLogConfiguration {
         s3_log_destination: params
             .s3_log_destination

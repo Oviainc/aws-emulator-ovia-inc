@@ -3,9 +3,10 @@
 //! @op GetRecords
 //! IMPLEMENTED: resolves the opaque `ShardIterator` token against [`crate::state`],
 //! returns the records at the position it names (honouring `Limit`) and mints the
-//! token for the position after them. An unknown or retired token is
-//! `ExpiredIteratorException`; a caught-up open shard is an empty `Records` list with
-//! a still-usable `NextShardIterator`.
+//! token for the position after them. A token this service minted whose 15 minute
+//! lifetime has passed is `ExpiredIteratorException`; a value it never minted is no
+//! iterator at all and is refused as a `ValidationException`; a caught-up open shard
+//! is an empty `Records` list with a still-usable `NextShardIterator`.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +188,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // or not anybody called.
         guard.materialize_due_expiries(now);
 
-        let cursor = guard
-            .iterator(&input.shard_iterator)
-            .cloned()
-            .ok_or_else(|| {
-                GetRecordsErrorModeled::ExpiredIteratorException(ExpiredIteratorException {
-                    message: Some(
-                        "The shard iterator is not valid or has expired; a shard iterator \
-                         expires 15 minutes after it is retrieved"
-                            .to_string(),
-                    ),
-                })
-            })?;
+        // The two refusals a token can draw are different claims, so they are
+        // decided by what the token IS rather than by one lookup failing:
+        // `ExpiredIteratorException` says "re-acquire an iterator and retry",
+        // which is only true of an iterator this service really minted, while a
+        // value it never minted names no position at all and can never work.
+        let cursor = match guard.resolve_iterator(&input.shard_iterator) {
+            crate::state::IteratorLookup::Live(cursor) => cursor.clone(),
+            crate::state::IteratorLookup::Retired => {
+                return Err(GetRecordsErrorModeled::ExpiredIteratorException(
+                    ExpiredIteratorException {
+                        message: Some(
+                            "The shard iterator has expired; a shard iterator expires 15 \
+                             minutes after it is retrieved"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+            crate::state::IteratorLookup::Unknown => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "Invalid ShardIterator",
+                ))
+            }
+        };
 
         // `Limit`'s declared range (1..) is enforced at the boundary; the documented
         // ceiling of 1000 records is not modelled, so it is applied here.

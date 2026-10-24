@@ -2,7 +2,9 @@
 
 //! @op ListJobs
 //!
-//! Pages over the stored jobs in creation order, one `JobListEntry` per job.
+//! Pages over the stored jobs in creation order, one `JobListEntry` per job: a plain
+//! job, an export order's main job (`IsMaster=true`) and each of that order's job parts
+//! are each one entry.
 //!
 //! ## Shape of an operation
 //!

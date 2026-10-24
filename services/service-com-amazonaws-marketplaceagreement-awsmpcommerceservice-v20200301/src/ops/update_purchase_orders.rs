@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePurchaseOrders
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePurchaseOrders`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Associates purchase order references with the charges of the agreements that hold
+//! them. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePurchaseOrders::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does
+//!
+//! Each `PurchaseOrder` of the list records its `purchaseOrderReference` on the charge
+//! its `chargeId` names, in the agreement that holds that charge — the charge belongs
+//! to the agreement whose quote minted it, so the agreement is RESOLVED from the charge
+//! rather than named by the request, which carries no agreement of its own. A charge
+//! carries one reference, so associating a charge that already has one replaces it.
+//!
+//! The list is refused whole, before anything is written, when an element names a
+//! charge no agreement holds, names one twice, carries no reference
+//! (`crate::state::validate_purchase_orders`, the rule `AcceptAgreementRequest` refuses
+//! its own `purchaseOrders` under) or states an `agreementId` other than the agreement
+//! holding the charge it names.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +152,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePurchaseOrders` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePurchaseOrdersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePurchaseOrders"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdatePurchaseOrdersErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The input names charges and no agreement, so the agreement each
+        // association belongs to is RESOLVED from the charge: a charge belongs
+        // to the agreement whose quote minted it, and charge ids are minted from
+        // the store's single counter, so a `chargeId` names at most one charge
+        // of at most one agreement.
+        let owners = store.charge_owners();
+        let charges: ::std::collections::BTreeSet<&str> =
+            owners.keys().map(String::as_str).collect();
+
+        // The same rule `AcceptAgreementRequest` refuses its own
+        // `purchaseOrders` under, applied to the charges of every agreement this
+        // call can reach: an element must name a charge that exists, name it at
+        // most once across the list, and carry the reference the association
+        // exists to record (`crate::state::validate_purchase_orders`). The list
+        // is refused BEFORE anything is written, so a refused call associates
+        // nothing.
+        if let Err(refusal) =
+            crate::state::validate_purchase_orders(&input.purchase_orders, &charges)
+        {
+            return Err(UpdatePurchaseOrdersErrorModeled::ValidationException(
+                crate::state::validation_exception(&refusal.reason, refusal.path),
+            )
+            .into());
+        }
+
+        // One spelling of "this element's member is not acceptable": the
+        // modelled `ValidationException` whose reason is resolved FROM the
+        // member (`INVALID_CHARGE_ID`, `INVALID_AGREEMENT_ID`) and whose
+        // `fields` entry names that element's own request path.
+        let refuse = |index: usize, member: &str| -> UpdatePurchaseOrdersError {
+            let path = crate::state::purchase_order_member_path(index, member);
+            UpdatePurchaseOrdersErrorModeled::ValidationException(
+                crate::state::validation_exception(
+                    &crate::state::member_reason(&path, crate::state::RefusalKind::Invalid),
+                    path,
+                ),
+            )
+            .into()
+        };
+
+        // The whole write is planned before any of it is applied, for the same
+        // reason: one unresolvable element refuses the call rather than leaving
+        // the elements before it associated.
+        let mut plan: Vec<(usize, String, PurchaseOrder)> =
+            Vec::with_capacity(input.purchase_orders.len());
+        for (index, order) in input.purchase_orders.iter().enumerate() {
+            let Some(agreement_id) = owners.get(&order.charge_id) else {
+                // `validate_purchase_orders` already refused an unresolvable
+                // `chargeId` against this same map, so this cannot be reached —
+                // and it is spelled as that same refusal rather than a panic.
+                return Err(refuse(index, "chargeId"));
+            };
+            // THE RULE THIS LOOP IS FOR: "the unique identifier of the agreement
+            // associated with this charge" — an element may state it, and a
+            // value that is not the agreement holding the charge contradicts the
+            // charge the same element names, so the member is refused rather
+            // than ignored.
+            if order
+                .agreement_id
+                .as_deref()
+                .is_some_and(|named| named != agreement_id)
+            {
+                return Err(refuse(index, "agreementId"));
+            }
+            plan.push((
+                index,
+                agreement_id.clone(),
+                PurchaseOrder {
+                    // The agreement the charge belongs to, resolved from the
+                    // store rather than taken from the request.
+                    agreement_id: Some(agreement_id.clone()),
+                    ..order.clone()
+                },
+            ));
+        }
+
+        // A charge carries ONE purchase order reference, so associating a charge
+        // that already carries one REPLACES it: this operation associates
+        // purchase orders "with agreement charges after an agreement is
+        // created", which is an update of the charge's association and not a
+        // second association beside it.
+        let mut updated: Vec<String> = Vec::new();
+        for (index, agreement_id, association) in plan {
+            let Some(agreement) = store.agreements.get_mut(&agreement_id) else {
+                // Unreachable: `owners` was read from `store.agreements` under
+                // the lock still held here, so the agreement a charge resolved
+                // to is still there. Spelled as the refusal an unresolvable
+                // `chargeId` earns rather than as a write silently dropped and
+                // reported as a success.
+                return Err(refuse(index, "chargeId"));
+            };
+            match agreement
+                .purchase_orders
+                .iter_mut()
+                .find(|held| held.charge_id == association.charge_id)
+            {
+                Some(held) => *held = association,
+                None => agreement.purchase_orders.push(association),
+            }
+            // The agreement's own record changed, which is what
+            // `AgreementViewSummary$lastUpdateTime` reports.
+            agreement.updated_at = now;
+            if !updated.contains(&agreement_id) {
+                updated.push(agreement_id);
+            }
+        }
+        for agreement_id in &updated {
+            crate::state::audit(
+                "UpdatePurchaseOrders",
+                "purchase orders associated",
+                agreement_id,
+                ctx.parts(),
+            );
+        }
+
+        // The output models no member: what this call associated is read back
+        // through `ListAgreementCharges`, which reports the reference carried by
+        // each charge of the agreement.
+        Ok(UpdatePurchaseOrdersOutput {})
     }
 }

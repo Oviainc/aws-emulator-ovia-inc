@@ -1,15 +1,41 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMetadataTransferJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMetadataTransferJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a metadata transfer job and persists it in [`crate::state`], so
+//! `GetMetadataTransferJob` reads back what was created.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMetadataTransferJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A job is an ACCOUNT-level resource (`/metadata-transfer-jobs` names no
+//! workspace), so it is stored beside the workspaces rather than inside one.
+//! This create mints the job's ARN, its creation instant and — when the request
+//! names none — its `metadataTransferJobId`, the way `CreateEntity` mints an
+//! `entityId`.
+//!
+//! The job is accepted in the non-terminal
+//! [`crate::state::METADATA_TRANSFER_JOB_STATE_VALIDATING`] state, with the
+//! instant its outcome falls due stored beside it
+//! ([`crate::state::METADATA_TRANSFER_JOB_SETTLE_SPAN`]); a reader materialises
+//! that outcome rather than sleeping for it. The outcome itself is the modelled
+//! failure state: transferring metadata means reading an Amazon S3 object, an
+//! IoT SiteWise asset model or a workspace's metadata document and writing what
+//! it describes into the destination, and this emulator performs none of that
+//! work, so a job nothing ran ends in `ERROR` carrying the `PROCESSING_ERROR`
+//! that says so ([`crate::state::METADATA_TRANSFER_JOB_ERROR_CODE`]) instead of
+//! reporting a `COMPLETED` transfer that never happened.
+//!
+//! The refusals this handler owns:
+//!
+//! * a source or the destination whose configuration does not match its `type`
+//!   — a `ValidationException`, naming the member and the type;
+//! * an IoT TwinMaker source or destination naming a workspace this service
+//!   does not hold — the `ResourceNotFoundException` this operation models;
+//! * a `metadataTransferJobId` already taken — a `ConflictException`;
+//! * the account already holds [`crate::state::MAX_METADATA_TRANSFER_JOBS`]
+//!   jobs — a `ServiceQuotaExceededException`.
+//!
+//! Two deliberate gaps. An Amazon S3 `location` is stored WITHOUT checking that
+//! the object or prefix it names exists: it lives in the caller's bucket, which
+//! this emulator does not reach. Authorization is not emulated, so the modelled
+//! `AccessDeniedException` is never returned.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +187,256 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMetadataTransferJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMetadataTransferJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMetadataTransferJob"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one mutates tenant state.
+        ::tracing::info!(
+            operation = "CreateMetadataTransferJob",
+            metadata_transfer_job_id = ?input.metadata_transfer_job_id,
+            destination_type = %input.destination.r#type,
+            "serving a request"
+        );
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateMetadataTransferJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the iottwinmaker store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        // A configuration that does not match the `type` beside it describes no
+        // transfer the service could run, so it is refused rather than stored:
+        // `SourceConfiguration` and `DestinationConfiguration` each carry one
+        // optional member per end type, and the model cannot say which one a
+        // given `type` requires.
+        for (index, source) in input.sources.iter().enumerate() {
+            if let Some(message) = source_configuration_error(index, source) {
+                return Err(CreateMetadataTransferJobErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+        if let Some(message) = destination_configuration_error(&input.destination) {
+            return Err(CreateMetadataTransferJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // Every IoT TwinMaker end of the transfer names a workspace by ARN, and
+        // a workspace this service does not hold is one no transfer could read
+        // or write — the `ResourceNotFoundException` this operation models
+        // (unlike `CreateScene`, which models none and refuses with a
+        // `ValidationException`).
+        for workspace in referenced_workspaces(&input) {
+            if state.resolve_workspace_id(workspace).is_none() {
+                return Err(
+                    CreateMetadataTransferJobErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::workspace_not_found_message(workspace)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A `metadataTransferJobId` the caller did not supply is minted here,
+        // as the uuid `CreateEntity` mints an `entityId` as: the member is
+        // optional on the request and required on the response, so the service
+        // is what names such a job.
+        let metadata_transfer_job_id = input
+            .metadata_transfer_job_id
+            .clone()
+            .unwrap_or_else(|| ::uuid::Uuid::new_v4().to_string());
+
+        if state
+            .metadata_transfer_jobs
+            .contains_key(&metadata_transfer_job_id)
+        {
+            return Err(CreateMetadataTransferJobErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "metadata transfer job {metadata_transfer_job_id} already exists"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The emulator's declared ceiling on the store, checked AFTER the
+        // identity conflict above so re-creating a taken id in a full account
+        // is still the ConflictException the id deserves.
+        if state.metadata_transfer_jobs.len() >= crate::state::MAX_METADATA_TRANSFER_JOBS {
+            return Err(
+                CreateMetadataTransferJobErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account has reached the limit of {} metadata transfer jobs",
+                            crate::state::MAX_METADATA_TRANSFER_JOBS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::metadata_transfer_job_arn(&region, &metadata_transfer_job_id);
+        let now = ::std::time::SystemTime::now();
+        let job = crate::state::MetadataTransferJob::accepted(
+            metadata_transfer_job_id.clone(),
+            arn.clone(),
+            input.description,
+            input.sources,
+            input.destination,
+            now,
+        );
+        // Reported from the record that was stored, so this answer and the read
+        // that follows it report one job's status from one place.
+        let status = job.status();
+        state
+            .metadata_transfer_jobs
+            .insert(metadata_transfer_job_id.clone(), job);
+
+        Ok(CreateMetadataTransferJobOutput {
+            metadata_transfer_job_id,
+            arn,
+            creation_date_time: crate::state::timestamp(now),
+            status,
+        })
     }
+}
+
+/// The `SourceType` / `DestinationType` values the model admits
+/// (`ops::types::SOURCE_TYPE_VALUES`, `ops::types::DESTINATION_TYPE_VALUES`),
+/// named here so the checks below read as the rule they enforce.
+const TYPE_S3: &str = "s3";
+/// See [`TYPE_S3`].
+const TYPE_IOT_SITE_WISE: &str = "iotsitewise";
+/// See [`TYPE_S3`].
+const TYPE_IOT_TWIN_MAKER: &str = "iottwinmaker";
+
+/// Why `sources[index]` describes no transferable source, or `None` when it
+/// describes one.
+///
+/// One rule, applied to every end of a transfer: the configuration member a
+/// `type` names must be present when the shape defines one, and no
+/// configuration belonging to another type may be. `iotsitewise` has an
+/// `iotSiteWiseConfiguration` whose every member is optional, so a SiteWise
+/// source carrying none still names a whole source (every asset model) and is
+/// accepted.
+fn source_configuration_error(index: usize, source: &SourceConfiguration) -> Option<String> {
+    let kind = source.r#type.as_str();
+    let strays: Vec<&str> = [
+        (source.s3_configuration.is_some() && kind != TYPE_S3).then_some("s3Configuration"),
+        (source.iot_site_wise_configuration.is_some() && kind != TYPE_IOT_SITE_WISE)
+            .then_some("iotSiteWiseConfiguration"),
+        (source.iot_twin_maker_configuration.is_some() && kind != TYPE_IOT_TWIN_MAKER)
+            .then_some("iotTwinMakerConfiguration"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let missing = match kind {
+        TYPE_S3 => source
+            .s3_configuration
+            .is_none()
+            .then_some("s3Configuration"),
+        TYPE_IOT_TWIN_MAKER => source
+            .iot_twin_maker_configuration
+            .is_none()
+            .then_some("iotTwinMakerConfiguration"),
+        TYPE_IOT_SITE_WISE => None,
+        other => {
+            return Some(format!(
+                "sources[{index}] has type {other}, which is not one of {}",
+                SOURCE_TYPE_VALUES.join(", ")
+            ));
+        }
+    };
+    configuration_error(&format!("sources[{index}]"), kind, missing, &strays)
+}
+
+/// Why `destination` describes no transferable destination, or `None` when it
+/// describes one. The same rule [`source_configuration_error`] applies, over
+/// the members `DestinationConfiguration` defines: it has none for an IoT
+/// SiteWise destination, so such a destination requires none.
+fn destination_configuration_error(destination: &DestinationConfiguration) -> Option<String> {
+    let kind = destination.r#type.as_str();
+    let strays: Vec<&str> = [
+        (destination.s3_configuration.is_some() && kind != TYPE_S3).then_some("s3Configuration"),
+        (destination.iot_twin_maker_configuration.is_some() && kind != TYPE_IOT_TWIN_MAKER)
+            .then_some("iotTwinMakerConfiguration"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let missing = match kind {
+        TYPE_S3 => destination
+            .s3_configuration
+            .is_none()
+            .then_some("s3Configuration"),
+        TYPE_IOT_TWIN_MAKER => destination
+            .iot_twin_maker_configuration
+            .is_none()
+            .then_some("iotTwinMakerConfiguration"),
+        TYPE_IOT_SITE_WISE => None,
+        other => {
+            return Some(format!(
+                "destination has type {other}, which is not one of {}",
+                DESTINATION_TYPE_VALUES.join(", ")
+            ));
+        }
+    };
+    configuration_error("destination", kind, missing, &strays)
+}
+
+/// The refusal message for the end of a transfer at `member` whose `kind`
+/// requires a `missing` configuration or carries `strays`, and `None` when it
+/// lacks nothing and carries nothing stray.
+///
+/// Built from the request — the member, its type and the configuration names —
+/// so the message says which part of the request was refused and why.
+fn configuration_error(
+    member: &str,
+    kind: &str,
+    missing: Option<&str>,
+    strays: &[&str],
+) -> Option<String> {
+    if let Some(missing) = missing {
+        return Some(format!("{member} has type {kind}, which requires {missing}"));
+    }
+    (!strays.is_empty()).then(|| {
+        format!(
+            "{member} has type {kind}, so it cannot carry {}",
+            strays.join(" or ")
+        )
+    })
+}
+
+/// Every workspace ARN this request names, in the order it names them: the
+/// workspace of each IoT TwinMaker source, then of an IoT TwinMaker
+/// destination. The other end types name an Amazon S3 location or an IoT
+/// SiteWise asset model instead, neither of which is a resource this service
+/// holds.
+fn referenced_workspaces(input: &CreateMetadataTransferJobInput) -> Vec<&str> {
+    input
+        .sources
+        .iter()
+        .filter_map(|source| source.iot_twin_maker_configuration.as_ref())
+        .map(|configuration| configuration.workspace.as_str())
+        .chain(
+            input
+                .destination
+                .iot_twin_maker_configuration
+                .as_ref()
+                .map(|configuration| configuration.workspace.as_str()),
+        )
+        .collect()
 }

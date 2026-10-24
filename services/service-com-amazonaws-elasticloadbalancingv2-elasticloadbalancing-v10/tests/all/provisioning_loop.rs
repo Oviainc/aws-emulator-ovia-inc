@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime};
 pub(crate) const REGION: &str = "us-west-2";
 
 /// The API version every awsQuery request carries, from the model's service version.
-const VERSION: &str = "2015-12-01";
+pub(crate) const VERSION: &str = "2015-12-01";
 
 /// The canonical account id every emulator ARN carries.
 pub(crate) fn account() -> &'static str {
@@ -337,7 +337,7 @@ async fn create_alb(router: &MultiServiceRouter, name: &str) -> String {
 }
 
 /// Create an HTTP/80 target group and answer its ARN.
-async fn create_http_target_group(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn create_http_target_group(router: &MultiServiceRouter, name: &str) -> String {
     let mut form = action("CreateTargetGroup");
     form.push(p("Name", name));
     form.push(p("Protocol", "HTTP"));
@@ -849,7 +849,10 @@ async fn target_group_health_check_defaults_follow_the_model() {
                 port: Some("traffic-port"),
                 path: Some("/"),
                 interval: "30",
-                timeout: "6",
+                // The RECORDED answer for an HTTP target group, which the model's own
+                // "the default is 6 seconds" disagrees with; see
+                // `health_check_config` in `src/ops/create_target_group.rs`.
+                timeout: "5",
                 healthy: "5",
                 unhealthy: "2",
                 http_matcher: Some("200"),
@@ -942,7 +945,7 @@ async fn target_group_health_check_defaults_follow_the_model() {
                 port: Some("traffic-port"),
                 path: Some("/AWS.ALB/healthcheck"),
                 interval: "30",
-                timeout: "6",
+                timeout: "5",
                 healthy: "5",
                 unhealthy: "2",
                 http_matcher: None,
@@ -952,18 +955,25 @@ async fn target_group_health_check_defaults_follow_the_model() {
             },
         ),
         (
-            // lambda: interval 35, timeout 30, unhealthy 5, health checks off.
+            // lambda: interval 35, timeout 30, unhealthy 2, health checks off. A
+            // Lambda target group reports NO health-check protocol or port — the load
+            // balancer invokes the function rather than connecting to a port — and its
+            // health check is an HTTP one all the same, so it carries the documented
+            // path and matcher. (The recorded AWS response for
+            // `elasticloadbalancing-lambda-target-group-lifecycle` diverged on exactly
+            // `HealthCheckPath`, `Matcher` and `IpAddressType` while
+            // `HealthCheckProtocol` and `HealthCheckPort` matched their absence.)
             "lambda-group",
             vec![p("TargetType", "lambda")],
             HealthCheckExpectation {
                 protocol: None,
                 port: None,
-                path: None,
+                path: Some("/"),
                 interval: "35",
                 timeout: "30",
                 healthy: "5",
-                unhealthy: "5",
-                http_matcher: None,
+                unhealthy: "2",
+                http_matcher: Some("200"),
                 grpc_matcher: None,
                 enabled: "false",
                 target_type: "lambda",

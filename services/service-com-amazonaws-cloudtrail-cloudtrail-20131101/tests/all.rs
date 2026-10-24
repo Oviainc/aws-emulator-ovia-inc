@@ -85,6 +85,19 @@ mod resource_policies;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+// Declared HERE rather than in the `import_*` span of the sorted list above: that span
+// is where every import suite landing in the same window inserts a line, so it is the
+// contended region, while these neighbours are stable. `harness` holds this suite's
+// import-registry fixtures.
+#[path = "all/harness.rs"]
+mod harness;
+#[path = "all/import_failures.rs"]
+mod import_failures;
+// Declared beside `import_failures` for the same reason: the sorted span above is the
+// contended region. `pattern_refusal_wording` pins how this service words a boundary
+// refusal for a `@pattern` violation, over every operation that has one.
+#[path = "all/pattern_refusal_wording.rs"]
+mod pattern_refusal_wording;
 #[path = "all/tag_refusal_envelope.rs"]
 mod tag_refusal_envelope;
 #[path = "all/tagging_arn_spelling.rs"]

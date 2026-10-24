@@ -15,6 +15,8 @@
 mod delete_message_batch;
 #[path = "all/message_lifecycle.rs"]
 mod message_lifecycle;
+#[path = "all/message_move_task.rs"]
+mod message_move_task;
 #[path = "all/message_plane.rs"]
 mod message_plane;
 #[path = "all/queue_configuration.rs"]

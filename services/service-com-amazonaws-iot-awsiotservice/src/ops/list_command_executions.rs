@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCommandExecutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCommandExecutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCommandExecutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One page of the account's COMMAND EXECUTIONS, computed from the SHARED
+//! job-execution store (`service_common::iot_job_executions`) the IoT Jobs data plane
+//! writes — `StartCommandExecution` enqueues one execution of a command on one device
+//! — and the device then moves. Every entry is the projection of one stored record
+//! ([`crate::state::to_command_execution_summary`]), so what this lists and what a
+//! single-execution reader reports are one value.
+//!
+//! The request narrows the listing and, with the same members, decides its ORDER: the
+//! time filter the request carries names the instant the listing both filters and
+//! sorts on, and `sortOrder` which way ([`Selection`]).
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +176,468 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCommandExecutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCommandExecutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The region the request is signed for: the `targetArn` of every execution
+        // reported is scoped to it, so it is also what the request's own `targetArn`
+        // filter is compared against.
+        let region = crate::state::request_region(ctx.parts());
+
+        // What the request selects and in which order is resolved BEFORE any store is
+        // reached: a request that names two filters the operation admits only one of,
+        // a time the calendar does not hold, or a `nextToken` this listing never
+        // issued is refused whatever the store holds.
+        let selection = Selection::of(&input)?;
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_next_token(token, &selection.scope())?),
+            None => None,
+        };
+        // `maxResults` is `range 1..100`, refused outside that before this handler
+        // runs; a request that names none asks for a page, and the largest page the
+        // model admits is the one it gets. The clamp is defensive rather than
+        // load-bearing: it keeps the page inside the modelled range without depending
+        // on a validation performed outside this module.
+        let page_size = input
+            .max_results
+            .map_or(MAX_COMMAND_MAX_RESULTS, |max| {
+                max.clamp(1, MAX_COMMAND_MAX_RESULTS)
+            }) as usize;
+
+        let unavailable = |what: &str| -> ListCommandExecutionsError {
+            ListCommandExecutionsErrorModeled::InternalServerException(InternalServerException {
+                message: Some(format!("the IoT emulator has no {what} attached")),
+            })
+            .into()
+        };
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable("state store"));
+        };
+        // The executions live in the SHARED store the IoT Jobs data plane serves, so
+        // this lists the very records a device polls, starts and updates.
+        let Some(executions) = crate::state::job_execution_store(&*self.engine) else {
+            return Err(unavailable("job execution store"));
+        };
+
+        // `namespace` is a property of the COMMAND, which this service owns, so the
+        // filter is resolved to the set of command ARNs created in that namespace. A
+        // command created without a namespace is in the BASE one: `CreateCommand`'s
+        // own `roleArn` is "the IAM role that you must provide when using the
+        // AWS-IoT-FleetWise namespace [...] not supported when you use the AWS-IoT
+        // namespace", so a command created with neither a namespace nor a role is one
+        // the AWS-IoT namespace's rules admit and the other's do not.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCommandExecutions"))
+        // LOCK ORDER: this service's store first and the shared one second, as
+        // `crate::state::job_execution_store` documents; the two are never held at
+        // once here, the command lock being released with this binding's scope.
+        let namespace_arns: Option<::std::collections::BTreeSet<String>> =
+            selection.namespace.as_deref().map(|namespace| {
+                state
+                    .lock()
+                    .commands
+                    .values()
+                    .filter(|command| {
+                        command.namespace.as_deref().unwrap_or(BASE_NAMESPACE) == namespace
+                    })
+                    .map(|command| command.command_arn.clone())
+                    .collect()
+            });
+
+        let now = ::service_common::iot_job_executions::now_epoch_seconds();
+        let mut store = executions.lock();
+
+        // A timer the command start or the device armed moves an execution to
+        // `TIMED_OUT` by itself, so the transitions the clock has already made due are
+        // recorded before anything is read: each was owed at its own deadline whether
+        // or not this call happened, and the status a later reader of the shared store
+        // sees must be the same one this listing reports.
+        let listed_things: Vec<String> = store
+            .things
+            .keys()
+            .filter(|thing_name| {
+                selection.selects_target(&crate::state::thing_arn(&region, thing_name))
+            })
+            .cloned()
+            .collect();
+        for thing_name in &listed_things {
+            store.time_out_due_executions(thing_name, now);
+        }
+
+        // One row per execution this listing is about, carrying the key it is ordered
+        // by: the instant the request's time filter selects, and the store's enqueue
+        // order breaking a tie between two executions created in the same second.
+        let mut rows: Vec<(SortKey, CommandExecutionSummary)> = Vec::new();
+        for thing_name in &listed_things {
+            for record in store.executions_for(thing_name) {
+                let Some(command_arn) = record.command_arn.as_deref() else {
+                    // Not a command execution at all: a job created it, and the job
+                    // readers are what report it.
+                    continue;
+                };
+                if selection
+                    .command_arn
+                    .as_deref()
+                    .is_some_and(|wanted| wanted != command_arn)
+                {
+                    continue;
+                }
+                if namespace_arns
+                    .as_ref()
+                    .is_some_and(|arns| !arns.contains(command_arn))
+                {
+                    continue;
+                }
+                let Some(instant) = selection.basis.instant(record) else {
+                    // The execution has no instant of the kind this listing filters
+                    // and orders by — it has not completed — so it is not one of the
+                    // executions that completed in the window asked about.
+                    continue;
+                };
+                if !selection.window.holds(instant) {
+                    continue;
+                }
+                let Some(summary) = crate::state::to_command_execution_summary(record, &region)
+                else {
+                    continue;
+                };
+                if selection
+                    .status
+                    .as_deref()
+                    .is_some_and(|wanted| summary.status.as_deref() != Some(wanted))
+                {
+                    continue;
+                }
+                rows.push(((instant, record.enqueue_sequence), summary));
+            }
+        }
+
+        // ONE total order over the whole selection, which is what makes a page
+        // boundary meaningful: by the selected instant, oldest first, and by the
+        // store's enqueue order where two executions share a second. `sortOrder`
+        // reverses it; "the API returns all commands in the descending order" by
+        // default (`sortOrder`), which is what `Selection` resolved.
+        rows.sort_by_key(|(key, _)| *key);
+        if !selection.ascending {
+            rows.reverse();
+        }
+
+        // One row beyond the page: its presence is what says the listing is
+        // truncated.
+        let mut page: Vec<(SortKey, CommandExecutionSummary)> = rows
+            .into_iter()
+            .filter(|(key, _)| {
+                resume_after.is_none_or(|cursor| selection.sorts_after(*key, cursor))
+            })
+            .take(page_size.saturating_add(1))
+            .collect();
+        let truncated = page.len() > page_size;
+        page.truncate(page_size);
+
+        // `nextToken` is "The token to use to get the next set of results, or null if
+        // there are no additional results".
+        let next_token = if truncated {
+            page.last()
+                .map(|(key, _)| encode_next_token(&selection.scope(), *key))
+        } else {
+            None
+        };
+
+        Ok(ListCommandExecutionsOutput {
+            // `CommandExecutionSummaryList` carries no length constraint, so a
+            // selection nothing matches answers with an EMPTY list rather than an
+            // absent member: "nothing matches" is an answer, not a missing one.
+            command_executions: Some(page.into_iter().map(|(_, summary)| summary).collect()),
+            next_token,
+        })
     }
+}
+
+/// The largest page `CommandMaxResults` admits (`range 1..100`), and therefore the
+/// page a request that names no `maxResults` gets: the model states no other default.
+const MAX_COMMAND_MAX_RESULTS: i32 = 100;
+
+/// The `CommandNamespace` a command created without one is in: the base namespace,
+/// which is the one `CreateCommand` admits a command carrying no `roleArn` in
+/// (`CreateCommand$roleArn`: "The IAM role that you must provide when using the
+/// AWS-IoT-FleetWise namespace [...] This field is not supported when you use the
+/// AWS-IoT namespace"). `CommandNamespace` declares no other value
+/// (`smithy_query(query="shape",shape="CommandNamespace")`: `AWS-IoT`,
+/// `AWS-IoT-FleetWise`).
+const BASE_NAMESPACE: &str = "AWS-IoT";
+
+/// `ASCENDING`, the one `SortOrder` value that is not the operation's default.
+///
+/// `sortOrder` documents "By default, the API returns all commands in the descending
+/// order based on the start time or completion time of the executions"
+/// (`smithy_query(query="shape",shape="SortOrder")`: `ASCENDING`, `DESCENDING`).
+const SORT_ORDER_ASCENDING: &str = "ASCENDING";
+
+/// The key one execution is ordered by: the instant the request's time filter selects
+/// and the store's enqueue order, which breaks a tie between two executions created
+/// inside the same whole second (`queued_at` is epoch SECONDS, so it cannot).
+type SortKey = (i64, u64);
+
+/// Which of an execution's instants a listing filters and orders by.
+///
+/// The operation documents the order as "descending order based on the start time or
+/// completion time of the executions, that are determined by the startTimeFilter and
+/// completeTimeFilter parameters" (`sortOrder`), so the time filter the request
+/// carries picks the instant — and a request carrying neither orders by when each
+/// execution was created, the only instant every execution has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Basis {
+    /// `createdAt`: "The date and time at which the command execution was created for
+    /// the target device."
+    Created,
+    /// `startedAt`: "The date and time at which the command started executing on the
+    /// target device."
+    Started,
+    /// `completedAt`: "The date and time at which the command completed executing on
+    /// the target device."
+    Completed,
+}
+
+impl Basis {
+    /// The instant this basis reads off a stored execution, or `None` when the
+    /// execution has no such instant yet.
+    ///
+    /// Only `Completed` can answer `None`: every execution was created, and every one
+    /// was started by the call that created it
+    /// ([`crate::state::command_execution_started_at`]), while an execution that has
+    /// not reached a terminal status has not completed — so it is not one of the
+    /// executions that "completed any time before or after" anything.
+    fn instant(self, record: &::service_common::iot_job_executions::JobExecutionRecord) -> Option<i64> {
+        match self {
+            Self::Created => Some(record.queued_at),
+            Self::Started => Some(crate::state::command_execution_started_at(record)),
+            Self::Completed => crate::state::command_execution_completed_at(record),
+        }
+    }
+
+    /// This basis as one field of a continuation token's scope; see
+    /// [`Selection::scope`].
+    fn scope(self) -> &'static str {
+        match self {
+            Self::Created => "c",
+            Self::Started => "s",
+            Self::Completed => "d",
+        }
+    }
+}
+
+/// The window a selected instant has to fall in: the `after` / `before` pair of the
+/// one `TimeFilter` the request carries, as epoch seconds.
+///
+/// Both bounds are read INCLUSIVELY — the members document "only after a particular
+/// date and time" and "only before a particular date and time" without stating which
+/// side the instant itself falls on, and an execution whose instant IS the bound is
+/// one the caller named.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Window {
+    after: Option<i64>,
+    before: Option<i64>,
+}
+
+impl Window {
+    /// Whether `instant` is in the window.
+    fn holds(self, instant: i64) -> bool {
+        self.after.is_none_or(|after| instant >= after)
+            && self.before.is_none_or(|before| instant <= before)
+    }
+
+    /// This window as one field of a continuation token's scope; see
+    /// [`Selection::scope`].
+    fn scope(self) -> String {
+        format!(
+            "{}{SCOPE_SEPARATOR}{}",
+            self.after.unwrap_or(i64::MIN),
+            self.before.unwrap_or(i64::MAX)
+        )
+    }
+}
+
+/// WHICH command executions a request selects and in WHICH order — everything the
+/// listing needs that comes from the request rather than from the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Selection {
+    /// `commandArn`: "You can use this information to list all command executions for
+    /// a particular command."
+    command_arn: Option<String>,
+    /// `targetArn`: "You can use this information to list all command executions for a
+    /// particular device."
+    target_arn: Option<String>,
+    /// `namespace`: the namespace the executions' COMMAND was created in.
+    namespace: Option<String>,
+    /// `status`, as a `CommandExecutionStatus` value: "List all command executions for
+    /// the device that have a particular status."
+    status: Option<String>,
+    basis: Basis,
+    window: Window,
+    /// Whether the oldest selected execution comes first.
+    ascending: bool,
+}
+
+impl Selection {
+    /// The selection a request asks for, or the modelled `ValidationException` (HTTP
+    /// 400, "The request is not valid") when it asks for one the operation does not
+    /// admit.
+    ///
+    /// Two refusals are the operation's own documentation: "You must provide only the
+    /// startedTimeFilter or the completedTimeFilter information. If you provide both
+    /// time filters, the API will generate an error" and "You must provide only the
+    /// commandArn or the thingArn information depending on whether you want to list
+    /// executions for a specific command or an IoT thing. If you provide both fields,
+    /// the API will generate an error." The third is a `TimeFilter` bound that names no
+    /// instant: the member is modelled as a STRING, so the framework cannot have
+    /// refused it, and a filter nobody can evaluate is refused rather than ignored.
+    fn of(input: &ListCommandExecutionsInput) -> Result<Self, ListCommandExecutionsError> {
+        if input.command_arn.is_some() && input.target_arn.is_some() {
+            return Err(validation(
+                "only one of commandArn and targetArn may be provided".to_string(),
+            ));
+        }
+        let (basis, filter) = match (
+            input.started_time_filter.as_ref(),
+            input.completed_time_filter.as_ref(),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(validation(
+                    "only one of startedTimeFilter and completedTimeFilter may be provided"
+                        .to_string(),
+                ));
+            }
+            (Some(started), None) => (Basis::Started, Some(("startedTimeFilter", started))),
+            (None, Some(completed)) => {
+                (Basis::Completed, Some(("completedTimeFilter", completed)))
+            }
+            (None, None) => (Basis::Created, None),
+        };
+        let mut window = Window::default();
+        if let Some((member, filter)) = filter {
+            window.after = parse_bound(member, "after", filter.after.as_deref())?;
+            window.before = parse_bound(member, "before", filter.before.as_deref())?;
+        }
+        Ok(Self {
+            command_arn: input.command_arn.clone(),
+            target_arn: input.target_arn.clone(),
+            namespace: input.namespace.clone(),
+            status: input.status.clone(),
+            basis,
+            window,
+            ascending: input.sort_order.as_deref() == Some(SORT_ORDER_ASCENDING),
+        })
+    }
+
+    /// Whether a device whose ARN is `target_arn` is one this listing is about. An ARN
+    /// the request names is compared against the ARN each execution is REPORTED with,
+    /// so a `targetArn` of another region, account or partition names another device —
+    /// which is what an ARN carrying those segments means.
+    fn selects_target(&self, target_arn: &str) -> bool {
+        self.target_arn
+            .as_deref()
+            .is_none_or(|wanted| wanted == target_arn)
+    }
+
+    /// Whether `key` comes after `cursor` in THIS selection's order, i.e. whether the
+    /// execution it belongs to is still to be returned once a page ending at `cursor`
+    /// has been.
+    fn sorts_after(&self, key: SortKey, cursor: SortKey) -> bool {
+        if self.ascending {
+            key > cursor
+        } else {
+            key < cursor
+        }
+    }
+
+    /// The LISTING a continuation token belongs to: the filters and the order, which
+    /// together decide which executions it walks and therefore what "the next set of
+    /// results" means. A token issued for one listing is refused by another.
+    fn scope(&self) -> String {
+        [
+            self.basis.scope().to_string(),
+            self.window.scope(),
+            self.command_arn.clone().unwrap_or_default(),
+            self.target_arn.clone().unwrap_or_default(),
+            self.namespace.clone().unwrap_or_default(),
+            self.status.clone().unwrap_or_default(),
+            if self.ascending { "a" } else { "d" }.to_string(),
+        ]
+        .join(&SCOPE_SEPARATOR.to_string())
+    }
+}
+
+/// A refusal of this request as the modelled `ValidationException` (HTTP 400),
+/// carrying `message`.
+fn validation(message: String) -> ListCommandExecutionsError {
+    ListCommandExecutionsErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// One bound of a `TimeFilter` as the instant it names, or the modelled
+/// `ValidationException` naming the member and the form it admits.
+///
+/// An absent bound is no bound at all, which is why `None` is a success: a filter may
+/// carry `after`, `before` or both.
+fn parse_bound(
+    member: &str,
+    bound: &str,
+    value: Option<&str>,
+) -> Result<Option<i64>, ListCommandExecutionsError> {
+    match value {
+        None => Ok(None),
+        Some(value) => crate::state::parse_string_date_time(value)
+            .map(Some)
+            .ok_or_else(|| {
+                validation(format!(
+                    "{member}.{bound} must be a date and time in the format \
+                     yyyy-MM-dd'T'HH:mm, got {value}"
+                ))
+            }),
+    }
+}
+
+/// The character that separates the fields of a token's SCOPE. A control character, so
+/// it cannot occur inside an ARN, a `CommandNamespace` or a `CommandExecutionStatus`
+/// value, nor inside the decimal bounds of a window.
+const SCOPE_SEPARATOR: char = '\u{1e}';
+
+/// The character that separates a token's scope from the position it resumes after.
+const TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// The opaque `nextToken` that resumes `scope`'s listing after the execution whose
+/// ordering key is `key`.
+///
+/// The key, not the id: it is the position in the listing's total order, so a page
+/// resumes where the last one ended even if that execution has since been deleted.
+/// Hex-encoded so the token is opaque to the caller whatever the filters contain. The
+/// encoding carries no integrity protection and claims none: a caller that reverses it
+/// can name any resume point of the listing it is already reading, which selects a
+/// page of that same listing and nothing else.
+fn encode_next_token(scope: &str, key: SortKey) -> String {
+    let (instant, sequence) = key;
+    ::hex::encode(format!(
+        "{scope}{TOKEN_SEPARATOR}{instant}{SCOPE_SEPARATOR}{sequence}"
+    ))
+}
+
+/// The position a `nextToken` resumes after, or `ValidationException` when the token is
+/// not one [`encode_next_token`] issued for THIS listing.
+///
+/// Every step is fallible on purpose: the token is caller-supplied, so nothing read out
+/// of it may panic the handler. A token issued for another selection is refused rather
+/// than silently resuming a different listing from the middle.
+fn decode_next_token(token: &str, scope: &str) -> Result<SortKey, ListCommandExecutionsError> {
+    let invalid = || -> ListCommandExecutionsError {
+        validation("nextToken is not a continuation token of this listing".to_string())
+    };
+    let bytes = ::hex::decode(token).map_err(|_| invalid())?;
+    let decoded = String::from_utf8(bytes).map_err(|_| invalid())?;
+    let (token_scope, cursor) = decoded.split_once(TOKEN_SEPARATOR).ok_or_else(invalid)?;
+    if token_scope != scope {
+        return Err(invalid());
+    }
+    let (instant, sequence) = cursor.split_once(SCOPE_SEPARATOR).ok_or_else(invalid)?;
+    Ok((
+        instant.parse().map_err(|_| invalid())?,
+        sequence.parse().map_err(|_| invalid())?,
+    ))
 }

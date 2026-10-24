@@ -4,9 +4,9 @@
 //!
 //! Every resource this service hands out lives here: configs keyed by their
 //! `(configType, configId)` pair (the two labels `GET /config/{configType}/{configId}`
-//! carries), mission profiles, contacts and AWS Ground Station Agents keyed by their
-//! uuid, plus one ARN index so a `trackingConfigArn` / `missionProfileArn` reference
-//! resolves without scanning a map.
+//! carries), mission profiles, contacts, ephemerides and AWS Ground Station Agents keyed
+//! by their uuid, plus one ARN index so a `trackingConfigArn` / `missionProfileArn`
+//! reference resolves without scanning a map.
 //!
 //! The helpers beside the struct are the pieces every handler of this service needs —
 //! the request's region, the union-member-to-`ConfigCapabilityType` mapping, the
@@ -29,8 +29,9 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     AgentDetails, AggregateStatus, ComponentStatusData, ConfigTypeData, ContactVersion,
-    DiscoveryData, Eirp, EndpointDetails, EphemerisMetaData, Frequency, FrequencyBandwidth,
-    InvalidParameterException, KmsKey, SpectrumConfig, TrackingOverrides,
+    AzElSegmentsData, DiscoveryData, Eirp, EndpointDetails, EphemerisData, EphemerisMetaData,
+    Frequency, FrequencyBandwidth, InvalidParameterException, KmsKey, S3Object, SpectrumConfig,
+    TrackingOverrides,
 };
 
 /// Region used in minted ARNs when the request carries no usable SigV4 credential
@@ -52,6 +53,14 @@ pub const SCHEDULING_SETTLES_AFTER: Duration = Duration::from_millis(300);
 /// interfaces), inside the 250–750 ms band this project gives a clock-owed transition, so
 /// a caller that reads the group straight after creating it still observes `creating`.
 pub const ENDPOINT_CREATION_SETTLES_AFTER: Duration = Duration::from_millis(300);
+
+/// `CreateEphemeris` admits an ephemeris in `VALIDATING`; the service validates the
+/// supplied data and the ephemeris reaches `ENABLED`, `DISABLED` or `INVALID` on its own.
+/// CHOSEN span (AWS documents no duration for it — the real service takes up to minutes to
+/// validate an ephemeris), inside the 250–750 ms band this project gives a clock-owed
+/// transition, so a caller that lists the ephemeris straight after creating it still
+/// observes `VALIDATING`.
+pub const EPHEMERIS_VALIDATION_SETTLES_AFTER: Duration = Duration::from_millis(300);
 
 /// Which `ConfigCapabilityType` a `ConfigTypeData` union member selects.
 ///
@@ -775,6 +784,8 @@ pub enum ResourceRef {
     DataflowEndpointGroup { dataflow_endpoint_group_id: String },
     /// An AWS Ground Station Agent, by `agentId`.
     Agent { agent_id: String },
+    /// An ephemeris, by `ephemerisId`.
+    Ephemeris { ephemeris_id: String },
 }
 
 /// A config as `CreateConfig` stored it.
@@ -1389,6 +1400,196 @@ pub fn is_ground_station_name(name: &str) -> bool {
         })
 }
 
+/// The status an ephemeris carries while the service is still validating the data it was
+/// created with.
+///
+/// This and the four constants below are values of the model's own `EphemerisStatus` enum,
+/// whose members are `VALIDATING`, `INVALID`, `ERROR`, `ENABLED`, `DISABLED` and `EXPIRED`
+/// (`smithy_query(query="shape", shape="EphemerisStatus")`). `ERROR` is not among them:
+/// the model documents it for an ephemeris the service itself failed to process, and
+/// nothing in this emulator fails that way, so no ephemeris here reaches it.
+pub const EPHEMERIS_VALIDATING: &str = "VALIDATING";
+
+/// The status of an ephemeris whose data validated and which was asked to be enabled.
+pub const EPHEMERIS_ENABLED: &str = "ENABLED";
+
+/// The status of an ephemeris whose data validated and which was not asked to be enabled.
+pub const EPHEMERIS_DISABLED: &str = "DISABLED";
+
+/// The status of an ephemeris whose supplied data did not validate.
+pub const EPHEMERIS_INVALID: &str = "INVALID";
+
+/// The status of an ephemeris whose expiration time has passed: `CreateEphemeris`
+/// documents `expirationTime` as "an overall expiration time for the ephemeris in UTC,
+/// after which it will become `EXPIRED`" (`smithy_query(query="doc",
+/// shape="CreateEphemerisRequest", member="expirationTime")`).
+pub const EPHEMERIS_EXPIRED: &str = "EXPIRED";
+
+/// Why an ephemeris whose supplied data describes a backwards-running validity range did
+/// not validate: a value of the model's `EphemerisInvalidReason` enum, whose members are
+/// `METADATA_INVALID`, `TIME_RANGE_INVALID`, `TRAJECTORY_INVALID`, `KMS_KEY_INVALID` and
+/// `VALIDATION_ERROR` (`smithy_query(query="shape", shape="EphemerisInvalidReason")`).
+pub const EPHEMERIS_TIME_RANGE_INVALID: &str = "TIME_RANGE_INVALID";
+
+/// The priority an ephemeris is created with when the request names none: the model's own
+/// documentation of `CreateEphemerisRequest$priority` — "Higher numbers take precedence.
+/// The default is 1. Must be 1 or greater." (`smithy_query(query="doc",
+/// shape="CreateEphemerisRequest", member="priority")`). The member carries no `@default`
+/// trait, so the documented default is applied here instead.
+pub const DEFAULT_EPHEMERIS_PRIORITY: i32 = 1;
+
+/// Whether an ephemeris created without an `enabled` member is enabled.
+///
+/// FALSE: the member exists to ask for enabling — "Set to `true` to enable the ephemeris
+/// after validation. Set to `false` to keep it disabled." (`smithy_query(query="doc",
+/// shape="CreateEphemerisRequest", member="enabled")`) — so a request that asks for
+/// neither has not asked to enable it, and the ephemeris validates to
+/// [`EPHEMERIS_DISABLED`]. `UpdateEphemeris` then enables it, where `enabled` is required.
+pub const EPHEMERIS_ENABLED_BY_DEFAULT: bool = false;
+
+/// Which `EphemerisType` an `EphemerisData` union member selects.
+///
+/// An ephemeris's type is NOT a request field: it is implied by whichever member of the
+/// union the caller set, and it is what `ListEphemerides` reports as `ephemerisType` and
+/// filters on. The three pairs are the model's own: `smithy_query(query="shape",
+/// shape="EphemerisData")` lists the members and `shape="EphemerisType"` the enum values.
+/// The fourth value, `SERVICE_MANAGED`, belongs to an ephemeris AWS supplies itself (the
+/// Space Track default), which no customer request creates.
+pub fn ephemeris_type_of(data: &EphemerisData) -> &'static str {
+    match data {
+        EphemerisData::Tle(_) => "TLE",
+        EphemerisData::Oem(_) => "OEM",
+        EphemerisData::azEl(_) => "AZ_EL",
+    }
+}
+
+/// The Amazon S3 object `data` was supplied from, when it names one rather than carrying
+/// the data inline — what `ListEphemerides` reports as an item's `sourceS3Object`.
+pub fn ephemeris_source_s3_object(data: &EphemerisData) -> Option<S3Object> {
+    match data {
+        EphemerisData::Tle(tle) => tle.s3_object.clone(),
+        EphemerisData::Oem(oem) => oem.s3_object.clone(),
+        EphemerisData::azEl(az_el) => match &az_el.data {
+            AzElSegmentsData::s3Object(object) => Some(object.clone()),
+            AzElSegmentsData::azElData(_) => None,
+        },
+    }
+}
+
+/// The validity ranges the data `data` carries, as `(start, end)` epoch seconds.
+///
+/// A TLE set declares one `validTimeRange` per entry and an az/el set one per segment
+/// (`smithy_query(query="shape", shape="TLEData")` / `shape="AzElSegment"`). An OEM body
+/// carries its validity inside the CCSDS document this emulator stores verbatim rather
+/// than parses, and data supplied from an Amazon S3 object is not fetched here, so both
+/// declare none.
+fn ephemeris_validity_ranges(data: &EphemerisData) -> Vec<(f64, f64)> {
+    match data {
+        EphemerisData::Tle(tle) => tle
+            .tle_data
+            .iter()
+            .flatten()
+            .map(|entry| {
+                (
+                    entry.valid_time_range.start_time.as_secs_f64(),
+                    entry.valid_time_range.end_time.as_secs_f64(),
+                )
+            })
+            .collect(),
+        EphemerisData::Oem(_) => Vec::new(),
+        EphemerisData::azEl(az_el) => match &az_el.data {
+            AzElSegmentsData::azElData(segments) => segments
+                .az_el_segment_list
+                .iter()
+                .map(|segment| {
+                    (
+                        segment.valid_time_range.start_time.as_secs_f64(),
+                        segment.valid_time_range.end_time.as_secs_f64(),
+                    )
+                })
+                .collect(),
+            AzElSegmentsData::s3Object(_) => Vec::new(),
+        },
+    }
+}
+
+/// The last instant the data `data` supplies is valid for, when the data declares its own
+/// validity ([`ephemeris_validity_ranges`]); `None` when it declares none.
+///
+/// This is the expiration an ephemeris created without an explicit `expirationTime`
+/// takes: the data stops being usable when its own validity ends.
+pub fn ephemeris_validity_end(data: &EphemerisData) -> Option<DateTime> {
+    ephemeris_validity_ranges(data)
+        .into_iter()
+        .map(|(_, end)| end)
+        .reduce(f64::max)
+        .map(DateTime::from_secs_f64)
+}
+
+/// Why the data `data` supplies cannot be used, as an `EphemerisInvalidReason`, or `None`
+/// when nothing in it is wrong.
+///
+/// A validity range must run forwards: one whose end does not follow its start describes
+/// no interval at all, so the data is refused as [`EPHEMERIS_TIME_RANGE_INVALID`] rather
+/// than enabled. This is the verdict of the validation `CreateEphemeris` starts, applied
+/// when that validation falls due ([`EPHEMERIS_VALIDATION_SETTLES_AFTER`]).
+pub fn ephemeris_invalid_reason(data: &EphemerisData) -> Option<&'static str> {
+    ephemeris_validity_ranges(data)
+        .iter()
+        .any(|(start, end)| end <= start)
+        .then_some(EPHEMERIS_TIME_RANGE_INVALID)
+}
+
+/// An ephemeris as `CreateEphemeris` stored it.
+#[derive(Debug, Clone)]
+pub struct Ephemeris {
+    pub ephemeris_id: String,
+    /// This ephemeris's ARN — what the tagging operations address it by, and what the one
+    /// ARN index resolves to this record.
+    pub ephemeris_arn: String,
+    /// The satellite this ephemeris applies to, when the request named one.
+    pub satellite_id: Option<String>,
+    pub name: String,
+    /// The `EphemerisType` the supplied data selected ([`ephemeris_type_of`]).
+    pub ephemeris_type: String,
+    pub priority: i32,
+    /// Whether the caller asked for this ephemeris to be enabled once it validates.
+    pub enabled: bool,
+    pub creation_time: DateTime,
+    /// When this ephemeris expires, after which it is [`EPHEMERIS_EXPIRED`]: the
+    /// request's `expirationTime`, or the end of the supplied data's own validity when
+    /// the request named none. `None` when neither is known, in which case the ephemeris
+    /// does not expire.
+    pub expiration_time: Option<DateTime>,
+    /// The Amazon S3 object the data was supplied from, when it was not supplied inline.
+    pub source_s3_object: Option<S3Object>,
+    /// The KMS key the request asked for the ephemeris to be encrypted with.
+    pub kms_key_arn: Option<String>,
+    /// The ephemeris data as supplied, which `DescribeEphemeris` reports as
+    /// `suppliedData`.
+    pub supplied_data: EphemerisData,
+    pub tags: HashMap<String, String>,
+    /// This ephemeris's `EphemerisStatus` as it stands now.
+    pub status: String,
+    /// The verdict of the validation this ephemeris's data failed, as an
+    /// `EphemerisInvalidReason`; `None` when the data validated. Set when the ephemeris
+    /// is created ([`ephemeris_invalid_reason`]) and reported only once the validation has
+    /// fallen due and the status is [`EPHEMERIS_INVALID`].
+    pub invalid_reason: Option<&'static str>,
+    /// The instant the service owes this ephemeris the move out of
+    /// [`EPHEMERIS_VALIDATING`]; `None` once that move has been materialised.
+    pub validation_settles_at: Option<SystemTime>,
+}
+
+/// What this service answers when a `satelliteId` names no satellite this account is
+/// on-boarded to.
+///
+/// Shared by every operation that takes one, so a create that references an unknown
+/// satellite and a listing filtered on one answer the same text.
+pub fn satellite_not_found_message(satellite_id: &str) -> String {
+    format!("No satellite found with id {satellite_id}")
+}
+
 /// Per-service state for com-amazonaws-groundstation-groundstation. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsGroundstationGroundstationState {
@@ -1402,6 +1603,8 @@ pub struct ComAmazonawsGroundstationGroundstationState {
     pub dataflow_endpoint_groups: HashMap<String, DataflowEndpointGroup>,
     /// Registered AWS Ground Station Agents, keyed by `agentId`.
     pub agents: HashMap<String, Agent>,
+    /// Ephemerides, keyed by `ephemerisId` — what `ListEphemerides` reports.
+    pub ephemerides: HashMap<String, Ephemeris>,
     /// Every ARN this service minted, and what it points at.
     pub arn_index: HashMap<String, ResourceRef>,
     /// The uplink frequency bands, in MHz, this account has been approved to transmit
@@ -1630,6 +1833,7 @@ impl Default for ComAmazonawsGroundstationGroundstationState {
             contacts: HashMap::new(),
             dataflow_endpoint_groups: HashMap::new(),
             agents: HashMap::new(),
+            ephemerides: HashMap::new(),
             arn_index: HashMap::new(),
             approved_uplink_bands_mhz: from_env(
                 APPROVED_UPLINK_BANDS_ENV,
@@ -1809,6 +2013,49 @@ impl ComAmazonawsGroundstationGroundstationState {
                 }
             }
             group.endpoints_settle_at = None;
+        }
+    }
+
+    /// Materialise every ephemeris status move the clock has already made due: the end of
+    /// the validation `CreateEphemeris` started, and the expiration of an ephemeris whose
+    /// `expirationTime` has passed. A reporting operation calls this before reading: both
+    /// moves were owed at this instant whether or not anybody called, so applying them
+    /// changes nothing a later caller could otherwise have seen.
+    ///
+    /// Validation lands the ephemeris on the verdict taken when it was created
+    /// ([`ephemeris_invalid_reason`]): [`EPHEMERIS_INVALID`] when its data describes no
+    /// usable validity range, else [`EPHEMERIS_ENABLED`] or [`EPHEMERIS_DISABLED`]
+    /// according to what the caller asked for. Expiration then overrides either of those
+    /// two, and an ephemeris that did not validate stays `INVALID`: there is nothing of
+    /// it to expire.
+    pub fn settle_due_ephemerides(&mut self) {
+        let now = SystemTime::now();
+        let now_seconds = now
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |since| since.as_secs_f64());
+        for ephemeris in self.ephemerides.values_mut() {
+            if let Some(due) = ephemeris.validation_settles_at {
+                if due > now {
+                    continue;
+                }
+                ephemeris.status = match (ephemeris.invalid_reason, ephemeris.enabled) {
+                    (Some(_), _) => EPHEMERIS_INVALID.to_string(),
+                    (None, true) => EPHEMERIS_ENABLED.to_string(),
+                    (None, false) => EPHEMERIS_DISABLED.to_string(),
+                };
+                ephemeris.validation_settles_at = None;
+            }
+            let expired = ephemeris
+                .expiration_time
+                .is_some_and(|expiration| expiration.as_secs_f64() <= now_seconds);
+            if expired
+                && matches!(
+                    ephemeris.status.as_str(),
+                    EPHEMERIS_ENABLED | EPHEMERIS_DISABLED
+                )
+            {
+                ephemeris.status = EPHEMERIS_EXPIRED.to_string();
+            }
         }
     }
 

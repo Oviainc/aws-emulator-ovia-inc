@@ -23,7 +23,10 @@
 //! The one lens definition this emulator ships itself — the AWS-official Well-Architected
 //! Framework lens's question set — lives here too, for the same reason: the risk roll-up
 //! of a workload and the answer list of a lens review must agree about which questions
-//! a lens asks.
+//! a lens asks. The aliases of the lenses Amazon Web Services publishes
+//! ([`AWS_OFFICIAL_LENS_ALIASES`]) live beside it, because a lens is applied BY NAME and
+//! every operation that applies one has to resolve that name against the same catalog
+//! ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::resolve_lens`]).
 //!
 //! The modelled `ResourceNotFoundException` / `ConflictException` constructors live
 //! here for the same reason: every operation that resolves an identifier or enforces a
@@ -924,6 +927,22 @@ pub const MAX_REVIEW_TEMPLATES: usize = 10_000;
 /// `ValidationException`. It is what bounds a STORED template's lens list, and with it
 /// the work of applying that template to a workload.
 pub const MAX_LENSES_PER_REVIEW_TEMPLATE: usize = 10;
+
+/// The most lenses one `CreateWorkload` request attaches — the same kind of quota as
+/// [`MAX_LENSES_PER_REVIEW_TEMPLATE`], for the lens list of a WORKLOAD.
+///
+/// `CreateWorkloadInput$Lenses` targets `WorkloadLenses`, which publishes no `@length`, so
+/// nothing in the model bounds the list a create attaches. The number here is the one the
+/// service publishes for a workload lens list elsewhere: `AssociateLenses` /
+/// `DisassociateLenses` take `LensAliases`, whose doc is "List of lens aliases to associate
+/// or disassociate with a workload. Up to 10 lenses can be specified."
+/// (`smithy_query(query="shape", shape="LensAliases")`). Being an emulator quota rather
+/// than a modelled constraint, `CreateWorkload` answers a longer list with the modelled
+/// `ServiceQuotaExceededException` — as `CreateReviewTemplate` does for a template's — and
+/// it is what bounds the lens list a STORED workload carries, the lens resolution that
+/// create runs ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::unapplicable_lenses_refusal`])
+/// and the per-lens work of every read that reports its lens reviews.
+pub const MAX_LENSES_PER_WORKLOAD: usize = 10;
 
 /// `ReviewTemplateUpdateStatus$CURRENT`: what a review template reports while every lens
 /// applied to it is at its current version. The enum publishes exactly `CURRENT` and
@@ -2410,6 +2429,91 @@ pub fn is_aws_official_lens(alias: &str) -> bool {
     fields.len() < 5 || fields[3].is_empty()
 }
 
+/// The aliases Amazon Web Services publishes its own lenses under — the AWS-OFFICIAL
+/// half of the catalog a `LensAlias` resolves against.
+///
+/// SOURCE: the Lens Catalog of the AWS Well-Architected Tool user guide
+/// (<https://docs.aws.amazon.com/wellarchitected/latest/userguide/lenses.html>), whose
+/// lenses are the ones AWS's own `ListLenses` reports under `LensType$AWS_OFFICIAL`. The
+/// Smithy model cannot supply the set: it bounds a `LensAlias` only by length and carries
+/// `serverless` as an example of one (`smithy_query(query="shape", shape="LensAlias")`),
+/// so the catalog is written out here for the same reason [`AWS_REGIONS`] is — a value
+/// outside the published set names no lens at all, and an operation that APPLIES a lens
+/// refuses it rather than recording it.
+///
+/// This emulator ships the QUESTION CONTENT of exactly one of these lenses
+/// ([`FRAMEWORK_LENS_ALIAS`]); the others are lenses it knows exist and holds no questions
+/// for ([`lens_questions`]), which is why the catalog is a list of aliases rather than of
+/// lens definitions.
+///
+/// `ListLenses` therefore ENUMERATES only the lens whose content is shipped
+/// ([`framework_lens_summary`]) beside the account's custom lenses: a `LensSummary` is lens
+/// CONTENT — its `LensName`, `Description`, `LensVersion` and publication instants — and
+/// this emulator holds none of that for the other aliases, so listing them would mean
+/// inventing it. Applying one is a different question: a lens is applied BY NAME, and the
+/// name is all this catalog has to resolve.
+pub const AWS_OFFICIAL_LENS_ALIASES: &[&str] = &[
+    "connectedmobility",
+    "dataanalytics",
+    "devops",
+    "financialservices",
+    "games",
+    "healthcareindustry",
+    "iot",
+    "machinelearning",
+    "mergersandacquisitions",
+    "migration",
+    "sap",
+    "serverless",
+    "softwareasaservice",
+    FRAMEWORK_LENS_ALIAS,
+];
+
+/// Whether a `LensAlias` names a lens Amazon Web Services publishes: a bare alias of
+/// [`AWS_OFFICIAL_LENS_ALIASES`], or an official lens ARN whose resource part ends in
+/// `lens/<one of those aliases>` ([`lens_alias`], [`is_aws_official_lens`]).
+pub fn is_published_official_lens(lens: &str) -> bool {
+    is_aws_official_lens(lens) && AWS_OFFICIAL_LENS_ALIASES.contains(&lens_alias(lens))
+}
+
+/// What the lens a `LensAlias` names is, as of the instant it is resolved — the answer the
+/// operations that APPLY a lens act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LensResolution {
+    /// A lens Amazon Web Services publishes ([`AWS_OFFICIAL_LENS_ALIASES`]). AWS's own
+    /// lenses are published content, so one is applicable as it stands.
+    Official,
+    /// A stored custom lens whose current content a version has been published from
+    /// ([`LensRecord::published_version`]) — applicable.
+    PublishedCustom,
+    /// A stored custom lens whose current content no version has been published from: the
+    /// lens exists, and "cannot be applied to workloads … until it's published with
+    /// CreateLensVersion" (`ImportLens` doc).
+    DraftCustom,
+    /// No lens: neither an alias of the official catalog nor a custom lens this store
+    /// holds under the ARN the request named.
+    Unknown,
+}
+
+/// How a `Lenses` list that names a lens which cannot be applied is refused: the modelled
+/// exception for the case, for the calling operation to lift into its own error enum.
+#[derive(Debug, Clone)]
+pub enum LensesRefusal {
+    /// An entry that names no lens at all. A lens is a named resource, so a name that
+    /// resolves to none is a `ResourceNotFoundException` (HTTP 404) over the `LENS`
+    /// resource type.
+    NotFound(ResourceNotFoundException),
+    /// An entry that names a lens which exists and cannot be applied yet. The lens
+    /// resolved, so what the request got wrong is the member value — a
+    /// `ValidationException` (HTTP 400) naming the member, the way `ExportLens` refuses
+    /// an official lens that exists and cannot be exported.
+    Unapplicable(crate::ops::types::ValidationException),
+}
+
+/// The member a lens-list refusal names (`CreateWorkloadInput$Lenses`,
+/// `CreateReviewTemplateInput$Lenses`).
+pub const LENSES_MEMBER: &str = "Lenses";
+
 /// The ARN of the AWS-OFFICIAL lens a `LensAlias` names, in the Region the request was
 /// signed for.
 ///
@@ -3287,6 +3391,75 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         alias_names_lens(alias, record).then_some(record)
     }
 
+    /// The lens a `LensAlias` names, as of `now`: the whole catalog a lens name resolves
+    /// against — the lenses Amazon Web Services publishes
+    /// ([`AWS_OFFICIAL_LENS_ALIASES`]) and the custom lenses this account holds
+    /// ([`Self::lens_by_alias`]), the latter applicable only once a version has been
+    /// published from their content.
+    pub fn resolve_lens(&self, lens: &str, now: SystemTime) -> LensResolution {
+        // "For custom lenses, this is the lens ARN" (`LensAlias` doc), so a name that
+        // carries no owner account can only be an official lens, and one that carries one
+        // can only be a custom lens: the two halves of the catalog never overlap.
+        if is_aws_official_lens(lens) {
+            return if is_published_official_lens(lens) {
+                LensResolution::Official
+            } else {
+                LensResolution::Unknown
+            };
+        }
+        match self.lens_by_alias(lens) {
+            None => LensResolution::Unknown,
+            Some(record) if record.published_version(now).is_some() => {
+                LensResolution::PublishedCustom
+            }
+            Some(_) => LensResolution::DraftCustom,
+        }
+    }
+
+    /// How a list of lenses a request asks to APPLY is refused, or `None` when every entry
+    /// names a lens that can be applied as of `now`.
+    ///
+    /// A lens is applied by name, and the name has to resolve: "Each lens is identified by
+    /// its `LensSummary$LensAlias`" (`WorkloadLenses` doc), and a custom lens "cannot be
+    /// applied to workloads … until it's published with CreateLensVersion" (`ImportLens`
+    /// doc). Every operation that attaches lenses to a resource resolves them through here,
+    /// so none of them can record a lens another operation would then report a review of
+    /// and find nothing for.
+    ///
+    /// The walk stops at the FIRST entry it refuses and allocates nothing per entry it
+    /// accepts, so the work this costs is one map lookup and one scan of the fixed
+    /// [`AWS_OFFICIAL_LENS_ALIASES`] catalog per entry and NOTHING that grows with the
+    /// caller's list beyond that — the list length itself is bounded by the calling
+    /// operation's own lens quota before it gets here.
+    pub fn unapplicable_lenses_refusal(
+        &self,
+        lenses: &[String],
+        now: SystemTime,
+    ) -> Option<LensesRefusal> {
+        for lens in lenses {
+            match self.resolve_lens(lens, now) {
+                // An entry naming NO lens is answered as a lookup miss, and one naming a
+                // lens that exists and is merely unpublished as a bad member value: told
+                // its lens is a draft, a caller would publish a lens this service never
+                // found.
+                LensResolution::Unknown => {
+                    return Some(LensesRefusal::NotFound(unknown_lens_not_found(lens)));
+                }
+                LensResolution::DraftCustom => {
+                    return Some(LensesRefusal::Unapplicable(member_constraint_exception(
+                        LENSES_MEMBER,
+                        &format!(
+                            "member must name a lens with a published version; lens {lens} \
+                             has none until one is published with CreateLensVersion"
+                        ),
+                    )));
+                }
+                LensResolution::Official | LensResolution::PublishedCustom => {}
+            }
+        }
+        None
+    }
+
     /// The service's stable list order: workload name, then id to break ties between
     /// two names that normalize apart but sort equal.
     pub fn workload_order(&self) -> Vec<(String, String)> {
@@ -4012,6 +4185,18 @@ pub fn lens_not_found(alias: &str) -> ResourceNotFoundException {
         LENS_RESOURCE_TYPE,
         alias.to_string(),
         &format!("custom lens with alias {alias}"),
+    )
+}
+
+/// [`resource_not_found`] for a `LensAlias` that names no lens at all: neither a lens
+/// Amazon Web Services publishes ([`AWS_OFFICIAL_LENS_ALIASES`]) nor a custom lens this
+/// account holds. Distinct from [`lens_not_found`], which is about a name that can only be
+/// a CUSTOM lens's and resolved to none.
+pub fn unknown_lens_not_found(alias: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        LENS_RESOURCE_TYPE,
+        alias.to_string(),
+        &format!("lens with alias {alias}"),
     )
 }
 

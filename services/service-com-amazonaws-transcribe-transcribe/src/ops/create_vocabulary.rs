@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVocabulary
-//! Creates a custom vocabulary from the terms the request lists, or refuses a request
-//! whose terms it would have to read from a file (see [`CreateVocabulary::handle`]).
+//! Records the custom vocabulary a request describes, whether it lists its terms
+//! inline or names the file they would be read from (see [`CreateVocabulary::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -199,6 +199,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_VOCABULARY_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Record the custom vocabulary this request describes.
+    ///
+    /// Its terms come from one of the two alternatives the operation publishes:
+    /// "you can either upload a text file that contains your new entries, phrases,
+    /// and terms into an Amazon S3 bucket and include the URI in your request, or you
+    /// can include a list of terms directly in your request using the Phrases flag".
+    /// EITHER is recorded — the resource is the same control-plane record, and every
+    /// later operation of the family must find it — and only the one transition the
+    /// clock owes it differs: a vocabulary built from the terms the request listed
+    /// becomes `READY`, while one whose terms would have had to be READ from a file
+    /// ends in the service's own modelled `FAILED` state with a `FailureReason`,
+    /// because this emulator reads no object store and makes no outbound request, so
+    /// that build is work nothing performed (see
+    /// [`crate::state::VocabularyRecord::advance_clock`]). Neither alternative, or
+    /// both at once, is what the operation refuses.
     async fn handle(
         &self,
         input: Self::Input,
@@ -222,11 +237,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // directly in your request using the Phrases flag" — one of the two, and the
         // model can express neither requirement, so the handler is where they are
         // refused.
-        let phrases = match crate::state::content_source(
+        let (phrases, file_uri) = match crate::state::content_source(
             input.phrases.as_deref(),
             input.vocabulary_file_uri.as_deref(),
         ) {
-            crate::state::ContentSource::Inline(phrases) => phrases.to_vec(),
+            crate::state::ContentSource::Inline(phrases) => (phrases.to_vec(), None),
+            // The file is recorded, not read: see this handler's own docs. The terms
+            // stay empty, because nothing loaded any.
+            crate::state::ContentSource::File(uri) => (Vec::new(), Some(uri.to_string())),
             crate::state::ContentSource::Neither => {
                 return Err(bad_request(
                     "Your request must include either Phrases or VocabularyFileUri. Add the \
@@ -240,23 +258,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                      request again.",
                 ))
             }
-            // Building this vocabulary would mean READING the object at that URI.
-            // This emulator reads no object store and makes no outbound request, so
-            // the file is unreachable to it and the request is refused with the error
-            // this operation models for a file it cannot access — rather than
-            // recording a vocabulary whose terms nothing ever loaded.
-            crate::state::ContentSource::File(uri) => {
-                return Err(bad_request(&format!(
-                    "The VocabularyFileUri {uri} can't be read by this emulator: it \
-                     builds a custom vocabulary only from the terms a request lists in \
-                     Phrases. Send the terms in Phrases and try your request again."
-                )))
-            }
         };
 
         // Amazon Transcribe publishes a 50 KB ceiling on a custom vocabulary's size, so
         // a longer list of terms is refused rather than stored — which is also what
-        // keeps the terms this emulator holds bounded.
+        // keeps the terms this emulator holds bounded. A request that named a file
+        // carries no terms to measure, and nothing reads the file, so nothing of it is
+        // stored either.
         let content_bytes = crate::state::content_bytes(&phrases);
         if content_bytes > crate::state::MAX_VOCABULARY_CONTENT_BYTES {
             return Err(bad_request(&format!(
@@ -307,12 +315,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sequence,
             language_code: input.language_code,
             phrases,
+            file_uri,
             // "If the state is READY, you can use the custom vocabulary in a
             // StartTranscriptionJob request": a new custom vocabulary is PENDING
             // until the service has finished processing it.
             state: crate::state::VOCABULARY_STATE_PENDING.to_string(),
             failure_reason: None,
-            ready_due: Some(now + crate::state::VOCABULARY_TRANSITION_DELAY),
+            transition_due: Some(now + crate::state::VOCABULARY_TRANSITION_DELAY),
             last_modified_time: now,
             region,
             data_access_role_arn: input.data_access_role_arn,
@@ -333,6 +342,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vocabulary = %record.name,
             state = %record.state,
             terms = record.phrases.len(),
+            from_file = record.file_uri.is_some(),
             "custom vocabulary created"
         );
         store.vocabularies.insert(record.name.clone(), record);

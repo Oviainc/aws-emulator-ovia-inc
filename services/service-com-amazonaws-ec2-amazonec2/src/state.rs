@@ -83,6 +83,14 @@
 //! attributes `ModifyVpcAttribute` sets and `DescribeVpcAttribute` reports, so those two
 //! operations and `CreateVpc`'s defaults cannot disagree about one VPC.
 //!
+//! The DHCP option set a VPC reports is a RESOURCE of its own, not a fact of the VPC, so it
+//! lives in [`ComAmazonawsEc2Amazonec2State::dhcp_options`] keyed by `DhcpOptionsId` and
+//! the VPC record only names it. An account has one default option set per Region and every
+//! VPC it creates there inherits that same set, which is what
+//! [`ComAmazonawsEc2Amazonec2State::default_dhcp_options_id`] answers — so a VPC's
+//! `DhcpOptionsId` names a set `DescribeDhcpOptions` reports, and two VPCs of one Region
+//! report the same one.
+//!
 //! ## Windows fast launch
 //!
 //! [`ComAmazonawsEc2Amazonec2State::fast_launch_images`] holds the Windows fast launch
@@ -685,8 +693,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     Address, AddressTransfer, ApplicationStatus, ApplicationStatusDetail, AttachVolumeOutput,
+    AttributeValue,
     AvailabilityZone, AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
     ByoipCidr,
+    DhcpConfiguration, DhcpOptions,
     CapacityBlock, ExportTask, FpgaImage, FpgaImageState, ImageUsageReport, LoadPermission,
     CapacityReservationFleet, FleetCapacityReservation,
     StorageLocation, VolumeRecycleBinInfo,
@@ -1133,6 +1143,10 @@ pub const INVALID_VPC_ID_NOT_FOUND: &str = "InvalidVpcID.NotFound";
 /// EC2's error code for a request that named a subnet id no subnet of the account has.
 pub const INVALID_SUBNET_ID_NOT_FOUND: &str = "InvalidSubnetID.NotFound";
 
+/// EC2's error code for a request that named a DHCP options id no option set of the
+/// account has (EC2 API "Error codes": `InvalidDhcpOptionID.NotFound`).
+pub const INVALID_DHCP_OPTION_ID_NOT_FOUND: &str = "InvalidDhcpOptionID.NotFound";
+
 /// EC2's error code for a request that named a security group no group of the account has.
 pub const INVALID_GROUP_NOT_FOUND: &str = "InvalidGroup.NotFound";
 
@@ -1285,6 +1299,23 @@ pub const DEFAULT_VPC_CIDR_BLOCK: &str = "172.31.0.0/16";
 /// `Tenancy` enum's `default` member.
 pub const DEFAULT_INSTANCE_TENANCY: &str = "default";
 
+/// The DHCP option whose value is the domain name an instance of the VPC gets.
+///
+/// One of the two options the account's default DHCP option set carries (Amazon VPC User
+/// Guide, "DHCP option sets": the automatically associated set "includes two options:
+/// `domain-name-servers` and `domain-name`"); its value is the Region's private DNS domain
+/// ([`private_dns_domain`]).
+pub const DHCP_OPTION_DOMAIN_NAME: &str = "domain-name";
+
+/// The DHCP option whose value lists the DNS servers an instance of the VPC resolves
+/// through — the other option of the default set.
+pub const DHCP_OPTION_DOMAIN_NAME_SERVERS: &str = "domain-name-servers";
+
+/// The value of [`DHCP_OPTION_DOMAIN_NAME_SERVERS`] in the default DHCP option set: the
+/// Amazon-provided DNS resolver of the VPC, named by this reserved word rather than by an
+/// address (Amazon VPC User Guide, "DHCP option sets").
+pub const AMAZON_PROVIDED_DNS: &str = "AmazonProvidedDNS";
+
 /// A VPC AWS has finished creating: the `VpcState` enum's `available` member.
 pub const VPC_STATE_AVAILABLE: &str = "available";
 
@@ -1436,6 +1467,28 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// ([`VpcAttributes::for_vpc`]), so a describe never has to invent a default for a
     /// VPC nobody has modified.
     pub vpc_attributes: BTreeMap<String, VpcAttributes>,
+    /// Every DHCP option set the account holds, by `DhcpOptionsId`, as the modelled
+    /// [`DhcpOptions`] shape itself — so a member a writer sets round-trips through
+    /// `DescribeDhcpOptions` without a field-by-field copy, the way [`Self::vpcs`] holds
+    /// [`Vpc`]s. Ordered by id, which is the order that describe reports and pages over.
+    ///
+    /// Written only by [`Self::default_dhcp_options_id`], which is how a VPC gets the
+    /// `DhcpOptionsId` it reports: a VPC's option set is a set the account HOLDS, so the
+    /// record has to exist before any VPC can name it. Nothing removes a record — a
+    /// Region's default set outlives every VPC of that Region, as it does on AWS — so the
+    /// map is bounded by its OWN ceiling, [`MAX_DHCP_OPTION_SETS`], which
+    /// [`Self::has_dhcp_option_set_capacity`] makes a create ask about; the VPC ceiling
+    /// would not bound it, because a deleted VPC gives its slot back and its Region's set
+    /// stays. Each record's bytes are charged against the store's byte budget when it is
+    /// minted, so the whole map is bounded in bytes as well as in count.
+    pub dhcp_options: BTreeMap<String, DhcpOptions>,
+    /// The `DhcpOptionsId` of each Region's DEFAULT DHCP option set, by Region.
+    ///
+    /// One entry per Region, because an account has one default option set per Region and
+    /// every VPC it creates there inherits that same set — this is the index that makes
+    /// [`Self::default_dhcp_options_id`] answer the same id for the second VPC of a Region
+    /// as for the first, instead of minting a set per VPC.
+    default_dhcp_options_ids: BTreeMap<String, String>,
     /// Every association between a local gateway route table and a virtual interface group
     /// the account holds, by `LocalGatewayRouteTableVirtualInterfaceGroupAssociationId`, as
     /// the modelled `LocalGatewayRouteTableVirtualInterfaceGroupAssociation` shape itself —
@@ -1898,6 +1951,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpcs: BTreeMap::new(),
             vpc_available_at: BTreeMap::new(),
             vpc_attributes: BTreeMap::new(),
+            dhcp_options: BTreeMap::new(),
+            default_dhcp_options_ids: BTreeMap::new(),
             subnets: BTreeMap::new(),
             subnet_available_at: BTreeMap::new(),
             verified_access_trust_providers: BTreeMap::new(),
@@ -1988,6 +2043,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             true,
             DEFAULT_INSTANCE_TENANCY,
             VPC_STATE_AVAILABLE,
+            DEFAULT_REGION,
             Vec::new(),
         );
         state.insert_default_subnets(&default_vpc, DEFAULT_VPC_CIDR_BLOCK, DEFAULT_REGION);
@@ -2045,12 +2101,94 @@ impl ComAmazonawsEc2Amazonec2State {
         self.subnets.len() < MAX_SUBNETS
     }
 
+    /// Whether `region`'s default DHCP option set can be answered: either the store already
+    /// holds it, or another set fits inside the store's ceiling
+    /// ([`MAX_DHCP_OPTION_SETS`]).
+    ///
+    /// A create of a VPC must ask this BEFORE inserting and refuse with
+    /// [`dhcp_options_limit_exceeded`] when it answers `false`, exactly as it asks
+    /// [`Self::has_vpc_capacity`]: the Region is caller-supplied text, so without this the
+    /// store would mint a record per Region string a caller invents, and a VPC that is
+    /// later deleted does not give its Region's set back (the Region's default set outlives
+    /// every VPC of it, as it does on AWS).
+    pub fn has_dhcp_option_set_capacity(&self, region: &str) -> bool {
+        self.default_dhcp_options_ids.contains_key(region)
+            || self.dhcp_options.len() < MAX_DHCP_OPTION_SETS
+    }
+
+    /// The bytes `region`'s default DHCP option set would ADD to the store: none when the
+    /// store already holds that Region's set, the record's own bytes
+    /// ([`default_dhcp_options_payload_bytes`]) when the next VPC of the Region would mint
+    /// it.
+    ///
+    /// A create asks this so the bytes it is about to store are part of what it checks
+    /// against [`Self::would_exceed_stored_bytes`], rather than being added behind the
+    /// budget's back.
+    pub fn unheld_default_dhcp_options_bytes(&self, region: &str) -> usize {
+        if self.default_dhcp_options_ids.contains_key(region) {
+            0
+        } else {
+            default_dhcp_options_payload_bytes(region)
+        }
+    }
+
+    /// The `DhcpOptionsId` of `region`'s DEFAULT DHCP option set, creating that set the
+    /// first time a VPC of the Region needs it.
+    ///
+    /// An account has ONE default DHCP option set per Region, and every VPC created there
+    /// without an explicit association inherits that same set (Amazon VPC User Guide, "DHCP
+    /// option sets"), so this answers the id already recorded for the Region and mints a
+    /// set only when the Region has none. The set it mints carries the two options AWS puts
+    /// in a default set — [`DHCP_OPTION_DOMAIN_NAME`] at the Region's private DNS domain
+    /// ([`private_dns_domain`]) and [`DHCP_OPTION_DOMAIN_NAME_SERVERS`] at
+    /// [`AMAZON_PROVIDED_DNS`] — and is stored in [`Self::dhcp_options`], so the id a VPC
+    /// reports names a set `DescribeDhcpOptions` can read back rather than nothing at all.
+    /// The record's bytes are charged against the store's byte budget here, so no writer
+    /// can store them uncharged.
+    ///
+    /// A WRITER: only a path that creates a VPC may call it, never a reporting operation,
+    /// and that path must have asked [`Self::has_dhcp_option_set_capacity`] and
+    /// [`Self::would_exceed_stored_bytes`] (with
+    /// [`Self::unheld_default_dhcp_options_bytes`]) first, so a request past either bound is
+    /// refused instead of overshooting it.
+    pub fn default_dhcp_options_id(&mut self, region: &str) -> String {
+        if let Some(dhcp_options_id) = self.default_dhcp_options_ids.get(region) {
+            return dhcp_options_id.clone();
+        }
+        let dhcp_options_id = self.next_id("dopt");
+        let configuration = |key: &str, value: String| DhcpConfiguration {
+            key: Some(key.to_string()),
+            values: Some(vec![AttributeValue { value: Some(value) }]),
+        };
+        self.dhcp_options.insert(
+            dhcp_options_id.clone(),
+            DhcpOptions {
+                owner_id: Some(::engine::emulator_account_id().to_string()),
+                // Nothing has tagged the set the service created for the account.
+                tags: Some(Vec::new()),
+                dhcp_options_id: Some(dhcp_options_id.clone()),
+                dhcp_configurations: Some(vec![
+                    configuration(DHCP_OPTION_DOMAIN_NAME, private_dns_domain(region)),
+                    configuration(
+                        DHCP_OPTION_DOMAIN_NAME_SERVERS,
+                        AMAZON_PROVIDED_DNS.to_string(),
+                    ),
+                ]),
+            },
+        );
+        self.add_stored_bytes(default_dhcp_options_payload_bytes(region));
+        self.default_dhcp_options_ids
+            .insert(region.to_string(), dhcp_options_id.clone());
+        dhcp_options_id
+    }
+
     /// Insert a VPC with `cidr_block` as its primary IPv4 CIDR block, in `vpc_state`, and
     /// answer the `VpcId` it was given.
     ///
-    /// Every id the record carries — the VPC's own, its primary CIDR association's, and
-    /// the DHCP options set associated with it — is minted here, so a VPC never shares an
-    /// id with another resource of this store.
+    /// The VPC's own id and its primary CIDR association's are minted here, so a VPC never
+    /// shares an id with another resource of this store. Its `DhcpOptionsId` is NOT minted
+    /// per VPC: it is `region`'s default DHCP option set
+    /// ([`Self::default_dhcp_options_id`]), which every VPC of the Region inherits.
     ///
     /// The caller-chosen bytes of `tags` are charged against the store's byte budget HERE
     /// rather than by each writer, so no writer can store them uncharged; a create still
@@ -2066,11 +2204,12 @@ impl ComAmazonawsEc2Amazonec2State {
         is_default: bool,
         instance_tenancy: &str,
         vpc_state: &str,
+        region: &str,
         tags: Vec<Tag>,
     ) -> String {
         let vpc_id = self.next_id("vpc");
         let association_id = self.next_id("vpc-cidr-assoc");
-        let dhcp_options_id = self.next_id("dopt");
+        let dhcp_options_id = self.default_dhcp_options_id(region);
         let vpc = Vpc {
             owner_id: Some(::engine::emulator_account_id().to_string()),
             instance_tenancy: Some(instance_tenancy.to_string()),
@@ -3812,19 +3951,39 @@ pub fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
         .collect()
 }
 
+/// The bytes a Region's default DHCP option set record holds, for the store's byte budget.
+///
+/// Every string of the record is either a word this crate chose or the Region's private DNS
+/// domain ([`private_dns_domain`]), which is the one caller-influenced part — the Region of
+/// the request's credential scope, which [`request_region`] holds to 64 characters.
+pub fn default_dhcp_options_payload_bytes(region: &str) -> usize {
+    DHCP_OPTION_DOMAIN_NAME.len()
+        + DHCP_OPTION_DOMAIN_NAME_SERVERS.len()
+        + AMAZON_PROVIDED_DNS.len()
+        + private_dns_domain(region).len()
+}
+
+/// The private DNS domain of a Region: the suffix of every Amazon-provided private
+/// hostname in it, and the `domain-name` of the Region's default DHCP option set.
+///
+/// AWS uses `ec2.internal` in `us-east-1` and `<region>.compute.internal` in every other
+/// Region (Amazon VPC User Guide, "DHCP option sets").
+pub fn private_dns_domain(region: &str) -> String {
+    if region == EC2_INTERNAL_REGION {
+        "ec2.internal".to_string()
+    } else {
+        format!("{region}.compute.internal")
+    }
+}
+
 /// The private IPv4 DNS hostname EC2 gives an instance for its primary private
 /// address.
 ///
 /// AWS builds the `ip-name` style hostname as `ip-<dash-separated address>`
-/// followed by `.ec2.internal` in `us-east-1` and `.<region>.compute.internal`
-/// in every other region.
+/// followed by the Region's private DNS domain ([`private_dns_domain`]).
 pub fn private_dns_name(private_ip: &str, region: &str) -> String {
     let host = private_ip.replace('.', "-");
-    if region == EC2_INTERNAL_REGION {
-        format!("ip-{host}.ec2.internal")
-    } else {
-        format!("ip-{host}.{region}.compute.internal")
-    }
+    format!("ip-{host}.{domain}", domain = private_dns_domain(region))
 }
 
 /// The processor architecture an instance type runs on.
@@ -5932,6 +6091,19 @@ pub fn invalid_subnet_id_not_found<E>(subnet_id: &str) -> crate::scaffolded::Sca
         INVALID_SUBNET_ID_NOT_FOUND,
         400,
         format!("The subnet ID '{subnet_id}' does not exist"),
+    )
+}
+
+/// Refuse a request that named a DHCP options id no option set of the account has, the way
+/// EC2 does: HTTP 400 [`INVALID_DHCP_OPTION_ID_NOT_FOUND`], with the id at fault — the
+/// same shape of refusal as the VPC and subnet ones above.
+pub fn invalid_dhcp_option_id_not_found<E>(
+    dhcp_options_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_DHCP_OPTION_ID_NOT_FOUND,
+        400,
+        format!("The dhcpOptions ID '{dhcp_options_id}' does not exist"),
     )
 }
 
@@ -8206,6 +8378,24 @@ pub const MAX_SUBNETS: usize = 4_096;
 /// codes).
 pub const SUBNET_LIMIT_EXCEEDED: &str = "SubnetLimitExceeded";
 
+/// The largest number of DHCP option sets this in-memory store holds.
+///
+/// A capacity bound in the style of [`MAX_VPCS`], not an AWS quota: this store mints one
+/// default option set per REGION
+/// ([`ComAmazonawsEc2Amazonec2State::default_dhcp_options_id`]), and the Region comes from
+/// the request's SigV4 credential scope, which is caller-supplied text — so without a
+/// ceiling a caller could mint a record per Region string it invents. It sits well above
+/// the number of Regions any AWS partition has ([`REGIONS_ENABLED_BY_DEFAULT`] lists 17 of
+/// the commercial one), so no client signing for real Regions reaches it.
+/// [`ComAmazonawsEc2Amazonec2State::has_dhcp_option_set_capacity`] is the predicate a
+/// writer asks before creating a VPC; a create past it refuses with
+/// [`DHCP_OPTIONS_LIMIT_EXCEEDED`].
+pub const MAX_DHCP_OPTION_SETS: usize = 64;
+
+/// EC2's error code for a create that would take the account past its DHCP option set
+/// quota (`DhcpOptionsLimitExceeded`, EC2 API error codes).
+pub const DHCP_OPTIONS_LIMIT_EXCEEDED: &str = "DhcpOptionsLimitExceeded";
+
 // ---------------------------------------------------------------------------
 // CIDR blocks
 // ---------------------------------------------------------------------------
@@ -8323,6 +8513,19 @@ pub fn vpc_limit_exceeded<E>() -> Scaffolded<E> {
         VPC_LIMIT_EXCEEDED,
         400,
         format!("The maximum number of VPCs has been reached ({MAX_VPCS})"),
+    )
+}
+
+/// Refuse a create whose Region has no default DHCP option set yet and would take the
+/// store past [`MAX_DHCP_OPTION_SETS`]: HTTP 400 [`DHCP_OPTIONS_LIMIT_EXCEEDED`].
+pub fn dhcp_options_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        DHCP_OPTIONS_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The maximum number of DHCP options sets has been reached \
+             ({MAX_DHCP_OPTION_SETS})"
+        ),
     )
 }
 
