@@ -51,6 +51,44 @@ pub const MAX_TUNNELS: usize = 500;
 /// by this constant, and the tunnels by [`MAX_TUNNELS`].
 pub const MAX_TAGS_PER_TUNNEL: usize = 50;
 
+/// The tag-key namespace AWS keeps for the tags it applies itself.
+///
+/// AWS's tagging rules reserve this prefix for AWS-generated tags and state that
+/// a caller can neither create nor edit nor delete a tag key carrying it, so a
+/// request that names such a key is refused rather than stored. The modelled
+/// `TagKey` pattern `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$` admits `:`, so the
+/// boundary validator passes the key through and the rule lives here.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` lies in the namespace [`RESERVED_TAG_KEY_PREFIX`] reserves.
+///
+/// Compared without regard to letter case: the reservation protects the
+/// namespace itself, so a key differing from it only in case is in it too and is
+/// refused the same way.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The first key of `keys` that [`is_reserved_tag_key`], if any — what a handler
+/// checks before it writes, so the whole request is refused and nothing in it is
+/// applied.
+pub fn first_reserved_tag_key<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    keys.into_iter().find(|key| is_reserved_tag_key(key))
+}
+
+/// The refusal message for a request whose `member` named the reserved `key`.
+///
+/// Built from the request — the member and the offending key — so the caller can
+/// fix the request from the text alone. Kept here so every tagging entry point
+/// refuses in the same words.
+pub fn reserved_tag_key_message(member: &str, key: &str) -> String {
+    format!(
+        "{member} names the tag key '{key}': the '{RESERVED_TAG_KEY_PREFIX}' prefix is reserved \
+         for tags Amazon Web Services applies itself and cannot be used by a caller."
+    )
+}
+
 /// The region an ARN carries when the request is unsigned and so names none.
 /// `emulator_arn`'s own documented default.
 pub const DEFAULT_REGION: &str = "us-east-1";

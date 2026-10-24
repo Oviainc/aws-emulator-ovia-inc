@@ -3,7 +3,9 @@
 //! @op TagResource
 //!
 //! Merges the supplied tags into the tag store of the tunnel `resourceArn` names,
-//! overwriting a tag that already carries that key.
+//! overwriting a tag that already carries that key. A key in the reserved
+//! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace is refused with HTTP 400
+//! `ValidationException` and stores nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -143,6 +145,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // The `aws:` prefix marks a tag AWS applied itself, which a caller may
+        // neither set nor overwrite, and the modelled `TagKey` pattern admits
+        // `:` so the boundary walk cannot refuse it. Checked before anything is
+        // written, so a request naming one such key stores none of its tags.
+        if let Some(key) =
+            crate::state::first_reserved_tag_key(input.tags.iter().map(|tag| tag.key.as_str()))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::reserved_tag_key_message("tags", key),
+            ));
         }
 
         // A tunnel carries at most `MAX_TAGS_PER_TUNNEL` tags. The modelled list
