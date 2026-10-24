@@ -67,6 +67,8 @@ mod stack_resource_provisioning;
 mod stack_resources;
 #[path = "all/stack_role_trust.rs"]
 mod stack_role_trust;
+#[path = "all/stack_tag_propagation.rs"]
+mod stack_tag_propagation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/template_outputs.rs"]

@@ -27,7 +27,10 @@ use crate::cluster_parameters::{create_group, default_group_name, reported_param
 ///
 /// The awsQuery wire numbers a list member from 1, so position `n` of
 /// `parameters` is sent as `Parameters.Parameter.{n + 1}`.
-async fn modify(emulator: &Emulator, group: &str, parameters: &[(&str, &str)]) -> Answer {
+///
+/// `pub(crate)` so the sibling reset suite sets the values it then resets
+/// through the real write path instead of seeding them.
+pub(crate) async fn modify(emulator: &Emulator, group: &str, parameters: &[(&str, &str)]) -> Answer {
     let mut params: Vec<(String, String)> =
         vec![("ParameterGroupName".to_string(), group.to_string())];
     for (position, (name, value)) in parameters.iter().enumerate() {
@@ -54,7 +57,9 @@ async fn modify(emulator: &Emulator, group: &str, parameters: &[(&str, &str)]) -
 ///
 /// Read back through `DescribeClusterParameters`, so the assertions are about
 /// what a LATER caller sees rather than about the store.
-async fn reported(emulator: &Emulator, group: &str) -> Vec<(String, String, String)> {
+///
+/// `pub(crate)` so the sibling reset suite reads a group back the same way.
+pub(crate) async fn reported(emulator: &Emulator, group: &str) -> Vec<(String, String, String)> {
     let answer = emulator
         .call(
             "DescribeClusterParameters",
@@ -96,7 +101,9 @@ async fn reported_value(emulator: &Emulator, group: &str, name: &str) -> (String
 
 /// The catalog entry for one parameter of the published family, read off the
 /// same catalog the handlers do rather than spelled out here.
-fn catalog_entry(name: &str) -> &'static state::EngineParameter {
+///
+/// `pub(crate)` so the sibling reset suite reads the same catalog.
+pub(crate) fn catalog_entry(name: &str) -> &'static state::EngineParameter {
     state::ENGINE_DEFAULT_PARAMETERS
         .iter()
         .find(|parameter| parameter.name == name)
@@ -142,6 +149,12 @@ async fn every_value_a_request_sets_is_what_the_group_reports_back() {
             group: "set-one-integer",
             sent: vec![("max_concurrency_scaling_clusters", "5")],
             expected: vec![("max_concurrency_scaling_clusters", "5")],
+        },
+        SetCase {
+            case: "one static integer parameter",
+            group: "set-one-static-integer",
+            sent: vec![("statement_timeout", "60000")],
+            expected: vec![("statement_timeout", "60000")],
         },
         SetCase {
             case: "the workload management configuration, a static free-text parameter",
@@ -205,7 +218,7 @@ async fn every_value_a_request_sets_is_what_the_group_reports_back() {
         );
         assert_eq!(
             answer.text("ParameterGroupStatus").as_deref(),
-            Some(state::PARAMETER_GROUP_STATUS_PENDING_REBOOT),
+            Some(state::PARAMETER_GROUP_STATUS_UPDATED),
             "case {}: expected the documented ParameterGroupStatus, got {:?}",
             case.case,
             answer.text("ParameterGroupStatus")
@@ -754,7 +767,9 @@ async fn the_default_parameter_group_takes_no_value_from_a_caller() {
 }
 
 /// Create a cluster configured with one parameter group.
-async fn create_cluster_on(emulator: &Emulator, identifier: &str, group: &str) {
+///
+/// `pub(crate)` so the sibling reset suite drives the same create path.
+pub(crate) async fn create_cluster_on(emulator: &Emulator, identifier: &str, group: &str) {
     let answer = emulator
         .call(
             "CreateCluster",
@@ -775,7 +790,12 @@ async fn create_cluster_on(emulator: &Emulator, identifier: &str, group: &str) {
 
 /// The `ParameterApplyStatus` values one cluster's parameter group membership
 /// reports, and the parameters it names as pending.
-async fn membership_of(emulator: &Emulator, identifier: &str) -> (Vec<String>, Vec<String>) {
+///
+/// `pub(crate)` so the sibling reset suite reads a membership the same way.
+pub(crate) async fn membership_of(
+    emulator: &Emulator,
+    identifier: &str,
+) -> (Vec<String>, Vec<String>) {
     let answer = emulator
         .call("DescribeClusters", &[("ClusterIdentifier", identifier)])
         .await;

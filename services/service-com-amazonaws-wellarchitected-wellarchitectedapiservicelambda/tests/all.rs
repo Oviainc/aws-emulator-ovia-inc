@@ -44,6 +44,9 @@ mod review_template_answers;
 #[path = "all/review_template_lifecycle.rs"]
 mod review_template_lifecycle;
 
+#[path = "all/share_invitation_answers.rs"]
+mod share_invitation_answers;
+
 #[path = "all/share_invitations.rs"]
 mod share_invitations;
 

@@ -41,6 +41,11 @@ mod config_stored_queries;
 mod config_tagging;
 #[path = "all/config_third_party_service_linked_recorder.rs"]
 mod config_third_party_service_linked_recorder;
+// Declared inside the sorted list, where `connector_*` sorts, rather than appended at
+// the tail block below: every suite that lands appends there, so a declaration added
+// there conflicts with the next one that lands.
+#[path = "all/connector_credential_verification.rs"]
+mod connector_credential_verification;
 #[path = "all/discovered_resources.rs"]
 mod discovered_resources;
 #[path = "all/error_message_rules.rs"]

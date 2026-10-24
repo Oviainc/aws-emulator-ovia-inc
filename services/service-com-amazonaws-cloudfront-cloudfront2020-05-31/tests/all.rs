@@ -17,6 +17,8 @@ mod cache_policy_lifecycle;
 mod cache_policy_update;
 #[path = "all/continuous_deployment_policies.rs"]
 mod continuous_deployment_policies;
+#[path = "all/create_location_header.rs"]
+mod create_location_header;
 #[path = "all/distribution_config_defaults.rs"]
 mod distribution_config_defaults;
 #[path = "all/distribution_config_read.rs"]

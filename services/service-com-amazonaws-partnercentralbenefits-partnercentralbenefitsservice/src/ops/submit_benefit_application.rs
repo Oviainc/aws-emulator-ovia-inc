@@ -181,9 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if application.status != crate::state::STATUS_PENDING_SUBMISSION {
             return Err(SubmitBenefitApplicationErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "benefit application {} is {}, so it cannot be submitted",
-                        application.id, application.status
+                    message: crate::state::status_conflict_message(
+                        &application.id,
+                        &application.status,
+                        "submitted",
                     ),
                 },
             )

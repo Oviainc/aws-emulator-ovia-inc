@@ -136,3 +136,13 @@ Cause 6 — service-quotas-service-code-pattern-validation#task#2, GetServiceQuo
 5. Cause 5: replay fixture service-quotas-tag-applied-quota step task#1 — the same ListServiceQuotas page shows the same wrong records, so the fix must be in the shared (ServiceCode, QuotaCode) lookup, not in one fixture.
 6. Cause 6: replay fixture service-quotas-service-code-pattern-validation step task#2 — GetServiceQuota for the VPCs-per-Region quota returns a different Description and UsageMetric.MetricDimensions.Resource 'VPC' instead of 'VPCsPerRegion'.
 7. After fixing, re-replay all five fixtures above (steps 2-6) and confirm every cluster clears.
+
+## Resolution
+
+Causes 1, 2, 4 and 6 are fixed, and causes 3 and 5 are fixed for every QuotaCode whose quota this catalog can name: `state::seed_quota_catalog`'s lambda rows now carry the definition of the quota their code names (L-B2AA0F47, L-72E0D058, L-F55076EC, L-B82A30EA), the vpc VPCs-per-Region row carries its published Description and the `VPCsPerRegion` usage-metric dimension, and every listing of the service serves a bounded page through `state::paginate` (`state::UNASKED_PAGE_SIZE`) with a `NextToken` while rows remain. `tests/all/applied_quota_records.rs` pins both rules over a table. Fixtures service-quotas-browse-services-and-quotas and service-quotas-service-code-pattern-validation replay clean.
+
+Remaining work, declined in this fix because no available value sources it (tracked here rather than silently closed):
+
+* AWS's codes L-14320ECE, L-25EEC0A4, L-4273958C, L-B430C318 and L-BA29C22B name five lambda quotas whose recorded definitions this report does not state and the replay withholds. Rather than keep them bound to the wrong rows, the catalog no longer claims them (those rows take their derived code), so the pairs answer the modelled `NoSuchResourceException`. Publishing them needs their recorded `QuotaName`/`Description`/`Unit`/`Value`/`Adjustable`.
+* `$.Quotas[QuotaCode="L-B82A30EA"].Description` — every other member of that row matches; AWS's published text is not available here, so the row carries this catalog's own wording.
+* The 400-response `$.Message` clusters this report lists under "NOT INCLUDED (deliberately)" are still the first divergence of fixtures service-quotas-error-paths and service-quotas-tag-applied-quota.

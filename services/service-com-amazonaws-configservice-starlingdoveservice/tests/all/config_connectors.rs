@@ -15,15 +15,28 @@
 //! 3. a filter selects the connectors whose named attribute equals one of the values
 //!    the filter carries, and a filter naming anything the model does not publish is
 //!    refused;
-//! 4. an `Arn` member is refused as invalid when it is not a connector ARN, and
-//!    answered as a missing resource when it is a connector ARN this account does not
-//!    hold — the same for every operation that takes one.
+//! 4. an `Arn` that does not resolve to a connector of this account in the Region the
+//!    request is scoped to is refused with ONE class and ONE text — whether the value
+//!    is malformed, names a connector that was never created, or names one a previous
+//!    delete removed — the same for every operation whose `Arn` names the connector it
+//!    acts on.
 //!
 //! The harness (`Emulator`) is the one `config_setup_and_rule_loop` already builds;
 //! every case drives the emulator the way a client does, through the
-//! `MultiServiceRouter`.
+//! `MultiServiceRouter`. The connectors these rules are pinned over are SEEDED in the
+//! shared engine ([`seed_connector`]), the way the other suites of this crate seed
+//! state, because `PutConnector` creates none: what it answers, and why, is pinned by
+//! `connector_credential_verification.rs`.
+
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_configservice_starlingdoveservice::ops::types::{
+    AzureConnectorConfiguration, ConnectorConfiguration,
+};
+use service_com_amazonaws_configservice_starlingdoveservice::state::{
+    self, service_state, ConnectorEntry,
+};
 
 use crate::config_setup_and_rule_loop::Emulator;
 
@@ -41,13 +54,18 @@ const PROVIDER_FILTER: &str = "provider";
 
 /// The `AzureTenantIdentifier` / `AzureClientIdentifier` length maximum, from
 /// `smithy_query(query="shape", shape="AzureTenantIdentifier")`: 1..128.
-const AZURE_IDENTIFIER_MAX_LEN: usize = 128;
+pub(crate) const AZURE_IDENTIFIER_MAX_LEN: usize = 128;
 
 /// The emulator's account id, the one every ARN it mints carries.
 const ACCOUNT: &str = "000000000000";
 
+/// The ONE text an operation whose `Arn` names the connector answers every value that
+/// does not resolve to one with, written out here rather than read from the handlers'
+/// own constant so this suite PINS it instead of restating it.
+const CONNECTOR_ARN_NOT_VALID_TEXT: &str = "The connector ARN provided is not valid.";
+
 /// A `ConnectorConfiguration` naming the Azure provider.
-fn azure_configuration(tenant: &str, client: &str) -> Value {
+pub(crate) fn azure_configuration(tenant: &str, client: &str) -> Value {
     json!({ "azure": { "tenantIdentifier": tenant, "clientIdentifier": client } })
 }
 
@@ -61,18 +79,66 @@ fn expected_name_and_arn(region: &str, tenant: &str) -> (String, String) {
     )
 }
 
-/// Create a connector for `tenant`, returning the ARN `PutConnector` minted.
-async fn put_connector(emulator: &Emulator, tenant: &str, client: &str) -> String {
-    let created = emulator
-        .ok(
-            "PutConnector",
-            &json!({ "ConnectorConfiguration": azure_configuration(tenant, client) }),
-        )
-        .await;
-    created["Arn"]
-        .as_str()
-        .unwrap_or_else(|| panic!("PutConnector must answer an Arn, got {created}"))
-        .to_string()
+/// Place a connector for the Azure `tenant`/`client` pair in the store, reaching it
+/// the way a handler does, and answer the ARN it is keyed by.
+///
+/// `PutConnector` creates NO connector in this emulator: a connector IS the credential
+/// Config connects to the third-party cloud service provider with, and verifying that
+/// credential with the provider is an outbound connection this emulator does not make,
+/// so every configuration is refused (`connector_credential_verification.rs` pins
+/// that). The connectors the read, listing and delete paths are pinned over are
+/// therefore seeded in the shared engine the router hands the handlers, the way the
+/// other suites of this crate seed state.
+pub(crate) fn seed_connector(emulator: &Emulator, tenant: &str, client: &str) -> String {
+    let name = state::connector_name(state::PROVIDER_AZURE, tenant);
+    let arn = state::connector_arn(&emulator.region, &name);
+    let handle = service_state(&*emulator.engine).expect("the test engine is the shared engine");
+    handle.lock().connectors.insert(
+        arn.clone(),
+        ConnectorEntry {
+            name,
+            arn: arn.clone(),
+            region: emulator.region.clone(),
+            provider: state::PROVIDER_AZURE.to_string(),
+            connector_configuration: ConnectorConfiguration {
+                azure: Some(AzureConnectorConfiguration {
+                    tenant_identifier: tenant.to_string(),
+                    client_identifier: client.to_string(),
+                }),
+            },
+            created_at: SystemTime::now(),
+            tags: Vec::new(),
+        },
+    );
+    arn
+}
+
+/// Call `operation` with `body` and answer the HTTP status, the error code and the
+/// message of the refusal it must be. Shared with the suites that pin the other
+/// connector operations' refusals.
+pub(crate) async fn refusal(
+    emulator: &Emulator,
+    operation: &str,
+    body: &Value,
+) -> (u16, String, String) {
+    let (status, parsed) = emulator.call(operation, body).await;
+    let code = parsed
+        .get("__type")
+        .and_then(Value::as_str)
+        .map(|wire| wire.rsplit('#').next().unwrap_or(wire).to_string())
+        .unwrap_or_else(|| format!("<no __type in {parsed}>"));
+    let message = ["message", "Message"]
+        .iter()
+        .find_map(|key| parsed.get(*key).and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string();
+    (status, code, message)
+}
+
+/// Call `operation` with `arn` and answer the HTTP status, the error code and the
+/// message of the refusal it must be.
+async fn refused_arn(emulator: &Emulator, operation: &str, arn: &str) -> (u16, String, String) {
+    refusal(emulator, operation, &json!({ "Arn": arn })).await
 }
 
 /// Every connector ARN `ListConnectors` reports, paged at `max_results` (0 asks for
@@ -120,7 +186,7 @@ async fn list_with_filters(emulator: &Emulator, filters: &Value) -> Vec<Value> {
 }
 
 #[tokio::test]
-async fn a_connector_is_listed_and_read_back_exactly_as_it_was_created() {
+async fn a_connector_in_state_is_listed_and_read_back_exactly_as_it_is_stored() {
     let emulator = Emulator::new();
     // Rows differ along the form and the length of the identifiers the configuration
     // carries: the GUID form Microsoft Entra ID uses, a one-character identifier (the
@@ -149,10 +215,10 @@ async fn a_connector_is_listed_and_read_back_exactly_as_it_was_created() {
 
     for (case, tenant, client) in cases {
         let (expected_name, expected_arn) = expected_name_and_arn(&emulator.region, tenant);
-        let arn = put_connector(&emulator, tenant, client).await;
+        let arn = seed_connector(&emulator, tenant, client);
         assert_eq!(
             arn, expected_arn,
-            "case {case:?}: PutConnector must mint a connector ARN naming the derived \
+            "case {case:?}: a connector must be keyed by the ARN naming its derived \
              connector name, got {arn:?}"
         );
 
@@ -187,7 +253,7 @@ async fn a_connector_is_listed_and_read_back_exactly_as_it_was_created() {
             .iter()
             .find(|summary| summary["arn"].as_str() == Some(expected_arn.as_str()))
             .unwrap_or_else(|| {
-                panic!("case {case:?}: ListConnectors must report the created connector, got {summaries:?}")
+                panic!("case {case:?}: ListConnectors must report the connector in state, got {summaries:?}")
             });
         assert_eq!(
             (
@@ -211,7 +277,7 @@ async fn a_connector_is_listed_and_read_back_exactly_as_it_was_created() {
     assert_eq!(
         arns.len(),
         cases.len(),
-        "every created connector must be listed exactly once, got {arns:?}"
+        "every connector in state must be listed exactly once, got {arns:?}"
     );
 }
 
@@ -221,7 +287,7 @@ async fn paging_reports_every_connector_exactly_once_at_every_page_size() {
     const CONNECTORS: usize = 7;
     let mut created = Vec::new();
     for index in 0..CONNECTORS {
-        created.push(put_connector(&emulator, &format!("tenant-{index}"), "client").await);
+        created.push(seed_connector(&emulator, &format!("tenant-{index}"), "client"));
     }
     created.sort();
 
@@ -294,7 +360,7 @@ async fn a_filter_selects_the_connectors_whose_attribute_it_matches() {
     let emulator = Emulator::new();
     const CONNECTORS: usize = 3;
     for index in 0..CONNECTORS {
-        put_connector(&emulator, &format!("tenant-{index}"), "client").await;
+        seed_connector(&emulator, &format!("tenant-{index}"), "client");
     }
 
     // Every row is a filter list and the number of the three stored connectors it
@@ -307,7 +373,7 @@ async fn a_filter_selects_the_connectors_whose_attribute_it_matches() {
             CONNECTORS,
         ),
         (
-            "a provider nothing was created for",
+            "a provider nothing is stored for",
             json!([{ "filterName": PROVIDER_FILTER, "filterValues": [UNPUBLISHED_PROVIDER] }]),
             0,
         ),
@@ -373,8 +439,8 @@ async fn a_filter_selects_the_connectors_whose_attribute_it_matches() {
 #[tokio::test]
 async fn a_deleted_connector_is_reported_by_neither_a_read_nor_a_listing() {
     let emulator = Emulator::new();
-    let kept = put_connector(&emulator, "tenant-kept", "client").await;
-    let deleted = put_connector(&emulator, "tenant-deleted", "client").await;
+    let kept = seed_connector(&emulator, "tenant-kept", "client");
+    let deleted = seed_connector(&emulator, "tenant-deleted", "client");
 
     emulator
         .ok("DeleteConnector", &json!({ "Arn": deleted }))
@@ -388,14 +454,12 @@ async fn a_deleted_connector_is_reported_by_neither_a_read_nor_a_listing() {
     );
 
     for operation in ["GetConnector", "DeleteConnector"] {
-        let (status, code) = emulator
-            .refused(operation, &json!({ "Arn": deleted }))
-            .await;
+        let (status, code, message) = refused_arn(&emulator, operation, &deleted).await;
         assert_eq!(
-            (status, code.as_str()),
-            (400, "ResourceNotFoundException"),
-            "case {operation:?}: a deleted connector must be answered as missing, got \
-             {status} {code}"
+            (status, code.as_str(), message.as_str()),
+            (400, "ValidationException", CONNECTOR_ARN_NOT_VALID_TEXT),
+            "case {operation:?}: a deleted connector's ARN must no longer resolve, got \
+             {status} {code} with message {message:?}"
         );
     }
 
@@ -411,14 +475,19 @@ async fn a_deleted_connector_is_reported_by_neither_a_read_nor_a_listing() {
 }
 
 #[tokio::test]
-async fn an_arn_member_is_refused_when_invalid_and_answered_as_missing_when_unknown() {
+async fn an_arn_that_does_not_resolve_is_refused_the_same_way_however_it_fails() {
     let emulator = Emulator::new();
-    put_connector(&emulator, "tenant-0", "client").await;
+    seed_connector(&emulator, "tenant-0", "client");
 
-    // Rows differ along WHY the value is not a connector ARN of this service: not an
-    // ARN at all, no resource portion, no connector name, another service's ARN, and
-    // another resource type of this service.
-    let invalid: [(&str, &str); 6] = [
+    // One table, two kinds of failure to resolve, ONE refusal. The first rows differ
+    // along WHY the value is no connector ARN of this service: not an ARN at all, no
+    // resource portion, no connector name, another service's ARN, and another resource
+    // type of this service. The last rows are WELL-FORMED connector ARNs that name no
+    // connector this account holds in the Region the request is scoped to — a name
+    // never created, and this account's own connector in another Region. AWS collapses
+    // both kinds into one class and one text, so a caller cannot tell from a refusal
+    // whether a connector by that ARN exists.
+    let cases: [(&str, &str); 8] = [
         ("not an ARN", "tenant-0"),
         ("too few ARN segments", "arn:aws:config:us-east-1:000000000000"),
         (
@@ -437,10 +506,6 @@ async fn an_arn_member_is_refused_when_invalid_and_answered_as_missing_when_unkn
             "another resource type of this service",
             "arn:aws:config:us-east-1:000000000000:configuration-recorder/default/abc",
         ),
-    ];
-    // A well-formed connector ARN that names no connector this account holds in this
-    // Region is missing, not invalid.
-    let unknown: [(&str, &str); 2] = [
         (
             "a connector this account never created",
             "arn:aws:config:us-east-1:000000000000:connector/azure-absent",
@@ -452,22 +517,14 @@ async fn an_arn_member_is_refused_when_invalid_and_answered_as_missing_when_unkn
     ];
 
     for operation in ["GetConnector", "DeleteConnector"] {
-        for (case, arn) in invalid {
-            let (status, code) = emulator.refused(operation, &json!({ "Arn": arn })).await;
+        for (case, arn) in cases {
+            let (status, code, message) = refused_arn(&emulator, operation, arn).await;
             assert_eq!(
-                (status, code.as_str()),
-                (400, "ValidationException"),
-                "case {operation:?} / {case:?}: expected HTTP 400 ValidationException, \
-                 got {status} {code}"
-            );
-        }
-        for (case, arn) in unknown {
-            let (status, code) = emulator.refused(operation, &json!({ "Arn": arn })).await;
-            assert_eq!(
-                (status, code.as_str()),
-                (400, "ResourceNotFoundException"),
-                "case {operation:?} / {case:?}: expected HTTP 400 \
-                 ResourceNotFoundException, got {status} {code}"
+                (status, code.as_str(), message.as_str()),
+                (400, "ValidationException", CONNECTOR_ARN_NOT_VALID_TEXT),
+                "case {operation:?} / {case:?}: expected HTTP 400 ValidationException \
+                 with the one connector-ARN text, got {status} {code} with message \
+                 {message:?}"
             );
         }
     }
@@ -482,115 +539,20 @@ async fn an_arn_member_is_refused_when_invalid_and_answered_as_missing_when_unkn
 }
 
 #[tokio::test]
-async fn one_provider_configuration_has_at_most_one_connector() {
-    let emulator = Emulator::new();
-    let arn = put_connector(&emulator, "tenant-0", "client-0").await;
-
-    // Rows are second requests for a configuration already connected: the same
-    // configuration, and the same tenant with another client identifier — the tenant
-    // is what the connector connects to, so both name the connector that exists.
-    let cases: [(&str, &str, &str); 2] = [
-        ("the same configuration", "tenant-0", "client-0"),
-        ("the same tenant, another client", "tenant-0", "client-1"),
-    ];
-    for (case, tenant, client) in cases {
-        let (status, code) = emulator
-            .refused(
-                "PutConnector",
-                &json!({ "ConnectorConfiguration": azure_configuration(tenant, client) }),
-            )
-            .await;
-        assert_eq!(
-            (status, code.as_str()),
-            (400, "ConflictException"),
-            "case {case:?}: expected HTTP 400 ConflictException, got {status} {code}"
-        );
-    }
-
-    // Another tenant is another connector, not a conflict.
-    let other = put_connector(&emulator, "tenant-1", "client-0").await;
-    assert_ne!(
-        other, arn,
-        "a connector for another tenant must get its own ARN, got {other:?}"
-    );
-
-    // Concurrent requests for one configuration have a single winner: the check and
-    // the insert are one step, so the store never holds two connectors for it.
-    let request = json!({
-        "ConnectorConfiguration": azure_configuration("tenant-concurrent", "client")
-    });
-    let (first, second, third, fourth) = tokio::join!(
-        emulator.call("PutConnector", &request),
-        emulator.call("PutConnector", &request),
-        emulator.call("PutConnector", &request),
-        emulator.call("PutConnector", &request),
-    );
-    let outcomes = [first, second, third, fourth];
-    let winners = outcomes
-        .iter()
-        .filter(|(status, _)| *status == 200)
-        .count();
-    assert_eq!(
-        winners, 1,
-        "case \"concurrent requests for one configuration\": exactly one must win, got \
-         {outcomes:?}"
-    );
-
-    let (arns, _) = list_connector_arns(&emulator, 0).await;
-    assert_eq!(
-        arns.len(),
-        3,
-        "the store must hold one connector per configuration, got {arns:?}"
-    );
-}
-
-#[tokio::test]
-async fn an_identifier_with_padding_is_refused_rather_than_normalised() {
-    let emulator = Emulator::new();
-    // The connector's name is derived from the tenant identifier, so an identifier is
-    // stored exactly as the caller sent it: padding is refused, not trimmed away into
-    // a different identifier. Rows differ along which identifier carries the padding
-    // and along the whitespace itself.
-    let cases: [(&str, &str, &str); 4] = [
-        ("leading space on the tenant", " tenant-0", "client-0"),
-        ("trailing space on the tenant", "tenant-0 ", "client-0"),
-        ("tab around the client", "\ttenant-0", "client-0"),
-        ("newline after the tenant", "tenant-0\n", "client-0"),
-    ];
-    for (case, tenant, client) in cases {
-        let (status, code) = emulator
-            .refused(
-                "PutConnector",
-                &json!({ "ConnectorConfiguration": azure_configuration(tenant, client) }),
-            )
-            .await;
-        assert_eq!(
-            (status, code.as_str()),
-            (400, "ValidationException"),
-            "case {case:?}: expected HTTP 400 ValidationException, got {status} {code}"
-        );
-    }
-
-    let (arns, _) = list_connector_arns(&emulator, 0).await;
-    assert!(
-        arns.is_empty(),
-        "a refused PutConnector must create nothing, got {arns:?}"
-    );
-}
-
-#[tokio::test]
 async fn a_connector_is_served_only_to_the_region_it_belongs_to() {
     // One account's store reached from two Regions: a connector is a regional
     // resource, so each Region sees only its own.
     let east = Emulator::in_region("us-east-1");
     let west = east.in_other_region("us-west-2");
 
-    let east_arn = put_connector(&east, "tenant-0", "client").await;
-    // The same tenant in another Region is another connector, not a conflict.
-    let west_arn = put_connector(&west, "tenant-0", "client").await;
+    let east_arn = seed_connector(&east, "tenant-0", "client");
+    // The same tenant in another Region is another connector: the Region is part of
+    // the connector's identity and of its ARN.
+    let west_arn = seed_connector(&west, "tenant-0", "client");
     assert_ne!(
         east_arn, west_arn,
-        "each Region must mint its own connector ARN, got {east_arn:?} and {west_arn:?}"
+        "each Region's connector must carry its own ARN, got {east_arn:?} and \
+         {west_arn:?}"
     );
 
     for (case, emulator, own, other) in [
@@ -613,124 +575,14 @@ async fn a_connector_is_served_only_to_the_region_it_belongs_to() {
             "case {case:?}: this Region's connector must be readable, got {read}"
         );
         for operation in ["GetConnector", "DeleteConnector"] {
-            let (status, code) = emulator.refused(operation, &json!({ "Arn": other })).await;
+            let (status, code, message) = refused_arn(emulator, operation, other).await;
             assert_eq!(
-                (status, code.as_str()),
-                (400, "ResourceNotFoundException"),
-                "case {case:?} / {operation:?}: another Region's connector must be \
-                 answered as missing, got {status} {code}"
+                (status, code.as_str(), message.as_str()),
+                (400, "ValidationException", CONNECTOR_ARN_NOT_VALID_TEXT),
+                "case {case:?} / {operation:?}: another Region's connector ARN must not \
+                 resolve here, got {status} {code} with message {message:?}"
             );
         }
     }
 }
 
-#[tokio::test]
-async fn a_configuration_naming_no_provider_is_refused() {
-    let emulator = Emulator::new();
-    // `ConnectorConfiguration`: "You must specify exactly one provider
-    // configuration." Rows differ along HOW the configuration fails to name one, and
-    // along which identifier of a named provider is blank.
-    let cases: [(&str, Value); 7] = [
-        ("no provider configuration", json!({})),
-        (
-            "a blank tenant identifier",
-            azure_configuration(" ", "client"),
-        ),
-        (
-            "a blank client identifier",
-            azure_configuration("tenant-0", "\t"),
-        ),
-        ("both identifiers blank", azure_configuration(" ", " ")),
-        // The connector's name is the resource portion of its ARN, so an identifier
-        // that cannot be part of one would mint a connector nothing could name
-        // afterwards. `AzureTenantIdentifier` constrains only its length (1..128), so
-        // these reach the handler.
-        (
-            "a tenant identifier carrying the ARN resource separator",
-            azure_configuration("tenant/0", "client"),
-        ),
-        (
-            "a tenant identifier that is only the separator",
-            azure_configuration("/", "client"),
-        ),
-        (
-            "a tenant identifier ending in the separator",
-            azure_configuration("tenant-0/", "client"),
-        ),
-    ];
-
-    for (case, configuration) in cases {
-        let (status, code) = emulator
-            .refused(
-                "PutConnector",
-                &json!({ "ConnectorConfiguration": configuration }),
-            )
-            .await;
-        assert_eq!(
-            (status, code.as_str()),
-            (400, "ValidationException"),
-            "case {case:?}: expected HTTP 400 ValidationException, got {status} {code}"
-        );
-    }
-
-    let (arns, _) = list_connector_arns(&emulator, 0).await;
-    assert!(
-        arns.is_empty(),
-        "a refused PutConnector must create nothing, got {arns:?}"
-    );
-}
-
-#[tokio::test]
-async fn the_connector_store_is_capped_at_this_accounts_quota() {
-    let emulator = Emulator::new();
-    // The quota this emulator enforces over the store, documented on
-    // `crate::state::CONNECTORS_QUOTA`: the `ConnectorSummaries` length maximum.
-    const QUOTA: usize = 100;
-
-    for index in 0..QUOTA {
-        put_connector(&emulator, &format!("tenant-{index:03}"), "client").await;
-    }
-
-    let (status, code) = emulator
-        .refused(
-            "PutConnector",
-            &json!({
-                "ConnectorConfiguration": azure_configuration("tenant-past-the-quota", "client")
-            }),
-        )
-        .await;
-    assert_eq!(
-        (status, code.as_str()),
-        (400, "MaxNumberOfConnectorsExceededException"),
-        "case \"one past the quota\": expected HTTP 400 \
-         MaxNumberOfConnectorsExceededException, got {status} {code}"
-    );
-
-    // The refusal left the stored connectors alone, and every one is still listed.
-    let (arns, _) = list_connector_arns(&emulator, 0).await;
-    assert_eq!(
-        arns.len(),
-        QUOTA,
-        "the store must still hold the quota's worth of connectors, got {} of them",
-        arns.len()
-    );
-
-    // Deleting one makes room for exactly one more.
-    emulator
-        .ok("DeleteConnector", &json!({ "Arn": arns[0].clone() }))
-        .await;
-    let created = put_connector(&emulator, "tenant-past-the-quota", "client").await;
-    assert!(
-        !arns.contains(&created),
-        "case \"after a delete\": the connector created must be a new one, got \
-         {created:?}"
-    );
-    let (after, _) = list_connector_arns(&emulator, 0).await;
-    assert_eq!(
-        after.len(),
-        QUOTA,
-        "case \"after a delete\": the store must be back at the quota, got {} \
-         connector(s)",
-        after.len()
-    );
-}

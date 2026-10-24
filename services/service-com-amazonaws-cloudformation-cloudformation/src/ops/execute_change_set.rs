@@ -208,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store is written under the lock and the lock is RELEASED with this block:
         // the calls that create or delete the stack's resources run after it, and each of
         // those reaches another service's own handler, which takes that service's lock.
-        let (stack_id, region, declared, previous_resources) = {
+        let (stack_id, region, declared, previous_resources, provenance) = {
             let mut store = state.lock();
             store.settle(now);
 
@@ -357,6 +357,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             let region = stack.region.clone();
             let declared = stack.current_resources().to_vec();
+            let provenance = stack.provenance();
 
             // "When you execute a change set, CloudFormation deletes all other change sets
             // associated with the stack because they aren't valid for the updated stack."
@@ -374,7 +375,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     due_at: now + crate::state::STATUS_TRANSITION_DELAY,
                 });
             }
-            (stack_id, region, declared, previous_resources)
+            (stack_id, region, declared, previous_resources, provenance)
         };
 
         // The deployed template's resources are reconciled with the ones the stack already
@@ -384,6 +385,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let materialised = crate::state::provisioning::reconcile(
             ctx,
             &region,
+            &provenance,
             declared,
             &previous_resources,
         )

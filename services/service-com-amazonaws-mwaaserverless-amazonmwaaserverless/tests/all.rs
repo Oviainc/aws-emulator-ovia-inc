@@ -15,6 +15,8 @@
 mod arn_validation_errors;
 #[path = "all/missing_resource_lookups.rs"]
 mod missing_resource_lookups;
+#[path = "all/resource_tag_listing.rs"]
+mod resource_tag_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_errors.rs"]

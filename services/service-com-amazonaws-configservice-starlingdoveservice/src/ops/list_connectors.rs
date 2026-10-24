@@ -3,9 +3,10 @@
 //! @op ListConnectors
 //!
 //! Reports the connectors this account and Region hold, as a page over the stored
-//! connectors ordered by name: a connector appears here from the `PutConnector` that
-//! created it until the `DeleteConnector` that removed it, and running this operation
-//! changes nothing about the store.
+//! connectors ordered by name: a connector appears here while the store holds it, until
+//! the `DeleteConnector` that removes it, and running this operation changes nothing
+//! about the store. (`PutConnector` stores none in this emulator: it refuses a provider
+//! credential it cannot verify with the provider — see `crate::ops::put_connector`.)
 //!
 //! ## Shape of an operation
 //!

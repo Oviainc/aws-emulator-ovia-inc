@@ -104,6 +104,20 @@ pub(crate) fn string_at(body: &Value, member: &str) -> String {
         .to_string()
 }
 
+/// The `message` of an error envelope, under either casing a protocol uses for
+/// it (`Message` on the modelled shapes, `message` on a framework refusal).
+///
+/// `pub(crate)` beside [`error_code`], so every suite in `tests/all/` reads a
+/// refusal's text through the same helper.
+pub(crate) fn error_message(payload: &Value) -> String {
+    for member in ["Message", "message"] {
+        if let Some(text) = payload.get(member).and_then(Value::as_str) {
+            return text.to_string();
+        }
+    }
+    panic!("an error body must carry a message, got {payload}")
+}
+
 /// The modelled shape name in an awsJson error envelope's `__type`.
 pub(crate) fn error_code(payload: &Value) -> String {
     payload["__type"]

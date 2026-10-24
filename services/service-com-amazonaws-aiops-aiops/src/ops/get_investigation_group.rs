@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInvestigationGroup
-//! Reports the stored configuration of the investigation group `{identifier}` names,
-//! read back from [`crate::state`]; `ResourceNotFoundException` when nothing matches.
+//! Reports the stored configuration of the investigation group `{identifier}` names
+//! IN THE REGION THIS REQUEST WAS SIGNED FOR, read back from [`crate::state`];
+//! `ResourceNotFoundException` when nothing matches there.
 //! A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
@@ -172,15 +173,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetInvestigationGroupErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the investigation group store is unavailable".to_string()),
             })
         })?;
 
+        // This service is regional: the endpoint this request reached holds only the
+        // groups of the Region it was signed for, so another Region's group is absent
+        // here however well-formed the ARN that named it.
+        let region = crate::state::request_region(ctx.parts());
+
         let store = state.lock();
-        let group = store.group(&input.identifier).ok_or_else(|| {
+        let group = store.group(&input.identifier, &region).ok_or_else(|| {
             GetInvestigationGroupErrorModeled::ResourceNotFoundException(
                 crate::state::investigation_group_not_found(),
             )

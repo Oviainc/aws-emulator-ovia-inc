@@ -12,9 +12,11 @@
 //!    so it never learns whether the application it named exists;
 //! 3. the `ClientToken` replay check — a retry of an amendment already applied changes
 //!    nothing and answers success;
-//! 4. optimistic concurrency — the request's `Revision` must be the application's
+//! 4. the application's status — AWS has finished with a terminal application
+//!    ([`crate::state::TERMINAL_STATUSES`]), so amending one is `ConflictException`;
+//! 5. optimistic concurrency — the request's `Revision` must be the application's
 //!    current one, else `ConflictException`;
-//! 5. the amendments themselves, applied to a copy so that a request carrying one that
+//! 6. the amendments themselves, applied to a copy so that a request carrying one that
 //!    cannot be applied leaves the stored application exactly as it was.
 //!
 //! ## What a `FieldPath` may name
@@ -489,6 +491,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some()
         {
             return Ok(AmendBenefitApplicationOutput {});
+        }
+
+        // AWS has finished with a terminal application (`APPROVED`, `REJECTED`,
+        // `CANCELED`), so there is nothing left to amend: the change is refused and
+        // nothing is persisted — see [`crate::state::TERMINAL_STATUSES`]. An amendment of
+        // a submitted application is exactly what this operation is for, so the
+        // non-terminal statuses are all accepted. Checked after the retry above, which
+        // changes nothing at all, and before the revision, which the status refusal does
+        // not depend on.
+        if application.is_terminal() {
+            return Err(AmendBenefitApplicationErrorModeled::ConflictException(
+                ConflictException {
+                    message: crate::state::status_conflict_message(
+                        &application.id,
+                        &application.status,
+                        "amended",
+                    ),
+                },
+            )
+            .into());
         }
 
         if application.revision_text() != input.revision {

@@ -204,9 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !application.is_recallable() {
             return Err(RecallBenefitApplicationErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "benefit application {} is {}, so it cannot be recalled",
-                        application.id, application.status
+                    message: crate::state::status_conflict_message(
+                        &application.id,
+                        &application.status,
+                        "recalled",
                     ),
                 },
             )

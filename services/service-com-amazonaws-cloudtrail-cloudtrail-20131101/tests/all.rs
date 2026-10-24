@@ -35,6 +35,8 @@ mod dashboard_updates;
 mod disable_federation;
 #[path = "all/emulator.rs"]
 mod emulator;
+#[path = "all/enum_refusal_wording.rs"]
+mod enum_refusal_wording;
 #[path = "all/event_configuration.rs"]
 mod event_configuration;
 #[path = "all/event_data_store_ingestion.rs"]
@@ -61,6 +63,8 @@ mod import_reads;
 mod import_stop;
 #[path = "all/insight_selectors.rs"]
 mod insight_selectors;
+#[path = "all/insights_data.rs"]
+mod insights_data;
 #[path = "all/insights_metric_data.rs"]
 mod insights_metric_data;
 #[path = "all/lake_queries.rs"]

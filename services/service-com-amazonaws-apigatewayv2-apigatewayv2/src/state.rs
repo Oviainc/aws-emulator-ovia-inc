@@ -322,6 +322,14 @@ pub struct ComAmazonawsApigatewayv2Apigatewayv2State {
     /// Drives [`ComAmazonawsApigatewayv2Apigatewayv2State::mint_api_id`]; see
     /// [`ID_MULTIPLIER`] for how an id is derived from it.
     pub api_id_seed: u64,
+    /// Every persisted portal product, keyed by `PortalProductId`. A portal product is
+    /// an ACCOUNT-level resource, not a child of an api, so it is stored here beside
+    /// the apis; `BTreeMap` for the same stable key order
+    /// [`ComAmazonawsApigatewayv2Apigatewayv2State::apis`] is kept in, which is what
+    /// makes `ListPortalProducts` paging resumable.
+    pub portal_products: BTreeMap<String, PortalProduct>,
+    /// Drives [`ComAmazonawsApigatewayv2Apigatewayv2State::mint_portal_product_id`].
+    pub portal_product_id_seed: u64,
     /// Every persisted VPC link, keyed by `VpcLinkId`. A VPC link is an
     /// account-and-Region resource rather than a child of an api — an integration only
     /// REFERENCES one through its `ConnectionId` — so it is stored beside [`Self::apis`]
@@ -345,6 +353,15 @@ impl ComAmazonawsApigatewayv2Apigatewayv2State {
     pub fn mint_api_id(&mut self) -> String {
         self.api_id_seed = self.api_id_seed.wrapping_add(1);
         mint_id(self.api_id_seed)
+    }
+
+    /// Mint a fresh `PortalProductId`: ten lowercase alphanumerics, never one already
+    /// minted. The modelled `__stringMin10Max30PatternAZ09` the member targets is
+    /// `^[a-z0-9]+$`, 10..30 characters, which [`mint_id`]'s ten-character lowercase
+    /// alphanumeric id satisfies.
+    pub fn mint_portal_product_id(&mut self) -> String {
+        self.portal_product_id_seed = self.portal_product_id_seed.wrapping_add(1);
+        mint_id(self.portal_product_id_seed)
     }
 
     /// Mint a fresh `VpcLinkId`: ten lowercase alphanumerics, never one already minted.
@@ -1250,6 +1267,78 @@ impl Deployment {
     }
 }
 
+/// The most portal products one account may hold, after which CreatePortalProduct is
+/// refused.
+///
+/// An EMULATOR growth bound, not a figure AWS publishes: it keeps a loop of
+/// CreatePortalProduct calls from growing this store without end, and is set to the
+/// per-parent bound this service already uses for the other collections it mints ids
+/// into ([`MAX_MODELS_PER_API`]). `TooManyRequestsException` ("A limit has been
+/// exceeded") is the modelled error the operation refuses with. Do not cite this as a
+/// published portal-products quota.
+pub const MAX_PORTAL_PRODUCTS: usize = 300;
+
+/// A persisted `PortalProduct` resource.
+///
+/// "Creates a new portal product" (`CreatePortalProduct`): an account-level resource,
+/// NOT a child of an api, so it lives beside
+/// [`ComAmazonawsApigatewayv2Apigatewayv2State::apis`] rather than inside one.
+#[derive(Debug, Clone)]
+pub struct PortalProduct {
+    pub portal_product_id: String,
+    /// The ARN every reader reports, built once at create time by
+    /// [`portal_product_arn`] from the Region the creating request addressed: an ARN
+    /// names the Region its resource was created in, so it cannot be rebuilt per read
+    /// from whatever Region a later caller signs for.
+    pub portal_product_arn: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    /// "The visual ordering of the product pages and product REST endpoint pages in a
+    /// published portal" (`PortalProduct$DisplayOrder`). A freshly created product owns
+    /// no pages, so it has no ordering until one is configured.
+    pub display_order: Option<wire::DisplayOrder>,
+    /// "The timestamp when the portal product was last modified"
+    /// (`PortalProduct$LastModified`) — the creation instant until something rewrites
+    /// the record.
+    pub last_modified: SystemTime,
+    pub tags: BTreeMap<String, String>,
+}
+
+/// The members `CreatePortalProduct`, `GetPortalProduct` and `UpdatePortalProduct`
+/// each report for one portal product — the three modelled responses carry exactly the
+/// same set — so [`PortalProduct::to_wire`] projects the record ONCE and every reader
+/// serializes that projection rather than assembling its own.
+#[derive(Debug, Clone)]
+pub struct PortalProductView {
+    pub description: Option<String>,
+    pub display_name: Option<String>,
+    pub display_order: Option<wire::DisplayOrder>,
+    pub last_modified: Option<::aws_smithy_types::DateTime>,
+    pub portal_product_arn: Option<String>,
+    pub portal_product_id: Option<String>,
+    pub tags: Option<std::collections::HashMap<String, String>>,
+}
+
+impl PortalProduct {
+    /// Project the record onto the members every portal-product reader reports.
+    pub fn to_wire(&self) -> PortalProductView {
+        PortalProductView {
+            description: self.description.clone(),
+            display_name: Some(self.display_name.clone()),
+            display_order: self.display_order.clone(),
+            last_modified: Some(to_timestamp(self.last_modified)),
+            portal_product_arn: Some(self.portal_product_arn.clone()),
+            portal_product_id: Some(self.portal_product_id.clone()),
+            tags: Some(
+                self.tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+        }
+    }
+}
+
 /// A persisted `VpcLink` resource, owned by the account and Region rather than by an
 /// api.
 #[derive(Debug, Clone)]
@@ -1404,6 +1493,25 @@ impl DomainName {
             tags: Some(self.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
         }
     }
+}
+
+/// The ARN of a stored portal product.
+///
+/// API Gateway's own ARNs carry the resource portion as the URI path of the resource
+/// (`/portalproducts/{portalProductId}`, the `GetPortalProduct` URI without its
+/// version prefix), under this service's `arnNamespace`
+/// (`smithy_query(query="service_info")` reports `apigateway`). Built through
+/// [`::engine::emulator_arn`], so the account segment is the emulator's canonical
+/// account rather than a literal: a portal product is an account-owned, shareable
+/// resource (`GetPortalProduct$ResourceOwnerAccountId`), so the owning account is part
+/// of its name. The namespace is [`ARN_SERVICE`], declared once for every resource this
+/// store names.
+pub fn portal_product_arn(region: &str, portal_product_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("/portalproducts/{portal_product_id}"),
+    )
 }
 
 /// The prefix of an Amazon VPC subnet id, the resource type `SubnetIdList`'s members

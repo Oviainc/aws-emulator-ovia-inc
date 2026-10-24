@@ -23,9 +23,9 @@
 
 use crate::ops::types::{
     AquaConfiguration, AvailabilityZone, Cluster, ClusterNode, ClusterParameterGroup,
-    ClusterParameterGroupStatus, ClusterSubnetGroup, ClusterVersion, NetworkInterface, Parameter,
-    PendingModifiedValues, Snapshot, Subnet, SupportedPlatform, VpcEndpoint,
-    VpcSecurityGroupMembership,
+    ClusterParameterGroupStatus, ClusterParameterStatus, ClusterSubnetGroup, ClusterVersion,
+    NetworkInterface, Parameter, PendingModifiedValues, Snapshot, Subnet, SupportedPlatform,
+    VpcEndpoint, VpcSecurityGroupMembership,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -275,16 +275,24 @@ pub const PARAMETER_APPLY_STATUS_IN_SYNC: &str = "in-sync";
 /// reboots."
 pub const PARAMETER_APPLY_STATUS_PENDING_REBOOT: &str = "pending-reboot";
 
-/// What `ModifyClusterParameterGroup` reports as the group's
-/// `ParameterGroupStatus`.
+/// What a change to what a cluster parameter group HOLDS reports as the group's
+/// `ParameterGroupStatus`: one sentence for both the modify and the reset, which
+/// are the two operations that change it and the two that answer
+/// `ClusterParameterGroupNameMessage`.
 ///
 /// Source: `smithy_query(query="doc", shape="ClusterParameterGroupNameMessage",
 /// member="ParameterGroupStatus")` — "if you made a change to a parameter group
-/// name-value pair, then the change could be pending a reboot of an associated
-/// cluster" — and the sentence the Amazon Redshift API/CLI reference prints for
-/// `modify-cluster-parameter-group`, which is this one verbatim.
-pub const PARAMETER_GROUP_STATUS_PENDING_REBOOT: &str =
-    "Your parameter group has been updated but changes won't get applied until you reboot the associated Clusters.";
+/// name-value pair, then the change COULD be pending a reboot of an associated
+/// cluster" — which is exactly what this sentence says: a dynamic-only change is
+/// applied to the associated clusters straight away, while a static one waits
+/// for their next reboot, as
+/// `smithy_query(query="doc", operation="ResetClusterParameterGroup")`'s "For
+/// parameter changes to take effect you must reboot any associated clusters"
+/// has it. The status does NOT depend on which parameters the request carried:
+/// it names both outcomes so a caller reads the one its own change falls under,
+/// which is why one constant serves both operations.
+pub const PARAMETER_GROUP_STATUS_UPDATED: &str =
+    "Your parameter group has been updated. If you changed only dynamic parameters, associated clusters are being modified now. If you changed static parameters, all updates, including dynamic parameters, will be applied when you reboot the associated clusters.";
 
 /// How many parameters one `ModifyClusterParameterGroup` request may carry.
 ///
@@ -292,6 +300,13 @@ pub const PARAMETER_GROUP_STATUS_PENDING_REBOOT: &str =
 /// member="Parameters")` — "A maximum of 20 parameters can be modified in a
 /// single request."
 pub const MAX_MODIFIABLE_PARAMETERS: usize = 20;
+
+/// How many parameters one `ResetClusterParameterGroup` request may name.
+///
+/// Source: `smithy_query(query="doc", shape="ResetClusterParameterGroupMessage",
+/// member="Parameters")` — "Constraints: A maximum of 20 parameters can be reset
+/// in a single request."
+pub const MAX_RESETTABLE_PARAMETERS: usize = 20;
 
 /// The parameter the workload management (WLM) configuration is held in.
 pub const WLM_JSON_CONFIGURATION: &str = "wlm_json_configuration";
@@ -440,16 +455,19 @@ fn allowed_range(item: &str) -> Option<(i64, i64)> {
 /// reports, in `ParameterName` order — which is the order a page walks, so the
 /// `Marker` cursor stays a stable offset into one sequence.
 ///
-/// Source: the Amazon Redshift Cluster Management Guide, "Amazon Redshift
-/// parameter groups": its default-parameter table lists exactly these settings
-/// with these default values, which is what
-/// `aws redshift describe-default-cluster-parameters --parameter-group-family
-/// redshift-1.0` reports for the one family this service publishes. The same
-/// guide is where each [`EngineParameter::apply_type`] comes from: a change to
-/// `enable_case_sensitive_identifier`, `enable_user_activity_logging`,
-/// `require_ssl`, `use_fips_ssl` or `wlm_json_configuration` is seen by an
-/// associated cluster only after a reboot, while every other setting applies
-/// dynamically. Every setting in the table is one a caller may change, hence
+/// Source: what the engine itself publishes for the one family this service
+/// offers — `aws redshift describe-default-cluster-parameters
+/// --parameter-group-family redshift-1.0`, the same catalog the Amazon Redshift
+/// Cluster Management Guide's "Amazon Redshift parameter groups"
+/// default-parameter table lists. Each entry's `Description`, `ApplyType`,
+/// `DataType` and `AllowedValues` are that output's, VERBATIM, including its own
+/// wording and spacing: a client renders the description as it arrives and reads
+/// `ApplyType` to decide whether a change needs a reboot, so neither is the
+/// emulator's to rephrase. The entries whose change an associated cluster sees
+/// only after a reboot are published `static` (`enable_case_sensitive_identifier`,
+/// `enable_user_activity_logging`, `require_ssl`, `statement_timeout`,
+/// `use_fips_ssl`, `wlm_json_configuration`); every other setting applies
+/// dynamically. Every setting in the catalog is one a caller may change, hence
 /// [`EngineParameter::is_modifiable`] on all of them.
 pub const ENGINE_DEFAULT_PARAMETERS: &[EngineParameter] = &[
     EngineParameter {
@@ -536,7 +554,7 @@ pub const ENGINE_DEFAULT_PARAMETERS: &[EngineParameter] = &[
     EngineParameter {
         name: "require_ssl",
         default_value: "false",
-        description: "Requires SSL for every connection to the database.",
+        description: "require ssl for all databaseconnections",
         data_type: DATA_TYPE_BOOLEAN,
         allowed_values: Some(BOOLEAN_ALLOWED_VALUES),
         apply_type: APPLY_TYPE_STATIC,
@@ -554,11 +572,10 @@ pub const ENGINE_DEFAULT_PARAMETERS: &[EngineParameter] = &[
     EngineParameter {
         name: "statement_timeout",
         default_value: "0",
-        description: "Aborts any statement that takes over the specified number of \
-                      milliseconds; 0 turns the limit off.",
+        description: "Aborts any statement that takes over the specified number of milliseconds.",
         data_type: DATA_TYPE_INTEGER,
         allowed_values: Some("0,100-2147483647"),
-        apply_type: APPLY_TYPE_DYNAMIC,
+        apply_type: APPLY_TYPE_STATIC,
         is_modifiable: true,
     },
     EngineParameter {
@@ -1142,6 +1159,62 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             .iter()
             .filter(|g| !g.default_group)
             .count()
+    }
+
+    /// Record, on every cluster configured with the parameter group `group_name`,
+    /// that each of these parameters now carries a change the cluster has not
+    /// seen.
+    ///
+    /// Source: `smithy_query(query="doc", shape="ClusterParameterStatus",
+    /// member="ParameterApplyStatus")` — "`pending-reboot`: The parameter value
+    /// will be applied after the cluster reboots" — with
+    /// `smithy_query(query="doc", operation="ResetClusterParameterGroup")`, "For
+    /// parameter changes to take effect you must reboot any associated clusters".
+    /// ONE rule for every path that changes what a group holds (the modify and
+    /// the reset), so the two cannot report different memberships for the same
+    /// kind of change. Naming no parameter changes nothing: a change an
+    /// associated cluster picks up without a reboot leaves nothing pending.
+    pub fn mark_parameter_group_pending_reboot(
+        &mut self,
+        group_name: &str,
+        parameter_names: &[String],
+    ) {
+        if parameter_names.is_empty() {
+            return;
+        }
+        for stored in &mut self.clusters {
+            let Some(memberships) = stored.cluster.cluster_parameter_groups.as_mut() else {
+                continue;
+            };
+            for membership in memberships
+                .iter_mut()
+                .filter(|m| m.parameter_group_name.as_deref() == Some(group_name))
+            {
+                membership.parameter_apply_status =
+                    Some(PARAMETER_APPLY_STATUS_PENDING_REBOOT.to_string());
+                let statuses = membership
+                    .cluster_parameter_status_list
+                    .get_or_insert_with(Vec::new);
+                for name in parameter_names {
+                    match statuses
+                        .iter_mut()
+                        .find(|status| status.parameter_name.as_deref() == Some(name.as_str()))
+                    {
+                        Some(status) => {
+                            status.parameter_apply_status =
+                                Some(PARAMETER_APPLY_STATUS_PENDING_REBOOT.to_string());
+                        }
+                        None => statuses.push(ClusterParameterStatus {
+                            parameter_name: Some(name.clone()),
+                            parameter_apply_status: Some(
+                                PARAMETER_APPLY_STATUS_PENDING_REBOOT.to_string(),
+                            ),
+                            parameter_apply_error_description: None,
+                        }),
+                    }
+                }
+            }
+        }
     }
 }
 

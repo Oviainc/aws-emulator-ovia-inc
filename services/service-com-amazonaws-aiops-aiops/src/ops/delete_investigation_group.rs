@@ -162,17 +162,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteInvestigationGroupErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the investigation group store is unavailable".to_string()),
             })
         })?;
 
+        // This service is regional: the endpoint this request reached holds only the
+        // groups of the Region it was signed for, so another Region's group is absent
+        // here and cannot be deleted through it.
+        let region = crate::state::request_region(ctx.parts());
+
         let mut store = state.lock();
         // The whole record goes: the group, its resource policy, its tags and its name
         // index entry, so the name becomes available to a later create.
-        if store.remove_group(&input.identifier).is_none() {
+        if store.remove_group(&input.identifier, &region).is_none() {
             return Err(DeleteInvestigationGroupErrorModeled::ResourceNotFoundException(
                 crate::state::investigation_group_not_found(),
             )

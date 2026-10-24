@@ -41,6 +41,9 @@ mod metadata_flags;
 #[path = "all/resource_error_messages.rs"]
 mod resource_error_messages;
 
+#[path = "all/response_front_door.rs"]
+mod response_front_door;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

@@ -25,6 +25,7 @@
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_servicequotas_servicequotasv20190624::state::UNASKED_PAGE_SIZE;
 
 use crate::quota_workflow::{client, emulator, walk_pages, Client};
 
@@ -373,22 +374,33 @@ async fn a_listing_reports_the_published_order_and_pages_with_a_next_token() {
             );
         }
 
-        // A caller that names no MaxResults is served the whole listing in ONE page,
-        // in the published order, with no token: `MaxResults` bounds what a caller
-        // may ASK for, not what the service returns unasked.
+        // A caller that names no MaxResults is served the page size the listing
+        // itself applies (`state::UNASKED_PAGE_SIZE`): the first rows of the
+        // published order, with a token for exactly as long as rows remain —
+        // `MaxResults` "defaults to a value appropriate to the operation", and the
+        // walk from that page yields the same listing.
         let defaulted = client
             .ok("ListServiceQuotas", json!({"ServiceCode": service_code}))
             .await;
+        let unasked = defaulted["Quotas"].as_array().cloned().unwrap_or_default();
+        let expected = UNASKED_PAGE_SIZE.min(quotas.len());
         assert_eq!(
-            defaulted["Quotas"].as_array().cloned().unwrap_or_default(),
-            quotas,
-            "case {service_code} no MaxResults: expected the whole listing in one page, got \
-             {defaulted}"
+            unasked.len(),
+            expected,
+            "case {service_code} no MaxResults: expected {expected} rows on the unasked page, \
+             got {defaulted}"
         );
-        assert!(
-            defaulted["NextToken"].is_null(),
-            "case {service_code} no MaxResults: a whole listing leaves nothing to resume, got \
-             {defaulted}"
+        assert_eq!(
+            unasked,
+            quotas[..expected],
+            "case {service_code} no MaxResults: the unasked page must be the first rows of the \
+             published order"
+        );
+        assert_eq!(
+            defaulted["NextToken"].is_string(),
+            expected < quotas.len(),
+            "case {service_code} no MaxResults: a NextToken is present exactly while rows \
+             remain, got {defaulted}"
         );
     }
 

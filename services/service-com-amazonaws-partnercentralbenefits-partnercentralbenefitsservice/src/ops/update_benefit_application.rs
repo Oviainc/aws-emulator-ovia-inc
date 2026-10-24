@@ -4,6 +4,13 @@
 //! Applies the supplied members to one stored benefit application in [`crate::state`],
 //! bumps its revision and `UpdatedAt`, and reports the new revision.
 //!
+//! An update edits the partner's own DRAFT: it is accepted only while the application is
+//! `PENDING_SUBMISSION` ([`crate::state::UPDATABLE_STATUSES`]), and from any other status
+//! — a submitted application AWS is reviewing, or a terminal one — it is refused with the
+//! modelled `ConflictException` and nothing is persisted. A submitted application is
+//! changed through `RecallBenefitApplication` (back to draft) or
+//! `AmendBenefitApplication` instead.
+//!
 //! Optimistic concurrency: the request's `Revision` must be the application's current
 //! one, so an update built on a stale read is refused with the modelled
 //! `ConflictException` rather than silently overwriting a newer write.
@@ -218,6 +225,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // An update is the partner editing its own DRAFT: once the application has been
+        // submitted the record is the one AWS is reviewing, and a terminal application is
+        // finished with, so an update of anything but a `PENDING_SUBMISSION` application
+        // is refused and NOTHING below runs — see [`crate::state::UPDATABLE_STATUSES`].
+        // Checked before the revision, because the status refuses the request whatever
+        // revision it names.
+        if !application.is_updatable() {
+            return Err(UpdateBenefitApplicationErrorModeled::ConflictException(
+                ConflictException {
+                    message: crate::state::status_conflict_message(
+                        &application.id,
+                        &application.status,
+                        "updated",
+                    ),
+                },
+            )
+            .into());
+        }
 
         if application.revision_text() != input.revision {
             return Err(UpdateBenefitApplicationErrorModeled::ConflictException(
