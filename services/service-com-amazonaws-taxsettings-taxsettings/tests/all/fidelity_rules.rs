@@ -553,9 +553,13 @@ fn valid_entry() -> Value {
 }
 
 /// A `PutTaxExemption` request whose certificate is named `document_name`.
+///
+/// The account is the caller's own, so a request the boundary admits reaches the
+/// handler and is applied rather than refused for naming an account outside the
+/// caller's consolidated billing family.
 fn exemption_request(document_name: &str) -> Value {
     json!({
-        "accountIds": ["000000000001"],
+        "accountIds": [engine::emulator_account_id()],
         "authority": { "country": "US", "state": "CA" },
         "exemptionType": "Reseller",
         "exemptionCertificate": {
@@ -631,12 +635,13 @@ async fn a_constraint_violation_names_the_member_and_the_constraint_only() {
             never_echoed: Some("ddddd".to_string()),
         },
         // A name the pattern admits passes the boundary and reaches the
-        // operation, which is still scaffolded: a 501, never a refusal.
+        // operation, which stores the exemption: a 200, never a refusal and no
+        // validation envelope.
         Message {
             name: "certificate named with an upper-case extension the pattern admits",
             operation: "PutTaxExemption",
             body: exemption_request("certificate.PDF"),
-            status: 501,
+            status: 200,
             stated: Stated::NoEnvelope,
             never_echoed: None,
         },
@@ -644,7 +649,7 @@ async fn a_constraint_violation_names_the_member_and_the_constraint_only() {
             name: "certificate name at the 128-character bound",
             operation: "PutTaxExemption",
             body: exemption_request(&document_name_at_bound),
-            status: 501,
+            status: 200,
             stated: Stated::NoEnvelope,
             never_echoed: None,
         },
