@@ -2,16 +2,20 @@
 
 //! What this service REFUSES on the command-execution surface, and how it says so.
 //!
-//! Three rules, each asserted over a set of inputs rather than one case:
+//! Four rules, each asserted over a set of inputs rather than one case:
 //!
 //! 1. an execution starts only for a command that EXISTS — an unregistered
 //!    `commandArn` is refused 400 `ValidationException` naming the command, and
 //!    nothing is persisted;
-//! 2. a `targetArn` the service cannot target is refused 400 with the value READ
+//! 2. an execution starts only in the form the referenced command ADMITS — a command
+//!    the control plane deprecated admits none, and a command whose payload is static
+//!    admits none carrying `parameters` — and such a start is refused 400
+//!    `ValidationException` with nothing persisted either;
+//! 3. a `targetArn` the service cannot target is refused 400 with the value READ
 //!    BACK out of the request — the resource type when it names an IoT resource,
 //!    the value itself when it does not — so two rejections of two targets are
 //!    distinguishable;
-//! 3. a per-execution read or write for a job the thing has no execution of is
+//! 4. a per-execution read or write for a job the thing has no execution of is
 //!    404, reporting the job and the thing the request named — one form, from
 //!    both operations that address a single execution.
 //!
@@ -22,7 +26,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::state::command_registry;
+use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::state::{
+    command_registry, iot_commands::CommandFacts,
+};
 use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -36,19 +42,21 @@ struct Emulator {
 }
 
 impl Emulator {
-    /// An emulator whose shared IoT command index holds exactly `commands`.
+    /// An emulator whose shared IoT command index holds exactly `commands`, each
+    /// with the facts its create decided.
     ///
-    /// The index is the control plane's (`iot:CreateCommand` registers an ARN
-    /// there; it is still a scaffold in its own crate, under its own issue), so a
-    /// test that needs a command to exist writes it the way that create will.
-    fn with_commands(commands: &[&str]) -> Self {
+    /// The index is the control plane's (`iot:CreateCommand` registers an ARN and
+    /// its facts there, `iot:UpdateCommand` records a deprecation), so a test that
+    /// needs a command to exist — in a particular form, or deprecated — writes it
+    /// the way those operations do.
+    fn with_commands(commands: &[(&str, CommandFacts)]) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         {
             let index = command_registry(&*engine).expect("the shared IoT command index");
             let mut index = index.lock();
-            for command_arn in commands {
+            for (command_arn, facts) in commands {
                 index
-                    .register(command_arn)
+                    .register(command_arn, *facts)
                     .unwrap_or_else(|refusal| panic!("register {command_arn}: {refusal}"));
             }
         }
@@ -79,12 +87,21 @@ impl Emulator {
     }
 
     async fn start_command(&self, target_arn: &str, command_arn: &str) -> (u16, Value) {
-        self.call(
-            "POST",
-            "/command-executions",
-            Some(json!({"targetArn": target_arn, "commandArn": command_arn})),
-        )
-        .await
+        self.start_command_with(target_arn, command_arn, None).await
+    }
+
+    /// `StartCommandExecution` carrying `parameters`, when the row supplies any.
+    async fn start_command_with(
+        &self,
+        target_arn: &str,
+        command_arn: &str,
+        parameters: Option<&Value>,
+    ) -> (u16, Value) {
+        let mut request = json!({"targetArn": target_arn, "commandArn": command_arn});
+        if let Some(parameters) = parameters {
+            request["parameters"] = parameters.clone();
+        }
+        self.call("POST", "/command-executions", Some(request)).await
     }
 
     async fn pending(&self, thing_name: &str) -> (u16, Value) {
@@ -139,7 +156,12 @@ async fn an_execution_starts_only_for_a_command_that_exists() {
         "arn:aws:iot:us-east-1:111122223333:command/reboot",
         "arn:aws-cn:iot:cn-north-1:444455556666:command/install_firmware",
     ];
-    let emulator = Emulator::with_commands(REGISTERED);
+    let emulator = Emulator::with_commands(
+        &REGISTERED
+            .iter()
+            .map(|command_arn| (*command_arn, CommandFacts::default()))
+            .collect::<Vec<(&str, CommandFacts)>>(),
+    );
 
     // (case, thing, commandArn, exists)
     let rows: [(&str, &str, &str, bool); 6] = [
@@ -263,7 +285,7 @@ async fn an_execution_starts_only_for_a_command_that_exists() {
 #[tokio::test]
 async fn an_unsupported_target_is_read_back_in_the_refusal() {
     const COMMAND_ARN: &str = "arn:aws:iot:us-east-1:111122223333:command/reboot";
-    let emulator = Emulator::with_commands(&[COMMAND_ARN]);
+    let emulator = Emulator::with_commands(&[(COMMAND_ARN, CommandFacts::default())]);
 
     // (case, targetArn, how the message must say the value was read)
     let rows: [(&str, &str, &str); 13] = [
@@ -386,7 +408,7 @@ async fn an_unsupported_target_is_read_back_in_the_refusal() {
 #[tokio::test]
 async fn a_missing_execution_reports_the_job_and_the_thing_it_was_asked_for() {
     const COMMAND_ARN: &str = "arn:aws:iot:us-east-1:111122223333:command/reboot";
-    let emulator = Emulator::with_commands(&[COMMAND_ARN]);
+    let emulator = Emulator::with_commands(&[(COMMAND_ARN, CommandFacts::default())]);
 
     // A thing that DOES hold an execution, so a missing job on a known thing is
     // covered as well as one on a thing nobody has ever targeted.
@@ -441,4 +463,202 @@ async fn a_missing_execution_reports_the_job_and_the_thing_it_was_asked_for() {
         status, 200,
         "the seeded execution must still be readable, got {status} {body}"
     );
+}
+
+/// RULE: a start is served only in the form the referenced COMMAND admits. A command
+/// the control plane has DEPRECATED (`iot:UpdateCommand$deprecated`) is no longer one
+/// new executions may be created from, and a command whose payload is STATIC (created
+/// with a literal `payload` and no `payloadTemplate`) has no placeholder a
+/// per-execution parameter could fill, so a start carrying `parameters` against one is
+/// not a request the service can honor. Either is refused 400 `ValidationException`,
+/// and the refusal persists nothing; everything else about the same command is
+/// accepted.
+///
+/// The rows span both facts the shared index carries and both ways a start can be
+/// shaped: which payload kind the command has, whether it has been deprecated, and
+/// whether the start carries parameters (and how many, of which modelled types).
+#[tokio::test]
+async fn a_command_admits_only_the_starts_its_payload_and_lifecycle_allow() {
+    const STATIC: &str = "arn:aws:iot:us-east-1:111122223333:command/static-reboot";
+    const TEMPLATED: &str = "arn:aws:iot:us-east-1:111122223333:command/templated-reboot";
+    const STATIC_DEPRECATED: &str = "arn:aws:iot:us-east-1:111122223333:command/static-retired";
+    const TEMPLATED_DEPRECATED: &str =
+        "arn:aws:iot:us-east-1:111122223333:command/templated-retired";
+
+    let emulator = Emulator::with_commands(&[
+        (
+            STATIC,
+            CommandFacts {
+                static_payload: true,
+                deprecated: false,
+            },
+        ),
+        (TEMPLATED, CommandFacts::default()),
+        (
+            STATIC_DEPRECATED,
+            CommandFacts {
+                static_payload: true,
+                deprecated: true,
+            },
+        ),
+        (
+            TEMPLATED_DEPRECATED,
+            CommandFacts {
+                static_payload: false,
+                deprecated: true,
+            },
+        ),
+    ]);
+
+    /// The refusal a start against a static-payload command carrying parameters gets.
+    const STATIC_PAYLOAD_REFUSAL: &str =
+        "The parameters option is unsupported for commands with static payloads.";
+
+    /// The refusal a start against a DEPRECATED command gets, which names the command
+    /// the request's `commandArn` named.
+    fn deprecated_refusal(command_arn: &str) -> String {
+        format!(
+            "The command {} is deprecated and cannot be used to start new command executions.",
+            command_arn.rsplit('/').next().unwrap_or_default()
+        )
+    }
+
+    /// One start the table makes: which command it names, how it is shaped, and what the
+    /// service answers.
+    struct Row {
+        case: &'static str,
+        thing: &'static str,
+        command_arn: &'static str,
+        /// The `parameters` the start carries, as the request body renders them; empty
+        /// when it carries none. (`CommandExecutionParameterMap` is modelled `len 1..`,
+        /// so an EMPTY map is refused by the constraint before the handler and is not
+        /// one of these rows.)
+        parameters: &'static str,
+        /// Whether the service serves the start; a row it refuses states which refusal.
+        served: bool,
+    }
+
+    let rows: [Row; 8] = [
+        Row {
+            case: "a static-payload command, started with no parameters",
+            thing: "laser-admits-1",
+            command_arn: STATIC,
+            parameters: "",
+            served: true,
+        },
+        Row {
+            case: "a static-payload command, started with one parameter",
+            thing: "laser-admits-2",
+            command_arn: STATIC,
+            parameters: r#"{ "level": { "S": "high" } }"#,
+            served: false,
+        },
+        Row {
+            case: "a static-payload command, started with parameters of several types",
+            thing: "laser-admits-3",
+            command_arn: STATIC,
+            parameters: r#"{ "level": { "S": "high" }, "retries": { "I": 2 }, "dry": { "B": true } }"#,
+            served: false,
+        },
+        Row {
+            case: "a templated command, started with parameters",
+            thing: "laser-admits-4",
+            command_arn: TEMPLATED,
+            parameters: r#"{ "level": { "S": "high" } }"#,
+            served: true,
+        },
+        Row {
+            case: "a templated command, started with none",
+            thing: "laser-admits-5",
+            command_arn: TEMPLATED,
+            parameters: "",
+            served: true,
+        },
+        Row {
+            case: "a deprecated static-payload command",
+            thing: "laser-admits-6",
+            command_arn: STATIC_DEPRECATED,
+            parameters: "",
+            served: false,
+        },
+        Row {
+            case: "a deprecated static-payload command, started with parameters",
+            thing: "laser-admits-7",
+            command_arn: STATIC_DEPRECATED,
+            parameters: r#"{ "level": { "S": "high" } }"#,
+            served: false,
+        },
+        Row {
+            case: "a deprecated templated command",
+            thing: "laser-admits-8",
+            command_arn: TEMPLATED_DEPRECATED,
+            parameters: r#"{ "level": { "S": "high" } }"#,
+            served: false,
+        },
+    ];
+
+    for row in rows {
+        let Row {
+            case,
+            thing,
+            command_arn,
+            parameters,
+            served,
+        } = row;
+        // The DEPRECATION is read first: a deprecated command admits no start at all,
+        // whatever shape it has.
+        let refusal = if served {
+            None
+        } else if [STATIC_DEPRECATED, TEMPLATED_DEPRECATED].contains(&command_arn) {
+            Some(deprecated_refusal(command_arn))
+        } else {
+            Some(STATIC_PAYLOAD_REFUSAL.to_string())
+        };
+        let parameters: Option<Value> = (!parameters.is_empty()).then(|| {
+            serde_json::from_str(parameters)
+                .unwrap_or_else(|why| panic!("case {case:?}: the row's parameters must be JSON: {why}"))
+        });
+        let (status, body) = emulator
+            .start_command_with(&thing_arn(thing), command_arn, parameters.as_ref())
+            .await;
+        let (status, queue) = match &refusal {
+            None => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected the start to be served, got {status} {body}"
+                );
+                assert!(
+                    body["executionId"].as_str().is_some_and(|id| !id.is_empty()),
+                    "case {case:?}: a served start mints an executionId, got {body}"
+                );
+                emulator.pending(thing).await
+            }
+            Some(expected) => {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected the start to be refused 400, got {status} {body}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "ValidationException",
+                    "case {case:?}: expected ValidationException, got {body}"
+                );
+                assert_eq!(
+                    message(&body),
+                    *expected,
+                    "case {case:?}: expected {expected:?}, got {body}"
+                );
+                emulator.pending(thing).await
+            }
+        };
+        assert_eq!(status, 200, "case {case:?}: the queue read must answer 200, got {queue}");
+        // A refusal persists NOTHING, and a served start persists exactly one
+        // execution: the device's queue is the record of which of the two happened.
+        assert_eq!(
+            queue["queuedJobs"].as_array().map(Vec::len),
+            Some(usize::from(refusal.is_none())),
+            "case {case:?}: expected {} queued execution(s), got {queue}",
+            usize::from(refusal.is_none())
+        );
+    }
 }

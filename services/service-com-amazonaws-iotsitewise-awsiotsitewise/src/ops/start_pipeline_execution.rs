@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartPipelineExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartPipelineExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartPipelineExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below records a pipeline execution against the stored
+//! pipeline's current version. It resolves, per compute node and ONCE here, the
+//! DAG order the pipeline's `dependsOn` edges define, the task each node runs,
+//! the fully resolved environment variables (task, then pipeline, then compute
+//! node, then this request's global and per-node overrides, which "take the
+//! highest priority in the environment variable hierarchy") and the fully
+//! resolved mounts (the task's, with this request's per-node overrides merged by
+//! mount name). `DescribePipelineExecution` reports that record. A retry carrying
+//! the `clientToken` of a start that already succeeded for this pipeline replays
+//! that execution's id rather than starting a second one.
+//!
+//! What this does NOT do is run anything: a compute node runs its task's
+//! container image, and this emulator has no container runtime, so the recorded
+//! execution stays `NOT_STARTED` and no node is reported started, succeeded or
+//! failed — a state, a duration or an error for work nothing ran would be
+//! invented rather than observed.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +191,179 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartPipelineExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartPipelineExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartPipelineExecutionError::Modeled(
+                StartPipelineExecutionErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // `clientToken` makes the start idempotent, as the member documents: a
+        // retry with the same token "returns the cached result from the original
+        // successful request without performing the operation again" — so a token
+        // this pipeline has already started an execution with replays that
+        // execution's id rather than starting a second one.
+        let token_key = input
+            .client_token
+            .as_deref()
+            .map(|token| {
+                crate::state::execution_token_key(
+                    &input.workspace_name,
+                    &input.pipeline_name,
+                    token,
+                )
+            });
+        if let Some(started) = token_key
+            .as_ref()
+            .and_then(|key| store.pipeline_execution_tokens.get(key))
+            .filter(|id| store.pipeline_executions.contains_key(*id))
+        {
+            return Ok(StartPipelineExecutionOutput {
+                pipeline_execution_id: started.clone(),
+            });
+        }
+
+        // A pipeline is identified by its workspace and its own name, so the lookup
+        // is scoped to the workspace the request names and an absence there is the
+        // modelled 404.
+        let pipeline = store
+            .pipelines
+            .get(&crate::state::pipeline_key(
+                &input.workspace_name,
+                &input.pipeline_name,
+            ))
+            .ok_or_else(|| not_found(crate::state::RESOURCE_PIPELINE, &input.pipeline_name))?
+            .clone();
+
+        // The store is bounded: a start is the only thing that adds an execution and
+        // nothing evicts one, so past the cap this is a quota refusal, refused before
+        // the per-node resolution below does any work.
+        if store.pipeline_executions.len() >= crate::state::MAX_PIPELINE_EXECUTIONS {
+            return Err(StartPipelineExecutionError::Modeled(
+                StartPipelineExecutionErrorModeled::LimitExceededException(LimitExceededException {
+                    message: format!(
+                        "This emulator holds at most {} pipeline executions.",
+                        crate::state::MAX_PIPELINE_EXECUTIONS
+                    ),
+                }),
+            ));
+        }
+
+        // "Each compute node runs according to the DAG dependency order defined in
+        // the pipeline", so the order is derived from the stored nodes' own
+        // `dependsOn` edges. The execution runs against the pipeline's CURRENT
+        // version, which is the one a read naming no version answers from.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartPipelineExecution"))
+        // Every write that stores `computations` refuses a list that is not a DAG,
+        // so the refusal below is defensive: it keeps this handler total rather than
+        // panicking if some future write ever stores one.
+        let order = crate::state::compute_node_execution_order(&pipeline.current.computations)
+            .map_err(|why| {
+                StartPipelineExecutionError::Modeled(
+                    StartPipelineExecutionErrorModeled::InvalidRequestException(
+                        InvalidRequestException { message: why },
+                    ),
+                )
+            })?;
+
+        let overrides = input.execution_environment_variable_overrides.clone();
+        let global_overrides = overrides.as_ref().and_then(|given| given.global.clone());
+        let node_overrides = overrides
+            .as_ref()
+            .and_then(|given| given.compute_nodes.clone())
+            .unwrap_or_default();
+        let mount_overrides = input
+            .execution_mount_overrides
+            .as_ref()
+            .map(|given| given.compute_nodes.clone())
+            .unwrap_or_default();
+
+        let mut compute_nodes = Vec::with_capacity(order.len());
+        for at in order {
+            let node = &pipeline.current.computations[at];
+            let task = store
+                .tasks
+                .get(&crate::state::task_key(
+                    &pipeline.workspace_name,
+                    &node.task_name,
+                ))
+                .ok_or_else(|| not_found(crate::state::RESOURCE_TASK, &node.task_name))?;
+            compute_nodes.push(crate::state::ComputeNodeExecutionRecord {
+                compute_node_name: node.compute_node_name.clone(),
+                task_name: task.name.clone(),
+                task_arn: task.arn.clone(),
+                task_version: task.version_label(),
+                depends_on: node.depends_on.clone().unwrap_or_default(),
+                state: crate::state::EXECUTION_STATE_NOT_STARTED.to_string(),
+                environment_variables: crate::state::resolved_environment_variables(&[
+                    task.environment_variables(),
+                    pipeline.current.environment_variables.as_ref(),
+                    node.environment_variables.as_ref(),
+                    global_overrides.as_ref(),
+                    node_overrides.get(&node.compute_node_name),
+                ]),
+                mounts: crate::state::resolved_mounts(
+                    task.mounts(),
+                    mount_overrides
+                        .get(&node.compute_node_name)
+                        .map(Vec::as_slice),
+                ),
+                // Nothing ran, so neither instant is known.
+                start_time: None,
+                end_time: None,
+            });
+        }
+
+        let id = loop {
+            let candidate = crate::state::new_id();
+            if !store.pipeline_executions.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+
+        let record = crate::state::PipelineExecutionRecord {
+            id: id.clone(),
+            workspace_name: pipeline.workspace_name.clone(),
+            pipeline_name: pipeline.name.clone(),
+            pipeline_version: pipeline.version_label(),
+            state: crate::state::EXECUTION_STATE_NOT_STARTED.to_string(),
+            execution_priority: input
+                .execution_priority
+                .unwrap_or(crate::state::DEFAULT_EXECUTION_PRIORITY),
+            request_environment_variables: overrides.unwrap_or_default(),
+            request_mount_overrides: input.execution_mount_overrides.clone(),
+            accepted_at: now,
+            // Nothing ran, so neither instant is known.
+            start_time: None,
+            end_time: None,
+            compute_nodes,
+            client_token: input.client_token.clone(),
+        };
+
+        if let Some(key) = token_key {
+            store.pipeline_execution_tokens.insert(key, id.clone());
+        }
+        store.pipeline_executions.insert(id.clone(), record);
+
+        Ok(StartPipelineExecutionOutput {
+            pipeline_execution_id: id,
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the resource kind the request
+/// addressed and the identifier it supplied.
+fn not_found(resource: &str, requested: &str) -> StartPipelineExecutionError {
+    StartPipelineExecutionError::Modeled(
+        StartPipelineExecutionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message: crate::state::not_found_message(resource, requested),
+        }),
+    )
 }

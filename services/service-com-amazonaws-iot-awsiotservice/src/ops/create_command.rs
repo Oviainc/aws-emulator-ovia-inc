@@ -7,6 +7,10 @@
 //! SHARED command index (`service_common::iot_commands`) that the IoT Jobs data
 //! plane's `StartCommandExecution` resolves a `commandArn` against — so a command
 //! created here is a command an execution may be started for, and nothing else is.
+//! The index entry carries the facts the data plane decides on as well
+//! ([`service_common::iot_commands::CommandFacts`]): whether this create made a
+//! STATIC-payload command, which is what says whether an execution of it may carry
+//! per-execution `parameters` at all.
 //!
 //! ## Shape of an operation
 //!
@@ -100,6 +104,30 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::iot_commands::CommandFacts;
+
+/// The facts about the command this request creates that readers OUTSIDE the control
+/// plane decide on, as the shared index records them.
+///
+/// A command's payload is static when the request supplies the literal `payload` —
+/// "The payload object for the STATIC command" — and no `payloadTemplate`, which is
+/// "the payload template for the DYNAMIC command [...] where the command execution
+/// placeholders are supplied either from mandatoryParameters or when
+/// StartCommandExecution is invoked". A command with a template, or with
+/// `mandatoryParameters` a start has to fill in, is therefore NOT static: those are
+/// the commands whose executions carry parameters.
+///
+/// A created command is never deprecated — `UpdateCommand$deprecated` is what
+/// deprecates one — so the flag the index records here is the one a create has.
+fn command_facts(input: &CreateCommandInput) -> CommandFacts {
+    CommandFacts {
+        static_payload: input.payload.is_some()
+            && input.payload_template.is_none()
+            && input.mandatory_parameters.is_none(),
+        deprecated: false,
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -241,7 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what decides a create at the ceiling: it is refused with the modelled
         // `ServiceQuotaExceededException` (HTTP 402) and nothing is written.
         let mut index = registry.lock();
-        if let Err(refusal) = index.register(&command_arn) {
+        if let Err(refusal) = index.register(&command_arn, command_facts(&input)) {
             return Err(match refusal {
                 crate::state::iot_commands::RegisterRefusal::AlreadyRegistered => {
                     CreateCommandErrorModeled::ConflictException(ConflictException {

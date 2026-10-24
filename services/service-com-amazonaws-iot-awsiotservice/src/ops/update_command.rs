@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCommand
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCommand`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCommand::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! WRITES the command the request names: the members it supplies become the command's
+//! (`displayName`, `description`) and `deprecated` moves its deprecation flag — "update
+//! information about a command or mark a command for deprecation". A member the request
+//! omits is left as it was, so one call changes exactly what it names, and the answer is
+//! built from the record that was just stored, which is what the next `GetCommand`
+//! reads.
+//!
+//! A deprecation is also recorded in the SHARED command index
+//! (`service_common::iot_commands`, [`crate::state::command_registry`]): the IoT Jobs
+//! data plane's `StartCommandExecution` is what has to refuse a new execution of a
+//! deprecated command, and that index is the only thing it can read about a command, so
+//! this write keeps the two planes from disagreeing about which commands new executions
+//! may be created from.
+//!
+//! A `commandId` the store holds no command under is 404 `ResourceNotFoundException`
+//! rather than a 200 that wrote nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +168,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCommand` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCommandErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCommand"))
+        // This operation addresses the command by its id, which is a path label; it
+        // needs no other request metadata.
+        let _ = ctx;
+        let unavailable = |what: &str| -> UpdateCommandError {
+            UpdateCommandErrorModeled::InternalServerException(InternalServerException {
+                message: Some(format!("the IoT emulator has no {what} attached")),
+            })
+            .into()
+        };
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable("state store"));
+        };
+        // A deprecation is read OUTSIDE this crate (the data plane's
+        // `StartCommandExecution`), so it is written to this service's record and to the
+        // shared index, or to neither.
+        let Some(registry) = crate::state::command_registry(&*self.engine) else {
+            return Err(unavailable("command registry"));
+        };
+
+        // LOCK ORDER: this service's store first, the shared index second, the order
+        // `crate::state::command_registry` documents.
+        let mut store = state.lock();
+        let Some(command) = store.commands.get_mut(&input.command_id) else {
+            return Err(UpdateCommandErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Command {} does not exist", input.command_id)),
+                },
+            )
+            .into());
+        };
+
+        // Each member the request carries is written as supplied; one it omits names no
+        // change, which is what makes this a partial update (`PATCH /commands/{id}`)
+        // rather than a replace.
+        if let Some(display_name) = input.display_name {
+            command.display_name = Some(display_name);
+        }
+        if let Some(description) = input.description {
+            command.description = Some(description);
+        }
+        if let Some(deprecated) = input.deprecated {
+            command.deprecated = deprecated;
+        }
+        // "The date and time when the command was last updated": this call is now that
+        // write, whichever members it moved.
+        command.last_updated_at = ::std::time::SystemTime::now();
+
+        // The answer is built from the record that was just stored, so what this call
+        // reports and what the next `GetCommand` reads are one value.
+        let output = UpdateCommandOutput {
+            command_id: Some(command.command_id.clone()),
+            display_name: command.display_name.clone(),
+            description: command.description.clone(),
+            deprecated: Some(command.deprecated),
+            last_updated_at: Some(::aws_smithy_types::DateTime::from(command.last_updated_at)),
+        };
+        let command_arn = command.command_arn.clone();
+        let deprecated = command.deprecated;
+        drop(store);
+
+        registry.lock().set_deprecated(&command_arn, deprecated);
+        Ok(output)
     }
 }
