@@ -410,9 +410,10 @@ fn listing_facet_values(
             .iter()
             .filter_map(|product_id| state.products.get(product_id))
             .map(|product| {
+                let status = product.deployed_on_aws();
                 (
-                    product.deployed_on_aws.clone(),
-                    deployed_on_aws_display_name(&product.deployed_on_aws).to_string(),
+                    status.to_string(),
+                    deployed_on_aws_display_name(status).to_string(),
                 )
             })
             .collect(),

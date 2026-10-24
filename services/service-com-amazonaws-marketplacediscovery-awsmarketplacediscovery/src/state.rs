@@ -136,6 +136,53 @@ pub const FULFILLMENT_OPTION_TYPE_DISPLAY_NAMES: &[(&str, &str)] = &[
     ("SAGEMAKER_MODEL", "SageMaker model"),
 ];
 
+/// The `DeployedOnAwsStatus` each `FulfillmentOptionType` implies for the product it
+/// fulfills.
+///
+/// Source: `GetProductOutput$deployedOnAws` — "Indicates whether the product is deployed on
+/// AWS infrastructure" (`smithy_query(query="shape",shape="GetProductOutput")`) — read
+/// against what each `FulfillmentOption` union member delivers:
+///
+/// * `DEPLOYED` — the option delivers an artifact that RUNS on AWS infrastructure once
+///   fulfilled: a machine image, a CloudFormation stack, a container, a Helm chart, an EKS
+///   add-on, an Image Builder component, a SageMaker algorithm or model package.
+/// * `NOT_DEPLOYED` — the option delivers software the buyer only ACCESSES, hosted by the
+///   seller and deployed on no AWS infrastructure of the buyer's: a SaaS subscription or an
+///   API.
+/// * `NOT_APPLICABLE` — the option delivers no deployable software at all, so deployment
+///   does not apply: a Data Exchange data set or a professional services engagement.
+///
+/// The table is keyed by the model's own enum values
+/// (`smithy_query(query="shape",shape="FulfillmentOptionType")`), so a product's reported
+/// status cannot disagree with the fulfillment it reports.
+pub const FULFILLMENT_DEPLOYMENT_STATUS: &[(&str, &str)] = &[
+    ("AMAZON_MACHINE_IMAGE", "DEPLOYED"),
+    ("API", "NOT_DEPLOYED"),
+    ("CLOUDFORMATION_TEMPLATE", "DEPLOYED"),
+    ("CONTAINER", "DEPLOYED"),
+    ("HELM", "DEPLOYED"),
+    ("EKS_ADD_ON", "DEPLOYED"),
+    ("EC2_IMAGE_BUILDER_COMPONENT", "DEPLOYED"),
+    ("DATA_EXCHANGE", "NOT_APPLICABLE"),
+    ("PROFESSIONAL_SERVICES", "NOT_APPLICABLE"),
+    ("SAAS", "NOT_DEPLOYED"),
+    ("SAGEMAKER_ALGORITHM", "DEPLOYED"),
+    ("SAGEMAKER_MODEL", "DEPLOYED"),
+];
+
+/// The deployment status one fulfillment option type implies, per
+/// [`FULFILLMENT_DEPLOYMENT_STATUS`].
+///
+/// A `FulfillmentOptionType` the model gains later is not classed yet, and a fulfillment
+/// nothing is known about supports no claim that the product runs on AWS — so it reports
+/// `NOT_APPLICABLE` rather than guessing a deployment.
+pub fn deployment_status(option_type: &str) -> &'static str {
+    FULFILLMENT_DEPLOYMENT_STATUS
+        .iter()
+        .find(|(fulfillment, _)| *fulfillment == option_type)
+        .map_or("NOT_APPLICABLE", |(_, status)| *status)
+}
+
 /// The human-readable name of one fulfillment option type, or the type itself when the
 /// model grows a value this table does not name yet.
 pub fn fulfillment_option_display_name(option_type: &str) -> String {
@@ -380,7 +427,6 @@ pub struct Product {
     pub listing_id: String,
     pub text: Localized,
     pub manufacturer: SellerInformation,
-    pub deployed_on_aws: String,
     pub logo_thumbnail_url: String,
     pub categories: Vec<Category>,
     pub highlights: Vec<String>,
@@ -395,6 +441,40 @@ pub struct Product {
 }
 
 impl Product {
+    /// Whether this product is deployed on AWS infrastructure, which is what
+    /// `GetProductOutput$deployedOnAws` reports ("Indicates whether the product is deployed
+    /// on AWS infrastructure").
+    ///
+    /// Derived from the product's OWN fulfillment options rather than stored beside them,
+    /// exactly as its `fulfillmentOptionSummaries` are: whether anything of the product runs
+    /// on AWS infrastructure is decided by how the product is delivered
+    /// ([`deployment_status`]), so a stored value could claim a deployment the product's
+    /// fulfillment contradicts — a SaaS product the seller hosts reporting that deployment
+    /// does not apply to it, say.
+    ///
+    /// A product fulfilled several ways reports the strongest claim its options support:
+    /// `DEPLOYED` when any option deploys it onto AWS, else `NOT_DEPLOYED` when any option
+    /// delivers software the buyer does not deploy, else `NOT_APPLICABLE`. A product with no
+    /// fulfillment option at all deploys nothing, so deployment does not apply to it.
+    pub fn deployed_on_aws(&self) -> &'static str {
+        let mut deployed = false;
+        let mut not_deployed = false;
+        for record in &self.fulfillment_options {
+            match deployment_status(record.option_type()) {
+                "DEPLOYED" => deployed = true,
+                "NOT_DEPLOYED" => not_deployed = true,
+                _ => {}
+            }
+        }
+        if deployed {
+            "DEPLOYED"
+        } else if not_deployed {
+            "NOT_DEPLOYED"
+        } else {
+            "NOT_APPLICABLE"
+        }
+    }
+
     /// This product's fulfillment options in `locale`, ordered by `fulfillmentOptionId`
     /// so every page of `ListFulfillmentOptions` is cut from one stable total order.
     pub fn fulfillment_options(&self, locale: &str) -> Vec<FulfillmentOption> {
@@ -611,7 +691,7 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
         });
         let deployed_on_aws = products
             .iter()
-            .any(|product| product.deployed_on_aws == "DEPLOYED");
+            .any(|product| product.deployed_on_aws() == "DEPLOYED");
         let multi_product = listing.product_ids.len() > 1;
         let free_trial = listing.offer_ids.iter().any(|offer_id| {
             self.offer_terms.get(offer_id).is_some_and(|terms| {
@@ -1308,7 +1388,9 @@ pub fn matches_every_search_filter(
                 state
                     .products
                     .get(product_id)
-                    .is_some_and(|product| values.contains(&product.deployed_on_aws))
+                    .is_some_and(|product| {
+                        values.iter().any(|value| value == product.deployed_on_aws())
+                    })
             }),
             "NUMBER_OF_PRODUCTS" => {
                 let products = listing.product_ids.len();
@@ -1386,9 +1468,13 @@ fn rating_bound(filter_type: &str, values: &[String]) -> Result<f64, String> {
 ///
 /// Source: the AWS Marketplace browse taxonomy — its top-level categories (Infrastructure
 /// Software, Business Applications, Data Products, Machine Learning, DevOps, IoT,
-/// Professional Services, Industries) and the subcategories published under each of them.
-/// The ids are this catalog's own slugs; the nesting and the display names are the
-/// taxonomy's.
+/// Professional Services, Industries), the subcategories published under each of them, and
+/// the sub-subcategories published under some of those (Data Analytics' Data Integration,
+/// Data Preparation and Data Visualization; Financial Services Data's Market Data and
+/// Reference Data). The ids are this catalog's own slugs; the nesting and the display names
+/// are the taxonomy's. The tree is three levels deep, so a record classified at a leaf
+/// carries a three-category path and a `CATEGORY` facet value can report a parent that
+/// itself has one.
 pub const CATEGORY_TAXONOMY: &[(&str, &str, Option<&str>)] = &[
     // Infrastructure Software and its subcategories.
     ("infrastructure-software", "Infrastructure Software", None),
@@ -1398,6 +1484,27 @@ pub const CATEGORY_TAXONOMY: &[(&str, &str, Option<&str>)] = &[
         Some("infrastructure-software"),
     ),
     ("storage", "Storage", Some("infrastructure-software")),
+    (
+        "data-analytics",
+        "Data Analytics",
+        Some("infrastructure-software"),
+    ),
+    // Data Analytics' own subcategories: the taxonomy's third level.
+    (
+        "data-integration",
+        "Data Integration",
+        Some("data-analytics"),
+    ),
+    (
+        "data-preparation",
+        "Data Preparation",
+        Some("data-analytics"),
+    ),
+    (
+        "data-visualization",
+        "Data Visualization",
+        Some("data-analytics"),
+    ),
     (
         "network-infrastructure",
         "Network Infrastructure",
@@ -1440,6 +1547,18 @@ pub const CATEGORY_TAXONOMY: &[(&str, &str, Option<&str>)] = &[
         "financial-services-data",
         "Financial Services Data",
         Some("data-products"),
+    ),
+    // Financial Services Data's own subcategories: the taxonomy's third level again, under
+    // a different top-level category.
+    (
+        "market-data",
+        "Market Data",
+        Some("financial-services-data"),
+    ),
+    (
+        "reference-data",
+        "Reference Data",
+        Some("financial-services-data"),
     ),
     (
         "healthcare-life-sciences-data",
@@ -1986,19 +2105,48 @@ fn text(name: &str, short_description: &str, long_description: &str) -> Localize
     }
 }
 
-fn support_resources(support_email: &str, docs_url: &str) -> Vec<Resource> {
+/// The resources a record carries: how to reach its manufacturer, and how to use it.
+///
+/// `ResourceType` declares exactly two kinds — `MANUFACTURER_SUPPORT` and
+/// `MANUFACTURER_INSTRUCTIONS` — and `ResourceContentType` four formats — `EMAIL`,
+/// `PHONE_NUMBER`, `LINK` and `OTHER` — `Resource$contentType` being "[t]he format of the
+/// resource content, such as a URL, email address, or text"
+/// (`smithy_query(query="shape",shape="Resource")`). A record therefore carries one resource
+/// per kind of contact and instruction the catalog holds for it, and between them the four
+/// span every format the model declares: a client that branches on `contentType` to dial a
+/// number or to render text rather than follow a link has a record to read, which it has not
+/// when a catalog only ever emits an address and a link.
+///
+/// The telephone numbers the callers pass are in the `555-01xx` range reserved for
+/// fictional use.
+fn support_resources(support_email: &str, support_phone: &str, docs_url: &str) -> Vec<Resource> {
     vec![
         Resource {
             resource_type: "MANUFACTURER_SUPPORT".to_string(),
             content_type: "EMAIL".to_string(),
             value: support_email.to_string(),
-            display_name: Some("Support".to_string()),
+            display_name: Some("Support email".to_string()),
+        },
+        Resource {
+            resource_type: "MANUFACTURER_SUPPORT".to_string(),
+            content_type: "PHONE_NUMBER".to_string(),
+            value: support_phone.to_string(),
+            display_name: Some("Support telephone".to_string()),
         },
         Resource {
             resource_type: "MANUFACTURER_INSTRUCTIONS".to_string(),
             content_type: "LINK".to_string(),
             value: docs_url.to_string(),
             display_name: Some("Documentation".to_string()),
+        },
+        Resource {
+            resource_type: "MANUFACTURER_INSTRUCTIONS".to_string(),
+            content_type: "OTHER".to_string(),
+            value: format!(
+                "Subscribe, then follow the getting-started steps of the documentation at \
+                 {docs_url}."
+            ),
+            display_name: Some("Getting started".to_string()),
         },
     ]
 }
@@ -2218,6 +2366,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             )],
             resources: support_resources(
                 "support@example.com",
+                "+1-206-555-0101",
                 "https://example.com/docs/acme-analytics",
             ),
             seller_engagements: engagements("https://example.com/acme/contact"),
@@ -2253,7 +2402,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             listing_id: "l-0001-analytics".to_string(),
             text: analytics_product_text,
             manufacturer: acme.clone(),
-            deployed_on_aws: "NOT_APPLICABLE".to_string(),
             logo_thumbnail_url: "https://example.com/logos/acme-analytics.png".to_string(),
             categories: classified_under(&["business-applications"]),
             highlights: vec!["Hosted by the seller".to_string()],
@@ -2264,6 +2412,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             )],
             resources: support_resources(
                 "support@example.com",
+                "+1-206-555-0101",
                 "https://example.com/docs/acme-analytics",
             ),
             seller_engagements: engagements("https://example.com/acme/contact"),
@@ -2419,6 +2568,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             promotional_media: Vec::new(),
             resources: support_resources(
                 "help@example.com",
+                "+1-206-555-0102",
                 "https://example.com/docs/nimbus-firewall",
             ),
             seller_engagements: engagements("https://example.com/nimbus/contact"),
@@ -2445,13 +2595,13 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 translations: BTreeMap::new(),
             },
             manufacturer: nimbus.clone(),
-            deployed_on_aws: "DEPLOYED".to_string(),
             logo_thumbnail_url: "https://example.com/logos/nimbus-firewall.png".to_string(),
             categories: classified_under(&["network-infrastructure"]),
             highlights: vec!["Runs in your account".to_string()],
             promotional_media: Vec::new(),
             resources: support_resources(
                 "help@example.com",
+                "+1-206-555-0102",
                 "https://example.com/docs/nimbus-firewall",
             ),
             seller_engagements: engagements("https://example.com/nimbus/contact"),
@@ -2537,6 +2687,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             promotional_media: Vec::new(),
             resources: support_resources(
                 "data@example.com",
+                "+1-206-555-0103",
                 "https://example.com/docs/orion-feed",
             ),
             seller_engagements: engagements("https://example.com/orion/contact"),
@@ -2563,12 +2714,15 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 translations: BTreeMap::new(),
             },
             manufacturer: orion.clone(),
-            deployed_on_aws: "NOT_APPLICABLE".to_string(),
             logo_thumbnail_url: "https://example.com/logos/orion-feed.png".to_string(),
             categories: classified_under(&["data-products"]),
             highlights: vec!["Parquet and CSV".to_string()],
             promotional_media: Vec::new(),
-            resources: support_resources("data@example.com", "https://example.com/docs/orion-feed"),
+            resources: support_resources(
+                "data@example.com",
+                "+1-206-555-0103",
+                "https://example.com/docs/orion-feed",
+            ),
             seller_engagements: engagements("https://example.com/orion/contact"),
             fulfillment_options: vec![data_exchange_option(
                 "fo-0006-datafeed-dataset",
@@ -2651,7 +2805,11 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                     "https://example.com/media/zephyr/walkthrough",
                 ),
             ],
-            resources: support_resources("ml@example.com", "https://example.com/docs/zephyr"),
+            resources: support_resources(
+                "ml@example.com",
+                "+1-206-555-0104",
+                "https://example.com/docs/zephyr",
+            ),
             seller_engagements: engagements("https://example.com/zephyr/contact"),
             use_cases: vec![
                 use_case(
@@ -2683,7 +2841,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 translations: BTreeMap::new(),
             },
             manufacturer: zephyr.clone(),
-            deployed_on_aws: "DEPLOYED".to_string(),
             logo_thumbnail_url: "https://example.com/logos/zephyr-mlkit.png".to_string(),
             categories: classified_under(&["machine-learning"]),
             highlights: vec!["GPU and CPU variants".to_string()],
@@ -2691,7 +2848,11 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 "Vision models in SageMaker",
                 "https://example.com/media/zephyr/vision",
             )],
-            resources: support_resources("ml@example.com", "https://example.com/docs/zephyr"),
+            resources: support_resources(
+                "ml@example.com",
+                "+1-206-555-0104",
+                "https://example.com/docs/zephyr",
+            ),
             seller_engagements: engagements("https://example.com/zephyr/contact"),
             fulfillment_options: vec![
                 sagemaker_model_option(
@@ -2724,12 +2885,15 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 translations: BTreeMap::new(),
             },
             manufacturer: zephyr.clone(),
-            deployed_on_aws: "DEPLOYED".to_string(),
             logo_thumbnail_url: "https://example.com/logos/zephyr-mlkit.png".to_string(),
             categories: classified_under(&["machine-learning"]),
             highlights: vec!["Runs on EKS or ECS".to_string()],
             promotional_media: Vec::new(),
-            resources: support_resources("ml@example.com", "https://example.com/docs/zephyr"),
+            resources: support_resources(
+                "ml@example.com",
+                "+1-206-555-0104",
+                "https://example.com/docs/zephyr",
+            ),
             seller_engagements: engagements("https://example.com/zephyr/contact"),
             fulfillment_options: vec![container_option(
                 "fo-0009-mlkit-nlp-container",
@@ -2793,7 +2957,11 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             offer_ids: vec!["o-0006-devtools-byol".to_string()],
             publisher: helios.clone(),
             promotional_media: Vec::new(),
-            resources: support_resources("dev@example.com", "https://example.com/docs/helios"),
+            resources: support_resources(
+                "dev@example.com",
+                "+1-206-555-0105",
+                "https://example.com/docs/helios",
+            ),
             seller_engagements: engagements("https://example.com/helios/contact"),
             use_cases: vec![use_case(
                 "release-automation",
@@ -2818,12 +2986,15 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 translations: BTreeMap::new(),
             },
             manufacturer: helios.clone(),
-            deployed_on_aws: "NOT_DEPLOYED".to_string(),
             logo_thumbnail_url: "https://example.com/logos/helios-devops.png".to_string(),
             categories: classified_under(&["devops"]),
             highlights: vec!["Self hosted".to_string()],
             promotional_media: Vec::new(),
-            resources: support_resources("dev@example.com", "https://example.com/docs/helios"),
+            resources: support_resources(
+                "dev@example.com",
+                "+1-206-555-0105",
+                "https://example.com/docs/helios",
+            ),
             seller_engagements: engagements("https://example.com/helios/contact"),
             fulfillment_options: vec![
                 helm_option(
@@ -2899,7 +3070,11 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             offer_ids: vec!["o-0007-backup-contract".to_string()],
             publisher: vertex.clone(),
             promotional_media: Vec::new(),
-            resources: support_resources("backup@example.com", "https://example.com/docs/vertex"),
+            resources: support_resources(
+                "backup@example.com",
+                "+1-206-555-0106",
+                "https://example.com/docs/vertex",
+            ),
             seller_engagements: engagements("https://example.com/vertex/contact"),
             use_cases: vec![use_case(
                 "backup-reporting",
@@ -2924,12 +3099,15 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 translations: BTreeMap::new(),
             },
             manufacturer: vertex.clone(),
-            deployed_on_aws: "NOT_APPLICABLE".to_string(),
             logo_thumbnail_url: "https://example.com/logos/vertex-backup.png".to_string(),
             categories: classified_under(&["storage"]),
             highlights: vec!["Read-only access".to_string()],
             promotional_media: Vec::new(),
-            resources: support_resources("backup@example.com", "https://example.com/docs/vertex"),
+            resources: support_resources(
+                "backup@example.com",
+                "+1-206-555-0106",
+                "https://example.com/docs/vertex",
+            ),
             seller_engagements: engagements("https://example.com/vertex/contact"),
             fulfillment_options: vec![
                 saas_option(
@@ -3004,196 +3182,193 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
 ///   type the model declares has to be reachable from some product — otherwise a client
 ///   following one fulfillment path finds no product that takes it.
 /// * The category taxonomy is a tree ([`CATEGORY_TAXONOMY`]), so listings have to sit at its
-///   subcategories for a `CATEGORY` facet value to have a `parent` to report.
+///   subcategories — at every level of them — for a `CATEGORY` facet value to have a
+///   `parent` to report, and for a parent to have one of its own.
 struct BreadthRow {
     /// The slug every id of this row's records is built from.
     slug: &'static str,
     name: &'static str,
     short_description: &'static str,
-    /// The taxonomy category the listing is classified under; its ancestors come with it
-    /// through [`classified_under`].
-    category: &'static str,
-    /// The `FulfillmentOptionType` its single product is fulfilled through.
+    /// The taxonomy categories the listing is classified under; each one's ancestors come
+    /// with it through [`classified_under`]. A record may sit at more than one category
+    /// (`CategoryList` holds up to 30), and then carries every one of their paths.
+    categories: &'static [&'static str],
+    /// The `FulfillmentOptionType` its single product is fulfilled through, which also
+    /// decides the product's `deployedOnAws` ([`Product::deployed_on_aws`]).
     fulfillment: &'static str,
-    /// `Product$deployedOnAws`: `DEPLOYED` when the buyer runs it in their own AWS account,
-    /// `NOT_DEPLOYED` when it is deployable but not deployed yet, and `NOT_APPLICABLE` when
-    /// the seller hosts it.
-    deployed_on_aws: &'static str,
 }
 
 /// The catalog's breadth rows, one listing each.
 ///
-/// The set spans every top-level category of [`CATEGORY_TAXONOMY`], every
-/// `FulfillmentOptionType` the model declares and all three `DeployedOnAwsStatus` values;
-/// the records themselves are this emulator's own seed data.
+/// The set spans every top-level category of [`CATEGORY_TAXONOMY`], categories at each of
+/// its three levels, every `FulfillmentOptionType` the model declares and — through the
+/// deployment each fulfillment implies — all three `DeployedOnAwsStatus` values; the records
+/// themselves are this emulator's own seed data.
 const BREADTH_ROWS: &[BreadthRow] = &[
     BreadthRow {
         slug: "aurora-linux-hardened",
         name: "Aurora Hardened Linux",
         short_description: "Hardened Linux images with CIS benchmark profiles applied.",
-        category: "operating-systems",
+        categories: &["operating-systems"],
         fulfillment: "AMAZON_MACHINE_IMAGE",
-        deployed_on_aws: "DEPLOYED",
     },
     BreadthRow {
         slug: "borealis-market-data",
         name: "Borealis Market Data Feed",
         short_description: "End-of-day and intraday reference prices for listed equities.",
-        category: "financial-services-data",
+        // Two leaves of one subtree: the listing carries both paths, so its categories run
+        // three levels deep and name two sibling subcategories.
+        categories: &["market-data", "reference-data"],
         fulfillment: "DATA_EXCHANGE",
-        deployed_on_aws: "NOT_APPLICABLE",
     },
     BreadthRow {
         slug: "cirrus-waf",
         name: "Cirrus Web Application Firewall",
         short_description: "Managed web application firewall rules for edge and VPC traffic.",
-        category: "security",
+        categories: &["security"],
         fulfillment: "CLOUDFORMATION_TEMPLATE",
-        deployed_on_aws: "DEPLOYED",
     },
     BreadthRow {
         slug: "delta-vision-labeler",
         name: "Delta Vision Labeler",
         short_description: "Image classification models for industrial inspection.",
-        category: "computer-vision",
+        categories: &["computer-vision"],
         fulfillment: "SAGEMAKER_MODEL",
-        deployed_on_aws: "NOT_DEPLOYED",
     },
     BreadthRow {
         slug: "equinox-fleet-telemetry",
         name: "Equinox Fleet Telemetry",
         short_description: "Telemetry ingestion and alerting for connected equipment.",
-        category: "iot-analytics",
+        categories: &["iot-analytics"],
         fulfillment: "SAAS",
-        deployed_on_aws: "NOT_APPLICABLE",
     },
     BreadthRow {
         slug: "aurora-object-vault",
         name: "Aurora Object Vault",
         short_description: "Immutable object storage with compliance retention.",
-        category: "storage",
+        categories: &["storage"],
         fulfillment: "CONTAINER",
-        deployed_on_aws: "DEPLOYED",
     },
     BreadthRow {
         slug: "borealis-health-atlas",
         name: "Borealis Health Atlas",
         short_description: "De-identified claims and prescription records for research.",
-        category: "healthcare-life-sciences-data",
+        categories: &["healthcare-life-sciences-data"],
         fulfillment: "DATA_EXCHANGE",
-        deployed_on_aws: "NOT_APPLICABLE",
     },
     BreadthRow {
         slug: "cirrus-secrets-broker",
         name: "Cirrus Secrets Broker",
         short_description: "Short-lived credential brokering for cluster workloads.",
-        category: "security",
+        categories: &["security"],
         fulfillment: "HELM",
-        deployed_on_aws: "DEPLOYED",
     },
     BreadthRow {
         slug: "delta-speech-studio",
         name: "Delta Speech Studio",
         short_description: "Speech transcription and diarisation for contact centres.",
-        category: "speech-recognition",
+        categories: &["speech-recognition"],
         fulfillment: "SAGEMAKER_ALGORITHM",
-        deployed_on_aws: "NOT_DEPLOYED",
     },
     BreadthRow {
         slug: "equinox-grid-forecast",
         name: "Equinox Grid Forecast",
         short_description: "Load and generation forecasting for energy networks.",
-        category: "energy",
+        categories: &["energy"],
         fulfillment: "API",
-        deployed_on_aws: "NOT_APPLICABLE",
     },
     BreadthRow {
         slug: "aurora-build-cache",
         name: "Aurora Build Cache",
         short_description: "Distributed build caching for large monorepos.",
-        category: "application-development",
+        categories: &["application-development"],
         fulfillment: "EKS_ADD_ON",
-        deployed_on_aws: "DEPLOYED",
     },
     BreadthRow {
         slug: "borealis-climate-grid",
         name: "Borealis Climate Grid",
         short_description: "Gridded climate observations and reanalysis series.",
-        category: "environmental-data",
+        categories: &["environmental-data"],
         fulfillment: "DATA_EXCHANGE",
-        deployed_on_aws: "NOT_APPLICABLE",
     },
     BreadthRow {
         slug: "cirrus-migration-studio",
         name: "Cirrus Migration Studio",
         short_description: "Assessment and replatforming services for legacy estates.",
-        category: "migration",
+        categories: &["migration"],
         fulfillment: "PROFESSIONAL_SERVICES",
-        deployed_on_aws: "NOT_APPLICABLE",
     },
     BreadthRow {
         slug: "delta-forms-reader",
         name: "Delta Forms Reader",
         short_description: "Document understanding for structured and semi-structured forms.",
-        category: "natural-language-processing",
+        categories: &["natural-language-processing"],
         fulfillment: "SAGEMAKER_MODEL",
-        deployed_on_aws: "NOT_DEPLOYED",
     },
     BreadthRow {
         slug: "equinox-retail-planner",
         name: "Equinox Retail Planner",
         short_description: "Assortment and replenishment planning for retailers.",
-        category: "retail",
+        categories: &["retail"],
         fulfillment: "SAAS",
-        deployed_on_aws: "NOT_APPLICABLE",
     },
     BreadthRow {
         slug: "aurora-golden-images",
         name: "Aurora Golden Images",
         short_description: "Image pipeline components for compliant base images.",
-        category: "infrastructure-as-code",
+        categories: &["infrastructure-as-code"],
         fulfillment: "EC2_IMAGE_BUILDER_COMPONENT",
-        deployed_on_aws: "DEPLOYED",
     },
     BreadthRow {
         slug: "borealis-spectrum-usage",
         name: "Borealis Spectrum Usage",
         short_description: "Mobile network coverage and spectrum usage records.",
-        category: "telecommunications-data",
+        categories: &["telecommunications-data"],
         fulfillment: "DATA_EXCHANGE",
-        deployed_on_aws: "NOT_APPLICABLE",
     },
     BreadthRow {
         slug: "cirrus-observability",
         name: "Cirrus Observability Stack",
         short_description: "Metrics, traces and log correlation for microservices.",
-        category: "monitoring",
+        categories: &["monitoring"],
         fulfillment: "HELM",
-        deployed_on_aws: "DEPLOYED",
     },
     BreadthRow {
         slug: "delta-crm-sync",
         name: "Delta CRM Sync",
         short_description: "Two-way synchronisation between CRM and billing systems.",
-        category: "crm",
+        categories: &["crm"],
         fulfillment: "SAAS",
-        deployed_on_aws: "NOT_APPLICABLE",
     },
     BreadthRow {
         slug: "equinox-hpc-solver",
         name: "Equinox HPC Solver",
         short_description: "Finite element solver for structural simulation.",
-        category: "high-performance-computing",
+        categories: &["high-performance-computing"],
         fulfillment: "AMAZON_MACHINE_IMAGE",
-        deployed_on_aws: "DEPLOYED",
     },
     BreadthRow {
         slug: "aurora-training-labs",
         name: "Aurora Training Labs",
         short_description: "Instructor-led enablement for platform engineering teams.",
-        category: "training",
+        categories: &["training"],
         fulfillment: "PROFESSIONAL_SERVICES",
-        deployed_on_aws: "NOT_APPLICABLE",
+    },
+    BreadthRow {
+        slug: "borealis-data-prep",
+        name: "Borealis Data Prep Studio",
+        short_description: "Profiling, cleansing and join authoring for analytics data sets.",
+        // Both sibling leaves of Data Analytics, so the listing carries the taxonomy's
+        // deepest path twice over: four categories across three levels.
+        categories: &["data-integration", "data-preparation"],
+        fulfillment: "SAAS",
+    },
+    BreadthRow {
+        slug: "cirrus-query-lens",
+        name: "Cirrus Query Lens",
+        short_description: "Interactive dashboards over warehouse and lakehouse tables.",
+        categories: &["data-visualization"],
+        fulfillment: "CONTAINER",
     },
 ];
 
@@ -3371,10 +3546,14 @@ fn seed_breadth(state: &mut ComAmazonawsMarketplacediscoveryAwsmarketplacediscov
             PRICING_UNIT_DISPLAY_NAMES[index % PRICING_UNIT_DISPLAY_NAMES.len()];
         let (rating, total_reviews) = BREADTH_REVIEWS[index % BREADTH_REVIEWS.len()];
 
-        let categories = classified_under(&[row.category]);
-        let category_name = categories
-            .last()
-            .map_or_else(String::new, |category| category.display_name.clone());
+        let categories = classified_under(row.categories);
+        // The row's own deepest category, which is the one its prose names: the expanded
+        // list also holds the ancestors that came with it.
+        let category_name = row
+            .categories
+            .iter()
+            .next_back()
+            .map_or_else(String::new, |leaf| taxonomy_category(leaf).display_name);
         let fulfillment_name = fulfillment_option_display_name(row.fulfillment);
         let long_description = format!(
             "{} {} is listed under {category_name} and fulfilled as {fulfillment_name}.",
@@ -3387,6 +3566,11 @@ fn seed_breadth(state: &mut ComAmazonawsMarketplacediscoveryAwsmarketplacediscov
         let logo = format!("https://example.com/logos/{slug}.png");
         let docs = format!("https://example.com/docs/{slug}");
         let support_email = format!("support@{slug}.example.com");
+        // A telephone number in the `555-01xx` range reserved for fictional use, one per
+        // row and clear of the numbers the records above take, so the `PHONE_NUMBER`
+        // resource of two rows is never the same number. BREADTH_ROWS is far shorter than
+        // the 90 numbers left in the range.
+        let support_phone = format!("+1-206-555-{:04}", 110 + index);
         let contact = format!("https://example.com/{slug}/contact");
 
         // A badge is not seeded: `listing_badges` derives each one from the records it
@@ -3414,7 +3598,7 @@ fn seed_breadth(state: &mut ComAmazonawsMarketplacediscoveryAwsmarketplacediscov
                     &format!("https://example.com/media/{slug}/overview.png"),
                     row.short_description,
                 )],
-                resources: support_resources(&support_email, &docs),
+                resources: support_resources(&support_email, &support_phone, &docs),
                 seller_engagements: engagements(&contact),
                 use_cases: vec![use_case(
                     slug,
@@ -3435,12 +3619,11 @@ fn seed_breadth(state: &mut ComAmazonawsMarketplacediscoveryAwsmarketplacediscov
                 listing_id: listing_id.clone(),
                 text: listing_text,
                 manufacturer: publisher.clone(),
-                deployed_on_aws: row.deployed_on_aws.to_string(),
                 logo_thumbnail_url: logo,
                 categories,
                 highlights: vec![format!("Fulfilled as {fulfillment_name}")],
                 promotional_media: Vec::new(),
-                resources: support_resources(&support_email, &docs),
+                resources: support_resources(&support_email, &support_phone, &docs),
                 seller_engagements: engagements(&contact),
                 fulfillment_options: vec![fulfillment_option_for_type(
                     row.fulfillment,
