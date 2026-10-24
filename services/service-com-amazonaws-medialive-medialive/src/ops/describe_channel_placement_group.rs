@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeChannelPlacementGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeChannelPlacementGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeChannelPlacementGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Get details about a ChannelPlacementGroup" — a REPORTING operation: it reads
+//! the group the request's `ClusterId` and `ChannelPlacementGroupId` name out of
+//! the channel placement group slice of this service's state
+//! (`crate::state::channel_placement_groups`) and writes nothing of its own. The
+//! only write on this path is `settle`, which materialises the transitions the
+//! CLOCK had already made due — a group's `ASSIGNING` -> `ASSIGNED` step — and so
+//! never changes what a later caller would otherwise have seen.
 //!
 //! ## Shape of an operation
 //!
@@ -160,20 +159,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeChannelPlacementGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeChannelPlacementGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeChannelPlacementGroup"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let mut state = state.lock();
+        // Reporting only: `settle` materialises transitions the clock had already
+        // made due, and the description is then read out of the store.
+        state.settle(::std::time::SystemTime::now());
+
+        // Both path labels name the resource: a group belongs to the cluster it
+        // was created in, so an id that names no group of THIS cluster is this
+        // operation's own modelled 404.
+        let group = state
+            .channel_placement_group_description(&input.cluster_id, &input.channel_placement_group_id)
+            .ok_or_else(|| {
+                DescribeChannelPlacementGroupErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::not_found_message(
+                        "ChannelPlacementGroup",
+                        &input.channel_placement_group_id,
+                    )),
+                })
+            })?;
+
+        Ok(crate::state::channel_placement_group_output!(
+            DescribeChannelPlacementGroupOutput,
+            group
+        ))
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to read the group from. A modelled server error, never a
+/// fresh engine (which would answer from an empty private store).
+fn unavailable() -> DescribeChannelPlacementGroupError {
+    DescribeChannelPlacementGroupErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }
