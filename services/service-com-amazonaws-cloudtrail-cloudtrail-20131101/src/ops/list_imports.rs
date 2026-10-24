@@ -310,7 +310,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             })
         })?;
-        let store = state.lock();
+        let mut store = state.lock();
+
+        // The status an import reads is the one the clock owes it: a job `StartImport`
+        // answered `INITIALIZING` is due to read `IN_PROGRESS` at the instant that
+        // call recorded, whether or not anybody read the import. Materialising those
+        // due transitions here — BEFORE the `ImportStatus` filter selects on status —
+        // is what keeps this listing and a `GetImport` of the same id from reporting
+        // one job in two different statuses. Only the Region this request reports on
+        // is settled: the key carries the Region, and no other Region's record is
+        // reported here.
+        let now = ::std::time::SystemTime::now();
+        for (_, record) in store
+            .imports
+            .iter_mut()
+            .filter(|((_, import_region), _)| import_region == &region)
+        {
+            record.settle(now);
+        }
 
         // The registry is keyed `(import id, Region)` and so iterates id-ordered,
         // which is the order the pages walk: a page resumes AT the key the previous
