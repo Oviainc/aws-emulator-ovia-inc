@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeValidDBInstanceModifications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeValidDBInstanceModifications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the bounds a modification of ONE stored DB instance
+//! has to stay inside — the storage types that instance's engine and DB instance class can
+//! be modified to and the size, provisioned-IOPS and provisioned-throughput ranges of
+//! each, the processor features its class exposes, and whether its engine takes a
+//! dedicated log volume. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeValidDBInstanceModifications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It is a REPORT: it reads the instance out of this service's store (materialising the
+//! transitions the clock already made due, as every report here does) and writes nothing.
+//! The bounds come from the SAME published catalogue `DescribeOrderableDBInstanceOptions`
+//! reports an orderable option from — that operation's storage profiles and instance
+//! classes — so what a caller is told it can modify an instance to cannot disagree with
+//! what it is told it can order. What the INSTANCE's own state decides is how each storage
+//! type's size range is cut: keeping the allocation it already has is one valid
+//! modification, and growing it is another that starts at the minimum increase
+//! `ModifyDBInstance` documents — which is why `StorageSize` is a LIST of ranges.
+//!
+//! Because those bounds are this operation's, so is their ENFORCEMENT: the shared
+//! `check_storage_modification` below is `pub` and `ModifyDBInstance` calls it, rather than
+//! growing a second copy of the same ranges that could drift from what this report
+//! publishes. It is the one cross-operation item here; everything else about
+//! `DescribeValidDBInstanceModifications` stays in this file.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +85,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::ops::describe_db_engine_versions::is_cluster_engine;
+use crate::ops::describe_orderable_db_instance_options::{
+    available_processor_features, instance_class_profile, instance_classes, max_allocated_storage,
+    storage_bounds, storage_profiles, StorageProfile,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,18 +160,520 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeValidDBInstanceModifications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeValidDBInstanceModificationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeValidDBInstanceModifications"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeValidDBInstanceModificationsError::validation)?;
+        // `DBInstanceIdentifier`: "The customer identifier or the ARN of your DB
+        // instance." An ARN names the region it belongs to, and RDS is regional, so an
+        // ARN of another region names nothing addressable here.
+        let named = &input.db_instance_identifier;
+        if crate::state::arn_region(named).is_some_and(|arn_region| arn_region != region) {
+            return Err(not_found(named));
+        }
+        // Identifiers are "stored as a lowercase string", so a named one is matched
+        // folded.
+        let identifier = crate::state::db_instance_identifier_of(named).to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router
+        // builds; 501 is the honest answer, never invented bounds for an instance this
+        // service cannot read.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones owed
+        // at this instant whether or not anybody called.
+        store.settle_due_transitions(&region);
+
+        let Some(instance) = store.db_instances.get(&(region.clone(), identifier.clone())) else {
+            // Worded with the value the CALLER named, as the other-region path above is.
+            return Err(not_found(named));
+        };
+        // "You can use this information when you call ModifyDBInstance" — and an instance
+        // a delete has already been accepted for can take no modification at all, so there
+        // is no set of valid modifications to report for one. The status the clock has yet
+        // to settle is real. An instance that is still coming up, or is already
+        // `modifying`, DOES have valid modifications: its engine and class fix them.
+        if instance.is_deleting() {
+            let status = instance.status.clone();
+            return Err(
+                DescribeValidDBInstanceModificationsErrorModeled::InvalidDBInstanceStateFault(
+                    InvalidDBInstanceStateFault {
+                        message: Some(format!(
+                            "DB instance {identifier} has no valid modifications (status \
+                             {status})"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(DescribeValidDBInstanceModificationsOutput {
+            valid_db_instance_modifications_message: Some(valid_modifications(
+                &instance.engine,
+                &instance.db_instance_class,
+                instance.allocated_storage,
+            )),
+        })
     }
+}
+
+/// The modelled not-found fault for a value that names no instance in the request's
+/// region, worded as this service words it in a report (`DescribeDBInstances` answers
+/// "DBInstance <name> not found." where the mutating operations answer "DB instance not
+/// found: <name>").
+fn not_found(named: &str) -> DescribeValidDBInstanceModificationsError {
+    DescribeValidDBInstanceModificationsErrorModeled::DBInstanceNotFoundFault(
+        DBInstanceNotFoundFault {
+            message: Some(format!("DBInstance {named} not found.")),
+        },
+    )
+    .into()
+}
+
+/// Storage is allocated, and IOPS and throughput are provisioned, in WHOLE units: every
+/// value between a reported range's bounds is valid, which is what a `Range$Step` of 1
+/// says ("The step value for the range. For example, if you have a range of 5,000 to
+/// 10,000, with a step value of 1,000, the valid values start at 5,000 and step up by
+/// 1,000").
+const WHOLE_UNITS: i32 = 1;
+
+/// The engines whose `AllocatedStorage` member documents a MINIMUM INCREASE for a
+/// modification: "For RDS for Db2, MariaDB, RDS for MySQL, RDS for Oracle, and RDS for
+/// PostgreSQL, the value supplied must be at least 10% greater than the current value.
+/// Values that are not at least 10% greater than the existing value are rounded up so
+/// that they are 10% greater than the current value."
+/// (`ModifyDBInstanceMessage$AllocatedStorage`.)
+fn grows_by_at_least_a_tenth(engine: &str) -> bool {
+    engine.starts_with("db2")
+        || engine.contains("oracle")
+        || matches!(engine, "mariadb" | "mysql" | "postgres")
+}
+
+/// The smallest `AllocatedStorage` a modification can GROW an instance currently allocated
+/// `current` GiB to.
+///
+/// Allocated storage only ever grows — RDS has no way to give storage back — so a value
+/// that changes it is above what the instance runs now: a tenth greater, rounded up to the
+/// whole GiB storage is allocated in, for the engines whose `AllocatedStorage` member
+/// documents that minimum increase ([`grows_by_at_least_a_tenth`]), and one GiB more for
+/// the engines it does not.
+///
+/// The increase is a BOUND here, not a rounding step, and that is what the recording says.
+/// `ModifyDBInstanceMessage$AllocatedStorage` adds in prose that a value "not at least 10%
+/// greater than the existing value" is "rounded up" to one that is — but the behavioural
+/// unit this operation was filed from,
+/// `rds.valid-db-instance-modifications-bound-what-modify-accepts`, modifies a 20 GiB
+/// `gp3` RDS for PostgreSQL instance to 21 GiB and records real AWS REJECTING that call
+/// ("real AWS rejects this call, but it SUCCEEDED" is the divergence the emulator answered
+/// with while it rounded 21 up to 22 instead). Recorded behaviour outranks the prose, so a
+/// size in the gap is refused — with the same "Invalid storage size for engine name
+/// <engine> and storage type <type>: <size>" message that same unit pins for a size past
+/// the maximum.
+fn growth_floor(engine: &str, current: i32) -> i32 {
+    if grows_by_at_least_a_tenth(engine) {
+        // `ceil(current * 1.1)`, in integers: `ceil(11 * current / 10)`.
+        let tenth_greater = (i64::from(current) * 11 + 9) / 10;
+        return i32::try_from(tenth_greater).unwrap_or(i32::MAX);
+    }
+    current.saturating_add(WHOLE_UNITS)
+}
+
+/// What a caller can modify a DB instance of `engine`, running DB instance class
+/// `class_name` on `allocated_storage` GiB, to.
+///
+/// Every bound is a property of the instance's ENGINE and CLASS, read from the published
+/// catalogue `DescribeOrderableDBInstanceOptions` orders against: the storage types that
+/// engine can carry, each type's own size, provisioned-IOPS and provisioned-throughput
+/// ranges and ratios, and the processor features the class exposes. The storage SIZES are
+/// cut by what the instance runs now ([`storage_size_ranges`]).
+fn valid_modifications(
+    engine: &str,
+    class_name: &str,
+    allocated_storage: Option<i32>,
+) -> ValidDBInstanceModificationsMessage {
+    let class = instance_class_profile(engine, class_name);
+    let storage: Vec<ValidStorageOptions> = storage_profiles(engine)
+        .iter()
+        .map(|profile| valid_storage_options(engine, profile, allocated_storage))
+        .collect();
+    ValidDBInstanceModificationsMessage {
+        storage: Some(storage),
+        // "Valid processor features for your DB instance": the ones this class exposes,
+        // which is an EMPTY list for a class whose processor is not configurable — the
+        // member is reported either way, so a caller reads "none are configurable" rather
+        // than "this emulator did not say".
+        valid_processor_features: Some(available_processor_features(engine, &class)),
+        // A dedicated log volume is a volume carried WITH the instance, so it is offered
+        // exactly where storage is the instance's rather than its cluster's — the same
+        // rule `DescribeOrderableDBInstanceOptions` reports `SupportsDedicatedLogVolume`
+        // by.
+        supports_dedicated_log_volume: Some(!is_cluster_engine(engine)),
+        // `AdditionalStorage` describes additional storage VOLUMES, which this service
+        // does not model for any instance (`DescribeOrderableDBInstanceOptions` reports
+        // none either); the member is left absent rather than claiming volume options
+        // nothing here can create.
+        additional_storage: None,
+    }
+}
+
+/// Project one storage profile onto the modelled `ValidStorageOptions` wire shape.
+///
+/// A range member is reported only where the type HAS that bound: a type whose IOPS and
+/// throughput follow the volume size rather than being provisioned (`gp2`) carries no
+/// provisioned-IOPS range and no ratio, and storage a CLUSTER manages (`aurora`,
+/// DocumentDB's and Neptune's `standard`) carries no size range and no autoscaling,
+/// because nothing about it is modified on the instance.
+fn valid_storage_options(
+    engine: &str,
+    profile: &StorageProfile,
+    allocated_storage: Option<i32>,
+) -> ValidStorageOptions {
+    // A type's published size range, its maximum capped by what the ENGINE accepts — the
+    // same cap an orderable option's `MaxStorageSize` carries.
+    let size_range = profile
+        .size_range
+        .map(|(min, max)| (min, max.min(max_allocated_storage(engine))));
+    ValidStorageOptions {
+        storage_type: Some(profile.name.to_string()),
+        storage_size: size_range
+            .map(|(min, max)| storage_size_ranges(engine, min, max, allocated_storage)),
+        provisioned_iops: profile.iops.as_ref().map(|iops| {
+            vec![Range {
+                from: Some(iops.min_per_instance),
+                to: Some(iops.max_per_instance),
+                step: Some(WHOLE_UNITS),
+            }]
+        }),
+        iops_to_storage_ratio: profile.iops.as_ref().map(|iops| {
+            vec![DoubleRange {
+                from: Some(iops.min_per_gib),
+                to: Some(iops.max_per_gib),
+            }]
+        }),
+        provisioned_storage_throughput: profile.throughput.as_ref().map(|throughput| {
+            vec![Range {
+                from: Some(throughput.min_per_instance),
+                to: Some(throughput.max_per_instance),
+                step: Some(WHOLE_UNITS),
+            }]
+        }),
+        storage_throughput_to_iops_ratio: profile.throughput.as_ref().map(|throughput| {
+            vec![DoubleRange {
+                from: Some(throughput.min_per_iops),
+                to: Some(throughput.max_per_iops),
+            }]
+        }),
+        // Storage autoscaling raises `AllocatedStorage`, so it applies exactly where
+        // storage is the instance's own.
+        supports_storage_autoscaling: Some(profile.size_range.is_some()),
+    }
+}
+
+/// The storage sizes a modification can set on an instance currently allocated
+/// `allocated_storage` GiB, for a storage type whose published range is `min` to `max`
+/// GiB.
+///
+/// `StorageSize` is a LIST of ranges because a modification has two valid shapes, and they
+/// are not contiguous:
+///
+/// * keeping the allocation the instance already has — one value, so a range from it to
+///   itself;
+/// * growing it, which starts at the minimum increase `ModifyDBInstance` documents
+///   ([`growth_floor`]) and runs to the type's maximum.
+///
+/// A type the instance's current allocation is outside of (converting a 20 GiB volume to
+/// Provisioned IOPS SSD, whose published minimum is 100 GiB) offers only the second: the
+/// current size is not a size that type takes. An instance already at the maximum offers
+/// only the first: there is nothing above it to grow into. An instance with no allocated
+/// storage of its own has nothing to keep and nothing to grow from, so the type's own
+/// range is what there is to report.
+fn storage_size_ranges(
+    engine: &str,
+    min: i32,
+    max: i32,
+    allocated_storage: Option<i32>,
+) -> Vec<Range> {
+    let whole_units = |from: i32, to: i32| Range {
+        from: Some(from),
+        to: Some(to),
+        step: Some(WHOLE_UNITS),
+    };
+    let mut ranges = Vec::new();
+    if let Some(current) = allocated_storage.filter(|current| (min..=max).contains(current)) {
+        ranges.push(whole_units(current, current));
+    }
+    let floor = match allocated_storage {
+        Some(current) => min.max(growth_floor(engine, current)),
+        None => min,
+    };
+    if floor <= max {
+        ranges.push(whole_units(floor, max));
+    }
+    if ranges.is_empty() {
+        // An allocation outside everything this type publishes: the type's own range is
+        // what there is to say about it.
+        ranges.push(whole_units(min, max));
+    }
+    ranges
+}
+
+/// The storage settings one `ModifyDBInstance` request asks an instance to end up with.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestedStorage<'a> {
+    /// The engine the instance runs once the modification is applied.
+    pub engine: &'a str,
+    /// The DB instance class it runs once the modification is applied.
+    pub class_name: &'a str,
+    /// The storage type it carries once the modification is applied.
+    pub storage_type: &'a str,
+    /// What it has allocated NOW, which is what a growth is measured from.
+    pub current_allocated_storage: Option<i32>,
+    /// `AllocatedStorage`, when the request supplies one.
+    pub allocated_storage: Option<i32>,
+    /// `MaxAllocatedStorage`, when the request supplies one.
+    pub max_allocated_storage: Option<i32>,
+    /// `Iops`, when the request supplies one.
+    pub iops: Option<i32>,
+    /// The provisioned IOPS the instance carries NOW, which is what a throughput the
+    /// request supplies alone is in ratio to.
+    pub current_iops: Option<i32>,
+    /// `StorageThroughput`, when the request supplies one.
+    pub storage_throughput: Option<i32>,
+    /// `ProcessorFeatures`, as the `(Name, Value)` pairs the request supplies.
+    pub processor_features: &'a [(Option<String>, Option<String>)],
+    /// `DedicatedLogVolume`, when the request supplies one.
+    pub dedicated_log_volume: Option<bool>,
+    /// Whether the request supplies `AdditionalStorageVolumes`.
+    pub additional_storage_volumes: bool,
+}
+
+/// Refuse a modification the bounds this operation reports exclude.
+///
+/// The bounds this operation publishes are exactly the bounds `ModifyDBInstance` enforces
+/// — "You can use this information when you call `ModifyDBInstance`" is only true if a
+/// value the report excludes is one that call refuses — so the check lives here, beside
+/// the report it reads, and `ModifyDBInstance` calls it. One refusal per reported member:
+///
+/// * `StorageSize`: a size in none of the ranges reported for the type, which covers every
+///   REDUCTION (storage only grows), every size past the maximum, and every growth smaller
+///   than the minimum increase `ModifyDBInstance` documents;
+/// * `ProvisionedIops` / `ProvisionedStorageThroughput` and their ratios: provisioned IOPS
+///   or throughput on a type that takes none, outside the range it publishes, or at a
+///   ratio outside the one it publishes;
+/// * `SupportsStorageAutoscaling`: an autoscaling ceiling on storage the instance does not
+///   own, or one below the storage it already has;
+/// * `ValidProcessorFeatures`: a processor feature on a class that exposes none, a feature
+///   it does not publish, or a value outside the ones it allows;
+/// * `SupportsDedicatedLogVolume`: a dedicated log volume on an engine offered none;
+/// * `AdditionalStorage`: an additional storage volume, which no instance here supports.
+///
+/// A type `StorageType` publishes but this service orders no option for — legacy magnetic
+/// `standard` — is bounded too, by `storage_bounds`: its published size range, and neither
+/// provisioned IOPS nor provisioned throughput, since a magnetic volume's performance is
+/// not configurable.
+pub fn check_storage_modification(requested: RequestedStorage<'_>) -> Result<(), String> {
+    let engine = requested.engine;
+    if requested.additional_storage_volumes {
+        return Err(format!(
+            "AdditionalStorageVolumes can't be specified for a DB instance of engine \
+             {engine}: it supports no additional storage volumes"
+        ));
+    }
+    if requested.dedicated_log_volume == Some(true) && is_cluster_engine(engine) {
+        return Err(format!(
+            "DedicatedLogVolume can't be enabled for a DB instance of engine {engine}: \
+             its storage is managed by its cluster"
+        ));
+    }
+    check_processor_features(engine, requested.class_name, requested.processor_features)?;
+    // Storage the instance does not OWN cannot be modified on it: an engine whose storage
+    // its cluster manages ("This setting doesn't apply to Amazon Aurora DB instances.
+    // Storage is managed by the DB cluster." — `CreateDBInstanceMessage$StorageType`)
+    // reports no `StorageSize` at all, so there is no size for a modification to set.
+    if requested.allocated_storage.is_some()
+        && storage_profiles(engine)
+            .iter()
+            .all(|profile| profile.size_range.is_none())
+    {
+        return Err(format!(
+            "AllocatedStorage can't be specified for a DB instance of engine {engine}: \
+             its storage is managed by its cluster"
+        ));
+    }
+
+    let Some(profile) = storage_bounds(engine, requested.storage_type) else {
+        // A type this engine publishes no value for: refused by the caller's own modelled
+        // `StorageTypeNotSupportedFault`, so there is nothing to bound here.
+        return Ok(());
+    };
+    let storage_type = profile.name;
+
+    let engine_cap = max_allocated_storage(engine);
+    if let (Some((min, max)), Some(asked)) = (profile.size_range, requested.allocated_storage) {
+        // The sizes this operation REPORTS for the instance are the sizes a modification
+        // can set: the allocation it already has, and a growth from the minimum increase
+        // up to the type's maximum. A value in neither — a reduction, a size past the
+        // maximum, or a growth smaller than that increase — is refused.
+        let ranges = storage_size_ranges(
+            engine,
+            min,
+            max.min(engine_cap),
+            requested.current_allocated_storage,
+        );
+        let admitted = ranges.iter().any(|range| {
+            range.from.is_some_and(|from| from <= asked) && range.to.is_some_and(|to| asked <= to)
+        });
+        if !admitted {
+            // RDS's own wording for a size it will not take, built from the request's
+            // engine, storage type and size: "Invalid storage size for engine name
+            // <engine> and storage type <type>: <size>".
+            return Err(format!(
+                "Invalid storage size for engine name {engine} and storage type \
+                 {storage_type}: {asked}"
+            ));
+        }
+    }
+
+    if let Some(ceiling) = requested.max_allocated_storage {
+        if profile.size_range.is_none() {
+            return Err(format!(
+                "MaxAllocatedStorage can't be specified for storage type {storage_type}, \
+                 which Amazon RDS does not scale for this instance"
+            ));
+        }
+        let allocated = requested
+            .allocated_storage
+            .or(requested.current_allocated_storage);
+        if allocated.is_some_and(|allocated| ceiling < allocated) || ceiling > engine_cap {
+            return Err(format!(
+                "Invalid max storage size for engine name {engine} and storage type \
+                 {storage_type}: {ceiling}"
+            ));
+        }
+    }
+
+    if let Some(iops) = requested.iops {
+        let Some(bounds) = &profile.iops else {
+            return Err(format!(
+                "Iops can't be specified for storage type {storage_type}, whose IOPS \
+                 follow the volume size"
+            ));
+        };
+        if !(bounds.min_per_instance..=bounds.max_per_instance).contains(&iops) {
+            return Err(format!(
+                "Invalid Iops value: {iops}; valid values for storage type \
+                 {storage_type} are {} to {}",
+                bounds.min_per_instance, bounds.max_per_instance
+            ));
+        }
+        if let Some(storage) = requested
+            .allocated_storage
+            .or(requested.current_allocated_storage)
+        {
+            let ratio = f64::from(iops) / f64::from(storage);
+            if ratio < bounds.min_per_gib || ratio > bounds.max_per_gib {
+                return Err(format!(
+                    "Invalid Iops to storage ratio: {iops} IOPS over {storage} GiB; \
+                     storage type {storage_type} takes {} to {} IOPS per GiB",
+                    bounds.min_per_gib, bounds.max_per_gib
+                ));
+            }
+        }
+    }
+
+    if let Some(throughput) = requested.storage_throughput {
+        let Some(bounds) = &profile.throughput else {
+            return Err(format!(
+                "StorageThroughput can't be specified for storage type {storage_type}, \
+                 whose throughput follows the provisioned IOPS"
+            ));
+        };
+        if !(bounds.min_per_instance..=bounds.max_per_instance).contains(&throughput) {
+            return Err(format!(
+                "Invalid StorageThroughput value: {throughput}; valid values for storage \
+                 type {storage_type} are {} to {} MiBps",
+                bounds.min_per_instance, bounds.max_per_instance
+            ));
+        }
+        if let Some(iops) = requested
+            .iops
+            .or(requested.current_iops)
+            // A type that takes provisioned IOPS runs at its baseline when nothing has
+            // provisioned any, and the throughput is in ratio to THAT.
+            .or_else(|| profile.iops.as_ref().map(|iops| iops.min_per_instance))
+        {
+            let ratio = f64::from(throughput) / f64::from(iops);
+            if ratio < bounds.min_per_iops || ratio > bounds.max_per_iops {
+                return Err(format!(
+                    "Invalid StorageThroughput to Iops ratio: {throughput} MiBps over \
+                     {iops} IOPS; storage type {storage_type} takes {} to {} MiBps per \
+                     provisioned IOPS",
+                    bounds.min_per_iops, bounds.max_per_iops
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Refuse processor features the class this modification leaves the instance on does not
+/// publish, which is what this operation reports as `ValidProcessorFeatures`.
+///
+/// A class the published family table does not carry is bounded by NOTHING here, and is
+/// admitted: that table is an explicitly partial subset of AWS's moving per-region matrix
+/// (see `instance_class_profile`), so an empty feature list for such a class means "this
+/// service publishes no features for it", not "AWS configures none". Only a class the
+/// table does carry, and that exposes no configurable processor, refuses features.
+fn check_processor_features(
+    engine: &str,
+    class_name: &str,
+    requested: &[(Option<String>, Option<String>)],
+) -> Result<(), String> {
+    if requested.is_empty() {
+        return Ok(());
+    }
+    let class = instance_class_profile(engine, class_name);
+    let published = available_processor_features(engine, &class);
+    if published.is_empty() {
+        let published_class = instance_classes(engine)
+            .iter()
+            .any(|known| known.name.eq_ignore_ascii_case(class_name));
+        if !published_class {
+            return Ok(());
+        }
+        return Err(format!(
+            "ProcessorFeatures can't be specified for DB instance class {class_name}: it \
+             exposes no configurable processor feature"
+        ));
+    }
+    for (name, value) in requested {
+        let name = name.as_deref().unwrap_or_default();
+        let Some(feature) = published
+            .iter()
+            .find(|feature| feature.name.as_deref() == Some(name))
+        else {
+            return Err(format!(
+                "Invalid processor feature name: {name}; DB instance class {class_name} \
+                 exposes {}",
+                published
+                    .iter()
+                    .filter_map(|feature| feature.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        };
+        let allowed = feature.allowed_values.as_deref().unwrap_or_default();
+        if let Some(value) = value {
+            if !allowed.split(',').any(|candidate| candidate == value) {
+                return Err(format!(
+                    "Invalid value {value} for processor feature {name}: valid values for \
+                     DB instance class {class_name} are {allowed}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
