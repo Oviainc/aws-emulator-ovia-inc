@@ -885,6 +885,112 @@ pub fn ndi_flow_size_rejection(ndi_feature: &str, flow_size: Option<&str>) -> Op
     ))
 }
 
+/// Whether `hour` is a maintenance start hour: "UTC time when the maintenance will happen.
+/// Use 24-hour HH:MM format. Minutes must be 00. Example: 13:00."
+/// (`smithy_query(query="doc",shape="AddMaintenance",member="MaintenanceStartHour")`, the
+/// same sentence `UpdateMaintenance$MaintenanceStartHour` and
+/// `Maintenance$MaintenanceStartHour` carry).
+pub fn is_maintenance_start_hour(hour: &str) -> bool {
+    let Some((hours, minutes)) = hour.split_once(':') else {
+        return false;
+    };
+    hours.len() == 2
+        && minutes == "00"
+        && hours.bytes().all(|byte| byte.is_ascii_digit())
+        && hours
+            .parse::<u8>()
+            .is_ok_and(|hours| (0..=23).contains(&hours))
+}
+
+/// Whether `date` is a scheduled maintenance date: "a scheduled date in ISO UTC format
+/// when the maintenance will happen. Use YYYY-MM-DD format. Example: 2021-01-30."
+/// (`smithy_query(query="doc",shape="UpdateMaintenance",member="MaintenanceScheduledDate")`).
+/// The day is bounded by the longest month rather than by the month named, which is as far
+/// as the documented format goes.
+pub fn is_maintenance_scheduled_date(date: &str) -> bool {
+    let parts: Vec<&str> = date.split('-').collect();
+    let [year, month, day] = parts.as_slice() else {
+        return false;
+    };
+    year.len() == 4
+        && month.len() == 2
+        && day.len() == 2
+        && [year, month, day]
+            .iter()
+            .all(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
+        && year.parse::<u16>().is_ok()
+        && month
+            .parse::<u8>()
+            .is_ok_and(|month| (1..=12).contains(&month))
+        && day.parse::<u8>().is_ok_and(|day| (1..=31).contains(&day))
+}
+
+/// The detail a request asking for a maintenance window is refused with when one of the
+/// two free-form members it carries is not in its documented format, or `None` when the
+/// window is expressible as one.
+///
+/// Every operation that WRITES a flow's maintenance window — the create shape
+/// (`AddMaintenance`, which requires the start hour) and the update shape
+/// (`UpdateMaintenance`, whose members are each optional) — checks it here, so one rule
+/// refuses one value for one reason whichever path stores it.
+pub fn maintenance_window_rejection(
+    maintenance_start_hour: Option<&str>,
+    maintenance_scheduled_date: Option<&str>,
+) -> Option<String> {
+    if let Some(hour) = maintenance_start_hour.filter(|hour| !is_maintenance_start_hour(hour)) {
+        return Some(format!(
+            "Invalid MaintenanceStartHour {hour:?}. Use 24-hour HH:MM format with minutes 00, \
+             for example 13:00."
+        ));
+    }
+    if let Some(date) =
+        maintenance_scheduled_date.filter(|date| !is_maintenance_scheduled_date(date))
+    {
+        return Some(format!(
+            "Invalid MaintenanceScheduledDate {date:?}. Use YYYY-MM-DD format, for example \
+             2021-01-30."
+        ));
+    }
+    None
+}
+
+/// The detail a request naming an Availability Zone is refused with when that zone is not
+/// one of `region`, or `None` when it is.
+///
+/// Every member a request can name a zone in is "limited to the Availability Zones within
+/// the current Region" (`CreateFlowRequest$AvailabilityZone`) or "must be a valid
+/// Availability Zone for the region specified by regionName, or the current region if no
+/// regionName is provided" (`CreateRouterInputRequest$AvailabilityZone`), so each create
+/// path words the refusal HERE, over the one encoding of the zone naming
+/// ([`is_zone_of_region`]).
+fn availability_zone_rejection(zone: &str, region: &str) -> Option<String> {
+    if is_zone_of_region(zone, region) {
+        return None;
+    }
+    Some(format!(
+        "AvailabilityZone {zone:?} is not an Availability Zone of Region {region:?}."
+    ))
+}
+
+/// The Availability Zone a create STORES for a request that named `requested` in `region`,
+/// or `Err` with the detail the request is refused with when that zone is not one of
+/// `region` ([`availability_zone_rejection`]). A request that names none is given a zone of
+/// the Region ([`default_availability_zone`]), because every resource that carries a zone
+/// reports one.
+///
+/// This is the crate's ONE resolution of the member, so a zone the flow create stores is a
+/// zone the router creates would also accept, and no path stores one its own Region has
+/// not got.
+pub fn resolved_availability_zone(requested: Option<&str>, region: &str) -> Result<String, String> {
+    match requested {
+        Some(zone) => match availability_zone_rejection(zone, region) {
+            Some(detail) => Err(detail),
+            None => Ok(zone.to_string()),
+        },
+        None => Ok(default_availability_zone(region)),
+    }
+}
+
 /// The first port handed to a source that did not ask for one. MediaConnect assigns an
 /// ingest port from its own pool when the request omits `IngestPort`; the emulator
 /// assigns from a WRAPPING pool that starts at this base, so a source's port is drawn
