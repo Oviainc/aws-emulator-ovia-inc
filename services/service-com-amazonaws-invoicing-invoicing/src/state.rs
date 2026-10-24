@@ -33,6 +33,7 @@
 //! [`ComAmazonawsInvoicingInvoicingState::procurement_portal_preferences`]: a preference is
 //! created by `CreateProcurementPortalPreference`, read back by
 //! `GetProcurementPortalPreference`, rewritten by `PutProcurementPortalPreference`,
+//! moved between verification statuses by `UpdateProcurementPortalPreferenceStatus`,
 //! erased by `DeleteProcurementPortalPreference` and validated through
 //! `SendProcurementPortalValidation` / `VerifyProcurementPortalValidation`, each one stored
 //! as the modelled `ProcurementPortalPreference` a reader reports, so its `Version`,
