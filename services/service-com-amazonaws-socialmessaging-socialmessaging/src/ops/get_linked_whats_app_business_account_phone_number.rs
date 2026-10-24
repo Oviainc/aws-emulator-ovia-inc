@@ -165,10 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetLinkedWhatsAppBusinessAccountPhoneNumberErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "no WhatsApp phone number with id '{}'",
-                            input.id
-                        )),
+                        message: Some(
+                            crate::state::ORIGINATION_PHONE_NUMBER_NOT_FOUND_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

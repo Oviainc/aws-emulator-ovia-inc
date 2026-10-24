@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListHostedZonesByVPC
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListHostedZonesByVPC`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListHostedZonesByVPC::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +99,38 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The most hosted zones one page carries.
+///
+/// Route 53's listing convention, which its sibling `ListHostedZones` states in
+/// its own documentation: "Amazon Route 53 returns a maximum of 100 items in
+/// each response. If you have a lot of hosted zones, you can use the maxitems
+/// parameter to list them in groups of up to 100."
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// The first character of a hosted-zone id (`Z1D633PJN98FT9`), and so of the
+/// pagination token this operation hands out, which IS the id of the zone the
+/// next page starts at.
+const ZONE_ID_PREFIX: char = 'Z';
+
+/// The longest `NextToken` this operation can have minted: `ResourceId`, which
+/// `HostedZoneSummary$HostedZoneId` targets, is `len 0..32`
+/// (smithy_query(query="shape",shape="ResourceId")).
+const MAX_TOKEN_LEN: usize = 32;
+
+/// Whether `token` has the shape of a token this operation minted — a bare
+/// hosted-zone id. Anything else never named a page, so it is refused rather
+/// than silently read as "start from the beginning".
+fn token_is_well_formed(token: &str) -> bool {
+    let Some(body) = token.strip_prefix(ZONE_ID_PREFIX) else {
+        return false;
+    };
+    !body.is_empty()
+        && token.len() <= MAX_TOKEN_LEN
+        && body
+            .chars()
+            .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -175,20 +198,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListHostedZonesByVPC` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListHostedZonesByVPCErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListHostedZonesByVPC"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            ListHostedZonesByVPCErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // `VPCId` is `len 0..1024`, so the empty string satisfies every modelled
+        // constraint and reaches this handler — but a required identifier that
+        // names no VPC cannot be looked up.
+        let vpc_id = input.vpc_id.trim();
+        if vpc_id.is_empty() {
+            return Err(ListHostedZonesByVPCErrorModeled::InvalidInput(InvalidInput {
+                message: Some(
+                    "Invalid request: VPCId must name the Amazon VPC to list hosted zones for"
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+        let vpc_region = input.vpc_region.trim();
+
+        // The token this operation mints is the hosted-zone id the next page
+        // starts at; one it never minted identifies no page at all.
+        let resume_at = match input.next_token.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(token) if token_is_well_formed(token) => Some(token.to_string()),
+            Some(token) => {
+                return Err(ListHostedZonesByVPCErrorModeled::InvalidPaginationToken(
+                    InvalidPaginationToken {
+                        message: Some(format!(
+                            "Invalid pagination token: {token} does not identify a page of \
+                             hosted zones"
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let page_size = input
+            .max_items
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        // "The value that you specified for MaxItems in the most recent
+        // ListHostedZonesByVPC request" — echoed as sent, while `page_size`
+        // above bounds the work and the response size.
+        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);
+
+        let store = state.lock();
+        // Zones are keyed by id in a `BTreeMap`, so this walk is a stable total
+        // order and a token always resumes at the same place. A VPC association
+        // is held BY the zone and names both the VPC's id and the region it was
+        // created in, so both have to match for the zone to be one this VPC is
+        // associated with.
+        let associated = store
+            .zones
+            .values()
+            .filter(|zone| {
+                zone.vpcs.iter().any(|vpc| {
+                    vpc.vpc_id.as_deref().map(str::trim) == Some(vpc_id)
+                        && vpc.vpc_region.as_deref().map(str::trim) == Some(vpc_region)
+                })
+            })
+            .filter(|zone| {
+                // The token is a bare zone id (`token_is_well_formed` accepts
+                // nothing else), and the walk is in id order, so resuming is an
+                // inclusive lower bound on that order.
+                resume_at
+                    .as_deref()
+                    .is_none_or(|token| zone.id.as_str() >= token)
+            });
+
+        let mut hosted_zone_summaries = Vec::new();
+        let mut next_token = None;
+        for zone in associated {
+            if hosted_zone_summaries.len() >= page_size as usize {
+                // "The value that you will use for NextToken in the next
+                // ListHostedZonesByVPC request": the first zone this page left
+                // out, which the next request resumes at.
+                next_token = Some(zone.id.clone());
+                break;
+            }
+            hosted_zone_summaries.push(HostedZoneSummary {
+                hosted_zone_id: zone.id.clone(),
+                name: zone.name.clone(),
+                // Every zone in this emulator was created through this API by
+                // the one account it presents, so the owner is that account and
+                // never an Amazon Web Services service: "If there is a value for
+                // OwningAccount, there is no value for OwningService, and vice
+                // versa."
+                owner: HostedZoneOwner {
+                    owning_account: Some(::engine::emulator_account_id().to_string()),
+                    owning_service: None,
+                },
+            });
+        }
+
+        Ok(ListHostedZonesByVPCOutput {
+            hosted_zone_summaries,
+            max_items: reported_max_items,
+            next_token,
+        })
     }
 }
