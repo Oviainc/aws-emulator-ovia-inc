@@ -43,5 +43,7 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/support.rs"]
 mod support;
+#[path = "all/tagging_authorization.rs"]
+mod tagging_authorization;
 #[path = "all/tagging_no_content.rs"]
 mod tagging_no_content;
