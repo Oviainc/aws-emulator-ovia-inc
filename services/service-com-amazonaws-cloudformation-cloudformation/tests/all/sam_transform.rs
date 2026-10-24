@@ -81,7 +81,10 @@ struct Case {
 }
 
 /// `Transform` plus `Resources`, as a JSON template body.
-fn sam_template(resources: &str) -> String {
+///
+/// `pub(crate)` because `sam_deployed_resources.rs` builds its rows with the same two
+/// sections rather than copying this.
+pub(crate) fn sam_template(resources: &str) -> String {
     format!(r#"{{"Transform":"AWS::Serverless-2016-10-31","Resources":{resources}}}"#)
 }
 

@@ -8,12 +8,9 @@
 //! had a schedule set reports the EMPTY array the modelled output documents, it does not
 //! acquire one by being read. This is the ONLY file to touch for this operation.
 //!
-//! `PutBandwidthRateLimitSchedule` is the operation that SETS the schedule and is still a
-//! scaffold answering 501 under its own stub issue
-//! (`issues/things-that-do-not-work/20261024T030827Z-backup-gateway-putbandwidthratelimitschedule-stub.md`),
-//! so until it lands the store is the only place a non-empty schedule can come from —
-//! this handler reads the very field that handler will write, so neither the shape nor
-//! the ordering can drift between them.
+//! `PutBandwidthRateLimitSchedule` is the operation that SETS the schedule, writing the
+//! very field this handler reads, so neither the shape nor the ordering can drift between
+//! them.
 //!
 //! ## Shape of an operation
 //!

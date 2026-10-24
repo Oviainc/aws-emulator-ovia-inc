@@ -192,6 +192,7 @@ async fn every_date_member_is_an_rfc3339_string_on_every_read_path() {
             &format!("/virtualclusters/{cluster}/jobruns"),
             Some(json!({
                 "clientToken": "wire-job-tok",
+                "executionRoleArn": "arn:aws:iam::000000000000:role/EMRJobRole",
                 "releaseLabel": "emr-6.10.0-latest",
                 "jobDriver": {"sparkSubmitJobDriver": {"entryPoint": "s3://bucket/main.py"}},
             })),
@@ -354,6 +355,7 @@ async fn created_by_names_the_caller_principal_on_every_resource() {
             &format!("/virtualclusters/{cluster}/jobruns"),
             Some(json!({
                 "clientToken": "by-job-tok",
+                "executionRoleArn": "arn:aws:iam::000000000000:role/EMRJobRole",
                 "releaseLabel": "emr-6.10.0-latest",
                 "jobDriver": {"sparkSqlJobDriver": {"entryPoint": "s3://bucket/q.sql"}},
             })),

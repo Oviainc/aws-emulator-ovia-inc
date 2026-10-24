@@ -97,28 +97,6 @@ pub const MAX_ACCOUNT_IDS_PER_REQUEST: usize = 50;
 /// freely, because that adds nothing.
 pub const MAX_ENROLLED_ACCOUNTS: usize = 1_000;
 
-/// The `description` a rule created without one carries.
-///
-/// A rule's `description` is reported for every rule that exists — a create that
-/// supplied none leaves the rule described by nothing, which is the empty
-/// string, not an absent member. Stored at create time so every read path
-/// (`GetAutomationRule`, `ListAutomationRules`, `UpdateAutomationRule`) projects
-/// the same value out of the store.
-pub const DEFAULT_RULE_DESCRIPTION: &str = "";
-
-/// The `priority` a rule created without one carries.
-///
-/// `priority` is "a string representation of a decimal number between 0 and 1
-/// ... When multiple rules match the same recommended action, Compute Optimizer
-/// assigns the action to the rule with the lowest priority value (highest
-/// priority)" (`smithy_query(query="doc",shape="AutomationRule",member="priority")`),
-/// so every rule has a precedence whether or not the create named one.
-///
-/// CHOSEN value: neither the model nor the operation docs give the default. It is
-/// the TOP of the documented range, which is the LOWEST precedence, so a rule
-/// whose create named a priority always wins the tie against one that did not.
-pub const DEFAULT_RULE_PRIORITY: &str = "1";
-
 /// The page size a paginated list uses when the caller sends no `maxResults`.
 /// The model bounds every `maxResults` member at `range(min: 1, max: 100)`
 /// (`ListAutomationRules`, `ListAutomationRulePreview`, …), so the largest page
@@ -660,15 +638,21 @@ pub struct StoredRule {
     pub rule_id: String,
     pub account_id: String,
     pub name: String,
-    /// Always a value: a create that supplied none stores
-    /// [`DEFAULT_RULE_DESCRIPTION`].
-    pub description: String,
+    /// What the create or the latest update supplied, and `None` while neither
+    /// has: the member is optional in every rule shape and the service holds no
+    /// value for it, so every read path leaves it out rather than reporting a
+    /// description the caller never set.
+    pub description: Option<String>,
     pub rule_type: String,
     pub rule_revision: i64,
     pub organization_configuration: Option<OrganizationConfiguration>,
-    /// Always a value: a create that supplied none stores
-    /// [`DEFAULT_RULE_PRIORITY`].
-    pub priority: String,
+    /// What the create or the latest update supplied, and `None` while neither
+    /// has. Neither the model nor the operation docs give a default, and
+    /// `priority` decides which rule claims a recommended action when several
+    /// match ("the rule with the lowest priority value (highest priority)",
+    /// `smithy_query(query="doc",shape="AutomationRule",member="priority")`), so
+    /// a rule whose create named none holds no precedence and reports none.
+    pub priority: Option<String>,
     pub recommended_action_types: Vec<String>,
     pub criteria: Option<Criteria>,
     pub schedule: Schedule,
@@ -691,12 +675,12 @@ impl StoredRule {
             rule_arn: Some(self.rule_arn.clone()),
             rule_id: Some(self.rule_id.clone()),
             name: Some(self.name.clone()),
-            description: Some(self.description.clone()),
+            description: self.description.clone(),
             rule_type: Some(self.rule_type.clone()),
             rule_revision: Some(self.rule_revision),
             account_id: Some(self.account_id.clone()),
             organization_configuration: self.organization_configuration.clone(),
-            priority: Some(self.priority.clone()),
+            priority: self.priority.clone(),
             recommended_action_types: Some(self.recommended_action_types.clone()),
             schedule: Some(self.schedule.clone()),
             status: Some(self.status.clone()),

@@ -146,7 +146,7 @@ impl Emr {
             .await
     }
 
-    async fn start_job(&self, cluster: &str, body: Value) -> Answer {
+    pub(crate) async fn start_job(&self, cluster: &str, body: Value) -> Answer {
         self.send(
             "POST",
             &format!("/virtualclusters/{cluster}/jobruns"),
@@ -155,7 +155,7 @@ impl Emr {
         .await
     }
 
-    async fn describe_job(&self, cluster: &str, id: &str) -> Answer {
+    pub(crate) async fn describe_job(&self, cluster: &str, id: &str) -> Answer {
         self.send(
             "GET",
             &format!("/virtualclusters/{cluster}/jobruns/{id}"),
@@ -193,6 +193,26 @@ impl Emr {
             .await;
         text(answer.ok(name), "/id", name)
     }
+}
+
+/// One `StartJobRun` body that a cluster can actually run: a submission naming no job
+/// template has to carry `executionRoleArn`, `releaseLabel` and `jobDriver` itself, the
+/// three members `JobTemplateData` marks `@required` (smithy_query: shape
+/// `JobTemplateData`). The driver is the caller's, so one definition of an acceptable
+/// submission serves every `JobDriver` member.
+pub(crate) fn runnable_body(token: &str, driver: Value) -> Value {
+    json!({
+        "clientToken": token,
+        "executionRoleArn": "arn:aws:iam::000000000000:role/EMRJobRole",
+        "releaseLabel": "emr-6.10.0-latest",
+        "jobDriver": driver,
+    })
+}
+
+/// The `sparkSubmitJobDriver` member of the `JobDriver` union (smithy_query: shape
+/// `JobDriver`), the driver the fixtures here submit.
+pub(crate) fn spark_submit_driver() -> Value {
+    json!({"sparkSubmitJobDriver": {"entryPoint": "s3://bucket/job.py"}})
 }
 
 /// Wait until a status transition the service owes has come due, with margin, so the
@@ -478,6 +498,8 @@ async fn a_replayed_job_run_client_token_is_scoped_to_its_virtual_cluster() {
     for (label, token, extra) in &cases {
         let mut body = json!({
             "clientToken": token,
+            "executionRoleArn": "arn:aws:iam::000000000000:role/EMRJobRole",
+            "releaseLabel": "emr-6.10.0-latest",
             "jobDriver": {"sparkSubmitJobDriver": {"entryPoint": "s3://bucket/job.py"}},
         });
         if let (Some(target), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
@@ -526,6 +548,8 @@ async fn a_started_job_run_is_described_from_state() {
             label: "a bare spark-submit driver",
             body: json!({
                 "clientToken": "job-tok-1",
+                "executionRoleArn": "arn:aws:iam::000000000000:role/EMRJobRole",
+                "releaseLabel": "emr-6.10.0-latest",
                 "jobDriver": {"sparkSubmitJobDriver": {"entryPoint": "s3://bucket/job.py"}},
             }),
         },
@@ -559,6 +583,7 @@ async fn a_started_job_run_is_described_from_state() {
             body: json!({
                 "name": "sql_job.1",
                 "clientToken": "job-tok-3",
+                "executionRoleArn": "arn:aws:iam::000000000000:role/sql/EMRJobRole",
                 "releaseLabel": "emr-7.0.0-latest",
                 "jobDriver": {"sparkSqlJobDriver": {
                     "entryPoint": "s3://bucket/query.sql",
@@ -567,8 +592,16 @@ async fn a_started_job_run_is_described_from_state() {
             }),
         },
         JobCase {
-            label: "no driver at all",
-            body: json!({"clientToken": "job-tok-4"}),
+            label: "a spark-submit driver with an empty argument list",
+            body: json!({
+                "clientToken": "job-tok-4",
+                "executionRoleArn": "arn:aws:iam::000000000000:role/EMRJobRole",
+                "releaseLabel": "emr-6.15.0",
+                "jobDriver": {"sparkSubmitJobDriver": {
+                    "entryPoint": "s3://bucket/empty.py",
+                    "entryPointArguments": [],
+                }},
+            }),
         },
     ];
 
@@ -675,6 +708,8 @@ async fn a_job_run_reaches_running_and_then_cancelled_on_the_clock() {
             json!({
                 "name": "lifecycle-job",
                 "clientToken": "job-lifecycle",
+                "executionRoleArn": "arn:aws:iam::000000000000:role/EMRJobRole",
+                "releaseLabel": "emr-6.10.0-latest",
                 "jobDriver": {"sparkSubmitJobDriver": {"entryPoint": "s3://bucket/job.py"}},
             }),
         )
@@ -761,7 +796,7 @@ async fn an_unresolvable_resource_is_refused_with_the_modelled_error() {
     let started = emr
         .start_job(
             &cluster,
-            json!({"clientToken": "job-resolve", "jobDriver": {"sparkSubmitJobDriver": {"entryPoint": "s3://b/j.py"}}}),
+            runnable_body("job-resolve", spark_submit_driver()),
         )
         .await;
     let job = text(started.ok("fixture"), "/id", "fixture");
@@ -844,6 +879,8 @@ async fn list_job_runs_pages_the_stored_runs_newest_first() {
                 json!({
                     "name": format!("job-{index}"),
                     "clientToken": format!("job-page-{index}"),
+                    "executionRoleArn": "arn:aws:iam::000000000000:role/EMRJobRole",
+                    "releaseLabel": "emr-6.10.0-latest",
                     "jobDriver": {"sparkSubmitJobDriver": {"entryPoint": "s3://bucket/job.py"}},
                 }),
             )
@@ -1010,6 +1047,8 @@ async fn list_job_runs_honours_every_filter() {
                 json!({
                     "name": format!("filter-{index}"),
                     "clientToken": format!("job-filter-{index}"),
+                    "executionRoleArn": "arn:aws:iam::000000000000:role/EMRJobRole",
+                    "releaseLabel": "emr-6.10.0-latest",
                     "jobDriver": {"sparkSubmitJobDriver": {"entryPoint": "s3://bucket/job.py"}},
                 }),
             )
@@ -1103,7 +1142,7 @@ async fn a_deleted_virtual_cluster_stays_describable_and_takes_no_more_work() {
     let started = emr
         .start_job(
             &cluster,
-            json!({"clientToken": "job-teardown", "jobDriver": {"sparkSubmitJobDriver": {"entryPoint": "s3://b/j.py"}}}),
+            runnable_body("job-teardown", spark_submit_driver()),
         )
         .await;
     let job = text(started.ok(case), "/id", case);
@@ -1255,10 +1294,7 @@ async fn the_virtual_cluster_store_is_capped_and_reclaims_retired_clusters() {
     let started = emr
         .start_job(
             &ids[0],
-            json!({
-                "clientToken": "cap-job",
-                "jobDriver": {"sparkSubmitJobDriver": {"entryPoint": "s3://bucket/job.py"}},
-            }),
+            runnable_body("cap-job", spark_submit_driver()),
         )
         .await;
     let job = text(started.ok(case), "/id", case);

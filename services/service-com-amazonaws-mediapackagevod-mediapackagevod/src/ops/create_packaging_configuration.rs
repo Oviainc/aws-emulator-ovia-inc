@@ -4,7 +4,8 @@
 //! IMPLEMENTED: mints a PackagingConfiguration against an existing PackagingGroup.
 //! Refuses a `PackagingGroupId` that resolves to nothing, a request that does
 //! not carry exactly one package block, and a `SpekeKeyProvider$RoleArn` that is not
-//! the ARN of an IAM role — each as a request-parameter violation,
+//! the ARN of an IAM role, and a `Tags` map that breaks AWS's resource-tagging
+//! restrictions ([`crate::state::check_tags`]) — each as a request-parameter violation,
 //! `UnprocessableEntityException` (422); resolves the package block's server-side
 //! defaults ([`crate::state::hls_package_with_defaults`] and its DASH/CMAF/MSS
 //! siblings), persists the resolved block, and answers HTTP 202 with the record just
@@ -205,6 +206,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // Tag-on-create is still tagging: the map is judged against AWS's resource
+        // tagging restrictions before the store is touched, so a refused request leaves
+        // no configuration and no tag behind.
+        crate::state::check_tags(input.tags.as_ref())?;
         // The `SpekeKeyProvider$RoleArn` of the chosen format's encryption block is
         // "an IAM role that AWS Elemental MediaPackage will assume when accessing the
         // key provider service", so it is read as an IAM role ARN before anything is

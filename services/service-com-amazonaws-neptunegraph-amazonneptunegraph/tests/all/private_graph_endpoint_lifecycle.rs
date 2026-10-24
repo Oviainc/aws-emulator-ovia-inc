@@ -29,10 +29,11 @@
 //! addressing pair names nothing — rather than re-running one recorded request.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::state::{
-    ENDPOINT_DELETION_SPAN, PROVISIONING_SPAN,
+    DELETION_SPAN, ENDPOINT_DELETION_SPAN, PROVISIONING_SPAN,
 };
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -699,8 +700,18 @@ async fn an_endpoint_does_not_outlive_the_graph_it_reaches() {
         "case DeleteGraph: expected 200, got {status}: {body}"
     );
 
-    // The deleted graph's endpoint went with it; the other graph's endpoint in the same
-    // VPC is untouched.
+    // The graph is on its way out, so its endpoint is still reachable for as long as the
+    // graph itself is...
+    let (status, body) = get_endpoint(&router, &graph_id, "vpc-doomed").await;
+    assert_eq!(
+        status, 200,
+        "case the deleting graph's endpoint: expected 200 while the graph is DELETING, \
+         got {status}: {body}"
+    );
+
+    // ...and goes with it once the deletion the clock owes falls due; the other graph's
+    // endpoint in the same VPC is untouched.
+    tokio::time::sleep(DELETION_SPAN + Duration::from_millis(150)).await;
     let (status, body) = get_endpoint(&router, &graph_id, "vpc-doomed").await;
     assert_eq!(
         status, 404,

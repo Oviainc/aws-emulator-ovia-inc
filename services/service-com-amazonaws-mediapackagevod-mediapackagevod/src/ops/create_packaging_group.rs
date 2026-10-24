@@ -4,7 +4,9 @@
 //! IMPLEMENTED: mints a PackagingGroup — reads the two ARN members of a CDN
 //! `Authorization` block it carries (a Secrets Manager secret and an IAM role),
 //! refusing a value that is not one with `UnprocessableEntityException` (422)
-//! attributed to that member, then persists the group under its caller-chosen `Id`
+//! attributed to that member, judges the `Tags` map it carries against AWS's
+//! resource-tagging restrictions ([`crate::state::check_tags`]) with the same 422,
+//! then persists the group under its caller-chosen `Id`
 //! in [`crate::state`] and answers with the record just stored, so the following
 //! `DescribePackagingGroup` returns the identical `Arn`, `DomainName` and
 //! `CreatedAt`. This is the ONLY file to touch for this operation.
@@ -184,6 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // Tag-on-create is still tagging, so the map is judged against AWS's resource
+        // tagging restrictions before anything is stored: a refused request creates no
+        // group and stores no tag, so the following describe reports neither.
+        crate::state::check_tags(input.tags.as_ref())?;
         // The CDN authorization block names a Secrets Manager secret and the IAM role
         // MediaPackage reads it as, so both members are read as ARNs of those services
         // before anything is stored — exactly as `UpdatePackagingGroup` reads the same

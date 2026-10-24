@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProcurementPortals
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProcurementPortals`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProcurementPortals::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the procurement portals this service supports, one page at a time: the
+//! catalog [`crate::state::procurement_portals`] derives from the modelled
+//! `ProcurementPortalName` values — the same catalog a `PortalIdentifier` on
+//! `ListProcurementPortalSuppliers` resolves against — walked in `PortalIdentifier`
+//! order. This operation writes NOTHING: it is a `@readonly`, `@paginated` read, and a
+//! portal is not a resource any operation of this service creates, so what it reports
+//! cannot be changed by a caller.
+//!
+//! Every entry carries the portal identifier, name and default feature configurations
+//! the operation documents it includes; which document and attachment types a portal
+//! defaults to, and why no display name is reported, is stated on
+//! [`crate::state::procurement_portals`].
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +121,17 @@ impl From<ListProcurementPortalsErrorModeled> for ListProcurementPortalsError {
     }
 }
 
+/// `MaxResults` carries `@range(min: 1, max: 100)` and `@default: 100`
+/// (`smithy_query(query="operation", operation="ListProcurementPortals")`), so a page
+/// never holds more than this many portals and an omitted `MaxResults` asks for this
+/// many.
+const MAX_PAGE_SIZE: usize = 100;
+
+/// What an opaque `NextToken` this operation minted decodes to, before the position the
+/// next page resumes at. Its own prefix, so a token minted for another paginated walk of
+/// this service — whose order is its own — is not accepted here.
+const NEXT_TOKEN_PREFIX: &str = "procurement-portals:";
+
 /// The `ListProcurementPortals` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,18 +168,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProcurementPortals` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProcurementPortalsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProcurementPortals"))
+        // This operation reports the portals the SERVICE supports, which no caller's
+        // state can add to or take from (see `crate::state::procurement_portals`), so
+        // there is no store read to make here and — being a read — no write either.
+        let _ = (ctx, &self.engine);
+
+        let resume_at =
+            crate::state::decode_page_token(NEXT_TOKEN_PREFIX, input.next_token.as_deref())
+                .map_err(|_| {
+                    ListProcurementPortalsErrorModeled::ValidationException(
+                        // This plane keys the refusal's text as `Message` (see
+                        // `crate::ops::types::MessageKey`).
+                        crate::state::invalid_next_token(MessageKey::Capitalised),
+                    )
+                })?;
+        // The boundary validator already refused a `MaxResults` outside `@range(1..100)`
+        // and the deserializer filled the `@default: 100` in, so this only guards the
+        // conversion.
+        let page_size = usize::try_from(input.max_results)
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // One stable, deterministic order (the catalog's `PortalIdentifier` keys), so a
+        // token — a POSITION in that order — stays meaningful across calls and the
+        // resumed page seeks straight to it rather than re-walking the earlier pages.
+        let catalog = crate::state::procurement_portals();
+        let mut procurement_portals = Vec::new();
+        let mut next_token = None;
+        let page = match resume_at.as_deref() {
+            Some(from) => catalog.range(from.to_string()..),
+            None => catalog.range::<String, _>(..),
+        };
+        for (portal_identifier, portal) in page {
+            if procurement_portals.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(
+                    NEXT_TOKEN_PREFIX,
+                    portal_identifier,
+                ));
+                break;
+            }
+            procurement_portals.push(portal.clone());
+        }
+
+        Ok(ListProcurementPortalsOutput {
+            procurement_portals,
+            next_token,
+        })
     }
 }

@@ -31,6 +31,8 @@ mod maintenance_start_time;
 mod metadata_sync;
 #[path = "all/negative_paths.rs"]
 mod negative_paths;
+#[path = "all/put_bandwidth_rate_limit_schedule.rs"]
+mod put_bandwidth_rate_limit_schedule;
 #[path = "all/put_hypervisor_property_mappings.rs"]
 mod put_hypervisor_property_mappings;
 #[path = "all/resource_untagging.rs"]

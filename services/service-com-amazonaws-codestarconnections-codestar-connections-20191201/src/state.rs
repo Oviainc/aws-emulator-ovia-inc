@@ -2,8 +2,8 @@
 
 //! Engine state for the com-amazonaws-codestarconnections-codestar-connections-20191201 service.
 //!
-//! This module owns the service's persisted resources (connections, repository links
-//! and their tags) plus the few request-derived helpers every handler needs: the ARN namespace, the
+//! This module owns the service's persisted resources (connections, repository links,
+//! hosts, sync blockers and their tags) plus the few request-derived helpers every handler needs: the ARN namespace, the
 //! region the caller signed for, and the `NextToken` codec the paginated list
 //! operations share. `src/lib.rs` is generated, so a helper several handlers reach
 //! lives here rather than in a module of its own.
@@ -14,7 +14,9 @@ use std::fmt::Write as _;
 use std::hash::BuildHasher;
 use std::time::SystemTime;
 
-use crate::ops::types::{Connection, Host, RepositoryLinkInfo, Tag, VpcConfiguration};
+use crate::ops::types::{
+    Connection, Host, RepositoryLinkInfo, SyncBlocker, SyncBlockerContext, Tag, VpcConfiguration,
+};
 
 /// This service's ARN namespace (`awsService.arnNamespace` in the Smithy model), used
 /// for every ARN the service mints.
@@ -77,6 +79,23 @@ pub const HOST_STATUS_DELETE_BLOCKED: &[&str] = &[
     HOST_STATUS_VPC_CONFIG_INITIALIZING,
     HOST_STATUS_VPC_CONFIG_DELETING,
 ];
+
+/// The statuses a sync blocker carries.
+///
+/// `SyncBlocker$Status` targets the closed `BlockerStatus` enum
+/// (`smithy_query(query="shape", shape="BlockerStatus")` — `ACTIVE`, `RESOLVED`, also
+/// generated as `ops::types::shared_types::BLOCKER_STATUS_VALUES`). A blocker the
+/// Git-sync side raises starts `ACTIVE`; resolving it is what `UpdateSyncBlocker` does,
+/// and `RESOLVED` is terminal — nothing moves a blocker back.
+pub const BLOCKER_STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`BLOCKER_STATUS_ACTIVE`].
+pub const BLOCKER_STATUS_RESOLVED: &str = "RESOLVED";
+
+/// The only `BlockerType` the model declares
+/// (`smithy_query(query="shape", shape="BlockerType")`): a sync blocker is raised by the
+/// service's own Git-sync component, never by a caller, which is why this service models
+/// no operation that creates one.
+pub const BLOCKER_TYPE_AUTOMATED: &str = "AUTOMATED";
 
 /// Region used when a request carries no SigV4 credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -268,6 +287,81 @@ impl StoredHost {
     }
 }
 
+/// A sync blocker as this service persists it.
+///
+/// One record per sync blocker `Id`. A blocker belongs to the (`ResourceName`,
+/// `SyncType`) pair whose syncing it blocks — the pair every blocker operation addresses
+/// it through — and carries every member of the modeled `SyncBlocker` shape, so the
+/// operation that resolves one and any later reader of it render the same row.
+#[derive(Debug, Clone)]
+pub struct StoredSyncBlocker {
+    /// The blocker's id, and the key of
+    /// [`ComAmazonawsCodestarconnectionsCodestarConnections20191201State::sync_blockers`].
+    pub id: String,
+    /// The resource whose syncing this blocker blocks.
+    pub resource_name: String,
+    /// The parent of that resource, when it has one.
+    pub parent_resource_name: Option<String>,
+    /// The `SyncConfigurationType` the blocker was raised under.
+    pub sync_type: String,
+    /// `SyncBlocker$Type` — one of `BLOCKER_TYPE_VALUES`, i.e.
+    /// [`BLOCKER_TYPE_AUTOMATED`].
+    pub blocker_type: String,
+    /// `SyncBlocker$Status` — [`BLOCKER_STATUS_ACTIVE`] or [`BLOCKER_STATUS_RESOLVED`].
+    pub status: String,
+    /// Why the blocker was raised.
+    pub created_reason: String,
+    /// When it was raised.
+    pub created_at: SystemTime,
+    /// The blocker's contexts, empty when it carries none.
+    pub contexts: Vec<SyncBlockerContext>,
+    /// The reason supplied when the blocker was resolved; absent while it is active.
+    pub resolved_reason: Option<String>,
+    /// When the blocker was resolved; absent while it is active.
+    pub resolved_at: Option<SystemTime>,
+}
+
+impl StoredSyncBlocker {
+    /// This record as the modeled `SyncBlocker` structure every reader returns.
+    ///
+    /// A blocker holding no contexts reports no `Contexts` member at all rather than an
+    /// empty list, and an ACTIVE one reports neither `ResolvedReason` nor `ResolvedAt`:
+    /// both are modeled optional and are what resolving the blocker fills in.
+    pub fn to_sync_blocker(&self) -> SyncBlocker {
+        SyncBlocker {
+            id: self.id.clone(),
+            r#type: self.blocker_type.clone(),
+            status: self.status.clone(),
+            created_reason: self.created_reason.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            contexts: if self.contexts.is_empty() {
+                None
+            } else {
+                Some(self.contexts.clone())
+            },
+            resolved_reason: self.resolved_reason.clone(),
+            resolved_at: self.resolved_at.map(::aws_smithy_types::DateTime::from),
+        }
+    }
+
+    /// Whether this blocker is still blocking syncing — the one state from which it can
+    /// be resolved.
+    pub fn is_active(&self) -> bool {
+        self.status == BLOCKER_STATUS_ACTIVE
+    }
+
+    /// Resolve this blocker: `UpdateSyncBlocker`'s whole effect, as its doc states it
+    /// ("update the status of a sync blocker, resolving the blocker and allowing syncing
+    /// to continue"). The status moves to [`BLOCKER_STATUS_RESOLVED`] and the reason and
+    /// the instant of the resolution are recorded; everything the blocker was raised
+    /// with is left as it was.
+    pub fn resolve(&mut self, resolved_reason: &str, at: SystemTime) {
+        self.status = BLOCKER_STATUS_RESOLVED.to_string();
+        self.resolved_reason = Some(resolved_reason.to_string());
+        self.resolved_at = Some(at);
+    }
+}
+
 /// Per-service state for com-amazonaws-codestarconnections-codestar-connections-20191201. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
@@ -281,6 +375,13 @@ pub struct ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
     /// through `StoredConnection::host_arn`, which is the association `DeleteHost`
     /// refuses to break.
     pub hosts: BTreeMap<String, StoredHost>,
+    /// Every sync blocker in this emulator, keyed by its `Id` — the id
+    /// `UpdateSyncBlocker` addresses a blocker by, alongside the resource and sync type
+    /// it belongs to. The service models no operation that RAISES one (a blocker is
+    /// `AUTOMATED`: the Git-sync component raises it), so this map holds whatever that
+    /// side of the service has put there and an id naming no entry is the modeled
+    /// `SyncBlockerDoesNotExistException`.
+    pub sync_blockers: BTreeMap<String, StoredSyncBlocker>,
     /// Tags by resource ARN, shared by `TagResource` / `UntagResource` /
     /// `ListTagsForResource` and populated from `CreateConnection.Tags`.
     pub tags: BTreeMap<String, BTreeMap<String, String>>,
@@ -349,6 +450,24 @@ impl ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
             .values()
             .filter(|connection| connection.host_arn.as_deref() == Some(host_arn))
             .count()
+    }
+
+    /// The sync blocker the (`Id`, `ResourceName`, `SyncType`) triple of a request
+    /// addresses, mutably.
+    ///
+    /// A blocker is addressed by its id TOGETHER with the resource and sync type it
+    /// belongs to, so an id that exists under another resource or another sync type
+    /// addresses nothing: it is not the blocker the request named, and the caller is
+    /// answered the same absence as for an id that was never raised.
+    pub fn sync_blocker_mut(
+        &mut self,
+        id: &str,
+        resource_name: &str,
+        sync_type: &str,
+    ) -> Option<&mut StoredSyncBlocker> {
+        self.sync_blockers
+            .get_mut(id)
+            .filter(|blocker| blocker.resource_name == resource_name && blocker.sync_type == sync_type)
     }
 
     /// Whether this service holds a resource under `resource_arn`.
@@ -547,6 +666,30 @@ pub fn host_arn(region: &str, host_id: &str) -> String {
 /// names the ARN that was supplied — which is the part of it that is a contract.
 pub fn host_not_found_message(host_arn: &str) -> String {
     format!("No host exists with the ARN: {host_arn}")
+}
+
+/// How this service reports a sync blocker the request's (`Id`, `ResourceName`,
+/// `SyncType`) triple does not address — an id never raised, or one raised for another
+/// resource or sync type.
+///
+/// The message is built from the REQUEST: it names the id that was asked for, which is
+/// the part of it a caller can act on. The template is the recorded one (corpus
+/// `simparity-wire-aws-v1`, fixture
+/// `codestar-connections-sync-status-and-blocker-error-paths#task#6`), down to the space
+/// the live service leaves after the sentence.
+pub fn sync_blocker_not_found_message(id: &str) -> String {
+    format!("Sync blocker with id {id} does not exist ")
+}
+
+/// How this service refuses resolving a sync blocker that is not [`BLOCKER_STATUS_ACTIVE`].
+///
+/// `UpdateSyncBlocker` resolves an ACTIVE blocker; a blocker already RESOLVED has no
+/// status left to move, so the request names a blocker it cannot apply to and is refused
+/// with the operation's modeled `InvalidInputException` rather than reported as success.
+/// The WORDING is the emulator's (AWS documents none); what is a contract is that the
+/// request is refused and names the id.
+pub fn sync_blocker_already_resolved_message(id: &str) -> String {
+    format!("Sync blocker with id {id} is already resolved")
 }
 
 /// Encode a pagination cursor: the creation sequence the next page starts at.

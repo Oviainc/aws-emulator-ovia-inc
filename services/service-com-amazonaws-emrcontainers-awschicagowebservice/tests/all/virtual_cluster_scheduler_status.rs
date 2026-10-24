@@ -87,6 +87,7 @@ pub(crate) async fn start_run(emr: &Emr, cluster: &str, token: &str) -> Answer {
         &format!("/virtualclusters/{cluster}/jobruns"),
         Some(json!({
             "clientToken": token,
+            "executionRoleArn": "arn:aws:iam::000000000000:role/EMRJobRole",
             "releaseLabel": "emr-6.10.0-latest",
             "jobDriver": {"sparkSubmitJobDriver": {"entryPoint": "s3://bucket/main.py"}},
         })),

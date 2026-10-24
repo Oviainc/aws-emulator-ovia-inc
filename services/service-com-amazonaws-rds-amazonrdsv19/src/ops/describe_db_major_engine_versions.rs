@@ -1,15 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBMajorEngineVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBMajorEngineVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the MAJOR-version families of this service's DB
+//! engine version catalogue — one entry per `(Engine, MajorEngineVersion)` pair the
+//! catalogue publishes — narrowed by the request's `Engine` and `MajorEngineVersion` and
+//! paged by `MaxRecords` / `Marker`. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBMajorEngineVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A major engine version is reference data, not caller state: it exists for every
+//! caller, no request creates it, and it reads the same before and after one. The
+//! families come from the engine-version catalogue `DescribeDBEngineVersions` owns, so
+//! the two reports cannot disagree about which major versions this service publishes — a
+//! family is reported whatever the status of its versions, because a family in Amazon RDS
+//! Extended Support (whose versions are no longer available for a new instance) is
+//! exactly the one a caller reads this report to plan an upgrade off.
+//!
+//! What each entry adds beyond the pair is its SUPPORT LIFECYCLE, and that is published
+//! only for the open-source engines: `SupportedEngineLifecycle` "only returns information
+//! for the open source engines Amazon RDS for MariaDB, Amazon RDS for MySQL, Amazon RDS
+//! for PostgreSQL, Aurora MySQL, and Aurora PostgreSQL", and `LifecycleSupportName`
+//! states that Amazon RDS for MariaDB "only returns the value
+//! `open-source-rds-standard-support`" where the other four return both values. An entry
+//! for a commercial engine (Db2, Oracle, Microsoft SQL Server, RDS Custom for SQL Server)
+//! therefore reports no lifecycle list at all rather than an empty or an invented one.
+//!
+//! The engines this one front door serves on behalf of ANOTHER control plane (Amazon
+//! DocumentDB and Amazon Neptune — see
+//! `crate::ops::describe_db_engine_versions::serves_another_control_plane`) are left out:
+//! neither of those models declares this operation, so neither control plane publishes a
+//! major-engine-version report, and this one answers for the RDS engines its own `Engine`
+//! member names. Every other engine the catalogue carries IS reported, the Microsoft SQL
+//! Server Developer Edition engines included: they are RDS engines whose versions this
+//! service publishes (`DescribeDBEngineVersions$Engine` lists `sqlserver-dev-ee`, and
+//! `CreateDBInstance$Engine` `custom-sqlserver-dev`), and a published valid-value list
+//! that has not caught up with an engine is not a reason to report no major version for
+//! it while reporting its versions.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +102,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The engine-version catalogue this report reads: one `CatalogVersion` per published
+// engine version, grouped into major-version families here.
+use crate::ops::describe_db_engine_versions::CatalogVersion;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -145,18 +173,406 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBMajorEngineVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBMajorEngineVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBMajorEngineVersions"))
+        // This operation reports reference data: it holds no per-caller records, so it
+        // reads neither this service's store nor the request context. Both are bound so
+        // the generated signature stays as it is.
+        let _ = (ctx, &self.engine);
+
+        // `MaxRecords` is read through the shared check for its DEFAULT page size: this
+        // operation's member carries a MODELLED range, so a value outside 20..100 is
+        // refused by the request layer before this handler runs and only the `None`
+        // branch — "Default: 100" — is reachable here.
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBMajorEngineVersionsError::validation)?;
+        // `families()` yields the families in catalogue order, so the keys below ascend
+        // and `paginate` can cut a page from them directly.
+        let matching: Vec<(String, DBMajorEngineVersion)> = families()
+            .into_iter()
+            .filter(|(_, family)| matches_request(family, &input))
+            .map(|(index, family)| (page_key(index), to_wire(family)))
+            .collect();
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBMajorEngineVersionsError::invalid_parameter_value)?;
+        Ok(DescribeDBMajorEngineVersionsOutput {
+            marker: page.next_marker,
+            db_major_engine_versions: Some(page.items),
+        })
     }
 }
+
+/// The pagination key of the family whose first catalogue row is at `index`.
+///
+/// `Marker` is an opaque pagination token, so what it owes a caller is that it is STABLE
+/// and ORDERED: `paginate` resumes at the first key at or past it, so paging walks one
+/// total order and a page boundary cannot drift between calls. The catalogue POSITION of
+/// a family's first version is both, and it keeps this report in the catalogue's own
+/// order — grouped by engine, ascending by version — rather than in the lexicographic
+/// order of major-version strings, under which `10.11` would be reported before the
+/// EARLIER `10.5`. Zero-padded so that lexicographic key order is numeric position order.
+fn page_key(index: usize) -> String {
+    format!("{index:06}")
+}
+
+/// The major-version families this service publishes, each with the catalogue position of
+/// its FIRST version.
+///
+/// The source is the engine-version catalogue `DescribeDBEngineVersions` owns: a major
+/// version exists because versions of it exist, so the distinct `(engine, major engine
+/// version)` pairs of that catalogue ARE this report, in first-appearance order. Every
+/// version of a family is walked, an available one and a deprecated one alike, because a
+/// family is published as long as the catalogue carries any version of it.
+fn families() -> Vec<(usize, &'static CatalogVersion)> {
+    let mut found: Vec<(usize, &'static CatalogVersion)> = Vec::new();
+    for (index, entry, _) in crate::ops::describe_db_engine_versions::catalogue() {
+        // An engine of another control plane publishes no major-engine-version report
+        // here; see this module's header.
+        if crate::ops::describe_db_engine_versions::serves_another_control_plane(entry.engine) {
+            continue;
+        }
+        if found
+            .iter()
+            .any(|(_, seen)| is_same_family(seen, entry.engine, entry.major_engine_version))
+        {
+            continue;
+        }
+        found.push((index, entry));
+    }
+    found
+}
+
+/// Whether `entry` is the family `(engine, major_engine_version)` names.
+fn is_same_family(entry: &CatalogVersion, engine: &str, major_engine_version: &str) -> bool {
+    entry.engine.eq_ignore_ascii_case(engine)
+        && entry
+            .major_engine_version
+            .eq_ignore_ascii_case(major_engine_version)
+}
+
+/// Whether `family` is in the report this request asks for.
+///
+/// Both members narrow and neither refuses: each is documented as the engine / the major
+/// engine version "to return details for", so a value naming a family this service does
+/// not publish selects none of them — the same answer the engine-version report gives a
+/// value no entry carries. Engine and version names are matched case-insensitively, the
+/// way every describe operation in this service matches them.
+fn matches_request(family: &CatalogVersion, input: &DescribeDBMajorEngineVersionsInput) -> bool {
+    if let Some(engine) = &input.engine {
+        if !family.engine.eq_ignore_ascii_case(engine) {
+            return false;
+        }
+    }
+    if let Some(major) = &input.major_engine_version {
+        if !family.major_engine_version.eq_ignore_ascii_case(major) {
+            return false;
+        }
+    }
+    true
+}
+
+/// One catalogue family as the modelled `DBMajorEngineVersion`.
+fn to_wire(family: &CatalogVersion) -> DBMajorEngineVersion {
+    DBMajorEngineVersion {
+        engine: Some(family.engine.to_string()),
+        major_engine_version: Some(family.major_engine_version.to_string()),
+        supported_engine_lifecycles: lifecycles(family.engine, family.major_engine_version),
+    }
+}
+
+/// `LifecycleSupportName` for RDS standard support or Aurora standard support, the first
+/// of the two values that enum publishes.
+const STANDARD_SUPPORT: &str = "open-source-rds-standard-support";
+
+/// `LifecycleSupportName` for Amazon RDS Extended Support, the second.
+const EXTENDED_SUPPORT: &str = "open-source-rds-extended-support";
+
+/// Seconds in one day.
+///
+/// The calendar below is written in whole days at midnight UTC, and Amazon RDS Extended
+/// Support picks a family up where standard support left it — so the extended window
+/// OPENS one day past the instant the standard window closes.
+const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+
+/// Whether `engine` is one of the OPEN-SOURCE engines a support lifecycle is published
+/// for at all: `SupportedEngineLifecycle` "only returns information for the open source
+/// engines Amazon RDS for MariaDB, Amazon RDS for MySQL, Amazon RDS for PostgreSQL,
+/// Aurora MySQL, and Aurora PostgreSQL".
+fn publishes_a_lifecycle(engine: &str) -> bool {
+    matches!(
+        engine,
+        "mariadb" | "mysql" | "postgres" | "aurora-mysql" | "aurora-postgresql"
+    )
+}
+
+/// Whether `engine` is offered Amazon RDS Extended Support past the end of standard
+/// support.
+///
+/// `LifecycleSupportName`: "For Amazon RDS for MySQL, Amazon RDS for PostgreSQL, Aurora
+/// MySQL, and Aurora PostgreSQL, this parameter returns both
+/// `open-source-rds-standard-support` and `open-source-rds-extended-support`. For Amazon
+/// RDS for MariaDB, this parameter only returns the value
+/// `open-source-rds-standard-support`."
+fn offers_extended_support(engine: &str) -> bool {
+    publishes_a_lifecycle(engine) && engine != "mariadb"
+}
+
+/// The support lifecycles of one family, or `None` for a family whose engine publishes
+/// none.
+///
+/// The windows are contiguous and in lifecycle order: standard support, from the day the
+/// family was released on this service to the day standard support for it ends, then —
+/// for an engine that is offered it — Amazon RDS Extended Support, from the day AFTER
+/// that until the published end of Extended Support.
+///
+/// An open-source family the calendar carries no row for PANICS rather than reporting no
+/// lifecycle list: the calendar and the engine-version catalogue are both in-tree
+/// literals, so a family without a row is a gap between the two tables, and reporting it
+/// as "this engine publishes no lifecycle" would state the answer a COMMERCIAL engine
+/// owes. Caller data cannot reach this: an `Engine` that is not a catalogue engine
+/// selects no family at all.
+fn lifecycles(engine: &str, major_engine_version: &str) -> Option<Vec<SupportedEngineLifecycle>> {
+    if !publishes_a_lifecycle(engine) {
+        return None;
+    }
+    let calendar = LIFECYCLE_CALENDAR
+        .iter()
+        .find(|row| row.engine == engine && row.major_engine_version == major_engine_version)
+        .unwrap_or_else(|| {
+            panic!(
+                "every open-source major engine version the catalogue publishes has a \
+                 support calendar row; {engine} {major_engine_version} has none"
+            )
+        });
+    let standard_end = crate::state::catalog_timestamp(calendar.standard_support_end);
+    let mut found = vec![SupportedEngineLifecycle {
+        lifecycle_support_name: STANDARD_SUPPORT.to_string(),
+        lifecycle_support_start_date: crate::state::catalog_timestamp(
+            calendar.standard_support_start,
+        ),
+        lifecycle_support_end_date: standard_end,
+    }];
+    if let Some(extended_end) = calendar
+        .extended_support_end
+        .filter(|_| offers_extended_support(engine))
+    {
+        found.push(SupportedEngineLifecycle {
+            lifecycle_support_name: EXTENDED_SUPPORT.to_string(),
+            lifecycle_support_start_date: ::aws_smithy_types::DateTime::from_secs(
+                standard_end.secs() + SECONDS_PER_DAY,
+            ),
+            lifecycle_support_end_date: crate::state::catalog_timestamp(extended_end),
+        });
+    }
+    Some(found)
+}
+
+/// The support calendar of one open-source major engine version.
+struct MajorVersionLifecycle {
+    /// The family's `Engine`, which must name an open-source engine
+    /// ([`publishes_a_lifecycle`]).
+    engine: &'static str,
+    /// The family's `MajorEngineVersion`, as the engine-version catalogue writes it.
+    major_engine_version: &'static str,
+    /// The day the family was released on this service, which opens standard support, as
+    /// an ISO-8601 instant.
+    standard_support_start: &'static str,
+    /// The day standard support for the family ends: the published date, aligned with the
+    /// community end of life of that major version.
+    standard_support_end: &'static str,
+    /// The day Amazon RDS Extended Support for the family ends, three years past the end
+    /// of standard support; `None` for a family offered no Extended Support.
+    extended_support_end: Option<&'static str>,
+}
+
+/// One calendar row, so the table below reads as a table.
+///
+/// Columns, in order: engine, major engine version, start of standard support, end of
+/// standard support, end of Amazon RDS Extended Support.
+const fn lifecycle(
+    engine: &'static str,
+    major_engine_version: &'static str,
+    standard_support_start: &'static str,
+    standard_support_end: &'static str,
+    extended_support_end: Option<&'static str>,
+) -> MajorVersionLifecycle {
+    MajorVersionLifecycle {
+        engine,
+        major_engine_version,
+        standard_support_start,
+        standard_support_end,
+        extended_support_end,
+    }
+}
+
+/// A family offered no Amazon RDS Extended Support, which is every MariaDB family: the
+/// column is empty rather than carrying a date nothing publishes.
+const NO_EXTENDED_SUPPORT: Option<&'static str> = None;
+
+/// The support calendar this service publishes for its open-source major engine versions.
+///
+/// Source: the major version release calendars Amazon publishes per open-source engine —
+/// "Amazon RDS for MySQL major version release calendar", and the MariaDB and PostgreSQL
+/// calendars beside it, in the Amazon RDS User Guide, with the Aurora MySQL and Aurora
+/// PostgreSQL release calendars in the Amazon Aurora User Guide. Each publishes, per major
+/// version, the day it was released on the service, the day standard support for it ends
+/// and the day Amazon RDS Extended Support for it ends. AWS publishes DAYS there, not
+/// times of day, so every instant below is that day at midnight UTC.
+///
+/// Like the engine-version catalogue this report reads, it is NOT the real service's live
+/// calendar, which moves with every release. What a caller can rely on is that every
+/// open-source family that catalogue publishes has a row here, that standard support opens
+/// no later than it closes, that Extended Support opens the day AFTER standard support
+/// closes and runs the three years AWS offers it for, and that a family whose engine is
+/// offered no Extended Support carries the standard window alone.
+///
+/// Rows are grouped by engine and ascend by major version, as the calendars publish them.
+const LIFECYCLE_CALENDAR: &[MajorVersionLifecycle] = &[
+    // --- Aurora MySQL -----------------------------------------------------
+    lifecycle(
+        "aurora-mysql",
+        "5.7",
+        "2017-10-24T00:00:00Z",
+        "2024-10-31T00:00:00Z",
+        Some("2027-10-31T00:00:00Z"),
+    ),
+    lifecycle(
+        "aurora-mysql",
+        "8.0",
+        "2022-01-27T00:00:00Z",
+        "2026-10-31T00:00:00Z",
+        Some("2029-10-31T00:00:00Z"),
+    ),
+    // --- Aurora PostgreSQL ------------------------------------------------
+    lifecycle(
+        "aurora-postgresql",
+        "11",
+        "2019-06-04T00:00:00Z",
+        "2024-02-29T00:00:00Z",
+        Some("2027-02-28T00:00:00Z"),
+    ),
+    lifecycle(
+        "aurora-postgresql",
+        "13",
+        "2021-05-11T00:00:00Z",
+        "2026-02-28T00:00:00Z",
+        Some("2029-02-28T00:00:00Z"),
+    ),
+    lifecycle(
+        "aurora-postgresql",
+        "14",
+        "2022-05-26T00:00:00Z",
+        "2026-11-30T00:00:00Z",
+        Some("2029-11-30T00:00:00Z"),
+    ),
+    lifecycle(
+        "aurora-postgresql",
+        "15",
+        "2023-04-25T00:00:00Z",
+        "2027-11-30T00:00:00Z",
+        Some("2030-11-30T00:00:00Z"),
+    ),
+    lifecycle(
+        "aurora-postgresql",
+        "16",
+        "2024-02-13T00:00:00Z",
+        "2028-11-30T00:00:00Z",
+        Some("2031-11-30T00:00:00Z"),
+    ),
+    // --- MariaDB ----------------------------------------------------------
+    // Every MariaDB family carries the standard window alone; see
+    // [`offers_extended_support`].
+    lifecycle(
+        "mariadb",
+        "10.5",
+        "2020-10-21T00:00:00Z",
+        "2025-06-30T00:00:00Z",
+        NO_EXTENDED_SUPPORT,
+    ),
+    lifecycle(
+        "mariadb",
+        "10.6",
+        "2021-07-21T00:00:00Z",
+        "2026-07-31T00:00:00Z",
+        NO_EXTENDED_SUPPORT,
+    ),
+    lifecycle(
+        "mariadb",
+        "10.11",
+        "2023-05-24T00:00:00Z",
+        "2028-02-29T00:00:00Z",
+        NO_EXTENDED_SUPPORT,
+    ),
+    lifecycle(
+        "mariadb",
+        "11.4",
+        "2024-11-21T00:00:00Z",
+        "2029-05-31T00:00:00Z",
+        NO_EXTENDED_SUPPORT,
+    ),
+    // --- MySQL ------------------------------------------------------------
+    lifecycle(
+        "mysql",
+        "5.7",
+        "2016-02-22T00:00:00Z",
+        "2024-02-29T00:00:00Z",
+        Some("2027-02-28T00:00:00Z"),
+    ),
+    lifecycle(
+        "mysql",
+        "8.0",
+        "2018-10-23T00:00:00Z",
+        "2026-07-31T00:00:00Z",
+        Some("2029-07-31T00:00:00Z"),
+    ),
+    lifecycle(
+        "mysql",
+        "8.4",
+        "2025-02-26T00:00:00Z",
+        "2032-04-30T00:00:00Z",
+        Some("2035-04-30T00:00:00Z"),
+    ),
+    // --- PostgreSQL -------------------------------------------------------
+    lifecycle(
+        "postgres",
+        "11",
+        "2018-11-13T00:00:00Z",
+        "2024-02-29T00:00:00Z",
+        Some("2027-02-28T00:00:00Z"),
+    ),
+    lifecycle(
+        "postgres",
+        "13",
+        "2020-11-10T00:00:00Z",
+        "2026-02-28T00:00:00Z",
+        Some("2029-02-28T00:00:00Z"),
+    ),
+    lifecycle(
+        "postgres",
+        "14",
+        "2021-11-03T00:00:00Z",
+        "2026-11-30T00:00:00Z",
+        Some("2029-11-30T00:00:00Z"),
+    ),
+    lifecycle(
+        "postgres",
+        "15",
+        "2023-02-09T00:00:00Z",
+        "2027-11-30T00:00:00Z",
+        Some("2030-11-30T00:00:00Z"),
+    ),
+    lifecycle(
+        "postgres",
+        "16",
+        "2023-11-09T00:00:00Z",
+        "2028-11-30T00:00:00Z",
+        Some("2031-11-30T00:00:00Z"),
+    ),
+    lifecycle(
+        "postgres",
+        "17",
+        "2024-11-14T00:00:00Z",
+        "2029-11-30T00:00:00Z",
+        Some("2032-11-30T00:00:00Z"),
+    ),
+];

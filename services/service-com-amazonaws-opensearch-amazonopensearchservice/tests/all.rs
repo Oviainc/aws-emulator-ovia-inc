@@ -19,6 +19,8 @@ mod data_source_registry;
 mod domain_health;
 #[path = "all/domain_lifecycle.rs"]
 mod domain_lifecycle;
+#[path = "all/service_software_rollback.rs"]
+mod service_software_rollback;
 #[path = "all/shared_es_signing_name_claim.rs"]
 mod shared_es_signing_name_claim;
 #[path = "all/state_roundtrip.rs"]

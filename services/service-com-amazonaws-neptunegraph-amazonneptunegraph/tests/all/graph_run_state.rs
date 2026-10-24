@@ -21,7 +21,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_neptunegraph_amazonneptunegraph::state::PROVISIONING_SPAN;
+use service_com_amazonaws_neptunegraph_amazonneptunegraph::state::{
+    DELETION_SPAN, PROVISIONING_SPAN,
+};
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -594,6 +596,21 @@ async fn a_stopped_graph_is_not_reconfigurable_but_is_deletable() {
         "case delete while STOPPED: expected DELETING, got {}",
         deleted["status"]
     );
+    // The deletion is a transition like any other: the graph stays readable while it is
+    // in flight and is gone once the clock makes it due.
+    let (deleting_status, deleting) = get(&router, &deleted_id).await;
+    assert_eq!(
+        deleting_status, 200,
+        "case delete while STOPPED: the graph must still be readable, \
+         got {deleting_status}: {deleting}"
+    );
+    assert_eq!(
+        deleting["status"],
+        json!("DELETING"),
+        "case delete while STOPPED: expected DELETING from GetGraph, got {}",
+        deleting["status"]
+    );
+    tokio::time::sleep(DELETION_SPAN + Duration::from_millis(150)).await;
     let (get_status, body) = get(&router, &deleted_id).await;
     assert_eq!(
         get_status, 404,

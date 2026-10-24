@@ -25,6 +25,8 @@ mod security_configuration;
 mod security_configuration_delete;
 #[path = "all/security_configuration_list.rs"]
 mod security_configuration_list;
+#[path = "all/start_job_run_required_members.rs"]
+mod start_job_run_required_members;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/virtual_cluster_job_run_loop.rs"]
