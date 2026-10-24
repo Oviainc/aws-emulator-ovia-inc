@@ -2285,6 +2285,36 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .find(|control| same_origin_access_control_config(&control.config, config))
     }
 
+    /// The distribution that attaches the origin access control `id` to one of its
+    /// origins, or `None` when no stored distribution does.
+    ///
+    /// `OriginAccessControlInUse` is documented as "Cannot delete the origin access
+    /// control because it's in use by one or more distributions", and `Origin$
+    /// OriginAccessControlId` is the only place a configuration names a control, so what
+    /// makes a control in use is a stored origin naming it. The scan reads the STORED
+    /// configurations rather than a second index beside them, so it cannot drift out of
+    /// step with what a read of those distributions reports; both collections are bounded
+    /// ([`MAX_DISTRIBUTIONS`] distributions, each with its own bounded origin list).
+    ///
+    /// An empty `id` names no control — [`resolve_distribution_config`] stores the empty
+    /// string for an origin that named none — so it never matches.
+    pub fn distribution_using_origin_access_control(
+        &self,
+        id: &str,
+    ) -> Option<&StoredDistribution> {
+        if id.is_empty() {
+            return None;
+        }
+        self.distributions.values().find(|distribution| {
+            distribution
+                .config
+                .origins
+                .items
+                .iter()
+                .any(|origin| origin.origin_access_control_id.as_deref() == Some(id))
+        })
+    }
+
     /// The origin request policy `id` names, or `None` when the store holds none.
     pub fn origin_request_policy(&self, id: &str) -> Option<&StoredOriginRequestPolicy> {
         self.origin_request_policies.get(id)
@@ -5244,17 +5274,21 @@ pub const NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE: &str =
 /// The modelled `NoSuchOriginAccessControl` (HTTP 404) for an origin access control id
 /// the store does not hold.
 ///
-/// The sentence is the one the model states on the shape itself — "The origin access
-/// control does not exist." — a property of the store rather than of the request, so
-/// nothing from the request belongs in the text.
+/// The sentence is a property of the store rather than of the request, so nothing from
+/// the request belongs in the text.
 pub fn no_such_origin_access_control() -> NoSuchOriginAccessControl {
     NoSuchOriginAccessControl {
         message: Some(NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE.to_string()),
     }
 }
 
-/// `NoSuchOriginAccessControl`'s message, as the model documents the shape.
-pub const NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE: &str = "The origin access control does not exist.";
+/// `NoSuchOriginAccessControl`'s message, in the form CloudFront answers a `NoSuch…` with
+/// for a named resource — "The specified <resource> does not exist.", as
+/// [`NO_SUCH_DISTRIBUTION_MESSAGE`] and [`NO_SUCH_ORIGIN_ACCESS_IDENTITY_MESSAGE`] carry
+/// it. The recorded service answers this code with that sentence, which the shape's own
+/// documentation states in its shorter form.
+pub const NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE: &str =
+    "The specified origin access control does not exist.";
 
 /// The sentence `OriginAccessControlAlreadyExists` carries, up to the control that
 /// already holds the submitted parameters, which it names at the end — the one piece of
@@ -5263,6 +5297,24 @@ pub fn origin_access_control_already_exists_message(existing_id: &str) -> String
     format!(
         "An origin access control with the specified parameters already exists: {existing_id}"
     )
+}
+
+/// The modelled `OriginAccessControlInUse` (HTTP 409) for a delete of a control an origin
+/// of `distribution_id` still names.
+///
+/// The sentence is the one the model states on the shape itself — "Cannot delete the
+/// origin access control because it's in use by one or more distributions." — up to the
+/// distribution that holds it, which it names at the end: the one piece of store-derived
+/// detail in it, and the one a caller cannot work out for itself.
+pub fn origin_access_control_in_use(
+    distribution_id: &str,
+) -> crate::ops::types::OriginAccessControlInUse {
+    crate::ops::types::OriginAccessControlInUse {
+        message: Some(format!(
+            "Cannot delete the origin access control because it's in use by one or more \
+             distributions: {distribution_id}"
+        )),
+    }
 }
 
 /// The modelled `InvalidArgument` for an `OriginAccessControlConfig$Name` longer than the

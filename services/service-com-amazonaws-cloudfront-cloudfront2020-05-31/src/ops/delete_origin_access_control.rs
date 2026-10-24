@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteOriginAccessControl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteOriginAccessControl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteOriginAccessControl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes ONE stored origin access control, so every later read of that id answers
+//! `NoSuchOriginAccessControl` and no listing reports it. The delete is gated on the
+//! caller holding the control's current version and on no stored distribution still
+//! naming it from an origin.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +165,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteOriginAccessControl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteOriginAccessControlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteOriginAccessControl"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes the rest of the store before this
+        // call reads it: whether a control is still in use is decided against the
+        // distributions as they stand at this instant.
+        store.settle(::std::time::SystemTime::now());
+
+        let Some(current_etag) = store
+            .origin_access_control(&input.id)
+            .map(|stored| stored.etag.clone())
+        else {
+            return Err(
+                DeleteOriginAccessControlErrorModeled::NoSuchOriginAccessControl(
+                    crate::state::no_such_origin_access_control(),
+                )
+                .into(),
+            );
+        };
+
+        // The precondition is checked first, the way HTTP evaluates one: a caller holding
+        // a version that is no longer current is told that before anything about what the
+        // control is attached to.
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            crate::state::IfMatch::Current => {}
+            crate::state::IfMatch::Invalid => {
+                return Err(
+                    DeleteOriginAccessControlErrorModeled::InvalidIfMatchVersion(
+                        crate::state::invalid_if_match_version(),
+                    )
+                    .into(),
+                );
+            }
+            crate::state::IfMatch::Stale => {
+                return Err(DeleteOriginAccessControlErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
+                )
+                .into());
+            }
+        }
+
+        // "You cannot delete an origin access control if it's in use. First, update all
+        // distributions to remove the origin access control from all origins, then delete
+        // the origin access control." So a control an origin of any stored distribution
+        // still names is refused here and stays readable.
+        if let Some(holder) = store
+            .distribution_using_origin_access_control(&input.id)
+            .map(|distribution| distribution.id.clone())
+        {
+            return Err(
+                DeleteOriginAccessControlErrorModeled::OriginAccessControlInUse(
+                    crate::state::origin_access_control_in_use(&holder),
+                )
+                .into(),
+            );
+        }
+
+        // Gone means gone: the record a read answered from is removed, so the id names no
+        // control and the parameters it held are free for a later create to claim.
+        store.origin_access_controls.remove(&input.id);
+
+        Ok(DeleteOriginAccessControlOutput)
     }
 }

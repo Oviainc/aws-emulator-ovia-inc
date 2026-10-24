@@ -71,7 +71,7 @@ use crate::response_headers_policy_lifecycle::escape;
 
 /// `POST /2020-05-31/origin-access-control` with the `OriginAccessControlConfig` document
 /// `body` — the member the operation binds to the HTTP payload.
-async fn create_control(router: &MultiServiceRouter, body: &str) -> Answer {
+pub(crate) async fn create_control(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -83,7 +83,7 @@ async fn create_control(router: &MultiServiceRouter, body: &str) -> Answer {
 }
 
 /// `GET /2020-05-31/origin-access-control/{Id}`.
-async fn get_control(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_control(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",
@@ -96,7 +96,7 @@ async fn get_control(router: &MultiServiceRouter, id: &str) -> Answer {
 
 /// `GET /2020-05-31/origin-access-control`, with `query` appended verbatim
 /// (`?MaxItems=2&Marker=E…`), from the operation's `http` binding.
-async fn list_controls(router: &MultiServiceRouter, query: &str) -> Answer {
+pub(crate) async fn list_controls(router: &MultiServiceRouter, query: &str) -> Answer {
     call(
         router,
         "GET",
@@ -113,9 +113,9 @@ async fn list_controls(router: &MultiServiceRouter, query: &str) -> Answer {
 
 /// One `OriginAccessControlConfig`, as a client submits it.
 #[derive(Debug, Clone)]
-struct Control {
+pub(crate) struct Control {
     /// What this row is a case of, named in every assertion it drives.
-    case: String,
+    pub(crate) case: String,
     name: String,
     /// `Description`, or `None` to leave the optional member out entirely.
     description: Option<String>,
@@ -130,7 +130,7 @@ struct Control {
 impl Control {
     /// The `OriginAccessControlConfig` XML a client sends for this configuration, in the
     /// model's member declaration order.
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         let mut out = format!(
             "<OriginAccessControlConfig \
              xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">"
@@ -154,7 +154,7 @@ impl Control {
 
     /// Assert that `config` — an `OriginAccessControlConfig` element the emulator
     /// serialised — reports exactly this configuration.
-    fn assert_matches(&self, config: &Node, context: &str, raw: &str) {
+    pub(crate) fn assert_matches(&self, config: &Node, context: &str, raw: &str) {
         for (member, expected) in [
             ("Name", self.name.clone()),
             ("SigningProtocol", self.signing_protocol.clone()),
@@ -224,7 +224,7 @@ impl Control {
 /// so every value of every enum the configuration carries appears at least once and the
 /// descriptions (absent, empty, ASCII, XML metacharacters) span the forms a text member
 /// takes.
-fn table() -> Vec<Control> {
+pub(crate) fn table() -> Vec<Control> {
     // The description forms, cycled across the rows: absent, empty, plain ASCII and text
     // carrying XML metacharacters, which the wire form has to survive.
     let descriptions: [Option<&str>; 4] = [
@@ -283,7 +283,7 @@ fn table() -> Vec<Control> {
 // ---------------------------------------------------------------------------
 
 /// The ids a listing's page reports, in the order the page carries them.
-fn page_ids(answer: &Answer) -> Vec<String> {
+pub(crate) fn page_ids(answer: &Answer) -> Vec<String> {
     answer
         .root()
         .at("Items")
