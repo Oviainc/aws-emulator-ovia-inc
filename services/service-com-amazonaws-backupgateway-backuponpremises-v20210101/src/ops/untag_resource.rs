@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the tags a request's `TagKeys` names from the resource an ARN names, in
+//! [`crate::state`]. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removal is BY KEY: a listed key is dropped whatever its value, every other tag stays,
+//! and a key the resource does not carry is nothing to remove — so the call succeeds and
+//! repeating it changes nothing.
+//!
+//! An ARN with no record behind it is refused as the resource TYPE it names: a missing
+//! hypervisor takes the modelled `ResourceNotFoundException` shape at HTTP 400 with
+//! `ErrorCode` `HypervisorNotFound`, every other type the 404 that shape declares
+//! ([`crate::state::MissingResource`]).
 //!
 //! ## Shape of an operation
 //!
@@ -83,10 +85,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupgateway-backuponp
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupgateway#UntagResource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupgateway#UntagResource",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -140,18 +146,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Request metadata only; the store is reached through `self.engine`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServerException(InternalServerException {
+                error_code: None,
+                message: Some("Backup gateway state is unavailable on this engine.".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // Untagging REMOVES BY KEY: every key the request names is dropped from the
+        // resource's tag set whatever its value, and a key the resource does not carry
+        // leaves the set alone — so the call is idempotent and never refuses a key that
+        // is not there.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // The ARN is resolved against the resource it NAMES — this service tags gateways
+        // and hypervisors alike, so one lookup spans both stores — and an ARN with no
+        // record behind it takes the refusal that resource type carries: the same
+        // modelled `ResourceNotFoundException` shape throughout, but a missing hypervisor
+        // is answered 400 with `ErrorCode` `HypervisorNotFound` where every other type
+        // takes the shape's own 404 (`crate::state::MissingResource`).
+        let Some(resource_arn) = state.remove_resource_tags(&input.resource_arn, &input.tag_keys)
+        else {
+            let missing = crate::state::MissingResource::for_arn(&input.resource_arn);
+            let error =
+                UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    error_code: missing.error_code().map(str::to_string),
+                    message: Some(missing.message(&input.resource_arn)),
+                });
+            return Err(match missing.status_override() {
+                Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
+                None => error.into(),
+            });
+        };
+
+        Ok(UntagResourceOutput {
+            resource_arn: Some(resource_arn),
+        })
     }
 }

@@ -1045,10 +1045,6 @@ async fn operations_outside_this_slice_still_answer_501() {
 
     let rows: [(&str, Value); 3] = [
         (
-            "UntagResource",
-            json!({ "ResourceARN": arn, "TagKeys": ["env"] }),
-        ),
-        (
             "GetVirtualMachine",
             json!({ "ResourceArn": format!(
                 "arn:aws:backup-gateway:{REGION}:{}:vm/vm-0000000000000000",
@@ -1058,6 +1054,10 @@ async fn operations_outside_this_slice_still_answer_501() {
         (
             "PutMaintenanceStartTime",
             json!({ "GatewayArn": arn, "HourOfDay": 2, "MinuteOfHour": 0, "DayOfWeek": 1 }),
+        ),
+        (
+            "UpdateGatewaySoftwareNow",
+            json!({ "GatewayArn": arn }),
         ),
     ];
 

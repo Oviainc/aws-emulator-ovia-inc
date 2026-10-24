@@ -1073,6 +1073,27 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
             hypervisor.arn.clone()
         }))
     }
+
+    /// Remove the tags `keys` names from the resource `arn` names, and hand back the ARN
+    /// the store holds it under.
+    ///
+    /// Removal is BY KEY and nothing else: a key the resource carries is dropped whatever
+    /// its value, a key it does not carry leaves the tag set alone (so removing the same
+    /// key twice, or one never set, is a no-op that still succeeds), and a repeated key in
+    /// one request removes it once. `None` for an ARN this store holds no record for, and
+    /// spans both resource types for the same reason as [`Self::resource_tags`].
+    pub fn remove_resource_tags(&mut self, arn: &str, keys: &[String]) -> Option<String> {
+        let tags = match self.gateways.get_mut(arn) {
+            Some(gateway) => &mut gateway.tags,
+            None => &mut self.hypervisors.get_mut(arn)?.tags,
+        };
+        for key in keys {
+            tags.remove(key);
+        }
+        // The ARN comes back out of the store, so what the response echoes is the key the
+        // store holds rather than the string the request spelled.
+        self.resource_tags(arn).map(|(resource_arn, _)| resource_arn)
+    }
 }
 
 /// One page of an ARN-keyed resource map in key order — the paging every list

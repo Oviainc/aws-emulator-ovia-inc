@@ -27,6 +27,8 @@ mod hypervisor_reads;
 mod metadata_sync;
 #[path = "all/negative_paths.rs"]
 mod negative_paths;
+#[path = "all/resource_untagging.rs"]
+mod resource_untagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/virtual_machine_listing.rs"]
