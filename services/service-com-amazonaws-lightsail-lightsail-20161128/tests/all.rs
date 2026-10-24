@@ -45,6 +45,8 @@ mod disk_restore_from_snapshot;
 mod disk_snapshot;
 #[path = "all/distribution_cdn.rs"]
 mod distribution_cdn;
+#[path = "all/domain_delete.rs"]
+mod domain_delete;
 #[path = "all/domain_entry_delete.rs"]
 mod domain_entry_delete;
 #[path = "all/domain_entry_recordset.rs"]
