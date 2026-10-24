@@ -1778,6 +1778,60 @@ pub fn malformed_id(member: &str, value: &str) -> Option<InvalidRequestException
     })
 }
 
+/// How many decimal digits an Amazon Web Services account ID is written with.
+///
+/// An account ID is a twelve-digit number — the `<account>` field of every ARN this
+/// service writes is one, namely `engine::emulator_account_id()` — so a member documented
+/// as an account ID carries exactly that many digits and nothing else.
+pub const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// The input member documented as an Amazon Web Services ACCOUNT ID: `InviteAction`'s
+/// `Principal`, "The Amazon Web Services account ID to invite". Named like
+/// [`MEMBER_ACCESSOR_ID`] because it is the input member a refusal echoes, not a resource
+/// noun.
+pub const MEMBER_PRINCIPAL: &str = "Principal";
+
+/// Whether `value` is an Amazon Web Services account ID: exactly [`ACCOUNT_ID_DIGITS`]
+/// ASCII decimal digits, leading zeros included (the emulator's own account id is one).
+///
+/// A FORMAT test on the account-id domain, like [`id_in_minted_space`] is on a resource-id
+/// space: nothing is claimed about whether such an account exists.
+pub fn is_account_id(value: &str) -> bool {
+    value.len() == ACCOUNT_ID_DIGITS && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// How this service words a value of a member documented as an account ID that is not one:
+/// `Principal parameter <value> is malformed: an Amazon Web Services account ID is 12
+/// digits`, naming the input member that carried it, the value the request held and the
+/// rule it broke, so the caller can see which of its inputs to fix. A value the request
+/// left EMPTY has nothing to echo, so the sentence states the member alone rather than
+/// reading as a double space — the same shape [`malformed_id_sentence`] takes.
+///
+/// `None` when there is nothing to refuse, i.e. the value IS an account ID.
+pub fn not_an_account_id_sentence(member: &str, value: &str) -> Option<String> {
+    if is_account_id(value) {
+        return None;
+    }
+    let rule = format!("an Amazon Web Services account ID is {ACCOUNT_ID_DIGITS} digits");
+    if value.is_empty() {
+        return Some(format!("{member} parameter is malformed: {rule}"));
+    }
+    Some(format!("{member} parameter {value} is malformed: {rule}"))
+}
+
+/// The `InvalidRequestException` ("The action or operation requested is invalid", HTTP
+/// 400) for a member documented as an Amazon Web Services account ID whose value is not
+/// one, worded by [`not_an_account_id_sentence`]; `None` when the value is an account ID.
+///
+/// Raised BEFORE anything is stored: a request naming a principal that could not be an
+/// account is one to fix, and accepting it would persist an action nothing could ever
+/// carry out.
+pub fn not_an_account_id(member: &str, value: &str) -> Option<InvalidRequestException> {
+    not_an_account_id_sentence(member, value).map(|message| InvalidRequestException {
+        message: Some(message),
+    })
+}
+
 /// The `ResourceNotFoundException` for a resource the request named BY ARN and this
 /// service does not hold.
 ///

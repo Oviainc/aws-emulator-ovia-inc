@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProposal
-//! Implemented: mints a proposal id, persists the proposal against the network the
-//! request names (with the actions, description and tags it carried, the proposing
-//! member, `IN_PROGRESS` as its status and the expiry the network's voting policy fixes),
-//! and returns the id read back out of the store. `GetProposal` projects the same record.
+//! Implemented: refuses a request whose `Actions` cannot be carried out — the two action
+//! kinds together, neither of them, or an `InviteAction$Principal` that is not an Amazon
+//! Web Services account ID — and otherwise mints a proposal id, persists the proposal
+//! against the network the request names (with the actions, description and tags it
+//! carried, the proposing member, `IN_PROGRESS` as its status and the expiry the network's
+//! voting policy fixes), and returns the id read back out of the store. `GetProposal`
+//! projects the same record.
 //!
 //! ## Shape of an operation
 //!
@@ -210,6 +213,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // "The Amazon Web Services account ID to invite" (`InviteAction$Principal`): the
+        // value names an ACCOUNT, and an Amazon Web Services account id is exactly twelve
+        // decimal digits. `PrincipalString` carries no pattern, so the handler is what
+        // holds the member to the domain its documentation gives it — and it must, because
+        // the invitation an approved `InviteAction` mints is only ever usable by the
+        // account it names: a principal no account could have would leave the proposal
+        // `APPROVED` having granted nothing. EVERY invite the request carries is held to
+        // it, so a list whose later entries are malformed is refused too, and the refusal
+        // comes before the idempotency record and before anything is stored.
+        for invite in input.actions.invitations.iter().flatten() {
+            if let Some(refusal) =
+                crate::state::not_an_account_id(crate::state::MEMBER_PRINCIPAL, &invite.principal)
+            {
+                return Err(CreateProposalErrorModeled::InvalidRequestException(refusal).into());
+            }
         }
 
         let region = crate::state::request_region(ctx);
