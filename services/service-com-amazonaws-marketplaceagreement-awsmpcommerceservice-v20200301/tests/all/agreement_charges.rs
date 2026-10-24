@@ -41,11 +41,10 @@ const AGREEMENT_TYPE: &str = "PurchaseAgreement";
 const OTHER_AGREEMENT_TYPE: &str = "VendorInsightsAgreement";
 
 /// The one catalog AWS Marketplace exposes, which every agreement of this
-/// service is created in.
+/// service is created in — and so the only catalog a selector admits: another
+/// one is refused rather than reported as an empty page, which
+/// `selector_resolution.rs` pins.
 const CATALOG: &str = "AWSMarketplace";
-
-/// A catalog name no agreement of this service is created in.
-const OTHER_CATALOG: &str = "AWSMarketplace.test";
 
 /// A charge is minted once and never revised here, so every reported charge sits
 /// at `ChargeRevision`'s first value (`@range(min: 1)`,
@@ -221,11 +220,12 @@ async fn the_report_carries_every_charge_of_every_agreement_it_selects() {
         }
 
         // A selector no agreement matches selects no charge at all — an empty
-        // report, not a refusal.
+        // report, not a refusal. Both values are ones the member admits: the
+        // other documented `agreementType`, alone and combined with the one
+        // catalog.
         for selector in [
             json!({"agreementType": OTHER_AGREEMENT_TYPE}),
-            json!({"catalog": OTHER_CATALOG}),
-            json!({"agreementType": AGREEMENT_TYPE, "catalog": OTHER_CATALOG}),
+            json!({"agreementType": OTHER_AGREEMENT_TYPE, "catalog": CATALOG}),
         ] {
             let answer = reported(&router, selector.clone()).await;
             assert!(

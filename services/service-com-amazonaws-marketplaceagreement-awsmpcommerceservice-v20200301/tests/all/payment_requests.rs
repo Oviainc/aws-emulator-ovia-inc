@@ -537,6 +537,10 @@ async fn each_optional_parameter_selects_the_stored_payment_requests_it_names() 
     let router = emulator();
     let alpha = agreement_with_variable_term(&router, "ap-alpha", "vpt-alpha").await;
     let beta = agreement_with_variable_term(&router, "ap-beta", "vpt-beta").await;
+    // A third agreement under which nothing was ever sent: an `agreementId`
+    // naming it is a selector that matches nothing, as opposed to one naming no
+    // agreement at all, which `selector_resolution.rs` pins as a refusal.
+    let gamma = agreement_with_variable_term(&router, "ap-gamma", "vpt-gamma").await;
     let ids = [
         sent(&router, &alpha, "vpt-alpha", "Alpha first", "10").await,
         sent(&router, &alpha, "vpt-alpha", "Alpha second", "20.5").await,
@@ -560,8 +564,8 @@ async fn each_optional_parameter_selects_the_stored_payment_requests_it_names() 
             expected: &[2],
         },
         Selector {
-            case: "an agreement the store does not hold selects nothing",
-            selector: json!({"agreementId": "agmt-does-not-exist"}),
+            case: "an agreement nothing was sent under selects nothing",
+            selector: json!({"agreementId": gamma.clone()}),
             expected: &[],
         },
         Selector {
@@ -585,18 +589,16 @@ async fn each_optional_parameter_selects_the_stored_payment_requests_it_names() 
             expected: &[0, 1, 2],
         },
         Selector {
-            case: "another catalog selects nothing",
-            selector: json!({"catalog": "AWSMarketplace.Staging"}),
-            expected: &[],
-        },
-        Selector {
             case: "an agreement and the status it holds are both applied",
             selector: json!({"agreementId": alpha.clone(), "status": PENDING_APPROVAL}),
             expected: &[0, 1],
         },
         Selector {
-            case: "an agreement and a catalog it is not in select nothing",
-            selector: json!({"agreementId": alpha.clone(), "catalog": "Other"}),
+            case: "an agreement and an agreement type it does not carry select nothing",
+            selector: json!({
+                "agreementId": alpha.clone(),
+                "agreementType": "VendorInsightsAgreement",
+            }),
             expected: &[],
         },
     ];
