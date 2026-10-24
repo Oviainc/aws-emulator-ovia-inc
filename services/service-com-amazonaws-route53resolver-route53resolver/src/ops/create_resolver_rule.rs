@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResolverRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResolverRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResolverRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. The Resolver-rule slice (`CreateResolverRule`,
+//! `GetResolverRule`, `AssociateResolverRule`, `GetResolverRuleAssociation`)
+//! computes every response from the records in [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +113,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    DNS_PORT, ENDPOINT_DIRECTION_OUTBOUND, RULE_TYPE_DELEGATE, RULE_TYPE_FORWARD,
+    RULE_TYPE_RECURSIVE, RULE_TYPE_SYSTEM,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -195,18 +194,260 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResolverRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResolverRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResolverRule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateResolverRuleErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let target_ips = input.target_ips.clone().unwrap_or_default();
+        let rule_type = input.rule_type.as_str();
+
+        // `RuleType`: "Currently, only Resolver can create rules that have a
+        // value of RECURSIVE for RuleType" — so a caller asking for one is
+        // refused rather than served a rule AWS would not have made.
+        if rule_type == RULE_TYPE_RECURSIVE {
+            return Err(CreateResolverRuleErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "Only Resolver can create rules with RuleType {RULE_TYPE_RECURSIVE}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `TargetIps`: "TargetIps is available only when the value of Rule type
+        // is FORWARD", and a FORWARD rule is what forwards queries "to the IP
+        // addresses that are specified in TargetIps", so it cannot do without
+        // them.
+        if rule_type == RULE_TYPE_FORWARD {
+            if target_ips.is_empty() {
+                return Err(CreateResolverRuleErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "A rule with RuleType {RULE_TYPE_FORWARD} must specify TargetIps"
+                        )),
+                    },
+                )
+                .into());
+            }
+        } else if !target_ips.is_empty() {
+            return Err(CreateResolverRuleErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "TargetIps is available only for a rule with RuleType {RULE_TYPE_FORWARD}, not {rule_type}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The model puts no maximum on `TargetList`, so the list one record can
+        // hold is bounded here; refused before the store is locked, so nothing
+        // is written.
+        if target_ips.len() > crate::state::MAX_TARGET_IPS {
+            return Err(CreateResolverRuleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "A Resolver rule accepts at most {} target IP addresses in this emulator",
+                        crate::state::MAX_TARGET_IPS
+                    )),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_RESOLVER_RULE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Each target address names where to forward to, so one that carries
+        // neither `Ip` nor `Ipv6` says nothing; and `TargetIps`: "You can
+        // specify either Ipv4 or Ipv6 addresses but not both in the same rule."
+        let ipv4_targets = target_ips.iter().filter(|target| target.ip.is_some()).count();
+        let ipv6_targets = target_ips
+            .iter()
+            .filter(|target| target.ipv6.is_some())
+            .count();
+        if ipv4_targets + ipv6_targets < target_ips.len() {
+            return Err(CreateResolverRuleErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: "Each target address must specify Ip or Ipv6".to_string(),
+                    field_name: Some("TargetIps".to_string()),
+                },
+            )
+            .into());
+        }
+        if ipv4_targets > 0 && ipv6_targets > 0 {
+            return Err(CreateResolverRuleErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: "A Resolver rule can specify either Ip or Ipv6 target addresses, not both"
+                        .to_string(),
+                    field_name: Some("TargetIps".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // `DomainName`: "DNS queries for this domain name are forwarded to the
+        // IP addresses that you specify in TargetIps", and a SYSTEM rule is the
+        // one that makes Resolver "process queries for a subdomain of that
+        // domain": both select on a domain name, so neither can omit it.
+        if (rule_type == RULE_TYPE_FORWARD || rule_type == RULE_TYPE_SYSTEM)
+            && input.domain_name.is_none()
+        {
+            return Err(CreateResolverRuleErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "A rule with RuleType {rule_type} must specify DomainName"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `TargetIps`: "when creating a DELEGATE rule, you must not provide the
+        // TargetIps parameter. If you provide the TargetIps, you may receive an
+        // ERROR message similar to 'Delegate resolver rules need to specify a
+        // nameserver name'" — the nameserver name is `DelegationRecord`.
+        if rule_type == RULE_TYPE_DELEGATE && input.delegation_record.is_none() {
+            return Err(CreateResolverRuleErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "A rule with RuleType {RULE_TYPE_DELEGATE} must specify DelegationRecord"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `ResolverEndpointId`: "The ID of the outbound Resolver endpoint that
+        // you want to use to route DNS queries to the IP addresses that you
+        // specify in TargetIps" — a FORWARD rule routes through one, so it names
+        // one, and whatever names an endpoint must name a stored OUTBOUND one.
+        if rule_type == RULE_TYPE_FORWARD && input.resolver_endpoint_id.is_none() {
+            return Err(CreateResolverRuleErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "A rule with RuleType {RULE_TYPE_FORWARD} must specify ResolverEndpointId"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        if let Some(endpoint_id) = input.resolver_endpoint_id.as_deref() {
+            let Some(endpoint) = store.resolver_endpoints.get(endpoint_id) else {
+                return Err(CreateResolverRuleErrorModeled::ResourceNotFoundException(
+                    crate::state::resolver_endpoint_not_found(endpoint_id),
+                )
+                .into());
+            };
+            if endpoint.direction != ENDPOINT_DIRECTION_OUTBOUND {
+                return Err(CreateResolverRuleErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "Resolver endpoint {endpoint_id} is {}; a Resolver rule routes queries through an {ENDPOINT_DIRECTION_OUTBOUND} endpoint",
+                            endpoint.direction
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // `CreatorRequestId` "allows failed requests to be retried without the
+        // risk of running the operation twice": a repeat of a request id that
+        // already created a rule resolves to THAT rule and creates nothing.
+        if let Some(existing_id) = store.rule_creator_request_id_index.get(&input.creator_request_id)
+        {
+            if let Some(record) = store.resolver_rules.get(existing_id) {
+                return Ok(CreateResolverRuleOutput {
+                    resolver_rule: Some(record.to_rule()),
+                });
+            }
+        }
+
+        // The store is bounded: a new rule past the cap is refused with the
+        // `LimitExceededException` this operation models, BEFORE anything is
+        // written. The retry path above is unaffected — it allocates no record.
+        if !store.can_store_another_rule() {
+            return Err(CreateResolverRuleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This emulator stores at most {} Resolver rules; delete one before creating another",
+                        crate::state::MAX_STORED_RULES
+                    )),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_RESOLVER_RULE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let timestamp = crate::state::now_rfc3339();
+        let seq = store.next_seq();
+        let id = crate::state::mint_rule_id(seq);
+        let arn = ::engine::emulator_arn(
+            crate::state::ARN_NAMESPACE,
+            &region,
+            &format!("resolver-rule/{id}"),
+        );
+
+        let stored_targets: Vec<TargetAddress> = target_ips
+            .iter()
+            .map(|target| TargetAddress {
+                ip: target.ip.clone(),
+                // DNS answers on port 53 (RFC 1035 §4.2), which is the port a
+                // target address that names none forwards to.
+                port: Some(target.port.unwrap_or(DNS_PORT)),
+                ipv6: target.ipv6.clone(),
+                // The `Protocol` enum's `Do53` is what "None" means for a
+                // Resolver protocol, per `CreateResolverEndpoint`'s `Protocols`
+                // doc: "None, which is treated as Do53."
+                protocol: Some(
+                    target
+                        .protocol
+                        .clone()
+                        .unwrap_or_else(|| crate::state::DEFAULT_PROTOCOL.to_string()),
+                ),
+                // "only used if the Protocol of the TargetAddress is DoH", so
+                // it is echoed, never invented.
+                server_name_indication: target.server_name_indication.clone(),
+            })
+            .collect();
+
+        let record = crate::state::ResolverRuleRecord {
+            seq,
+            id: id.clone(),
+            arn,
+            creator_request_id: input.creator_request_id.clone(),
+            name: input.name.clone(),
+            domain_name: input.domain_name.clone(),
+            rule_type: input.rule_type.clone(),
+            target_ips: stored_targets,
+            resolver_endpoint_id: input.resolver_endpoint_id.clone(),
+            delegation_record: input.delegation_record.clone(),
+            owner_id: ::engine::emulator_account_id().to_string(),
+            share_status: crate::state::SHARE_STATUS_NOT_SHARED.to_string(),
+            status: crate::state::RULE_STATUS_COMPLETE.to_string(),
+            status_message: None,
+            tags: input.tags.clone().unwrap_or_default(),
+            creation_time: timestamp.clone(),
+            modification_time: timestamp,
+        };
+
+        let rule = record.to_rule();
+        store
+            .rule_creator_request_id_index
+            .insert(input.creator_request_id.clone(), id.clone());
+        store.resolver_rules.insert(id, record);
+
+        Ok(CreateResolverRuleOutput {
+            resolver_rule: Some(rule),
+        })
     }
 }

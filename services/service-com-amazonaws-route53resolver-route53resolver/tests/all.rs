@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/resolver_endpoints.rs"]
 mod resolver_endpoints;
+#[path = "all/resolver_rules.rs"]
+mod resolver_rules;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

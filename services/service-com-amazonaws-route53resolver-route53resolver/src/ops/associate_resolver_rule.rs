@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateResolverRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateResolverRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateResolverRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. The Resolver-rule slice (`CreateResolverRule`,
+//! `GetResolverRule`, `AssociateResolverRule`, `GetResolverRuleAssociation`)
+//! computes every response from the records in [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +160,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateResolverRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateResolverRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateResolverRule"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AssociateResolverRuleErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+
+        // `ResolverRuleId`: "The ID of the Resolver rule that you want to
+        // associate with the VPC" — the rule has to exist for the association to
+        // mean anything.
+        if !store.resolver_rules.contains_key(&input.resolver_rule_id) {
+            return Err(AssociateResolverRuleErrorModeled::ResourceNotFoundException(
+                crate::state::resolver_rule_not_found(&input.resolver_rule_id),
+            )
+            .into());
+        }
+
+        // One rule is associated with one VPC at most once: associating a pair
+        // the store already holds is the resource that "you tried to create
+        // [and] already exists", so it is refused and nothing is written.
+        if let Some(existing) = store.find_rule_association(&input.resolver_rule_id, &input.vpc_id) {
+            return Err(AssociateResolverRuleErrorModeled::ResourceExistsException(
+                ResourceExistsException {
+                    message: Some(format!(
+                        r#"Resolver rule "{}" is already associated with VPC "{}" by association "{}""#,
+                        input.resolver_rule_id, input.vpc_id, existing.id
+                    )),
+                    resource_type: Some(
+                        crate::state::RESOURCE_TYPE_RESOLVER_RULE_ASSOCIATION.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: an association past the cap is refused with the
+        // `LimitExceededException` this operation models, before anything is
+        // written.
+        if !store.can_store_another_rule_association() {
+            return Err(AssociateResolverRuleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This emulator stores at most {} Resolver rule associations; disassociate one before associating another",
+                        crate::state::MAX_STORED_RULE_ASSOCIATIONS
+                    )),
+                    resource_type: Some(
+                        crate::state::RESOURCE_TYPE_RESOLVER_RULE_ASSOCIATION.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::Instant::now();
+        let seq = store.next_seq();
+        let record = crate::state::ResolverRuleAssociationRecord {
+            seq,
+            id: crate::state::mint_rule_association_id(seq),
+            resolver_rule_id: input.resolver_rule_id.clone(),
+            vpc_id: input.vpc_id.clone(),
+            name: input.name.clone(),
+            // A new association reports the transient status of the model's
+            // `ResolverRuleAssociationStatus`; the move to `COMPLETE` is owed
+            // after the provisioning span, so a caller reading straight after
+            // this call still observes `CREATING`.
+            status: crate::state::RULE_ASSOCIATION_STATUS_CREATING.to_string(),
+            status_message: None,
+            complete_at: now + crate::state::PROVISIONING_DELAY,
+        };
+
+        let association = record.to_association(now);
+        store
+            .resolver_rule_associations
+            .insert(record.id.clone(), record);
+
+        Ok(AssociateResolverRuleOutput {
+            resolver_rule_association: Some(association),
+        })
     }
 }

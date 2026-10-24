@@ -3,18 +3,21 @@
 //! Engine state for the com-amazonaws-route53resolver-route53resolver service.
 //!
 //! Besides the state struct this module owns the small pieces the Resolver
-//! endpoint operations share, so no two handlers grow their own copy: id
-//! minting, the RFC 3339 clock read, the clock-owed status transition, the
-//! opaque pagination cursor the two `@paginated` list operations mint and
-//! verify, the record -> modelled-shape projections, and the RSLVR-coded
-//! exception message every endpoint operation reports a missing endpoint with.
+//! endpoint and Resolver rule operations share, so no two handlers grow their
+//! own copy: id minting, the RFC 3339 clock read, the clock-owed status
+//! transition, the opaque pagination cursor the two `@paginated` list
+//! operations mint and verify, the record -> modelled-shape projections, and
+//! the exception bodies the operations report a missing resource with.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{IpAddressResponse, ResolverEndpoint, ResourceNotFoundException, Tag};
+use crate::ops::types::{
+    IpAddressResponse, ResolverEndpoint, ResolverRule, ResolverRuleAssociation,
+    ResourceNotFoundException, Tag, TargetAddress,
+};
 
 /// The region an ARN carries when the request's SigV4 scope names none.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -38,6 +41,24 @@ pub const ENDPOINT_STATUS_DELETING: &str = "DELETING";
 pub const IP_STATUS_CREATING: &str = "CREATING";
 pub const IP_STATUS_ATTACHED: &str = "ATTACHED";
 pub const IP_STATUS_UPDATING: &str = "UPDATING";
+
+/// `ResolverEndpointDirection` value for an endpoint that "forwards DNS queries
+/// from the DNS service for a VPC to your network", from the model's enum
+/// (`smithy_query(query="shape",shape="ResolverEndpointDirection")`); it is the
+/// direction a Resolver rule routes its queries through.
+pub const ENDPOINT_DIRECTION_OUTBOUND: &str = "OUTBOUND";
+
+/// `RuleTypeOption` values, the model's whole enum
+/// (`smithy_query(query="shape",shape="RuleTypeOption")`).
+pub const RULE_TYPE_FORWARD: &str = "FORWARD";
+pub const RULE_TYPE_SYSTEM: &str = "SYSTEM";
+pub const RULE_TYPE_RECURSIVE: &str = "RECURSIVE";
+pub const RULE_TYPE_DELEGATE: &str = "DELEGATE";
+
+/// The port a rule's target address forwards to when the request names none:
+/// the well-known DNS port (RFC 1035 §4.2, "the Internet standard port 53").
+/// Inside `TargetAddress$Port`'s modelled range (0..65535).
+pub const DNS_PORT: i32 = 53;
 
 /// The protocol an endpoint gets when the request names none.
 ///
@@ -122,6 +143,53 @@ pub const RSLVR_CODE_ENDPOINT_NOT_FOUND: &str = "RSLVR-00501";
 /// exist": the modelled shape name of a Resolver endpoint.
 pub const RESOURCE_TYPE_RESOLVER_ENDPOINT: &str = "ResolverEndpoint";
 
+/// The same, for a Resolver rule and for one rule-to-VPC association.
+pub const RESOURCE_TYPE_RESOLVER_RULE: &str = "ResolverRule";
+pub const RESOURCE_TYPE_RESOLVER_RULE_ASSOCIATION: &str = "ResolverRuleAssociation";
+
+/// The `ResolverRuleStatus` a stored rule reports.
+///
+/// The model's enum (`smithy_query(query="shape",shape="ResolverRuleStatus")`)
+/// is `COMPLETE | DELETING | UPDATING | FAILED`: it has no provisioning value,
+/// so a created rule is settled the moment it exists and the clock owes it no
+/// transition. `DELETING`/`UPDATING`/`FAILED` describe operations this slice
+/// does not perform.
+pub const RULE_STATUS_COMPLETE: &str = "COMPLETE";
+
+/// `ResolverRuleAssociationStatus` values this slice reports, out of the
+/// model's enum (`smithy_query(query="shape",shape="ResolverRuleAssociationStatus")`);
+/// `DELETING`, `FAILED` and `OVERRIDDEN` describe states this slice does not
+/// produce.
+pub const RULE_ASSOCIATION_STATUS_CREATING: &str = "CREATING";
+pub const RULE_ASSOCIATION_STATUS_COMPLETE: &str = "COMPLETE";
+
+/// `ResolverRule$ShareStatus` for a rule this account owns and has not shared:
+/// a member of the model's `ShareStatus` enum
+/// (`smithy_query(query="shape",shape="ShareStatus")`). The emulator has one
+/// account, so no rule it mints is shared with another.
+pub const SHARE_STATUS_NOT_SHARED: &str = "NOT_SHARED";
+
+/// The most Resolver rules, and rule associations, this store holds.
+///
+/// Both creates admit any new request (`CreateResolverRule` any unseen
+/// `CreatorRequestId`, `AssociateResolverRule` any unseen rule/VPC pair), so
+/// without these bounds a caller looping creates would grow one emulator
+/// process without limit. A create past the bound is REFUSED with the
+/// `LimitExceededException` both operations model; a retry of a stored
+/// `CreatorRequestId` stays allowed, because it allocates no new record.
+pub const MAX_STORED_RULES: usize = 1_000;
+
+/// See [`MAX_STORED_RULES`].
+pub const MAX_STORED_RULE_ASSOCIATIONS: usize = 1_000;
+
+/// The most `TargetIps` one Resolver rule may be created with.
+///
+/// The model's `TargetList` declares a minimum of 1 and NO maximum, so this is
+/// the emulator's own bound on what one record can hold — the same reasoning as
+/// [`MAX_SECURITY_GROUP_IDS`], not a published AWS quota. A create past it is
+/// refused with the `LimitExceededException` the operation models.
+pub const MAX_TARGET_IPS: usize = 100;
+
 /// Render one Route 53 Resolver exception message: the service error code in
 /// square brackets, a space, the sentence that states the fault, and the
 /// terminating period.
@@ -148,6 +216,38 @@ pub fn resolver_endpoint_not_found(resolver_endpoint_id: &str) -> ResourceNotFou
             &format!(r#"Resolver endpoint with ID "{resolver_endpoint_id}" does not exist"#),
         )),
         resource_type: Some(RESOURCE_TYPE_RESOLVER_ENDPOINT.to_string()),
+    }
+}
+
+/// The `ResourceNotFoundException` the rule operations answer for an id they
+/// hold no Resolver rule under.
+///
+/// Unlike the endpoint message, this one carries no `RSLVR-nnnnn` service error
+/// code: no recorded response available here states the code Route 53 Resolver
+/// uses for a missing rule, and the model states no message text, so the
+/// message states the fault plainly instead of inventing one. The HTTP status
+/// (400) and the error shape are what the contract fixes; the wording is an
+/// example.
+pub fn resolver_rule_not_found(resolver_rule_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            r#"Resolver rule with ID "{resolver_rule_id}" does not exist."#
+        )),
+        resource_type: Some(RESOURCE_TYPE_RESOLVER_RULE.to_string()),
+    }
+}
+
+/// The `ResourceNotFoundException` `GetResolverRuleAssociation` answers for an
+/// id it holds no rule association under. See
+/// [`resolver_rule_not_found`] on the absent service error code.
+pub fn resolver_rule_association_not_found(
+    resolver_rule_association_id: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            r#"Resolver rule association with ID "{resolver_rule_association_id}" does not exist."#
+        )),
+        resource_type: Some(RESOURCE_TYPE_RESOLVER_RULE_ASSOCIATION.to_string()),
     }
 }
 
@@ -201,7 +301,7 @@ impl IpAddressRecord {
 #[derive(Debug, Clone)]
 pub struct ResolverEndpointRecord {
     /// Position in the store's creation order, from
-    /// [`ComAmazonawsRoute53resolverRoute53resolverState::endpoint_id_seq`]. It
+    /// [`ComAmazonawsRoute53resolverRoute53resolverState::id_seq`]. It
     /// is the list order and the source of the minted ids.
     pub seq: u64,
     pub id: String,
@@ -360,6 +460,104 @@ impl FilterKey {
     }
 }
 
+/// A Resolver rule, as stored.
+#[derive(Debug, Clone)]
+pub struct ResolverRuleRecord {
+    /// Position in the store's creation order, from
+    /// [`ComAmazonawsRoute53resolverRoute53resolverState::id_seq`].
+    pub seq: u64,
+    pub id: String,
+    pub arn: String,
+    pub creator_request_id: String,
+    pub name: Option<String>,
+    pub domain_name: Option<String>,
+    pub rule_type: String,
+    pub target_ips: Vec<TargetAddress>,
+    pub resolver_endpoint_id: Option<String>,
+    pub delegation_record: Option<String>,
+    pub owner_id: String,
+    pub share_status: String,
+    /// The `ResolverRuleStatus` this rule reports; see [`RULE_STATUS_COMPLETE`]
+    /// on why a stored rule is already settled.
+    pub status: String,
+    pub status_message: Option<String>,
+    pub tags: Vec<Tag>,
+    pub creation_time: String,
+    pub modification_time: String,
+}
+
+impl ResolverRuleRecord {
+    /// Project the record onto the modelled `ResolverRule`.
+    pub fn to_rule(&self) -> ResolverRule {
+        ResolverRule {
+            id: Some(self.id.clone()),
+            creator_request_id: Some(self.creator_request_id.clone()),
+            arn: Some(self.arn.clone()),
+            domain_name: self.domain_name.clone(),
+            status: Some(self.status.clone()),
+            status_message: self.status_message.clone(),
+            rule_type: Some(self.rule_type.clone()),
+            name: self.name.clone(),
+            // `TargetIps` is modelled with a minimum length of 1, so an empty
+            // list is left unset rather than serialized as `[]`.
+            target_ips: if self.target_ips.is_empty() {
+                None
+            } else {
+                Some(self.target_ips.clone())
+            },
+            resolver_endpoint_id: self.resolver_endpoint_id.clone(),
+            owner_id: Some(self.owner_id.clone()),
+            share_status: Some(self.share_status.clone()),
+            creation_time: Some(self.creation_time.clone()),
+            modification_time: Some(self.modification_time.clone()),
+            delegation_record: self.delegation_record.clone(),
+        }
+    }
+}
+
+/// One association between a Resolver rule and a VPC, as stored.
+#[derive(Debug, Clone)]
+pub struct ResolverRuleAssociationRecord {
+    /// Position in the store's creation order, from
+    /// [`ComAmazonawsRoute53resolverRoute53resolverState::id_seq`].
+    pub seq: u64,
+    pub id: String,
+    pub resolver_rule_id: String,
+    pub vpc_id: String,
+    pub name: Option<String>,
+    /// The transient `ResolverRuleAssociationStatus` reported until
+    /// [`Self::complete_at`] falls due.
+    pub status: String,
+    pub status_message: Option<String>,
+    /// The instant at which the move to `COMPLETE` is owed.
+    pub complete_at: Instant,
+}
+
+impl ResolverRuleAssociationRecord {
+    /// This association's `ResolverRuleAssociationStatus` as of `now`: the
+    /// transient status until the transition the clock owes falls due,
+    /// `COMPLETE` after it.
+    pub fn status_at(&self, now: Instant) -> &str {
+        if now < self.complete_at {
+            &self.status
+        } else {
+            RULE_ASSOCIATION_STATUS_COMPLETE
+        }
+    }
+
+    /// Project the record onto the modelled `ResolverRuleAssociation`.
+    pub fn to_association(&self, now: Instant) -> ResolverRuleAssociation {
+        ResolverRuleAssociation {
+            id: Some(self.id.clone()),
+            resolver_rule_id: Some(self.resolver_rule_id.clone()),
+            name: self.name.clone(),
+            vpc_id: Some(self.vpc_id.clone()),
+            status: Some(self.status_at(now).to_string()),
+            status_message: self.status_message.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-route53resolver-route53resolver. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsRoute53resolverRoute53resolverState {
@@ -369,9 +567,17 @@ pub struct ComAmazonawsRoute53resolverRoute53resolverState {
     /// `CreatorRequestId` resolves to the endpoint it already made instead of a
     /// duplicate.
     pub creator_request_id_index: HashMap<String, String>,
-    /// Monotonic counter behind every minted endpoint and IP id, so ids are
-    /// reproducible within a run and never collide.
-    pub endpoint_id_seq: u64,
+    /// Every stored Resolver rule, keyed by its `Id`.
+    pub resolver_rules: HashMap<String, ResolverRuleRecord>,
+    /// `CreatorRequestId` -> rule id, so a retried create with the same
+    /// `CreatorRequestId` resolves to the rule it already made instead of a
+    /// duplicate.
+    pub rule_creator_request_id_index: HashMap<String, String>,
+    /// Every stored rule-to-VPC association, keyed by its `Id`.
+    pub resolver_rule_associations: HashMap<String, ResolverRuleAssociationRecord>,
+    /// Monotonic counter behind every minted id (endpoint, IP, rule,
+    /// association), so ids are reproducible within a run and never collide.
+    pub id_seq: u64,
 }
 
 impl ComAmazonawsRoute53resolverRoute53resolverState {
@@ -384,8 +590,37 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
 
     /// Take the next value of the id sequence.
     pub fn next_seq(&mut self) -> u64 {
-        self.endpoint_id_seq = self.endpoint_id_seq.saturating_add(1);
-        self.endpoint_id_seq
+        self.id_seq = self.id_seq.saturating_add(1);
+        self.id_seq
+    }
+
+    /// Whether one more Resolver rule may be stored, i.e. the store is still
+    /// below [`MAX_STORED_RULES`].
+    pub fn can_store_another_rule(&self) -> bool {
+        self.resolver_rules.len() < MAX_STORED_RULES
+    }
+
+    /// Whether one more rule association may be stored, i.e. the store is still
+    /// below [`MAX_STORED_RULE_ASSOCIATIONS`].
+    pub fn can_store_another_rule_association(&self) -> bool {
+        self.resolver_rule_associations.len() < MAX_STORED_RULE_ASSOCIATIONS
+    }
+
+    /// The association between `resolver_rule_id` and `vpc_id`, if the store
+    /// holds one.
+    ///
+    /// A rule and a VPC are associated at most once, so this is what
+    /// `AssociateResolverRule` consults before writing a second record for the
+    /// same pair. The scan is over a store bounded by
+    /// [`MAX_STORED_RULE_ASSOCIATIONS`].
+    pub fn find_rule_association(
+        &self,
+        resolver_rule_id: &str,
+        vpc_id: &str,
+    ) -> Option<&ResolverRuleAssociationRecord> {
+        self.resolver_rule_associations
+            .values()
+            .find(|record| record.resolver_rule_id == resolver_rule_id && record.vpc_id == vpc_id)
     }
 
     /// Every stored endpoint in creation order — the order both the list
@@ -441,7 +676,11 @@ fn scramble(seq: u64) -> u64 {
 /// `rslvr-out-<hex>`; `INBOUND_DELEGATION` is an inbound direction, so it takes
 /// the inbound infix. Every result fits `ResourceId` (length 1..64).
 pub fn mint_endpoint_id(direction: &str, seq: u64) -> String {
-    let infix = if direction == "OUTBOUND" { "out" } else { "in" };
+    let infix = if direction == ENDPOINT_DIRECTION_OUTBOUND {
+        "out"
+    } else {
+        "in"
+    };
     format!("rslvr-{infix}-{:016x}", scramble(seq))
 }
 
@@ -449,6 +688,18 @@ pub fn mint_endpoint_id(direction: &str, seq: u64) -> String {
 /// Resolver network interface `rni-<hex>`.
 pub fn mint_ip_id(seq: u64) -> String {
     format!("rni-{:016x}", scramble(seq))
+}
+
+/// Mint the `Id` of a Resolver rule from the id sequence. AWS names a Resolver
+/// rule `rslvr-rr-<hex>`. Every result fits `ResourceId` (length 1..64).
+pub fn mint_rule_id(seq: u64) -> String {
+    format!("rslvr-rr-{:016x}", scramble(seq))
+}
+
+/// Mint the `Id` of a rule-to-VPC association from the id sequence. AWS names a
+/// Resolver rule association `rslvr-rrassoc-<hex>`.
+pub fn mint_rule_association_id(seq: u64) -> String {
+    format!("rslvr-rrassoc-{:016x}", scramble(seq))
 }
 
 /// The `HostVPCId` of an endpoint placed in `subnet_ids`.

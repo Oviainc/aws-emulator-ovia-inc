@@ -8,6 +8,10 @@
 //! `POST /` with `X-Amz-Target: Route53Resolver.<OperationName>`), through the
 //! same router the emulator mounts, so what is asserted is the HTTP behaviour
 //! and not a handler called directly.
+//!
+//! The transport helpers below ([`emulator`], [`call`], [`ok`],
+//! [`expect_error`] and friends) are `pub(crate)` so the other suites in this
+//! test target reuse them instead of growing a second copy.
 
 use std::time::Duration;
 
@@ -22,13 +26,13 @@ use std::sync::Arc;
 
 /// The region every request below is signed for; it is where the ARNs the
 /// service mints must be rooted.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The canonical placeholder account id every emulator ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// A fresh emulator: one shared engine, this one service mounted on it.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(EmulatedService::new(engine));
@@ -36,7 +40,7 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// Call one operation and return `(http status, parsed body)`.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -67,7 +71,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16
 }
 
 /// Call an operation that must succeed, and return its body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(status, 200, "{operation} must succeed, got {status}: {parsed}");
     parsed
@@ -75,7 +79,7 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value 
 
 /// The `__type` of an error response, which carries the modelled error's shape
 /// name on the awsJson protocols.
-fn error_type(body: &Value) -> String {
+pub(crate) fn error_type(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -83,7 +87,7 @@ fn error_type(body: &Value) -> String {
 }
 
 /// Assert an operation failed with `expected` as its modelled error.
-async fn expect_error(
+pub(crate) async fn expect_error(
     router: &MultiServiceRouter,
     operation: &str,
     body: Value,
@@ -126,7 +130,7 @@ fn endpoint(body: &Value) -> &Value {
         .expect("the response carries a ResolverEndpoint")
 }
 
-fn string_member(value: &Value, member: &str) -> String {
+pub(crate) fn string_member(value: &Value, member: &str) -> String {
     value
         .get(member)
         .and_then(Value::as_str)
@@ -136,7 +140,7 @@ fn string_member(value: &Value, member: &str) -> String {
 
 /// The same object with `Status` dropped, so two reads can be compared without
 /// the member the clock is allowed to move.
-fn without_status(value: &Value) -> Value {
+pub(crate) fn without_status(value: &Value) -> Value {
     let mut cloned = value.clone();
     if let Some(object) = cloned.as_object_mut() {
         object.remove("Status");
@@ -146,7 +150,7 @@ fn without_status(value: &Value) -> Value {
 
 /// Parse a modelled `Rfc3339TimeString` (length 20..40) into a point in time, so
 /// two timestamps are compared numerically rather than as text.
-fn parse_time(case: &str, member: &str, raw: &str) -> aws_smithy_types::DateTime {
+pub(crate) fn parse_time(case: &str, member: &str, raw: &str) -> aws_smithy_types::DateTime {
     assert!(
         raw.len() >= 20 && raw.len() <= 40,
         "case {case:?}: {member} must satisfy Rfc3339TimeString's length 20..40, got {raw:?}"
