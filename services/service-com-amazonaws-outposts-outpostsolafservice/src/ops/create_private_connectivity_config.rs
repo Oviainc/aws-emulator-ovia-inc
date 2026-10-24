@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePrivateConnectivityConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePrivateConnectivityConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePrivateConnectivityConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Configures private connectivity for ONE Outpost and persists it on that
+//! Outpost's record, where `GetPrivateConnectivityConfig` reads it back:
+//!
+//! * the `OutpostId` label names the Outpost either way the modelled pattern
+//!   `^(arn:…:outpost/)?op-[a-f0-9]{17}$` allows — bare id or full Outpost ARN — and
+//!   an Outpost this store does not hold is 404 `NotFoundException`;
+//! * the `VpcInformationList` the caller sent is stored as sent and reported back
+//!   from what was stored;
+//! * a configured Outpost reports the terminal `ENABLED` status: the modelled
+//!   `PrivateConnectivityStatus` enum has no provisioning value, so nothing is owed
+//!   on it afterwards;
+//! * this API models no update and no delete of the configuration, so a second
+//!   create against an already configured Outpost is the inconsistent state its
+//!   `ConflictException` (409) states, and leaves the stored configuration as it
+//!   was.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +163,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePrivateConnectivityConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePrivateConnectivityConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePrivateConnectivityConfig"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreatePrivateConnectivityConfigErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Outposts store is unavailable".to_string()),
+                },
+            )
+        })?;
+        // `OutpostId` accepts the bare id or the full Outpost ARN; both name the
+        // same stored record.
+        let outpost_id = crate::state::resolve_outpost_id(&input.outpost_id).ok_or_else(|| {
+            CreatePrivateConnectivityConfigErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::outpost_id_pattern_report()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // Private connectivity belongs to an Outpost, so an Outpost that does not
+        // exist cannot be configured: the not-found error this call models, worded
+        // by the identifier echo of the value AS SUPPLIED.
+        let record = store.outposts.get_mut(&outpost_id).ok_or_else(|| {
+            CreatePrivateConnectivityConfigErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::OUTPOST_ID_MEMBER,
+                    &input.outpost_id,
+                )),
+            })
+        })?;
+        // The configuration establishes the Outpost's service link over the
+        // caller's VPC, and this API models no call that updates or removes it, so
+        // re-creating one that already exists is exactly the inconsistent state its
+        // `ConflictException` reports. The stored configuration is left untouched,
+        // and the exception names the resource the conflict is about through its own
+        // `ResourceId` / `ResourceType` members.
+        if record.private_connectivity.is_some() {
+            return Err(CreatePrivateConnectivityConfigErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Outpost {outpost_id} already has a private connectivity configuration."
+                    )),
+                    resource_id: Some(outpost_id),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_OUTPOST.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let config = PrivateConnectivityConfig {
+            // The VPC, its subnets and the VPC endpoint are the caller's, stored as
+            // sent so every later read answers the request's own values.
+            vpc_information_list: Some(input.vpc_information_list),
+            private_connectivity_status: Some(
+                crate::state::PRIVATE_CONNECTIVITY_ENABLED.to_string(),
+            ),
+            // `RoleArn` and `ProvisioningRoleArn` name IAM roles AWS Outposts
+            // assumes to provision and run the service link. This emulator has no
+            // IAM role behind this configuration, so it reports none rather than an
+            // ARN naming a role that does not exist.
+            role_arn: None,
+            provisioning_role_arn: None,
+        };
+        record.private_connectivity = Some(config.clone());
+
+        Ok(CreatePrivateConnectivityConfigOutput {
+            private_connectivity_config: Some(config),
+            // The modelled output member is the Outpost's ID, so it is the bare id
+            // the label resolved to — the same value `GetOutpost` reports — whichever
+            // form the request named it in.
+            outpost_id: Some(outpost_id),
+        })
     }
 }
