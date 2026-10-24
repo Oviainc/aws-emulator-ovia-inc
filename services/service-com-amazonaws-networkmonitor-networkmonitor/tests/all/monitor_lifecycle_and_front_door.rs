@@ -32,25 +32,15 @@ use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::monitor_and_probe::{
-    call, create_monitor, create_probe, error_code, get_monitor, is_modelled_probe_id,
-    name_of_length, probes_of, router, source_arn, string_at, ACCOUNT, PAST_ACTIVATION, REGION,
+    call, create_monitor, create_probe, error_code, error_message, get_monitor,
+    is_modelled_probe_id, name_of_length, probe_json, probes_of, router, source_arn, string_at,
+    ACCOUNT, PAST_ACTIVATION, REGION,
 };
 
-/// The `message` member of an error response, or `"<none>"`.
-fn error_message(body: &Value) -> String {
-    body.get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("<none>")
-        .to_string()
-}
-
-/// One probe body for `monitorName`-free use, with a `sourceArn` that names a
-/// subnet of this account.
-fn probe_json(destination: &str) -> String {
-    format!(
-        r#"{{"sourceArn":"{}","destination":"{destination}","protocol":"ICMP","packetSize":56}}"#,
-        source_arn()
-    )
+/// One ICMP probe body of the shared form, for the cases here that vary only
+/// the destination.
+fn icmp_probe_json(destination: &str) -> String {
+    probe_json(destination, "ICMP", r#","packetSize":56"#)
 }
 
 async fn get_probe(router: &MultiServiceRouter, name: &str, probe_id: &str) -> (u16, Value) {
@@ -83,7 +73,7 @@ async fn a_monitors_state_follows_the_probes_it_holds() {
     for (case, probe_count, initial, _settled) in cases {
         let name = format!("state-{probe_count}");
         let probes: Vec<String> = (0..*probe_count)
-            .map(|i| probe_json(&format!("10.0.0.{}", i + 1)))
+            .map(|i| icmp_probe_json(&format!("10.0.0.{}", i + 1)))
             .collect();
         let body = format!(
             r#"{{"monitorName":"{name}","probes":[{}]}}"#,
@@ -152,7 +142,7 @@ async fn a_probe_added_to_an_idle_monitor_activates_it_and_its_deletion_idles_it
     let (status, probe) = create_probe(
         &router,
         "idle-then-busy",
-        &format!(r#"{{"probe":{}}}"#, probe_json("10.0.0.1")),
+        &format!(r#"{{"probe":{}}}"#, icmp_probe_json("10.0.0.1")),
     )
     .await;
     assert_eq!(status, 200, "expected CreateProbe 200, got {probe:?}");
@@ -393,7 +383,7 @@ async fn a_missing_resource_is_reported_with_the_account_and_the_name_requested(
                 "CreateProbe",
                 "POST",
                 format!("/monitors/{absent}/probes"),
-                Some(format!(r#"{{"probe":{}}}"#, probe_json("10.0.0.1"))),
+                Some(format!(r#"{{"probe":{}}}"#, icmp_probe_json("10.0.0.1"))),
             ),
             (
                 "GetProbe",

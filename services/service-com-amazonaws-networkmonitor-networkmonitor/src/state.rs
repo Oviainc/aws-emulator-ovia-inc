@@ -14,10 +14,26 @@
 //!
 //! Every value a handler reports is read back out of these records; nothing is
 //! echoed straight from a request without being stored first.
+//!
+//! ## How a refusal this service authors is stated
+//!
+//! A rule the model states in prose but its constraints cannot express is
+//! applied by the service, so the service also has to STATE the refusal. It
+//! states it the way AWS states a constraint failure — the
+//! `N validation error(s) detected: Value '<submitted>' at '<member path>'
+//! failed to satisfy constraint: <requirement>` construction, built from the
+//! request — and it builds it through the framework's OWN clause renderer
+//! ([`stated_violation`], [`stated_requirement`]), so a refusal a handler raises
+//! reads exactly like the one the boundary validator renders for a modelled
+//! constraint. A refusal whose AWS sentence is known as a whole
+//! ([`TCP_PORT_REQUIRED_MESSAGE`], [`aggregation_period_message`],
+//! [`monitor_not_found_message`]) keeps that sentence instead.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use aws_smithy_schema_server::constraints::{envelope, path, Violation, ViolationKind};
 
 /// The ARN namespace this service stamps into every ARN it mints
 /// (`OPERATIONS.md`: "ARN namespace: `networkmonitor`").
@@ -101,6 +117,14 @@ pub const TCP_PORT_REQUIRED_MESSAGE: &str = "Destination port must be provided f
 /// The shape's `@range(min: 0, max: 65536)` admits `0`, so the handler applies
 /// the documented floor.
 pub const MIN_DESTINATION_PORT: i32 = 1;
+
+/// What a probe `destination` has to be, as a refusal's clause states the
+/// requirement: the model documents `ProbeInput$destination` as "The destination
+/// IP address. This must be either `IPV4` or `IPV6`" and
+/// `UpdateProbeInput$destination` as "The updated IP address for the probe
+/// destination. This must be either an IPv4 or IPv6 address", and the shape
+/// carries only `@length(1..255)`, so the format is the service's to check.
+const DESTINATION_REQUIREMENT: &str = "Member must be an IPv4 or IPv6 address";
 
 /// How long after the call that adds the first probe to a monitor the clock owes
 /// that monitor, and that probe, the `PENDING` -> `ACTIVE` transition.
@@ -357,6 +381,126 @@ pub fn resolve_aggregation_period(requested: Option<i64>) -> Result<i64, String>
     Err(aggregation_period_message())
 }
 
+/// The text that separates a constraint clause's subject from the requirement
+/// it states, in the framework's own wording ([`Violation::message`]). SPLIT on,
+/// never written: see [`stated_requirement`].
+const CONSTRAINT_MARKER: &str = " failed to satisfy constraint: ";
+
+/// The longest submitted value a refusal echoes back before the rest is elided.
+///
+/// The cap and the elision text are the framework's own (`MAX_ECHOED_VALUE` in
+/// `aws_smithy_schema_server::constraints`), so a long value refused here reads
+/// exactly as the same value refused at the boundary: a clause interpolates a
+/// value whose length the CALLER chooses, so an unbounded echo would let a small
+/// request name an arbitrarily large response. The checks themselves always read
+/// the whole value; this is rendering only.
+const MAX_ECHOED_VALUE: usize = 256;
+
+/// A value the caller submitted, as a clause echoes it: itself, or its first
+/// [`MAX_ECHOED_VALUE`] bytes followed by the framework's own elision.
+fn echoed(value: &str) -> String {
+    if value.len() <= MAX_ECHOED_VALUE {
+        return value.to_string();
+    }
+    let mut end = MAX_ECHOED_VALUE;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... [{} bytes]", &value[..end], value.len())
+}
+
+/// The dotted path of a top-level member of a request, spelled through the
+/// framework's own path rule so a clause this service raises names a member
+/// exactly as the boundary validator names it.
+pub fn member_path(member: &str) -> String {
+    path::member(member)
+}
+
+/// The dotted path of the `position`-th (1-BASED) element of a list member —
+/// `probes.1.member` for the first entry of `CreateMonitor`'s `probes`.
+pub fn element_path(member: &str, position: usize) -> String {
+    path::join(&[path::member(member), path::element(position)])
+}
+
+/// AWS's constraint-violation message for ONE rule this service's own code
+/// applies, rendered by the framework's own clause builder.
+///
+/// `member_path` is where the offending member sat in the REQUEST (the operation
+/// that holds the request supplies it, since only it knows that); `submitted` is
+/// the value the caller sent, echoed single-quoted and capped ([`echoed`]), or
+/// `None` for a member that carried none; `kind` is the constraint class the
+/// value broke. The count envelope, the clause and the requirement for `kind`
+/// are all [`envelope`]'s and [`Violation::message`]'s, so this cannot drift
+/// from the wording a modelled constraint is refused with — and nothing is
+/// rendered through Rust's `Debug`, which quotes a string and is a language
+/// artefact no AWS service emits.
+pub fn stated_violation(member_path: &str, submitted: Option<&str>, kind: ViolationKind) -> String {
+    let violation = Violation {
+        path: member_path.to_string(),
+        kind,
+        value: submitted.map(echoed),
+    };
+    envelope(std::slice::from_ref(&violation)).unwrap_or_else(|| violation.message())
+}
+
+/// The same message for a requirement the framework carries no
+/// [`ViolationKind`] for — a rule only this service can state, such as which
+/// cursors a listing vends, or a format the model documents in prose.
+///
+/// [`ViolationKind`] is `#[non_exhaustive]` and lives in the framework crate, so
+/// such a rule cannot be expressed as one. The envelope and the clause are still
+/// the framework's: a clause is rendered for this member and value and only the
+/// text after [`CONSTRAINT_MARKER`] is this service's, so the two refusal paths
+/// cannot drift into two sentence shapes.
+pub fn stated_requirement(
+    member_path: &str,
+    submitted: Option<&str>,
+    requirement: &str,
+) -> String {
+    // Every class renders the same clause HEAD; this one is simply the class no
+    // member of this service can break, so the requirement being replaced is
+    // never one a caller could have been shown.
+    let rendered = stated_violation(member_path, submitted, ViolationKind::UniqueItems);
+    match rendered.rsplit_once(CONSTRAINT_MARKER) {
+        Some((head, _)) => format!("{head}{CONSTRAINT_MARKER}{requirement}"),
+        None => rendered,
+    }
+}
+
+/// The requirement an enumerated value set states, over the values as AWS
+/// renders them: BARE and SORTED, rather than in the order the model declares
+/// them or in any language's quoting.
+pub fn enum_value_set(values: &[&str]) -> ViolationKind {
+    let mut sorted: Vec<String> = values.iter().map(|value| (*value).to_string()).collect();
+    sorted.sort_unstable();
+    ViolationKind::EnumValue(sorted)
+}
+
+/// The refusal of a value outside an enumerated type's value set, for a member
+/// the model targets a plain `string` with — so the boundary validator admits
+/// any text and the operation applies the enum itself.
+pub fn enum_value_refusal(member: &str, allowed: &[&str], submitted: &str) -> String {
+    stated_violation(
+        &member_path(member),
+        Some(submitted),
+        enum_value_set(allowed),
+    )
+}
+
+/// The refusal of a pagination cursor `operation` never vended.
+///
+/// A cursor is opaque — [`encode_page_token`] decides what one is — so the rule
+/// a caller has to satisfy is WHERE the value came from: a token that same
+/// listing handed back. The member and the rejected token are the request's, so
+/// the clause is built from it like any other.
+pub fn unknown_page_token_refusal(member: &str, operation: &str, submitted: &str) -> String {
+    stated_requirement(
+        &member_path(member),
+        Some(submitted),
+        &format!("Member must be a {member} returned by a previous {operation} call"),
+    )
+}
+
 /// What the service states when an `aggregationPeriod` is outside the documented
 /// allow-list: the list itself, rendered from [`AGGREGATION_PERIODS`] so the
 /// sentence cannot drift from the values the handlers actually admit.
@@ -397,13 +541,17 @@ pub struct ProbeSpec {
 /// * `sourceArn` is "The ARN of the subnet", so an ARN that names anything other
 ///   than a VPC subnet of this account ([`subnet_id_of`]) is refused — the
 ///   shape's `@pattern("^arn:.*$")` admits any ARN at all.
+///
+/// `probe_path` is where this probe sits in the REQUEST, for the clause a
+/// refusal states; see [`validate_probe_spec`].
 pub fn build_probe(
     spec: ProbeSpec,
     probe_id: String,
     region: &str,
     now: SystemTime,
+    probe_path: &str,
 ) -> Result<Probe, String> {
-    let address_family = validate_probe_spec(&spec)?;
+    let address_family = validate_probe_spec(&spec, probe_path)?;
     Ok(Probe {
         probe_arn: probe_arn(region, &probe_id),
         probe_id,
@@ -432,7 +580,14 @@ pub fn build_probe(
 /// create, and `UpdateProbe` on the record it has merged the request into), so a
 /// probe an update leaves behind satisfies exactly what a create would have
 /// refused. `Err` carries a message naming the offending member.
-pub fn validate_probe_spec(spec: &ProbeSpec) -> Result<&'static str, String> {
+///
+/// `probe_path` is the dotted path of the probe WITHIN the request this spec was
+/// built from, which is what a refusal's clause names the member by: `probe` for
+/// `CreateProbe`, `probes.<position>.member` for one entry of `CreateMonitor`'s
+/// list ([`element_path`]), and the EMPTY path for `UpdateProbe`, which binds a
+/// probe's members at the top level of its own input. Only the operation holding
+/// the request knows where its probe sat, so it supplies it.
+pub fn validate_probe_spec(spec: &ProbeSpec, probe_path: &str) -> Result<&'static str, String> {
     if subnet_id_of(&spec.source_arn).is_none() {
         return Err(format!(
             "The specified subnet {} does not exist or could not be found.",
@@ -440,9 +595,10 @@ pub fn validate_probe_spec(spec: &ProbeSpec) -> Result<&'static str, String> {
         ));
     }
     let Some(address_family) = address_family_of(&spec.destination) else {
-        return Err(format!(
-            "destination must be an IPv4 or IPv6 address, got {:?}",
-            spec.destination
+        return Err(stated_requirement(
+            &probe_member_path(probe_path, "destination"),
+            Some(&spec.destination),
+            DESTINATION_REQUIREMENT,
         ));
     };
     if spec.protocol == PROTOCOL_TCP && spec.destination_port.is_none() {
@@ -450,12 +606,28 @@ pub fn validate_probe_spec(spec: &ProbeSpec) -> Result<&'static str, String> {
     }
     if let Some(port) = spec.destination_port {
         if port < MIN_DESTINATION_PORT {
-            return Err(format!(
-                "destinationPort must be at least {MIN_DESTINATION_PORT}, got {port}"
+            // The documented floor, stated in the framework's own wording for a
+            // numeric bound: the model's `@range(min: 0)` admits `0`, so this
+            // bound is the service's but the clause is the one a `@range`
+            // refusal already reads like.
+            return Err(stated_violation(
+                &probe_member_path(probe_path, "destinationPort"),
+                Some(&port.to_string()),
+                ViolationKind::MinValue(MIN_DESTINATION_PORT.to_string()),
             ));
         }
     }
     Ok(address_family)
+}
+
+/// The dotted path of one member of the probe sitting at `probe_path`, which is
+/// empty for an operation that binds a probe's members at the top level of its
+/// own input (`UpdateProbe`).
+fn probe_member_path(probe_path: &str, member: &str) -> String {
+    if probe_path.is_empty() {
+        return member_path(member);
+    }
+    path::join(&[probe_path.to_string(), path::member(member)])
 }
 
 /// Check that `requested` is a state a CALLER may put a probe into.

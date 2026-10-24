@@ -295,8 +295,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // The rules a create applies, applied to the MERGED record — checked
         // BEFORE anything is written, so a refused update leaves the stored
-        // probe exactly as it was.
-        let address_family = crate::state::validate_probe_spec(&merged).map_err(validation)?;
+        // probe exactly as it was. This operation binds a probe's members at
+        // the top level of its own input, so a refusal's clause names them
+        // unprefixed (`destination`, not `probe.destination`).
+        let address_family = crate::state::validate_probe_spec(&merged, "").map_err(validation)?;
 
         // `modifiedAt` moves only when a stored value actually changed, so a
         // repeat of the same update (the model marks this operation
