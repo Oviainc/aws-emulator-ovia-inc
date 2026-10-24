@@ -168,17 +168,18 @@ pub const DEFAULT_URL_ENCODE_CHILD_MANIFEST: bool = false;
 ///
 /// Each submitted manifest is persisted with its computed URL, so a single create's
 /// record size is caller-chosen unless the count is bounded; the model puts no `@length`
-/// on the manifest lists, so this is the emulator's own ceiling, refused with the same
-/// `ServiceQuotaExceededException` the count ceilings use.
+/// on the manifest lists, so the NUMBER here is the emulator's own choice. The REFUSAL
+/// is not: the model's `ValidationExceptionType` declares `NUM_MANIFESTS_HIGH` beside
+/// `NUM_MANIFESTS_LOW`, i.e. a manifest count outside the service's bounds is an input
+/// failure (`ValidationException`), not a quota error.
 pub const MAX_MANIFESTS_PER_ORIGIN_ENDPOINT: usize = 100;
 
 /// The fewest manifest configurations an origin endpoint may carry, counted across the
 /// four families together.
 ///
-/// Unlike the ceilings above this is NOT the emulator's own bound: the model's
-/// `ValidationExceptionType` declares `NUM_MANIFESTS_LOW` beside `NUM_MANIFESTS_HIGH`,
-/// i.e. the service enforces a minimum manifest count, and an endpoint with no manifest
-/// can serve nothing at all. A request below it is refused with `ValidationException`.
+/// Like the ceiling above, this bound is reported as a `ValidationException` carrying the
+/// discriminator for the side of the bound that was crossed (`NUM_MANIFESTS_LOW` here),
+/// and an endpoint with no manifest can serve nothing at all.
 pub const MIN_MANIFESTS_PER_ORIGIN_ENDPOINT: usize = 1;
 
 /// The most harvest jobs one origin endpoint holds at once.
@@ -2746,31 +2747,39 @@ pub struct ManifestSetViolation {
     pub validation_exception_type: &'static str,
 }
 
-/// Check the manifest set an origin endpoint is being created or updated with against
-/// its container type: at least one manifest, and no family the container cannot serve.
-///
-/// `counts` is how many manifests the request carries per family, in
-/// [`ManifestFamily::ALL`] order. `None` means the set is acceptable. This is the same
-/// rule for `CreateOriginEndpoint` and `UpdateOriginEndpoint`: both carry the whole
-/// manifest set and the same required `ContainerType`.
-/// Which operation is checking a manifest set — the two differ only in what the
-/// "too few manifests" sentence tells the caller to retry.
+/// Which operation is checking a manifest set — the two differ only in what a
+/// manifest-count sentence tells the caller to retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestSetOn {
     Create,
     Update,
 }
 
+/// Check the manifest set an origin endpoint is being created or updated with: its total
+/// count against both ends of the permitted range, and each present family against the
+/// container type.
+///
+/// `counts` is how many manifests the request carries per family, in
+/// [`ManifestFamily::ALL`] order. `None` means the set is acceptable. This is the same
+/// rule for `CreateOriginEndpoint` and `UpdateOriginEndpoint`: both carry the whole
+/// manifest set and the same required `ContainerType`, so an endpoint's stored manifest
+/// count stays inside the range whichever operation last wrote it.
+///
+/// A count outside the range is an input failure, reported on `ValidationException` with
+/// the discriminator for the end that was crossed — `NUM_MANIFESTS_LOW` below
+/// [`MIN_MANIFESTS_PER_ORIGIN_ENDPOINT`], `NUM_MANIFESTS_HIGH` above
+/// [`MAX_MANIFESTS_PER_ORIGIN_ENDPOINT`] — not a quota refusal.
 pub fn manifest_set_violation(
     container: &str,
     counts: [usize; ManifestFamily::ALL.len()],
     on: ManifestSetOn,
 ) -> Option<ManifestSetViolation> {
-    if counts.iter().sum::<usize>() < MIN_MANIFESTS_PER_ORIGIN_ENDPOINT {
-        let retry = match on {
-            ManifestSetOn::Create => "create",
-            ManifestSetOn::Update => "update",
-        };
+    let retry = match on {
+        ManifestSetOn::Create => "create",
+        ManifestSetOn::Update => "update",
+    };
+    let total: usize = counts.iter().sum();
+    if total < MIN_MANIFESTS_PER_ORIGIN_ENDPOINT {
         return Some(ManifestSetViolation {
             message: validation_message(
                 None,
@@ -2781,6 +2790,20 @@ pub fn manifest_set_violation(
                 ),
             ),
             validation_exception_type: "NUM_MANIFESTS_LOW",
+        });
+    }
+    if total > MAX_MANIFESTS_PER_ORIGIN_ENDPOINT {
+        return Some(ManifestSetViolation {
+            message: validation_message(
+                None,
+                &format!(
+                    "You've requested an origin endpoint with {total} manifests. Your \
+                     origin endpoint can contain at most \
+                     {MAX_MANIFESTS_PER_ORIGIN_ENDPOINT} manifests. Remove a manifest and \
+                     try to {retry} your origin endpoint again"
+                ),
+            ),
+            validation_exception_type: "NUM_MANIFESTS_HIGH",
         });
     }
     for (family, count) in ManifestFamily::ALL.into_iter().zip(counts) {
@@ -2803,27 +2826,6 @@ pub fn manifest_set_violation(
         }
     }
     None
-}
-
-/// The quota refusal for a manifest set past [`MAX_MANIFESTS_PER_ORIGIN_ENDPOINT`], or
-/// `None` when it fits.
-///
-/// Every operation that WRITES a manifest set — `CreateOriginEndpoint` and
-/// `UpdateOriginEndpoint` — checks it here before anything is stored, so the record size
-/// of an endpoint is bounded by this ceiling whichever operation last wrote it rather
-/// than by how many manifests a request carries. The model puts no `@length` on the
-/// manifest lists, so the request boundary does not clamp the count and this is the only
-/// bound; the refusal is the `ServiceQuotaExceededException` the counting ceilings use.
-pub fn manifest_ceiling_exceeded(
-    counts: [usize; ManifestFamily::ALL.len()],
-) -> Option<String> {
-    let total: usize = counts.iter().sum();
-    (total > MAX_MANIFESTS_PER_ORIGIN_ENDPOINT).then(|| {
-        format!(
-            "An origin endpoint accepts at most {MAX_MANIFESTS_PER_ORIGIN_ENDPOINT} \
-             manifests; the request has {total}"
-        )
-    })
 }
 
 /// The ETag of an origin endpoint: a digest over everything the endpoint is made of, so
