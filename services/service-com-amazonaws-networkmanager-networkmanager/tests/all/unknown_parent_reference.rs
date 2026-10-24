@@ -24,7 +24,8 @@
 //! unknown too (the recorded case), while `CreateSite`, `CreateDevice` and
 //! `CreateCoreNetwork` hang straight off the global network and report `globalNetworkId`.
 //! `CreateDevice`'s `SiteId` is an OPTIONAL extra reference, so it is reported on `siteId`
-//! only once the global network it is addressed inside resolves.
+//! only once the global network it is addressed inside resolves. An attachment create
+//! hangs off the CORE network, so it reports `coreNetworkId`.
 
 use serde_json::{json, Value};
 
@@ -36,11 +37,23 @@ use crate::global_network_lifecycle::{error_code, ids_of, Emulator};
 const FIELD_GLOBAL_NETWORK_ID: &str = "globalNetworkId";
 /// See [`FIELD_GLOBAL_NETWORK_ID`].
 const FIELD_SITE_ID: &str = "siteId";
+/// See [`FIELD_GLOBAL_NETWORK_ID`]: the same `<kind>Id` spelling for the core network an
+/// attachment create addresses.
+const FIELD_CORE_NETWORK_ID: &str = "coreNetworkId";
 
 /// The prose each kind's refusal carries, as recorded.
 const GLOBAL_NETWORK_NOT_FOUND: &str = "Global network not found.";
 /// See [`GLOBAL_NETWORK_NOT_FOUND`].
 const SITE_NOT_FOUND: &str = "Site not found.";
+/// See [`GLOBAL_NETWORK_NOT_FOUND`]: the same "<Kind> not found." prose for the core
+/// network kind.
+const CORE_NETWORK_NOT_FOUND: &str = "Core network not found.";
+
+/// A VPN connection ARN of the modelled form
+/// (`^arn:[^:]{1,63}:ec2:[^:]{0,63}:[^:]{0,63}:vpn-connection\/vpn-[0-9a-f]{8,17}$`,
+/// `smithy_query shape=VpnConnectionArn`), so a `CreateSiteToSiteVpnAttachment` row is
+/// refused on its core-network reference rather than by the schema.
+const VPN_CONNECTION_ARN: &str = "arn:aws:ec2:us-west-2:111122223333:vpn-connection/vpn-0000abcd";
 
 /// One row: a create whose input carries a reference that names nothing, and the member
 /// and prose the refusal has to report.
@@ -269,6 +282,21 @@ async fn every_create_refuses_a_reference_that_names_nothing_as_a_field_validati
             body: json!({ "GlobalNetworkId": not_an_id }),
             field: FIELD_GLOBAL_NETWORK_ID,
             message: GLOBAL_NETWORK_NOT_FOUND,
+        },
+        BadReference {
+            // An attachment hangs off the CORE network, so its reference member and the
+            // kind its prose names are the core network's. Only the ids that satisfy the
+            // modelled `CoreNetworkId` pattern are rows: this reference travels in the
+            // BODY, so a string outside `^core-network-([0-9a-f]{8,17})$` is refused by
+            // the schema before the handler sees it.
+            case: "CreateSiteToSiteVpnAttachment on a core network that never existed",
+            uri: "/site-to-site-vpn-attachments".to_string(),
+            body: json!({
+                "CoreNetworkId": "core-network-00000000000000099",
+                "VpnConnectionArn": VPN_CONNECTION_ARN,
+            }),
+            field: FIELD_CORE_NETWORK_ID,
+            message: CORE_NETWORK_NOT_FOUND,
         },
     ];
 

@@ -47,7 +47,7 @@ const AVAILABLE: &str = "AVAILABLE";
 /// The key names (`version`, `core-network-configuration`, `asn-ranges`,
 /// `edge-locations`, `location`, `segments`, `attachment-policies`) are the published Cloud
 /// WAN core network policy schema's, the same source the other suites build documents from.
-fn policy_document(region: &str, rules: &Value) -> String {
+pub(crate) fn policy_document(region: &str, rules: &Value) -> String {
     let mut document = json!({
         "version": "2021.12",
         "core-network-configuration": {
@@ -64,7 +64,7 @@ fn policy_document(region: &str, rules: &Value) -> String {
 
 /// Create a global network and, in it, a core network whose policy is
 /// [`policy_document`]. Answers the minted core network id.
-async fn core_network_with(
+pub(crate) async fn core_network_with(
     emulator: &Emulator,
     case: &str,
     region: &str,
@@ -91,7 +91,7 @@ async fn core_network_with(
 }
 
 /// `AcceptAttachment`.
-async fn accept(emulator: &Emulator, attachment_id: &str) -> (u16, Value) {
+pub(crate) async fn accept(emulator: &Emulator, attachment_id: &str) -> (u16, Value) {
     emulator
         .call("POST", &format!("/attachments/{attachment_id}/accept"), None)
         .await
