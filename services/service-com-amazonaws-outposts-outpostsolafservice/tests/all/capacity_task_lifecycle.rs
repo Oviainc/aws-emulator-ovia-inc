@@ -51,7 +51,7 @@ const CAPACITY_TASK_ID_LENGTH: usize = 21;
 
 /// A `CapacityTaskId` this emulator never mints — well formed, so the boundary
 /// accepts it, and naming nothing.
-const ABSENT_CAPACITY_TASK_ID: &str = "cap-00000000000000000";
+pub(crate) const ABSENT_CAPACITY_TASK_ID: &str = "cap-00000000000000000";
 
 /// An `OrderId` of the modelled form `^oo-[a-f0-9]{17}$`. Orders are not persisted
 /// by this slice (`CreateOrder` is still a scaffold stub), so an order id is only
@@ -148,7 +148,11 @@ async fn start(outposts: &Outposts, outpost_identifier: &str, request: &Value) -
 }
 
 /// `StartCapacityTask`, required to have been accepted.
-async fn start_ok(outposts: &Outposts, outpost_identifier: &str, request: &Value) -> Value {
+pub(crate) async fn start_ok(
+    outposts: &Outposts,
+    outpost_identifier: &str,
+    request: &Value,
+) -> Value {
     outposts
         .ok("POST", &capacity_route(outpost_identifier), Some(request))
         .await
@@ -169,7 +173,7 @@ async fn get_ok(outposts: &Outposts, outpost_identifier: &str, capacity_task_id:
 }
 
 /// A pool of `count` hosts of `instance_type`, the modelled `InstanceTypeCapacity`.
-fn pool(instance_type: &str, count: i64) -> Value {
+pub(crate) fn pool(instance_type: &str, count: i64) -> Value {
     json!({ "InstanceType": instance_type, "Count": count })
 }
 

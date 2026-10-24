@@ -289,6 +289,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // not by the call that creates the Outpost, so a just-created
                 // Outpost carries no asset and `ListAssets` reports none for it.
                 assets: Vec::new(),
+                // An instance is launched through Amazon EC2 against the Outpost,
+                // not by this call, so a just-created Outpost runs none and
+                // `ListBlockingInstancesForCapacityTask` reports none for it.
+                instances: Vec::new(),
             },
         );
 

@@ -19,9 +19,9 @@ use sha2::{Digest, Sha256};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    Address, AssetInfo, CapacityTaskFailure, DetailedInstanceTypeItem, FormFactorConfig,
-    InstanceTypeCapacity, InstancesToExclude, Outpost, PricingOption, PrivateConnectivityConfig,
-    Quote, Site,
+    Address, AssetInfo, AssetInstance, CapacityTaskFailure, DetailedInstanceTypeItem,
+    FormFactorConfig, InstanceTypeCapacity, InstancesToExclude, Outpost, PricingOption,
+    PrivateConnectivityConfig, Quote, Site,
 };
 
 /// The region every minted ARN falls back to when the request carries no SigV4
@@ -132,6 +132,16 @@ pub const DECOMMISSION_STATUS_SKIPPED: &str = "SKIPPED";
 /// states which of those values this store can observe and why it reports none of
 /// the others.
 pub const BLOCKING_OUTPOST_ORDER_CANCELLABLE: &str = "OUTPOST_ORDER_CANCELLABLE";
+
+/// The `BlockingResourceType` an Amazon EC2 instance still running on an Outpost is
+/// reported as, from the modelled enum's values.
+///
+/// AWS documents that an Outpost's instances have to be gone before it can be
+/// decommissioned, and the store's record of an instance running on an Outpost is
+/// [`OutpostRecord::instances`] — so an Outpost that holds one blocks its own
+/// decommission. See
+/// [`ComAmazonawsOutpostsOutpostsolafserviceState::blocking_resource_types`].
+pub const BLOCKING_EC2_INSTANCE: &str = "EC2_INSTANCE";
 
 /// How long after `CreateQuote` the quote's `ExpirationDate` falls.
 ///
@@ -336,6 +346,29 @@ pub struct OutpostRecord {
     /// with no installed hardware is reported as having none rather than as having
     /// hardware the emulator made up.
     pub assets: Vec<AssetInfo>,
+    /// The Amazon EC2 instances RUNNING on this Outpost — what
+    /// `ListBlockingInstancesForCapacityTask` weighs a capacity task against, and what
+    /// `ListAssetInstances` (still a scaffold stub, with an issue of its own) reports
+    /// — in the order they were recorded, which is the order a page of them is cut in
+    /// ([`BLOCKING_INSTANCE_PAGE`]).
+    ///
+    /// Kept on the Outpost's own record for the reason [`OutpostRecord::assets`] is: an
+    /// instance runs on exactly ONE Outpost (the modelled routes nest both lists of
+    /// them under `/outposts/{OutpostIdentifier}/…`), so deleting the Outpost takes its
+    /// instances with it.
+    ///
+    /// An instance is launched through Amazon EC2 — `RunInstances` with the Outpost's
+    /// ARN — and not by any call in THIS API, so `CreateOutpost` leaves this empty and
+    /// nothing here is ever invented: it holds only the instances that were actually
+    /// recorded for the Outpost, exactly as [`OutpostRecord::assets`] holds only
+    /// recorded hardware, and an Outpost nobody has launched an instance on is reported
+    /// as having none.
+    ///
+    /// The modelled [`AssetInstance`] is the shape this service reports an instance as
+    /// (`ListAssetInstances$AssetInstances`) and carries every member the narrower
+    /// `BlockingInstance` projection does, so the two lists read ONE record of an
+    /// instance rather than two copies of it.
+    pub instances: Vec<AssetInstance>,
 }
 
 /// The `CapacityTaskStatus` a capacity task carries the moment `StartCapacityTask`
@@ -373,8 +406,11 @@ pub const CAPACITY_TASK_TERMINAL: &[&str] = &[
 //
 // * `WAITING_FOR_EVACUATION` and the `CapacityTaskFailure` type
 //   `BLOCKING_INSTANCES_NOT_EVACUATED` describe a task held up by running EC2
-//   instances. This emulator runs no instances on an Outpost, so no task is ever
-//   blocked by one and none waits.
+//   instances. Whether a task is held up is a judgement about the Outpost's
+//   INSTALLED instance capacity, which this emulator does not model — the same
+//   reason `StartCapacityTask` answers a dry run 501 — so a task it starts runs on
+//   the clock and never waits. Which instances would have to stop is reported by
+//   `ListBlockingInstancesForCapacityTask`, off [`OutpostRecord::instances`].
 // * `FAILED` needs a failure something produced; nothing in this slice can fail a
 //   task, so `Failed` stays absent rather than carrying an invented reason.
 // * `CANCELLATION_IN_PROGRESS` and `CANCELLED` belong to `CancelCapacityTask`,
@@ -972,8 +1008,8 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// `StartOutpostDecommission` reports in `BlockingResourceTypes`.
     ///
     /// The modelled enum names seven kinds of resource (see
-    /// [`crate::ops::types::shared_types::BLOCKING_RESOURCE_TYPE_VALUES`]). Exactly
-    /// one of them is a resource THIS service's store can hold:
+    /// [`crate::ops::types::shared_types::BLOCKING_RESOURCE_TYPE_VALUES`]). Two of
+    /// them are resources THIS service's store can hold. The first:
     ///
     /// * [`BLOCKING_OUTPOST_ORDER_CANCELLABLE`] — an Outpost order still outstanding
     ///   on the Outpost. The store's one record of such an order is a quote of this
@@ -983,14 +1019,19 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     ///   about is one that can still be cancelled, and a decommission has to wait for
     ///   it.
     ///
-    /// The other six name resources that live nowhere in this store, so reporting one
+    /// A second is a resource it CAN hold:
+    ///
+    /// * [`BLOCKING_EC2_INSTANCE`] — an Amazon EC2 instance still running on the
+    ///   Outpost, which AWS requires to be gone before an Outpost can be
+    ///   decommissioned. The store's record of such an instance is
+    ///   [`OutpostRecord::instances`]; an Outpost nobody has launched an instance on
+    ///   holds none, so it reports none. The instances a capacity task names in
+    ///   `InstancesToExclude` are the caller's own input and never a record of a
+    ///   running instance.
+    ///
+    /// The other five name resources that live nowhere in this store, so reporting one
     /// would be asserting a resource this emulator has no record of:
     ///
-    /// * `EC2_INSTANCE` — this emulator runs no instances on an Outpost (stated once
-    ///   beside [`CAPACITY_TASK_TERMINAL`], which is why no capacity task ever waits
-    ///   for an evacuation either). The instances a capacity task names in
-    ///   `InstancesToExclude` are the caller's own input, not a record of instances
-    ///   this service placed.
     /// * `OUTPOST_RAM_SHARE`, `LGW_ROUTING_DOMAIN`, `LGW_ROUTE_TABLE`,
     ///   `LGW_VIRTUAL_INTERFACE_GROUP` — resource shares and local gateway resources
     ///   belong to other services' APIs; nothing in this service creates or holds
@@ -1014,6 +1055,13 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         });
         if order_outstanding {
             blocking.insert(BLOCKING_OUTPOST_ORDER_CANCELLABLE.to_string());
+        }
+        let instance_running = self
+            .outposts
+            .get(outpost_id)
+            .is_some_and(|record| !record.instances.is_empty());
+        if instance_running {
+            blocking.insert(BLOCKING_EC2_INSTANCE.to_string());
         }
         blocking.into_iter().collect()
     }
@@ -1798,6 +1846,15 @@ pub const ORDERABLE_INSTANCE_TYPE_PAGE: &str = "instanceTypes";
 /// names is a position in THAT list and the route the token is replayed on names
 /// the Outpost it belongs to. See [`OUTPOST_PAGE`].
 pub const ASSET_PAGE: &str = "assets";
+
+/// The stamp a `ListBlockingInstancesForCapacityTask` page token carries.
+///
+/// An instance is not a top-level resource with a creation sequence of its own
+/// either: it runs on ONE Outpost, held in that Outpost's own recorded order
+/// ([`OutpostRecord::instances`]), so the boundary such a token names is a position
+/// in THAT list and the route it is replayed on names the Outpost (and the capacity
+/// task) it belongs to. See [`ASSET_PAGE`].
+pub const BLOCKING_INSTANCE_PAGE: &str = "blockingInstances";
 
 /// The page size a list uses when the caller named no `MaxResults`, which is also
 /// the ceiling the model declares for it (`MaxResults1000`, `range(1..1000)`).
