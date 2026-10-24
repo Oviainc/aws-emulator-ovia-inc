@@ -68,6 +68,19 @@
 //!    Services' own, so a caller cannot create a tag in it — the same reservation
 //!    `TagResource` and `UntagResource` enforce, applied here because this operation
 //!    writes the request's tags onto the environment it mints.
+//! 12. Each `serviceAccessSecurityGroups.securityGroups` entry names a security group
+//!    the account holds IN that same VPC: those groups "allow traffic between the Amazon
+//!    EVS control plane and your VPC for Amazon EVS service access"
+//!    (`ServiceAccessSecurityGroups` doc) and Amazon EVS creates none of them, and a
+//!    security group belongs to one VPC — rule 7 for the one other member of this
+//!    request that names an existing EC2 resource of the caller's network
+//!    ([`crate::state::ec2_resources::security_group_failures`]).
+//!
+//! `initialVlans.hcxNetworkAclId` is NOT among them: a network access control list is an
+//! EC2 resource too, but the account's EC2 store holds no network ACL records at all, so
+//! that store can report neither that the id names one nor that it does not — and an
+//! unanswerable question refuses nothing, exactly as an unreadable store does
+//! ([`crate::state::ec2_resources`]).
 //!
 //! Supplying a parameter the chosen VCF mode does not support is NOT one of them.
 //! `SELF_DEPLOYED` "does not support" `licenseInfo`, `hosts`, `vcfHostnames`, `siteId`
@@ -501,6 +514,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &*self.engine,
                 &input.vpc_id,
                 &placeable,
+            ));
+
+            // The security groups the request names are the caller's own too: they
+            // "allow traffic between the Amazon EVS control plane and your VPC for
+            // Amazon EVS service access" (`ServiceAccessSecurityGroups` doc) and Amazon
+            // EVS creates none of them, so each has to be a group the account holds IN
+            // that VPC — a security group belongs to one VPC, so a group of another one
+            // cannot carry this VPC's traffic. Judged exactly as the service access
+            // subnet is, from the same store, and only once there IS a VPC to judge
+            // membership against.
+            let named_groups: Vec<(String, &str)> = input
+                .service_access_security_groups
+                .as_ref()
+                .and_then(|groups| groups.security_groups.as_deref())
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .map(|(index, group_id)| {
+                    (
+                        format!("serviceAccessSecurityGroups.securityGroups[{index}]"),
+                        group_id.as_str(),
+                    )
+                })
+                .collect();
+            let references: Vec<crate::state::ec2_resources::SecurityGroupReference<'_>> =
+                named_groups
+                    .iter()
+                    .map(
+                        |(member, group_id)| crate::state::ec2_resources::SecurityGroupReference {
+                            member,
+                            group_id,
+                        },
+                    )
+                    .collect();
+            failures.extend(crate::state::ec2_resources::security_group_failures(
+                &*self.engine,
+                &input.vpc_id,
+                &references,
             ));
         }
 
