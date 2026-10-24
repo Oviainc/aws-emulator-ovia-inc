@@ -29,12 +29,16 @@
 //!   was signed for) is capped at [`MAX_ENDPOINTS`] the same way.
 //! * A record's `tags` are capped at [`MAX_TAGS_PER_RESOURCE`], so `TagResource` cannot
 //!   grow one record without limit either; past the cap it answers the same quota error.
+//!   A job's share attempt ([`ShareAttempt`], what `CreateResourceShare` records) is a
+//!   SINGLE field on the job — "the most recent share attempt" — so sharing a job over
+//!   and over replaces that one attempt instead of growing anything, and
+//!   `pending_shares` holds at most one entry per stored job, bounding it by `MAX_JOBS`.
 //! * Every lookup is an O(log n) `BTreeMap` probe; no handler clones the whole store.
 //! * [`ComAmazonawsMediaconvertMediaconvertState::settle`] — the only work a reporting
 //!   operation does — touches ONLY the records whose due instant has already passed, by
-//!   draining the `pending` and `pending_queries` indexes that are ordered by that
-//!   instant, and does a CONSTANT amount of work per record it drains. It costs
-//!   O(k log n) in the number k of records actually due, which is zero on the
+//!   draining the `pending`, `pending_queries` and `pending_shares` indexes that are
+//!   ordered by that instant, and does a CONSTANT amount of work per record it drains. It
+//!   costs O(k log n) in the number k of records actually due, which is zero on the
 //!   overwhelming majority of calls; it is never a sweep of the job set.
 //! * `job_engine_versions` is NOT caller-driven at all: the account's Job engine version
 //!   catalogue is seeded once, at state construction, with exactly
@@ -193,6 +197,13 @@ pub const BILLING_TAGS_SOURCE_JOB: &str = "JOB";
 /// status can be NOT_SHARED, INITIATED, or SHARED". A job no resource share has been
 /// created for is `NOT_SHARED`.
 pub const SHARE_STATUS_NOT_SHARED: &str = "NOT_SHARED";
+/// See [`SHARE_STATUS_NOT_SHARED`]: the status of a share attempt `CreateResourceShare`
+/// has recorded and the service has not finished sharing yet. NOT terminal, so the clock
+/// owes it its completion.
+pub const SHARE_STATUS_INITIATED: &str = "INITIATED";
+/// See [`SHARE_STATUS_NOT_SHARED`]: the status of a share attempt the service has
+/// completed — the job's resources are shared with the support case the attempt names.
+pub const SHARE_STATUS_SHARED: &str = "SHARED";
 
 /// The `Priority` a job or job template created without one carries.
 ///
@@ -376,6 +387,15 @@ const JOB_SETTLES_AFTER: Duration = Duration::from_millis(750);
 /// a caller reading the results immediately after starting the query still observes the
 /// query in `SUBMITTED` with no results yet.
 const JOBS_QUERY_COMPLETES_AFTER: Duration = Duration::from_millis(500);
+
+/// How long after `CreateResourceShare` a job's share attempt leaves the non-terminal
+/// `INITIATED` status for `SHARED`.
+///
+/// A chosen span, not a documented one: the operation answers 202 ("Create a new resource
+/// share REQUEST"), so the sharing itself completes after the call, and AWS documents no
+/// duration for it. It is deliberately non-zero so a caller reading the job immediately
+/// after the call still observes `INITIATED` and the state conflict that goes with it.
+const SHARE_COMPLETES_AFTER: Duration = Duration::from_millis(500);
 
 /// Why a job that leaves `SUBMITTED` here ends in `ERROR` rather than `COMPLETE`.
 ///
@@ -592,6 +612,15 @@ pub fn account_endpoint_url(region: &str) -> String {
 /// id in a MediaConvert queue ARN is `queues/<name>`.
 pub fn queue_name_from_reference(reference: &str) -> &str {
     resource_name_from_reference(RESOURCE_TYPE_QUEUES, reference)
+}
+
+/// The job id a caller named, whether they gave the id or the job's ARN.
+///
+/// `CreateResourceShare$JobId` is "Specify MediaConvert Job ID or ARN to share", so it
+/// accepts the same two forms every resource reference in this service does; the resource
+/// id in a MediaConvert job ARN is `jobs/<id>`.
+pub fn job_id_from_reference(reference: &str) -> &str {
+    resource_name_from_reference(RESOURCE_TYPE_JOBS, reference)
 }
 
 /// The job template name a caller named, whether they gave the name or the template's
@@ -1341,9 +1370,10 @@ pub struct JobRecord {
     /// Always a value: service-applied ([`default_acceleration_settings`]) when the
     /// request omits it.
     pub acceleration_settings: AccelerationSettings,
-    /// Whether this job has been shared, which `CreateResourceShare` is what moves — so
-    /// a job nothing has shared is [`SHARE_STATUS_NOT_SHARED`].
-    pub share_status: String,
+    /// This job's most recent share attempt, as `CreateResourceShare` recorded it, or
+    /// `None` while nothing has ever asked for one — the single source of BOTH share
+    /// members [`Self::view`] reports, so the status and the details can never disagree.
+    pub share: Option<ShareAttempt>,
     pub hop_destinations: Vec<HopDestination>,
     pub job_engine_version_requested: Option<String>,
     pub simulate_reserved_queue: Option<String>,
@@ -1373,6 +1403,46 @@ pub struct JobTiming {
     pub submit_time: Option<SystemTime>,
     pub start_time: Option<SystemTime>,
     pub finish_time: Option<SystemTime>,
+}
+
+/// One share attempt against a job: the support case the `CreateResourceShare` request
+/// named, the status that attempt has reached and the instant its completion is owed at —
+/// the same instant that indexes it in the store's `pending_shares`, as a job's
+/// `settles_at` mirrors its `pending` entry.
+///
+/// At most ONE attempt is kept per job, because `Job$LastShareDetails` reports only "the
+/// MOST RECENT share attempt for the job" — a later attempt against another support case
+/// replaces this one rather than joining it, so sharing a job repeatedly cannot grow the
+/// store.
+#[derive(Debug, Clone)]
+pub struct ShareAttempt {
+    /// The `SupportCaseId` this share was requested against: "AWS Support case
+    /// identifier".
+    pub support_case_id: String,
+    /// [`SHARE_STATUS_INITIATED`] until the clock makes the attempt's completion due,
+    /// then [`SHARE_STATUS_SHARED`].
+    pub status: String,
+    /// When the clock owes this attempt its completion, which is also its entry in the
+    /// store's `pending_shares` index — read to drop that entry when a later attempt
+    /// supersedes this one, and `None` once the attempt is [`SHARE_STATUS_SHARED`], which
+    /// nothing further is due from.
+    pub completes_at: Option<SystemTime>,
+}
+
+impl ShareAttempt {
+    /// What `Job$LastShareDetails` reports: "Contains information about the most recent
+    /// share attempt for the job."
+    ///
+    /// The member is a bare `__string` and AWS documents no format for it, so this
+    /// rendering is CHOSEN; what it reports is not — both values are read off the stored
+    /// attempt, so it is the only channel through which a reader can see which support
+    /// case a job's resources were shared with.
+    pub fn details(&self) -> String {
+        format!(
+            "supportCaseId={}, shareStatus={}",
+            self.support_case_id, self.status
+        )
+    }
 }
 
 impl JobTiming {
@@ -1489,7 +1559,9 @@ impl JobRecord {
             job_engine_version_used: None,
             job_percent_complete: None,
             job_template: self.job_template.clone(),
-            last_share_details: None,
+            // "Contains information about the most recent share attempt for the job" —
+            // absent while no share was ever attempted; see [`ShareAttempt::details`].
+            last_share_details: self.share.as_ref().map(ShareAttempt::details),
             // "Provides messages from the service about jobs that you have already
             // successfully submitted": the container is always reported, and this service
             // has produced no informational or warning message about the job, so both
@@ -1509,7 +1581,14 @@ impl JobRecord {
             retry_count: Some(0),
             role: self.role.clone(),
             settings: self.settings.clone(),
-            share_status: Some(self.share_status.clone()),
+            // A job no share attempt was ever recorded for is NOT_SHARED; otherwise the
+            // status is the one the stored attempt has reached.
+            share_status: Some(
+                self.share
+                    .as_ref()
+                    .map_or(SHARE_STATUS_NOT_SHARED, |attempt| attempt.status.as_str())
+                    .to_string(),
+            ),
             simulate_reserved_queue: self.simulate_reserved_queue.clone(),
             status: Some(self.status.clone()),
             status_update_interval: Some(self.status_update_interval.clone()),
@@ -1991,6 +2070,22 @@ pub enum CancelOutcome {
     NotCancelable(String),
 }
 
+/// What the store did when asked to create a resource share for a job.
+#[derive(Debug)]
+pub enum ShareOutcome {
+    /// The attempt is recorded: the job's share status is now
+    /// [`SHARE_STATUS_INITIATED`], and the clock owes it its completion. Whatever attempt
+    /// the job carried before, against another support case, is superseded by it.
+    Initiated,
+    /// An attempt against the SAME support case is already recorded for this job, so the
+    /// request asks for the state the job is in and NOTHING was changed — not the
+    /// attempt's status, not its instant. The repeat is a no-op success, so a support
+    /// workflow that runs twice does not have to tell "already shared" from a failure.
+    AlreadyRecorded,
+    /// No job is stored under that id.
+    NotFound,
+}
+
 /// What the store did when asked to delete a queue.
 #[derive(Debug)]
 pub enum DeleteQueueOutcome {
@@ -2174,6 +2269,10 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     /// The jobs queries still owed their exit from `SUBMITTED`, ordered by the instant it
     /// comes due, drained by [`Self::settle`] exactly as `pending` is.
     pending_queries: BTreeSet<(SystemTime, String)>,
+    /// The jobs whose share attempt is still owed its exit from `INITIATED`, ordered by
+    /// the instant it comes due, drained by [`Self::settle`] exactly as `pending` is. At
+    /// most one entry per stored job, so it is bounded by [`MAX_JOBS`].
+    pending_shares: BTreeSet<(SystemTime, String)>,
     /// Monotonic suffix source for a minted job id; never reset, so no id repeats.
     job_sequence: u64,
     /// Monotonic suffix source for a minted jobs query id. See `job_sequence`.
@@ -2191,6 +2290,13 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     /// `job_settles_after` is: a test pins the span it needs instead of racing the real
     /// clock. Nothing on a request path writes it.
     pub jobs_query_completes_after: Duration,
+    /// How long after `CreateResourceShare` a job's share attempt is due to leave
+    /// `INITIATED`.
+    ///
+    /// Defaults to [`SHARE_COMPLETES_AFTER`], and is a field for the same reason
+    /// `job_settles_after` is: a test pins the span it needs instead of racing the real
+    /// clock. Nothing on a request path writes it.
+    pub share_completes_after: Duration,
 }
 
 impl Default for ComAmazonawsMediaconvertMediaconvertState {
@@ -2250,26 +2356,41 @@ impl Default for ComAmazonawsMediaconvertMediaconvertState {
             idempotency: BTreeMap::new(),
             pending: BTreeSet::new(),
             pending_queries: BTreeSet::new(),
+            pending_shares: BTreeSet::new(),
             job_sequence: 0,
             jobs_query_sequence: 0,
             job_settles_after: JOB_SETTLES_AFTER,
             jobs_query_completes_after: JOBS_QUERY_COMPLETES_AFTER,
+            share_completes_after: SHARE_COMPLETES_AFTER,
         }
     }
 }
 
+/// Which timeline a drained [`ComAmazonawsMediaconvertMediaconvertState::settle`] entry
+/// belongs to, so the one ordered walk over the pending indexes applies the right change.
+#[derive(Debug, Clone, Copy)]
+enum Due {
+    /// A job's exit from `SUBMITTED`.
+    Job,
+    /// A jobs query's completion.
+    JobsQuery,
+    /// A job's share attempt reaching `SHARED`.
+    Share,
+}
+
 impl ComAmazonawsMediaconvertMediaconvertState {
     /// Materialise every status change the clock had already made due at `now` — a job's
-    /// exit from `SUBMITTED` and a jobs query's completion.
+    /// exit from `SUBMITTED`, a jobs query's completion and a job's share attempt
+    /// reaching `SHARED`.
     ///
-    /// Bounded by the number of records actually due, not by the size of the store: both
-    /// pending indexes are ordered by due instant, so this drains their already-due
-    /// prefix, oldest first across the two, and stops at the first entry still in the
-    /// future. Each drained entry costs a bounded, constant amount of work — a job's
-    /// status and timing, or a query's status flip — so the cost of one call is the
-    /// number of records that came due and nothing else; neither kind re-reads the store.
-    /// It is the only write a reporting operation makes, and every change it applies was
-    /// owed at `now` whether or not anybody called.
+    /// Bounded by the number of records actually due, not by the size of the store: every
+    /// pending index is ordered by due instant, so this drains their already-due prefix,
+    /// oldest first across the three, and stops at the first entry still in the future.
+    /// Each drained entry costs a bounded, constant amount of work — a job's status and
+    /// timing, a query's status flip or a share attempt's status flip — so the cost of
+    /// one call is the number of records that came due and nothing else; no kind re-reads
+    /// the store. It is the only write a reporting operation makes, and every change it
+    /// applies was owed at `now` whether or not anybody called.
     ///
     /// Whether a job may leave `SUBMITTED` at all is its QUEUE's decision, not the
     /// clock's: `QueueStatus` says "If you pause a queue, jobs in that queue won't
@@ -2278,30 +2399,38 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     /// `ACTIVE` again. See [`Self::settle_job`].
     pub fn settle(&mut self, now: SystemTime) {
         loop {
-            let next_job = self.pending.first().cloned();
-            let next_query = self.pending_queries.first().cloned();
-            match (next_job, next_query) {
-                // The two timelines are drained as one, oldest due instant first, so
-                // each change lands in the order the clock made it due.
-                (Some(job), query) if query.as_ref().is_none_or(|(due, _)| job.0 <= *due) => {
-                    if job.0 > now {
-                        break;
-                    }
-                    self.pending.remove(&job);
-                    self.settle_job(job.0, &job.1);
+            // The three timelines are drained as one, oldest due instant first, so each
+            // change lands in the order the clock made it due. `min_by_key` over the
+            // head of each index keeps that ordering without a match arm per pair.
+            let next = [
+                self.pending.first().map(|entry| (entry.clone(), Due::Job)),
+                self.pending_queries
+                    .first()
+                    .map(|entry| (entry.clone(), Due::JobsQuery)),
+                self.pending_shares
+                    .first()
+                    .map(|entry| (entry.clone(), Due::Share)),
+            ]
+            .into_iter()
+            .flatten()
+            .min_by(|left, right| left.0.cmp(&right.0));
+            // Nothing is pending at all, or the earliest entry is still in the future.
+            let Some((entry, kind)) = next.filter(|(entry, _)| entry.0 <= now) else {
+                break;
+            };
+            match kind {
+                Due::Job => {
+                    self.pending.remove(&entry);
+                    self.settle_job(entry.0, &entry.1);
                 }
-                (_, Some(query)) => {
-                    if query.0 > now {
-                        break;
-                    }
-                    self.pending_queries.remove(&query);
-                    self.complete_jobs_query(&query.1);
+                Due::JobsQuery => {
+                    self.pending_queries.remove(&entry);
+                    self.complete_jobs_query(&entry.1);
                 }
-                // Nothing is due. `(Some(_), None)` cannot reach here — a pending job
-                // with no pending query always takes the first arm, whose guard holds
-                // when there is no query — but guards do not count towards
-                // exhaustiveness, so it is named rather than left to a catch-all.
-                (None, None) | (Some(_), None) => break,
+                Due::Share => {
+                    self.pending_shares.remove(&entry);
+                    self.complete_share(entry.0, &entry.1);
+                }
             }
         }
     }
@@ -2405,6 +2534,76 @@ impl ComAmazonawsMediaconvertMediaconvertState {
             // A completed query is terminal, so the clock owes it nothing further.
             query.completes_at = None;
         }
+    }
+
+    /// The completion the clock owed a job's share attempt at `due`: it leaves the
+    /// non-terminal `INITIATED` status for `SHARED`.
+    ///
+    /// CONSTANT work per attempt, as the two transitions above are: one status flip on
+    /// the job the entry names, reached by a single map probe.
+    ///
+    /// An entry whose instant is not the one the job's CURRENT attempt is waiting for
+    /// belongs to an attempt a later `CreateResourceShare` superseded, and completes
+    /// nothing: the newer attempt keeps the whole span it was given.
+    fn complete_share(&mut self, due: SystemTime, id: &str) {
+        if let Some(attempt) = self.jobs.get_mut(id).and_then(|job| job.share.as_mut()) {
+            if attempt.completes_at != Some(due) {
+                return;
+            }
+            if attempt.status == SHARE_STATUS_INITIATED {
+                attempt.status = SHARE_STATUS_SHARED.to_string();
+            }
+            // A shared attempt is terminal, so the clock owes it nothing further.
+            attempt.completes_at = None;
+        }
+    }
+
+    /// Record a share attempt against a stored job: "Create a new resource share request
+    /// for MediaConvert resources with AWS Support."
+    ///
+    /// The attempt, the job's share status and the clock-owed completion are owned
+    /// together here, so the three cannot be left inconsistent by a caller that forgets
+    /// one. `id` is the job id the request's reference resolved to
+    /// ([`job_id_from_reference`]).
+    ///
+    /// The attempt REPLACES whatever the job's previous one was, whatever status that one
+    /// had reached, because `Job$LastShareDetails` reports only "the most recent share
+    /// attempt for the job" — so no job ever holds more than one, and sharing a job
+    /// repeatedly does not grow the store. The superseded attempt's clock-owed completion
+    /// goes with it, so the attempt that replaced it waits its own whole span. The one
+    /// request that changes nothing is the repeat against the SAME support case, which
+    /// asks for the state the job is already in; see [`ShareOutcome`].
+    pub fn create_resource_share(
+        &mut self,
+        id: &str,
+        support_case_id: &str,
+        now: SystemTime,
+    ) -> ShareOutcome {
+        let due = now + self.share_completes_after;
+        let Some(job) = self.jobs.get_mut(id) else {
+            return ShareOutcome::NotFound;
+        };
+        if job
+            .share
+            .as_ref()
+            .is_some_and(|attempt| attempt.support_case_id == support_case_id)
+        {
+            return ShareOutcome::AlreadyRecorded;
+        }
+        // The instant the superseded attempt was waiting for, so its index entry goes
+        // with it instead of completing the new attempt early.
+        let superseded = job.share.as_ref().and_then(|attempt| attempt.completes_at);
+        job.share = Some(ShareAttempt {
+            support_case_id: support_case_id.to_string(),
+            // INITIATED is not terminal, so the clock owes this attempt its completion.
+            status: SHARE_STATUS_INITIATED.to_string(),
+            completes_at: Some(due),
+        });
+        if let Some(superseded) = superseded {
+            self.pending_shares.remove(&(superseded, id.to_string()));
+        }
+        self.pending_shares.insert((due, id.to_string()));
+        ShareOutcome::Initiated
     }
 
     /// Store a newly started jobs query, refusing it once the store is at

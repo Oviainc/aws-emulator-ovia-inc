@@ -21,6 +21,8 @@ mod guardrail_wire_shape;
 mod guardrails;
 #[path = "all/marketplace_model_endpoints.rs"]
 mod marketplace_model_endpoints;
+#[path = "all/model_import_jobs.rs"]
+mod model_import_jobs;
 #[path = "all/model_invocation_logging.rs"]
 mod model_invocation_logging;
 #[path = "all/prompt_routers.rs"]
