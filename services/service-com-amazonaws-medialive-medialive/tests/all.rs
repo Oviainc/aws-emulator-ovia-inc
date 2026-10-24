@@ -11,6 +11,9 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/channel_lifecycle.rs`) — which the layout check refuses. The `#[path]` is
 // what points it into `tests/all/`.
+#[path = "all/account_configuration.rs"]
+mod account_configuration;
+
 #[path = "all/batch_delete.rs"]
 mod batch_delete;
 
