@@ -300,7 +300,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let arn =
             crate::state::enabled_control_arn(&region, &crate::state::new_enabled_control_id());
-        let operation_identifier = crate::state::new_operation_identifier();
+        // `EnableControl` "starts an asynchronous operation", so the identifier it returns
+        // names a record in the control operation log — the one store a control operation
+        // identifier resolves against.
+        let operation_identifier = store.record_control_operation(
+            crate::state::ControlOperationType::EnableControl,
+            &input.control_identifier,
+            &input.target_identifier,
+            &arn,
+            now,
+        );
 
         // A control is deployed into the regions the landing zone governs; with no
         // landing zone deployed, the only region this request names is the one it was
