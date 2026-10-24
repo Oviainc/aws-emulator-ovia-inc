@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopyDBClusterParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopyDBClusterParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Copies a cluster parameter group this service holds: the copy carries the source's
+//! family and every parameter value a caller had set on it, under a new name and
+//! description. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopyDBClusterParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "You can't copy a default DB cluster parameter group" — those are the groups AWS
+//! provides per engine family, and the operation's own documentation sends a caller who
+//! wants one to `CreateDBClusterParameterGroup` instead, which starts from the family's
+//! published defaults.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +157,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopyDBClusterParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopyDBClusterParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopyDBClusterParameterGroup"))
+        let region = crate::state::request_region(ctx)
+            .map_err(CopyDBClusterParameterGroupError::validation)?;
+        // The model constrains neither identifier, so the rules their own documentation
+        // states are enforced here: the target name follows the name rule the API
+        // publishes for a cluster parameter group, and "this value is stored as a lowercase
+        // string".
+        crate::state::validate_parameter_group_name(
+            "TargetDBClusterParameterGroupIdentifier",
+            &input.target_db_cluster_parameter_group_identifier,
+        )
+        .map_err(CopyDBClusterParameterGroupError::invalid_parameter_value)?;
+        let target = input
+            .target_db_cluster_parameter_group_identifier
+            .to_ascii_lowercase();
+        // Nothing caller-sized reaches the store unchecked.
+        crate::state::check_free_form(
+            "TargetDBClusterParameterGroupDescription",
+            &input.target_db_cluster_parameter_group_description,
+        )
+        .map_err(CopyDBClusterParameterGroupError::validation)?;
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tags(&tags)
+            .map_err(CopyDBClusterParameterGroupError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated group.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+
+        // "You can't copy a default DB cluster parameter group": a name of that form is a
+        // group AWS provides, so the refusal names the restriction rather than reporting
+        // the group as missing.
+        let source_named = input.source_db_cluster_parameter_group_identifier.clone();
+        if crate::state::arn_resource_name_of(&source_named)
+            .to_ascii_lowercase()
+            .starts_with("default.")
+        {
+            return Err(CopyDBClusterParameterGroupError::invalid_parameter_value(
+                format!(
+                    "invalid value '{source_named}' for \
+                     SourceDBClusterParameterGroupIdentifier: you can't copy a default DB \
+                     cluster parameter group; create a new custom group for the family \
+                     instead"
+                ),
+            ));
+        }
+        // RDS is regional: the source is resolved in the region the request was signed
+        // for, by name or by ARN, and a value that names no group there is the modelled
+        // not-found fault.
+        let Some(source) = store.resolve_cluster_parameter_group(&region, &source_named) else {
+            return Err(
+                CopyDBClusterParameterGroupErrorModeled::DBParameterGroupNotFoundFault(
+                    DBParameterGroupNotFoundFault {
+                        message: Some(format!(
+                            "DBClusterParameterGroup not found: {source_named}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The copy carries the source's family and the parameter values a caller set on
+        // it: "copies the specified DB cluster parameter group", so a describe of the copy
+        // reports the same parameters as a describe of the source.
+        let record = crate::state::DbClusterParameterGroupRecord {
+            name: target.clone(),
+            family: source.family.clone(),
+            description: input.target_db_cluster_parameter_group_description,
+            region: region.clone(),
+            parameters: source.parameters.clone(),
+            tags,
+        };
+
+        let key = (region.clone(), target.clone());
+        if store.db_cluster_parameter_groups.contains_key(&key) {
+            return Err(
+                CopyDBClusterParameterGroupErrorModeled::DBParameterGroupAlreadyExistsFault(
+                    DBParameterGroupAlreadyExistsFault {
+                        message: Some(format!("Parameter group {target} already exists")),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.cluster_parameter_groups_in(&region).len()
+            >= crate::state::DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(
+                CopyDBClusterParameterGroupErrorModeled::DBParameterGroupQuotaExceededFault(
+                    DBParameterGroupQuotaExceededFault {
+                        message: Some(format!(
+                            "Cannot create more than {} cluster parameter groups in {region}",
+                            crate::state::DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let db_cluster_parameter_group = record.to_wire();
+        store.db_cluster_parameter_groups.insert(key, record);
+        Ok(CopyDBClusterParameterGroupOutput {
+            db_cluster_parameter_group: Some(db_cluster_parameter_group),
+        })
     }
 }

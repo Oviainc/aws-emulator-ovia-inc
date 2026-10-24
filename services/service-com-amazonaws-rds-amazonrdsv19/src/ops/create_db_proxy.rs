@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBProxy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBProxy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates an RDS proxy: a named front door, with its own endpoint, that database clients
+//! connect to instead of connecting to a DB instance or DB cluster directly. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBProxy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The proxy starts with NO targets — `RegisterDBProxyTargets` adds the databases it
+//! connects to, and `DescribeDBProxyTargets` reports them — and with the one target group
+//! every proxy has, named `default`.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +192,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBProxy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBProxyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBProxy"))
+        let region = crate::state::request_region(ctx).map_err(CreateDBProxyError::validation)?;
+        // Nothing caller-sized reaches the store unchecked: the role ARN and every string
+        // one `Auth` entry carries are length-bounded, and the subnet and security group
+        // lists are count-bounded.
+        crate::state::check_stored_text("RoleArn", &input.role_arn, crate::state::MAX_IAM_ROLE_ARN_LEN)
+            .map_err(CreateDBProxyError::invalid_parameter_value)?;
+        crate::state::check_request_list_len(
+            "VpcSubnetIds",
+            input.vpc_subnet_ids.len(),
+            crate::state::MAX_SUBNETS_PER_DB_SUBNET_GROUP,
+        )
+        .map_err(CreateDBProxyError::invalid_parameter_value)?;
+        let security_groups = input.vpc_security_group_ids.unwrap_or_default();
+        crate::state::check_security_group_memberships("VpcSecurityGroupIds", &security_groups)
+            .map_err(CreateDBProxyError::invalid_parameter_value)?;
+        let auth = input.auth.unwrap_or_default();
+        for entry in &auth {
+            for (member, value) in [
+                ("Auth.Description", entry.description.as_deref()),
+                ("Auth.UserName", entry.user_name.as_deref()),
+                ("Auth.AuthScheme", entry.auth_scheme.as_deref()),
+                ("Auth.SecretArn", entry.secret_arn.as_deref()),
+                ("Auth.IAMAuth", entry.iam_auth.as_deref()),
+                (
+                    "Auth.ClientPasswordAuthType",
+                    entry.client_password_auth_type.as_deref(),
+                ),
+            ] {
+                if let Some(value) = value {
+                    crate::state::check_free_form(member, value)
+                        .map_err(CreateDBProxyError::invalid_parameter_value)?;
+                }
+            }
+        }
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tags(&tags).map_err(CreateDBProxyError::invalid_parameter_value)?;
+        // "The EC2 subnet IDs for the proxy": a value that is not a subnet id names no
+        // subnet, which is the modelled `InvalidSubnet`.
+        for subnet_id in &input.vpc_subnet_ids {
+            if let Err(message) = crate::state::check_subnet_id(subnet_id) {
+                return Err(CreateDBProxyErrorModeled::InvalidSubnet(InvalidSubnet {
+                    message: Some(message),
+                })
+                .into());
+            }
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated proxy.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // "This name must be unique for all proxies owned by your Amazon Web Services
+        // account in the specified Amazon Web Services Region."
+        let key = (region.clone(), input.db_proxy_name.clone());
+        if store.db_proxies.contains_key(&key) {
+            return Err(CreateDBProxyErrorModeled::DBProxyAlreadyExistsFault(
+                DBProxyAlreadyExistsFault {
+                    message: Some(format!(
+                        "A DB proxy named {} already exists",
+                        input.db_proxy_name
+                    )),
+                },
+            )
+            .into());
+        }
+        if store.db_proxies_in(&region).len() >= crate::state::DB_PROXY_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(CreateDBProxyErrorModeled::DBProxyQuotaExceededFault(
+                DBProxyQuotaExceededFault {
+                    message: Some(format!(
+                        "Cannot create more than {} DB proxies in {region}",
+                        crate::state::DB_PROXY_QUOTA_PER_REGION
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mint = store.next_mint();
+        let now = crate::state::now_as_wire_timestamp();
+        // A new proxy is not ready to handle requests yet: it reports `creating` and
+        // reaches `available` on its own. The due instant is stored on the record — nothing
+        // sleeps.
+        let record = crate::state::DbProxyRecord {
+            name: input.db_proxy_name,
+            region: region.clone(),
+            engine_family: input.engine_family,
+            default_auth_scheme: input
+                .default_auth_scheme
+                .unwrap_or_else(|| crate::state::DEFAULT_AUTH_SCHEME_NONE.to_string()),
+            auth: auth
+                .into_iter()
+                .map(|entry| UserAuthConfigInfo {
+                    description: entry.description,
+                    user_name: entry.user_name,
+                    auth_scheme: entry.auth_scheme,
+                    secret_arn: entry.secret_arn,
+                    iam_auth: entry.iam_auth,
+                    client_password_auth_type: entry.client_password_auth_type,
+                })
+                .collect(),
+            role_arn: input.role_arn,
+            vpc_subnet_ids: input.vpc_subnet_ids,
+            vpc_security_group_ids: security_groups,
+            // `RequireTLS` / `DebugLogging` each turn something on that the request asks
+            // for, so a proxy created without them has it off.
+            require_tls: input.require_tls.unwrap_or(false),
+            idle_client_timeout: input
+                .idle_client_timeout
+                .unwrap_or(crate::state::DEFAULT_IDLE_CLIENT_TIMEOUT),
+            debug_logging: input.debug_logging.unwrap_or(false),
+            endpoint_network_type: input
+                .endpoint_network_type
+                .unwrap_or_else(|| crate::state::NETWORK_TYPE_IPV4.to_string()),
+            target_connection_network_type: input
+                .target_connection_network_type
+                .unwrap_or_else(|| crate::state::NETWORK_TYPE_IPV4.to_string()),
+            endpoint_host: crate::state::mint_endpoint_host(mint),
+            status: crate::state::DB_PROXY_STATUS_CREATING.to_string(),
+            pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                crate::state::DB_PROXY_STATUS_AVAILABLE,
+            )),
+            created_date: now,
+            updated_date: now,
+            targets: Vec::new(),
+            tags,
+        };
+        let db_proxy = record.to_wire();
+        store.db_proxies.insert(key, record);
+        Ok(CreateDBProxyOutput {
+            db_proxy: Some(db_proxy),
+        })
     }
 }
