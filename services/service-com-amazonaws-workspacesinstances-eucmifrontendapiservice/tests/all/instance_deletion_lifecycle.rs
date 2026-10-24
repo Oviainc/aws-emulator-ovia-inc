@@ -29,6 +29,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::workspace_instance_lifecycle::{
     call, create, error_code, harness, list_all_ids, minimal_create, ok, provision_state,
+    DEFAULT_TEST_REGION,
 };
 
 /// Every value `ProvisionStateEnum` declares, as the generated constant the model
@@ -383,7 +384,12 @@ async fn an_instance_tearing_down_no_longer_holds_a_running_instance_slot() {
     let store = wsinst::state::service_state(&*engine).expect("the service's own store");
     let (held, running) = {
         let state = store.lock();
-        (state.instances.len(), state.running_instance_count())
+        // The quota is counted per account per Region, so the count is asked for the
+        // Region these calls were signed for.
+        (
+            state.instances.len(),
+            state.running_instance_count(DEFAULT_TEST_REGION),
+        )
     };
     assert_eq!(
         (held, running),

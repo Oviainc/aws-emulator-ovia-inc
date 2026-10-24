@@ -58,8 +58,9 @@ fn supplied_value(n: usize) -> String {
 /// the plan at that index (see [`supplied_value`]).
 type KeyRow = (&'static str, fn(usize) -> Value);
 
-/// `CreateUsagePlanKey` on `plan` for `key_id` with `key_type`.
-async fn create_usage_plan_key(
+/// `CreateUsagePlanKey` on `plan` for `key_id` with `key_type`. Shared with the sibling
+/// `usage_plan_collection` suite, which meters keys to narrow the plan collection.
+pub(crate) async fn create_usage_plan_key(
     gateway: &Gateway,
     plan: &str,
     key_id: &str,

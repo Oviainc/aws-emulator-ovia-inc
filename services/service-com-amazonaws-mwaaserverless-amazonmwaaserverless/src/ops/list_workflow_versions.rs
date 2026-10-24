@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkflowVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkflowVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkflowVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: one `WorkflowVersionSummary` per immutable version the named workflow
+//! holds in this service's store (`crate::state`), in the order the versions were
+//! appended, at most `MaxResults` per page. A workflow the store does not hold is the
+//! service's lookup miss, not an empty page. The only write is the change the clock
+//! already owed — the teardown of a workflow past its `DELETING` span — so a read never
+//! changes what a later caller sees. The `NextToken` this operation returns is the only
+//! one it accepts back; anything else is refused as a `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -94,6 +92,19 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+/// The list this operation's pagination cursors belong to, so a cursor issued for
+/// another paginated list of this service is refused here.
+const PAGE_KIND: &str = "WorkflowVersions";
+
+/// The smallest page size the modelled `MaxResults` range allows
+/// (`@range(min: 1, max: 100)`).
+const MIN_PAGE_SIZE: usize = 1;
+
+/// The largest page size that same range allows.
+const MAX_PAGE_SIZE: usize = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -105,12 +116,26 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mwaaserverless-amazonmw
 // here — hence the `ListWorkflowVersionsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mwaaserverless#ListWorkflowVersions")]
+// Widened with `ResourceNotFoundException`: `WorkflowArn` is this operation's
+// `@httpLabel` — the parent resource the listing walks, `GET
+// /workflows/{WorkflowArn}/versions` — and every sibling operation that resolves that
+// same ARN (`GetWorkflow`, `DeleteWorkflow`, `StartWorkflowRun`, `ListWorkflowRuns`,
+// `ListTagsForResource`) declares `ResourceNotFoundException` for a workflow the store
+// does not hold. This operation's own `errors` list omits it, so it is widened in here
+// through `extra_errors` rather than answered as an empty page, which would report
+// "this workflow has no versions" for a workflow that does not exist. The shape is this
+// service's own (`com.amazonaws.mwaaserverless#ResourceNotFoundException`), served at
+// `crate::state::LOOKUP_MISS_STATUS` like every other lookup miss here.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mwaaserverless#ListWorkflowVersions",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum ListWorkflowVersionsErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     OperationTimeoutException(OperationTimeoutException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -166,32 +191,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (ctx, &self.engine);
+        // `ctx` carries only request metadata; the listing is identified by its input.
+        let _ = ctx;
 
         // A member value that fails the constraint its model declares is refused
         // first, with the modelled `ValidationException` — `Message`,
         // `Reason: fieldValidationFailed` and a `FieldList` entry naming each
-        // offending member. A well-formed request still reaches the 501 below:
-        // the operation itself is not implemented yet.
+        // offending member.
         validate_input(&input).map_err(|refusal| {
             ListWorkflowVersionsError::from(
                 ListWorkflowVersionsErrorModeled::ValidationException(refusal),
             )
         })?;
 
-        // Implement `ListWorkflowVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkflowVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". The members listed in `skip_validation` on
-        // `ListWorkflowVersionsInput` are checked by `validate_input` below; every other
-        // modeled constraint is refused BEFORE this handler runs.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkflowVersions"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListWorkflowVersionsErrorModeled::InternalServerException(InternalServerException {
+                message: "the com.amazonaws.mwaaserverless workflow store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+
+        // The ONE write a read may make: finish every workflow teardown the clock has
+        // already made due, so the versions of a workflow past its `DELETING` span are
+        // gone with it — the same step every handler that touches `workflows` takes.
+        store.reap_deleted_workflows(now);
+
+        // The cursor is the `WorkflowVersion` of the last item on the previous page.
+        // Decoded BEFORE the workflow lookup so a foreign token is one refusal whatever
+        // the ARN resolves to.
+        let after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(PAGE_KIND, token).ok_or_else(|| {
+                    ListWorkflowVersionsErrorModeled::ValidationException(
+                        crate::state::invalid_page_token("ListWorkflowVersions"),
+                    )
+                })?,
+            ),
+        };
+
+        // The entity this listing walks is the workflow its `@httpLabel` names: one the
+        // store does not hold has no versions to page over, and an empty page for it
+        // would claim the workflow exists.
+        let workflow = store.workflows.get(&input.workflow_arn).ok_or_else(|| {
+            crate::state::lookup_miss(
+                ListWorkflowVersionsErrorModeled::ResourceNotFoundException(
+                    crate::state::unresolved(
+                        crate::state::UnresolvedEntity::Workflow,
+                        &input.workflow_arn,
+                    ),
+                ),
+            )
+        })?;
+
+        // `MaxResults` carries `@default: 20` and `@range(1..100)`, both applied before
+        // this handler runs, so the value is already a usable page size; it is held to
+        // those published bounds anyway, because a page size of zero would report "this
+        // workflow has no versions" for a workflow that has them — a wrong answer dressed
+        // as success — and the walk must always make progress.
+        let page_size = usize::try_from(input.max_results)
+            .unwrap_or(0)
+            .clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE);
+
+        // A version is immutable and is never removed on its own — it goes only with the
+        // workflow that holds it — so the cursor's version still occupies the same place
+        // in the history on the next call, and resuming just after it neither repeats nor
+        // skips an entry. A cursor naming a version THIS workflow does not hold was
+        // therefore not issued for this listing, and is refused like any other foreign
+        // token rather than silently restarting or truncating the walk.
+        let start = match after.as_deref() {
+            None => 0,
+            Some(last) => workflow
+                .versions
+                .iter()
+                .position(|record| record.version == last)
+                .map(|index| index + 1)
+                .ok_or_else(|| {
+                    ListWorkflowVersionsErrorModeled::ValidationException(
+                        crate::state::invalid_page_token("ListWorkflowVersions"),
+                    )
+                })?,
+        };
+
+        let remaining = &workflow.versions[start..];
+        let workflow_versions: Vec<WorkflowVersionSummary> = remaining
+            .iter()
+            .take(page_size)
+            .map(|record| summarize(workflow, record))
+            .collect();
+
+        // A token only when a further page exists, so a client stops without an extra
+        // empty round trip.
+        let next_token = match workflow_versions.last() {
+            Some(last) if remaining.len() > workflow_versions.len() => Some(
+                crate::state::encode_page_token(PAGE_KIND, &last.workflow_version),
+            ),
+            _ => None,
+        };
+
+        Ok(ListWorkflowVersionsOutput {
+            // The page itself — the `@paginated` `items` member — so "no versions on this
+            // page" is the empty list rather than an absent member.
+            workflow_versions: Some(workflow_versions),
+            next_token,
+        })
+    }
+}
+
+/// One stored version as the `WorkflowVersionSummary` this listing reports.
+///
+/// Every member comes from the stored record, and the configuration members come from
+/// the snapshot that version froze — the same ones `GetWorkflow` serves when it is asked
+/// for that version by name. `ModifiedAt` is the version's own creation instant: a
+/// version is immutable once created, so nothing ever modifies it afterwards.
+/// `ScheduleConfiguration` stays absent because no modelled operation of this service
+/// accepts a schedule, so no stored version holds one.
+fn summarize(
+    workflow: &crate::state::Workflow,
+    record: &crate::state::WorkflowVersionRecord,
+) -> WorkflowVersionSummary {
+    WorkflowVersionSummary {
+        workflow_version: record.version.clone(),
+        workflow_arn: workflow.arn.clone(),
+        is_latest_version: Some(record.is_latest),
+        created_at: Some(crate::state::timestamp(record.created_at)),
+        modified_at: Some(crate::state::timestamp(record.created_at)),
+        definition_s3_location: Some(record.snapshot.definition_s3_location.clone()),
+        schedule_configuration: None,
+        trigger_mode: record.snapshot.trigger_mode.clone(),
     }
 }
 

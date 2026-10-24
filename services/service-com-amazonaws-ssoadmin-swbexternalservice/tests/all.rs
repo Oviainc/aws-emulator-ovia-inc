@@ -47,6 +47,8 @@ mod instance_regions;
 mod instance_update;
 #[path = "all/list_instances_pagination.rs"]
 mod list_instances_pagination;
+#[path = "all/managed_policies.rs"]
+mod managed_policies;
 #[path = "all/managed_policies_in_permission_set.rs"]
 mod managed_policies_in_permission_set;
 #[path = "all/permissions_boundary.rs"]

@@ -324,6 +324,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A regional resource belongs to the Region its create call was signed for, so
         // the Region comes from the credential scope, never from a member.
         let region = crate::state::request_region(ctx.parts());
+        // A Region this service is not available in has no endpoint of this service, so
+        // it holds no volumes and admits none — there is no Availability Zone of such a
+        // Region for this service to place a volume in.
+        if !crate::state::is_supported_region(&region) {
+            return Err(
+                CreateVolumeErrorModeled::ValidationException(crate::state::region_not_supported())
+                    .into(),
+            );
+        }
         validate_configuration(&input, &region)
             .map_err(CreateVolumeErrorModeled::ValidationException)?;
 
@@ -355,6 +364,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let fingerprint = crate::state::request_fingerprint(&parameters);
         match crate::state::resolve_client_token(
             &state.volume_client_tokens,
+            &region,
             input.client_token.as_deref(),
             &fingerprint,
         ) {
@@ -378,9 +388,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A real account has a Service Quotas limit on volumes, and this operation
         // models `ServiceQuotaExceededException` for reaching it. Capacity is released
         // by DeleteVolume.
-        if !state.has_volume_capacity() {
+        if !state.has_volume_capacity(&region) {
             return Err(CreateVolumeErrorModeled::ServiceQuotaExceededException(
-                crate::state::volume_quota_exceeded(state.volumes.len()),
+                crate::state::volume_quota_exceeded(state.volume_count(&region)),
             )
             .into());
         }
@@ -409,6 +419,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let volume_id = state.mint_volume_id();
         let record = crate::state::VolumeRecord {
             id: volume_id.clone(),
+            // The Region the create was signed for: the volume belongs to it, and
+            // `availability_zone` names one of ITS zones (checked above).
+            region: region.clone(),
             availability_zone: input.availability_zone,
             size_in_gb: input.size_in_gb,
             volume_type: input.volume_type,
@@ -424,7 +437,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if let Some(token) = input.client_token {
             state.volume_client_tokens.insert(
-                token,
+                (region, token),
                 crate::state::IdempotencyClaim {
                     resource_id: volume_id.clone(),
                     fingerprint,
