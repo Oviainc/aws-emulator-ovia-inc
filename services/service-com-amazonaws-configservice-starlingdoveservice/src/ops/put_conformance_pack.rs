@@ -1,15 +1,62 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutConformancePack
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutConformancePack`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutConformancePack::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates a conformance pack — "a collection of Config rules that can be
+//! easily deployed in an account and a region" — and the CloudFormation stack it is
+//! deployed as.
+//!
+//! What this handler enforces, and where each rule comes from:
+//!
+//! * "You must specify only one of the follow parameters: TemplateS3Uri, TemplateBody
+//!   or TemplateSSMDocumentDetails": a request carrying none of them, or more than one,
+//!   is refused with the modelled `InvalidParameterValueException`;
+//! * a `TemplateBody` is READ as the YAML (or JSON, which YAML 1.2 is a superset of)
+//!   template it must be, and must declare the resource types a conformance pack
+//!   template declares ([`CONFORMANCE_PACK_TEMPLATE_RESOURCE_TYPES`]); a body that is
+//!   neither is refused with the modelled `ConformancePackTemplateValidationException`
+//!   ("You have specified a template that is not valid or supported") and leaves NO
+//!   pack behind for that name;
+//! * "PutConformancePack is an idempotent API. Subsequent requests won't create a
+//!   duplicate resource if one was already created": a second call for the same name
+//!   redeploys that pack rather than creating another, and "tags will not be updated,
+//!   even if they are different";
+//! * a NEW pack has to fit under this Region's conformance pack quota
+//!   ([`crate::state::CONFORMANCE_PACKS_QUOTA`]), else
+//!   `MaxNumberOfConformancePacksExceededException`;
+//! * the deployment is not finished when this call answers: the pack is
+//!   `CREATE_IN_PROGRESS` until the clock makes `CREATE_COMPLETE` due
+//!   ([`crate::state::CONFORMANCE_PACK_DEPLOY_SETTLE_AFTER`]), which is what
+//!   `DescribeConformancePackStatus` reports.
+//!
+//! A template Config has to FETCH to read — `TemplateS3Uri`, whose body is an Amazon S3
+//! object, and `TemplateSSMDocumentDetails`, whose body is a Systems Manager document —
+//! is not read here: this handler cannot see either store, so rather than deploy a pack
+//! from a template it never read it answers the scaffold's 501 for those two legs alone.
+//!
+//! ## What a deployment here does
+//!
+//! The deployment CREATES what the template declares: each `AWS::Config::ConfigRule` is
+//! written into this account's Config rules, under the name Config gives a pack's rule
+//! ([`crate::state::conformance_pack_rule_name`]) and carrying the pack's service
+//! principal as its `CreatedBy`, and each `AWS::Config::RemediationConfiguration` is
+//! written as the remediation of the rule it names. So a pack this operation reports
+//! `CREATE_COMPLETE` is one whose rules `DescribeConfigRules` reports and whose
+//! remediation actions `DescribeRemediationConfigurations` reports; a REDEPLOY of the
+//! same pack replaces exactly the resources its previous deployment created; and a
+//! deployment whose rules would not fit under this Region's Config rules quota creates
+//! nothing — leaving a previous deployment of the same pack standing — and is reported in
+//! the modelled `CREATE_FAILED` state with the reason
+//! (`ConformancePackStatusReason`) rather than as a completion of work nothing performed.
+//!
+//! What the deployment does NOT do is evaluate those rules against resources: an
+//! evaluation result is recorded by the evaluation writers, which are scaffolded, so the
+//! pack's rules report the `INSUFFICIENT_DATA` of a rule nothing has evaluated — and the
+//! conformance pack compliance surface that would roll that up
+//! (`DescribeConformancePackCompliance`, `GetConformancePackComplianceDetails`,
+//! `GetConformancePackComplianceSummary`, `ListConformancePackComplianceScores`) is
+//! still scaffolded under its own stub issues, so nothing reports a compliance result
+//! that nothing produced.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +186,588 @@ use super::types::*;
 // `PutConformancePackError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-configservice-starlingdoveservice.json");
 
+/// The resource types a conformance pack template declares (this operation's own doc:
+/// "You can use a YAML template with two resource types: Config rule
+/// (AWS::Config::ConfigRule) and remediation action
+/// (AWS::Config::RemediationConfiguration)").
+pub const CONFORMANCE_PACK_TEMPLATE_RESOURCE_TYPES: [&str; 2] = [
+    "AWS::Config::ConfigRule",
+    "AWS::Config::RemediationConfiguration",
+];
+
+/// The two resource types of [`CONFORMANCE_PACK_TEMPLATE_RESOURCE_TYPES`], named so the
+/// reading can tell one declared resource from the other.
+const CONFIG_RULE_RESOURCE_TYPE: &str = CONFORMANCE_PACK_TEMPLATE_RESOURCE_TYPES[0];
+/// See [`CONFIG_RULE_RESOURCE_TYPE`].
+const REMEDIATION_RESOURCE_TYPE: &str = CONFORMANCE_PACK_TEMPLATE_RESOURCE_TYPES[1];
+
+/// The properties of a declared `AWS::Config::ConfigRule`, spelled as CloudFormation
+/// spells them — which, for this resource type, is how the `ConfigRule` shape spells its
+/// own members.
+const RULE_NAME_MEMBER: &str = "ConfigRuleName";
+/// See [`RULE_NAME_MEMBER`].
+const RULE_DESCRIPTION_MEMBER: &str = "Description";
+/// See [`RULE_NAME_MEMBER`].
+const RULE_SOURCE_MEMBER: &str = "Source";
+/// See [`RULE_NAME_MEMBER`].
+const RULE_INPUT_PARAMETERS_MEMBER: &str = "InputParameters";
+/// See [`RULE_NAME_MEMBER`].
+const RULE_MAXIMUM_EXECUTION_FREQUENCY_MEMBER: &str = "MaximumExecutionFrequency";
+/// See [`RULE_NAME_MEMBER`].
+const RULE_SCOPE_MEMBER: &str = "Scope";
+/// See [`RULE_NAME_MEMBER`].
+const SOURCE_OWNER_MEMBER: &str = "Owner";
+/// See [`RULE_NAME_MEMBER`].
+const SOURCE_IDENTIFIER_MEMBER: &str = "SourceIdentifier";
+/// See [`RULE_NAME_MEMBER`].
+const SCOPE_COMPLIANCE_RESOURCE_TYPES_MEMBER: &str = "ComplianceResourceTypes";
+/// See [`RULE_NAME_MEMBER`].
+const SCOPE_COMPLIANCE_RESOURCE_ID_MEMBER: &str = "ComplianceResourceId";
+/// See [`RULE_NAME_MEMBER`].
+const SCOPE_TAG_KEY_MEMBER: &str = "TagKey";
+/// See [`RULE_NAME_MEMBER`].
+const SCOPE_TAG_VALUE_MEMBER: &str = "TagValue";
+
+/// The properties of a declared `AWS::Config::RemediationConfiguration`, spelled the
+/// same way (the members of the `RemediationConfiguration` shape).
+const REMEDIATION_RULE_NAME_MEMBER: &str = "ConfigRuleName";
+/// See [`REMEDIATION_RULE_NAME_MEMBER`].
+const REMEDIATION_TARGET_TYPE_MEMBER: &str = "TargetType";
+/// See [`REMEDIATION_RULE_NAME_MEMBER`].
+const REMEDIATION_TARGET_ID_MEMBER: &str = "TargetId";
+/// See [`REMEDIATION_RULE_NAME_MEMBER`].
+const REMEDIATION_TARGET_VERSION_MEMBER: &str = "TargetVersion";
+/// See [`REMEDIATION_RULE_NAME_MEMBER`].
+const REMEDIATION_PARAMETERS_MEMBER: &str = "Parameters";
+/// See [`REMEDIATION_RULE_NAME_MEMBER`].
+const REMEDIATION_RESOURCE_TYPE_MEMBER: &str = "ResourceType";
+/// See [`REMEDIATION_RULE_NAME_MEMBER`].
+const REMEDIATION_AUTOMATIC_MEMBER: &str = "Automatic";
+/// See [`REMEDIATION_RULE_NAME_MEMBER`]: the two forms one remediation parameter takes.
+const PARAMETER_RESOURCE_VALUE_MEMBER: &str = "ResourceValue";
+/// See [`REMEDIATION_RULE_NAME_MEMBER`].
+const PARAMETER_STATIC_VALUE_MEMBER: &str = "StaticValue";
+/// See [`REMEDIATION_RULE_NAME_MEMBER`].
+const PARAMETER_VALUE_MEMBER: &str = "Value";
+/// See [`REMEDIATION_RULE_NAME_MEMBER`].
+const PARAMETER_VALUES_MEMBER: &str = "Values";
+
+/// How Config words `ConformancePackTemplateValidationException` for a template body it
+/// cannot deploy.
+///
+/// A FIXED service sentence — the recorded refusal of a body that is not a template
+/// carries it and reports no part of the body — which the refusals that name WHAT about
+/// the template is unsupported extend rather than replace.
+pub const INVALID_TEMPLATE_MESSAGE: &str = "Template passed in the input parameter is invalid";
+
+/// The section of a template that declares the resources it deploys, and the member of
+/// one declared resource that names its type. Both are CloudFormation's own spelling,
+/// which is the template language a conformance pack template is written in.
+const TEMPLATE_RESOURCES_SECTION: &str = "Resources";
+/// See [`TEMPLATE_RESOURCES_SECTION`].
+const TEMPLATE_RESOURCE_TYPE_MEMBER: &str = "Type";
+
+/// The most nodes the TREE this reader builds may carry, and the deepest it may nest.
+///
+/// These bound what the READER holds: `TemplateBody` is `@length(1, 51200)`, which the
+/// boundary validator enforces before this handler runs, so the parse is over at most
+/// 51 200 characters, and a body that would build a larger or deeper tree than this is
+/// read as no template. They do NOT bound the loader's own recursion — an
+/// `EventReceiver` cannot abort `load`, because `on_event` returns `()` — which is what
+/// [`guard_template_nesting`] bounds BEFORE the loader is entered. A conformance pack
+/// template declaring sixty rules nests a handful of levels and a few thousand nodes, so
+/// both sit an order of magnitude above any template.
+const MAX_TEMPLATE_NODES: usize = 100_000;
+/// See [`MAX_TEMPLATE_NODES`].
+const MAX_TEMPLATE_DEPTH: usize = 64;
+
+/// Pre-flight bounds on an untrusted template body, applied BEFORE the loader builds a
+/// tree from it.
+///
+/// What has to be bounded is how deep the loader can RECURSE: an `EventReceiver` cannot
+/// abort `load` (`on_event` returns `()`), and exhausting the stack aborts the process
+/// rather than unwinding, so the reader's own [`MAX_TEMPLATE_DEPTH`] can only refuse a
+/// tree it was already handed. The two sibling readings of caller-supplied YAML in this
+/// tree guard their loads the same way, for the same reason
+/// (`services/service-com-amazonaws-cloudformation-cloudformation/src/state/template.rs`
+/// and `services/service-com-amazonaws-apigateway-backplanecontrolservice/src/ops/put_rest_api.rs`).
+///
+/// Each measure is a bound on NESTING rather than on how big the body is, so a large,
+/// flat template passes all of them:
+///
+/// * [`MAX_TEMPLATE_FLOW_DEPTH`] — the flow collections (`[`, `{`) open at once, with
+///   closers subtracted: the nesting a well-formed body actually reaches.
+/// * [`MAX_TEMPLATE_FLOW_OPENERS`] — the total flow openers, the backstop for the one way
+///   the measure above can be fooled: this is a byte scan, so a `]` inside a quoted
+///   scalar lowers the running depth while the loader's own depth keeps climbing. However
+///   many closers a body hides, its real flow nesting cannot exceed its opener COUNT.
+/// * [`MAX_TEMPLATE_INDENT`] columns of leading indentation and
+///   [`MAX_TEMPLATE_COMPACT_PER_LINE`] compact `- `/`? ` indicators on one line — the two
+///   ways BLOCK nesting descends (a column per level across lines, or a compact entry
+///   within one line).
+///
+/// Over-counting (a `[` inside a quoted scalar) is the only failure mode, and each bound
+/// sits far above the nesting a conformance pack template reaches.
+fn guard_template_nesting(body: &str) -> Option<()> {
+    let mut flow_depth = 0usize;
+    let mut flow_openers = 0usize;
+    let mut compact_on_line = 0usize;
+    let mut indent = 0usize;
+    let mut counting_indent = true;
+    let mut previous = b'\n';
+
+    for byte in body.bytes() {
+        match byte {
+            b'\n' | b'\r' => {
+                indent = 0;
+                compact_on_line = 0;
+                counting_indent = true;
+            }
+            b' ' | b'\t' if counting_indent => {
+                indent += 1;
+                if indent > MAX_TEMPLATE_INDENT {
+                    return None;
+                }
+            }
+            b'[' | b'{' => {
+                counting_indent = false;
+                flow_depth += 1;
+                flow_openers += 1;
+                if flow_depth > MAX_TEMPLATE_FLOW_DEPTH || flow_openers > MAX_TEMPLATE_FLOW_OPENERS
+                {
+                    return None;
+                }
+            }
+            b']' | b'}' => {
+                counting_indent = false;
+                flow_depth = flow_depth.saturating_sub(1);
+            }
+            _ => counting_indent = false,
+        }
+        // A `-` or `?` is a block indicator only where a token may start — at the start of
+        // a line or after whitespace — which is what keeps a hyphen inside a name, an ARN
+        // or a description from counting as one.
+        if matches!(byte, b'-' | b'?') && matches!(previous, b'\n' | b'\r' | b' ' | b'\t') {
+            compact_on_line += 1;
+            if compact_on_line > MAX_TEMPLATE_COMPACT_PER_LINE {
+                return None;
+            }
+        }
+        previous = byte;
+    }
+    Some(())
+}
+
+/// The most flow collections (`[`, `{`) a template body may have open at once. Chosen,
+/// far past the property nesting any conformance pack template reaches.
+const MAX_TEMPLATE_FLOW_DEPTH: usize = 64;
+
+/// The most flow openers a template body may carry in total — the backstop for
+/// [`MAX_TEMPLATE_FLOW_DEPTH`] described in [`guard_template_nesting`]. Chosen: a body of
+/// this many openers with every closer hidden inside a quoted scalar is the worst case
+/// this bound permits, and it sits far above the flow collections a template uses.
+const MAX_TEMPLATE_FLOW_OPENERS: usize = 2_048;
+
+/// The most columns of leading indentation one line of a template body may carry, which is
+/// where block nesting descends across lines. Chosen.
+const MAX_TEMPLATE_INDENT: usize = 256;
+
+/// The most compact block indicators (`- `, `? `) one line may carry, which is where block
+/// nesting (`- - - x`) descends without costing a column. Chosen.
+const MAX_TEMPLATE_COMPACT_PER_LINE: usize = 256;
+
+/// The section of a template that declares a resource's properties, and the members of
+/// a declared Config rule and remediation action this deployment reads out of it. All
+/// are CloudFormation's own spelling, which is the template language a conformance pack
+/// template is written in, and each is the member of the corresponding Config API shape.
+const TEMPLATE_PROPERTIES_SECTION: &str = "Properties";
+
+/// One resource a conformance pack template declares, as the deployment reads it.
+#[derive(Debug)]
+enum DeclaredResource {
+    /// A Config rule (`AWS::Config::ConfigRule`).
+    Rule(DeclaredRule),
+    /// A remediation action (`AWS::Config::RemediationConfiguration`) for one of the
+    /// rules the same template declares.
+    Remediation(DeclaredRemediation),
+}
+
+/// A Config rule a template declares: the name it gives the rule and the rule's own
+/// definition, read out of the resource's `Properties`.
+#[derive(Debug)]
+struct DeclaredRule {
+    /// `Properties.ConfigRuleName`, or the resource's logical id when the template names
+    /// none — which is how CloudFormation names a resource whose name it is not given.
+    declared_name: String,
+    description: Option<String>,
+    source: Source,
+    input_parameters: Option<String>,
+    maximum_execution_frequency: Option<String>,
+    scope: Option<Scope>,
+}
+
+/// A remediation action a template declares, naming the rule (by the name the TEMPLATE
+/// gives it) that it remediates.
+#[derive(Debug)]
+struct DeclaredRemediation {
+    rule_declared_name: String,
+    requested: RemediationConfiguration,
+}
+
+/// The resources `body` declares, or why it is not a conformance pack template.
+///
+/// The body is READ, not matched: `yaml-rust2` parses it as the YAML 1.2 document a
+/// CloudFormation template is written as (and JSON is a subset of), so a body is judged
+/// by the template it IS. What a conformance pack template has to be, beyond parsing: a
+/// single document, a mapping, carrying a non-empty `Resources` section each of whose
+/// declared resources is one of the two resource types a conformance pack deploys and
+/// declares the properties CloudFormation requires for that type — a `Source` for a
+/// Config rule, and a `ConfigRuleName`, `TargetType` and `TargetId` for a remediation
+/// action, whose rule the same template must declare.
+fn read_conformance_pack_template(body: &str) -> Result<Vec<DeclaredResource>, String> {
+    let Some(::serde_json::Value::Object(template)) = read_template(body) else {
+        return Err(INVALID_TEMPLATE_MESSAGE.to_string());
+    };
+    let Some(::serde_json::Value::Object(resources)) = template.get(TEMPLATE_RESOURCES_SECTION)
+    else {
+        return Err(format!(
+            "{INVALID_TEMPLATE_MESSAGE}: the template declares no \
+             {TEMPLATE_RESOURCES_SECTION} section"
+        ));
+    };
+    if resources.is_empty() {
+        return Err(format!(
+            "{INVALID_TEMPLATE_MESSAGE}: the template's {TEMPLATE_RESOURCES_SECTION} section \
+             declares no resource"
+        ));
+    }
+
+    let mut declared = Vec::new();
+    for (logical_id, resource) in resources {
+        let resource = resource.as_object();
+        let resource_type = resource
+            .and_then(|resource| resource.get(TEMPLATE_RESOURCE_TYPE_MEMBER))
+            .and_then(::serde_json::Value::as_str);
+        let Some(resource_type) = resource_type else {
+            return Err(format!(
+                "{INVALID_TEMPLATE_MESSAGE}: the resource '{logical_id}' declares no \
+                 {TEMPLATE_RESOURCE_TYPE_MEMBER}"
+            ));
+        };
+        let properties = resource
+            .and_then(|resource| resource.get(TEMPLATE_PROPERTIES_SECTION))
+            .and_then(::serde_json::Value::as_object);
+        let text = |member: &str| -> Option<String> {
+            properties
+                .and_then(|properties| properties.get(member))
+                .and_then(::serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+
+        match resource_type {
+            CONFIG_RULE_RESOURCE_TYPE => {
+                // CloudFormation requires `Source` for a Config rule, and Config
+                // requires the source's `Owner`: a rule that names neither cannot be
+                // deployed, so the template that declares it is not one Config deploys.
+                let source = properties
+                    .and_then(|properties| properties.get(RULE_SOURCE_MEMBER))
+                    .and_then(::serde_json::Value::as_object);
+                let owner = source
+                    .and_then(|source| source.get(SOURCE_OWNER_MEMBER))
+                    .and_then(::serde_json::Value::as_str);
+                let Some(owner) = owner else {
+                    return Err(format!(
+                        "{INVALID_TEMPLATE_MESSAGE}: the Config rule '{logical_id}' declares no \
+                         {RULE_SOURCE_MEMBER}.{SOURCE_OWNER_MEMBER}"
+                    ));
+                };
+                declared.push(DeclaredResource::Rule(DeclaredRule {
+                    declared_name: text(RULE_NAME_MEMBER).unwrap_or_else(|| logical_id.clone()),
+                    description: text(RULE_DESCRIPTION_MEMBER),
+                    source: Source {
+                        owner: owner.to_string(),
+                        source_identifier: source
+                            .and_then(|source| source.get(SOURCE_IDENTIFIER_MEMBER))
+                            .and_then(::serde_json::Value::as_str)
+                            .map(str::to_string),
+                        // A rule's `SourceDetails` and `CustomPolicyDetails` are not
+                        // read here: neither is required to deploy the rule, and this
+                        // reading reports only what the template states.
+                        source_details: None,
+                        custom_policy_details: None,
+                    },
+                    // "A string, in JSON format, that is passed to the Config rule
+                    // Lambda function": a template may write it as the JSON string it
+                    // is, or as the mapping that document is, and both are stored as
+                    // that document.
+                    input_parameters: properties
+                        .and_then(|properties| properties.get(RULE_INPUT_PARAMETERS_MEMBER))
+                        .map(|value| match value {
+                            ::serde_json::Value::String(text) => text.clone(),
+                            other => other.to_string(),
+                        }),
+                    maximum_execution_frequency: text(RULE_MAXIMUM_EXECUTION_FREQUENCY_MEMBER),
+                    scope: properties
+                        .and_then(|properties| properties.get(RULE_SCOPE_MEMBER))
+                        .and_then(::serde_json::Value::as_object)
+                        .map(|scope| Scope {
+                            compliance_resource_types: scope
+                                .get(SCOPE_COMPLIANCE_RESOURCE_TYPES_MEMBER)
+                                .and_then(::serde_json::Value::as_array)
+                                .map(|types| {
+                                    types
+                                        .iter()
+                                        .filter_map(::serde_json::Value::as_str)
+                                        .map(str::to_string)
+                                        .collect()
+                                }),
+                            tag_key: scope
+                                .get(SCOPE_TAG_KEY_MEMBER)
+                                .and_then(::serde_json::Value::as_str)
+                                .map(str::to_string),
+                            tag_value: scope
+                                .get(SCOPE_TAG_VALUE_MEMBER)
+                                .and_then(::serde_json::Value::as_str)
+                                .map(str::to_string),
+                            compliance_resource_id: scope
+                                .get(SCOPE_COMPLIANCE_RESOURCE_ID_MEMBER)
+                                .and_then(::serde_json::Value::as_str)
+                                .map(str::to_string),
+                            service_principals: None,
+                        }),
+                }));
+            }
+            REMEDIATION_RESOURCE_TYPE => {
+                // CloudFormation requires all three of these for a remediation action.
+                let (Some(rule_declared_name), Some(target_type), Some(target_id)) = (
+                    text(REMEDIATION_RULE_NAME_MEMBER),
+                    text(REMEDIATION_TARGET_TYPE_MEMBER),
+                    text(REMEDIATION_TARGET_ID_MEMBER),
+                ) else {
+                    return Err(format!(
+                        "{INVALID_TEMPLATE_MESSAGE}: the remediation action '{logical_id}' must \
+                         declare {REMEDIATION_RULE_NAME_MEMBER}, \
+                         {REMEDIATION_TARGET_TYPE_MEMBER} and {REMEDIATION_TARGET_ID_MEMBER}"
+                    ));
+                };
+                let automatic = properties
+                    .and_then(|properties| properties.get(REMEDIATION_AUTOMATIC_MEMBER))
+                    .map(|value| match value {
+                        ::serde_json::Value::Bool(flag) => *flag,
+                        other => other.as_str() == Some("true"),
+                    })
+                    .unwrap_or_default();
+                declared.push(DeclaredResource::Remediation(DeclaredRemediation {
+                    rule_declared_name,
+                    requested: RemediationConfiguration {
+                        // The rule's deployed name is not known until the pack has an
+                        // id, so the deployment fills it in.
+                        config_rule_name: String::new(),
+                        target_type,
+                        target_id,
+                        target_version: text(REMEDIATION_TARGET_VERSION_MEMBER),
+                        parameters: properties
+                            .and_then(|properties| {
+                                properties.get(REMEDIATION_PARAMETERS_MEMBER)
+                            })
+                            .and_then(::serde_json::Value::as_object)
+                            .map(|parameters| {
+                                parameters
+                                    .iter()
+                                    .map(|(name, value)| {
+                                        (name.clone(), remediation_parameter(value))
+                                    })
+                                    .collect()
+                            }),
+                        resource_type: text(REMEDIATION_RESOURCE_TYPE_MEMBER),
+                        automatic,
+                        execution_controls: None,
+                        maximum_automatic_attempts: None,
+                        retry_attempt_seconds: None,
+                        arn: None,
+                        created_by_service: None,
+                    },
+                }));
+            }
+            other => {
+                return Err(format!(
+                    "{INVALID_TEMPLATE_MESSAGE}: the resource '{logical_id}' is of type \
+                     '{other}', and a conformance pack template declares only {}",
+                    CONFORMANCE_PACK_TEMPLATE_RESOURCE_TYPES.join(" and "),
+                ))
+            }
+        }
+    }
+
+    // "The specified Config rule ... must exist": a remediation action remediates one of
+    // the rules the pack deploys, so a template whose remediation names a rule it does
+    // not declare cannot be deployed.
+    let rule_names: Vec<&str> = declared
+        .iter()
+        .filter_map(|resource| match resource {
+            DeclaredResource::Rule(rule) => Some(rule.declared_name.as_str()),
+            DeclaredResource::Remediation(_) => None,
+        })
+        .collect();
+    for resource in &declared {
+        if let DeclaredResource::Remediation(remediation) = resource {
+            if !rule_names.contains(&remediation.rule_declared_name.as_str()) {
+                return Err(format!(
+                    "{INVALID_TEMPLATE_MESSAGE}: the remediation action remediates the Config \
+                     rule '{}', which the template does not declare",
+                    remediation.rule_declared_name,
+                ));
+            }
+        }
+    }
+    Ok(declared)
+}
+
+/// One remediation parameter as the template writes it: the resource member the value is
+/// taken from (`ResourceValue.Value`), or the static values given for it
+/// (`StaticValue.Values`).
+fn remediation_parameter(value: &::serde_json::Value) -> RemediationParameterValue {
+    let member = |outer: &str, inner: &str| {
+        value
+            .get(outer)
+            .and_then(|outer| outer.get(inner))
+            .cloned()
+            .unwrap_or(::serde_json::Value::Null)
+    };
+    RemediationParameterValue {
+        resource_value: member(PARAMETER_RESOURCE_VALUE_MEMBER, PARAMETER_VALUE_MEMBER)
+            .as_str()
+            .map(|value| ResourceValue {
+                value: value.to_string(),
+            }),
+        static_value: member(PARAMETER_STATIC_VALUE_MEMBER, PARAMETER_VALUES_MEMBER)
+            .as_array()
+            .map(|values| StaticValue {
+                values: values
+                    .iter()
+                    .filter_map(::serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+            }),
+    }
+}
+
+/// `body` as the tree it declares, or `None` when it is no single YAML document.
+///
+/// The nesting bounds are checked FIRST, on the bytes ([`guard_template_nesting`]), so a
+/// body that would drive the loader into a deep recursion is refused before the loader is
+/// entered rather than descended with. Every scalar is kept as the TEXT it was written as:
+/// the template is CHECKED here, not interpreted, and the one value this reading asks
+/// about — a resource's `Type` — is a string in every template. An ALIAS is refused rather
+/// than expanded, because an alias is how a few hundred bytes of YAML turn into gigabytes,
+/// and nothing in a conformance pack template needs one.
+fn read_template(body: &str) -> Option<::serde_json::Value> {
+    use ::serde_json::{Map, Value};
+
+    enum Frame {
+        Sequence(Vec<Value>),
+        Mapping {
+            entries: Map<String, Value>,
+            pending_key: Option<String>,
+        },
+    }
+
+    #[derive(Default)]
+    struct Reader {
+        root: Option<Value>,
+        open: Vec<Frame>,
+        nodes: usize,
+        refused: bool,
+    }
+
+    impl Reader {
+        /// Place one finished node: as the root, as the next item of the open sequence,
+        /// or as the key or the value of the open mapping.
+        fn place(&mut self, node: Value) {
+            self.nodes += 1;
+            if self.nodes > MAX_TEMPLATE_NODES {
+                self.refused = true;
+                return;
+            }
+            let Some(frame) = self.open.last_mut() else {
+                // A second document in the same stream: a template is one document.
+                if self.root.is_some() {
+                    self.refused = true;
+                }
+                self.root = Some(node);
+                return;
+            };
+            match frame {
+                Frame::Sequence(items) => items.push(node),
+                Frame::Mapping {
+                    entries,
+                    pending_key,
+                } => match pending_key.take() {
+                    // A mapping key is a scalar; a template keys no section by a list or
+                    // a map, and this reader invents no spelling for one.
+                    None => match node {
+                        Value::String(key) => *pending_key = Some(key),
+                        _ => self.refused = true,
+                    },
+                    Some(key) => {
+                        entries.insert(key, node);
+                    }
+                },
+            }
+        }
+
+        fn open_frame(&mut self, frame: Frame) {
+            if self.open.len() >= MAX_TEMPLATE_DEPTH {
+                self.refused = true;
+                return;
+            }
+            self.open.push(frame);
+        }
+
+        fn close_frame(&mut self) {
+            let Some(frame) = self.open.pop() else {
+                self.refused = true;
+                return;
+            };
+            let node = match frame {
+                Frame::Sequence(items) => Value::Array(items),
+                Frame::Mapping { entries, .. } => Value::Object(entries),
+            };
+            self.place(node);
+        }
+    }
+
+    impl ::yaml_rust2::parser::EventReceiver for Reader {
+        fn on_event(&mut self, event: ::yaml_rust2::parser::Event) {
+            use ::yaml_rust2::parser::Event;
+            if self.refused {
+                return;
+            }
+            match event {
+                Event::Scalar(value, _style, _anchor, _tag) => self.place(Value::String(value)),
+                Event::SequenceStart(_anchor, _tag) => self.open_frame(Frame::Sequence(Vec::new())),
+                Event::MappingStart(_anchor, _tag) => self.open_frame(Frame::Mapping {
+                    entries: Map::new(),
+                    pending_key: None,
+                }),
+                Event::SequenceEnd | Event::MappingEnd => self.close_frame(),
+                Event::Alias(_) => self.refused = true,
+                _ => {}
+            }
+        }
+    }
+
+    let mut reader = Reader::default();
+    guard_template_nesting(body)?;
+    ::yaml_rust2::parser::Parser::new_from_str(body)
+        .load(&mut reader, true)
+        .ok()?;
+    if reader.refused || !reader.open.is_empty() {
+        return None;
+    }
+    reader.root
+}
+
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `PutConformancePackError` alias below. An operation that models no errors
@@ -205,18 +834,278 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutConformancePack` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutConformancePackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutConformancePack"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // "You must specify only one of the follow parameters: TemplateS3Uri,
+        // TemplateBody or TemplateSSMDocumentDetails." Each is optional on its own, so
+        // the request walk cannot refuse a request that carries none or several: the
+        // rule is about the COMBINATION, which this operation's own
+        // `InvalidParameterValueException` ("One or more of the specified parameters are
+        // not valid") is what refuses.
+        let sources = [
+            ("TemplateBody", input.template_body.is_some()),
+            ("TemplateS3Uri", input.template_s3_uri.is_some()),
+            (
+                "TemplateSSMDocumentDetails",
+                input.template_ssm_document_details.is_some(),
+            ),
+        ];
+        let specified: Vec<&str> = sources
+            .iter()
+            .filter(|(_, present)| *present)
+            .map(|(member, _)| *member)
+            .collect();
+        if specified.len() != 1 {
+            return Err(invalid_parameter(format!(
+                "You must specify only one of the following parameters: {}, and {} were \
+                 specified",
+                sources
+                    .iter()
+                    .map(|(member, _)| *member)
+                    .collect::<Vec<&str>>()
+                    .join(", "),
+                if specified.is_empty() {
+                    "none".to_string()
+                } else {
+                    specified.join(", ")
+                },
+            )));
+        }
+
+        // A template body this call carries is READ here; a template Config would have
+        // to FETCH is not, so the two legs that name one answer the scaffold's 501
+        // rather than deploying a pack from a template nothing read. See the module doc.
+        if input.template_s3_uri.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutConformancePack with a TemplateS3Uri",
+            ));
+        }
+        if input.template_ssm_document_details.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutConformancePack with a TemplateSSMDocumentDetails",
+            ));
+        }
+
+        let template_body = input.template_body;
+        // A template that cannot be deployed is refused BEFORE anything is stored, so
+        // the refusal leaves no pack behind for this name; what the template DECLARES is
+        // read in the same pass, because it is what the deployment creates.
+        let declared = match template_body.as_deref() {
+            Some(body) => read_conformance_pack_template(body).map_err(|message| {
+                PutConformancePackError::from(
+                    PutConformancePackErrorModeled::ConformancePackTemplateValidationException(
+                        ConformancePackTemplateValidationException {
+                            message: Some(message),
+                        },
+                    ),
+                )
+            })?,
+            // The two legs that carry no body answered 501 above.
+            None => Vec::new(),
+        };
+
+        let name = input.conformance_pack_name;
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let completes_at = now + crate::state::CONFORMANCE_PACK_DEPLOY_SETTLE_AFTER;
+        let mut store = state.lock();
+
+        // "Subsequent requests won't create a duplicate resource if one was already
+        // created": a pack this account already holds is REDEPLOYED from the template
+        // this call carries, keeping the identity (the id, the ARN and the stack) it was
+        // created with and the tags it was created with ("Tags are added at creation and
+        // cannot be updated with this operation"). Only a NEW pack has to fit under this
+        // Region's conformance pack quota.
+        let existing = store.conformance_packs.get(&name).cloned();
+        let (id, arn, stack_arn, tags, previously_deployed) = match existing {
+            Some(pack) => (
+                pack.id,
+                pack.arn,
+                pack.stack_arn,
+                pack.tags,
+                pack.deployed_rule_names,
+            ),
+            None => {
+                if store.conformance_packs.len() >= crate::state::CONFORMANCE_PACKS_QUOTA {
+                    return Err(
+                        PutConformancePackErrorModeled::MaxNumberOfConformancePacksExceededException(
+                            MaxNumberOfConformancePacksExceededException {
+                                message: Some(format!(
+                                    "this account already has the maximum of {} conformance \
+                                     packs in this Region",
+                                    crate::state::CONFORMANCE_PACKS_QUOTA,
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                let sequence = store.next_conformance_pack_seq;
+                // A u64 counter cannot be exhausted by API calls, so it never reissues
+                // an id; saturating rather than wrapping keeps that true by construction.
+                store.next_conformance_pack_seq = sequence.saturating_add(1);
+                // The id, the ARN and the stack ARN are Config's to assign, never read
+                // off the request.
+                let id = crate::state::mint_conformance_pack_id(sequence);
+                (
+                    id.clone(),
+                    crate::state::conformance_pack_arn(&region, &name, &id),
+                    crate::state::conformance_pack_stack_arn(&region, &name, &id),
+                    // The tags a create carries are this resource's tag set, reached by
+                    // the tagging operations through the store's one ARN-to-tags path.
+                    crate::state::tag_set(input.tags.as_deref().unwrap_or_default()),
+                    Vec::new(),
+                )
+            }
+        };
+
+        // The deployment itself: the Config rules the template declares are CREATED in
+        // this account, with the names Config gives a pack's rules, and the remediation
+        // actions declared for them beside them. A pack whose rules would not fit under
+        // this Region's Config rules quota cannot be deployed, which is a deployment
+        // FAILURE the pack reports (`CREATE_FAILED` with the reason) rather than a
+        // completion of work nothing performed — and such a deployment changes NOTHING,
+        // so a failed redeploy leaves the pack's previous resources standing.
+        let rules: Vec<&DeclaredRule> = declared
+            .iter()
+            .filter_map(|resource| match resource {
+                DeclaredResource::Rule(rule) => Some(rule),
+                DeclaredResource::Remediation(_) => None,
+            })
+            .collect();
+        // The rules THIS pack already deployed are the ones a redeploy replaces, so they
+        // do not count against the quota the newly declared ones have to fit under.
+        let held_by_this_pack = previously_deployed
+            .iter()
+            .filter(|rule_name| store.config_rules.contains_key(*rule_name))
+            .count();
+        let held_by_others = store.config_rules.len().saturating_sub(held_by_this_pack);
+        let mut deployed_rule_names = Vec::new();
+        let mut failure_reason = None;
+        if held_by_others + rules.len() > crate::state::CONFIG_RULES_QUOTA {
+            failure_reason = Some(format!(
+                "The conformance pack could not be deployed: creating the {} Config rule(s) it \
+                 declares would take this account past the limit of {} Config rules in this \
+                 Region.",
+                rules.len(),
+                crate::state::CONFIG_RULES_QUOTA,
+            ));
+            // Nothing was created, so what the pack's previous deployment created is
+            // still what it holds.
+            deployed_rule_names = previously_deployed;
+        } else {
+            // The resources a previous deployment of THIS pack created are the ones it
+            // replaces: the redeploy drops them before creating what the new template
+            // declares, and touches nothing else in the account's rules.
+            for rule_name in &previously_deployed {
+                store.config_rules.remove(rule_name);
+                store.remediation_configurations.remove(rule_name);
+            }
+            for rule in rules {
+                let rule_name = crate::state::conformance_pack_rule_name(&rule.declared_name, &id);
+                let sequence = store.next_rule_seq;
+                store.next_rule_seq = sequence.saturating_add(1);
+                let rule_id = crate::state::mint_config_rule_id(sequence);
+                let rule_arn = crate::state::config_rule_arn(&region, &rule_id);
+                store.config_rules.insert(
+                    rule_name.clone(),
+                    crate::state::ConfigRuleEntry {
+                        name: rule_name.clone(),
+                        arn: rule_arn,
+                        id: rule_id,
+                        description: rule.description.clone(),
+                        scope: rule.scope.clone(),
+                        source: rule.source.clone(),
+                        input_parameters: rule.input_parameters.clone(),
+                        maximum_execution_frequency: rule.maximum_execution_frequency.clone(),
+                        state: crate::state::CONFIG_RULE_STATE_ACTIVE.to_string(),
+                        evaluation_modes: crate::state::default_evaluation_modes(),
+                        rule_evaluation_visibility: Some(
+                            crate::state::RULE_EVALUATION_VISIBILITY_EXTERNAL.to_string(),
+                        ),
+                        // The pack deployed this rule through Config's own
+                        // service-linked role, which is what `CreatedBy` reports.
+                        created_by: Some(
+                            crate::state::CONFORMANCE_PACK_SERVICE_PRINCIPAL.to_string(),
+                        ),
+                        created_at: now,
+                        // A pack's rule carries no tags of the caller's: the tags the
+                        // request names are the PACK's.
+                        tags: crate::state::TagSet::new(),
+                        evaluation_results: ::std::collections::BTreeMap::new(),
+                        // Config evaluates a rule as soon as it is created, with no call
+                        // from the caller; the pass completes a span later.
+                        evaluation: crate::state::RuleEvaluationEntry::invoked_at(now),
+                    },
+                );
+                deployed_rule_names.push(rule_name);
+            }
+
+            for resource in &declared {
+                let DeclaredResource::Remediation(remediation) = resource else {
+                    continue;
+                };
+                // The remediation configuration is keyed by the rule it remediates, as
+                // the deployment named that rule.
+                let rule_name = crate::state::conformance_pack_rule_name(
+                    &remediation.rule_declared_name,
+                    &id,
+                );
+                let sequence = store.next_remediation_configuration_seq;
+                store.next_remediation_configuration_seq = sequence.saturating_add(1);
+                let remediation_id =
+                    crate::state::mint_remediation_configuration_id(sequence);
+                let remediation_arn = crate::state::remediation_configuration_arn(
+                    &region,
+                    &rule_name,
+                    &remediation_id,
+                );
+                let mut requested = remediation.requested.clone();
+                requested.config_rule_name = rule_name.clone();
+                store.remediation_configurations.insert(
+                    rule_name,
+                    crate::state::RemediationConfigurationEntry::new(
+                        remediation_id,
+                        remediation_arn,
+                        &requested,
+                    ),
+                );
+            }
+        }
+
+        store.conformance_packs.insert(
+            name.clone(),
+            crate::state::ConformancePackEntry {
+                name,
+                id,
+                arn: arn.clone(),
+                stack_arn,
+                template_body,
+                delivery_s3_bucket: input.delivery_s3_bucket,
+                delivery_s3_key_prefix: input.delivery_s3_key_prefix,
+                input_parameters: input.conformance_pack_input_parameters.unwrap_or_default(),
+                deployed_rule_names,
+                failure_reason,
+                last_update_requested_at: now,
+                deployment_completes_at: completes_at,
+                tags,
+            },
+        );
+
+        Ok(PutConformancePackOutput {
+            conformance_pack_arn: Some(arn),
+        })
     }
+}
+
+/// Refuse the request with this operation's own modelled `InvalidParameterValueException`
+/// (HTTP 400), which is what Config answers a request whose parameters cannot hold
+/// together. The message is BUILT FROM THE REQUEST.
+fn invalid_parameter(message: String) -> PutConformancePackError {
+    PutConformancePackErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message),
+    })
+    .into()
 }

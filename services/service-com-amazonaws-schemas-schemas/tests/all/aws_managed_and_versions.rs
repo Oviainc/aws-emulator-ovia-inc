@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_schemas_schemas::state::{
-    aws_managed_schemas, ManagedSchema, AWS_MANAGED_REGISTRY, AWS_MANAGED_SCHEMA_TYPE,
-    AWS_SERVICE_EVENT_TYPES,
+    aws_managed_schemas, schema_name_order_key, ManagedSchema, AWS_MANAGED_REGISTRY,
+    AWS_MANAGED_SCHEMA_TYPE, AWS_SERVICE_EVENT_TYPES,
 };
 
 use crate::registry_schema_lifecycle::{
@@ -252,10 +252,12 @@ async fn the_aws_managed_catalogue_is_visible_to_every_account() {
         "an account must see the AWS-managed registry, got {visible:?}"
     );
 
-    // Source: `crate::state::aws_managed_schemas`, the catalogue the store seeds.
+    // Source: `crate::state::aws_managed_schemas`, the catalogue the store seeds, in
+    // the order a listing collates schema names in
+    // (`crate::state::schema_name_order_key`).
     let catalogue = aws_managed_schemas();
     let mut expected: Vec<String> = catalogue.iter().map(|entry| entry.name.clone()).collect();
-    expected.sort();
+    expected.sort_by_key(|name| schema_name_order_key(name));
     let walked = walk(
         &emulator,
         &format!("{}/schemas", registry_uri(AWS_MANAGED_REGISTRY)),

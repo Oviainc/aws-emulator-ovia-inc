@@ -359,6 +359,7 @@ mod tests {
                 })
                 .collect(),
             rule_evaluation_visibility: Some(RULE_EVALUATION_VISIBILITY_EXTERNAL.to_string()),
+            created_by: None,
             created_at: SystemTime::UNIX_EPOCH,
             tags: Default::default(),
             evaluation_results: recorded

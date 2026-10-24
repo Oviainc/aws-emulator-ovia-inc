@@ -21,6 +21,8 @@ mod catalog_projections;
 mod crawlers;
 #[path = "all/data_catalog.rs"]
 mod data_catalog;
+#[path = "all/error_messages.rs"]
+mod error_messages;
 #[path = "all/etl_connections.rs"]
 mod etl_connections;
 #[path = "all/etl_jobs_and_connections.rs"]

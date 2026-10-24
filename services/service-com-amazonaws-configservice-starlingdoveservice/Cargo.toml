@@ -21,6 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `sqlparser`: the SQL `SELECT` command `SelectResourceConfig` takes is PARSED with it,
+# so a malformed expression is refused because the parser cannot read it rather than
+# because this emulator searched its text.
+sqlparser = "0.59"
+# `yaml-rust2`: a conformance pack `TemplateBody` is a YAML (or JSON, which YAML 1.2 is a
+# superset of) CloudFormation template, so one YAML parser reads both spellings and
+# `PutConformancePack` judges the template it IS. Pure Rust, no `unsafe`, no C.
+yaml-rust2 = { version = "0.10", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

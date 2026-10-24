@@ -2,6 +2,12 @@
 
 //! What an aggregate configuration-item read reports, end to end over the wire.
 //!
+//! Two reads are pinned here: `BatchGetAggregateResourceConfig`, which answers a LIST of
+//! aggregate resource identifiers, and `GetAggregateResourceConfig`, which answers ONE —
+//! the same lookup, with the difference that a single read has a resource to refuse
+//! about rather than a list to report unprocessed identifiers in (see the second half of
+//! this file).
+//!
 //! The rule pinned here: `BatchGetAggregateResourceConfig` answers each requested
 //! aggregate resource identifier with the CURRENT configuration item the named
 //! configuration aggregator holds for it — the resource recorded in a source account

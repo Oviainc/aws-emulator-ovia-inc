@@ -43,6 +43,8 @@ mod managed_action_history;
 mod not_found_messages;
 #[path = "all/operations_role.rs"]
 mod operations_role;
+#[path = "all/platform_branch_catalog.rs"]
+mod platform_branch_catalog;
 #[path = "all/platform_branches.rs"]
 mod platform_branches;
 #[path = "all/platform_version_catalog_projection.rs"]
