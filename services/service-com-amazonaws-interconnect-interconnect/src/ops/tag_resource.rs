@@ -132,7 +132,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// value it had. Writing the same tags again therefore changes nothing, so the
     /// call is idempotent, and a request carrying no tag adds nothing. An `arn` that
     /// names no resource of this service is a 404: tagging never brings a resource
-    /// into existence.
+    /// into existence. A key in the namespace AWS reserves for its own system tags is
+    /// not the caller's to write, so a request carrying one is refused on the input
+    /// and nothing is stored.
     async fn handle(
         &self,
         input: Self::Input,
@@ -164,7 +166,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // What the request itself carries is judged before any resource is looked up:
-        // a tag key or value outside the modelled lengths, or more tags in one
+        // a tag key or value outside the modelled lengths, a key inside the namespace
+        // AWS reserves for its own system tags, or more tags in one
         // request than a resource can hold, is a fault in the INPUT whatever the
         // `arn` names, and judging it first keeps a 404 from masking it. (The
         // boundary validator holds a LIST's members to their target's constraints
