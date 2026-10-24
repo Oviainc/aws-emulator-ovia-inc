@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInstrumentationConfigurationStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInstrumentationConfigurationStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInstrumentationConfigurationStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implement it here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,23 +160,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::GET_INSTRUMENTATION_CONFIGURATION_STATUS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the status events reported against one instrumentation configuration over a
+    /// time window, a page at a time.
+    ///
+    /// A read: it projects the stored history and writes nothing of its own. The one write it
+    /// does make is the lapse of a BREAKPOINT configuration whose `ExpiresAt` has fallen due,
+    /// which the CLOCK owed at that instant whether or not anybody called — see
+    /// [`crate::state::ComAmazonawsApplicationsignalsApplicationsignalsState::expire_instrumentation_configurations`].
+    ///
+    /// The events are those of ONE status (the requested one, else `ACTIVE`) that fall in the
+    /// requested window (else the last hour), most recent first. The configuration itself is
+    /// resolved under the identity the request names — a `LocationIdentifier` is "either full
+    /// code location or a pre-computed hash" — and an identity that names no stored
+    /// configuration is the modelled `ResourceNotFoundException`; a stored configuration
+    /// nothing has reported for has an empty event list, which is not an error.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInstrumentationConfigurationStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInstrumentationConfigurationStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInstrumentationConfigurationStatus"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetInstrumentationConfigurationStatusErrorModeled::ThrottlingException(
+                    ThrottlingException {
+                        message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
+        // The model cannot express "both of these members or neither", so the documented
+        // pairing is enforced here and refused with 400 rather than read as half a window.
+        let requested_window = crate::state::status_event_window(
+            input.start_time.as_ref(),
+            input.end_time.as_ref(),
+            &now,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let status = input
+            .status
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_STATUS_EVENT_STATUS.to_string());
+
+        let scope = crate::state::InstrumentationScope::new(
+            &input.instrumentation_type,
+            &input.service,
+            &input.environment,
+        );
+        let location_hash = crate::state::identified_location_hash(&input.location_identifier);
+        let key = crate::state::instrumentation_key(&input.signal_type, &location_hash);
+
+        // `MaxResults` is modelled with a `@default` of 60 and `range 1..100`, so the
+        // boundary validator has already refused anything outside the range and filled the
+        // default for an absent member. A non-positive value can therefore only mean the
+        // member was absent, and is read as the documented default rather than as a page of
+        // nothing.
+        let page_size = if input.max_results < 1 {
+            crate::state::DEFAULT_STATUS_EVENT_PAGE as usize
+        } else {
+            input.max_results as usize
+        };
+
+        // The token is resolved under the tag of the chronology that issued it, so a token
+        // from another configuration or another status is refused rather than honoured as a
+        // boundary in this one. The window the sequence is being paged over travels inside
+        // the cursor, so every page of one sequence covers one window even when the request
+        // named none and took the relative default; a request that names a DIFFERENT window
+        // than the token was issued for is paging another projection, and is refused too.
+        let token_tag = crate::state::instrumentation_status_token_tag(&scope, &key, &status);
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                let cursor = crate::state::decode_cursor(&token_tag, token)
+                    .as_deref()
+                    .and_then(crate::state::StatusEventCursor::decode)
+                    .filter(|cursor| {
+                        input.start_time.is_none() && input.end_time.is_none()
+                            || cursor.covers(&requested_window.0, &requested_window.1)
+                    });
+                match cursor {
+                    Some(cursor) => Some(cursor),
+                    None => {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            "NextToken is not a token this service issued for this configuration, \
+                             status and time range",
+                        ))
+                    }
+                }
+            }
+        };
+
+        // A continued page covers the window its sequence started over, not one recomputed
+        // from this call's clock.
+        let (start, end) = match cursor.as_ref() {
+            Some(cursor) => cursor.window(),
+            None => requested_window,
+        };
+
+        let mut store = state.lock();
+        store.expire_instrumentation_configurations(&now);
+
+        // The response's `Location` is the location the configuration is stored at, which is
+        // also the only form the modelled `Location` union carries: a request naming the
+        // pre-computed hash has no location of its own to echo.
+        let Some(configuration) = store.instrumentation_configuration(&scope, &key) else {
+            let region = crate::state::region_of(ctx.parts());
+            return Err(
+                GetInstrumentationConfigurationStatusErrorModeled::ResourceNotFoundException(
+                    crate::state::instrumentation_configuration_not_found(
+                        &region,
+                        &scope,
+                        &input.signal_type,
+                        &location_hash,
+                    ),
+                )
+                .into(),
+            );
+        };
+        let location = configuration.location.clone();
+
+        let (events, next_token) = store.page_instrumentation_status_events(
+            &scope,
+            &key,
+            &crate::state::StatusEventQuery {
+                status: status.clone(),
+                start,
+                end,
+                older_than: cursor.map(|cursor| cursor.older_than),
+                page_size,
+            },
+        );
+
+        Ok(GetInstrumentationConfigurationStatusOutput {
+            service: input.service,
+            environment: input.environment,
+            signal_type: input.signal_type,
+            location,
+            status,
+            events,
+            next_token: next_token
+                .map(|cursor| crate::state::encode_cursor(&token_tag, &cursor.encode())),
+        })
     }
 }
