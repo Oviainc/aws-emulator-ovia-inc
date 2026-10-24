@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutProtocolsList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutProtocolsList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutProtocolsList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a Firewall Manager protocols list, or updates one that already
+//! exists, and persists it so `GetProtocolsList` (and, once implemented,
+//! `ListProtocolsLists`) reports it. A MUTATING operation, the protocols-list
+//! twin of `PutAppsList` and the same create-or-update shape as `PutPolicy`:
+//!
+//! * CREATE (`ProtocolsList.ListId` absent) — mints the `ListId`, the first
+//!   `ListUpdateToken` and the protocols-list ARN, records the create and last
+//!   update instants and stores the whole document. The list it creates is a
+//!   CUSTOMER list, never one of Firewall Manager's own managed (default) lists,
+//!   so `GetProtocolsList` finds it with `DefaultList` false.
+//! * UPDATE (`ProtocolsList.ListId` present) — the request's `ListUpdateToken`
+//!   must equal the stored one (`ProtocolsListData$ListUpdateToken`: "When you
+//!   update the list, the update token must match the token of the current
+//!   version of the application list"), and a successful write rotates the token
+//!   so the caller's copy is stale. The protocols array the write supersedes is
+//!   archived in `PreviousProtocolsList` under the version number it had.
+//!
+//! Every member the SERVICE owns — `ListId`, `ListUpdateToken`, `CreateTime`,
+//! `LastUpdateTime` and `PreviousProtocolsList` — is derived here from the record
+//! rather than taken from the request, so a caller cannot write a second, stale
+//! copy of one into the store.
+//!
+//! Administrator-gated, like every organisation-scoped Firewall Manager
+//! operation: with no Firewall Manager default administrator association in this
+//! account/Region the call is refused by [`crate::state::require_administrator`]
+//! BEFORE any member of the payload is examined, so nothing is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +138,23 @@ impl From<PutProtocolsListErrorModeled> for PutProtocolsListError {
     }
 }
 
+/// The number of protocols lists this service stores before it refuses to
+/// create another. An EMULATOR-CHOSEN bound, not an AWS-documented quota number
+/// (Firewall Manager's published list quota is adjustable, so the exact value is
+/// ours), matching the bound its sibling writers `PutPolicy` and
+/// `PutResourceSet` apply. What is modelled is the BEHAVIOUR — the service
+/// bounds how many objects an account can create and answers
+/// `LimitExceededException` once the bound is reached, the condition that
+/// error's own documentation names — so the store cannot grow without limit.
+const MAX_PROTOCOLS_LISTS: usize = 250;
+
+/// The highest version number `PreviousProtocolsList` can key an archived
+/// protocols array under: its key is `com.amazonaws.fms#PreviousListVersion`,
+/// whose pattern is `^\d{1,2}$`, so a version number is at most two digits. A
+/// list updated more times than this keeps the 99 versions the map can name and
+/// archives no further ones, rather than emitting a key the model refuses.
+const MAX_PREVIOUS_LIST_VERSION: usize = 99;
+
 /// The `PutProtocolsList` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +191,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutProtocolsList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutProtocolsListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutProtocolsList"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutProtocolsListErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The authorization gate, BEFORE any member of the payload is examined.
+        crate::state::require_administrator(&store, &region)?;
+
+        // The SERVICE-OWNED members are taken out of the stored copy:
+        // `ProtocolsListRecord` is the single source of truth for the `ListId`,
+        // the `ListUpdateToken` and the two timestamps, and
+        // `ProtocolsListRecord::list()` overlays them for every reader. The
+        // version history is the service's own record of what this list used to
+        // hold, so a caller's `PreviousProtocolsList` is dropped too and the
+        // stored one is rebuilt below.
+        let mut list = input.protocols_list.clone();
+        let requested_id = list.list_id.take();
+        let requested_token = list.list_update_token.take();
+        list.create_time = None;
+        list.last_update_time = None;
+        list.previous_protocols_list = None;
+
+        let record = match requested_id {
+            // UPDATE: the id names an existing customer list, and the token must
+            // match the version that is stored.
+            Some(list_id) => {
+                // A Firewall Manager MANAGED list is not in the namespace this
+                // operation writes — `GetProtocolsList` keeps the two apart with
+                // its `DefaultList` member — so an id naming one names no list a
+                // caller can update.
+                let found = store
+                    .protocols_lists
+                    .get(&list_id)
+                    .filter(|record| !record.default_list);
+                let Some(existing) = found else {
+                    return Err(PutProtocolsListErrorModeled::ResourceNotFoundException(
+                        crate::state::resource_not_found(),
+                    )
+                    .into());
+                };
+                if requested_token.as_deref() != Some(existing.update_token.as_str()) {
+                    return Err(PutProtocolsListErrorModeled::InvalidOperationException(
+                        InvalidOperationException {
+                            message: Some(
+                                "the ListUpdateToken in the request does not match the \
+                                 ListUpdateToken of the current protocols list version"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+
+                // `PreviousProtocolsList` is "a map of previous version numbers
+                // to their corresponding protocol arrays": the stored array is
+                // the version this write supersedes, and the archive already
+                // holds every version before it — so the version being
+                // superseded is one past what the archive names, the create
+                // being version 1.
+                let mut history = existing
+                    .list
+                    .previous_protocols_list
+                    .clone()
+                    .unwrap_or_default();
+                let superseded_version = history.len() + 1;
+                if superseded_version <= MAX_PREVIOUS_LIST_VERSION {
+                    history.insert(
+                        superseded_version.to_string(),
+                        existing.list.protocols_list.clone(),
+                    );
+                }
+                list.previous_protocols_list = Some(history);
+
+                crate::state::ProtocolsListRecord {
+                    list_id,
+                    list_arn: existing.list_arn.clone(),
+                    // A successful update makes the caller's token stale, so the
+                    // next update has to read the current one back first.
+                    update_token: crate::state::mint_identifier(),
+                    default_list: existing.default_list,
+                    list,
+                    // `TagList` is optional, and an absent optional member is
+                    // "unchanged", not "empty": an update that sends no TagList
+                    // keeps the tags the list already carries. A TagList that IS
+                    // sent replaces the set.
+                    tags: input
+                        .tag_list
+                        .clone()
+                        .unwrap_or_else(|| existing.tags.clone()),
+                    created_at: existing.created_at,
+                    updated_at: now,
+                }
+            }
+            // CREATE: mint the identifiers and the ARN.
+            None => {
+                if store.protocols_lists.len() >= MAX_PROTOCOLS_LISTS {
+                    return Err(PutProtocolsListErrorModeled::LimitExceededException(
+                        LimitExceededException {
+                            message: Some(format!(
+                                "the maximum of {MAX_PROTOCOLS_LISTS} Firewall Manager protocols \
+                                 lists has already been created"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                let list_id = crate::state::mint_identifier();
+                crate::state::ProtocolsListRecord {
+                    list_arn: crate::state::protocols_list_arn(&region, &list_id),
+                    list_id,
+                    update_token: crate::state::mint_identifier(),
+                    // This API creates CUSTOMER lists; a managed (default) list
+                    // is Firewall Manager's own and is not created through it.
+                    default_list: false,
+                    list,
+                    // A new resource carries only the tags the create sent.
+                    tags: input.tag_list.clone().unwrap_or_default(),
+                    created_at: now,
+                    updated_at: now,
+                }
+            }
+        };
+
+        store
+            .tags_by_arn
+            .insert(record.list_arn.clone(), record.tags.clone());
+        let output = PutProtocolsListOutput {
+            protocols_list: Some(record.list()),
+            protocols_list_arn: Some(record.list_arn.clone()),
+        };
+        store.protocols_lists.insert(record.list_id.clone(), record);
+        Ok(output)
     }
 }

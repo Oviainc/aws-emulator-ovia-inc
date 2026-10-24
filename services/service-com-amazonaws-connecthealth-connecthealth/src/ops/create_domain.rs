@@ -71,6 +71,9 @@
 //! ## Errors
 //!
 //! * `ServiceQuotaExceededException` (HTTP 402) — The request exceeds a service quota.
+//! * `ValidationException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   this SERVICE models the shape, this operation's own `errors` list does not name it,
+//!   and it is the error the account-wide Domain cap is surfaced as.
 //!
 //! ## Beside the model
 //!
@@ -130,10 +133,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-connecthealth-connecthe
 // here — hence the `CreateDomainError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.connecthealth#CreateDomain")]
+//
+// `ValidationException` is widened in through `extra_errors`: this SERVICE models the
+// shape (`smithy_query(query="shape", shape="ValidationException")`, errorKind client,
+// httpError 400) and six of its operations list it, but `CreateDomain`'s own `errors`
+// list names only `ServiceQuotaExceededException` — while the account-wide Domain cap is
+// surfaced as a `ValidationException`, so the modelled shape is what this handler
+// answers with rather than the framework's synthetic one.
+#[smithy_macros::operation_error(
+    "com.amazonaws.connecthealth#CreateDomain",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum CreateDomainErrorModeled {
     ServiceQuotaExceededException(ServiceQuotaExceededException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -197,18 +211,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::region_of(ctx);
         let now = ::std::time::SystemTime::now();
+        // The account this create is signed for, which is the account that will own the
+        // domain and the one the cap below is measured against.
+        let account_id = crate::state::owning_account_id();
 
         let mut store = state.lock();
         store.purge_due_deletions(now);
 
-        // Bound the store BEFORE minting, so a refused request advances nothing: the
-        // operation's own modelled quota error is the channel for a store that is full.
-        if store.domains.len() >= crate::state::MAX_DOMAINS {
-            return Err(CreateDomainErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
+        // The account-wide Domain cap, enforced BEFORE anything is minted so a refused
+        // request advances nothing. It is a LIVE count of the domains the account holds,
+        // so a `DeleteDomain` (once its purge has fallen due) frees the slot and the next
+        // create succeeds. The purge above is what makes the count live at this instant.
+        let held = store.domains_held_by(&account_id);
+        if held >= crate::state::MAX_DOMAINS_PER_ACCOUNT {
+            return Err(CreateDomainErrorModeled::ValidationException(
+                ValidationException {
                     message: Some(format!(
-                        "this account already holds the maximum of {} domains",
-                        crate::state::MAX_DOMAINS
+                        "Account {account_id} has reached the maximum limit of {} domains.",
+                        crate::state::MAX_DOMAINS_PER_ACCOUNT
                     )),
                 },
             )
@@ -244,6 +264,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let domain_id = store.mint_domain_id();
+        // The id is remembered as ALLOCATED for as long as the history holds it, past
+        // the domain's own purge: `DeleteDomain` tells an id this account once owned from
+        // one that was never allocated anywhere by exactly this record.
+        store.record_domain_allocation(&domain_id);
         let arn = crate::state::domain_arn(&region, &domain_id);
 
         // `encryptionContext` is derived, not asked for: a customer-managed key is in
@@ -273,7 +297,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let domain = crate::state::Domain {
             domain_id: domain_id.clone(),
             arn: arn.clone(),
-            account_id: crate::state::owning_account_id(),
+            account_id,
             // Every domain this emulator creates is onboarded through the one
             // provisioning path it implements; the generation is fixed here, at
             // creation, and read back from the record by every response.
