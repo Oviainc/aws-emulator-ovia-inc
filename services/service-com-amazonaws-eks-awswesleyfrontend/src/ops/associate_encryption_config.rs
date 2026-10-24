@@ -68,8 +68,9 @@ use std::time::SystemTime;
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    self, UpdateRecord, STATUS_ACTIVE, STATUS_UPDATING, UPDATE_COMPLETION_DELAY,
-    UPDATE_IN_PROGRESS, UPDATE_PARAM_ENCRYPTION_CONFIG, UPDATE_TYPE_ASSOCIATE_ENCRYPTION_CONFIG,
+    self, PendingClusterConfig, UpdateRecord, STATUS_ACTIVE, STATUS_UPDATING,
+    UPDATE_COMPLETION_DELAY, UPDATE_IN_PROGRESS, UPDATE_PARAM_ENCRYPTION_CONFIG,
+    UPDATE_TYPE_ASSOCIATE_ENCRYPTION_CONFIG,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -281,7 +282,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }],
             client_request_token: replayed_token.map(str::to_owned),
             succeeds_at: Some(now + UPDATE_COMPLETION_DELAY),
-            pending_encryption_config: Some(input.encryption_config.clone()),
+            pending_config: Some(PendingClusterConfig {
+                encryption_config: Some(input.encryption_config.clone()),
+                ..Default::default()
+            }),
             // "This field is present only if any cancellation is attempted for the
             // update": none has been, so `CancelUpdate` is the only writer of either.
             cancellation: None,

@@ -386,8 +386,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_request_token: replayed_token.map(str::to_owned),
             succeeds_at: Some(now + UPDATE_COMPLETION_DELAY),
             // This update associates an identity provider, so it carries no pending
-            // `encryptionConfig` for the cluster itself.
-            pending_encryption_config: None,
+            // change to the cluster's own configuration.
+            pending_config: None,
             // "This field is present only if any cancellation is attempted for the
             // update": none has been, so `CancelUpdate` is the only writer of either.
             cancellation: None,

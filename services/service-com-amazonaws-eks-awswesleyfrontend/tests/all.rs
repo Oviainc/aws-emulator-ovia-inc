@@ -27,6 +27,8 @@ mod capability_lifecycle;
 mod certificate_authority;
 #[path = "all/child_create_resolves_the_cluster_first.rs"]
 mod child_create_resolves_the_cluster_first;
+#[path = "all/cluster_config_update.rs"]
+mod cluster_config_update;
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
 #[path = "all/cluster_version_catalog.rs"]

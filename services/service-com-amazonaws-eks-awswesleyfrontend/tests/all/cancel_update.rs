@@ -184,7 +184,7 @@ fn seed_update(
         params,
         client_request_token: None,
         succeeds_at: completes_after.map(|after| created_at + after),
-        pending_encryption_config: None,
+        pending_config: None,
         cancellation: None,
         cancellation_request_token: None,
     };
