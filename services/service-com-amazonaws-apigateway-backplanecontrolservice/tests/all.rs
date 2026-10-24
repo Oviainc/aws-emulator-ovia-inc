@@ -71,6 +71,8 @@ mod sdk_types;
 mod service_claim;
 #[path = "all/stage_collection.rs"]
 mod stage_collection;
+#[path = "all/stage_invoke.rs"]
+mod stage_invoke;
 #[path = "all/stage_lifecycle.rs"]
 mod stage_lifecycle;
 #[path = "all/state_roundtrip.rs"]

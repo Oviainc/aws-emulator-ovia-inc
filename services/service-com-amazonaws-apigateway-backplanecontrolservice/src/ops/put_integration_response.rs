@@ -7,7 +7,8 @@
 //! code, with the header mappings and body templates that transform it. The record is
 //! stored on the integration the method carries ([`crate::state::MethodEntry::integration`]'s
 //! `integrationResponses`), keyed by its `statusCode`, so `GetIntegrationResponse` and
-//! `GetIntegration` report the same one record.
+//! `GetIntegration` report the same one record. It is also the OUTPUT MAPPING the
+//! execute-api data plane answers a request with (`crate::service::invoke`).
 //!
 //! ## Shape of an operation
 //!
