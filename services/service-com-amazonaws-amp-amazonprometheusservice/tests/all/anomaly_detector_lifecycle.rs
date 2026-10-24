@@ -647,8 +647,11 @@ async fn unresolved_ids_answer_the_modelled_refusals() {
     assert_eq!(created.status, 202, "case \"seed\": expected 202, got {created:?}");
     let detector_id = text(&created.body["anomalyDetectorId"]);
 
-    // CreateAnomalyDetector models no ResourceNotFoundException, so an unknown
-    // workspaceId is refused as the modelled ValidationException.
+    // `workspaceId` is an `@httpLabel` naming the detector's PARENT: a well-formed
+    // request this service cannot place in a workspace this account holds is the modelled
+    // 404, not a member-validation 400. (A member the caller got wrong is still reported
+    // first — `tests/all/kms_key_arn_and_parent_resolution.rs` holds both that ordering
+    // and the not-found rule over every workspace-scoped operation.)
     let unknown_workspace = create_detector(
         &amp,
         region,
@@ -660,13 +663,13 @@ async fn unresolved_ids_answer_the_modelled_refusals() {
     )
     .await;
     assert_eq!(
-        unknown_workspace.status, 400,
-        "case \"unknown workspace\": CreateAnomalyDetector must refuse with 400, \
+        unknown_workspace.status, 404,
+        "case \"unknown workspace\": CreateAnomalyDetector must refuse with 404, \
          got {unknown_workspace:?}"
     );
     assert_eq!(
         unknown_workspace.error_code(),
-        "ValidationException",
+        "ResourceNotFoundException",
         "case \"unknown workspace\": unexpected error code, got {unknown_workspace:?}"
     );
 

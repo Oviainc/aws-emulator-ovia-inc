@@ -37,11 +37,10 @@ md-5 = "0.10"
 sha1 = "0.10"
 # The opaque `versionRevision` of a package version: base64 of its content digest.
 base64 = "0.22"
-
-[dev-dependencies]
-# Percent-encoding for the `resourceArn` query value the tagging suite sends: an ARN
-# carries `:` and `/`, and the refusal rows carry spaces and non-ASCII, so the suite uses
-# the maintained encoder the sibling service crates use rather than its own.
+# Percent-encoding of the identifiers this service puts in an ARN resource path (a
+# package group's pattern carries wildcards and sigils), and the decoding of a
+# caller-supplied `resourceArn` back into them. Also the `resourceArn` query value the
+# tagging suite sends, as it is for the sibling service crates.
 percent-encoding = "2.3"
 
 [build-dependencies]

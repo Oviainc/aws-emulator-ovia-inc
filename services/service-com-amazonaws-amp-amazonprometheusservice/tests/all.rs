@@ -15,6 +15,8 @@
 mod anomaly_detector_lifecycle;
 #[path = "all/default_scraper_configuration.rs"]
 mod default_scraper_configuration;
+#[path = "all/kms_key_arn_and_parent_resolution.rs"]
+mod kms_key_arn_and_parent_resolution;
 #[path = "all/logging_configuration.rs"]
 mod logging_configuration;
 #[path = "all/query_logging_configuration.rs"]

@@ -179,7 +179,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The FORM of the `scopeId` first: a value that cannot be an identifier this
+        // service generates is the modelled 400, decided before the store is reached.
+        if !crate::state::is_scope_id(&input.scope_id) {
+            return Err(
+                GetQueryResultsWorkloadInsightsTopContributorsErrorModeled::ValidationException(
+                    crate::state::invalid_scope_id(),
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 GetQueryResultsWorkloadInsightsTopContributorsErrorModeled::InternalServerException(
@@ -191,6 +202,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = state.lock();
         state.settle(::std::time::SystemTime::now());
+
+        // The scope the query hangs off, before the query itself: this operation DOES
+        // model `ResourceNotFoundException`, so a well-formed scope reference the
+        // store cannot resolve is reported as the absence it is — in this service's
+        // missing-scope wording — rather than as a refusal naming the `queryId`.
+        if !state.scopes.contains_key(&input.scope_id) {
+            return Err(
+                GetQueryResultsWorkloadInsightsTopContributorsErrorModeled::ResourceNotFoundException(
+                    crate::state::scope_not_found(&region, &input.scope_id),
+                )
+                .into(),
+            );
+        }
 
         let Some(query) = state.query(
             crate::state::QueryKind::WorkloadInsightsTopContributors,
