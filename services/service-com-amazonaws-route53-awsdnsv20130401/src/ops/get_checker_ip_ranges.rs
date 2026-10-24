@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCheckerIpRanges
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCheckerIpRanges`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCheckerIpRanges::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation reports
+//!
+//! The CIDR blocks Route 53's health checkers send their checks from. They are
+//! SERVICE-owned — no operation of this API creates, changes or deletes one — so they
+//! live in this service's store, seeded by
+//! [`crate::state::ComAmazonawsRoute53Awsdnsv20130401State`]'s `Default`, and this
+//! handler only reads them. The reported order is the blocks' numeric order in the
+//! address space (`CheckerIpRanges`: "a complex type that contains sorted list of IP
+//! ranges in CIDR format"), which [`crate::state::checker_ip_ranges`] computes.
 //!
 //! ## Shape of an operation
 //!
@@ -127,21 +128,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _input: Self::Input,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCheckerIpRanges` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCheckerIpRangesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCheckerIpRanges"))
+        // Reporting only: the health-checker ranges are read out of the store that
+        // seeded them, so every call answers the same list and leaves the store
+        // exactly as it was. `GetCheckerIpRangesRequest` carries no member, so there
+        // is nothing in the request to validate or to vary the answer by.
+        let checker_ip_ranges = match crate::state::service_state(&*self.engine) {
+            Some(state) => state.lock().checker_ip_ranges().to_vec(),
+            // Unreachable under the router, which always mounts this service on the
+            // shared `InMemoryEngine`. These blocks belong to the service rather than
+            // to the account, so nothing a store holds could have changed them: the
+            // answer comes from the same function that seeds the store.
+            None => crate::state::checker_ip_ranges(),
+        };
+
+        Ok(GetCheckerIpRangesOutput { checker_ip_ranges })
     }
 }
