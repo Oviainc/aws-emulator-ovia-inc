@@ -14,13 +14,15 @@
 //!   `Quotas` list, because the code exists;
 //! * the ARN of an AWS DEFAULT quota carries no account segment, while the APPLIED
 //!   quota of the same pair carries the account;
-//! * a listing called with no `MaxResults` returns every item in one page, and the
-//!   same items come back however the listing is paged.
+//! * a listing called with no `MaxResults` returns ONE BOUNDED page, with a
+//!   `NextToken` while items remain, and the same items come back however the
+//!   listing is paged.
 //!
 //! The harness (`client`, `walk_pages`, `ACCOUNT`) is the one `quota_workflow.rs`
 //! already uses, so both suites speak to the emulator the same way.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_servicequotas_servicequotasv20190624::state::UNASKED_PAGE_SIZE;
 
 use crate::quota_workflow::{client, emulator, walk_pages, Client, ACCOUNT};
 
@@ -318,16 +320,17 @@ async fn an_aws_default_quota_arn_names_no_account_and_the_applied_one_does() {
     }
 }
 
-/// A listing called with no `MaxResults` returns EVERY item in one page; a caller
-/// that names a page size gets that page size, and walking the pages yields the same
-/// items.
+/// A listing called with no `MaxResults` returns ONE BOUNDED page — the page size
+/// the listing applies, with a `NextToken` while items remain — and a caller that
+/// names a page size gets that page size, with the walk yielding the same items.
 #[tokio::test]
-async fn a_listing_with_no_page_size_returns_every_item_in_one_page() {
+async fn a_listing_with_no_page_size_returns_one_bounded_page() {
     let engine = emulator();
     let client = client(&engine, "us-east-1");
 
     // Rows: a listing far longer than the modelled MaxResults ceiling (the catalog),
-    // and listings shorter than it (the seeded quota sets).
+    // and listings shorter than it (the seeded quota sets), including one shorter
+    // than a single unasked page.
     let listings = [
         ("ListServices", json!({}), "Services"),
         (
@@ -348,37 +351,46 @@ async fn a_listing_with_no_page_size_returns_every_item_in_one_page() {
     ];
 
     for (operation, body, items) in &listings {
-        let whole = client.ok(operation, body.clone()).await;
-        let page = whole[items]
+        // The whole listing, as the token chain yields it.
+        let whole = walk_pages(&client, operation, body, items, None).await;
+        let unasked = client.ok(operation, body.clone()).await;
+        let page = unasked[items]
             .as_array()
-            .unwrap_or_else(|| panic!("case {operation}: expected a {items} list, got {whole}"))
+            .unwrap_or_else(|| panic!("case {operation}: expected a {items} list, got {unasked}"))
             .clone();
+        let expected = UNASKED_PAGE_SIZE.min(whole.len());
         assert_eq!(
-            whole["NextToken"],
-            Value::Null,
-            "case {operation}: a listing with no MaxResults is one whole page, got a NextToken \
-             after {} items",
+            page.len(),
+            expected,
+            "case {operation}: an unasked listing is one page of at most {UNASKED_PAGE_SIZE} \
+             items, expected {expected}, got {}",
             page.len()
+        );
+        assert_eq!(
+            unasked["NextToken"].is_string(),
+            whole.len() > UNASKED_PAGE_SIZE,
+            "case {operation}: a NextToken is present exactly while items remain ({} items), \
+             got {unasked}",
+            whole.len()
         );
 
         // Paging it yields exactly the same items, in the same order.
         for size in [1_i64, 7, 100] {
-            if page.len() as i64 / size > 1_000 {
+            if whole.len() as i64 / size > 1_000 {
                 continue;
             }
             let paged = walk_pages(&client, operation, body, items, Some(size)).await;
             assert_eq!(
-                paged, page,
+                paged, whole,
                 "case {operation} MaxResults={size}: paging must yield the one listing"
             );
         }
     }
 
-    // The catalog is longer than the largest page a caller may ask for, so a page
-    // size SHORTENS it and carries a token.
-    let catalog = client.ok("ListServices", json!({})).await["Services"]
-        .as_array()
-        .expect("a Services list")
+    // The catalog is longer than the largest page a caller may ask for, so even the
+    // largest asked page SHORTENS it and carries a token.
+    let catalog = walk_pages(&client, "ListServices", &json!({}), "Services", None)
+        .await
         .len();
     let first = client.ok("ListServices", json!({"MaxResults": 100})).await;
     assert_eq!(

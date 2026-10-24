@@ -11,8 +11,10 @@
 //! * `QuotaAppliedAtLevel` keeps the quotas applied at that level — `ALL` keeps every
 //!   one, since a quota applied at any level is applied at all of them;
 //! * `MaxResults` / `NextToken` page the listing, and a token this service did not
-//!   issue is `InvalidPaginationTokenException`. The quotas come back in the order the
-//!   catalog publishes them.
+//!   issue is `InvalidPaginationTokenException`. `MaxResults` "defaults to a value
+//!   appropriate to the operation", so a caller that names none is served
+//!   [`crate::state::UNASKED_PAGE_SIZE`] rows and a `NextToken` for as long as rows
+//!   remain. The quotas come back in the order the catalog publishes them.
 //!
 //! Before answering it materialises the increase decisions the clock has already made
 //! due, so the value listed here is the value in force at the instant of the call and
