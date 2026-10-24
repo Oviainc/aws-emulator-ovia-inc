@@ -218,10 +218,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
 
         // A VPC attachment reaches the VPC through subnets OF that VPC, so the request has
-        // to name at least one and every one of them has to lie in the VPC's own Region.
-        // The modelled `SubnetArnList` carries neither rule (`smithy_query
-        // shape=SubnetArnList` constrains the member STRING only, and even allows the
-        // empty string), so both are refused here.
+        // to name at least one, and the rest of the rule — every entry in the VPC's own
+        // Region, no entry twice, and no more than one attachment may hold — belongs to
+        // `crate::state::check_subnet_list`, the one function `UpdateVpcAttachment` judges
+        // its own lists by. The modelled `SubnetArnList` carries none of it (`smithy_query
+        // shape=SubnetArnList` constrains the member STRING only, and even allows the empty
+        // string), so it is enforced here.
         if input.subnet_arns.is_empty() {
             return Err(CreateVpcAttachmentErrorModeled::ValidationException(
                 crate::state::field_rejection(
@@ -232,21 +234,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        for subnet_arn in &input.subnet_arns {
-            let subnet_region = crate::state::ec2_arn_region(subnet_arn);
-            if subnet_region != Some(edge_location.as_str()) {
-                return Err(CreateVpcAttachmentErrorModeled::ValidationException(
-                    crate::state::field_rejection(
-                        crate::state::FIELD_SUBNET_ARNS,
-                        crate::state::VALIDATION_REASON_OTHER,
-                        format!(
-                            "subnet {subnet_arn} is not in {edge_location}, the Region of the VPC it must belong to"
-                        ),
-                    ),
-                )
-                .into());
-            }
-        }
+        crate::state::check_subnet_list(
+            crate::state::FIELD_SUBNET_ARNS,
+            &edge_location,
+            &input.subnet_arns,
+            crate::state::MAX_SUBNETS_PER_VPC_ATTACHMENT,
+        )
+        .map_err(CreateVpcAttachmentErrorModeled::ValidationException)?;
 
         // `ClientToken` is the operation's modelled `@idempotencyToken`, so a retry of the
         // same request answers the record the first call minted instead of minting a
@@ -362,6 +356,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // transition is owed on it: `AcceptAttachment` is what starts the settle span.
             available_at: (!claim.require_acceptance).then(|| now + crate::state::SETTLE_DELAY),
             accepted_at: None,
+            // Nothing has changed this attachment yet; see `AttachmentRecord::changed_at`.
+            changed_at: None,
             attachment_policy_rule_number: claim.rule_number,
             segment_name: claim.segment_name,
             network_function_group_name: claim.network_function_group_name,

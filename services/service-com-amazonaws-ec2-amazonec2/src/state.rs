@@ -191,6 +191,36 @@
 //! at. The shape carries no status member: AWS hands a trust provider back ready, so the
 //! clock owes it no transition and there is nothing to derive on read.
 //!
+//! ## Verified Access groups and endpoints
+//!
+//! [`ComAmazonawsEc2Amazonec2State::verified_access_groups`] holds the account's Verified
+//! Access groups as the modelled [`crate::ops::types::VerifiedAccessGroup`] shape itself,
+//! keyed by `VerifiedAccessGroupId`, and
+//! [`ComAmazonawsEc2Amazonec2State::insert_verified_access_group`] is the one way a group is
+//! stored: it derives every member the service owns (the group id, its ARN and the owning
+//! account) rather than taking them from a caller. That writer sits ahead of the operation
+//! that will call it — `CreateVerifiedAccessGroup` is still a scaffold stub with its own
+//! open issue — exactly as [`ComAmazonawsEc2Amazonec2State::insert_network_interface`] does,
+//! so the create lands on this one record rather than on a second copy of a group beside it.
+//! An endpoint resolves the group it is attached to here, and reads the instance the group
+//! belongs to off that record, so one endpoint cannot name an instance its group does not.
+//!
+//! [`ComAmazonawsEc2Amazonec2State::verified_access_endpoints`] holds the account's Verified
+//! Access endpoints as [`VerifiedAccessEndpointRecord`]s, keyed by
+//! `VerifiedAccessEndpointId` in a [`BTreeMap`] — the same stable order every other store
+//! here is kept in, so a pagination token can name the id the next page starts at. The
+//! record is the modelled [`crate::ops::types::VerifiedAccessEndpoint`] shape
+//! `CreateVerifiedAccessEndpoint` answers with and `DescribeVerifiedAccessEndpoints`
+//! reports, plus the two facts that shape carries no member for: the `pending` -> `active`
+//! move the clock owes an endpoint AWS hands back in the non-terminal `pending` status
+//! ([`VerifiedAccessEndpointRecord::pending`], the [`ClockTransition`] every other record of
+//! this store carries, on the same monotonic clock and the same [`TRANSITION_DELAY`] span as
+//! a `pending` VPC's `available` move, applied by
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]), and the endpoint-level
+//! policy document the create takes ([`VerifiedAccessEndpointRecord::policy_document`]),
+//! which `GetVerifiedAccessEndpointPolicy` reports and which the endpoint shape itself does
+//! not carry.
+//!
 //! ## Secondary networks
 //!
 //! [`ComAmazonawsEc2Amazonec2State::secondary_networks`] holds the account's secondary
@@ -1826,6 +1856,18 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// minted, so a repeat of the same request answers with that trust provider instead
     /// of creating a second one.
     pub verified_access_trust_provider_client_tokens: HashMap<String, String>,
+    /// Every Verified Access group the account holds, by `VerifiedAccessGroupId`, as the
+    /// modelled [`crate::ops::types::VerifiedAccessGroup`] shape itself — see the module
+    /// docs. Ordered by id, the order a describe of the groups reports and pages over.
+    pub verified_access_groups: BTreeMap<String, crate::ops::types::VerifiedAccessGroup>,
+    /// Every Verified Access endpoint the account holds, by `VerifiedAccessEndpointId`, as
+    /// [`VerifiedAccessEndpointRecord`]s — see the module docs. Ordered by id, which is the
+    /// order `DescribeVerifiedAccessEndpoints` reports and pages over.
+    pub verified_access_endpoints: BTreeMap<String, VerifiedAccessEndpointRecord>,
+    /// A `CreateVerifiedAccessEndpoint` `ClientToken` and the endpoint id it minted, so a
+    /// repeat of the same request answers with that endpoint instead of creating a second
+    /// one.
+    pub verified_access_endpoint_client_tokens: HashMap<String, String>,
     /// Every AMI the account can see, by `ImageId`, as the modelled [`Image`] shape itself
     /// — the Amazon-published catalog a fresh account already has (see the module docs)
     /// plus any image a writer stores later. Ordered by id, which is the order the
@@ -2324,6 +2366,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             subnet_available_at: BTreeMap::new(),
             verified_access_trust_providers: BTreeMap::new(),
             verified_access_trust_provider_client_tokens: HashMap::new(),
+            // A fresh account has created no Verified Access group and no endpoint on one.
+            verified_access_groups: BTreeMap::new(),
+            verified_access_endpoints: BTreeMap::new(),
+            verified_access_endpoint_client_tokens: HashMap::new(),
             local_gateway_route_table_virtual_interface_group_associations: BTreeMap::new(),
             // A local gateway route table lives on an Outpost, which no EC2 call creates.
             local_gateway_route_tables: BTreeMap::new(),
@@ -4073,6 +4119,28 @@ impl ComAmazonawsEc2Amazonec2State {
             // The transition is applied once; nothing is owed on this pool any more.
             false
         });
+        // A Verified Access endpoint `CreateVerifiedAccessEndpoint` answered as `pending`
+        // reaches `active` once its due instant has passed, whether or not anybody called —
+        // the same contract as a `pending` VPC's move above, and the reason the endpoint's
+        // due instant is kept beside the modelled shape rather than on it.
+        for record in self.verified_access_endpoints.values_mut() {
+            let due = record
+                .pending
+                .as_ref()
+                .filter(|pending| now >= pending.due_at)
+                .cloned();
+            if let Some(pending) = due {
+                record.view.status = Some(crate::ops::types::VerifiedAccessEndpointStatus {
+                    code: Some(pending.to.to_string()),
+                    message: None,
+                });
+                // The endpoint changed when the move fell due, not when somebody next asked
+                // about it, so "The last updated time" (`VerifiedAccessEndpoint$
+                // LastUpdatedTime`) is the due instant.
+                record.view.last_updated_time = Some(iso8601_utc(pending.at));
+                record.pending = None;
+            }
+        }
         // A VPC BPA exclusion `CreateVpcBlockPublicAccessExclusion` answered as
         // `create-in-progress` reaches `create-complete` once its due instant has passed,
         // whether or not anybody called — the same contract as a `pending` VPC's move
@@ -9949,6 +10017,384 @@ impl ComAmazonawsEc2Amazonec2State {
         self.verified_access_trust_providers
             .insert(trust_provider_id.clone(), provider);
         trust_provider_id
+    }
+}
+
+// =============================================================================
+// Verified Access groups and endpoints
+// =============================================================================
+
+/// The id prefix a Verified Access group is minted under: EC2 names a group's ids
+/// `vagr-<hex>`, the same `<prefix>-<hex>` form every other EC2 resource id takes, so
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] mints them.
+pub const VERIFIED_ACCESS_GROUP_ID_PREFIX: &str = "vagr";
+
+/// The id prefix a Verified Access endpoint is minted under: `vae-<hex>`, beside the
+/// group's [`VERIFIED_ACCESS_GROUP_ID_PREFIX`] and the trust provider's
+/// [`VERIFIED_ACCESS_TRUST_PROVIDER_ID_PREFIX`].
+pub const VERIFIED_ACCESS_ENDPOINT_ID_PREFIX: &str = "vae";
+
+/// The one `ResourceType` a `CreateVerifiedAccessEndpoint` tag specification may name:
+/// "The tags to assign to the Verified Access endpoint"
+/// (`CreateVerifiedAccessEndpointRequest$TagSpecifications`), spelled as the modelled
+/// `ResourceType` enum spells it (`smithy_query(query="shape",shape="ResourceType")`).
+pub const VERIFIED_ACCESS_ENDPOINT_TAGGABLE_RESOURCE: &str = "verified-access-endpoint";
+
+/// `VerifiedAccessEndpointType`'s `load-balancer`
+/// (`smithy_query(query="shape",shape="VerifiedAccessEndpointType")`) — the kind whose
+/// options are `LoadBalancerOptions`.
+pub const VERIFIED_ACCESS_ENDPOINT_TYPE_LOAD_BALANCER: &str = "load-balancer";
+
+/// `VerifiedAccessEndpointType`'s `network-interface` — the kind whose options are
+/// `NetworkInterfaceOptions`.
+pub const VERIFIED_ACCESS_ENDPOINT_TYPE_NETWORK_INTERFACE: &str = "network-interface";
+
+/// `VerifiedAccessEndpointType`'s `rds` — the kind whose options are `RdsOptions`.
+pub const VERIFIED_ACCESS_ENDPOINT_TYPE_RDS: &str = "rds";
+
+/// `VerifiedAccessEndpointType`'s `cidr` — the kind whose options are `CidrOptions`.
+pub const VERIFIED_ACCESS_ENDPOINT_TYPE_CIDR: &str = "cidr";
+
+/// `VerifiedAccessEndpointAttachmentType`'s only member, `vpc`
+/// (`smithy_query(query="shape",shape="VerifiedAccessEndpointAttachmentType")`) — the
+/// attachment that makes `SecurityGroupIds` required ("Required if AttachmentType is set to
+/// vpc", `CreateVerifiedAccessEndpointRequest$SecurityGroupIds`).
+pub const VERIFIED_ACCESS_ENDPOINT_ATTACHMENT_TYPE_VPC: &str = "vpc";
+
+/// The status `CreateVerifiedAccessEndpoint` answers a fresh endpoint with: the
+/// `VerifiedAccessEndpointStatusCode` enum's `pending` member
+/// (`smithy_query(query="shape",shape="VerifiedAccessEndpointStatusCode")`), which is not
+/// terminal — so the clock owes the endpoint [`VERIFIED_ACCESS_ENDPOINT_STATUS_ACTIVE`] one
+/// [`TRANSITION_DELAY`] later.
+pub const VERIFIED_ACCESS_ENDPOINT_STATUS_PENDING: &str = "pending";
+
+/// The status a `pending` endpoint reaches once its move falls due: the
+/// `VerifiedAccessEndpointStatusCode` enum's `active` member.
+pub const VERIFIED_ACCESS_ENDPOINT_STATUS_ACTIVE: &str = "active";
+
+/// How many Verified Access endpoints this emulator stores before
+/// `CreateVerifiedAccessEndpoint` is refused.
+///
+/// CHOSEN, like [`MAX_VERIFIED_ACCESS_TRUST_PROVIDERS`] and for the same reason: nothing in
+/// this emulator reclaims a stored endpoint, so the store needs a ceiling that is not the
+/// process's memory. Well above the published per-Region Verified Access quota a test would
+/// exercise. A count ceiling is not a memory bound on its own — see [`MAX_STORED_BYTES`] —
+/// so the caller-chosen bytes of each record are charged against that budget too
+/// ([`verified_access_endpoint_payload_bytes`]).
+pub const MAX_VERIFIED_ACCESS_ENDPOINTS: usize = 1_000;
+
+/// The largest page `DescribeVerifiedAccessEndpoints` serves, and the page it serves when
+/// the request names no size.
+///
+/// The top of the modelled `MaxResults` range, `range 5..1000`
+/// (`smithy_query(query="operation",operation="DescribeVerifiedAccessEndpoints")`), so a
+/// request that names no page size is answered with the largest page the operation can be
+/// ASKED for and the `NextToken` path behaves the same either way.
+pub const MAX_VERIFIED_ACCESS_ENDPOINTS_PAGE_SIZE: usize = 1000;
+
+/// EC2's code for a Verified Access group id that names no group of the account.
+///
+/// EC2's model declares no error shape at all (see [`crate::scaffolded::ServiceError`]), and
+/// the service answers `Invalid<Resource>Id.NotFound` for an id of a resource it cannot
+/// resolve — `InvalidVolume.NotFound`, `InvalidLaunchTemplateId.NotFound` — so that is the
+/// code this resource's id gets.
+pub const INVALID_VERIFIED_ACCESS_GROUP_ID_NOT_FOUND: &str = "InvalidVerifiedAccessGroupId.NotFound";
+
+/// EC2's code for a Verified Access endpoint id that names no endpoint of the account,
+/// named the same way as [`INVALID_VERIFIED_ACCESS_GROUP_ID_NOT_FOUND`].
+pub const INVALID_VERIFIED_ACCESS_ENDPOINT_ID_NOT_FOUND: &str =
+    "InvalidVerifiedAccessEndpointId.NotFound";
+
+/// EC2's quota code for one Verified Access endpoint too many, named the way every other
+/// per-resource EC2 quota code is (`VolumeLimitExceeded`, `LaunchTemplateLimitExceeded`).
+pub const VERIFIED_ACCESS_ENDPOINT_LIMIT_EXCEEDED: &str = "VerifiedAccessEndpointLimitExceeded";
+
+/// How many `PortRanges` entries one Verified Access endpoint's options block may carry.
+///
+/// CHOSEN, like [`MAX_SECURITY_GROUPS_PER_INSTANCE`] and for the same reason: the list's
+/// length is the CALLER's, the modelled
+/// `CreateVerifiedAccessEndpointPortRangeList` declares no `@length`
+/// (`smithy_query(query="shape",shape="CreateVerifiedAccessEndpointPortRangeList")`), and
+/// every entry is retained for the process's lifetime and cloned into each describe page. So
+/// the count is bounded here, well above any endpoint a test or a real application
+/// configures, and the entries are charged against [`MAX_STORED_BYTES`] as well
+/// ([`verified_access_endpoint_payload_bytes`]), so neither the record count nor the byte
+/// budget can be sidestepped through this list.
+pub const MAX_VERIFIED_ACCESS_ENDPOINT_PORT_RANGES: usize = 64;
+
+/// The ARN of a Verified Access group:
+/// `arn:aws:ec2:<region>:<account>:verified-access-group/<id>`, the form
+/// `VerifiedAccessGroup$VerifiedAccessGroupArn` carries ("The ARN of the Verified Access
+/// group"), built from the same [`::engine::emulator_arn`] every other ARN of this store is.
+pub fn verified_access_group_arn(region: &str, group_id: &str) -> String {
+    ::engine::emulator_arn("ec2", region, &format!("verified-access-group/{group_id}"))
+}
+
+/// The DNS suffix a Verified Access endpoint's generated name carries.
+///
+/// CHOSEN: "A DNS name that is generated for the endpoint"
+/// (`VerifiedAccessEndpoint$EndpointDomain`) is all the model says about the name's form, and
+/// the real service's name also carries an opaque edge label nothing in the API reports. What
+/// a caller can rely on is what [`verified_access_endpoint_domain`] gives it: a name that
+/// carries the prefix the request asked for, is unique to the endpoint (it carries the minted
+/// endpoint id), names the Region the endpoint was created in, and does not change between
+/// reads.
+pub const VERIFIED_ACCESS_ENDPOINT_DOMAIN_SUFFIX: &str = "prod.verified-access";
+
+/// "A DNS name that is generated for the endpoint"
+/// (`VerifiedAccessEndpoint$EndpointDomain`), for the endpoint `endpoint_id` in `region`.
+///
+/// `prefix` is "A custom identifier that is prepended to the DNS name that is generated for
+/// the endpoint" (`CreateVerifiedAccessEndpointRequest$EndpointDomainPrefix`) — prepended
+/// when the request named one, and left off the name when it did not. The rest is derived
+/// from the endpoint's own id, the Region and the DNS suffix of that Region's PARTITION
+/// ([`partition_dns_suffix`], the one definition of that suffix in this module, so a Region
+/// outside the commercial partition gets a name in its own), making the name unique per
+/// endpoint and stable across reads; see [`VERIFIED_ACCESS_ENDPOINT_DOMAIN_SUFFIX`].
+pub fn verified_access_endpoint_domain(
+    prefix: Option<&str>,
+    endpoint_id: &str,
+    region: &str,
+) -> String {
+    let tail = format!(
+        "{endpoint_id}.{VERIFIED_ACCESS_ENDPOINT_DOMAIN_SUFFIX}.{region}.{}",
+        partition_dns_suffix(region)
+    );
+    match prefix.filter(|prefix| !prefix.is_empty()) {
+        Some(prefix) => format!("{prefix}.{tail}"),
+        None => tail,
+    }
+}
+
+/// One stored Verified Access endpoint: the modelled shape every operation that reports one
+/// answers with, plus the two facts that shape carries no member for.
+#[derive(Debug, Clone)]
+pub struct VerifiedAccessEndpointRecord {
+    /// The endpoint as `CreateVerifiedAccessEndpoint` answered it and
+    /// `DescribeVerifiedAccessEndpoints` reports it.
+    pub view: crate::ops::types::VerifiedAccessEndpoint,
+    /// The `pending` -> `active` move the clock owes the endpoint, until
+    /// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies it. `None` on
+    /// an endpoint that has nothing owed.
+    pub pending: Option<ClockTransition<&'static str>>,
+    /// "The Verified Access policy document"
+    /// (`CreateVerifiedAccessEndpointRequest$PolicyDocument`), which the modelled endpoint
+    /// shape carries no member for: `GetVerifiedAccessEndpointPolicy` is what reports it
+    /// (still a scaffold stub with its own open issue). Kept here so the document the create
+    /// accepted is the one that reader will answer with, rather than dropped on the floor.
+    pub policy_document: Option<String>,
+}
+
+/// The caller-chosen bytes one stored Verified Access group holds for the process's
+/// lifetime: its tags, its description and the key ARN its SSE block names. The id, the ARN
+/// and the owning account are derived by
+/// [`ComAmazonawsEc2Amazonec2State::insert_verified_access_group`], and the timestamps are
+/// this module's own, so they are bounded already and not counted here.
+pub fn verified_access_group_payload_bytes(group: &crate::ops::types::VerifiedAccessGroup) -> usize {
+    let text = |value: &Option<String>| value.as_ref().map_or(0, String::len);
+    tag_list_bytes(group.tags.as_deref().unwrap_or_default())
+        .saturating_add(text(&group.description))
+        .saturating_add(
+            group
+                .sse_specification
+                .as_ref()
+                .map_or(0, |sse| text(&sse.kms_key_arn)),
+        )
+}
+
+/// The caller-chosen bytes one stored Verified Access endpoint holds for the process's
+/// lifetime: every string the REQUEST chose the length of, the policy document beside the
+/// record, the `EndpointDomainPrefix` the generated endpoint domain carries, and the client
+/// token the token map keeps.
+///
+/// The ids, the timestamps, the status and the endpoint and attachment kinds are the
+/// service's own or come from a modelled enum, so they are bounded already and not counted
+/// here, and so is the rest of the generated endpoint domain (the minted id, the Region and
+/// the partition suffix) — only `domain_prefix`, the one part of that name the CALLER chose
+/// the length of, is charged, which is why the figure does not depend on whether the domain
+/// has been minted yet. The `PortRanges` entries of the endpoint's options block ARE charged,
+/// at the size of the stored range: the list's length is the caller's
+/// ([`MAX_VERIFIED_ACCESS_ENDPOINT_PORT_RANGES`] caps how many, this charge makes the byte
+/// budget see them). ONE definition of the charge, computed identically by the create's
+/// ceiling pre-check and by
+/// [`ComAmazonawsEc2Amazonec2State::insert_verified_access_endpoint`], so a writer cannot
+/// store bytes the store's budget never saw.
+pub fn verified_access_endpoint_payload_bytes(
+    record: &VerifiedAccessEndpointRecord,
+    domain_prefix: Option<&str>,
+    client_token: Option<&str>,
+) -> usize {
+    let text = |value: &Option<String>| value.as_ref().map_or(0, String::len);
+    let ids = |values: &Option<Vec<String>>| {
+        values
+            .iter()
+            .flatten()
+            .fold(0usize, |total, value| total.saturating_add(value.len()))
+    };
+    // A port range holds two bounded integers, so what the caller chooses is HOW MANY of
+    // them the record keeps: each entry is charged at the size of the stored range.
+    let port_ranges = |ranges: &Option<Vec<crate::ops::types::VerifiedAccessEndpointPortRange>>| {
+        ranges.iter().flatten().count().saturating_mul(
+            ::std::mem::size_of::<crate::ops::types::VerifiedAccessEndpointPortRange>(),
+        )
+    };
+    let endpoint = &record.view;
+    let mut bytes = tag_list_bytes(endpoint.tags.as_deref().unwrap_or_default())
+        .saturating_add(text(&endpoint.description))
+        .saturating_add(text(&endpoint.application_domain))
+        .saturating_add(text(&endpoint.domain_certificate_arn))
+        .saturating_add(domain_prefix.map_or(0, str::len))
+        .saturating_add(ids(&endpoint.security_group_ids))
+        .saturating_add(text(&record.policy_document))
+        .saturating_add(client_token.map_or(0, str::len));
+    if let Some(options) = endpoint.load_balancer_options.as_ref() {
+        bytes = bytes
+            .saturating_add(text(&options.load_balancer_arn))
+            .saturating_add(ids(&options.subnet_ids))
+            .saturating_add(port_ranges(&options.port_ranges));
+    }
+    if let Some(options) = endpoint.network_interface_options.as_ref() {
+        bytes = bytes
+            .saturating_add(text(&options.network_interface_id))
+            .saturating_add(port_ranges(&options.port_ranges));
+    }
+    if let Some(options) = endpoint.rds_options.as_ref() {
+        bytes = bytes
+            .saturating_add(text(&options.rds_db_instance_arn))
+            .saturating_add(text(&options.rds_db_cluster_arn))
+            .saturating_add(text(&options.rds_db_proxy_arn))
+            .saturating_add(text(&options.rds_endpoint))
+            .saturating_add(ids(&options.subnet_ids));
+    }
+    if let Some(options) = endpoint.cidr_options.as_ref() {
+        bytes = bytes
+            .saturating_add(text(&options.cidr))
+            .saturating_add(ids(&options.subnet_ids))
+            .saturating_add(port_ranges(&options.port_ranges));
+    }
+    if let Some(sse) = endpoint.sse_specification.as_ref() {
+        bytes = bytes.saturating_add(text(&sse.kms_key_arn));
+    }
+    bytes
+}
+
+/// Refuse a request that named a Verified Access group id this account holds no group for:
+/// HTTP 400 [`INVALID_VERIFIED_ACCESS_GROUP_ID_NOT_FOUND`].
+///
+/// One code covers an id of any shape, the way
+/// [`invalid_verified_access_trust_provider_id_not_found`] does: an id this service never
+/// minted names no group of the account whether or not it reads like one. The message names
+/// the id the REQUEST gave, in the `The <resource> ID '<id>' does not exist` wording EC2
+/// answers an unresolvable id with ([`crate::scaffolded::Scaffolded::invalid_instance_id_not_found`],
+/// [`invalid_dhcp_option_id_not_found`]), so a client reading the text sees which id it was.
+pub fn invalid_verified_access_group_id_not_found<E>(group_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_VERIFIED_ACCESS_GROUP_ID_NOT_FOUND,
+        400,
+        format!("The verified-access-group ID '{group_id}' does not exist"),
+    )
+}
+
+/// Refuse a request that named a Verified Access endpoint id this account holds no endpoint
+/// for: HTTP 400 [`INVALID_VERIFIED_ACCESS_ENDPOINT_ID_NOT_FOUND`], worded like
+/// [`invalid_verified_access_group_id_not_found`].
+pub fn invalid_verified_access_endpoint_id_not_found<E>(
+    endpoint_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_VERIFIED_ACCESS_ENDPOINT_ID_NOT_FOUND,
+        400,
+        format!("The verified-access-endpoint ID '{endpoint_id}' does not exist"),
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_VERIFIED_ACCESS_ENDPOINTS`]: HTTP
+/// 400 [`VERIFIED_ACCESS_ENDPOINT_LIMIT_EXCEEDED`].
+pub fn verified_access_endpoint_limit_exceeded<E>(
+    message: impl Into<String>,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        VERIFIED_ACCESS_ENDPOINT_LIMIT_EXCEEDED,
+        400,
+        message,
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Store `group` under a freshly minted `VerifiedAccessGroupId`, derive the members the
+    /// SERVICE owns on it — the id, the ARN that id and `region` build
+    /// ([`verified_access_group_arn`]) and the owning account — charge the caller-chosen
+    /// bytes it retains against the store's byte budget, and answer the id it was given.
+    ///
+    /// The one way a group is stored, so two writers cannot report one group differently.
+    /// `CreateVerifiedAccessGroup` is still a scaffold stub with its own open issue; this
+    /// seam is what it will call, and what a test seeds a group through, exactly as
+    /// [`Self::insert_network_interface`] stands ahead of `CreateNetworkInterface`.
+    pub fn insert_verified_access_group(
+        &mut self,
+        mut group: crate::ops::types::VerifiedAccessGroup,
+        region: &str,
+    ) -> String {
+        let group_id = self.next_id(VERIFIED_ACCESS_GROUP_ID_PREFIX);
+        group.verified_access_group_id = Some(group_id.clone());
+        group.verified_access_group_arn = Some(verified_access_group_arn(region, &group_id));
+        group.owner = Some(::engine::emulator_account_id().to_string());
+        self.add_stored_bytes(verified_access_group_payload_bytes(&group));
+        self.verified_access_groups.insert(group_id.clone(), group);
+        group_id
+    }
+
+    /// Whether another Verified Access endpoint fits inside the store's ceiling
+    /// ([`MAX_VERIFIED_ACCESS_ENDPOINTS`]).
+    ///
+    /// The same contract as [`Self::has_verified_access_trust_provider_capacity`]: a create
+    /// asks first and refuses with [`verified_access_endpoint_limit_exceeded`] when it
+    /// answers `false`.
+    pub fn has_verified_access_endpoint_capacity(&self) -> bool {
+        self.verified_access_endpoints.len() < MAX_VERIFIED_ACCESS_ENDPOINTS
+    }
+
+    /// Store `record` under a freshly minted `VerifiedAccessEndpointId`, write that id and
+    /// the endpoint domain it names onto the record, charge the caller-chosen bytes it and
+    /// `client_token` retain against the store's byte budget, and answer the id.
+    ///
+    /// The id is minted HERE rather than by the writer, so an endpoint never shares an id
+    /// with another resource of this store, and the generated endpoint domain is built from
+    /// that id here too ([`verified_access_endpoint_domain`]) so the two cannot disagree —
+    /// `domain_prefix` is the request's `EndpointDomainPrefix` and `region` the Region it was
+    /// signed for. The charge happens at the insert the way
+    /// [`Self::insert_verified_access_trust_provider`] charges a trust provider's, so no path
+    /// can store those bytes uncharged, and it is the SAME figure
+    /// [`verified_access_endpoint_payload_bytes`] gives the create's pre-check — the prefix is
+    /// charged, the derived rest of the domain is bounded — so a create still asks
+    /// [`Self::has_verified_access_endpoint_capacity`] and
+    /// [`Self::would_exceed_stored_bytes`] first and cannot overshoot either ceiling.
+    pub fn insert_verified_access_endpoint(
+        &mut self,
+        mut record: VerifiedAccessEndpointRecord,
+        domain_prefix: Option<&str>,
+        region: &str,
+        client_token: Option<&str>,
+    ) -> String {
+        let endpoint_id = self.next_id(VERIFIED_ACCESS_ENDPOINT_ID_PREFIX);
+        record.view.verified_access_endpoint_id = Some(endpoint_id.clone());
+        record.view.endpoint_domain = Some(verified_access_endpoint_domain(
+            domain_prefix,
+            &endpoint_id,
+            region,
+        ));
+        self.add_stored_bytes(verified_access_endpoint_payload_bytes(
+            &record,
+            domain_prefix,
+            client_token,
+        ));
+        if let Some(token) = client_token {
+            self.verified_access_endpoint_client_tokens
+                .insert(token.to_string(), endpoint_id.clone());
+        }
+        self.verified_access_endpoints
+            .insert(endpoint_id.clone(), record);
+        endpoint_id
     }
 }
 

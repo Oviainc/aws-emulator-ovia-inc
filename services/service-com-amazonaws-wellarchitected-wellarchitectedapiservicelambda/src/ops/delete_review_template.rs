@@ -6,7 +6,9 @@
 //! empty 200. The template is resolved against the one store every review-template
 //! operation shares (`crate::state::…State::review_templates`), so an ARN naming no
 //! stored template is a 404 `ResourceNotFoundException` — and so is a `GetReviewTemplate`
-//! of a template this operation has deleted.
+//! of a template this operation has deleted. The `@idempotencyToken` is honoured: a RETRY
+//! — the same `ClientRequestToken` naming the same ARN — replays the original request's
+//! empty 200 rather than reporting the ARN it dropped as absent.
 //!
 //! ## Shape of an operation
 //!
@@ -186,13 +188,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // `ClientRequestToken` is accepted (the model requires it) but nothing is keyed to
-        // it, exactly as `DeleteWorkload` treats its own: a delete records no resource for
-        // a replay to return, and once the template is gone its ARN resolves to nothing, so
-        // a repeat delete is the same 404 any other unknown ARN gets.
-        let _ = &input.client_request_token;
+        // `ClientRequestToken` is `@idempotencyToken`, and the rule it documents holds for
+        // a delete exactly as it does for `DeleteWorkload`: a retry under the same token
+        // and the same parameters, after the original request completed successfully,
+        // replays that request's result. The only parameter besides the token is the ARN
+        // the request names, so the fingerprint is over that.
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "TemplateArn": &input.template_arn,
+        }));
 
         let mut store = state.lock();
+
+        // Read before the ARN is resolved: the original request dropped the template, so
+        // the ARN no longer resolves and only the recorded delete can answer the retry.
+        match crate::state::delete_replay(
+            &store.delete_review_template_tokens,
+            &input.client_request_token,
+            crate::state::REVIEW_TEMPLATE_RESOURCE_TYPE,
+            &fingerprint,
+        ) {
+            crate::state::DeleteReplay::Replay => return Ok(DeleteReviewTemplateOutput),
+            crate::state::DeleteReplay::Conflict(exception) => {
+                return Err(DeleteReviewTemplateErrorModeled::ConflictException(exception).into())
+            }
+            crate::state::DeleteReplay::Fresh => {}
+        }
 
         // "Only the owner of a review template can delete it" (this operation's doc). This
         // emulator serves ONE account, and that account owns every template it stores —
@@ -205,6 +225,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // Recorded only now the delete has COMPLETED SUCCESSFULLY: a refused request has
+        // no result to replay, so the token it carried is still free.
+        store.delete_review_template_tokens.remember(
+            input.client_request_token,
+            crate::state::CompletedDeleteToken {
+                resource_id: input.template_arn,
+                fingerprint,
+            },
+        );
 
         Ok(DeleteReviewTemplateOutput)
     }

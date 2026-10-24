@@ -1235,6 +1235,69 @@ impl<Token> TokenLedger<Token> {
     }
 }
 
+/// What a COMPLETED delete's `ClientRequestToken` resolves to: the resource the original
+/// request removed, plus a fingerprint of that request's parameters so a token spent on a
+/// DIFFERENT request can be told apart from a genuine retry.
+///
+/// A delete is the one idempotent shape whose resource is GONE by the time a retry
+/// arrives, so the ledger entry — not the resource — is what the replay is served from:
+/// there is nothing left to project, only the record that this exact request has already
+/// executed once. That is why ONE record type serves every delete this service models,
+/// where each create carries its own (its replay has to answer the created resource's
+/// identifiers).
+#[derive(Debug, Clone)]
+pub struct CompletedDeleteToken {
+    /// The identifier the original request named — the id or ARN of the resource it
+    /// deleted — so a token spent on another request can report what it already resolved
+    /// to.
+    pub resource_id: String,
+    /// [`parameter_fingerprint`] of the original request's parameters.
+    pub fingerprint: String,
+}
+
+/// What a delete carrying a `ClientRequestToken` must do, before it resolves its target.
+#[derive(Debug)]
+pub enum DeleteReplay {
+    /// The ledger does not remember the token: this is a new request, so run the delete.
+    Fresh,
+    /// The token names THIS request, which already completed successfully: answer its
+    /// result again rather than resolving a resource the original request removed.
+    Replay,
+    /// The token was already spent on a request with different parameters, so this one
+    /// cannot be the same request: refuse with the modelled conflict.
+    Conflict(ConflictException),
+}
+
+/// How a delete carrying `client_request_token` must proceed, read off `ledger` — the
+/// ledger of deletes of this kind that have already completed.
+///
+/// This is the `@idempotencyToken` rule the `ClientRequestToken` shape documents, applied
+/// to a delete: a retry with the same token and the same parameters, after the original
+/// request completed successfully, is answered with the original request's result. A
+/// delete's result is its empty success, so a caller that resolves this to
+/// [`DeleteReplay::Replay`] answers that success without touching the store — the retry
+/// must not be a not-found just because the original request did its job.
+///
+/// `resource_type` and the ledger entry's [`CompletedDeleteToken::resource_id`] are what
+/// the conflict names, so a token reused for another target says which resource it was
+/// already spent on.
+pub fn delete_replay(
+    ledger: &TokenLedger<CompletedDeleteToken>,
+    client_request_token: &str,
+    resource_type: &str,
+    fingerprint: &str,
+) -> DeleteReplay {
+    match ledger.get(client_request_token) {
+        None => DeleteReplay::Fresh,
+        Some(spent) if spent.fingerprint == fingerprint => DeleteReplay::Replay,
+        Some(spent) => DeleteReplay::Conflict(idempotency_token_conflict(
+            resource_type,
+            spent.resource_id.clone(),
+            client_request_token,
+        )),
+    }
+}
+
 /// The most tags one resource carries: `TagMap` is `@length(min: 1, max: 50)` wherever a
 /// request supplies one (`smithy_query(query="operation", operation="ImportLens")`), so
 /// 50 is the most a stored resource can hold too.
@@ -3605,6 +3668,16 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `CreateWorkload`'s `ClientRequestToken` -> what the original request created.
     /// Caller input keys it, so it is a BOUNDED [`TokenLedger`].
     pub create_workload_tokens: TokenLedger<CreateWorkloadToken>,
+    /// `DeleteWorkload`'s `ClientRequestToken` -> the delete the original request
+    /// completed ([`delete_replay`]), so a retry carrying it replays that success instead
+    /// of resolving an id the original request removed.
+    ///
+    /// It deliberately OUTLIVES the workload it names — that is the whole point of it,
+    /// and why [`Self::remove_workload`] (which drops the ledgers that resolve to a live
+    /// workload) leaves it alone. Nothing a live resource bounds it, so the
+    /// [`TokenLedger`]'s own ceiling ([`MAX_REMEMBERED_REQUEST_TOKENS`]) is what does:
+    /// write it through [`TokenLedger::remember`].
+    pub delete_workload_tokens: TokenLedger<CompletedDeleteToken>,
     /// Every stored review template, keyed by its `TemplateArn` — the only identifier
     /// the modelled operations take for one (`GetReviewTemplate`,
     /// `UpdateReviewTemplate` and `DeleteReviewTemplate` all bind `TemplateArn` as the
@@ -3613,6 +3686,10 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `CreateReviewTemplate`'s `ClientRequestToken` -> what the original request
     /// created. Caller input keys it, so it is a BOUNDED [`TokenLedger`].
     pub create_review_template_tokens: TokenLedger<CreateReviewTemplateToken>,
+    /// `DeleteReviewTemplate`'s `ClientRequestToken` -> the delete the original request
+    /// completed, held exactly as [`Self::delete_workload_tokens`] is and for the same
+    /// reason: the deleted template cannot serve the replay, so the completed delete does.
+    pub delete_review_template_tokens: TokenLedger<CompletedDeleteToken>,
     /// Every stored Well-Architected Tool profile, keyed by its `ProfileArn` — the only
     /// identifier the modelled profile operations take for one (`GetProfile`,
     /// `UpdateProfile`, `DeleteProfile` and every `/profiles/{ProfileArn}` route bind it
@@ -4169,6 +4246,10 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
 
     /// Drop a workload and everything keyed to it: the name that reserved uniqueness
     /// and any create token that resolved to it.
+    ///
+    /// [`Self::delete_workload_tokens`] is NOT among them: a token that names the delete
+    /// itself has to survive the resource the delete removed, or the retry it was issued
+    /// for could not be replayed.
     pub fn remove_workload(&mut self, workload_id: &str) -> Option<WorkloadRecord> {
         let record = self.workloads.remove(workload_id)?;
         self.workload_name_index

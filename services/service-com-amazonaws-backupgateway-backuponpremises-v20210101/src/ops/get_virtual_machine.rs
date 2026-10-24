@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetVirtualMachine
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetVirtualMachine`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetVirtualMachine::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns the virtual machine an ARN names, built from the record persisted in
+//! [`crate::state`] — the same record `ListVirtualMachines` pages over, plus the VMware
+//! tags only a read of a single machine reports. `@readonly`: it writes nothing, and a
+//! machine reaches the store as part of a hypervisor's inventory
+//! ([`crate::state::ComAmazonawsBackupgatewayBackuponpremisesV20210101State::record_virtual_machine`]),
+//! never through a read, so an ARN the store holds no machine under is refused rather
+//! than minting one. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -81,10 +79,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupgateway-backuponp
 // here — hence the `GetVirtualMachineError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupgateway#GetVirtualMachine")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupgateway#GetVirtualMachine",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetVirtualMachineErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -138,18 +140,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetVirtualMachine` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetVirtualMachineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetVirtualMachine"))
+        // Request metadata only; the store is reached through `self.engine`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetVirtualMachineErrorModeled::InternalServerException(InternalServerException {
+                error_code: None,
+                message: Some("Backup gateway state is unavailable on this engine.".to_string()),
+            })
+        })?;
+        let state = state.lock();
+
+        // `ResourceArn`'s length and pattern are refused by the boundary validator before
+        // `handle` runs, so reaching here means the ARN is well formed; whether it names a
+        // virtual machine is a fact of the STORE, which is what this lookup asks.
+        let Some(machine) = state.virtual_machine(&input.resource_arn) else {
+            // This operation resolves exactly one resource type, so an ARN it cannot
+            // resolve is a missing VIRTUAL MACHINE whatever else the ARN spells — and
+            // this service answers that with the modelled `ResourceNotFoundException` at
+            // the HTTP 404 its `@httpError` declares, stating no `ErrorCode`
+            // (`crate::state::MissingResource::Other`), the one place the status and the
+            // code are chosen together. Deliberately NOT
+            // `crate::state::MissingResource::for_arn`, which reads the refusal off the
+            // ARN's resource type: that is for the tagging operations, which take any of
+            // this service's resources in one member and so have to tell them apart. Here
+            // the resource that is missing is the virtual machine the caller asked for,
+            // whatever type the ARN happens to spell.
+            let missing = crate::state::MissingResource::Other;
+            let error = GetVirtualMachineErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    error_code: missing.error_code().map(str::to_string),
+                    message: Some(missing.message(&input.resource_arn)),
+                },
+            );
+            return Err(match missing.status_override() {
+                Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
+                None => error.into(),
+            });
+        };
+
+        // Every member comes out of the stored record, through the same helper the
+        // listing's summary is built from, so a read of one machine and a listing that
+        // holds it cannot disagree about it.
+        Ok(GetVirtualMachineOutput {
+            virtual_machine: Some(machine.details()),
+        })
     }
 }

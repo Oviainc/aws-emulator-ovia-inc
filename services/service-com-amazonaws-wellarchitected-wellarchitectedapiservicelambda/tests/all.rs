@@ -32,6 +32,9 @@ mod custom_lens_import;
 #[path = "all/custom_lens_versions.rs"]
 mod custom_lens_versions;
 
+#[path = "all/delete_idempotency.rs"]
+mod delete_idempotency;
+
 #[path = "all/get_agent_profile.rs"]
 mod get_agent_profile;
 

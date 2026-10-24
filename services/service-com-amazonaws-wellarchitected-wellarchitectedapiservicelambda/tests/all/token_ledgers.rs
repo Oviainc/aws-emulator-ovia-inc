@@ -134,6 +134,26 @@ async fn every_caller_keyed_token_ledger_stays_within_its_ceiling() {
             fingerprint: format!("fingerprint-{index}"),
         },
     );
+    // The DELETE ledgers: a completed delete has no live resource to bound it, so the
+    // ledger's own ceiling is the only thing that does.
+    assert_bounded(
+        "delete-workload",
+        &mut store.delete_workload_tokens,
+        |index| state::CompletedDeleteToken {
+            resource_id: format!("{index:032x}"),
+            fingerprint: format!("fingerprint-{index}"),
+        },
+    );
+    assert_bounded(
+        "delete-review-template",
+        &mut store.delete_review_template_tokens,
+        |index| state::CompletedDeleteToken {
+            resource_id: format!(
+                "arn:aws:wellarchitected:us-west-2:000000000000:review-template/{index:032x}"
+            ),
+            fingerprint: format!("fingerprint-{index}"),
+        },
+    );
     assert_bounded("import-lens", &mut store.import_lens_tokens, |index| {
         state::ImportLensToken {
             lens_id: format!("{index:032x}"),

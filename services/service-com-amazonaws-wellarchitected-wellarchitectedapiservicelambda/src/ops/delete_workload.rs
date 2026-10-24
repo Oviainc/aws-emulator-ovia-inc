@@ -2,10 +2,13 @@
 
 //! @op DeleteWorkload
 //! IMPLEMENTED: removes the stored workload and everything keyed to it — its name
-//! reservation, its create tokens and its milestones — so a later `GetWorkload` or
-//! `DeleteWorkload` for that id answers `ResourceNotFoundException` (404) and
-//! `ListWorkloads` no longer enumerates it. An id that does not satisfy the modelled
-//! `WorkloadId` pattern is resolved by the same lookup, so it is a 404 too.
+//! reservation, its create tokens and its milestones — so a later `GetWorkload` answers
+//! `ResourceNotFoundException` (404) and `ListWorkloads` no longer enumerates it. An id
+//! that does not satisfy the modelled `WorkloadId` pattern is resolved by the same lookup,
+//! so it is a 404 too. The `@idempotencyToken` is honoured: a RETRY — the same
+//! `ClientRequestToken` naming the same workload — replays the original request's empty
+//! 200 rather than reporting the id it removed as absent, while a delete under a token
+//! this service has not spent resolves the id and is a 404 when nothing carries it.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +183,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // `ClientRequestToken` is accepted (the model requires it) but nothing is keyed to
-        // it: only the owner's workload exists to delete, and once it is gone the id
-        // resolves to nothing, so a repeat delete is a 404 rather than a replayed 200.
-        let _ = &input.client_request_token;
+        // `ClientRequestToken` is `@idempotencyToken`: "If you retry a request with the
+        // same client request token and the same parameters after the original request has
+        // completed successfully, the result of the original request is returned"
+        // (`smithy_query(query="shape", shape="ClientRequestToken")`). The only parameter
+        // a delete carries besides the token is the target it names, so the fingerprint is
+        // over that — two deletes of DIFFERENT workloads are different requests, however
+        // they are tokened.
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "WorkloadId": &input.workload_id,
+        }));
 
         let mut store = state.lock();
+
+        // Resolved from the ledger BEFORE the id is: the original request removed the
+        // workload, so the id no longer resolves and only the recorded delete can answer
+        // the retry. That is what keeps an SDK or at-least-once retry of a delete that
+        // succeeded from being reported as a not-found.
+        match crate::state::delete_replay(
+            &store.delete_workload_tokens,
+            &input.client_request_token,
+            crate::state::WORKLOAD_RESOURCE_TYPE,
+            &fingerprint,
+        ) {
+            crate::state::DeleteReplay::Replay => return Ok(DeleteWorkloadOutput),
+            crate::state::DeleteReplay::Conflict(exception) => {
+                return Err(DeleteWorkloadErrorModeled::ConflictException(exception).into())
+            }
+            crate::state::DeleteReplay::Fresh => {}
+        }
+
         if store.remove_workload(&input.workload_id).is_none() {
             return Err(DeleteWorkloadErrorModeled::ResourceNotFoundException(
                 crate::state::workload_not_found(&input.workload_id),
             )
             .into());
         }
+
+        // Recorded only now the delete has COMPLETED SUCCESSFULLY, which is the condition
+        // the documented rule names: a request that was refused has no result to replay,
+        // so a token spent on one is still free. Written through the ledger's bounded
+        // `remember`, because the token is caller-chosen.
+        store.delete_workload_tokens.remember(
+            input.client_request_token,
+            crate::state::CompletedDeleteToken {
+                resource_id: input.workload_id,
+                fingerprint,
+            },
+        );
 
         Ok(DeleteWorkloadOutput)
     }

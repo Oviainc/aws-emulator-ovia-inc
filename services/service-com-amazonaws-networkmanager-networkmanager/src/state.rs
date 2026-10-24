@@ -115,6 +115,15 @@ pub const CORE_NETWORK_POLICY_KIND: &str = "core-network-policy";
 /// the ARN resource type and the network-resource inventory.
 pub const ATTACHMENT_KIND: &str = "attachment";
 
+/// The state an attachment is in while a CHANGE to one that already exists is in flight,
+/// as against the [`STATE_CREATING`] of one whose creation is.
+///
+/// `AttachmentState` carries both (`smithy_query shape=AttachmentState`, mirrored in
+/// `ops::types::ATTACHMENT_STATE_VALUES`), so an accepted `UpdateVpcAttachment` reports
+/// `UPDATING` until the transition the clock owes falls due and [`STATE_AVAILABLE`] after
+/// it. See [`AttachmentRecord::state_at`].
+pub const ATTACHMENT_STATE_UPDATING: &str = "UPDATING";
+
 /// The three `AttachmentType`s this service mints, of the five the model enumerates
 /// (CONNECT, DIRECT_CONNECT_GATEWAY, SITE_TO_SITE_VPN, TRANSIT_GATEWAY_ROUTE_TABLE, VPC:
 /// `smithy_query shape=AttachmentType`, mirrored in `ops::types::ATTACHMENT_TYPE_VALUES`).
@@ -200,6 +209,10 @@ pub const FIELD_EDGE_LOCATION: &str = "edgeLocation";
 pub const FIELD_VPC_ARN: &str = "vpcArn";
 /// See [`FIELD_CORE_NETWORK_ID`].
 pub const FIELD_SUBNET_ARNS: &str = "subnetArns";
+/// See [`FIELD_CORE_NETWORK_ID`]: the two lists an update of a VPC attachment carries.
+pub const FIELD_ADD_SUBNET_ARNS: &str = "addSubnetArns";
+/// See [`FIELD_CORE_NETWORK_ID`].
+pub const FIELD_REMOVE_SUBNET_ARNS: &str = "removeSubnetArns";
 /// See [`FIELD_CORE_NETWORK_ID`].
 pub const FIELD_VPN_CONNECTION_ARN: &str = "vpnConnectionArn";
 /// See [`FIELD_GLOBAL_NETWORK_ID`]: the same lowerCamelCase spelling of the request
@@ -1125,6 +1138,102 @@ impl CoreNetworkRecord {
     }
 }
 
+/// How many subnet ARNs one VPC attachment may hold.
+///
+/// Cloud WAN attaches a VPC through its subnets, one per Availability Zone, and no Region
+/// offers more than a handful, so — like [`MAX_ATTACHMENTS_PER_CORE_NETWORK`] — this bound
+/// is CHOSEN: the model carries no number and neither the create nor the update of a VPC
+/// attachment models a quota error (`smithy_query query="operation"
+/// operation="CreateVpcAttachment,UpdateVpcAttachment"`), so its only purpose is that no
+/// caller can grow one attachment's subnet list without end. A request that would push the
+/// list past it is refused with the modelled `ValidationException` naming the member that
+/// asked, and stores nothing.
+pub const MAX_SUBNETS_PER_VPC_ATTACHMENT: usize = 50;
+
+/// Refuse a subnet list that would leave a VPC attachment holding more than `limit`
+/// subnets.
+///
+/// `length` is how many the attachment would be left holding, so this is called on the
+/// list the attachment WOULD hold (a create's `SubnetArns`, the list an update composes) —
+/// never on a removal, which cannot grow it. `limit` is
+/// [`MAX_SUBNETS_PER_VPC_ATTACHMENT`], except where an attachment already holds more than
+/// that: an update may then still change it, but never grow it (see
+/// `UpdateVpcAttachment`), so the limit applied is the one the message reports.
+pub fn check_subnet_count(
+    member: &str,
+    length: usize,
+    limit: usize,
+) -> Result<(), ValidationException> {
+    if length > limit {
+        return Err(field_rejection(
+            member,
+            VALIDATION_REASON_OTHER,
+            format!("a VPC attachment holds at most {limit} subnets, but the request would leave {length}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Check a subnet-ARN list a request carries for a VPC attachment.
+///
+/// The LENGTH is judged FIRST, before any walk of the list: `SubnetArnList` carries no
+/// modelled `@length` (`smithy_query shape=SubnetArnList` constrains the member string
+/// only), so a caller chooses how long it is, and no per-entry work is done on a list that
+/// is already too long to be accepted. `limit` is [`MAX_SUBNETS_PER_VPC_ATTACHMENT`],
+/// except where an attachment already holds more than that: an update may then still
+/// change it, but never grow it (see `UpdateVpcAttachment`).
+///
+/// Then every entry must name a subnet the VPC could hold — one in the VPC's own Region,
+/// which is the attachment's edge location — and no entry may repeat, since a subnet is
+/// attached once or not at all. The modelled `SubnetArn` admits the EMPTY string as well
+/// (`^arn:…:subnet\/subnet-[0-9a-f]{8,17}$|^$`, `smithy_query shape=SubnetArn`), which
+/// names no subnet and so names no Region; it is refused by the same check. Membership is
+/// tested through a set built once, so a list at the bound costs O(n log n).
+///
+/// What the attachment would be LEFT holding is the separate rule
+/// [`check_subnet_count`]: this one judges the list as the request carried it.
+///
+/// Shared by `CreateVpcAttachment` and `UpdateVpcAttachment`, so ONE function owns the
+/// rule and the two cannot judge a subnet list differently; each passes the member of its
+/// own request that carried the list.
+pub fn check_subnet_list(
+    member: &str,
+    edge_location: &str,
+    requested: &[String],
+    limit: usize,
+) -> Result<(), ValidationException> {
+    if requested.len() > limit {
+        return Err(field_rejection(
+            member,
+            VALIDATION_REASON_OTHER,
+            format!(
+                "at most {limit} subnet ARNs may be named, but {} were",
+                requested.len()
+            ),
+        ));
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for subnet_arn in requested {
+        if ec2_arn_region(subnet_arn) != Some(edge_location) {
+            return Err(field_rejection(
+                member,
+                VALIDATION_REASON_OTHER,
+                format!(
+                    "subnet {subnet_arn} is not in {edge_location}, the Region of the VPC it must belong to"
+                ),
+            ));
+        }
+        if !seen.insert(subnet_arn.as_str()) {
+            return Err(field_rejection(
+                member,
+                VALIDATION_REASON_OTHER,
+                format!("subnet {subnet_arn} is named more than once"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A telemetry-bearing network resource of one global network: a connection registered
 /// with the global network whose session health `GetNetworkTelemetry` reports.
 ///
@@ -1276,6 +1385,11 @@ pub struct AttachmentRecord {
     /// last changed before the transition above falls due. `None` for an attachment no rule
     /// asked acceptance for, which never waited for one.
     pub accepted_at: Option<SystemTime>,
+    /// The instant a CHANGE to this attachment was last requested — what
+    /// `UpdateVpcAttachment` records — or `None` for one nothing has changed since it was
+    /// created. What [`Self::state_at`] tells a creation in flight from a change in flight
+    /// by, and what [`Self::updated_at`] reports until the transition falls due.
+    pub changed_at: Option<SystemTime>,
     /// The `attachment-policies` rule of the core network policy in force that claimed this
     /// attachment, and what that rule put the attachment in: the
     /// `Attachment$AttachmentPolicyRuleNumber`, `Attachment$SegmentName` and
@@ -1330,11 +1444,16 @@ impl AttachmentRecord {
     /// waits in [`STATE_CREATING`] until the transition the clock owes falls due and is
     /// [`STATE_AVAILABLE`] after it. An attachment the policy in force asked acceptance for
     /// waits in [`STATE_PENDING_ATTACHMENT_ACCEPTANCE`] INSTEAD, and the clock never moves
-    /// it: only [`Self::accept_at`] does, after which the span above starts.
+    /// it: only [`Self::accept_at`] does, after which the span above starts. A CHANGE to an
+    /// attachment that is already there owes the same transition from
+    /// [`ATTACHMENT_STATE_UPDATING`], which is why the state before the due instant depends
+    /// on whether anything has changed the attachment since it was created
+    /// ([`Self::changed_at`]).
     pub fn state_at(&self, now: SystemTime) -> &'static str {
         match self.available_at {
             None => STATE_PENDING_ATTACHMENT_ACCEPTANCE,
             Some(available_at) if now >= available_at => STATE_AVAILABLE,
+            Some(_) if self.changed_at.is_some() => ATTACHMENT_STATE_UPDATING,
             Some(_) => STATE_CREATING,
         }
     }
@@ -1359,13 +1478,16 @@ impl AttachmentRecord {
     }
 
     /// When this attachment last changed, as of `now`: the create, the acceptance that
-    /// started it, or the `CREATING` -> `AVAILABLE` transition once that has fallen due.
-    /// DERIVED from the stored instants, so a read reports a current `UpdatedAt` without
-    /// writing one.
+    /// started it, the change an update requested, or the transition to `AVAILABLE` once
+    /// that has fallen due. DERIVED from the stored instants, so a read reports a current
+    /// `UpdatedAt` without writing one.
     pub fn updated_at(&self, now: SystemTime) -> SystemTime {
         match self.available_at {
             Some(available_at) if now >= available_at => available_at,
-            _ => self.accepted_at.unwrap_or(self.created_at),
+            _ => self
+                .changed_at
+                .or(self.accepted_at)
+                .unwrap_or(self.created_at),
         }
     }
 

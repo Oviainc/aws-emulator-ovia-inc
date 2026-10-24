@@ -1723,7 +1723,7 @@ impl ::std::fmt::Debug for PoolSigningKey {
 
 impl PoolSigningKey {
     /// A freshly generated key pair, drawn from the operating system's CSPRNG
-    /// (`rand`'s thread-local generator, seeded from the OS).
+    /// (`Generate::generate`, which `p256` fills from `getrandom`).
     ///
     /// One scalar multiplication, so this is microseconds of work: a pool mints
     /// its key when the pool is created and no request path ever generates one.
