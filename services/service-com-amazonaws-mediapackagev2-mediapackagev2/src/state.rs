@@ -16,11 +16,12 @@
 //! ordered map makes that order a property of the store rather than of each read.
 //!
 //! The same holds for the members the SERVICE applies rather than the caller: a channel's
-//! switching and CMSD-header blocks, an origin endpoint's segment settings, startover
-//! window and URI/stream-name modes, and every manifest configuration's window, URI path
-//! type and child-manifest URL encoding are materialised ONCE, at create time, from the
-//! submitted value or the service's default, and stored — so the create response, a later
-//! read and the list projection all report the same concrete value.
+//! input type and output locking mode, its switching and CMSD-header blocks, an origin
+//! endpoint's segment settings, startover window and URI/stream-name modes, and every
+//! manifest configuration's window, URI path type and child-manifest URL encoding are
+//! materialised ONCE, at create time, from the submitted value or the service's default,
+//! and stored — so the create response, a later read and the list projection all report
+//! the same concrete value.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -51,6 +52,11 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// The `InputType` a channel is created with when the request omits it: the model's
 /// `InputType` doc says "If unprovided, the value defaults to HLS".
 pub const DEFAULT_INPUT_TYPE: &str = "HLS";
+
+/// The `OutputLockingMode` a channel is created with when the request omits it and the
+/// channel's input type may carry the member at all: the model's `OutputLockingMode` doc
+/// says "If you don't specify a value, the default is EPOCH_LOCKED".
+pub const DEFAULT_OUTPUT_LOCKING_MODE: &str = "EPOCH_LOCKED";
 
 /// How many ingest endpoints a channel is given. MediaPackage v2 hands every channel a
 /// redundant pair, which is why `IngestEndpoints` is a list rather than a single URL.
@@ -648,7 +654,10 @@ pub struct Channel {
     pub group_name: String,
     pub arn: String,
     pub description: Option<String>,
-    pub input_type: Option<String>,
+    /// Materialised at create time from the submitted value or the service's default, so
+    /// it is never absent: see [`materialized_input_type`]. The input type is immutable,
+    /// so no later write replaces it.
+    pub input_type: String,
     pub ingest_endpoints: Vec<IngestEndpoint>,
     /// Materialised at create time rather than only when the caller sends one: the
     /// service reports a channel's switching state on every projection of it.
@@ -657,6 +666,8 @@ pub struct Channel {
     /// [`Channel::input_switch_configuration`].
     pub output_header_configuration: OutputHeaderConfiguration,
     pub multiview_configuration: Option<MultiviewConfiguration>,
+    /// Materialised at create time on a channel whose input type may carry the member,
+    /// and absent on one that may not: see [`materialized_output_locking_mode`].
     pub output_locking_mode: Option<String>,
     pub created_at: ::aws_smithy_types::DateTime,
     pub modified_at: ::aws_smithy_types::DateTime,
@@ -695,7 +706,7 @@ impl Channel {
         self.etag = etag(&[
             self.arn.clone(),
             self.description.clone().unwrap_or_default(),
-            self.input_type.clone().unwrap_or_default(),
+            self.input_type.clone(),
             self.output_locking_mode.clone().unwrap_or_default(),
             // The APPLIED switching and CMSD-header state is part of the channel's
             // content, so a channel that differs only in it has a different ETag. Each
@@ -950,6 +961,44 @@ pub fn materialized_output_header_configuration(
     let mut configuration = submitted.unwrap_or_default();
     configuration.publish_mqcs = Some(configuration.publish_mqcs.unwrap_or(false));
     configuration
+}
+
+/// The input type a channel is stored with: the one the request named, else the HLS the
+/// model's `InputType` doc declares for an unprovided value ("If unprovided, the value
+/// defaults to HLS").
+///
+/// Materialised rather than held as the raw optional, because the service applies the
+/// default at create time: every projection of a channel — the create response, a later
+/// read, an update's response and the list item — reports a concrete input type.
+pub fn materialized_input_type(submitted: Option<String>) -> String {
+    submitted.unwrap_or_else(|| DEFAULT_INPUT_TYPE.to_string())
+}
+
+/// The output locking mode a channel is stored with.
+///
+/// The model documents a service-applied default for the member ("If you don't specify a
+/// value, the default is `EPOCH_LOCKED`") AND restricts which input types may carry it at
+/// all, so the default is materialised only on a channel whose input type may carry it; a
+/// channel that may not has no mode and reports none. The restriction is read off the
+/// same table a SUBMITTED mode is refused by ([`channel_input_type_violation`]), so a
+/// stored mode and a refused one can never disagree about which input types carry the
+/// member.
+pub fn materialized_output_locking_mode(
+    submitted: Option<String>,
+    input_type: &str,
+) -> Option<String> {
+    if channel_input_type_violation(
+        SubmittedChannelMembers {
+            output_locking_mode: true,
+            ..SubmittedChannelMembers::default()
+        },
+        input_type,
+    )
+    .is_some()
+    {
+        return None;
+    }
+    Some(submitted.unwrap_or_else(|| DEFAULT_OUTPUT_LOCKING_MODE.to_string()))
 }
 
 /// The segment configuration an origin endpoint is stored with.

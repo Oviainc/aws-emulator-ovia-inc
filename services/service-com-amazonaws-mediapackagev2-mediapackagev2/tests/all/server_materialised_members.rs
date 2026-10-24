@@ -111,6 +111,103 @@ fn channel_cases() -> Vec<Case> {
     ]
 }
 
+/// Channel rows for the two members whose DEFAULT the model documents: `InputType` ("If
+/// unprovided, the value defaults to HLS") and `OutputLockingMode` ("If you don't specify
+/// a value, the default is `EPOCH_LOCKED`", on a channel whose input type may carry the
+/// member at all).
+///
+/// The `InputType` catalogue is the model's own enum — HLS | CMAF | MULTIVIEW
+/// (`smithy_query(query="shape", shape="InputType,OutputLockingMode")`) — and the rows
+/// cover each of its values, present and absent, against a locking mode that is absent,
+/// the default named explicitly, and the non-default one.
+fn channel_default_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "nothing but a name: no input type, so the service applies its own",
+            body: || json!({}),
+            expected: vec![
+                ("/InputType", json!("HLS")),
+                // An HLS channel may not carry an output locking mode at all, so there is
+                // no mode to default: the member stays absent.
+                ("/OutputLockingMode", Value::Null),
+            ],
+        },
+        Case {
+            label: "a described, tagged channel that still names no input type",
+            body: || json!({"Description": "ingest", "tags": {"team": "video"}}),
+            expected: vec![
+                ("/InputType", json!("HLS")),
+                ("/OutputLockingMode", Value::Null),
+            ],
+        },
+        Case {
+            label: "the default input type named explicitly",
+            body: || json!({"InputType": "HLS"}),
+            expected: vec![
+                ("/InputType", json!("HLS")),
+                ("/OutputLockingMode", Value::Null),
+            ],
+        },
+        Case {
+            label: "CMAF naming no locking mode, so the service applies its own",
+            body: || json!({"InputType": "CMAF"}),
+            expected: vec![
+                ("/InputType", json!("CMAF")),
+                ("/OutputLockingMode", json!("EPOCH_LOCKED")),
+            ],
+        },
+        Case {
+            label: "CMAF naming the default locking mode explicitly",
+            body: || json!({"InputType": "CMAF", "OutputLockingMode": "EPOCH_LOCKED"}),
+            expected: vec![
+                ("/InputType", json!("CMAF")),
+                ("/OutputLockingMode", json!("EPOCH_LOCKED")),
+            ],
+        },
+        Case {
+            label: "CMAF naming the non-default locking mode",
+            body: || json!({"InputType": "CMAF", "OutputLockingMode": "NON_EPOCH_LOCKED"}),
+            expected: vec![
+                ("/InputType", json!("CMAF")),
+                ("/OutputLockingMode", json!("NON_EPOCH_LOCKED")),
+            ],
+        },
+        Case {
+            label: "a multiview channel naming no locking mode",
+            body: || {
+                json!({
+                    "InputType": "MULTIVIEW",
+                    "MultiviewConfiguration": {
+                        "AvailableSources": ["feed-a", "feed-b"],
+                        "AvailableLayouts": ["LAYOUT_2EH"],
+                    },
+                })
+            },
+            expected: vec![
+                ("/InputType", json!("MULTIVIEW")),
+                ("/OutputLockingMode", json!("EPOCH_LOCKED")),
+            ],
+        },
+        Case {
+            label: "a multiview channel naming the non-default locking mode",
+            body: || {
+                json!({
+                    "InputType": "MULTIVIEW",
+                    "OutputLockingMode": "NON_EPOCH_LOCKED",
+                    "MultiviewConfiguration": {
+                        "AvailableSources": ["feed-a"],
+                        "AvailableLayouts": ["LAYOUT_4E"],
+                    },
+                })
+            },
+            expected: vec![
+                ("/InputType", json!("MULTIVIEW")),
+                ("/OutputLockingMode", json!("NON_EPOCH_LOCKED")),
+            ],
+        },
+    ]
+}
+
 /// Origin-endpoint rows.
 ///
 /// The enum catalogues come from the model: `UriSeparator` is UNDERSCORE | HYPHEN,
@@ -399,6 +496,94 @@ async fn an_origin_endpoint_reports_the_settings_the_service_applied() {
                 actual, expected,
                 "case {label:?}: ListOriginEndpoints item {member} expected {expected}, \
                  got {actual}"
+            );
+        }
+    }
+}
+
+/// `GET /channelGroup/{group}/channel` — the `ListChannels` binding from the model's
+/// `http` trait, for the list projection of a channel's materialised members.
+async fn list_channels(emulator: &Emulator, group: &str) -> (u16, Value) {
+    emulator
+        .call(
+            "GET",
+            &format!("/channelGroup/{group}/channel?maxResults=100"),
+            None,
+        )
+        .await
+}
+
+/// RULE — a channel member the model documents a service-applied default for is
+/// materialised ONCE, at create time, from the submitted value or that default, and
+/// stored: every projection of the channel (the create response, a later read, an
+/// update's response and the list item) reports the same concrete value, and reports one
+/// even when the create request named none.
+#[tokio::test]
+async fn a_channel_reports_the_documented_defaults_the_service_applied() {
+    let emulator = Emulator::new();
+
+    for (index, case) in channel_default_cases().into_iter().enumerate() {
+        let label = case.label;
+        let group = format!("default-group-{index}");
+        let channel = format!("default-channel-{index}");
+        let (status, body) = emulator.create_group(&group, json!({})).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: CreateChannelGroup expected 200, got {status} {body}"
+        );
+
+        let (status, created) = emulator
+            .create_channel(&group, &channel, (case.body)())
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: CreateChannel expected 200, got {status} {created}"
+        );
+
+        let (status, read) = emulator.get_channel(&group, &channel).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: GetChannel expected 200, got {status} {read}"
+        );
+
+        // An update names neither member — `InputType` is immutable and
+        // `OutputLockingMode` is not an `UpdateChannel` input at all — so its response
+        // must still report what the create materialised.
+        let (status, updated) = emulator
+            .update_channel(&group, &channel, json!({}), &[])
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: UpdateChannel expected 200, got {status} {updated}"
+        );
+
+        let (status, listed) = list_channels(&emulator, &group).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: ListChannels expected 200, got {status} {listed}"
+        );
+        let item = at(&listed, "/Items/0");
+
+        for (projection, body) in [
+            ("CreateChannel", &created),
+            ("GetChannel", &read),
+            ("UpdateChannel", &updated),
+            ("ListChannels item", &item),
+        ] {
+            for (pointer, expected) in &case.expected {
+                let actual = at(body, pointer);
+                assert_eq!(
+                    &actual, expected,
+                    "case {label:?}: {projection} {pointer} expected {expected}, got {actual}"
+                );
+            }
+            // The input type is on the channel whatever the request said, so no
+            // projection of it may leave the member out.
+            let input_type = at(body, "/InputType");
+            assert!(
+                input_type.is_string(),
+                "case {label:?}: {projection} must report a concrete InputType, got \
+                 {input_type}"
             );
         }
     }

@@ -237,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             reset_at: channel.reset_at,
             description: channel.description.clone(),
             ingest_endpoints: Some(channel.ingest_endpoints.clone()),
-            input_type: channel.input_type.clone(),
+            input_type: Some(channel.input_type.clone()),
             e_tag: Some(channel.etag.clone()),
             tags: Some(channel.tags.clone()),
             input_switch_configuration: Some(channel.input_switch_configuration.clone()),
