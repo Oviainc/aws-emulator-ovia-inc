@@ -242,66 +242,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The marker every token this service mints carries, so a hex string the service
-/// never issued is refused rather than honoured as a resume point.
+/// The marker every token this listing mints carries, so a hex string this service never
+/// issued — or one minted for another collection — is refused rather than honoured as a
+/// resume point. The codec itself is the service's one
+/// ([`crate::state::encode_page_token`]), so every listing's token is built one way.
 const PAGE_TOKEN_MARKER: &str = "ahi-datastores-v1:";
 
 /// The total order the listing walks: creation instant first, id to break a tie — so a
 /// page boundary is stable no matter how the underlying map iterates.
 fn sort_key(datastore: &crate::state::Datastore) -> (u64, u32, &str) {
-    let since_epoch = datastore
-        .created_at
-        .duration_since(::std::time::SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    (
-        since_epoch.as_secs(),
-        since_epoch.subsec_nanos(),
-        datastore.datastore_id.as_str(),
+    crate::state::page_sort_key(datastore.created_at, &datastore.datastore_id)
+}
+
+/// Encode the sort key the next page starts at as this listing's opaque `nextToken`.
+fn encode_page_token(first_of_next_page: &crate::state::Datastore) -> String {
+    crate::state::encode_page_token(
+        PAGE_TOKEN_MARKER,
+        first_of_next_page.created_at,
+        &first_of_next_page.datastore_id,
     )
 }
 
-/// A decoded continuation token: the FULL sort key the next page starts at, so resuming
-/// does not depend on the store that minted it still existing.
-#[derive(Debug)]
-struct PageCursor {
-    created_at_secs: u64,
-    created_at_nanos: u32,
-    datastore_id: String,
-}
-
-impl PageCursor {
-    fn as_key(&self) -> (u64, u32, &str) {
-        (
-            self.created_at_secs,
-            self.created_at_nanos,
-            self.datastore_id.as_str(),
-        )
-    }
-}
-
-/// Encode the sort key the next page starts at as an opaque `nextToken`.
-///
-/// Hex keeps the token inside `NextToken`'s `^\p{ASCII}{0,8192}$` pattern and makes it
-/// plainly not a data store id, so no caller can mistake it for one.
-fn encode_page_token(first_of_next_page: &crate::state::Datastore) -> String {
-    let (secs, nanos, id) = sort_key(first_of_next_page);
-    ::hex::encode(format!("{PAGE_TOKEN_MARKER}{secs}.{nanos}:{id}").as_bytes())
-}
-
-/// Decode a token produced by [`encode_page_token`], or `None` when it was not — a
-/// well-formed hex string without the marker, or with a payload this service would
-/// never mint, is not one.
-fn decode_page_token(token: &str) -> Option<PageCursor> {
-    let bytes = ::hex::decode(token).ok()?;
-    let decoded = String::from_utf8(bytes).ok()?;
-    let payload = decoded.strip_prefix(PAGE_TOKEN_MARKER)?;
-    // `DatastoreId` is `^[0-9a-z]{32}$`, so neither `:` nor `.` can appear in the id and
-    // splitting on the first of each is unambiguous.
-    let (instant, datastore_id) = payload.split_once(':')?;
-    let (secs, nanos) = instant.split_once('.')?;
-    Some(PageCursor {
-        created_at_secs: secs.parse().ok()?,
-        created_at_nanos: nanos.parse().ok()?,
-        datastore_id: datastore_id.to_string(),
-    })
+/// Decode a token produced by [`encode_page_token`], or `None` when it was not one — a
+/// well-formed hex string without this listing's marker, or with a payload this service
+/// would never mint, is not one.
+fn decode_page_token(token: &str) -> Option<crate::state::PageCursor> {
+    crate::state::decode_page_token(PAGE_TOKEN_MARKER, token)
 }
