@@ -115,13 +115,24 @@ pub const ERROR_TYPE_VALIDATION_EXCEPTION: &str = "VALIDATION_EXCEPTION";
 /// [`ERROR_TYPE_VALIDATION_EXCEPTION`].
 pub const ERROR_TYPE_RESOURCE_NOT_FOUND_EXCEPTION: &str = "RESOURCE_NOT_FOUND_EXCEPTION";
 
-/// The largest page any listing returns, and the page size used when the caller names
-/// no `maxResults`.
+/// The largest page any listing returns.
 ///
 /// Both halves of the model agree on this number: `maxResults` carries
 /// `@range(min: 1, max: 250)` on every paginated operation, and each output list
-/// carries `@length(min: 0, max: 250)`.
+/// carries `@length(min: 0, max: 250)`. It bounds an explicit `maxResults`; it is NOT
+/// the size of a page the caller did not size (see [`DEFAULT_PAGE_SIZE`]).
 pub const MAX_PAGE_SIZE: i32 = 250;
+
+/// The page size a listing uses when the caller names no `maxResults`.
+///
+/// Every paginated operation of this service documents its `maxResults` as
+/// "Default: `100`" (`ListTransactionsInput$maxResults`,
+/// `ListTokenBalancesInput$maxResults`, `ListAssetContractsInput$maxResults`,
+/// `ListTransactionEventsInput$maxResults` and
+/// `ListFilteredTransactionEventsInput$maxResults` all carry the same sentence), so an
+/// unsized request pages at 100 and hands back a `nextToken` once more items remain —
+/// the maximum is a ceiling on what the caller may ASK for, not the default.
+pub const DEFAULT_PAGE_SIZE: i32 = 100;
 
 /// The networks this service calls Bitcoin networks.
 ///
@@ -993,7 +1004,8 @@ impl TransactionSelector {
 ///
 /// `all` is every item that matches the request, in the order the response reports
 /// them, paired with the key that identifies the item within the listing. The page holds
-/// at most `max_results` items and carries a token only when further items remain, so a
+/// at most `max_results` items — or, when the caller named none, at most
+/// [`DEFAULT_PAGE_SIZE`] — and carries a token only when further items remain, so a
 /// caller that follows tokens to exhaustion sees every item exactly once. The token
 /// names the first item NOT on the page, which is why resuming is an exact key match
 /// and works for either `sortOrder`.
@@ -1014,8 +1026,8 @@ pub fn page<T>(
     };
     // `maxResults` carries `@range(min: 1, max: 250)`, which this service's own
     // validation has already refused anything outside of
-    // (`validation::max_results`); absent, the page is the modelled maximum.
-    let limit = max_results.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE) as usize;
+    // (`validation::max_results`); absent, the page is the documented default.
+    let limit = max_results.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE) as usize;
 
     let mut rest = all.into_iter().skip(start);
     let items: Vec<T> = rest.by_ref().take(limit).map(|(_, item)| item).collect();

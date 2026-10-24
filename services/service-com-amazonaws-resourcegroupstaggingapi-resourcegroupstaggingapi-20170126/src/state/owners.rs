@@ -17,7 +17,7 @@
 //!
 //! That last part holds only where the owner MODELS the tag set. A resource the
 //! owner resolves but models no tags for ([`Resolution::Present`] with no
-//! `tags`: an EventBridge rule, a Step Functions execution) keeps its tags in
+//! `tags`: a Step Functions execution) keeps its tags in
 //! [`crate::state`]'s own store, which the owner's delete does not reach — so
 //! `GetResources` goes on reporting that ARN until something tags or untags it
 //! again. The alternative, dropping the entry the moment an owner answers
@@ -115,8 +115,9 @@ impl Change<'_> {
     }
 }
 
-/// The per-resource failure for an ARN the owning service holds no resource for:
-/// that service's own error code, with the 400 the tagging API reports for a
+/// The per-resource failure for an ARN the owning service will not tag — one it
+/// holds no resource for, or one it refuses outright: that service's own error
+/// code and its own message, with the 400 the tagging API reports for a
 /// resource-level client fault.
 fn absent(code: &str, message: String) -> Resolution {
     Resolution::Absent(FailureInfo {
@@ -255,6 +256,12 @@ pub fn tagged_resources<Eng: Send + Sync + 'static>(
                 owner_events::state::event_bus_arn(region, &bus.name),
                 plain_tag_pairs(&bus.tags),
             );
+            // A rule's ARN is the one that service MINTED for it, so a rule on
+            // a bus other than the default one is reported under the form that
+            // carries its bus.
+            for rule in bus.rules.values() {
+                record(rule.arn.clone(), plain_tag_pairs(&rule.tags));
+            }
         }
     }
     if let Some(state) = owner_kms::state::service_state(engine) {
@@ -363,64 +370,74 @@ fn ecs<Eng: Send + Sync + 'static>(
     }
 }
 
-/// Amazon EventBridge: an event bus carries its own `tags`; a rule is resolved
-/// but the emulator models no tag set for it, so the tagging store is its home.
+/// Amazon EventBridge: "rules and event buses can be tagged" (`TagResource`),
+/// and that service holds the tag set of BOTH kinds, so those sets are the ones
+/// this API reads and writes.
+///
+/// The ARN is resolved against those records by the EventBridge crate's OWN
+/// resolver ([`owner_events::state::parse_tagged_resource`] plus `tags_of_mut`),
+/// so the kinds this API can tag, the record each ARN resolves to and the
+/// refusal a missing one gets are that service's own — with no second copy of
+/// the resolution, the tags or the wording here to drift from it.
 fn events<Eng: Send + Sync + 'static>(
     engine: &Eng,
     arn: &ParsedArn,
     change: Option<&Change<'_>>,
 ) -> Resolution {
-    use owner_events::ops::types::Tag;
-    use owner_events::state::event_bus_arn;
+    /// One EventBridge tag record from a pair.
+    fn tag(key: &str, value: &str) -> owner_events::ops::types::Tag {
+        owner_events::ops::types::Tag {
+            key: key.to_string(),
+            value: value.to_string(),
+        }
+    }
 
     let Some(state) = owner_events::state::service_state(engine) else {
         return Resolution::Unowned;
     };
+    // An `events` ARN that resolver does not recognise as a taggable resource of
+    // that service at all is NOT a missing resource: it is a request EventBridge
+    // refuses, so the per-resource failure carries that refusal — its own
+    // parameter wording under the `ValidationException` code, which is still
+    // "any valid error code returned by the ... service that hosts the
+    // resource".
+    let resource = match owner_events::state::parse_tagged_resource(&arn.arn) {
+        Ok(resource) => resource,
+        Err(reason) => return absent("ValidationException", reason),
+    };
     let mut state = state.lock();
-    let names: Vec<String> = state.buses.keys().cloned().collect();
-    for name in names {
-        if event_bus_arn(&arn.region, &name) == arn.arn {
-            let bus = state
-                .buses
-                .get_mut(&name)
-                .expect("a bus named by the key just read from the same map");
-            let mut pairs = plain_tag_pairs(&bus.tags);
-            if let Some(change) = change {
-                if let Err(would_hold) = change.apply(&mut pairs) {
-                    return Resolution::TooManyTags(would_hold);
-                }
-                // In place, for the reason `option_tag_list!` gives.
-                match change {
-                    Change::Upsert { tags: upserts, .. } => {
-                        for (key, value) in upserts.iter() {
-                            match bus.tags.iter_mut().find(|tag| &tag.key == key) {
-                                Some(held) => held.value = value.clone(),
-                                None => bus.tags.push(Tag {
-                                    key: key.clone(),
-                                    value: value.clone(),
-                                }),
-                            }
-                        }
+    // A tag write never brings a resource into being, so an ARN that service
+    // holds no record for is a per-resource failure carrying ITS not-found
+    // wording: the rule named together with the event bus it was looked up on,
+    // or the bus named — composed by that service, never assembled here out of
+    // the ARN text.
+    let Some(stored) = state.tags_of_mut(&resource) else {
+        return absent(
+            "ResourceNotFoundException",
+            owner_events::state::no_such_tagged_resource(&resource),
+        );
+    };
+    let mut pairs = plain_tag_pairs(stored);
+    if let Some(change) = change {
+        if let Err(would_hold) = change.apply(&mut pairs) {
+            return Resolution::TooManyTags(would_hold);
+        }
+        // In place, for the reason `option_tag_list!` gives.
+        match change {
+            Change::Upsert { tags: upserts, .. } => {
+                for (key, value) in upserts.iter() {
+                    match stored.iter_mut().find(|held| &held.key == key) {
+                        Some(held) => held.value = value.clone(),
+                        None => stored.push(tag(key, value)),
                     }
-                    Change::Remove(keys) => bus
-                        .tags
-                        .retain(|tag| !keys.iter().any(|removed| removed == &tag.key)),
                 }
             }
-            return Resolution::Present { tags: Some(pairs) };
+            Change::Remove(keys) => {
+                stored.retain(|held| !keys.iter().any(|removed| removed == &held.key))
+            }
         }
     }
-    let holds_rule = state
-        .buses
-        .values()
-        .any(|bus| bus.rules.values().any(|rule| rule.arn == arn.arn));
-    if holds_rule {
-        return Resolution::Present { tags: None };
-    }
-    absent(
-        "ResourceNotFoundException",
-        format!("The specified resource wasn't found: {}", arn.arn),
-    )
+    Resolution::Present { tags: Some(pairs) }
 }
 
 /// Amazon KMS: a customer managed key, whose tags are the key's own.

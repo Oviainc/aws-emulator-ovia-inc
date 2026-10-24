@@ -23,8 +23,7 @@ pub struct StopDeploymentInput {
 /// `StartedAt` and `CompletedAt` target `Iso8601DateTime` (`@timestampFormat("date-time")`),
 /// so this shape's schema and serializer come from `ac_deployment_shape!` rather than from
 /// `#[smithy_macros::smithy(shape = ...)]` — see `types/deployment_wire.rs`, which also
-/// states where the `Type` member below comes from. `StopDeployment` is still a 501 of its
-/// own, so nothing serializes this document yet; it carries the same schema as the
+/// states where the `Type` member below comes from. It carries the same schema as the
 /// `Deployment` documents `StartDeployment` and `GetDeployment` answer because it is the
 /// same shape, and one shape cannot have two wire forms.
 #[derive(Debug, Clone, Default)]

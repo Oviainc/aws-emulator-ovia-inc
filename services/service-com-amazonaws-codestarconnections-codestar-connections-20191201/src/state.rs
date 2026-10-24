@@ -726,6 +726,51 @@ pub fn host_not_found_message(host_arn: &str) -> String {
     format!("No host exists with the ARN: {host_arn}")
 }
 
+/// How this service reports a CONNECTION ARN that resolves to no connection it holds.
+///
+/// A FIXED sentence: the recorded wire answers a connection ARN that names nothing with
+/// this text and does NOT echo the ARN back (corpus `simparity-wire-aws-v1`, fixture
+/// `codestar-connections-connection-error-paths#task#2` and `#task#3`), unlike the host
+/// and repository-link wordings beside it, which name the value they were handed. One
+/// constant, so `GetConnection`, `DeleteConnection` and a tag operation addressing a
+/// connection word the refusal the same way.
+pub const NO_SUCH_CONNECTION_MESSAGE: &str = "No connection exists with the ARN";
+
+/// How this service reports a repository-link ARN that resolves to no link it holds.
+///
+/// The link readers address a link by its `RepositoryLinkId` and word their refusal from
+/// that id ([`repository_link_not_found_message`]); a TAG operation addresses the link by
+/// its ARN, so its refusal names the ARN it was handed, as the host wording does.
+pub fn no_such_repository_link_message(repository_link_arn: &str) -> String {
+    format!("No repository link exists with the ARN: {repository_link_arn}")
+}
+
+/// How this service reports a caller-supplied `ResourceArn` that resolves to no resource
+/// it holds, worded for the KIND of resource the ARN names.
+///
+/// The tag operations take a `ResourceArn` that may address any resource this service
+/// holds (see [`ComAmazonawsCodestarconnectionsCodestarConnections20191201State::holds_resource`]),
+/// so the refusal is selected from the ARN's own resource segment rather than wording
+/// every absence as a connection's: an absent host reads as the host readers word it, an
+/// absent repository link as a link, and anything else — a connection ARN, or an ARN of
+/// another vendor's resource — as the recorded connection sentence.
+pub fn absent_resource_message(resource_arn: &str) -> String {
+    match ::service_common::arn::resource_type(resource_arn) {
+        Some("host") => host_not_found_message(resource_arn),
+        Some("repository-link") => no_such_repository_link_message(resource_arn),
+        _ => NO_SUCH_CONNECTION_MESSAGE.to_string(),
+    }
+}
+
+/// The status this service's recorded wire answers an ARN that resolves to no resource
+/// with: HTTP 400, the awsJson1_0 client-error status, not the `@httpError 404` the
+/// `ResourceNotFoundException` shape declares (the recorded
+/// `codestar-connections-connection-error-paths#task#2` and `#task#3` expectations —
+/// status 400 with `__type` `ResourceNotFoundException`). `GetHost` and the
+/// repository-link operations answer an absent resource the same way, from their own
+/// fixtures. The handler passes this to `crate::scaffolded::Scaffolded::modeled_with_status`.
+pub const RESOURCE_NOT_FOUND_STATUS: u16 = 400;
+
 /// How this service reports a sync blocker the request's (`Id`, `ResourceName`,
 /// `SyncType`) triple does not address — an id never raised, or one raised for another
 /// resource or sync type.

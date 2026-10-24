@@ -39,6 +39,8 @@ mod purchase_order_updates;
 mod refusal_wording;
 #[path = "all/selector_resolution.rs"]
 mod selector_resolution;
+#[path = "all/selector_values.rs"]
+mod selector_values;
 #[path = "all/seller_submitted_request_views.rs"]
 mod seller_submitted_request_views;
 #[path = "all/state_roundtrip.rs"]

@@ -87,6 +87,22 @@ impl Emulator {
             .unwrap_or_default()
             .to_string()
     }
+
+    /// Create a storage configuration and return the ARN the service minted for it — the
+    /// only kind of value `AutoParticipantRecordingConfiguration$storageConfigurationArn`
+    /// can name, since it is a reference to a `StorageConfiguration` of this service.
+    async fn create_storage_configuration(&self, bucket: &str) -> String {
+        let request = json!({ "s3": { "bucketName": bucket }, "name": bucket });
+        let (status, response) = self.call("CreateStorageConfiguration", &request).await;
+        assert_eq!(
+            status, 200,
+            "CreateStorageConfiguration {request}: got {status} {response}"
+        );
+        response["storageConfiguration"]["arn"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
 }
 
 /// The wire error code of a failed call (`__type` in a restJson1 error body).
@@ -440,6 +456,9 @@ async fn attributes_over_one_kilobyte_are_refused() {
 #[tokio::test]
 async fn get_stage_reads_back_what_create_stage_returned() {
     let emulator = Emulator::new();
+    // A recording configuration names a storage configuration of this service, so the
+    // row that attaches one creates it first.
+    let storage = emulator.create_storage_configuration("recordings").await;
     let cases: Vec<(&str, Value)> = vec![
         ("name only", json!({ "name": "demo-stage" })),
         ("no members at all", json!({})),
@@ -452,8 +471,7 @@ async fn get_stage_reads_back_what_create_stage_returned() {
             json!({
                 "name": "recorded",
                 "autoParticipantRecordingConfiguration": {
-                    "storageConfigurationArn":
-                        "arn:aws:ivs:us-east-1:000000000000:storage-configuration/abcd1234",
+                    "storageConfigurationArn": storage.as_str(),
                     "mediaTypes": ["AUDIO_VIDEO"],
                     "recordingReconnectWindowSeconds": 30,
                 },
@@ -918,9 +936,11 @@ async fn create_participant_token_refuses_a_stage_that_does_not_exist() {
 #[tokio::test]
 async fn update_stage_changes_only_the_members_supplied() {
     let emulator = Emulator::new();
+    // The configuration an update attaches names a storage configuration of this
+    // service, so it is created first and the update names the ARN that create minted.
+    let storage = emulator.create_storage_configuration("updates").await;
     let recording = json!({
-        "storageConfigurationArn":
-            "arn:aws:ivs:us-east-1:000000000000:storage-configuration/abcd1234",
+        "storageConfigurationArn": storage.as_str(),
         "mediaTypes": ["AUDIO_ONLY"],
         "recordingReconnectWindowSeconds": 15,
     });
@@ -929,8 +949,7 @@ async fn update_stage_changes_only_the_members_supplied() {
     // `recordParticipantReplicas` carries `@default: false`, so the framework has
     // already materialised `false` by the time the handler sees the request.
     let stored_recording = json!({
-        "storageConfigurationArn":
-            "arn:aws:ivs:us-east-1:000000000000:storage-configuration/abcd1234",
+        "storageConfigurationArn": storage.as_str(),
         "mediaTypes": ["AUDIO_ONLY"],
         "recordingReconnectWindowSeconds": 15,
         "recordParticipantReplicas": false,
@@ -1218,11 +1237,6 @@ async fn the_stores_are_bounded_and_report_the_modeled_quota_error() {
 // The Stage and ParticipantToken projections
 // ---------------------------------------------------------------------------
 
-/// A storage-configuration ARN inside `AutoParticipantRecordingStorageConfigurationArn`'s
-/// pattern, so a row that attaches storage is accepted.
-const STORAGE_CONFIGURATION_ARN: &str =
-    "arn:aws:ivs:us-east-1:000000000000:storage-configuration/abcd1234";
-
 /// Every member of `AutoParticipantRecordingConfiguration` at the default the model
 /// documents for it: what a stage reports when its request configured no storage.
 ///
@@ -1292,11 +1306,14 @@ fn assert_stage_endpoints(case: &str, stage: &Value) {
 #[tokio::test]
 async fn every_stage_projection_carries_endpoints_a_recording_configuration_and_a_session_id() {
     let emulator = Emulator::new();
+    // The row that configures storage names a storage configuration of this service, so
+    // it is created first and the request names the ARN that create minted.
+    let storage = emulator.create_storage_configuration("projections").await;
 
     // Rows differ in which members the creating request supplies, and in whether it
     // configures storage for individual-participant recording.
     let configured = json!({
-        "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+        "storageConfigurationArn": storage.as_str(),
         "mediaTypes": ["AUDIO_ONLY"],
         "recordingReconnectWindowSeconds": 30,
     });
@@ -1334,7 +1351,7 @@ async fn every_stage_projection_carries_endpoints_a_recording_configuration_and_
             "a recording configuration with storage configured",
             json!({ "autoParticipantRecordingConfiguration": configured }),
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "mediaTypes": ["AUDIO_ONLY"],
                 "recordingReconnectWindowSeconds": 30,
                 "recordParticipantReplicas": false,
@@ -1445,6 +1462,9 @@ async fn stage_endpoints_are_assigned_per_stage_and_do_not_change() {
 #[tokio::test]
 async fn the_recording_configuration_fills_in_the_modeled_default_for_every_member_left_out() {
     let emulator = Emulator::new();
+    // Every row that configures storage names a storage configuration of this service, so
+    // it is created first and the rows name the ARN that create minted.
+    let storage = emulator.create_storage_configuration("defaults").await;
 
     // Rows differ in which members the configuration supplies and in the values it
     // supplies for them: every `ParticipantRecordingMediaType` the model lists
@@ -1459,9 +1479,9 @@ async fn the_recording_configuration_fills_in_the_modeled_default_for_every_memb
     let cases: Vec<(&str, Value, Value)> = vec![
         (
             "storage configuration only",
-            json!({ "storageConfigurationArn": STORAGE_CONFIGURATION_ARN }),
+            json!({ "storageConfigurationArn": storage.as_str() }),
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "mediaTypes": ["AUDIO_VIDEO"],
                 "recordingReconnectWindowSeconds": 0,
                 "recordParticipantReplicas": false,
@@ -1476,11 +1496,11 @@ async fn the_recording_configuration_fills_in_the_modeled_default_for_every_memb
         (
             "audio only",
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "mediaTypes": ["AUDIO_ONLY"],
             }),
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "mediaTypes": ["AUDIO_ONLY"],
                 "recordingReconnectWindowSeconds": 0,
                 "recordParticipantReplicas": false,
@@ -1495,7 +1515,7 @@ async fn the_recording_configuration_fills_in_the_modeled_default_for_every_memb
         (
             "no media recorded, thumbnails at the minimum interval",
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "mediaTypes": ["NONE"],
                 "thumbnailConfiguration": {
                     "recordingMode": "INTERVAL",
@@ -1503,7 +1523,7 @@ async fn the_recording_configuration_fills_in_the_modeled_default_for_every_memb
                 },
             }),
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "mediaTypes": ["NONE"],
                 "recordingReconnectWindowSeconds": 0,
                 "recordParticipantReplicas": false,
@@ -1518,14 +1538,14 @@ async fn the_recording_configuration_fills_in_the_modeled_default_for_every_memb
         (
             "thumbnails at the maximum interval, in both storage formats",
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "thumbnailConfiguration": {
                     "targetIntervalSeconds": 86_400,
                     "storage": ["SEQUENTIAL", "LATEST"],
                 },
             }),
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "mediaTypes": ["AUDIO_VIDEO"],
                 "recordingReconnectWindowSeconds": 0,
                 "recordParticipantReplicas": false,
@@ -1540,12 +1560,12 @@ async fn the_recording_configuration_fills_in_the_modeled_default_for_every_memb
         (
             "HLS segments at the minimum duration, reconnect window at its minimum",
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "recordingReconnectWindowSeconds": 0,
                 "hlsConfiguration": { "targetSegmentDurationSeconds": 2 },
             }),
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "mediaTypes": ["AUDIO_VIDEO"],
                 "recordingReconnectWindowSeconds": 0,
                 "recordParticipantReplicas": false,
@@ -1560,7 +1580,7 @@ async fn the_recording_configuration_fills_in_the_modeled_default_for_every_memb
         (
             "every member supplied, at the maximum of each bound",
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "mediaTypes": ["AUDIO_VIDEO"],
                 "recordingReconnectWindowSeconds": 300,
                 "recordParticipantReplicas": true,
@@ -1572,7 +1592,7 @@ async fn the_recording_configuration_fills_in_the_modeled_default_for_every_memb
                 "hlsConfiguration": { "targetSegmentDurationSeconds": 10 },
             }),
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "mediaTypes": ["AUDIO_VIDEO"],
                 "recordingReconnectWindowSeconds": 300,
                 "recordParticipantReplicas": true,
@@ -1650,42 +1670,42 @@ async fn the_recording_configuration_fills_in_the_modeled_default_for_every_memb
         (
             "a thumbnail interval one below the minimum",
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "thumbnailConfiguration": { "targetIntervalSeconds": 0 },
             }),
         ),
         (
             "a thumbnail interval one above the maximum",
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "thumbnailConfiguration": { "targetIntervalSeconds": 86_401 },
             }),
         ),
         (
             "an HLS segment duration one below the minimum",
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "hlsConfiguration": { "targetSegmentDurationSeconds": 1 },
             }),
         ),
         (
             "an HLS segment duration one above the maximum",
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "hlsConfiguration": { "targetSegmentDurationSeconds": 11 },
             }),
         ),
         (
             "a reconnect window one below the minimum",
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "recordingReconnectWindowSeconds": -1,
             }),
         ),
         (
             "a reconnect window one above the maximum",
             json!({
-                "storageConfigurationArn": STORAGE_CONFIGURATION_ARN,
+                "storageConfigurationArn": storage.as_str(),
                 "recordingReconnectWindowSeconds": 301,
             }),
         ),

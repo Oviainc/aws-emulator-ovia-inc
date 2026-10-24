@@ -266,14 +266,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         // The hardware the request scopes the report to: one named asset of this
-        // Outpost, or the Outpost itself. An `AssetId` that names none of its assets
-        // is the same not-found error, echoed on the member it arrived in.
+        // Outpost, or the Outpost itself. An `AssetId` is resolved among the assets
+        // of the Outpost in hand, and one that names none of them is the same
+        // not-found error, echoed on the member it arrived in.
         let hardware = match input.asset_id.as_deref().filter(|id| !id.is_empty()) {
             Some(asset_id) => {
-                let asset = record
-                    .assets
-                    .iter()
-                    .find(|asset| asset.asset_id.as_deref() == Some(asset_id))
+                let asset = store
+                    .asset_of_outpost(&outpost_id, asset_id)
                     .ok_or_else(|| {
                         GetOutpostSupportedInstanceTypesErrorModeled::NotFoundException(
                             NotFoundException {

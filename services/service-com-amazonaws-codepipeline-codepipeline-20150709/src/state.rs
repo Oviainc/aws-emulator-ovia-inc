@@ -3526,6 +3526,37 @@ pub fn resolved_execution_mode(declaration: &PipelineDeclaration) -> String {
         .to_string()
 }
 
+/// The pipeline structure to REPORT for `declaration`: the stored one, with every
+/// action's artifact-list members present.
+///
+/// `ActionDeclaration$inputArtifacts` ("The name or ID of the artifact consumed by
+/// the action") and `$outputArtifacts` ("The name or ID of the result of the action
+/// declaration") target lists with no minimum length, so an action that consumes or
+/// produces nothing has an EMPTY list rather than no list at all: both members
+/// belong to every action declaration the service reports, and the reported
+/// structure is what a caller reads a definition back as — to diff it against the
+/// structure it submitted, to render the stage graph, or to edit it and send it to
+/// `UpdatePipeline`, each of which reads the two members on every action. Omitting
+/// them would also drop them from such an edit-then-update cycle.
+///
+/// The ONE place this projection lives, so `CreatePipeline`, `UpdatePipeline` and
+/// `GetPipeline` cannot disagree about the structure they report. Nothing else is
+/// resolved here: every other member is reported exactly as stored.
+pub fn reported_declaration(declaration: &PipelineDeclaration) -> PipelineDeclaration {
+    let mut reported = declaration.clone();
+    for stage in &mut reported.stages {
+        for action in &mut stage.actions {
+            if action.input_artifacts.is_none() {
+                action.input_artifacts = Some(Vec::new());
+            }
+            if action.output_artifacts.is_none() {
+                action.output_artifacts = Some(Vec::new());
+            }
+        }
+    }
+    reported
+}
+
 /// How many executions a pipeline whose `executionMode` is `execution_mode` runs
 /// concurrently: one in `SUPERSEDED` mode, [`MAX_CONCURRENT_EXECUTIONS_PARALLEL`] in
 /// the modes that hold several (`QUEUED`, `PARALLEL`).

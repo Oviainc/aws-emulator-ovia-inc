@@ -145,15 +145,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         if store.connections.remove(&input.connection_arn).is_none() {
-            return Err(DeleteConnectionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Could not find connection {}",
-                        input.connection_arn
-                    )),
-                },
-            )
-            .into());
+            // Nothing to delete: the ARN resolves to no connection, which is the modeled
+            // absence, answered at the status the live service answers an absent resource
+            // with (`state::RESOURCE_NOT_FOUND_STATUS`) — the same answer a repeated
+            // delete gets, so idempotent teardown reads one code and one status.
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                DeleteConnectionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::NO_SUCH_CONNECTION_MESSAGE.to_string()),
+                    },
+                ),
+                crate::state::RESOURCE_NOT_FOUND_STATUS,
+            ));
         }
         // The ARN is never reused, so the tags keyed by it go with the connection.
         store.tags.remove(&input.connection_arn);

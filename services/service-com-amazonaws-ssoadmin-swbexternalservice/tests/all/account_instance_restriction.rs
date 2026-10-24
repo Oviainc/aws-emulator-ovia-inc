@@ -34,7 +34,7 @@ struct SurfaceCall {
     /// What the operation answers for an `InstanceArn` the account holds no instance
     /// under: 400 `ResourceNotFoundException` for the operations that resolve the instance
     /// themselves (every refusal of a request on this awsJson1_1 surface is 400, so the
-    /// error code is what tells it from the restriction), and 501 for the three that are
+    /// error code is what tells it from the restriction), and 501 for those that are
     /// still scaffolds — those model the account-instance refusal and nothing else, which
     /// is exactly why an unknown ARN is not refused as one.
     unknown_instance_status: u16,
@@ -174,7 +174,7 @@ fn surface_calls(instance_arn: &str, variant: &Variant) -> Vec<SurfaceCall> {
         SurfaceCall {
             label: format!("{}: DescribeAccountAssignmentCreationStatus", variant.label),
             operation: "DescribeAccountAssignmentCreationStatus",
-            unknown_instance_status: 501,
+            unknown_instance_status: 400,
             body: json!({
                 "InstanceArn": instance_arn,
                 "AccountAssignmentCreationRequestId": variant.request_id,
@@ -296,7 +296,7 @@ async fn the_restriction_precedes_the_existence_checks() {
 
 /// The same surface on an ORGANIZATION instance: it is SERVED. This is what makes the
 /// refusal above a property of the instance type rather than of the operations — and the
-/// three operations that are still scaffolds answer their 501 here, not the restriction.
+/// operations that are still scaffolds answer their 501 here, not the restriction.
 #[tokio::test]
 async fn the_same_surface_is_served_on_an_organization_instance() {
     let (router, instance_arn) = organization_router();
@@ -361,7 +361,33 @@ async fn the_same_surface_is_served_on_an_organization_instance() {
         );
     }
 
-    // The three that are still scaffolds: unimplemented, which is a 501 — never the
+    // An operation of the surface that IS served reports a missing resource as a missing
+    // resource on an organization instance: `DescribeAccountAssignmentCreationStatus` of
+    // a request id nothing was minted for is a not-found, never the account-instance
+    // refusal (which would claim this instance cannot serve the operation at all) and
+    // never a 501.
+    let (status, body) = call(
+        &router,
+        "DescribeAccountAssignmentCreationStatus",
+        &json!({
+            "InstanceArn": instance_arn,
+            "AccountAssignmentCreationRequestId": "11111111-2222-4333-8444-555555555555",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case DescribeAccountAssignmentCreationStatus: an unknown request id on an \
+         organization instance expected HTTP 400, got {status} {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ResourceNotFoundException",
+        "case DescribeAccountAssignmentCreationStatus: expected ResourceNotFoundException, \
+         got {body}"
+    );
+
+    // The ones that are still scaffolds: unimplemented, which is a 501 — never the
     // account-instance refusal, which would claim this instance cannot serve them.
     let scaffolded: Vec<(&str, Value)> = vec![
         (
@@ -376,13 +402,6 @@ async fn the_same_surface_is_served_on_an_organization_instance() {
                 ),
                 "PrincipalType": "GROUP",
                 "PrincipalId": "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
-            }),
-        ),
-        (
-            "DescribeAccountAssignmentCreationStatus",
-            json!({
-                "InstanceArn": instance_arn,
-                "AccountAssignmentCreationRequestId": "11111111-2222-4333-8444-555555555555",
             }),
         ),
         (

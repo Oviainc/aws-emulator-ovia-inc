@@ -122,6 +122,16 @@ const DEFAULT_PREVENT_USER_EXISTENCE_ERRORS: &str = "LEGACY";
 /// sentence per username, which is what makes the refusal an existence oracle.
 pub const USER_NOT_FOUND_MESSAGE: &str = "User does not exist.";
 
+/// The message a `ResourceNotFoundException` carries when the group an operation
+/// names is not one the named pool holds.
+///
+/// Amazon Cognito answers the same sentence for every group name: the group
+/// lookup reports that nothing was found and names no group, so the refusal
+/// cannot be read as a statement about one particular group name. Every
+/// operation that resolves a `GroupName` against a pool reports it the same way,
+/// exactly as [`USER_NOT_FOUND_MESSAGE`] is reported for a username.
+pub const GROUP_NOT_FOUND_MESSAGE: &str = "Group not found.";
+
 // ---------------------------------------------------------------------------
 // Password policy rejection wording
 //

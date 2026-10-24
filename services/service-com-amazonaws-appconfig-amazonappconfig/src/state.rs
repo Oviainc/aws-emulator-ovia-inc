@@ -36,6 +36,14 @@ pub const DEPLOYMENT_DEPLOYING: &str = "DEPLOYING";
 pub const DEPLOYMENT_BAKING: &str = "BAKING";
 /// See [`DEPLOYMENT_DEPLOYING`].
 pub const DEPLOYMENT_COMPLETE: &str = "COMPLETE";
+/// See [`DEPLOYMENT_DEPLOYING`]. Where a caller's stop puts a deployment that is still
+/// rolling out or baking: the rollback has started and has not finished yet.
+pub const DEPLOYMENT_ROLLING_BACK: &str = "ROLLING_BACK";
+/// See [`DEPLOYMENT_ROLLING_BACK`]. Where that rollback leaves it once it finishes.
+pub const DEPLOYMENT_ROLLED_BACK: &str = "ROLLED_BACK";
+/// See [`DEPLOYMENT_ROLLING_BACK`]. Where reverting a deployment that already completed
+/// leaves it.
+pub const DEPLOYMENT_REVERTED: &str = "REVERTED";
 
 /// `EnvironmentState` values this service moves an environment through — the WIRE
 /// values, which for this one enum are NOT the model's member names.
@@ -56,13 +64,14 @@ pub const DEPLOYMENT_COMPLETE: &str = "COMPLETE";
 pub const ENVIRONMENT_READY_FOR_DEPLOYMENT: &str = "ReadyForDeployment";
 /// See [`ENVIRONMENT_READY_FOR_DEPLOYMENT`].
 pub const ENVIRONMENT_DEPLOYING: &str = "Deploying";
-/// See [`ENVIRONMENT_READY_FOR_DEPLOYMENT`]. No operation moves an environment here
-/// yet — AppConfig enters it only while rolling a deployment back — so the value is
-/// carried for completeness of the wire catalog.
+/// See [`ENVIRONMENT_READY_FOR_DEPLOYMENT`]. An environment enters it while the
+/// deployment it holds is rolling back, which is what a caller's `StopDeployment` of a
+/// deployment still in progress starts.
 pub const ENVIRONMENT_ROLLING_BACK: &str = "RollingBack";
-/// See [`ENVIRONMENT_ROLLING_BACK`].
+/// See [`ENVIRONMENT_ROLLING_BACK`]: where that rollback leaves the environment.
 pub const ENVIRONMENT_ROLLED_BACK: &str = "RolledBack";
-/// See [`ENVIRONMENT_ROLLING_BACK`].
+/// See [`ENVIRONMENT_ROLLING_BACK`]: where reverting the environment's latest
+/// deployment leaves it.
 pub const ENVIRONMENT_REVERTED: &str = "Reverted";
 
 /// `ExperimentDefinitionStatus` values this service reports, from
@@ -96,6 +105,12 @@ pub const EVENT_PERCENTAGE_UPDATED: &str = "PERCENTAGE_UPDATED";
 pub const EVENT_BAKE_TIME_STARTED: &str = "BAKE_TIME_STARTED";
 /// See [`EVENT_DEPLOYMENT_STARTED`].
 pub const EVENT_DEPLOYMENT_COMPLETED: &str = "DEPLOYMENT_COMPLETED";
+/// See [`EVENT_DEPLOYMENT_STARTED`].
+pub const EVENT_ROLLBACK_STARTED: &str = "ROLLBACK_STARTED";
+/// See [`EVENT_DEPLOYMENT_STARTED`].
+pub const EVENT_ROLLBACK_COMPLETED: &str = "ROLLBACK_COMPLETED";
+/// See [`EVENT_DEPLOYMENT_STARTED`].
+pub const EVENT_REVERT_COMPLETED: &str = "REVERT_COMPLETED";
 
 /// The `DeploymentType` value of a deployment a caller started with `StartDeployment`,
 /// from `DEPLOYMENT_TYPE_VALUES` in `crate::ops::types` (the model's `DeploymentType`
@@ -510,6 +525,29 @@ const DESCRIPTION_DEPLOYMENT_COMPLETED: &str = "Deployment completed";
 /// See [`DESCRIPTION_DEPLOYMENT_STARTED`]. A deployment whose completion falls due at the
 /// instant it was asked for took no time at all, which is what its event says.
 const DESCRIPTION_DEPLOYMENT_COMPLETED_INSTANTLY: &str = "Deployment completed instantly";
+/// See [`DESCRIPTION_DEPLOYMENT_STARTED`]: the event a caller's stop records.
+const DESCRIPTION_ROLLBACK_STARTED: &str = "Deployment rollback started";
+/// See [`DESCRIPTION_DEPLOYMENT_STARTED`].
+const DESCRIPTION_ROLLBACK_COMPLETED: &str = "Deployment rollback completed";
+/// See [`DESCRIPTION_DEPLOYMENT_STARTED`].
+const DESCRIPTION_REVERT_COMPLETED: &str = "Deployment reverted";
+
+/// How long after it completed a deployment may still be reverted: "AppConfig only
+/// allows a revert within 72 hours of deployment completion", from the model's own
+/// `StopDeployment` documentation. A DOCUMENTED duration, so it keeps its documented
+/// value; [`REVERT_WINDOW_HOURS`] is the same number in the unit that sentence states it
+/// in, which is also the unit the refusal reports.
+pub const REVERT_WINDOW_HOURS: u64 = 72;
+/// See [`REVERT_WINDOW_HOURS`].
+pub const REVERT_WINDOW: Duration = Duration::from_secs(REVERT_WINDOW_HOURS * 60 * 60);
+
+/// How long the rollback a caller's stop starts takes to finish.
+///
+/// The EMULATOR's span, not a documented one: AppConfig answers the stop while the
+/// deployment is still `ROLLING_BACK` and the clock owes the `ROLLED_BACK` it ends in,
+/// so the span is short but never zero — a caller reading the deployment straight after
+/// stopping it sees the rollback in progress, exactly as it would against AppConfig.
+const ROLLBACK_DURATION: Duration = Duration::from_millis(500);
 
 /// The percentage of targets a finished rollout has reached, and the ceiling every growth
 /// step is capped at: the maximum of the model's `Percentage` shape (`range 1..100`).
@@ -826,33 +864,52 @@ impl Environment {
     }
 
     /// Bring this environment, and every deployment in it, up to the state the clock
-    /// already owes at `now`: an environment is `DEPLOYING` exactly while one of its
-    /// deployments is still rolling out or baking, and `READY_FOR_DEPLOYMENT` once
-    /// none is.
+    /// already owes at `now`.
     pub fn materialize(&mut self, now: SystemTime) {
         for deployment in self.deployments.values_mut() {
             deployment.materialize(now);
         }
-        self.state = if self.deployments.values().any(Deployment::is_in_flight) {
-            ENVIRONMENT_DEPLOYING.to_string()
-        } else {
-            ENVIRONMENT_READY_FOR_DEPLOYMENT.to_string()
-        };
+        self.state = self.owed_state();
     }
 
-    /// The deployment still rolling out or baking in this environment, if any. A
-    /// second deployment into the same environment conflicts with it.
-    pub fn deployment_in_flight(&self) -> Option<&Deployment> {
-        self.deployments.values().find(|d| d.is_in_flight())
+    /// The state this environment is in, read off the deployments it holds: it is
+    /// `DEPLOYING` while one is still rolling out or baking and `ROLLING_BACK` while one
+    /// is rolling back, and otherwise it reports what its LATEST deployment left behind —
+    /// `ROLLED_BACK` or `REVERTED` for one a caller stopped, and `READY_FOR_DEPLOYMENT`
+    /// for one that ran to completion or for an environment nothing was ever deployed
+    /// into.
+    fn owed_state(&self) -> String {
+        if self.deployments.values().any(Deployment::is_in_flight) {
+            return ENVIRONMENT_DEPLOYING.to_string();
+        }
+        if self.deployments.values().any(Deployment::is_rolling_back) {
+            return ENVIRONMENT_ROLLING_BACK.to_string();
+        }
+        let latest = self
+            .deployments
+            .values()
+            .max_by_key(|deployment| deployment.deployment_number);
+        match latest.map(|deployment| deployment.state.as_str()) {
+            Some(DEPLOYMENT_ROLLED_BACK) => ENVIRONMENT_ROLLED_BACK.to_string(),
+            Some(DEPLOYMENT_REVERTED) => ENVIRONMENT_REVERTED.to_string(),
+            _ => ENVIRONMENT_READY_FOR_DEPLOYMENT.to_string(),
+        }
+    }
+
+    /// The deployment this environment is still working on — rolling out, baking, or
+    /// rolling back after a caller stopped it. A second deployment into the same
+    /// environment conflicts with it.
+    pub fn active_deployment(&self) -> Option<&Deployment> {
+        self.deployments.values().find(|d| d.is_active())
     }
 
     /// Store a new deployment and answer the stored record.
     ///
     /// Only [`MAX_RETAINED_DEPLOYMENTS_PER_ENVIRONMENT`] records are kept: the oldest
     /// beyond that bound are dropped first, and only ones the deployment has already
-    /// finished with — a deployment still rolling out or baking is the one a caller is
-    /// watching, so it is never evicted, and an environment holding nothing but
-    /// in-flight deployments keeps them all (at most one, since `StartDeployment`
+    /// finished with — a deployment still rolling out, baking or rolling back is the one
+    /// a caller is watching, so it is never evicted, and an environment holding nothing
+    /// but active deployments keeps them all (at most one, since `StartDeployment`
     /// refuses a second). The record being stored is never dropped either: pruning
     /// drops lower deployment numbers and this is the highest, so the entry it is
     /// written into is always vacant.
@@ -862,7 +919,7 @@ impl Environment {
             let Some(oldest_finished) = self
                 .deployments
                 .values()
-                .filter(|held| !held.is_in_flight())
+                .filter(|held| !held.is_active())
                 .map(|held| held.deployment_number)
                 .min()
             else {
@@ -1018,6 +1075,11 @@ pub struct Deployment {
     pub applied_extensions: Vec<AppliedExtension>,
     pub started_at: SystemTime,
     pub completed_at: Option<SystemTime>,
+    /// The instant the rollback a caller's stop started falls due to finish, set only
+    /// while this deployment is `ROLLING_BACK` and `None` for one nobody stopped. Stored
+    /// as the instant it was owed from, so the transition is the clock's and no reader
+    /// has to sleep for it.
+    pub rollback_completion_due: Option<SystemTime>,
     pub event_log: Vec<DeploymentEvent>,
     pub kms_key_identifier: Option<String>,
     pub version_label: Option<String>,
@@ -1040,6 +1102,18 @@ pub struct NewDeployment {
     pub kms_key_identifier: Option<String>,
     pub version_label: Option<String>,
     pub tags: HashMap<String, String>,
+}
+
+/// Why a stop was refused, which is what decides the refusal's wording; see
+/// [`Deployment::stop`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopRefusal {
+    /// The deployment is in a state no stop applies to: one the service has already
+    /// finished with, or a completed one the caller did not ask to revert.
+    NotStoppable,
+    /// The deployment completed longer than [`REVERT_WINDOW`] ago, so it can no longer
+    /// be reverted.
+    RevertWindowElapsed,
 }
 
 impl Deployment {
@@ -1073,6 +1147,8 @@ impl Deployment {
             applied_extensions: Vec::new(),
             started_at,
             completed_at: None,
+            // Nothing has stopped it: the only thing that sets this is a caller's stop.
+            rollback_completion_due: None,
             event_log: vec![deployment_event(
                 EVENT_DEPLOYMENT_STARTED,
                 TRIGGERED_BY_USER,
@@ -1097,6 +1173,71 @@ impl Deployment {
             self.state.as_str(),
             DEPLOYMENT_DEPLOYING | DEPLOYMENT_BAKING
         )
+    }
+
+    /// Whether the deployment is rolling back after a caller stopped it — the one
+    /// non-terminal state nothing but a stop puts it in, and which the clock then
+    /// finishes.
+    pub fn is_rolling_back(&self) -> bool {
+        self.state == DEPLOYMENT_ROLLING_BACK
+    }
+
+    /// Whether the deployment has not yet reached a state it can no longer leave: it is
+    /// rolling out, baking or rolling back, so the service is still working on it.
+    pub fn is_active(&self) -> bool {
+        self.is_in_flight() || self.is_rolling_back()
+    }
+
+    /// Stop this deployment at `now`, as `StopDeployment` asks.
+    ///
+    /// A deployment the service is still working on is rolled back: it moves to
+    /// `ROLLING_BACK` straight away and the clock owes the `ROLLED_BACK` it ends in. A
+    /// deployment that already completed is reverted instead — but only when the caller
+    /// supplied `allow_revert` and only inside [`REVERT_WINDOW`] of its completion — and
+    /// a revert has no intermediate state, so it is `REVERTED` at once. A deployment in
+    /// any other state is refused and left exactly as it was.
+    ///
+    /// "Still working on it" is read as the deployment being IN PROGRESS — rolling out
+    /// or baking — rather than as the single state `DEPLOYING`: the model's own sentence
+    /// about what a stop does speaks of "an in-progress deployment", and a deployment
+    /// monitoring its final bake time has not finished either, so a caller stopping it
+    /// gets the same rollback. That reading is a DECISION, recorded here: the narrower
+    /// one would refuse a stop of a `BAKING` deployment that carried no `AllowRevert`.
+    pub fn stop(&mut self, allow_revert: bool, now: SystemTime) -> Result<(), StopRefusal> {
+        if self.is_in_flight() {
+            self.state = DEPLOYMENT_ROLLING_BACK.to_string();
+            self.rollback_completion_due = Some(now + ROLLBACK_DURATION);
+            self.event_log.push(deployment_event(
+                EVENT_ROLLBACK_STARTED,
+                TRIGGERED_BY_USER,
+                DESCRIPTION_ROLLBACK_STARTED.to_string(),
+                now,
+            ));
+            return Ok(());
+        }
+        if self.state != DEPLOYMENT_COMPLETE || !allow_revert {
+            return Err(StopRefusal::NotStoppable);
+        }
+        // A completed deployment always carries its completion instant; the start is the
+        // only instant that could stand in for it, and it is never later.
+        let completed_at = self.completed_at.unwrap_or(self.started_at);
+        if now
+            .duration_since(completed_at)
+            .unwrap_or_default()
+            > REVERT_WINDOW
+        {
+            return Err(StopRefusal::RevertWindowElapsed);
+        }
+        self.state = DEPLOYMENT_REVERTED.to_string();
+        // `CompletedAt` is left where it was: the deployment did complete then, and the
+        // revert is a later event of its own rather than a second completion.
+        self.event_log.push(deployment_event(
+            EVENT_REVERT_COMPLETED,
+            TRIGGERED_BY_USER,
+            DESCRIPTION_REVERT_COMPLETED.to_string(),
+            now,
+        ));
+        Ok(())
     }
 
     /// How long the rollout itself lasts: the strategy's deployment duration.
@@ -1183,6 +1324,33 @@ impl Deployment {
     /// not anybody asked, so a reporting operation may call it: it cannot make a later
     /// caller see anything other than what the clock had already made true.
     pub fn materialize(&mut self, now: SystemTime) {
+        // A rollback is the one transition here a CALLER started, so it is finished on
+        // its own: a deployment that was stopped mid-rollout is owed nothing further by
+        // the strategy's schedule.
+        if self.is_rolling_back() {
+            let Some(due) = self.rollback_completion_due else {
+                // Unreachable: `stop` is the only thing that puts a deployment in this
+                // state and it always records when the rollback falls due. Asserted
+                // rather than silently absorbed, so a future path that forgets it shows
+                // up in a debug build instead of leaving a record stuck here.
+                debug_assert!(
+                    false,
+                    "a rolling-back deployment records when its rollback falls due"
+                );
+                return;
+            };
+            if now >= due {
+                self.state = DEPLOYMENT_ROLLED_BACK.to_string();
+                self.completed_at = Some(due);
+                self.event_log.push(deployment_event(
+                    EVENT_ROLLBACK_COMPLETED,
+                    TRIGGERED_BY_APPCONFIG,
+                    DESCRIPTION_ROLLBACK_COMPLETED.to_string(),
+                    due,
+                ));
+            }
+            return;
+        }
         if !self.is_in_flight() {
             return;
         }
@@ -1519,13 +1687,59 @@ pub fn next_token_not_issued() -> String {
 /// AppConfig attributes this conflict to the ENVIRONMENT rather than to the deployment
 /// holding it: the recorded refusal names the environment and the state it currently
 /// has, and nothing else — no deployment number. `state` is the `DeploymentState` of the
-/// deployment still in flight, which is the state the recorded refusal reports (the
-/// uppercase `DEPLOYING` / `BAKING` form, not `Environment$State`'s CamelCase wire
-/// value), so a retry loop keyed on the environment reads the subject AppConfig names.
+/// deployment the service is still working on, which is the state the recorded refusal
+/// reports (the uppercase `DEPLOYING` / `BAKING` / `ROLLING_BACK` form, not
+/// `Environment$State`'s CamelCase wire value), so a retry loop keyed on the environment
+/// reads the subject AppConfig names.
 pub fn environment_not_ready_for_deployment(environment_id: &str, state: &str) -> String {
     format!(
         "Environment {environment_id} currently has a state of {state}. The current deployment \
          must finish before a new deployment can be started."
+    )
+}
+
+// =============================================================================
+// `BadRequestException` messages
+// =============================================================================
+
+/// `Message` for a stop refused because the deployment is not in a state a stop applies
+/// to, as the recorded refusal words it:
+///
+/// ```text
+/// Deployment <number> for App <application id> and Environment <environment id> cannot \
+///     be stopped, it has a status of <state>.
+/// ```
+///
+/// DERIVED from the request and the record it addressed — the deployment the caller named,
+/// the application and environment it scoped the lookup to, and the state that deployment
+/// is actually in — so nothing of any one request is stored here.
+pub fn deployment_cannot_be_stopped(
+    application_id: &str,
+    environment_id: &str,
+    deployment_number: i32,
+    state: &str,
+) -> String {
+    format!(
+        "Deployment {deployment_number} for App {application_id} and Environment \
+         {environment_id} cannot be stopped, it has a status of {state}."
+    )
+}
+
+/// `Message` for a revert refused because the deployment completed too long ago.
+///
+/// A window-level refusal is a DIFFERENT refusal from [`deployment_cannot_be_stopped`]
+/// and has no recorded instance, so it keeps that one's subject clause — the request's own
+/// identifiers — and states the window the model documents instead of the state, which is
+/// not what made it fail.
+pub fn deployment_revert_window_elapsed(
+    application_id: &str,
+    environment_id: &str,
+    deployment_number: i32,
+) -> String {
+    format!(
+        "Deployment {deployment_number} for App {application_id} and Environment \
+         {environment_id} cannot be reverted, it completed more than {REVERT_WINDOW_HOURS} \
+         hours ago."
     )
 }
 

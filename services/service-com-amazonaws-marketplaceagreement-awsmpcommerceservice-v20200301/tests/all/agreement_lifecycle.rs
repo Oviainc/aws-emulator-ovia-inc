@@ -1443,6 +1443,16 @@ async fn a_search_selects_stored_agreements_by_the_documented_filters() {
             json!([{"name": "AfterEndTime", "values": ["yesterday"]}]),
             "INVALID_FILTER_VALUES",
         ),
+        (
+            "an AgreementType the service does not publish",
+            json!([{"name": "AgreementType", "values": ["Nonsense"]}]),
+            "INVALID_AGREEMENT_TYPE",
+        ),
+        (
+            "a Status outside AgreementStatus",
+            json!([{"name": "Status", "values": ["NOTASTATUS"]}]),
+            "INVALID_STATUS",
+        ),
     ] {
         // The same filter list is refused whatever the store holds: once
         // against the agreements above, and once against an empty store, where

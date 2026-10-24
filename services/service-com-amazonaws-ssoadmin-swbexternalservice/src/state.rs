@@ -270,6 +270,16 @@ pub fn application_assignment_not_found_message(
     )
 }
 
+/// The refusal a `RequestId` this instance holds no assignment-operation status record
+/// for earns, as the message of the modelled `ResourceNotFoundException`.
+///
+/// Built from the request, like [`trusted_token_issuer_not_found_message`]: it names the
+/// request id that resolved to nothing, which is what tells "no operation was ever
+/// tracked under this id" from "some other resource of this call is missing".
+pub fn assignment_operation_not_found_message(request_id: &str) -> String {
+    format!("Could not find the status of an assignment operation with request id {request_id}.")
+}
+
 /// `ApplicationStatus::ENABLED` (the enum is `ENABLED | DISABLED`) — the status an
 /// application carries when the create that made it named none.
 ///
@@ -1917,6 +1927,27 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
                 && row.permission_set_arn == permission_set_arn
                 && row.principal_type == principal_type
                 && row.principal_id == principal_id
+        })
+    }
+
+    /// The status record of the assignment operation `request_id` names, WITHIN
+    /// `instance_arn`.
+    ///
+    /// An assignment operation is performed under one instance — the permission set it
+    /// names belongs to that instance, and a permission set that goes takes its
+    /// operation records with it ([`Self::remove_instance`],
+    /// `DeletePermissionSet`) — so a `RequestId` whose record hangs off another
+    /// instance's permission set is as absent here as one nothing was ever minted for.
+    /// That is what keeps a `Describe…Status` read of one instance from reporting
+    /// another instance's history.
+    pub fn assignment_operation(
+        &self,
+        instance_arn: &str,
+        request_id: &str,
+    ) -> Option<&AssignmentOperationRecord> {
+        self.assignment_operations.get(request_id).filter(|record| {
+            self.permission_set(instance_arn, &record.permission_set_arn)
+                .is_some()
         })
     }
 }

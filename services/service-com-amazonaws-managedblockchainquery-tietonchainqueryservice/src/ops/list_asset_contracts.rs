@@ -206,7 +206,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `validation::list_asset_contracts_input`, and `state::page` clamps whatever
         // reaches it to `state::MAX_PAGE_SIZE` (250) — the same number the output list's
         // own `@length` carries — so one page is bounded by the model, never by the
-        // request.
+        // request. A request that names no `maxResults` pages at
+        // `state::DEFAULT_PAGE_SIZE`, this member's documented "Default: 100".
         let page = crate::state::page(all, input.max_results, input.next_token.as_deref())
             .map_err(|_| {
                 ListAssetContractsErrorModeled::ValidationException(

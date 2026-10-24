@@ -159,6 +159,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::store_unavailable(UpdateStageErrorModeled::InternalServerException)
         })?;
         let mut store = state.lock();
+        if !store.stages.contains_key(&input.arn) {
+            return Err(crate::state::resource_not_found(
+                UpdateStageErrorModeled::ResourceNotFoundException,
+                &input.arn,
+            ));
+        }
+
+        // Through the same seam `CreateStage` uses, so an updated stage reports the
+        // configuration's documented defaults exactly as a created one does and a
+        // reference to a storage configuration this account does not hold is refused the
+        // same way. Resolved before the record is touched, so a refused update changes
+        // nothing.
+        let recording_configuration = match input.auto_participant_recording_configuration {
+            Some(configuration) => Some(
+                crate::state::resolved_recording_configuration(
+                    &store,
+                    Self::NAME,
+                    Some(configuration),
+                )
+                .map_err(|message| {
+                    crate::state::validation_failed(
+                        UpdateStageErrorModeled::ValidationException,
+                        message,
+                    )
+                })?,
+            ),
+            None => None,
+        };
+
         let record = store.stages.get_mut(&input.arn).ok_or_else(|| {
             crate::state::resource_not_found(
                 UpdateStageErrorModeled::ResourceNotFoundException,
@@ -171,11 +200,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(name) = input.name {
             record.name = Some(name);
         }
-        if let Some(configuration) = input.auto_participant_recording_configuration {
-            // Through the same seam `CreateStage` uses, so an updated stage reports the
-            // configuration's documented defaults exactly as a created one does.
-            record.auto_participant_recording_configuration =
-                crate::state::effective_recording_configuration(Some(configuration));
+        if let Some(configuration) = recording_configuration {
+            record.auto_participant_recording_configuration = configuration;
         }
 
         Ok(UpdateStageOutput {

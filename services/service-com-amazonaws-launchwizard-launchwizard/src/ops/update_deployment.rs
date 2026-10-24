@@ -202,13 +202,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // A deployment whose delete has started has no settings left to apply, so the
-        // update is refused rather than applied. `force` does not reach this: it
+        // A deployment takes new settings only while its lifecycle is AT REST. A
+        // deployment whose delete has started has no settings left to apply, and one
+        // that is still being created or is still applying an earlier update owes the
+        // clock the steps that lifecycle scheduled — accepting a configuration change
+        // now would discard them and report an outcome for work the caller never saw
+        // finish. Both are refused with the modelled `ValidationException`, leaving the
+        // in-flight lifecycle exactly as it was. `force` does not reach this: it
         // overrides validation WARNINGS, not the state the resource is in.
-        if deployment.is_deleting_or_deleted() {
+        if let Some(message) = crate::state::deployment_update_refusal(deployment) {
             return Err(UpdateDeploymentErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(crate::state::DEPLOYMENT_NOT_UPDATABLE_MESSAGE.to_string()),
+                    message: Some(message.to_string()),
                 },
             )
             .into());
@@ -317,8 +322,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // statuses an UPDATE moves a deployment through (`UPDATE_IN_PROGRESS` ->
         // `UPDATE_COMPLETED`). The first is non-terminal, so reaching the second is owed
         // by the CLOCK one `TRANSITION_SPAN` from here and a caller that reads straight
-        // back still sees the update under way. Any step the deployment still owed is
-        // replaced: these settings are what it is applying now.
+        // back still sees the update under way.
         deployment.enter_status(crate::state::STATUS_UPDATE_IN_PROGRESS.to_string());
         deployment.status_reason = None;
         deployment.modified_at = now;
@@ -332,9 +336,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::EVENT_IN_PROGRESS,
             now,
         ));
+        // The step is APPENDED rather than written over the queue: the at-rest guard
+        // above is what makes that the same thing, since a deployment whose lifecycle is
+        // at rest owes no step, and nothing another lifecycle scheduled is ever dropped
+        // here.
         let completed_at = now + crate::state::TRANSITION_SPAN;
-        deployment.pending = ::std::collections::VecDeque::from(vec![
-            crate::state::PendingTransition {
+        deployment
+            .pending
+            .push_back(crate::state::PendingTransition {
                 due_at: completed_at,
                 status: crate::state::STATUS_UPDATE_COMPLETED.to_string(),
                 event: crate::state::DeploymentEvent::new(
@@ -343,8 +352,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::EVENT_COMPLETED,
                     completed_at,
                 ),
-            },
-        ]);
+            });
 
         // Every member comes from the stored record, which now holds the update.
         Ok(UpdateDeploymentOutput {

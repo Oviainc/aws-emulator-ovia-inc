@@ -42,7 +42,7 @@ use service_com_amazonaws_appconfig_amazonappconfig::ops::types::{
 /// One row: what a failing assertion calls it, and the criteria of the deployment
 /// strategy the deployment is paced by — `DeploymentDurationInMinutes`, `GrowthFactor`,
 /// `GrowthType` and `FinalBakeTimeInMinutes`.
-type Row = (&'static str, i32, f64, &'static str, i32);
+pub(crate) type Row = (&'static str, i32, f64, &'static str, i32);
 
 /// The strategies deployed with. The bounds are the model's own:
 /// `MinutesBetween0And24Hours` is `range 0..1440` and `Percentage` is `range 1..100`
@@ -78,7 +78,7 @@ const ROWS: [Row; 8] = [
 ];
 
 /// Host version 1 of `profile`'s configuration, so there is something to deploy.
-async fn host_version(router: &MultiServiceRouter, application: &str, profile: &str) {
+pub(crate) async fn host_version(router: &MultiServiceRouter, application: &str, profile: &str) {
     let answer = send(
         router,
         "POST",
@@ -103,7 +103,7 @@ async fn host_version(router: &MultiServiceRouter, application: &str, profile: &
 ///
 /// `index` names the strategy, because the model's `Name` is `length 1..64` and a case
 /// label is prose.
-async fn create_strategy(router: &MultiServiceRouter, index: usize, row: &Row) -> String {
+pub(crate) async fn create_strategy(router: &MultiServiceRouter, index: usize, row: &Row) -> String {
     let (case, duration, growth_factor, growth_type, bake) = *row;
     let answer = json_call(
         router,
@@ -150,12 +150,12 @@ fn iso_instant(case: &str, document: &str, member: &str, value: &Value) -> DateT
 }
 
 /// A member of a document, or `Value::Null` when it is absent.
-fn member(body: &Value, name: &str) -> Value {
+pub(crate) fn member(body: &Value, name: &str) -> Value {
     body.get(name).cloned().unwrap_or(Value::Null)
 }
 
 /// The `EventLog` of a document, as the JSON array it carries.
-fn event_log(case: &str, document: &str, body: &Value) -> Vec<Value> {
+pub(crate) fn event_log(case: &str, document: &str, body: &Value) -> Vec<Value> {
     body.get("EventLog")
         .and_then(Value::as_array)
         .cloned()
@@ -163,7 +163,7 @@ fn event_log(case: &str, document: &str, body: &Value) -> Vec<Value> {
 }
 
 /// The `EventType` of each entry of an event log, in the order the log reports them.
-fn event_types(log: &[Value]) -> Vec<String> {
+pub(crate) fn event_types(log: &[Value]) -> Vec<String> {
     log.iter()
         .map(|event| {
             member(event, "EventType")

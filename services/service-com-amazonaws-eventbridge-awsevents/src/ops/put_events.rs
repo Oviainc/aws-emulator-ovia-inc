@@ -240,7 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 failed += 1;
                 entries.push(refused(
                     RESOURCE_NOT_FOUND,
-                    format!("Event bus {} does not exist.", accepted.bus),
+                    crate::state::no_such_event_bus(&accepted.bus),
                 ));
                 continue;
             };

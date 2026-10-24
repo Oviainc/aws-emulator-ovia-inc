@@ -172,7 +172,7 @@ async fn untagging_removes_the_keys_it_names_and_reports_what_it_removed() {
             "case {name:?}: Tag expected 200, got {tagged_status} {tagged}",
         );
         let mut expected: BTreeMap<String, String> = start.iter().cloned().collect();
-        let stored = stored_tags(&emulator, name, &arn).await;
+        let stored = stored_tags(&emulator, region, name, &arn).await;
         assert_eq!(
             stored, expected,
             "case {name:?}: expected the starting map {expected:?}, got {stored:?}",
@@ -199,7 +199,7 @@ async fn untagging_removes_the_keys_it_names_and_reports_what_it_removed() {
             for key in &removed {
                 expected.remove(key);
             }
-            let stored = stored_tags(&emulator, case, &arn).await;
+            let stored = stored_tags(&emulator, region, case, &arn).await;
             assert_eq!(
                 stored, expected,
                 "case {case:?}: expected the stored map {expected:?}, got {stored:?}",
@@ -217,7 +217,7 @@ async fn untagging_removes_the_keys_it_names_and_reports_what_it_removed() {
                 Vec::<String>::new(),
                 "case {case:?}: repeating the list must remove nothing, got {repeated}",
             );
-            let after = stored_tags(&emulator, case, &arn).await;
+            let after = stored_tags(&emulator, region, case, &arn).await;
             assert_eq!(
                 after, expected,
                 "case {case:?}: repeating the list must leave the map at {expected:?}, \
@@ -321,7 +321,7 @@ async fn a_key_this_service_refuses_removes_nothing() {
             (400, "BadRequestException"),
             "case {case:?}: expected Untag to answer 400 BadRequestException, got {status} {body}",
         );
-        let stored = stored_tags(&emulator, &case, &arn).await;
+        let stored = stored_tags(&emulator, "us-east-1", &case, &arn).await;
         assert_eq!(
             stored, expected,
             "case {case:?}: a refused list must remove nothing, expected {expected:?}, \
@@ -343,7 +343,7 @@ async fn a_key_this_service_refuses_removes_nothing() {
         (400, "BadRequestException"),
         "a request carrying no Keys must be refused, got {status} {body}",
     );
-    let stored = stored_tags(&emulator, "no Keys at all", &arn).await;
+    let stored = stored_tags(&emulator, "us-east-1", "no Keys at all", &arn).await;
     assert_eq!(
         stored, expected,
         "a refused request must remove nothing, expected {expected:?}, got {stored:?}",
@@ -414,7 +414,7 @@ async fn an_arn_that_addresses_no_stored_group_removes_nothing() {
             "case {case:?}: expected Untag to answer {status} {code}, \
              got {answered_status} {body}",
         );
-        let stored = stored_tags(&emulator, case, &present).await;
+        let stored = stored_tags(&emulator, "us-east-1", case, &present).await;
         assert_eq!(
             stored, expected,
             "case {case:?}: the refusal must leave the stored group's tags at {expected:?}, \

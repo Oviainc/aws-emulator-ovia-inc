@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMemberDetectors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMemberDetectors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the stored configuration of each named member account's detector
+//! — the `Features` list and the deprecated `DataSources` view of the same switches — read
+//! off the member records the administrator's detector holds. An account that is not an
+//! associated member of this administrator is REPORTED in `UnprocessedAccounts`; a request
+//! the service cannot understand is refused with `BadRequestException`. A pure report:
+//! nothing here writes to the store.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMemberDetectors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +146,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMemberDetectors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMemberDetectorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMemberDetectors"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetMemberDetectorsErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let administrator = crate::state::administrator_account_id();
+
+        // Parameter failures first: a value that cannot be a value of its member at
+        // all is refused whatever the store holds, because `UnprocessedAccounts`
+        // reports accounts that were not PROCESSED, never a request that was not
+        // understood.
+        if !crate::state::is_detector_id(&input.detector_id) {
+            return Err(bad_request(crate::state::invalid_parameter_message(
+                crate::state::DETECTOR_ID_MEMBER,
+            )));
+        }
+        if input
+            .account_ids
+            .iter()
+            .any(|account_id| !crate::state::is_account_id(account_id))
+        {
+            return Err(bad_request(crate::state::invalid_parameter_message(
+                crate::state::ACCOUNT_ID_MEMBER,
+            )));
+        }
+
+        // A pure report: nothing below writes to the store.
+        let state = state.lock();
+        // Members hang off the detector that administers them, so only the
+        // account/Region that owns it reads their configuration.
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            return Err(bad_request(crate::state::detector_id_rejection(
+                &input.detector_id,
+            )));
+        };
+
+        let mut configurations = Vec::new();
+        let mut unprocessed = Vec::new();
+        let mut seen = ::std::collections::BTreeSet::new();
+        for account_id in &input.account_ids {
+            // `AccountIds` names a SET of accounts: a repeated id is reported once,
+            // on either list.
+            if !seen.insert(account_id.as_str()) {
+                continue;
+            }
+            match detector.members.get(account_id) {
+                // Only an account ASSOCIATED with this administrator is monitored
+                // under it, so only that account's configuration is reported here.
+                Some(member) if member.is_associated() => configurations
+                    .push(crate::state::member_data_source_configuration_view(member)),
+                _ => unprocessed.push(UnprocessedAccount {
+                    account_id: account_id.clone(),
+                    result: crate::state::not_a_member_message(&administrator),
+                }),
+            }
+        }
+
+        Ok(GetMemberDetectorsOutput {
+            member_data_source_configurations: configurations,
+            unprocessed_accounts: unprocessed,
+        })
     }
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type`
+/// member.
+fn bad_request(message: impl Into<String>) -> GetMemberDetectorsError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }

@@ -155,8 +155,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Authorization is not emulated: the emulator verifies request signatures
         // centrally but holds no principals or policies, so the modelled
         // `ForbiddenException` is deliberately unreachable here and a success says
-        // nothing about the caller's permissions.
-        let _ = ctx;
+        // nothing about the caller's permissions. `ctx` is read below for the region
+        // the request addressed.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetGroupErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -182,9 +182,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(crate::state::GROUP_NOT_FOUND_MESSAGE.to_string()),
             }))
         };
+        // A group lives in the region whose endpoint created it, so the request's
+        // own region is where the identifier is resolved: a group of another region
+        // answers no read here.
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
-        let name = store.lookup(identifier).ok_or_else(not_found)?;
-        let group = store.groups.get(&name).ok_or_else(not_found)?;
+        let key = store.lookup(&region, identifier).ok_or_else(not_found)?;
+        let group = store.groups.get(&key).ok_or_else(not_found)?;
         Ok(GetGroupOutput {
             group: Some(group.to_group()),
         })

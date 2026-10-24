@@ -245,7 +245,7 @@ async fn deletion_protection_refuses_a_delete_only_while_the_group_holds_resourc
                     "case {case:?}: expected the memberships to survive as {expected:?}, \
                      got {listed}",
                 );
-                let surviving_tags = stored_tags(&emulator, &case, &arn).await;
+                let surviving_tags = stored_tags(&emulator, "us-east-1", &case, &arn).await;
                 assert_eq!(
                     surviving_tags,
                     tag_pairs(),

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes from the Lightsail resource the request names every tag whose key the
+//! request lists, leaving the resource's other tags alone, and answers the
+//! operation-log entry the change appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +165,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A tag change is a regional call: a bucket, a container service and a
+        // load balancer are identified by the Region they were created in
+        // together with their name, so the Region of the request's SigV4
+        // credential scope is what `resourceName` is resolved in.
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_ms();
+
+        // `resourceName` and `tagKeys` are modelled `@required` members, and the
+        // pattern on each name is a modelled constraint, so the centralized walk
+        // refused anything outside them before this body ran. What is left is
+        // what the model cannot express: the name must be one this account
+        // holds, and an ARN the request carries as well must be that same
+        // resource's.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // The key list itself is NOT bounded here: the published 50-tag limit is
+        // on the tags a resource HOLDS, not on how many keys a removal may name,
+        // and a key the resource does not carry is simply nothing to remove. The
+        // keys go into a set, so the work is the resource's own tags against one
+        // lookup each however long the list is.
+        let keys: ::std::collections::BTreeSet<String> = input.tag_keys.into_iter().collect();
+        let name = input.resource_name;
+        let requested_arn = input.resource_arn;
+
+        crate::state::with_state(&*self.engine, |store| {
+            let resolved = store.with_tagged_record(&region, &name, |record, resource_type| {
+                // `resourceArn` is "the ARN of the resource from which you want
+                // to remove a tag" — the SAME resource `resourceName` names — so
+                // a request carrying both is served only when they agree, rather
+                // than one of the two being silently ignored.
+                if let Some(arn) = requested_arn.as_deref() {
+                    if arn != record.arn() {
+                        return Err(invalid(format!(
+                            "resourceArn '{arn}' is not the ARN of the resource named \
+                             '{name}'"
+                        )));
+                    }
+                }
+                let kept = crate::state::tags_without(record, &keys);
+                record.set_tags(kept);
+                Ok((resource_type, record.location().clone()))
+            });
+            // A name this account holds no resource of is Lightsail's
+            // `DoesNotExist` rejection, the same envelope every other not-found
+            // path in this crate answers with.
+            let Some(resolved) = resolved else {
+                return Err(not_found(&name, &region));
+            };
+            let (resource_type, location) = resolved?;
+            // `operations` is a list because other Lightsail calls act on
+            // several resources at once; this one changes the tags of exactly
+            // the one resource it names, so it answers exactly one entry.
+            let operation = store.record_untyped_operation(now, resource_type, &name, &location);
+            Ok(UntagResourceOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> UntagResourceError {
+    UntagResourceErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No resource of this account is stored under that name: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist`, and a message built from the request.
+///
+/// The message names the request's own members rather than one resource type,
+/// because the request names a resource without saying what kind it is; the
+/// Region is in it because the resources whose identity includes one are
+/// resolved in the Region the call was made in.
+fn not_found(name: &str, region: &str) -> UntagResourceError {
+    crate::scaffolded::Scaffolded::does_not_exist(format!(
+        "resourceName '{name}' does not name a resource of this account in {region}"
+    ))
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> UntagResourceError {
+    UntagResourceErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail resource store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

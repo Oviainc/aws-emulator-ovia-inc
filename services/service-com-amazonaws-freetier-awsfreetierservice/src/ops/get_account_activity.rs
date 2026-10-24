@@ -175,8 +175,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An id that cannot be an `ActivityId` is a malformed request, not a
         // missing activity: the framework refuses it before `handle` runs, and
-        // checking here keeps that a 400 rather than a 404 whatever the
-        // boundary does.
+        // checking here keeps that a `ValidationException` rather than a
+        // not-found whatever the boundary does.
         let activity_id = input.activity_id.as_str();
         if !crate::state::is_activity_id(activity_id) {
             return Err(validation(format!(
@@ -205,12 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .find(|activity| activity.activity_id == activity_id)
         else {
-            return Err(GetAccountActivityErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no activity with id {activity_id} exists for this account"),
-                },
-            )
-            .into());
+            return Err(unknown_activity(activity_id));
         };
 
         // `startedAt` appears only for an activity in the IN_PROGRESS or
@@ -246,4 +241,20 @@ fn validation(message: impl Into<String>) -> GetAccountActivityError {
         message: message.into(),
     })
     .into()
+}
+
+/// The modelled `ResourceNotFoundException` for a well-formed id that names no
+/// activity of the caller's account.
+///
+/// Answered with the status this service sends for that shape
+/// ([`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`]) rather than the status the
+/// model annotates on it, exactly as the service's other not-found path is: the
+/// shape, the body and the wire error code stay the modelled ones, so the status
+/// a client reads does not depend on which operation it asked.
+fn unknown_activity(activity_id: &str) -> GetAccountActivityError {
+    crate::scaffolded::resource_not_found(
+        GetAccountActivityErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message: format!("no activity with id {activity_id} exists for this account"),
+        }),
+    )
 }

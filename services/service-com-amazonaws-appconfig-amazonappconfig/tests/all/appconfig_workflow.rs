@@ -1535,7 +1535,7 @@ fn created_deployment_strategies_are_bounded() {
 
 /// What `StartDeployment` persists about a deployment, for the schedule tests that
 /// drive `state::Deployment` directly.
-fn new_deployment() -> NewDeployment {
+pub(crate) fn new_deployment() -> NewDeployment {
     NewDeployment {
         deployment_number: 1,
         application_id: "abcd123".to_string(),
