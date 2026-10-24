@@ -41,6 +41,8 @@ mod entity_detection;
 // whole-document baselines that `entity_detection` asserts the rules of.
 #[path = "all/scratch_dump.rs"]
 mod scratch_dump;
+#[path = "all/key_phrases.rs"]
+mod key_phrases;
 #[path = "all/key_phrases_jobs.rs"]
 mod key_phrases_jobs;
 #[path = "all/pii_detection.rs"]

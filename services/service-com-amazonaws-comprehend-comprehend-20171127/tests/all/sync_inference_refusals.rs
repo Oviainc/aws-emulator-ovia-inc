@@ -53,6 +53,7 @@ const BATCH_OPERATIONS: &[(&str, u16)] = &[
     ("BatchDetectSentiment", 200),
     ("BatchDetectDominantLanguage", 200),
     ("BatchDetectSyntax", 200),
+    ("BatchDetectKeyPhrases", 200),
     ("BatchDetectEntities", 501),
 ];
 
