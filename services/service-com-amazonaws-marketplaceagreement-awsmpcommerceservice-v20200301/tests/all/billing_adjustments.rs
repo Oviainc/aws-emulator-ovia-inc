@@ -250,7 +250,7 @@ async fn every_filter_selects_on_the_stored_request() {
             expected: every.clone(),
         },
         Listing {
-            case: "another agreementType selects nothing".to_string(),
+            case: "the other agreement type the member admits selects nothing".to_string(),
             request: json!({"agreementType": "VendorInsightsAgreement"}),
             expected: vec![],
         },
