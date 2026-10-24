@@ -19,8 +19,9 @@
 //! a new file under `src/ops/` would be picked up by `build.rs` as an operation.
 
 use crate::ops::types::{
-    Action, ActionHistory, ActionHistoryDetails, Budget, CostTypes, Definition, HealthStatus,
-    Notification, NotificationWithSubscribers, ResourceTag, Spend, Subscriber, TimePeriod,
+    Action, ActionHistory, ActionHistoryDetails, Budget, CalculatedSpend, CostTypes, Definition,
+    HealthStatus, Notification, NotificationWithSubscribers, ResourceTag, Spend, Subscriber,
+    TimePeriod,
 };
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -682,8 +683,9 @@ pub fn stamp_service_owned(budget: &mut Budget, at: SystemTime, previous: Option
 /// * `CalculatedSpend` — "the actual and forecasted cost or usage that the budget
 ///   tracks" (`Budget$CalculatedSpend`), and the one member `UpdateBudget` documents a
 ///   caller cannot change ("you can change every part of a budget except for the
-///   `budgetName` and the `calculatedSpend`"). With nothing spent behind the budget
-///   there is no actual or forecasted amount to report.
+///   `budgetName` and the `calculatedSpend`"). The service computes it from the usage it
+///   has attributed to the budget, so the write path stores none and every read reports
+///   the computed figure instead (see [`calculated_spend`]).
 /// * `AutoAdjustData$LastAutoAdjustTime` — "the last time that your budget was
 ///   auto-adjusted". Adjusting an auto-adjusting budget's amount means averaging the
 ///   account's historical or forecasted cost, which this emulator holds none of, so it
@@ -957,12 +959,16 @@ pub fn planned_limit_in_force(planned: &HashMap<String, Spend>, at: SystemTime) 
 
 /// The `Budget` a read reports for `stored`, as of `at`.
 ///
-/// Every member is the one the write path stored, except the `BudgetLimit` of a
-/// planned-limit budget, which is derived: "`DescribeBudget` and `DescribeBudgets`
-/// response along with `PlannedBudgetLimits` also contain `BudgetLimit` representing the
-/// current month or quarter limit present in `PlannedBudgetLimits`"
-/// (`Budget$PlannedBudgetLimits`). It is derived on the READ and never written back —
-/// which entry is in force follows the clock, not anything a caller did.
+/// Every member is the one the write path stored, except the two the SERVICE computes on
+/// the read:
+///
+/// * the `BudgetLimit` of a planned-limit budget: "`DescribeBudget` and `DescribeBudgets`
+///   response along with `PlannedBudgetLimits` also contain `BudgetLimit` representing the
+///   current month or quarter limit present in `PlannedBudgetLimits`"
+///   (`Budget$PlannedBudgetLimits`). Which entry is in force follows the clock, not
+///   anything a caller did, so it is derived here and never written back.
+/// * `CalculatedSpend`, the cost or usage the budget tracks (see [`calculated_spend`]),
+///   which no request can set and every read reports.
 pub fn project_budget(stored: &StoredBudget, at: SystemTime) -> Budget {
     let mut budget = stored.budget.clone();
     if budget.budget_limit.is_none() {
@@ -970,7 +976,52 @@ pub fn project_budget(stored: &StoredBudget, at: SystemTime) -> Budget {
             budget.budget_limit = planned_limit_in_force(planned, at);
         }
     }
+    budget.calculated_spend = calculated_spend(&budget);
     budget
+}
+
+/// The amount of cost or usage attributed to a budget this emulator holds.
+///
+/// Nothing in this emulator spends behind a budget — it holds budgets, their
+/// notifications, their actions and their tags, and no usage records — so the amount
+/// attributed to any one of them is the sum over an empty set of usage. That figure is
+/// reported in the budget's own unit (see [`calculated_spend`]), and it satisfies the
+/// `NumericValue` `@pattern` every `Spend$Amount` is validated against.
+pub const ATTRIBUTED_SPEND_AMOUNT: &str = "0";
+
+/// The `CalculatedSpend` a read reports for `budget` — "the actual and forecasted cost or
+/// usage that the budget tracks" (`Budget$CalculatedSpend`).
+///
+/// The service, not the caller, computes it (`UpdateBudget`: "you can change every part of
+/// a budget except for the `budgetName` and the `calculatedSpend`"), and
+/// `CalculatedSpend$ActualSpend` is `@required`, so a read reports the spend it has for
+/// the budget rather than leaving the member out:
+///
+/// * `ActualSpend` is "the amount of cost, usage, RI units, or Savings Plans units that
+///   you used" — [`ATTRIBUTED_SPEND_AMOUNT`] here — measured in the unit the budget
+///   tracks. `Spend$Unit` is "the unit of measurement that's used for the budget forecast,
+///   actual spend, or budget threshold", one unit for all three, so it is the unit of the
+///   limit THIS read reports: the fixed `BudgetLimit`, the planned entry in force, or the
+///   utilization/coverage default (see [`apply_percentage_limit_default`]).
+/// * `ForecastedSpend` is "the amount … that you're forecasted to use", "predicted based
+///   on your historical usage profile" (`CalculatedSpend`). There is no usage history here
+///   to predict from, so no forecast is reported — the member is optional, and a figure
+///   nothing forecast would be invented rather than computed.
+///
+/// `None` for a budget whose read reports no limit at all — the auto-adjusting budget
+/// whose amount AWS averages from cost data this emulator does not hold (see
+/// [`drop_service_derived`]). Nothing in such a record names a unit of measurement, and
+/// `Spend$Unit` is `@required`, so there is no spend to report rather than one measured in
+/// a unit this service made up.
+fn calculated_spend(budget: &Budget) -> Option<CalculatedSpend> {
+    let limit = budget.budget_limit.as_ref()?;
+    Some(CalculatedSpend {
+        actual_spend: Spend {
+            amount: ATTRIBUTED_SPEND_AMOUNT.to_string(),
+            unit: limit.unit.clone(),
+        },
+        forecasted_spend: None,
+    })
 }
 
 /// Marker the opaque pagination token carries, so a token minted by another

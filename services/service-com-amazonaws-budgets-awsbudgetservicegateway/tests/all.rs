@@ -35,6 +35,8 @@ mod budget_lifecycle;
 mod budget_read_projection;
 #[path = "all/budget_validation_rules.rs"]
 mod budget_validation_rules;
+#[path = "all/calculated_spend.rs"]
+mod calculated_spend;
 #[path = "all/client_error_envelopes.rs"]
 mod client_error_envelopes;
 #[path = "all/notification_deletion.rs"]
