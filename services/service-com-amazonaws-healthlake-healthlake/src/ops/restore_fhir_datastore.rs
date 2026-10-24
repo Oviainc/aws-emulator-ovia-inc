@@ -249,8 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::DatastoreStatus::Active => {}
                 // `ConflictException` is modelled as "the data store is in a
                 // transition state and the user requested action cannot be
-                // performed" — which is exactly `CREATING` and `DELETING`.
+                // performed" — which is exactly `CREATING`, `UPDATING` and
+                // `DELETING`.
                 crate::state::DatastoreStatus::Creating
+                | crate::state::DatastoreStatus::Updating
                 | crate::state::DatastoreStatus::Deleting => {
                     return Err(RestoreFHIRDatastoreErrorModeled::ConflictException(
                         ConflictException {
