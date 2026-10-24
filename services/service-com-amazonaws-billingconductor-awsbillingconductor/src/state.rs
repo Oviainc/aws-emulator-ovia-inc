@@ -387,9 +387,21 @@ impl TieringRecord {
     }
 }
 
-/// A billing group as `CreateBillingGroup` persisted it. `Size`, `Status` and
-/// `BillingGroupType` are DERIVED (see the methods below), never stored, so they
-/// cannot drift from the membership and the preferences they are computed from.
+/// The billing group statuses a CALLER may ask for, out of the three the modelled
+/// `BillingGroupStatus` enumerates
+/// (`smithy_query(query="shape",shape="BillingGroupStatus")`).
+///
+/// `PRIMARY_ACCOUNT_MISSING` is not among them: it reports that the group has no
+/// billing owner, a condition of the resource the service DERIVES (see
+/// [`BillingGroupRecord::status`]), so it is not a status a request chooses. The
+/// other two say whether the group is billing (`ACTIVE`) or not yet (`PENDING`),
+/// which is the group's own operational state and so is the caller's to set.
+pub const CALLER_SETTABLE_BILLING_GROUP_STATUSES: &[&str] = &["ACTIVE", "PENDING"];
+
+/// A billing group as `CreateBillingGroup` persisted it. `Size`,
+/// `BillingGroupType` and the owner half of `Status` are DERIVED (see the methods
+/// below), never stored, so they cannot drift from the membership and the
+/// preferences they are computed from.
 #[derive(Debug, Clone, Default)]
 pub struct BillingGroupRecord {
     pub arn: String,
@@ -400,6 +412,11 @@ pub struct BillingGroupRecord {
     pub linked_account_ids: Vec<String>,
     pub auto_associate: Option<bool>,
     pub responsibility_transfer_arn: Option<String>,
+    /// The operational `BillingGroupStatus` a caller asked this group to hold, one
+    /// of [`CALLER_SETTABLE_BILLING_GROUP_STATUSES`]. `None` for a group no caller
+    /// has set a status on, which reads back as `ACTIVE` — the status a group with a
+    /// billing owner holds until something says otherwise.
+    pub requested_status: Option<String>,
     pub tags: BTreeMap<String, String>,
     pub creation_time_millis: i64,
     pub last_modified_time_millis: i64,
@@ -411,26 +428,42 @@ impl BillingGroupRecord {
         i64::try_from(self.linked_account_ids.len()).unwrap_or(i64::MAX)
     }
 
-    /// `BillingGroupStatus`. A group needs a billing owner: either a primary
-    /// account, or a responsibility transfer relationship — the model documents
+    /// True when the group has a billing owner: either a primary account, or a
+    /// responsibility transfer relationship — the model documents
     /// `AccountGrouping.ResponsibilityTransferArn` as "When specified, the
-    /// PrimaryAccountId is no longer required". Without either, the group is
-    /// `PRIMARY_ACCOUNT_MISSING`.
+    /// PrimaryAccountId is no longer required".
+    pub fn has_billing_owner(&self) -> bool {
+        self.primary_account_id.is_some() || self.responsibility_transfer_arn.is_some()
+    }
+
+    /// `BillingGroupStatus`. A group with no billing owner
+    /// ([`has_billing_owner`](Self::has_billing_owner)) is `PRIMARY_ACCOUNT_MISSING`,
+    /// whatever any request asked for: that status reports the absence rather than a
+    /// choice. A group that HAS one holds the operational status last asked for, and
+    /// `ACTIVE` until one is.
     pub fn status(&self) -> &'static str {
-        if self.primary_account_id.is_some() || self.responsibility_transfer_arn.is_some() {
-            "ACTIVE"
-        } else {
-            "PRIMARY_ACCOUNT_MISSING"
+        if !self.has_billing_owner() {
+            return "PRIMARY_ACCOUNT_MISSING";
+        }
+        match self.requested_status.as_deref() {
+            Some("PENDING") => "PENDING",
+            _ => "ACTIVE",
         }
     }
 
     /// `StatusReason`: why the group is in [`status`](Self::status), absent when it
     /// is `ACTIVE`.
     pub fn status_reason(&self) -> Option<String> {
-        (self.status() == "PRIMARY_ACCOUNT_MISSING").then(|| {
-            "The billing group has no primary account and no responsibility transfer ARN."
-                .to_string()
-        })
+        match self.status() {
+            "PRIMARY_ACCOUNT_MISSING" => Some(
+                "The billing group has no primary account and no responsibility transfer ARN."
+                    .to_string(),
+            ),
+            "PENDING" => {
+                Some("The billing group is not billing yet at its owner's request.".to_string())
+            }
+            _ => None,
+        }
     }
 
     /// `BillingGroupType`: a group that bills through a transfer relationship is
@@ -1068,6 +1101,17 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             .get(name)
             .map(String::as_str)
             .filter(|existing| *existing != plan_arn)
+    }
+
+    /// The billing group a name is taken by, when it is not `group_arn`'s own name —
+    /// the uniqueness index behind "The names must be unique to each billing group",
+    /// decided the same way as for a pricing plan so a rename to the name already
+    /// held is not a conflict.
+    pub fn conflicting_billing_group_name(&self, name: &str, group_arn: &str) -> Option<&str> {
+        self.billing_group_names
+            .get(name)
+            .map(String::as_str)
+            .filter(|existing| *existing != group_arn)
     }
 
     /// The group an account is already associated with, when it is not `group_arn`.
