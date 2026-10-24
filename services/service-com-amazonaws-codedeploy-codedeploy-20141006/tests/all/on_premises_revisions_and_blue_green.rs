@@ -253,10 +253,16 @@ async fn an_on_premises_instance_reads_back_as_it_was_registered() {
             Some(*name),
             "case {name:?}: expected the registered instanceName, got {info:?}"
         );
-        assert_eq!(
-            info["instanceArn"].as_str(),
-            Some(format!("arn:aws:codedeploy:{REGION}:{ACCOUNT}:instance/{name}").as_str()),
-            "case {name:?}: expected the minted instanceArn, got {info:?}"
+        // The ARN names this REGISTRATION: the host name, then the registration
+        // id the service minted for it.
+        let arn_prefix = format!("arn:aws:codedeploy:{REGION}:{ACCOUNT}:instance/{name}_");
+        let reported_arn = info["instanceArn"].as_str().unwrap_or_default();
+        assert!(
+            reported_arn
+                .strip_prefix(arn_prefix.as_str())
+                .is_some_and(|registration| !registration.is_empty()),
+            "case {name:?}: expected the minted instanceArn to start {arn_prefix:?} and carry a \
+             registration id, got {info:?}"
         );
         assert_eq!(
             info[*arn_member].as_str(),
@@ -330,7 +336,6 @@ async fn reading_an_unregistered_on_premises_instance_is_refused() {
         "never-registered-name",
         "REGISTERED-ONE",
         "registered-one.2",
-        "i-0123456789abcdef0",
     ] {
         let code = emulator
             .refused(name, "GetOnPremisesInstance", json!({"instanceName": name}))
@@ -364,6 +369,13 @@ async fn reading_an_unregistered_on_premises_instance_is_refused() {
         (
             "a name longer than the service's name length",
             json!({"instanceName": "n".repeat(101)}),
+            "InvalidInstanceNameException",
+        ),
+        (
+            // The EC2-instance-id form is RESERVED, so it is refused as a name
+            // rather than reported as a host nothing registered.
+            "a name in the reserved EC2 instance id form",
+            json!({"instanceName": "i-0123456789abcdef0"}),
             "InvalidInstanceNameException",
         ),
     ] {
@@ -471,14 +483,15 @@ async fn deregistering_an_on_premises_instance_retires_its_record() {
     );
 }
 
-/// RULE: a batch read carries at most the number of names the model documents
-/// for `instanceNames` (25) and at least one, and a batch outside that range is
-/// refused as a client error rather than served.
+/// RULE: a batch read carries at most the number of names
+/// `BatchLimitExceededException` states as the request-size quota (100) and at
+/// least one, and a batch outside that range is refused as a client error rather
+/// than served.
 #[tokio::test]
 async fn a_batch_of_on_premises_instances_is_held_to_the_documented_limit() {
     let emulator = Emulator::new();
     let names: Vec<String> = (0..101).map(|index| format!("batched-{index:03}")).collect();
-    for name in names.iter().take(26) {
+    for name in names.iter().take(100) {
         emulator
             .ok(
                 "RegisterOnPremisesInstance",
@@ -490,14 +503,15 @@ async fn a_batch_of_on_premises_instances_is_held_to_the_documented_limit() {
             .await;
     }
 
-    // Rows: each published bound, one past it, and the batch the recorded client
-    // sent. The limit (25) is the one the model documents for the member.
+    // Rows: an empty batch, sizes inside the quota (including the 25 the
+    // operation's own prose names and one past it), the quota itself, and one
+    // past it.
     let cases: &[(usize, Option<&str>)] = &[
         (0, Some("InstanceNameRequiredException")),
         (1, None),
-        (24, None),
         (25, None),
-        (26, Some("BatchLimitExceededException")),
+        (26, None),
+        (100, None),
         (101, Some("BatchLimitExceededException")),
     ];
 
