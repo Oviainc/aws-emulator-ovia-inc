@@ -464,6 +464,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
+        // "you can optionally run your service behind one or more load balancers. The
+        // load balancers distribute traffic across the tasks that are associated with
+        // the service": each `loadBalancers` entry names a target group the scheduler
+        // registers this service's tasks into, and whether it CAN carry them is decided
+        // by the target group's own `TargetType` — which lives in the Elastic Load
+        // Balancing v2 service's store, not in this request. Read BEFORE this service's
+        // store is locked, so the cross-service read holds no guard of ours (see
+        // `crate::state::target_group_target_types`).
+        let requested_load_balancers = input.load_balancers.clone().unwrap_or_default();
+        // The list is caller-supplied and every entry costs a lookup in another service's
+        // store, so it is bounded HERE, before any per-entry work and before either store
+        // is locked, at the ECS service quota for target groups per service. The refusal
+        // is a `ClientException` ("specifying an identifier that isn't valid" and the
+        // other client-side refusals) to match this crate's other caller-supplied-list
+        // bound, `MAX_CONTAINER_DEFINITIONS` in `register_task_definition`.
+        if requested_load_balancers.len() > crate::state::MAX_LOAD_BALANCERS {
+            return Err(CreateServiceErrorModeled::ClientException(ClientException {
+                message: Some(format!(
+                    "loadBalancers must name at most {} load balancers; got {}",
+                    crate::state::MAX_LOAD_BALANCERS,
+                    requested_load_balancers.len()
+                )),
+            })
+            .into());
+        }
+        let target_group_arns =
+            crate::state::requested_target_group_arns(&requested_load_balancers);
+        let target_types =
+            crate::state::target_group_target_types(&*self.engine, &target_group_arns)
+                .ok_or_else(|| {
+                    CreateServiceErrorModeled::ServerException(ServerException {
+                        message: Some(
+                            "the Elastic Load Balancing store is unavailable".to_string(),
+                        ),
+                    })
+                })?;
+
         let mut guard = state.lock();
         guard.advance_clock(now);
 
@@ -523,6 +560,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+        }
+
+        // The pairing the target group's `TargetType` must satisfy: an `awsvpc` task is
+        // registered by the IP of its own elastic network interface, every other network
+        // mode by the container instance that runs it
+        // (`crate::state::load_balancer_refusal`).
+        if let Some(message) = crate::state::load_balancer_refusal(
+            &requested_load_balancers,
+            definition.as_ref().map(|found| found.network_mode.as_str()),
+            &target_types,
+        ) {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
         }
 
         let key = (cluster_name.clone(), name.clone());
@@ -605,7 +659,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "If your account has already created the Amazon ECS service-linked role,
             // that role is used for your service unless you specify a role here."
             role_arn: crate::state::service_role_arn(input.role.as_deref(), scheduler_owned),
-            load_balancers: input.load_balancers.clone().unwrap_or_default(),
+            load_balancers: requested_load_balancers,
             service_registries: input.service_registries.clone().unwrap_or_default(),
             deployment_configuration: crate::state::deployment_configuration(
                 input.deployment_configuration.clone(),

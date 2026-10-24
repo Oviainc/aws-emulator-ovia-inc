@@ -289,6 +289,14 @@ pub const MAX_LIST_PAGE_SIZE: i32 = 100;
 /// containers every task of that revision mints and every describe renders.
 pub const MAX_CONTAINER_DEFINITIONS: usize = 10;
 
+/// How many load-balancer attachments one service may be given. The Amazon ECS service
+/// quota "Target groups per service" is 5, and the cap is also what bounds the work ONE
+/// `CreateService` or `UpdateService` can ask for: every entry names up to two target
+/// groups that are looked up in the Elastic Load Balancing v2 service's store, so
+/// without it a caller could repeat an entry up to the request-body cap and set both how
+/// much work this request does and how long that other service's lock is held.
+pub const MAX_LOAD_BALANCERS: usize = 5;
+
 /// How many ids one describe request may name. Amazon ECS accepts at most 100 per
 /// `DescribeClusters`/`DescribeTasks`/`DescribeContainerInstances` call, and the cap is
 /// also what bounds the work
@@ -421,6 +429,16 @@ pub const NETWORK_MODE_HOST: &str = "host";
 /// `NetworkMode` enum. The `networkMode` doc: "If the network mode is set to none, you
 /// cannot specify port mappings in your container definitions".
 pub const NETWORK_MODE_NONE: &str = "none";
+
+/// The ELBv2 `TargetType` that registers a target by IP address, from that service's
+/// `TargetTypeEnum` (`smithy_query(query="shape", shape="TargetTypeEnum",
+/// model_path="services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10/smithy-model/com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10.json")`:
+/// `instance`, `ip`, `lambda`, `alb`).
+pub const TARGET_TYPE_IP: &str = "ip";
+
+/// The ELBv2 `TargetType` that registers a target by EC2 instance id, from the same
+/// enum as [`TARGET_TYPE_IP`].
+pub const TARGET_TYPE_INSTANCE: &str = "instance";
 
 /// The `protocol` a port mapping takes when the registration names none. The
 /// `PortMapping$protocol` doc: "Valid values are tcp and udp (case-sensitive). The
@@ -3252,6 +3270,141 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 /// Now, as the wire timestamp type every modelled timestamp member uses.
 pub fn now() -> DateTime {
     DateTime::from(SystemTime::now())
+}
+
+/// The `TargetType` a target group must carry to receive the tasks of a revision whose
+/// `networkMode` is `network_mode`.
+///
+/// `LoadBalancer$targetGroupArn`: "If your service's task definition uses the `awsvpc`
+/// network mode, you must choose `ip` as the target type, not `instance`. Do this when
+/// creating your target groups because tasks that use the `awsvpc` network mode are
+/// associated with an elastic network interface, not an Amazon EC2 instance." Every
+/// other mode (`bridge`, [`NETWORK_MODE_HOST`], [`NETWORK_MODE_NONE`]) leaves the task
+/// on the container instance's network interface, so the load balancer reaches it at
+/// that instance — the `instance` target type.
+pub fn required_target_type(network_mode: &str) -> &'static str {
+    if network_mode == NETWORK_MODE_AWSVPC {
+        TARGET_TYPE_IP
+    } else {
+        TARGET_TYPE_INSTANCE
+    }
+}
+
+/// Every ELBv2 target group a `loadBalancers` list names, in request order: each entry's
+/// `targetGroupArn` plus the `alternateTargetGroupArn` of its `advancedConfiguration`,
+/// which a blue/green deployment registers the SAME tasks into and which is therefore
+/// bound by the same rule.
+///
+/// The list is caller-supplied, so the duplicate check is a hash-set lookup rather than a
+/// scan — the walk is linear in the list, and the list itself is bounded by
+/// [`MAX_LOAD_BALANCERS`] before a handler calls this.
+pub fn requested_target_group_arns(load_balancers: &[LoadBalancer]) -> Vec<String> {
+    let mut arns = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in load_balancers {
+        for arn in [
+            entry.target_group_arn.as_deref(),
+            entry
+                .advanced_configuration
+                .as_ref()
+                .and_then(|advanced| advanced.alternate_target_group_arn.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if seen.insert(arn.to_string()) {
+                arns.push(arn.to_string());
+            }
+        }
+    }
+    arns
+}
+
+/// The `TargetType` of each ELBv2 target group in `arns`, read from the Elastic Load
+/// Balancing v2 service's OWN store through the one shared engine — so a target group
+/// created over that API is seen here with no propagation step and no second copy of it
+/// kept in this service's state. An ARN that names no stored target group is absent from
+/// the answer.
+///
+/// `None` when that store is unreachable (the engine is not the shared in-memory one),
+/// which a handler answers with the same modelled server error it uses for its own
+/// store being unreachable.
+///
+/// LOCK ORDER: this takes the ELBv2 store's lock and holds no other while it does, and
+/// it hands back owned values rather than a guard — so it is called with NO guard of
+/// this service's store held. Keeping the cross-service read one-directional and
+/// guard-free is what makes a lock cycle between the two stores unreachable. The map it
+/// allocates is bounded by the request's own `loadBalancers` list.
+pub fn target_group_target_types<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    arns: &[String],
+) -> Option<HashMap<String, String>> {
+    let state =
+        ::service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::service_state(
+            engine,
+        )?;
+    let store = state.lock();
+    Some(
+        arns.iter()
+            .filter_map(|arn| {
+                store
+                    .target_groups
+                    .get(arn)
+                    .map(|group| (arn.clone(), group.target_type.clone()))
+            })
+            .collect(),
+    )
+}
+
+/// The refusal a `loadBalancers` list a request NAMES earns, or `None` when every target
+/// group it names exists and can carry the service's tasks.
+///
+/// `target_types` is what [`target_group_target_types`] read for
+/// [`requested_target_group_arns`] of the same list: an ARN it does not hold names no
+/// target group at all, and one it does is checked by [`target_group_type_refusal`]. A
+/// service with no resolved task definition (a deployment controller that takes its tasks
+/// from a task set) has no network mode to check against, so only the existence of the
+/// target group is.
+pub fn load_balancer_refusal(
+    load_balancers: &[LoadBalancer],
+    network_mode: Option<&str>,
+    target_types: &HashMap<String, String>,
+) -> Option<String> {
+    let arns = requested_target_group_arns(load_balancers);
+    for arn in &arns {
+        if !target_types.contains_key(arn) {
+            return Some(format!(
+                "The target group with targetGroupArn {arn} does not exist"
+            ));
+        }
+    }
+    network_mode.and_then(|mode| target_group_type_refusal(&arns, mode, target_types))
+}
+
+/// The compatibility half of [`load_balancer_refusal`]: the refusal the target groups in
+/// `arns` earn against a revision whose `networkMode` is `network_mode`, over those the
+/// ELBv2 store still holds. `None` when every one of them carries the target type
+/// [`required_target_type`] names for that mode.
+pub fn target_group_type_refusal(
+    arns: &[String],
+    network_mode: &str,
+    target_types: &HashMap<String, String>,
+) -> Option<String> {
+    let required = required_target_type(network_mode);
+    for arn in arns {
+        let Some(target_type) = target_types.get(arn) else {
+            continue;
+        };
+        if target_type != required {
+            return Some(format!(
+                "The provided target group {arn} has target type {target_type}, which is \
+                 incompatible with the {network_mode} network mode of the task definition; \
+                 a service whose task definition uses the {network_mode} network mode \
+                 requires a target group of target type {required}"
+            ));
+        }
+    }
+    None
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
