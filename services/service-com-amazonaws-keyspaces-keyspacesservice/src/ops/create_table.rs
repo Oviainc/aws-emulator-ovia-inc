@@ -440,6 +440,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 replica_specifications,
                 warm_throughput_specification,
                 tags,
+                // A table whose schema and TTL settings have never changed has one
+                // revision of them — the current one — so nothing is superseded yet.
+                superseded: Vec::new(),
+                // A create is not a restore, so this table has no restore origin.
+                restored_from: None,
+                // Nothing has been dropped, so every instant since this create is one whose
+                // restorable settings are known.
+                earliest_known_settings: None,
             },
         );
         // The clock now owes this table its ACTIVE transition; tell the store the earliest

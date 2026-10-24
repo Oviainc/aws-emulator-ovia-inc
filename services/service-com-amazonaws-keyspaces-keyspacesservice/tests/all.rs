@@ -27,6 +27,8 @@ mod list_types;
 mod multi_region_table_replicas;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/restore_table.rs"]
+mod restore_table;
 #[path = "all/service_managed_catalog.rs"]
 mod service_managed_catalog;
 #[path = "all/state_roundtrip.rs"]

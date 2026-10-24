@@ -155,6 +155,17 @@ pub(crate) fn table_arn(keyspace: &str, table: &str) -> String {
     )
 }
 
+/// The epoch-seconds instant a call ran at, as the JSON timestamps on this protocol are
+/// carried and compared.
+///
+/// Shared with the other suites of this test binary, so there is ONE conversion for this
+/// service rather than a copy per file.
+pub(crate) fn epoch_seconds(at: std::time::SystemTime) -> f64 {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .expect("the test clock is after the epoch")
+        .as_secs_f64()
+}
+
 /// The smallest schema the model accepts: one partition key drawn from two columns.
 pub(crate) fn minimal_schema(partition_key: &str) -> Value {
     json!({
