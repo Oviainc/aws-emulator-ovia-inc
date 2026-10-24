@@ -27,7 +27,9 @@ use crate::rest_api_lifecycle::{assert_failure, create_api, string_member, Answe
 
 /// A Lambda authorizer URI of the form the `authorizerUri` member documents:
 /// `arn:aws:apigateway:{region}:lambda:path/2015-03-31/functions/[FunctionARN]/invocations`.
-fn lambda_uri(function: &str) -> String {
+/// Shared with the `flush_stage_authorizers_cache` suite, which needs authorizers on the
+/// APIs whose stages it flushes.
+pub(crate) fn lambda_uri(function: &str) -> String {
     format!(
         "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/\
          arn:aws:lambda:us-east-1:123456789012:function:{function}/invocations"
@@ -35,8 +37,9 @@ fn lambda_uri(function: &str) -> String {
 }
 
 /// A Cognito user pool ARN of the form the `providerARNs` member documents:
-/// `arn:aws:cognito-idp:{region}:{account_id}:userpool/{user_pool_id}`.
-fn user_pool_arn(pool: &str) -> String {
+/// `arn:aws:cognito-idp:{region}:{account_id}:userpool/{user_pool_id}`. Shared with the
+/// `flush_stage_authorizers_cache` suite.
+pub(crate) fn user_pool_arn(pool: &str) -> String {
     format!("arn:aws:cognito-idp:us-east-1:123456789012:userpool/{pool}")
 }
 
@@ -47,8 +50,10 @@ async fn create_authorizer(gateway: &Gateway, api: &str, request: Value) -> Answ
         .await
 }
 
-/// `GetAuthorizer` for `authorizer` of `api`.
-async fn get_authorizer(gateway: &Gateway, api: &str, authorizer: &str) -> Answer {
+/// `GetAuthorizer` for `authorizer` of `api`. Shared with the
+/// `flush_stage_authorizers_cache` suite, which reads an authorizer back to see that a
+/// cache flush did not touch it.
+pub(crate) async fn get_authorizer(gateway: &Gateway, api: &str, authorizer: &str) -> Answer {
     gateway
         .call(
             "GET",
@@ -59,7 +64,13 @@ async fn get_authorizer(gateway: &Gateway, api: &str, authorizer: &str) -> Answe
 }
 
 /// `CreateAuthorizer` with `request`, asserting the modelled 201 and answering the body.
-async fn created_authorizer(gateway: &Gateway, api: &str, case: &str, request: Value) -> Value {
+/// Shared with the `flush_stage_authorizers_cache` suite.
+pub(crate) async fn created_authorizer(
+    gateway: &Gateway,
+    api: &str,
+    case: &str,
+    request: Value,
+) -> Value {
     let answer = create_authorizer(gateway, api, request).await;
     assert_eq!(
         answer.status, 201,

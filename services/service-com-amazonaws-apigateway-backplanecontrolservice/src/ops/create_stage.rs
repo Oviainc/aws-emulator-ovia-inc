@@ -401,6 +401,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             // No flush has run on a stage this call creates.
             cache_flush_done_at: None,
+            authorizers_cache_flushed_at: None,
             variables: input
                 .variables
                 .unwrap_or_default()

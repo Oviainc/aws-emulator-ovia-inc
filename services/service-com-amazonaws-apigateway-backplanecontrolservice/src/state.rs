@@ -266,6 +266,21 @@ pub struct StageEntry {
     /// it on, so an instant already in the past means no flush is outstanding; absent
     /// until the stage is flushed at all. See [`CACHE_CLUSTER_FLUSH_SPAN`].
     pub cache_flush_done_at: Option<::std::time::Instant>,
+    /// When `FlushStageAuthorizersCache` LAST dropped this stage's authorizer cache
+    /// entries; absent until the stage's authorizer cache is flushed at all.
+    ///
+    /// This is the stage's authorizer-cache invalidation watermark: an authorizer result
+    /// cached before this instant is no longer usable, so a reader of a cached authorizer
+    /// result must treat anything older as a miss. Unlike a cache cluster, which a stage
+    /// only has when the caller asked for one, EVERY stage has an authorizer cache (each
+    /// authorizer caches its result for its own
+    /// `authorizerResultTtlInSeconds`), so this watermark is written on every accepted
+    /// flush of a stage that exists.
+    ///
+    /// No operation of this service REPORTS it: API Gateway's `Stage` has no member for
+    /// the authorizer cache, so a flush of it leaves every member `GetStage` reports —
+    /// `cacheClusterStatus` included — exactly as it was.
+    pub authorizers_cache_flushed_at: Option<::std::time::Instant>,
     pub variables: BTreeMap<String, String>,
     pub documentation_version: Option<String>,
     pub canary_settings: Option<CanarySettings>,

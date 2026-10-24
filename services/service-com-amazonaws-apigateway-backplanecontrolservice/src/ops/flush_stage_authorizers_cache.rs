@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op FlushStageAuthorizersCache
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `FlushStageAuthorizersCache`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`FlushStageAuthorizersCache::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Drops every authorizer cache entry of one stage of a REST API.
+//!
+//! The call addresses the stage's AUTHORIZER cache (`DELETE
+//! /restapis/{restApiId}/stages/{stageName}/cache/authorizers`), so it resolves the API
+//! and the stage — a label naming neither is a 404 `NotFoundException` — and then
+//! invalidates that stage's cached authorizer results by stamping the stage's
+//! invalidation watermark ([`crate::state::StageEntry::authorizers_cache_flushed_at`]):
+//! a result cached before that instant is no longer usable.
+//!
+//! Every stage has an authorizer cache — each authorizer caches its result for its own
+//! `authorizerResultTtlInSeconds` — so, unlike `FlushStageCache`, which can address a
+//! stage that has no cache cluster, this flush always has a cache to empty and is
+//! recorded on every stage it resolves, whether or not the API has authorizers yet.
+//!
+//! Dropping cached results neither deletes the authorizers themselves nor touches the
+//! stage's cache CLUSTER: `Stage` models no member for the authorizer cache, so every
+//! member a later `GetStage` reports — `cacheClusterStatus` included — reads back
+//! unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +181,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `FlushStageAuthorizersCache` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(FlushStageAuthorizersCacheErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("FlushStageAuthorizersCache"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+            FlushStageAuthorizersCacheErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+            })
+        })?;
+        let stage = api.stages.get_mut(&input.stage_name).ok_or_else(|| {
+            FlushStageAuthorizersCacheErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_STAGE.to_string()),
+            })
+        })?;
+        // The flush is recorded as the instant from which cached authorizer results of
+        // this stage are invalid, so a result cached before this call is a miss and one
+        // cached after it is not. A repeated flush is accepted and advances the
+        // watermark, which is what a fresh flush means; the authorizers themselves and
+        // every other member of the stage are left exactly as they were.
+        stage.authorizers_cache_flushed_at = Some(::std::time::Instant::now());
+        Ok(FlushStageAuthorizersCacheOutput)
     }
 }

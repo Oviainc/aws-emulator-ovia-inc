@@ -33,6 +33,8 @@ mod domain_name_collection;
 mod epoch_second_timestamps;
 #[path = "all/execute_api_data_plane.rs"]
 mod execute_api_data_plane;
+#[path = "all/flush_stage_authorizers_cache.rs"]
+mod flush_stage_authorizers_cache;
 #[path = "all/flush_stage_cache.rs"]
 mod flush_stage_cache;
 #[path = "all/gateway_response.rs"]

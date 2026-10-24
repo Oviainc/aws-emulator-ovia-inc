@@ -42,8 +42,10 @@ async fn flush_cache(gateway: &Gateway, api: &str, stage_name: &str) -> Answer {
         .await
 }
 
-/// The `cacheClusterStatus` a stage body reports, named for the case.
-fn cluster_status(body: &Value, case: &str) -> String {
+/// The `cacheClusterStatus` a stage body reports, named for the case. Shared with the
+/// `flush_stage_authorizers_cache` suite, which checks an AUTHORIZER-cache flush leaves
+/// the cluster where it was.
+pub(crate) fn cluster_status(body: &Value, case: &str) -> String {
     body["cacheClusterStatus"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case}: expected a cacheClusterStatus, got {body:?}"))
@@ -62,8 +64,9 @@ fn without_cluster_status(body: &Value) -> Value {
 /// Create `stage_name` on `api` from `extra` (the cache members and whatever else the row
 /// sets), answering the created stage's body. Waits out
 /// [`CACHE_CLUSTER_CREATE_SPAN`] for a stage that asked for a cluster, so the stage is
-/// `AVAILABLE` — a settled cluster — before the flush under test.
-async fn settled_stage(
+/// `AVAILABLE` — a settled cluster — before the flush under test. Shared with the
+/// `flush_stage_authorizers_cache` suite, which needs the same settled stages.
+pub(crate) async fn settled_stage(
     gateway: &Gateway,
     api: &str,
     deployment: &str,

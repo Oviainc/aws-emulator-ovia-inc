@@ -32,6 +32,11 @@ pub(crate) struct Gateway {
     /// build — the `execute_api_data_plane` suite drives UNSIGNED requests to a stage
     /// invoke URL, which carry neither this harness's credential scope nor its host.
     pub(crate) router: MultiServiceRouter,
+    /// The shared engine the service is mounted on, kept so a suite can read a record a
+    /// call PERSISTED where no operation of this service reports it — the stage's
+    /// authorizer-cache watermark the `flush_stage_authorizers_cache` suite checks, which
+    /// `Stage` models no member for.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 /// One answered request: the HTTP status, the `x-amzn-errortype` error code when the
@@ -49,8 +54,16 @@ impl Gateway {
         // The tests exercise the service, not SigV4: requests carry a credential scope
         // so the router can name the target service, but no real signature.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// The engine this emulator's service is mounted on, so a suite can reach the very
+    /// store the handlers wrote through [`service_state`].
+    ///
+    /// [`service_state`]: service_com_amazonaws_apigateway_backplanecontrolservice::state::service_state
+    pub(crate) fn engine(&self) -> &engine::InMemoryEngine {
+        &self.engine
     }
 
     pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
