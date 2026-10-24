@@ -174,6 +174,8 @@ pub const MAX_SCHEDULED_REPORTS: usize = 1_000;
 /// `state` resolved — so every reader projects the stored record rather than
 /// re-deriving anything from a request. `last_execution_at` and `health_status` stay
 /// unset until an execution of this report sets them: nothing has run at create time.
+/// A reader never projects `health_status` directly — [`Self::health`] resolves the
+/// unrefreshed record's health for every view at once.
 #[derive(Debug, Clone)]
 pub struct ScheduledReportRecord {
     pub arn: String,
@@ -190,6 +192,8 @@ pub struct ScheduledReportRecord {
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
     pub last_execution_at: Option<SystemTime>,
+    /// The health this report's last refresh established, unset until one has: the
+    /// readers project [`ScheduledReportRecord::health`], never this member.
     pub health_status: Option<HealthStatus>,
     /// The tags supplied at create time, read back by `ListTagsForResource` and
     /// narrowed by `UntagResource`, in the order they were stored.
@@ -210,9 +214,35 @@ impl ScheduledReportRecord {
             .unwrap_or(SCHEDULE_STATE_ENABLED)
     }
 
+    /// The health of this report, as EVERY view of it reports it.
+    ///
+    /// Health is a property of the RESOURCE, not of the view that renders it, so the
+    /// resolution lives here once rather than in each projection: a detail read and a
+    /// listing of the same record can never disagree about it.
+    ///
+    /// A record whose health nothing has refreshed is [`HEALTH_STATUS_HEALTHY`] — the
+    /// model documents `HEALTHY` as "the scheduled report is configured properly and
+    /// has all required permissions to execute"
+    /// (`smithy_query(query="shape",shape="HealthStatus")`), which is what a report
+    /// this service accepted at create time is — with no `lastRefreshedAt` (no refresh
+    /// has happened) and no `statusReasons` (the model documents those as present only
+    /// when the status is `UNHEALTHY`).
+    pub fn health(&self) -> HealthStatus {
+        self.health_status.clone().unwrap_or_else(|| HealthStatus {
+            status_code: HEALTH_STATUS_HEALTHY.to_string(),
+            last_refreshed_at: None,
+            status_reasons: None,
+        })
+    }
+
     /// This record projected onto the modelled `ScheduledReport` shape that
     /// `GetScheduledReport` (and the other readers) return: the stored record's own
     /// fields, never request input.
+    ///
+    /// `healthStatus` is optional on this shape and `@required` on the summary, but it
+    /// is the same property of the same record either way, so the detail view reports
+    /// exactly what [`Self::health`] resolves rather than reporting less than the
+    /// listing does.
     pub fn report(&self) -> ScheduledReport {
         ScheduledReport {
             arn: Some(self.arn.clone()),
@@ -226,7 +256,7 @@ impl ScheduledReportRecord {
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
             updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
             last_execution_at: self.last_execution_at.map(::aws_smithy_types::DateTime::from),
-            health_status: self.health_status.clone(),
+            health_status: Some(self.health()),
         }
     }
 
@@ -240,11 +270,9 @@ impl ScheduledReportRecord {
     /// * `scheduleExpression` is optional inside `ScheduleConfig`, and a
     ///   `GenericString` of length 0..1024 — so a schedule stored without an
     ///   expression summarises as the empty string rather than inventing one.
-    /// * `healthStatus` is optional on `ScheduledReport` and absent until something
-    ///   refreshes it, so a report whose health nothing has refreshed summarises as
-    ///   [`HEALTH_STATUS_HEALTHY`] with no `lastRefreshedAt` (no refresh has
-    ///   happened) and no `statusReasons` (the model documents those as present
-    ///   only when the status is `UNHEALTHY`).
+    /// * `healthStatus` is optional on the stored record until something refreshes it,
+    ///   and is resolved by [`Self::health`] — the same resolution the detail view
+    ///   uses, so both views of one record report one health.
     pub fn summary(&self) -> ScheduledReportSummary {
         ScheduledReportSummary {
             arn: self.arn.clone(),
@@ -256,11 +284,7 @@ impl ScheduledReportRecord {
                 .clone()
                 .unwrap_or_default(),
             state: self.schedule_state().to_string(),
-            health_status: self.health_status.clone().unwrap_or_else(|| HealthStatus {
-                status_code: HEALTH_STATUS_HEALTHY.to_string(),
-                last_refreshed_at: None,
-                status_reasons: None,
-            }),
+            health_status: self.health(),
             schedule_expression_time_zone: self
                 .schedule_config
                 .schedule_expression_time_zone

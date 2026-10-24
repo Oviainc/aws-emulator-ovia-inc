@@ -9,7 +9,10 @@
 //! back is the value some earlier call persisted.
 //!
 //! The account policy is a SINGLETON — the API has no policy name or id, so `PutPolicy`
-//! replaces one record and `DeletePolicy` drops it; it is not caller-driven growth.
+//! replaces one record and `DeletePolicy` drops it; it is not caller-driven growth. What
+//! it DOES is gate a job submission: a job whose input is at an [`InputLocation`] the
+//! stored policy marks `DISALLOWED` ([`PolicyRecord::disallowed_input`]) is refused
+//! instead of stored.
 //!
 //! # Bounds on caller-driven growth and per-request work
 //!
@@ -116,12 +119,71 @@ pub const INPUT_POLICY_DISALLOWED: &str = "DISALLOWED";
 /// See [`INPUT_POLICY_DISALLOWED`].
 pub const INPUT_POLICY_ALLOWED: &str = "ALLOWED";
 
+/// What separates a URI's scheme from the rest of it, so [`InputLocation::of`] reads the
+/// scheme of a job input without spelling the three prefixes out.
+const SCHEME_SEPARATOR: &str = "://";
+
+/// An input location the modelled `Policy` carries a decision for.
+///
+/// The `Policy` shape has exactly three members, one per location
+/// (`smithy_query(query="shape",shape="Policy")`): `S3Inputs` — "Allow or disallow jobs
+/// that specify Amazon S3 inputs" — and `HttpInputs`/`HttpsInputs`, the same sentence for
+/// HTTP and HTTPS inputs. Which location an input is AT is what the scheme of its URI
+/// names: `Input$FileInput` is constrained to `s3://…`, `http://…` or `https://…`. The
+/// scheme, the `Policy` member that governs it and the decision a stored policy holds for
+/// it are therefore tied together here, rather than paired up by hand at each use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputLocation {
+    /// `S3Inputs`: an input in Amazon S3.
+    S3,
+    /// `HttpInputs`: an input fetched over HTTP.
+    Http,
+    /// `HttpsInputs`: an input fetched over HTTPS.
+    Https,
+}
+
+impl InputLocation {
+    /// Every location the `Policy` shape models, in its member order.
+    pub const ALL: [Self; 3] = [Self::S3, Self::Http, Self::Https];
+
+    /// The `Policy` member carrying this location's decision, in the Smithy member
+    /// spelling.
+    pub const fn member(self) -> &'static str {
+        match self {
+            Self::S3 => "S3Inputs",
+            Self::Http => "HttpInputs",
+            Self::Https => "HttpsInputs",
+        }
+    }
+
+    /// The URI scheme an input at this location carries.
+    pub const fn scheme(self) -> &'static str {
+        match self {
+            Self::S3 => "s3",
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+
+    /// The location a job input URI names, or `None` for a value whose scheme is none of
+    /// the locations the `Policy` shape models — which carries no decision either way.
+    pub fn of(uri: &str) -> Option<Self> {
+        let (scheme, _) = uri.trim().split_once(SCHEME_SEPARATOR)?;
+        Self::ALL
+            .into_iter()
+            .find(|location| scheme.eq_ignore_ascii_case(location.scheme()))
+    }
+}
+
 /// Every input location the modelled `Policy` carries a decision for, in the Smithy
-/// member spelling (`smithy_query(query="shape",shape="Policy")`): `S3Inputs`,
-/// `HttpInputs`, `HttpsInputs`. [`PolicyRecord::allows_no_input`] and
-/// [`policy_allows_no_input_message`] both read the set from here, so the condition that
-/// is checked and the locations the refusal names cannot drift apart.
-pub const INPUT_LOCATION_MEMBERS: [&str; 3] = ["S3Inputs", "HttpInputs", "HttpsInputs"];
+/// member spelling: `S3Inputs`, `HttpInputs`, `HttpsInputs`. Derived from
+/// [`InputLocation`], so the locations a refusal names and the ones a policy decides for
+/// cannot drift apart.
+pub const INPUT_LOCATION_MEMBERS: [&str; InputLocation::ALL.len()] = [
+    InputLocation::S3.member(),
+    InputLocation::Http.member(),
+    InputLocation::Https.member(),
+];
 
 /// `PricingPlan` values (`smithy_query(query="shape",shape="PricingPlan")`).
 pub const PRICING_PLAN_ON_DEMAND: &str = "ON_DEMAND";
@@ -528,6 +590,24 @@ pub fn policy_allows_no_input_message() -> String {
         allowed = INPUT_POLICY_ALLOWED,
         all = input_locations_joined("and"),
         any = input_locations_joined("or"),
+    )
+}
+
+/// How this service refuses a job whose input the account's policy disallows.
+///
+/// `InputPolicy` "allows or disallows a job you submit to run based on the conditions
+/// that you specify", and each `Policy` member allows or disallows "jobs that specify
+/// <location> inputs" — so a job stating an input at a `DISALLOWED` location is one the
+/// account does not permit. As with [`not_found_message`], the sentence is built from the
+/// request (the input it refused) and from the policy member that refused it, never from
+/// a recorded prose.
+pub fn policy_disallows_input_message(uri: &str, location: InputLocation) -> String {
+    format!(
+        "Your account policy sets {member} to {decision}, so this job's input {uri} is not \
+         allowed. Submit a job whose inputs are all allowed, or change your policy and \
+         resubmit your job.",
+        member = location.member(),
+        decision = INPUT_POLICY_DISALLOWED,
     )
 }
 
@@ -2033,16 +2113,40 @@ impl PolicyRecord {
     /// AWS states a policy must not meet: "Policies require at least one input location
     /// to be set to ALLOWED."
     pub fn allows_no_input(&self) -> bool {
-        self.decisions()
-            .iter()
-            .all(|decision| decision.as_deref() == Some(INPUT_POLICY_DISALLOWED))
+        InputLocation::ALL
+            .into_iter()
+            .all(|location| self.disallows(location))
     }
 
-    /// This record's decisions, one per member of [`INPUT_LOCATION_MEMBERS`] and in that
-    /// order. The array's length IS the member list's, so an input location added to one
-    /// and not the other does not compile.
-    fn decisions(&self) -> [&Option<String>; INPUT_LOCATION_MEMBERS.len()] {
-        [&self.s3_inputs, &self.http_inputs, &self.https_inputs]
+    /// The decision this policy states for one input location, `None` when the policy
+    /// does not restrict that location at all.
+    fn decision(&self, location: InputLocation) -> &Option<String> {
+        match location {
+            InputLocation::S3 => &self.s3_inputs,
+            InputLocation::Http => &self.http_inputs,
+            InputLocation::Https => &self.https_inputs,
+        }
+    }
+
+    /// Whether this policy forbids a job whose input is at `location`.
+    ///
+    /// A location the policy does not state carries no decision — it is allowed, as it is
+    /// for an account carrying no policy at all — so only an explicit `DISALLOWED`
+    /// forbids anything.
+    pub fn disallows(&self, location: InputLocation) -> bool {
+        self.decision(location).as_deref() == Some(INPUT_POLICY_DISALLOWED)
+    }
+
+    /// The first of `uris` this policy forbids a job from reading, with the location
+    /// whose decision forbids it, or `None` when the policy allows every one of them.
+    ///
+    /// An input whose URI names no location the `Policy` shape models carries no decision
+    /// (see [`InputLocation::of`]) and so is not forbidden by any policy.
+    pub fn disallowed_input<'a>(&self, uris: &'a [String]) -> Option<(&'a str, InputLocation)> {
+        uris.iter().find_map(|uri| {
+            let location = InputLocation::of(uri)?;
+            self.disallows(location).then_some((uri.as_str(), location))
+        })
     }
 
     /// The modelled `Policy`.
