@@ -62,14 +62,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// How many application names one `BatchGetApplications` request may carry.
-///
-/// AWS documents the bound in the operation's own text ("The maximum number of
-/// applications that can be returned is 100", "The maximum number of application
-/// names you can specify is 100") and models `BatchLimitExceededException` as the
-/// refusal past it, so the value is NOT chosen here.
-const MAX_BATCH_NAMES: usize = 100;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,14 +150,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        if names.len() > MAX_BATCH_NAMES {
+        // The request-size quota is the one `BatchLimitExceededException` states
+        // for every batch reader of this service (`crate::state::MAX_BATCH_SIZE`),
+        // which is also the figure this operation's own prose carries.
+        if names.len() > crate::state::MAX_BATCH_SIZE {
             return Err(BatchGetApplicationsErrorModeled::BatchLimitExceededException(
                 BatchLimitExceededException {
-                    message: Some(format!(
-                        "The maximum number of names or IDs allowed for this request \
-                         ({MAX_BATCH_NAMES}) was exceeded: {} were specified",
-                        names.len()
-                    )),
+                    message: Some(crate::state::batch_limit_exceeded_message()),
                 },
             )
             .into());

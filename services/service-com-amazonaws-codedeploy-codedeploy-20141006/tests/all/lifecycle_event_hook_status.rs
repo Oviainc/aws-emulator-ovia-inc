@@ -354,17 +354,19 @@ async fn only_a_validation_result_can_be_reported() {
     }
 }
 
-/// RULE: a hook result can only be reported for a deployment whose lifecycle
-/// hooks are Lambda validation functions — the Lambda and ECS compute platforms —
-/// and a deployment has at most one hook execution per hook its platform runs;
-/// an execution id past that count, or none at all, names no hook execution of
-/// that deployment.
+/// RULE: a hook result is reported against a hook execution OF the deployment
+/// named, so a `lifecycleEventHookExecutionId` that names none of its hook
+/// executions is refused with `InvalidLifecycleEventHookExecutionIdException` —
+/// an id past the number of hooks its compute platform runs, none at all, and
+/// any id at all against a deployment whose platform runs its lifecycle events
+/// through the CodeDeploy agent and so issues no hook execution id.
 #[tokio::test]
 async fn a_hook_execution_belongs_to_a_deployment_that_has_one() {
     let emulator = Emulator::new();
 
-    // EC2/on-premises lifecycle events are run by the CodeDeploy agent, so the
-    // operation does not apply to a `Server` deployment at all.
+    // EC2/on-premises lifecycle events are run by the CodeDeploy agent, so such
+    // a deployment issues no hook execution id and no id names a hook execution
+    // of it.
     let server = seeded_deployment(&emulator, "agent-driven", "Server").await;
     let (status, body) = emulator
         .call(
@@ -378,8 +380,8 @@ async fn a_hook_execution_belongs_to_a_deployment_that_has_one() {
         .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (400, "UnsupportedActionForDeploymentTypeException"),
-        "case Server: expected the compute platform to be refused, got {status} {body:?}"
+        (400, "InvalidLifecycleEventHookExecutionIdException"),
+        "case Server: expected the hook execution id to be refused, got {status} {body:?}"
     );
 
     for (platform, hooks) in HOOK_COUNTS {

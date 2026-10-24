@@ -195,8 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ListApplicationRevisionsErrorModeled::BucketNameFilterRequiredException(
                     BucketNameFilterRequiredException {
                         message: Some(
-                            "A bucket name filter is required when a key prefix filter is \
-                             specified, but was not provided"
+                            "S3 object key prefix filter specified without specifying bucket name"
                                 .to_string(),
                         ),
                     },
