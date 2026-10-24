@@ -162,6 +162,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
+
+        // The KEYS of the two maps this request carries are judged FIRST, by the rules
+        // the model gives them: `DeploymentSpecifications` keys are `KeyString`
+        // (len 3..256, `^[a-zA-Z0-9-:]+$`) and `Tags` keys are `TagKey` (len 1..128,
+        // `^[a-zA-Z0-9 _.:/=+@-]+$`). The pre-handler constraint walk judged everything
+        // else about this input, but a map's KEY constraints are the one part the
+        // generated schema does not carry — it judges a key against the map member's
+        // schema, which composes the VALUE shape's constraints — so an undersized
+        // specification key or an empty tag key reaches the handler unjudged (see
+        // `state::map_key_schema`, and `ops/tag_resource.rs` for the same check on the
+        // tagging path). Judging them here, before the store is reached, keeps the
+        // boundary's order: a request whose shape breaks the model is refused before any
+        // resource it names is resolved, and nothing is stored that this service's own
+        // tagging API would then declare invalid.
+        if let Some(message) =
+            crate::state::specification_key_refusal(input.specifications.keys().map(String::as_str))
+                .or_else(|| {
+                    input.tags.as_ref().and_then(|tags| {
+                        crate::state::tag_key_refusal(tags.keys().map(String::as_str))
+                    })
+                })
+        {
+            return Err(CreateDeploymentErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The submitted settings, ordered, so the report over them below is stable and
+        // the stored record is the same map `GetDeployment` reads back.
+        let specifications: ::std::collections::BTreeMap<String, String> =
+            input.specifications.into_iter().collect();
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateDeploymentErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Launch Wizard state store is unavailable".to_string()),
@@ -201,6 +236,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // catalogue borrow ends before the store is written to below.
         let workload_version_name = pattern.workload_version_name.clone();
         let pattern_version_name = pattern.pattern_version_name.clone();
+
+        // The settings are judged against the specification schema THIS pattern
+        // publishes — the same `state::specification_warnings` an update is judged by,
+        // over the same records `GetWorkloadDeploymentPattern` reports: a field the
+        // pattern marks `required` that the map omits, a value outside a field's
+        // `allowedValues`, and a key the pattern does not publish. An update can apply
+        // settings the schema warns about (`force`); `CreateDeployment` models no such
+        // member, so here the warnings are the refusal, and a deployment the schema
+        // says is unusable is never stored. Judged BEFORE the `dryRun` short-circuit
+        // below, so a pre-flight of an unusable request is refused rather than
+        // answered success.
+        let warnings = crate::state::specification_warnings(pattern, &specifications);
+        if !warnings.is_empty() {
+            return Err(CreateDeploymentErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::specification_create_refusal(&warnings)),
+                },
+            )
+            .into());
+        }
 
         // A deployment name identifies the deployment to a caller, so it cannot be
         // reused while a deployment still holds it.
@@ -309,7 +364,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             pattern_name: input.deployment_pattern_name,
             status: crate::state::STATUS_CREATING.to_string(),
             status_reason: None,
-            specifications: input.specifications.into_iter().collect(),
+            specifications,
             resource_group: None,
             deployment_arn,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
