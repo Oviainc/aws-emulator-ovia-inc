@@ -209,6 +209,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
+        // "You will see this exception ... if a list operation is performed on an
+        // environment resource that is still initializing" (`ValidationException` doc):
+        // a list is refused while the environment it addresses is still being built,
+        // rather than reporting the VLANs of a half-built environment.
+        if let Some(refusal) = crate::state::list_refused_while_initializing(environment) {
+            return Err(ListEnvironmentVlansErrorModeled::ValidationException(refusal).into());
+        }
+
         let mut matching = environment
             .vlans
             .iter()

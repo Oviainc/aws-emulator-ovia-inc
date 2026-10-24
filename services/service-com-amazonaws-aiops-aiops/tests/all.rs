@@ -15,6 +15,8 @@
 mod error_message_rules;
 #[path = "all/investigation_group_identifier_forms.rs"]
 mod investigation_group_identifier_forms;
+#[path = "all/investigation_group_name_identity.rs"]
+mod investigation_group_name_identity;
 #[path = "all/investigation_group_policy_delete.rs"]
 mod investigation_group_policy_delete;
 #[path = "all/investigation_group_singleton.rs"]
