@@ -143,7 +143,18 @@ pub fn billing_period_key(value: &str) -> Option<i64> {
 /// `@timestampFormat("date-time")` members with — rather than a second date library or
 /// hand-written civil-calendar arithmetic.
 pub fn current_billing_period() -> String {
-    ::aws_smithy_types::DateTime::from_millis(now_millis())
+    billing_period_at(now_millis())
+}
+
+/// The `BillingPeriod` the instant `millis` falls in — the month a call made then
+/// bills in.
+///
+/// The calendar conversion is the one [`current_billing_period`] describes, applied to
+/// an instant the store holds rather than to the clock, so the period a stored write
+/// took effect in is derivable from the instant it was recorded at and no second
+/// spelling of a month is persisted beside it.
+pub fn billing_period_at(millis: i64) -> String {
+    ::aws_smithy_types::DateTime::from_millis(millis)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .ok()
         .and_then(|rendered| rendered.get(.."YYYY-MM".len()).map(str::to_string))
@@ -598,6 +609,17 @@ pub struct CustomLineItemRecord {
     pub associated_resources: Vec<ResourceAssociationRecord>,
     pub creation_time_millis: i64,
     pub last_modified_time_millis: i64,
+    /// The instant the item's CURRENT generation took effect: the create that minted
+    /// the item, or the later write that opened a new generation of it (see
+    /// [`ComAmazonawsBillingconductorAwsbillingconductorState::put_custom_line_item`]).
+    /// It is what a version reports as its `StartTime`.
+    pub version_start_time_millis: i64,
+    /// The generations of this item that later writes SUPERSEDED, oldest first, at
+    /// most [`MAX_CUSTOM_LINE_ITEM_VERSIONS`] of them. The generation in effect NOW is
+    /// not among them — it is projected from this record by [`Self::current_version`] —
+    /// so the history and the live item cannot drift. Held on the record so a deleted
+    /// item takes its history with it.
+    pub superseded_versions: Vec<CustomLineItemVersion>,
 }
 
 impl CustomLineItemRecord {
@@ -625,6 +647,50 @@ impl CustomLineItemRecord {
             self.exclusive_end_billing_period.as_deref(),
             billing_period,
         )
+    }
+
+    /// The billing period this item's CURRENT generation is in effect FROM.
+    ///
+    /// The billing-period range a write names is the span the item it leaves applies
+    /// in, and a write that names none leaves the item in effect from the billing
+    /// period that write itself landed in — so a generation always has a start billing
+    /// period, and that period is what identifies it.
+    pub fn version_start_billing_period(&self) -> String {
+        self.inclusive_start_billing_period
+            .clone()
+            .unwrap_or_else(|| billing_period_at(self.version_start_time_millis))
+    }
+
+    /// This item's CURRENT generation, as a version snapshot.
+    ///
+    /// Projected from the live record — through the same `ChargeDetails` and
+    /// `AssociationSize` derivations every other read of the item uses — rather than
+    /// stored twice, so the newest version a history read reports is the item a read of
+    /// the item itself reports.
+    pub fn current_version(&self) -> CustomLineItemVersion {
+        CustomLineItemVersion {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            billing_group_arn: self.billing_group_arn.clone(),
+            account_id: self.account_id.clone(),
+            charge_details: self.charge_details(),
+            association_size: self.association_size(),
+            computation_rule: self.computation_rule.clone(),
+            presentation_service: self.presentation_service.clone(),
+            start_billing_period: self.version_start_billing_period(),
+            exclusive_end_billing_period: self.exclusive_end_billing_period.clone(),
+            creation_time_millis: self.creation_time_millis,
+            last_modified_time_millis: self.last_modified_time_millis,
+            start_time_millis: self.version_start_time_millis,
+        }
+    }
+
+    /// Every generation of this item, OLDEST FIRST: the ones later writes superseded,
+    /// frozen as they stood, and then the one in effect now.
+    pub fn versions(&self) -> Vec<CustomLineItemVersion> {
+        let mut versions = self.superseded_versions.clone();
+        versions.push(self.current_version());
+        versions
     }
 
     /// The association for `arn`, if this item already holds one.
@@ -658,6 +724,41 @@ impl CustomLineItemRecord {
                 .then(|| self.line_item_filters.clone()),
         }
     }
+}
+
+/// One GENERATION of a custom line item — a VERSION of it, as
+/// `ListCustomLineItemVersions` reports one.
+///
+/// A generation is the state the item had while it was in effect, together with the
+/// billing period it took effect in and the instant it did. A superseded generation is
+/// FROZEN: nothing writes to it again, so the history a read reports is what the item
+/// really was, not a recomputation from the item it has since become.
+#[derive(Debug, Clone, Default)]
+pub struct CustomLineItemVersion {
+    pub name: String,
+    pub description: String,
+    pub billing_group_arn: String,
+    pub account_id: Option<String>,
+    /// `ChargeDetails` as this generation reported them.
+    pub charge_details: crate::ops::types::ListCustomLineItemChargeDetails,
+    /// `AssociationSize`: the resources associated to the item in this generation.
+    pub association_size: i64,
+    pub computation_rule: Option<String>,
+    /// `PresentationDetails.Service`.
+    pub presentation_service: Option<String>,
+    /// The billing period this generation is in effect FROM, inclusive — see
+    /// [`CustomLineItemRecord::version_start_billing_period`].
+    pub start_billing_period: String,
+    /// The billing period this generation stops applying at, EXCLUSIVE, when the write
+    /// that left it named one. A generation that outlived no range of its own is closed
+    /// by the generation that replaced it instead.
+    pub exclusive_end_billing_period: Option<String>,
+    /// The item's `CreationTime`, which every generation of it shares.
+    pub creation_time_millis: i64,
+    pub last_modified_time_millis: i64,
+    /// `StartTime`: "The inclusive start time" — the instant this generation took
+    /// effect.
+    pub start_time_millis: i64,
 }
 
 /// The auto billing group creation preference recorded for ONE billing transfer, as
@@ -726,7 +827,9 @@ pub fn responsibility_transfer_owner_account(arn: &str) -> Option<&str> {
 ///   model itself can represent. A create past the cap is REFUSED with
 ///   `ServiceLimitExceededException`, and an association past it fails THAT resource
 ///   with the modelled `SERVICE_LIMIT_EXCEEDED` reason; a deleted billing group takes
-///   its items, and their associations, with it.
+///   its items, and their associations, with it. An item also carries the generations
+///   of it that later writes superseded, at most [`MAX_CUSTOM_LINE_ITEM_VERSIONS`],
+///   oldest dropped first.
 /// * `billing_transfer_preferences` holds one entry per billing transfer whose
 ///   preference was set, at most [`MAX_BILLING_TRANSFER_PREFERENCES`]; nothing in this
 ///   API deletes a billing transfer, so that store evicts the oldest-set preference
@@ -1045,6 +1148,41 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             .retain(|key| remaining.contains_key(key));
 
         Some(removed)
+    }
+
+    /// Write `updated` over the stored custom line item it names, keeping the
+    /// generations a version read reports.
+    ///
+    /// A version of a custom line item is the generation of it that applies in a
+    /// billing period, so the billing period a write takes effect in decides what the
+    /// write does to the history: a write taking effect in a DIFFERENT billing period
+    /// than the one the item's current generation started in closes that generation —
+    /// frozen as it stood, so a later read of the history reports the item as it really
+    /// was — and opens a new generation at `now`, while a write taking effect in the
+    /// generation's own billing period REPLACES it, because one billing period has one
+    /// version of the item.
+    ///
+    /// The kept history is bounded like every other store here, since a caller decides
+    /// how many writes to make: past [`MAX_CUSTOM_LINE_ITEM_VERSIONS`] superseded
+    /// generations the OLDEST is dropped, which reads back as a history that starts
+    /// later — never as a lost current item, which a later caller must still see.
+    pub fn put_custom_line_item(&mut self, mut updated: CustomLineItemRecord, now: i64) {
+        let arn = updated.arn.clone();
+        let superseded = self
+            .custom_line_items
+            .get(&arn)
+            .filter(|previous| {
+                previous.version_start_billing_period() != updated.version_start_billing_period()
+            })
+            .map(CustomLineItemRecord::current_version);
+        if let Some(superseded) = superseded {
+            updated.superseded_versions.push(superseded);
+            while updated.superseded_versions.len() > MAX_CUSTOM_LINE_ITEM_VERSIONS {
+                updated.superseded_versions.remove(0);
+            }
+            updated.version_start_time_millis = now;
+        }
+        self.custom_line_items.insert(arn, updated);
     }
 
     /// Delete a pricing rule and the index entries that only existed because of
@@ -1479,6 +1617,16 @@ pub const MAX_CUSTOM_LINE_ITEMS: usize = 1000;
 /// association past the bound fails THAT resource with the modelled
 /// `SERVICE_LIMIT_EXCEEDED` reason rather than displacing a stored association.
 pub const MAX_RESOURCES_PER_CUSTOM_LINE_ITEM: usize = 5;
+
+/// How many SUPERSEDED generations of one custom line item this emulator keeps for
+/// `ListCustomLineItemVersions` to report.
+///
+/// A CHOSEN bound, not an AWS limit: a caller decides how many times to update an
+/// item, and each update that takes effect in a new billing period adds a generation,
+/// so the kept history has to be capped. The OLDEST generation is dropped first, which
+/// reads back as a history that begins later — never as the loss of the generation in
+/// effect now, which is projected from the item itself and so is always reported.
+pub const MAX_CUSTOM_LINE_ITEM_VERSIONS: usize = 100;
 
 /// How many pricing rules this emulator stores for the account. A CHOSEN bound;
 /// see [`MAX_PRICING_PLANS`] for why it exists and how it is enforced. A rule IS

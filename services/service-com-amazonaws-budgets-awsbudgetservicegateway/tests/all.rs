@@ -41,6 +41,8 @@ mod client_error_envelopes;
 mod notification_deletion;
 #[path = "all/notification_lifecycle.rs"]
 mod notification_lifecycle;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/service_owned_budget_members.rs"]
 mod service_owned_budget_members;
 #[path = "all/state_roundtrip.rs"]
