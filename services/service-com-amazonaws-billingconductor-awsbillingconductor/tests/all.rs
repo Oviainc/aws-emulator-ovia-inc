@@ -19,6 +19,8 @@ mod associate_pricing_rules;
 mod billing_group_core_loop;
 #[path = "all/custom_line_item_and_create_name_refusals.rs"]
 mod custom_line_item_and_create_name_refusals;
+#[path = "all/list_custom_line_items.rs"]
+mod list_custom_line_items;
 #[path = "all/payer_account_authorization.rs"]
 mod payer_account_authorization;
 #[path = "all/payer_account_gate.rs"]
