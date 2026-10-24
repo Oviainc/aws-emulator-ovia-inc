@@ -20,6 +20,10 @@
 //! multiplex, which is what the multiplex's own derived `ProgramCount` counts. A
 //! program has no id and no ARN of its own — it is reached by naming its
 //! multiplex and its name — and it goes away with the multiplex that holds it.
+//! A program's `PacketIdentifiersMap` lives on that record too, because
+//! `UpdateMultiplex`'s `PacketIdentifiersMapping` is keyed by program name: an
+//! entry of that map is the packet identifiers of one program of the multiplex
+//! the update names.
 //!
 //! A multiplex's LIFECYCLE is one stored pending transition per record (a
 //! [`MultiplexTransition`]: the instant it comes due and the `MultiplexState` it
@@ -55,7 +59,8 @@ use std::ops::Bound;
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    Multiplex, MultiplexAlert, MultiplexProgram, MultiplexProgramSettings,
+    Multiplex, MultiplexAlert, MultiplexProgram, MultiplexProgramPacketIdentifiersMap,
+    MultiplexProgramSettings,
     MultiplexProgramSummary, MultiplexSettings,
 };
 
@@ -268,16 +273,45 @@ pub enum MultiplexRefusal {
     /// the request asked for, so the refusal can name it.
     AvailabilityZoneCount(usize),
     /// A `MultiplexSettings` member fell outside the range the model publishes
-    /// for it. Carries the member's wire name, the value the request carried and
-    /// that published range, so the refusal can name all three.
-    SettingOutOfRange {
-        member: &'static str,
-        value: i32,
-        min: i32,
-        max: i32,
-    },
+    /// for it.
+    SettingOutOfRange(MultiplexSettingOutOfRange),
     /// The store already holds [`MAX_MULTIPLEXES`] multiplexes.
     StoreFull,
+}
+
+/// A `MultiplexSettings` member whose value falls outside the range the model
+/// publishes for it: the member's wire name, the value the request carried and
+/// that published range, so the refusal can name all three.
+///
+/// Its own type rather than a variant's fields, because every writer of a
+/// `MultiplexSettings` — `CreateMultiplex` and `UpdateMultiplex` — refuses the
+/// same values for the same reason, so the check ([`setting_out_of_range`]) and
+/// the wording ([`Display`]) live here once rather than once per operation.
+#[derive(Debug, Clone, Copy)]
+pub struct MultiplexSettingOutOfRange {
+    pub member: &'static str,
+    pub value: i32,
+    pub min: i32,
+    pub max: i32,
+}
+
+/// The refusal's wording, which names the member, the published range and the
+/// value the request carried, so a caller can fix the request from that text
+/// alone. One copy, so two writers of the same settings cannot word the same
+/// refusal differently.
+impl std::fmt::Display for MultiplexSettingOutOfRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            member,
+            value,
+            min,
+            max,
+        } = self;
+        write!(
+            f,
+            "multiplexSettings.{member} must be between {min} and {max}, got {value}"
+        )
+    }
 }
 
 /// The first `MultiplexSettings` member whose value falls outside the range the
@@ -292,7 +326,7 @@ pub enum MultiplexRefusal {
 /// re-stated here because the request boundary validates range traits only on
 /// the operation's own input members, not on the members of a nested structure
 /// like this one, so a value the real service refuses would otherwise be stored.
-fn setting_out_of_range(settings: &MultiplexSettings) -> Option<MultiplexRefusal> {
+fn setting_out_of_range(settings: &MultiplexSettings) -> Option<MultiplexSettingOutOfRange> {
     // (wire member name, the value the request carried, minimum, maximum)
     let members: [(&'static str, Option<i32>, i32, i32); 4] = [
         (
@@ -323,14 +357,12 @@ fn setting_out_of_range(settings: &MultiplexSettings) -> Option<MultiplexRefusal
     members
         .into_iter()
         .find_map(|(member, value, min, max)| match value {
-            Some(value) if !(min..=max).contains(&value) => {
-                Some(MultiplexRefusal::SettingOutOfRange {
-                    member,
-                    value,
-                    min,
-                    max,
-                })
-            }
+            Some(value) if !(min..=max).contains(&value) => Some(MultiplexSettingOutOfRange {
+                member,
+                value,
+                min,
+                max,
+            }),
             _ => None,
         })
 }
@@ -358,6 +390,29 @@ pub enum MultiplexStartRefusal {
     /// The multiplex is not in a state a start accepts. Carries its current
     /// `MultiplexState`, so the refusal can name it.
     NotStartable(String),
+}
+
+/// Why [`ComAmazonawsMedialiveMedialiveState::update_multiplex`] wrote nothing.
+/// Each variant is one refusal `UpdateMultiplex` models.
+#[derive(Debug)]
+pub enum MultiplexUpdateRefusal {
+    /// No multiplex in the store has the id the request named, so there is
+    /// nothing to change.
+    NotFound,
+    /// The multiplex the request named is going away (`DELETING`) or gone
+    /// (`DELETED`): its record is still readable, but a delete has already been
+    /// accepted for that id, so it names no multiplex a caller may still
+    /// change. Carries its current `MultiplexState`, so the refusal can name
+    /// it.
+    Gone(String),
+    /// A new `MultiplexSettings` member fell outside the range the model
+    /// publishes for it — the same refusal, with the same wording, the create
+    /// makes.
+    Settings(MultiplexSettingOutOfRange),
+    /// The `PacketIdentifiersMapping` named a program the multiplex does not
+    /// hold, so there is no program to set those packet identifiers on. Carries
+    /// the `ProgramName` the mapping asked for.
+    ProgramNotFound(String),
 }
 
 /// Why a `MultiplexProgramSettings` a request carried is not one the real
@@ -596,19 +651,29 @@ fn program_settings_refusal(
 
 /// One created multiplex program, as `CreateMultiplexProgram` stored it.
 ///
-/// The members mirror the model's `MultiplexProgram` shape minus the three it
+/// The members mirror the model's `MultiplexProgram` shape minus the two it
 /// derives or does not report: `ChannelId` is "The MediaLive channel associated
 /// with the program", which comes from the channels this store holds
 /// ([`ComAmazonawsMedialiveMedialiveState::channel_in_multiplex_program`]);
-/// `PacketIdentifiersMap` and `PipelineDetails` report what the transport-stream
-/// multiplexer the real service runs allocates and ingests, which this emulator
-/// does not run and therefore does not claim.
+/// `PipelineDetails` reports which channel pipeline each multiplex pipeline is
+/// currently ingesting from, which this emulator does not run and therefore does
+/// not claim.
+///
+/// `PacketIdentifiersMap` is stored, because a caller CAN set it: it is what
+/// `UpdateMultiplex`'s `PacketIdentifiersMapping` carries, keyed by the
+/// `ProgramName` the identifiers belong to (the value shape's own documentation:
+/// "Packet identifiers map for a given Multiplex program"). Until a caller sets
+/// it the program carries none — the PIDs the real service's multiplexer
+/// allocates on its own are not something this emulator invents.
 #[derive(Debug, Clone)]
 pub struct MultiplexProgramRecord {
     /// The `ProgramName` the request created the program under, which is also
     /// the key it is stored at: it identifies the program within its multiplex.
     pub program_name: String,
     pub multiplex_program_settings: MultiplexProgramSettings,
+    /// The packet identifiers a caller set for this program through
+    /// `UpdateMultiplex`, or `None` while none have been set.
+    pub packet_identifiers_map: Option<MultiplexProgramPacketIdentifiersMap>,
 }
 
 /// One created multiplex, as `CreateMultiplex` stored it plus its lifecycle
@@ -657,6 +722,14 @@ impl MultiplexRecord {
         i32::try_from(self.programs.len()).unwrap_or(i32::MAX)
     }
 
+    /// Whether a delete has already been accepted for this multiplex: it is
+    /// `DELETING`, or it has reached the terminal `DELETED`. The ONE predicate
+    /// behind both rules below, so the two cannot drift apart — the id names a
+    /// record a reader goes on reporting, and nothing may write to it again.
+    fn delete_accepted(&self) -> bool {
+        self.state == multiplex_state::DELETING || self.state == multiplex_state::DELETED
+    }
+
     /// Whether a program can be created in this multiplex right now: in every
     /// state but the two that take the multiplex away, since a multiplex that
     /// is `DELETING` or has reached the terminal `DELETED` holds nothing new.
@@ -664,7 +737,16 @@ impl MultiplexRecord {
     /// multiplex that has not finished coming up, which is why a caller can
     /// create one straight after `CreateMultiplex`.
     fn accepts_programs(&self) -> bool {
-        self.state != multiplex_state::DELETING && self.state != multiplex_state::DELETED
+        !self.delete_accepted()
+    }
+
+    /// Whether this multiplex is one a caller may still CHANGE: the same
+    /// [`MultiplexRecord::delete_accepted`] states rule it out, and for the same
+    /// reason. Every other state is updatable, including the transient ones: the
+    /// model publishes no state precondition for an update, so this emulator
+    /// claims none beyond the delete it has already accepted.
+    fn is_updatable(&self) -> bool {
+        !self.delete_accepted()
     }
 
     /// "The number of currently healthy pipelines". A multiplex runs one
@@ -1024,7 +1106,7 @@ impl ComAmazonawsMedialiveMedialiveState {
             ));
         }
         if let Some(refusal) = setting_out_of_range(&multiplex_settings) {
-            return Err(refusal);
+            return Err(MultiplexRefusal::SettingOutOfRange(refusal));
         }
         if self.multiplexes.len() >= MAX_MULTIPLEXES {
             return Err(MultiplexRefusal::StoreFull);
@@ -1090,6 +1172,89 @@ impl ComAmazonawsMedialiveMedialiveState {
             state: Some(multiplex.state.clone()),
             tags: Some(multiplex.tags.clone()),
         })
+    }
+
+    /// Change the multiplex `multiplex_id` as `UpdateMultiplex` asks, or refuse.
+    ///
+    /// Each member the request carries REPLACES the stored one, and a member it
+    /// omits leaves that part of the multiplex exactly as it stands — the model
+    /// makes all three optional, so an update that carries none asks for no
+    /// change and the caller is answered with the multiplex as it is. A
+    /// `MultiplexSettings` the request does carry replaces the stored structure
+    /// WHOLE (the update member is the structure itself, not a per-member
+    /// patch), so an absent nested member becomes absent on the multiplex.
+    ///
+    /// `packet_identifiers_mapping` is keyed by the `ProgramName` the
+    /// identifiers belong to, which is what identifies a program within one
+    /// multiplex, so each entry replaces the `PacketIdentifiersMap` of that
+    /// program of THIS multiplex; a program the mapping names and the multiplex
+    /// does not hold is refused rather than stored under a name nothing reads.
+    ///
+    /// The published ranges of the settings, the state the multiplex must be in,
+    /// the programs the mapping resolves to and the writes live together here,
+    /// so a handler cannot check one of them and write past another; the
+    /// handler's job is only to turn a [`MultiplexUpdateRefusal`] into the
+    /// operation's own modelled error. The request is validated before it is
+    /// resolved, and every refusal is raised before the FIRST write, so a
+    /// refused update leaves the multiplex and all of its programs exactly as
+    /// they were.
+    pub fn update_multiplex(
+        &mut self,
+        multiplex_id: &str,
+        name: Option<String>,
+        multiplex_settings: Option<MultiplexSettings>,
+        packet_identifiers_mapping: Option<HashMap<String, MultiplexProgramPacketIdentifiersMap>>,
+    ) -> Result<(), MultiplexUpdateRefusal> {
+        if let Some(refusal) = multiplex_settings.as_ref().and_then(setting_out_of_range) {
+            return Err(MultiplexUpdateRefusal::Settings(refusal));
+        }
+
+        let multiplex = self
+            .multiplexes
+            .get_mut(multiplex_id)
+            .ok_or(MultiplexUpdateRefusal::NotFound)?;
+        if !multiplex.is_updatable() {
+            return Err(MultiplexUpdateRefusal::Gone(multiplex.state.clone()));
+        }
+
+        // Every program the mapping names is resolved BEFORE anything is
+        // written, so an update naming one program that exists and one that does
+        // not writes neither. A `BTreeMap`, so the names are walked in order and
+        // the refusal is the same whichever order the request's own map happened
+        // to hash them in.
+        let mut mapping: BTreeMap<String, MultiplexProgramPacketIdentifiersMap> =
+            packet_identifiers_mapping
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+        if let Some(program_name) = mapping
+            .keys()
+            .find(|program_name| !multiplex.programs.contains_key(*program_name))
+        {
+            return Err(MultiplexUpdateRefusal::ProgramNotFound(
+                program_name.clone(),
+            ));
+        }
+
+        if let Some(name) = name {
+            multiplex.name = name;
+        }
+        if let Some(multiplex_settings) = multiplex_settings {
+            multiplex.multiplex_settings = multiplex_settings;
+        }
+        // The walk is over the PROGRAMS, taking each one's entry out of the
+        // mapping, so every entry the check above proved present is written
+        // exactly once and none can be quietly skipped.
+        for (program_name, program) in &mut multiplex.programs {
+            if let Some(packet_identifiers_map) = mapping.remove(program_name) {
+                program.packet_identifiers_map = Some(packet_identifiers_map);
+            }
+        }
+        debug_assert!(
+            mapping.is_empty(),
+            "every program the mapping names was resolved before the first write"
+        );
+        Ok(())
     }
 
     /// Run the multiplex `multiplex_id`: move it into `STARTING`, owing
@@ -1214,6 +1379,11 @@ impl ComAmazonawsMedialiveMedialiveState {
             MultiplexProgramRecord {
                 program_name,
                 multiplex_program_settings,
+                // A created program carries no packet identifiers: the real
+                // service's multiplexer allocates them, and this emulator does
+                // not run it. `UpdateMultiplex`'s `PacketIdentifiersMapping` is
+                // the one thing that sets them.
+                packet_identifiers_map: None,
             },
         );
         Ok(())
@@ -1343,14 +1513,15 @@ impl ComAmazonawsMedialiveMedialiveState {
         Some(MultiplexProgram {
             channel_id: self.channel_in_multiplex_program(multiplex_id, &program.program_name),
             multiplex_program_settings: Some(program.multiplex_program_settings.clone()),
-            // ABSENT, not empty: `PacketIdentifiersMap` reports the
-            // transport-stream packet identifiers the real service's
-            // multiplexer allocates for the program, and `PipelineDetails`
-            // reports which channel pipeline each multiplex pipeline is
-            // currently ingesting from. This emulator runs neither, so it
-            // reports neither rather than inventing PIDs and an active
-            // pipeline for a transport stream nothing is producing.
-            packet_identifiers_map: None,
+            // The packet identifiers a caller set through `UpdateMultiplex`,
+            // and ABSENT while none were set: the PIDs the real service's
+            // multiplexer allocates on its own are not ones this emulator
+            // invents for a transport stream nothing is producing.
+            packet_identifiers_map: program.packet_identifiers_map.clone(),
+            // ABSENT, not empty: `PipelineDetails` reports which channel
+            // pipeline each multiplex pipeline is currently ingesting from.
+            // This emulator runs no multiplexer, so it reports no active
+            // pipeline rather than inventing one.
             pipeline_details: None,
             program_name: Some(program.program_name.clone()),
         })

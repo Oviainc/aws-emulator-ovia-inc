@@ -123,6 +123,16 @@ pub const MESSAGE_KNOWLEDGE_BASE_NOT_FOUND: &str = "Knowledge Base does not exis
 /// is refused with the modelled `ValidationException`.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The sentence a tagging operation refuses an ARN this account holds no resource
+/// under with.
+///
+/// It is the model's own documentation of `ResourceNotFoundException`
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`: "The specified
+/// resource does not exist."), and it carries NOTHING from the request, so a caller
+/// cannot probe the store through the wording. The ARN the caller asked about travels
+/// in the error's own `resourceName` member, which the model provides for naming it.
+pub const MESSAGE_RESOURCE_NOT_FOUND: &str = "The specified resource does not exist.";
+
 /// The only `KnowledgeBaseType` a content upload may be started against.
 ///
 /// `StartContentUpload`'s own documentation states the rule — "You can only upload
@@ -410,7 +420,11 @@ pub fn association_fingerprint(
 /// Connect model of this same service states the rule in the same way (that
 /// crate's `state::tags_out`), so the two mounted models of one endpoint cannot
 /// answer this member differently.
-fn wire_tags(tags: &BTreeMap<String, String>) -> Option<HashMap<String, String>> {
+///
+/// It is the ONE owner of that rule in this crate: every operation that reports a
+/// `tags` member — a resource read, and `ListTagsForResource`, whose whole output
+/// is that member — renders it through here rather than restating the rule.
+pub fn wire_tags(tags: &BTreeMap<String, String>) -> Option<HashMap<String, String>> {
     Some(
         tags.iter()
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -904,6 +918,50 @@ impl ComAmazonawsWisdomWisdomserviceState {
         self.idempotency_order
             .retain(|key| self.idempotency.contains_key(key));
         Some(assistant)
+    }
+
+    /// The tags persisted on the resource a full resource ARN names, whatever
+    /// resource family that ARN belongs to.
+    ///
+    /// Tagging is a cross-family surface: `ListTagsForResource`, `TagResource` and
+    /// `UntagResource` take an `Arn` rather than one family's path label
+    /// (`smithy_query(query="operation",operation="ListTagsForResource")`), so the
+    /// lookup goes through the ARN index of EVERY family this store holds a tag map
+    /// for — assistants, knowledge bases, sessions and assistant associations — and
+    /// reads the tags off that one stored record. Nothing is copied into a second
+    /// place: a tag a create persisted on its resource is the tag reported here, and a
+    /// resource a delete removed is in no index any more.
+    ///
+    /// `None` means the ARN names no resource this account holds, which includes an
+    /// ARN this emulator never minted (another partition, service or account): it is
+    /// in no index, so it names nothing.
+    pub fn tags_of_resource(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
+        if let Some(assistant_id) = self.assistant_arn_index.get(resource_arn) {
+            return self
+                .assistants
+                .get(assistant_id)
+                .map(|assistant| &assistant.tags);
+        }
+        if let Some(knowledge_base_id) = self.knowledge_base_arn_index.get(resource_arn) {
+            return self
+                .knowledge_bases
+                .get(knowledge_base_id)
+                .map(|knowledge_base| &knowledge_base.tags);
+        }
+        if let Some((assistant_id, session_id)) = self.session_arn_index.get(resource_arn) {
+            return self
+                .assistants
+                .get(assistant_id)
+                .and_then(|assistant| assistant.sessions.get(session_id))
+                .map(|session| &session.tags);
+        }
+        if let Some((_, association_id)) = self.assistant_association_arn_index.get(resource_arn) {
+            return self
+                .assistant_associations
+                .get(association_id)
+                .map(|association| &association.tags);
+        }
+        None
     }
 
     /// Resolve a knowledge base path label — a bare uuid or a knowledge-base ARN — to

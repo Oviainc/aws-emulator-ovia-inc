@@ -26,7 +26,10 @@
 //!   refused (`PublicKeyAlreadyExists`, 409);
 //! * an id no public key holds is `NoSuchPublicKey` (404);
 //! * `PublicKeyConfig$Comment`: "The comment cannot be longer than 128 characters", so a
-//!   longer comment is refused before anything is stored.
+//!   longer comment is refused before anything is stored;
+//! * the number of public keys the account holds is BOUNDED, and a create past the bound
+//!   is refused with the error the operation models for a full account
+//!   (`TooManyPublicKeys`, 400) and mints nothing.
 //!
 //! The table rows differ along everything these rules generalise over: the form of the
 //! encoded key (single-line and multi-line PEM, long and short bodies), whether a comment
@@ -39,7 +42,7 @@
 use std::collections::BTreeSet;
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    INVALID_PUBLIC_KEY_MARKER_MESSAGE, MAX_ITEMS, MAX_PUBLIC_KEY_COMMENT,
+    INVALID_PUBLIC_KEY_MARKER_MESSAGE, MAX_ITEMS, MAX_PUBLIC_KEYS, MAX_PUBLIC_KEY_COMMENT,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -252,8 +255,8 @@ fn table() -> Vec<Key> {
 // Reading an answer
 // ---------------------------------------------------------------------------
 
-/// The ids a listing's page reports, in the order the page carries them.
-fn page_ids(answer: &Answer) -> Vec<String> {
+/// The `(Id, Name)` pair of every summary a listing's page reports, in page order.
+fn page_ids_and_names(answer: &Answer) -> Vec<(String, String)> {
     answer
         .root()
         .at("Items")
@@ -261,10 +264,23 @@ fn page_ids(answer: &Answer) -> Vec<String> {
             items
                 .children_named("PublicKeySummary")
                 .into_iter()
-                .map(|summary| summary.text_at("Id").unwrap_or_default().to_string())
+                .map(|summary| {
+                    (
+                        summary.text_at("Id").unwrap_or_default().to_string(),
+                        summary.text_at("Name").unwrap_or_default().to_string(),
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The ids a listing's page reports, in the order the page carries them.
+fn page_ids(answer: &Answer) -> Vec<String> {
+    page_ids_and_names(answer)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
 }
 
 /// Whether `value` has the shape of a public key id CloudFront mints: `K` followed by 13
@@ -891,5 +907,171 @@ async fn a_comment_past_the_documented_bound_is_refused() {
         Some("1"),
         "case refused comments: expected only the accepted key to be stored, got {}",
         listed.raw
+    );
+}
+
+/// Walk every page of the listing at the server's own ceiling and report the
+/// `(Id, Name)` pair of each stored key, in listing order.
+///
+/// A full account holds more keys than one page carries, so the whole collection is only
+/// reachable by resuming at each page's `NextMarker` — the way a client enumerates it.
+async fn walk_all_keys(router: &MultiServiceRouter) -> Vec<(String, String)> {
+    let mut walked: Vec<(String, String)> = Vec::new();
+    let mut marker: Option<String> = None;
+    loop {
+        let query = match &marker {
+            Some(value) => format!("?MaxItems={MAX_ITEMS}&Marker={value}"),
+            None => format!("?MaxItems={MAX_ITEMS}"),
+        };
+        let page = list_keys(router, &query).await;
+        assert_eq!(
+            page.status, 200,
+            "case walking the account: expected HTTP 200 for {query}, got {} with {}",
+            page.status, page.raw
+        );
+        walked.extend(page_ids_and_names(&page));
+        match page.root().text_at("NextMarker").map(str::to_string) {
+            Some(value) => marker = Some(value),
+            None => break,
+        }
+    }
+    walked
+}
+
+/// How many public keys ONE account holds is bounded ([`MAX_PUBLIC_KEYS`]): a key record
+/// is what every later read answers from, so it cannot be evicted, and the create AT the
+/// bound is accepted while every create PAST it is refused with the error the operation
+/// models for a full account (`TooManyPublicKeys`, HTTP 400). The refusal mints nothing:
+/// the keys already stored are readable and unchanged, the account still holds exactly the
+/// keys the accepted creates stored, and the caller reference a refused create named is
+/// still free — so a repeat under it is refused the same way rather than reporting a key.
+#[tokio::test]
+async fn a_create_past_the_account_bound_is_refused() {
+    let router = emulator();
+
+    // The bound is an ENTRY COUNT, so what matters is the create that fills it and the
+    // ones past it; the rows filling it still vary the configuration's forms, so the count
+    // is what refuses them rather than anything about one key.
+    let mut filled: Vec<(String, String)> = Vec::new();
+    for index in 0..MAX_PUBLIC_KEYS {
+        let row = Key {
+            case: format!("key {index} of the bound"),
+            caller_reference: format!("public-key-bound-{index}"),
+            name: format!("public-key-bound-{index}"),
+            encoded_key: pem(1 + index % 3, 'Q'),
+            comment: match index % 3 {
+                0 => None,
+                1 => Some(String::new()),
+                _ => Some(format!("key {index}")),
+            },
+        };
+        let answer = create_key(&router, &row.xml()).await;
+        assert_eq!(
+            answer.status, 201,
+            "case {}: expected HTTP 201 within the bound, got {} with {}",
+            row.case, answer.status, answer.raw
+        );
+        let id = answer.root().text_at("Id").unwrap_or_default().to_string();
+        assert!(
+            is_public_key_id(&id),
+            "case {}: expected a minted public key id, got {id:?}",
+            row.case
+        );
+        filled.push((id, row.name.clone()));
+    }
+
+    // Every create past the bound is refused, whatever its configuration: the bound is
+    // about the account, not about the key being uploaded.
+    let past = [
+        Key {
+            case: "one key past the bound".to_string(),
+            caller_reference: "public-key-bound-past".to_string(),
+            name: "public-key-bound-past".to_string(),
+            encoded_key: pem(1, 'R'),
+            comment: None,
+        },
+        Key {
+            case: "a multi-line key past the bound".to_string(),
+            caller_reference: "public-key-bound-past-multiline".to_string(),
+            name: "public-key-bound-past-multiline".to_string(),
+            encoded_key: pem(8, 'S'),
+            comment: Some("one too many".to_string()),
+        },
+        Key {
+            case: "a key past the bound reusing a stored key's name".to_string(),
+            caller_reference: "public-key-bound-past-renamed".to_string(),
+            name: "public-key-bound-0".to_string(),
+            encoded_key: pem(2, 'T'),
+            comment: Some(String::new()),
+        },
+    ];
+    for row in &past {
+        // Twice: the first refusal must leave the caller reference it named free, so the
+        // repeat is refused by the bound again rather than answered with a stored key.
+        for attempt in 1..=2 {
+            let answer = create_key(&router, &row.xml()).await;
+            assert_eq!(
+                answer.status, 400,
+                "case {} (attempt {attempt}): expected HTTP 400 past the bound, got {} \
+                 with {}",
+                row.case, answer.status, answer.raw
+            );
+            assert_eq!(
+                answer.error_code(),
+                "TooManyPublicKeys",
+                "case {} (attempt {attempt}): expected TooManyPublicKeys, got {}",
+                row.case,
+                answer.raw
+            );
+        }
+    }
+
+    // The refusals stored nothing and changed nothing: the account holds exactly the keys
+    // the accepted creates stored, and no key carries a refused create's name.
+    let walked = walk_all_keys(&router).await;
+    assert_eq!(
+        walked.len(),
+        MAX_PUBLIC_KEYS,
+        "case the whole account: expected exactly {MAX_PUBLIC_KEYS} stored keys, got {}",
+        walked.len()
+    );
+    let stored_ids: BTreeSet<&str> = walked.iter().map(|(id, _)| id.as_str()).collect();
+    let expected_ids: BTreeSet<&str> = filled.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(
+        stored_ids, expected_ids,
+        "case the whole account: expected the accepted creates' ids to be the stored ones"
+    );
+    for row in &past {
+        let names: Vec<&str> = walked
+            .iter()
+            .filter(|(_, name)| name == &row.name)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        // One stored key already carries the third row's name, and no refusal may add a
+        // second one under it.
+        let expected = usize::from(filled.iter().any(|(_, name)| name == &row.name));
+        assert_eq!(
+            names.len(),
+            expected,
+            "case {}: expected {expected} stored key(s) named {}, got {names:?}",
+            row.case,
+            row.name
+        );
+    }
+
+    // A key stored before the refusals is still readable, at the configuration and the
+    // instant its own create left behind.
+    let (first_id, _) = &filled[0];
+    let read = get_key(&router, first_id).await;
+    assert_eq!(
+        read.status, 200,
+        "case a key stored before the refusals: expected HTTP 200, got {} with {}",
+        read.status, read.raw
+    );
+    assert_eq!(
+        read.root().text_at("Id"),
+        Some(first_id.as_str()),
+        "case a key stored before the refusals: expected {first_id} in the read, got {}",
+        read.raw
     );
 }

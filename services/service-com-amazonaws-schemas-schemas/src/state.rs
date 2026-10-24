@@ -1061,14 +1061,22 @@ impl Schema {
 }
 
 /// The SERVICE-SPECIFIC event types the service-owned catalogue holds a schema for:
-/// the events an AWS service publishes beyond the CloudTrail-delivered family every
-/// source publishes (which [`CLOUD_TRAIL_EVENT_FAMILY`] carries instead, one entry per
-/// source per kind of CloudTrail record).
+/// the event types a publishing source publishes of its own, beside the
+/// CloudTrail-delivered family [`CLOUD_TRAIL_EVENT_FAMILY`] carries for the sources in
+/// [`AWS_EVENT_SOURCES`].
+///
+/// This table is PER SOURCE, not a template over sources: which event types a source
+/// publishes is published data, so a row exists for an event type AWS publishes and a
+/// source carries exactly the rows written for it. A source may publish its own event
+/// types and no CloudTrail-delivered schema at all, in which case it appears here and
+/// not in [`AWS_EVENT_SOURCES`].
 ///
 /// Source: the `detail` of each event as AWS documents it (the EventBridge event
 /// reference for the publishing service); the `detail_type` is the `detail-type`
 /// EventBridge delivers it under and the `event_name` is the name the catalogue
-/// publishes it as, which AWS derives from that detail-type.
+/// publishes it as, which AWS derives from that detail-type by taking the spaces out.
+/// A row AWS documents the identity but not the `detail` of is written with
+/// [`ManagedEventType::identified`].
 ///
 /// This is seeded content, not a response: `ListRegistries`, `ListSchemas` and
 /// `DescribeSchema` report it from the store like any other registry, and
@@ -1146,61 +1154,171 @@ pub const AWS_SERVICE_EVENT_TYPES: &[ManagedEventType] = &[
     // source and the `detail-type` EventBridge delivers them under) but with an
     // unconstrained `detail`: AWS documents that these events exist, not the members
     // their `detail` carries. [`UNDOCUMENTED_DETAIL`] says what that means for a
-    // reader.
-    ManagedEventType {
-        source: "aws.a4b",
-        detail_type: "Room State Change",
-        event_name: "RoomStateChange",
-        components: UNDOCUMENTED_DETAIL,
-    },
-    ManagedEventType {
-        source: "aws.a4b",
-        detail_type: "Room Device Calendar Error Status",
-        event_name: "RoomDeviceCalendarErrorStatus",
-        components: UNDOCUMENTED_DETAIL,
-    },
-    ManagedEventType {
-        source: "aws.act",
-        detail_type: "Trust Bundle Association Version Updated",
-        event_name: "TrustBundleAssociationVersionUpdated",
-        components: UNDOCUMENTED_DETAIL,
-    },
-    ManagedEventType {
-        source: "aws.events",
-        detail_type: "API Destination Activated",
-        event_name: "APIDestinationActivated",
-        components: UNDOCUMENTED_DETAIL,
-    },
-    ManagedEventType {
-        source: "aws.events",
-        detail_type: "API Destination Deactivated",
-        event_name: "APIDestinationDeactivated",
-        components: UNDOCUMENTED_DETAIL,
-    },
-    ManagedEventType {
-        source: "aws.events",
-        detail_type: "Connection Activated",
-        event_name: "ConnectionActivated",
-        components: UNDOCUMENTED_DETAIL,
-    },
-    ManagedEventType {
-        source: "aws.events",
-        detail_type: "Connection Authorization Started",
-        event_name: "ConnectionAuthorizationStarted",
-        components: UNDOCUMENTED_DETAIL,
-    },
-    ManagedEventType {
-        source: "aws.events",
-        detail_type: "Connection Deactivated",
-        event_name: "ConnectionDeactivated",
-        components: UNDOCUMENTED_DETAIL,
-    },
-    ManagedEventType {
-        source: "aws.events",
-        detail_type: "Connection Deauthorization Started",
-        event_name: "ConnectionDeauthorizationStarted",
-        components: UNDOCUMENTED_DETAIL,
-    },
+    // reader, and [`ManagedEventType::identified`] is how such a row is written.
+    //
+    // They are grouped by publishing source, because WHICH event types a source
+    // publishes is per-source published data: a source publishes the event types AWS
+    // publishes for it and no others, so a row is added for an event type AWS
+    // publishes rather than derived from a template over sources.
+    ManagedEventType::identified("aws.a4b", "Room State Change", "RoomStateChange"),
+    ManagedEventType::identified(
+        "aws.a4b",
+        "Room Device Calendar Error Status",
+        "RoomDeviceCalendarErrorStatus",
+    ),
+    // `aws.access-analyzer` publishes its finding events and NOTHING of the
+    // CloudTrail-delivered family, which is why it is absent from
+    // [`AWS_EVENT_SOURCES`].
+    ManagedEventType::identified(
+        "aws.access-analyzer",
+        "Access Analyzer Finding",
+        "AccessAnalyzerFinding",
+    ),
+    ManagedEventType::identified(
+        "aws.access-analyzer",
+        "Unused Access Finding for IAM entities",
+        "UnusedAccessFindingforIAMentities",
+    ),
+    ManagedEventType::identified(
+        "aws.acm-pca",
+        "ACM Private CA Audit Report Generation",
+        "ACMPrivateCAAuditReportGeneration",
+    ),
+    ManagedEventType::identified(
+        "aws.acm-pca",
+        "ACM Private CA CRL Generation",
+        "ACMPrivateCACRLGeneration",
+    ),
+    ManagedEventType::identified(
+        "aws.acm-pca",
+        "ACM Private CA Certificate Issuance",
+        "ACMPrivateCACertificateIssuance",
+    ),
+    ManagedEventType::identified(
+        "aws.acm-pca",
+        "ACM Private CA Certificate Revocation",
+        "ACMPrivateCACertificateRevocation",
+    ),
+    ManagedEventType::identified(
+        "aws.acm-pca",
+        "ACM Private CA Creation",
+        "ACMPrivateCACreation",
+    ),
+    ManagedEventType::identified(
+        "aws.act",
+        "Trust Bundle Association Version Updated",
+        "TrustBundleAssociationVersionUpdated",
+    ),
+    ManagedEventType::identified(
+        "aws.application-autoscaling",
+        "Application Auto Scaling Scaling Activity State Change",
+        "ApplicationAutoScalingScalingActivityStateChange",
+    ),
+    ManagedEventType::identified(
+        "aws.cleanrooms",
+        "Analysis Template Created",
+        "AnalysisTemplateCreated",
+    ),
+    ManagedEventType::identified(
+        "aws.cleanrooms",
+        "Analysis Template Deleted",
+        "AnalysisTemplateDeleted",
+    ),
+    ManagedEventType::identified(
+        "aws.cleanrooms",
+        "Analysis Template Updated",
+        "AnalysisTemplateUpdated",
+    ),
+    ManagedEventType::identified(
+        "aws.deadline",
+        "Budget Threshold Reached",
+        "BudgetThresholdReached",
+    ),
+    ManagedEventType::identified(
+        "aws.deadline",
+        "Fleet Size Recommendation Change",
+        "FleetSizeRecommendationChange",
+    ),
+    ManagedEventType::identified(
+        "aws.deadline",
+        "Job Lifecycle Status Change",
+        "JobLifecycleStatusChange",
+    ),
+    ManagedEventType::identified(
+        "aws.deadline",
+        "Job Run Status Change",
+        "JobRunStatusChange",
+    ),
+    ManagedEventType::identified(
+        "aws.deadline",
+        "Step Lifecycle Status Change",
+        "StepLifecycleStatusChange",
+    ),
+    ManagedEventType::identified(
+        "aws.deadline",
+        "Step Run Status Change",
+        "StepRunStatusChange",
+    ),
+    ManagedEventType::identified(
+        "aws.events",
+        "API Destination Activated",
+        "APIDestinationActivated",
+    ),
+    ManagedEventType::identified(
+        "aws.events",
+        "API Destination Deactivated",
+        "APIDestinationDeactivated",
+    ),
+    // The connection event types `aws.events` publishes: a connection's authorization
+    // and its lifecycle, each delivered under its own `detail-type`. The pair of
+    // "started" events ("Connection Creation Started", "Connection Update Started",
+    // "Connection Deletion Started") report work beginning, and the rest report the
+    // state a connection reached.
+    ManagedEventType::identified("aws.events", "Connection Activated", "ConnectionActivated"),
+    ManagedEventType::identified(
+        "aws.events",
+        "Connection Authorization Started",
+        "ConnectionAuthorizationStarted",
+    ),
+    ManagedEventType::identified(
+        "aws.events",
+        "Connection Authorized",
+        "ConnectionAuthorized",
+    ),
+    ManagedEventType::identified(
+        "aws.events",
+        "Connection Creation Started",
+        "ConnectionCreationStarted",
+    ),
+    ManagedEventType::identified(
+        "aws.events",
+        "Connection Deauthorization Started",
+        "ConnectionDeauthorizationStarted",
+    ),
+    ManagedEventType::identified(
+        "aws.events",
+        "Connection Deauthorized",
+        "ConnectionDeauthorized",
+    ),
+    ManagedEventType::identified(
+        "aws.events",
+        "Connection Deletion Started",
+        "ConnectionDeletionStarted",
+    ),
+    ManagedEventType::identified(
+        "aws.events",
+        "Connection Failed Connectivity",
+        "ConnectionFailedConnectivity",
+    ),
+    ManagedEventType::identified(
+        "aws.events",
+        "Connection Update Started",
+        "ConnectionUpdateStarted",
+    ),
+    // The scheduled events `aws.events` delivers to a rule's targets: the plain
+    // scheduled event ([`AWS_SERVICE_EVENT_TYPES`] above, which carries a document)
+    // and the one whose payload is JSON.
+    ManagedEventType::identified("aws.events", "Scheduled Json", "ScheduledJson"),
 ];
 
 /// The `components.schemas` of an event type whose `detail` AWS publishes no member
@@ -1282,14 +1400,15 @@ pub const CLOUD_TRAIL_EVENT_NAME: &str = "AWSAPICallviaCloudTrail";
 /// The `detail-type` EventBridge delivers a CloudTrail-recorded API call under.
 pub const CLOUD_TRAIL_DETAIL_TYPE: &str = "AWS API Call via CloudTrail";
 
-/// The CloudTrail-delivered event family every AWS event source publishes, as
-/// `(detail-type, EventName)` pairs.
+/// The CloudTrail-delivered event family the catalogue publishes for a source in
+/// [`AWS_EVENT_SOURCES`], as `(detail-type, EventName)` pairs.
 ///
 /// CloudTrail records more than API calls, and EventBridge delivers each KIND of record
 /// under its own `detail-type`: a console action, a console sign-in, an Insights event,
 /// a network-activity event and a service event beside the API call itself. The
-/// catalogue holds one schema per kind per source, so a source's entries are this whole
-/// family, not the API call alone.
+/// catalogue holds one schema per kind for a source it publishes these for, so such a
+/// source's entries are this whole family, not the API call alone; WHICH sources those
+/// are is [`AWS_EVENT_SOURCES`].
 ///
 /// The `detail` of every one of them IS a CloudTrail record, whose contents are the
 /// same whichever kind it records (CloudTrail User Guide, "CloudTrail record
@@ -1455,19 +1574,25 @@ const CLOUD_TRAIL_COMPONENTS: &str = r##"{
   }
 }"##;
 
-/// The AWS event sources the managed catalogue holds a schema for — the `aws.<service>`
-/// namespaces EventBridge delivers AWS service events under.
+/// The AWS event sources the managed catalogue holds a CloudTrail-delivered schema
+/// FOR — the `aws.<service>` namespaces whose CloudTrail records EventBridge delivers,
+/// under the detail-types of [`CLOUD_TRAIL_EVENT_FAMILY`].
 ///
-/// Source: the event-source namespaces AWS publishes events under, one per service
-/// that records API calls in CloudTrail (EventBridge delivers those records under the
-/// detail-types of [`CLOUD_TRAIL_EVENT_FAMILY`], which is why every source below
-/// carries that whole family of schemas in the catalogue). Kept in alphabetical order
-/// for reading; the store sorts by name on its own, and a name repeated here seeds one
-/// schema, not two.
+/// Source: the event-source namespaces the published catalogue carries those schemas
+/// under. WHICH sources they are is published data, read off the catalogue one source
+/// at a time — it is not every `aws.<service>` namespace there is, and a source's
+/// entry here says nothing about which of its OWN event types the catalogue publishes
+/// ([`AWS_SERVICE_EVENT_TYPES`] carries those, per source, and a source may appear
+/// there and not here). Kept in alphabetical order for reading; the store sorts by
+/// name on its own, and a name repeated here seeds one schema, not two.
 pub const AWS_EVENT_SOURCES: &[&str] = &[
     "aws.a4b",
     "aws.abuse",
-    "aws.access-analyzer",
+    // `aws.access-analyzer` is deliberately NOT here: the catalogue publishes its
+    // finding event types ([`AWS_SERVICE_EVENT_TYPES`]) and no CloudTrail-delivered
+    // schema for it. Membership of this list is per-source published data, not every
+    // event source there is.
+    "aws.access-insights",
     "aws.account",
     "aws.acm",
     "aws.acm-pca",
@@ -1507,6 +1632,7 @@ pub const AWS_EVENT_SOURCES: &[&str] = &[
     "aws.ce",
     "aws.chatbot",
     "aws.chime",
+    "aws.cleanrooms",
     "aws.cloud9",
     "aws.clouddirectory",
     "aws.cloudformation",
@@ -1541,6 +1667,7 @@ pub const AWS_EVENT_SOURCES: &[&str] = &[
     "aws.datapipeline",
     "aws.datasync",
     "aws.dax",
+    "aws.deadline",
     "aws.deepracer",
     "aws.detective",
     "aws.devicefarm",
@@ -1755,6 +1882,23 @@ impl ManagedEventType {
             detail_type,
             event_name,
             components: CLOUD_TRAIL_COMPONENTS,
+        }
+    }
+
+    /// An event type the catalogue publishes by its IDENTITY alone — the source and
+    /// the `detail-type` EventBridge delivers it under — because AWS documents that
+    /// the event exists without documenting the members of its `detail`. See
+    /// [`UNDOCUMENTED_DETAIL`] for what the rendered document then says.
+    pub const fn identified(
+        source: &'static str,
+        detail_type: &'static str,
+        event_name: &'static str,
+    ) -> Self {
+        Self {
+            source,
+            detail_type,
+            event_name,
+            components: UNDOCUMENTED_DETAIL,
         }
     }
 
@@ -2262,6 +2406,63 @@ pub struct Page<T> {
     pub next_token: Option<String>,
 }
 
+/// Collate a listing of a registry's schemas: the schemas `entries` names, paired with
+/// the key [`schema_name_order_key`] collates each name under, in that key's order —
+/// which is the order `ListSchemas` and `SearchSchemas` serve a registry's schemas in
+/// and [`page_by_key`] then pages over.
+///
+/// The names are collated, not the values: this orders the WHOLE selection (so the
+/// caller filters cheaply before it, or lazily over the result) and touches nothing but
+/// each schema's name.
+pub fn in_schema_name_order<'a, V>(
+    entries: impl Iterator<Item = (&'a String, V)>,
+) -> Vec<(String, V)> {
+    let mut collated: Vec<(String, V)> = entries
+        .map(|(name, value)| (schema_name_order_key(name), value))
+        .collect();
+    collated.sort_by(|(left, _), (right, _)| left.cmp(right));
+    collated
+}
+
+/// The key a `SchemaName` is collated under in a listing of schemas.
+///
+/// A registry is NOT served in byte order of its schema names: the published catalogue
+/// orders `aws.application-autoscaling@ApplicationAutoScalingScalingActivityStateChange`
+/// ahead of `aws.application-autoscaling@AWSAPICallviaCloudTrail` (which needs case to
+/// be folded, since `A` < `a` byte-wise would decide it the other way) and
+/// `aws.autoscaling@AWSAPICallviaCloudTrail` ahead of
+/// `aws.autoscaling-plans@AWSAPICallviaCloudTrail` (which needs the punctuation to be
+/// left out, since `-` < `@` byte-wise would decide it the other way). So the collation
+/// compares a name's LETTERS AND DIGITS, case-folded, and nothing else.
+///
+/// Two names can fold to the same letters and digits (one `-` apart, or one letter's
+/// case apart), and a listing's order has to be total — a `NextToken` names a POSITION
+/// in it, so two names it cannot separate would make a resumed walk skip or repeat one
+/// of them. The raw name therefore breaks the tie, after
+/// [`COLLATION_TIEBREAK_SEPARATOR`]: that separator is below every byte a folded half
+/// can hold, so comparing two of these keys as strings is exactly comparing their
+/// `(folded, raw)` pairs — which is what lets [`page_by_key`] keep comparing keys as
+/// strings.
+pub fn schema_name_order_key(schema_name: &str) -> String {
+    let mut key: String = schema_name
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    key.push(COLLATION_TIEBREAK_SEPARATOR);
+    key.push_str(schema_name);
+    key
+}
+
+/// What separates the two halves of a [`schema_name_order_key`]: the folded half it
+/// collates by, and the raw name that breaks a tie between two names that fold alike.
+///
+/// A folded half holds only alphanumeric characters, every one of which encodes to
+/// bytes above this one, so the separator cannot appear inside a half and a key's
+/// string order is its `(folded, raw)` order — including where one folded half is a
+/// prefix of another, which this byte makes the shorter one.
+const COLLATION_TIEBREAK_SEPARATOR: char = '\u{1}';
+
 /// Mint a `NextToken` that resumes strictly after `last_key`, for a listing selected
 /// by `selection`.
 ///
@@ -2290,10 +2491,11 @@ fn decode_next_token(selection: &str, token: &str) -> Option<String> {
 
 /// Take one page out of a key-ordered sequence.
 ///
-/// `entries` must be ordered by key (a `BTreeMap`'s iteration order is). The page
-/// starts strictly after the key `token` encodes and holds at most `page_size` items;
-/// `next_token` is minted only when a further entry exists, so the last page of a
-/// listing carries none.
+/// `entries` must be ordered by key (a `BTreeMap`'s iteration order is, and
+/// [`in_schema_name_order`]'s output is ordered by the collation key it pairs each
+/// item with). The page starts strictly after the key `token` encodes and holds at most
+/// `page_size` items; `next_token` is minted only when a further entry exists, so the
+/// last page of a listing carries none.
 ///
 /// `page_size` is a count, never "unbounded": a listing that materialised its whole
 /// selection into one response would be a response-amplification path out of a store
@@ -2886,6 +3088,104 @@ mod tests {
     /// The selection the helper's own tests page under; its shape does not matter
     /// here, only that it is the same one on both sides of a token.
     const SELECTION: &str = "prefix=;scope=Local";
+
+    /// The collation a listing of schemas serves is the order of each name's letters
+    /// and digits, case-folded, with the raw name breaking a tie — and comparing the
+    /// composite keys as strings is exactly comparing those `(folded, raw)` pairs.
+    ///
+    /// Driven over a generated cross product rather than a handful of names: every
+    /// combination of a separator, a casing and a trailing fragment, which is what the
+    /// rule generalises over. The expectation is computed independently of
+    /// [`schema_name_order_key`], from the pair itself.
+    #[test]
+    fn a_schema_name_collates_by_its_letters_and_digits() {
+        // Fragments crossed into names: the separators a schema name carries, both
+        // casings of the words around them, and tails that differ in length, in digits
+        // and in nothing but case.
+        let separators = ["", ".", "-", "@", "_", "..", "-@"];
+        let heads = ["svc", "SVC", "Svc9"];
+        let tails = ["a", "A", "ab", "a1", "1a", "", "aB2"];
+
+        let mut names: Vec<String> = Vec::new();
+        for head in heads {
+            for separator in separators {
+                for tail in tails {
+                    names.push(format!("{head}{separator}{tail}"));
+                }
+            }
+        }
+        names.sort_unstable();
+        names.dedup();
+
+        // The pair the collation is DEFINED by, computed here without the key.
+        let pair = |name: &str| -> (String, String) {
+            (
+                name.chars()
+                    .filter(|character| character.is_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect(),
+                name.to_string(),
+            )
+        };
+
+        for left in &names {
+            for right in &names {
+                let case = (left, right);
+                let by_key = schema_name_order_key(left).cmp(&schema_name_order_key(right));
+                let by_pair = pair(left).cmp(&pair(right));
+                assert_eq!(
+                    by_key, by_pair,
+                    "case {case:?}: the key order must be the (folded, raw) order, \
+                     got {by_key:?} against {by_pair:?}"
+                );
+            }
+        }
+
+        // A key is a total order over distinct names: no two of them share one, so a
+        // `NextToken` naming a position can never be ambiguous.
+        let keys: BTreeSet<String> = names.iter().map(|name| schema_name_order_key(name)).collect();
+        assert_eq!(
+            keys.len(),
+            names.len(),
+            "every distinct name must have its own key, got {} keys for {} names",
+            keys.len(),
+            names.len()
+        );
+    }
+
+    /// [`in_schema_name_order`] puts a selection into exactly that order, whatever
+    /// order the store handed it over in.
+    #[test]
+    fn a_selection_is_collated_before_it_is_paged() {
+        // Source: the two orderings a byte comparison answers the other way round —
+        // one decided by case, one by punctuation.
+        let stored: Vec<String> = [
+            "svc.autoscaling-plans@AWSAPICallviaCloudTrail",
+            "svc.autoscaling@AWSAPICallViaCloudTrail",
+            "svc.autoscaling@AWSAPICallviaCloudTrail",
+            "svc.application-autoscaling@AWSAPICallviaCloudTrail",
+            "svc.application-autoscaling@ApplicationAutoScalingScalingActivityStateChange",
+        ]
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+
+        let collated: Vec<&str> = in_schema_name_order(stored.iter().map(|name| (name, name)))
+            .into_iter()
+            .map(|(_, name)| name.as_str())
+            .collect();
+        assert_eq!(
+            collated,
+            vec![
+                "svc.application-autoscaling@ApplicationAutoScalingScalingActivityStateChange",
+                "svc.application-autoscaling@AWSAPICallviaCloudTrail",
+                "svc.autoscaling@AWSAPICallViaCloudTrail",
+                "svc.autoscaling@AWSAPICallviaCloudTrail",
+                "svc.autoscaling-plans@AWSAPICallviaCloudTrail",
+            ],
+            "the selection must come out in the collated order"
+        );
+    }
 
     /// A listing shorter than the page size is one page and carries no token.
     #[test]

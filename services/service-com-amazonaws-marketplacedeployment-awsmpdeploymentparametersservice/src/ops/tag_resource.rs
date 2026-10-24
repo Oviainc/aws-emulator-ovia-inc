@@ -15,7 +15,10 @@
 //! service's and names no stored record is a 404 carrying this service's own
 //! `NotFoundException` code (`crate::state::parameter_not_found`), which is the code
 //! its recorded responses use rather than the modelled `ResourceNotFoundException`
-//! shape name.
+//! shape name. A record whose `expirationDate` has passed is "scheduled for
+//! deletion" and is dropped before the ARN is resolved
+//! (`crate::state::ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::purge_expired`),
+//! so a tag write against an expired parameter gets that same not-found failure.
 //!
 //! ## Shape of an operation
 //!
@@ -163,7 +166,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        // Materialise the expiry the clock has already made due before resolving the
+        // ARN: a parameter past its `expirationDate` is scheduled for deletion, so a
+        // tag write against it is a write to a resource that no longer exists. ONE
+        // clock sample decides it.
+        store.purge_expired(now);
 
         let Some(record) = store.parameters.get_mut(&input.resource_arn) else {
             // The not-found CODE this service emits is `NotFoundException`, not the

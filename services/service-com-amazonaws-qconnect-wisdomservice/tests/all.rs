@@ -27,6 +27,8 @@ mod enum_value_refusal;
 mod knowledge_base_lifecycle;
 #[path = "all/modelled_refusals.rs"]
 mod modelled_refusals;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/session_recommendations.rs"]
 mod session_recommendations;
 #[path = "all/state_roundtrip.rs"]

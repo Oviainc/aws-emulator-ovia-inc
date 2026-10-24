@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteScene
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteScene`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes a scene from the workspace that contains it, so the next `GetScene`
+//! on it is a `ResourceNotFoundException` and the ARN it was minted with stops
+//! resolving (the tags reachable under that ARN go with it).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteScene::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Nothing stored in this service REFERENCES a scene: a scene names its content
+//! in S3, and no other resource of this service names a scene — so, unlike
+//! `DeleteComponentType`, this delete has no reference check to make and an
+//! existing scene is always removable.
+//!
+//! A scene has no lifecycle `state` anywhere in its API and
+//! `DeleteSceneResponse` carries no members, so the removal this call performs
+//! is reported by the empty HTTP 200 body alone. Both labels address an
+//! EXISTING resource, so a workspace or a scene the store does not hold is the
+//! modelled `ResourceNotFoundException` (HTTP 404) — the same reading `GetScene`
+//! gives the same two labels, which also makes a repeated delete a 404 rather
+//! than a second success.
+//!
+//! Authorization is not emulated, so the modelled `AccessDeniedException` is
+//! never returned: a 200 from here is not an authorization decision.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +151,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteScene` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSceneErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteScene"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one destroys tenant state.
+        ::tracing::info!(
+            operation = "DeleteScene",
+            workspace_id = %input.workspace_id,
+            scene_id = %input.scene_id,
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteSceneErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // Both labels address an EXISTING resource, so neither naming something
+        // the store does not hold is anything but a 404.
+        let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
+            return Err(DeleteSceneErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::workspace_not_found_message(
+                        &input.workspace_id,
+                    )),
+                },
+            )
+            .into());
+        };
+        // The removal IS the lookup: a scene nothing references is removable
+        // whatever it carries, so the record is taken out of the workspace that
+        // contains it and a miss is the 404 the labels earn.
+        let Some(removed) = workspace.scenes.remove(&input.scene_id) else {
+            return Err(DeleteSceneErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::scene_not_found_message(
+                        &input.workspace_id,
+                        &input.scene_id,
+                    )),
+                },
+            )
+            .into());
+        };
+        // The record is gone, so the ARN it was indexed under stops resolving
+        // with it: the index must never name a scene the store does not hold,
+        // and the scene's tags are reachable only through that ARN.
+        state.arn_index.remove(&removed.arn);
+        ::tracing::info!(
+            operation = "DeleteScene",
+            workspace_id = %input.workspace_id,
+            scene_id = %input.scene_id,
+            "removed a scene"
+        );
+
+        Ok(DeleteSceneOutput {})
     }
 }

@@ -4,19 +4,21 @@
 //! `aws.events` registry every account sees, which holds one schema per AWS event
 //! type.
 //!
-//! The rule under test is the catalogue's MEMBERSHIP and readability: every AWS event
-//! source publishes an API-call event type, every event type the catalogue holds is
-//! named `<source>@<EventName>`, and each member is readable end to end — it is listed
-//! (through `NextToken`, because the catalogue is far larger than one page), described
-//! with its document and its derived description, exported, and found by a search.
+//! The rule under test is the catalogue's MEMBERSHIP and readability: a source the
+//! catalogue publishes CloudTrail-delivered schemas for publishes an API-call event
+//! type, every event type the catalogue holds is named `<source>@<EventName>`, and each
+//! member is readable end to end — it is listed (through `NextToken`, because the
+//! catalogue is far larger than one page), described with its document and its derived
+//! description, exported, and found by a search.
 //!
 //! Every case drives the real wire path, through the harness in
 //! `registry_schema_lifecycle.rs` — nothing here touches the state struct directly.
 
 use serde_json::Value;
 use service_com_amazonaws_schemas_schemas::state::{
-    aws_managed_schemas, ManagedSchema, AWS_EVENT_SOURCES, AWS_MANAGED_REGISTRY,
-    AWS_MANAGED_SCHEMA_TYPE, AWS_SERVICE_EVENT_TYPES, CLOUD_TRAIL_EVENT_NAME, MAX_PAGE_SIZE,
+    aws_managed_schemas, schema_name_order_key, ManagedSchema, AWS_EVENT_SOURCES,
+    AWS_MANAGED_REGISTRY, AWS_MANAGED_SCHEMA_TYPE, AWS_SERVICE_EVENT_TYPES, CLOUD_TRAIL_EVENT_NAME,
+    MAX_PAGE_SIZE,
 };
 
 use crate::registry_schema_lifecycle::{
@@ -61,14 +63,14 @@ fn readable_rows() -> Vec<String> {
     ]
 }
 
-/// RULE: the AWS-managed registry holds a schema for every AWS event source's
-/// API-call event type, published under `<source>@<EventName>`.
+/// RULE: the AWS-managed registry holds the API-call event type of every source it
+/// publishes CloudTrail-delivered schemas for, published under `<source>@<EventName>`.
 ///
-/// Driven over EVERY source the catalogue names, not a sample: the rule is about the
-/// catalogue's membership, so each source is a row. Each is selected by its own name
-/// prefix, so the case is independent of which page the entry lands on.
+/// Driven over EVERY such source the catalogue names, not a sample: the rule is about
+/// the catalogue's membership, so each source is a row. Each is selected by its own
+/// name prefix, so the case is independent of which page the entry lands on.
 #[tokio::test]
-async fn the_catalogue_holds_the_api_call_event_type_of_every_event_source() {
+async fn the_catalogue_holds_the_api_call_event_type_of_every_cloud_trail_source() {
     let emulator = Emulator::new();
 
     for source in AWS_EVENT_SOURCES {
@@ -266,9 +268,9 @@ async fn every_catalogue_member_exports_in_both_schema_languages() {
 }
 
 /// RULE (an invariant): following `NextToken` walks the catalogue exactly once — the
-/// concatenated pages are its whole membership in name order, with no repeat and no
-/// gap — whatever page size is asked for, including one past the page the service will
-/// serve.
+/// concatenated pages are its whole membership in the order the registry collates
+/// schema names in, with no repeat and no gap — whatever page size is asked for,
+/// including one past the page the service will serve.
 #[tokio::test]
 async fn paging_the_catalogue_walks_every_member_exactly_once() {
     let emulator = Emulator::new();
@@ -277,7 +279,9 @@ async fn paging_the_catalogue_walks_every_member_exactly_once() {
         .iter()
         .map(|entry| entry.name.clone())
         .collect();
-    expected.sort();
+    // The order a listing serves, which is the collation of the schema NAMES — not
+    // their bytes. Source: `crate::state::schema_name_order_key`.
+    expected.sort_by_key(|name| schema_name_order_key(name));
     assert!(
         expected.len() > MAX_PAGE_SIZE,
         "the catalogue must be larger than one page for this case to page at all, got {}",
@@ -297,7 +301,8 @@ async fn paging_the_catalogue_walks_every_member_exactly_once() {
         let walked = walk(&emulator, &catalogue_uri(), limit, schema_names).await;
         assert_eq!(
             walked, expected,
-            "case limit={limit:?}: paging must walk the whole catalogue once, in name order"
+            "case limit={limit:?}: paging must walk the whole catalogue once, in the \
+             order it collates names in"
         );
     }
 }

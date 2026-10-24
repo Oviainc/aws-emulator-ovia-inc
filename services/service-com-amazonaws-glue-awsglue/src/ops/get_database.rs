@@ -167,10 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(entry) = store.database(&catalog_id, &input.name) else {
             return Err(GetDatabaseErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(format!(
-                        "Database {} not found in catalog {catalog_id}",
-                        crate::state::fold_name(&input.name)
-                    )),
+                    message: Some(crate::state::messages::database_not_found(&input.name)),
                     from_federation_source: None,
                 },
             )

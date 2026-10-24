@@ -170,9 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(catalog) = store.catalogs.get_mut(&catalog_id) else {
             return Err(UpdateDatabaseErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(format!(
-                        "Database {addressed} not found in catalog {catalog_id}"
-                    )),
+                    message: Some(crate::state::messages::database_not_found(&input.name)),
                     from_federation_source: None,
                 },
             )
@@ -189,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(UpdateDatabaseErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
-                    message: Some(format!("Database already exists: {submitted}")),
+                    message: Some(crate::state::messages::DATABASE_ALREADY_EXISTS.to_string()),
                 },
             )
             .into());
@@ -200,9 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(mut entry) = catalog.databases.remove(&addressed) else {
             return Err(UpdateDatabaseErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(format!(
-                        "Database {addressed} not found in catalog {catalog_id}"
-                    )),
+                    message: Some(crate::state::messages::database_not_found(&input.name)),
                     from_federation_source: None,
                 },
             )

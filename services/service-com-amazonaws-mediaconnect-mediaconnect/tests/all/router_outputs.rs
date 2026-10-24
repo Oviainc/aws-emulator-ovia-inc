@@ -34,18 +34,26 @@ use crate::flow_lifecycle::{Emulator, REGION};
 const NETWORK_INTERFACE_ARN: &str =
     "arn:aws:mediaconnect:us-east-1:000000000000:routerNetworkInterface:a1b2c3d4e5f6";
 /// A `FlowArn` matching the modelled pattern (see `flow_lifecycle`).
-const FLOW_ARN: &str = "arn:aws:mediaconnect:us-east-1:000000000000:flow:1-0000000a:ro-target";
+///
+/// `pub(crate)` because `tests/all/router_output_lifecycle.rs` builds its own cases from
+/// the same fixtures, so the two suites cannot drift apart.
+pub(crate) const FLOW_ARN: &str =
+    "arn:aws:mediaconnect:us-east-1:000000000000:flow:1-0000000a:ro-target";
 /// A `FlowSourceArn` matching the modelled pattern
 /// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:source:[a-zA-Z0-9-]+:[a-zA-Z0-9_-]+$`.
 const FLOW_SOURCE_ARN: &str =
     "arn:aws:mediaconnect:us-east-1:000000000000:source:1-0000000a:ro-target-source";
 /// A `MediaLiveInputArn` matching the modelled pattern
-/// `^arn:(aws[a-zA-Z-]*):medialive:[a-z0-9-]+:[0-9]{12}:input:[a-zA-Z0-9]+$`.
-const MEDIALIVE_INPUT_ARN: &str = "arn:aws:medialive:us-east-1:000000000000:input:mlinput1";
-/// A `SecretArn` matching the modelled pattern.
-const SECRET_ARN: &str = "arn:aws:secretsmanager:us-east-1:000000000000:secret:router-key";
-/// A `RoleArn` matching the modelled pattern.
-const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/router-output-role";
+/// `^arn:(aws[a-zA-Z-]*):medialive:[a-z0-9-]+:[0-9]{12}:input:[a-zA-Z0-9]+$`. See
+/// [`FLOW_ARN`] for why it is `pub(crate)`.
+pub(crate) const MEDIALIVE_INPUT_ARN: &str =
+    "arn:aws:medialive:us-east-1:000000000000:input:mlinput1";
+/// A `SecretArn` matching the modelled pattern. See [`FLOW_ARN`] for why it is
+/// `pub(crate)`.
+pub(crate) const SECRET_ARN: &str =
+    "arn:aws:secretsmanager:us-east-1:000000000000:secret:router-key";
+/// A `RoleArn` matching the modelled pattern. See [`FLOW_ARN`] for why it is `pub(crate)`.
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/router-output-role";
 
 /// An ARN satisfying the modelled `RouterOutputArn` pattern that no create minted, so no
 /// store holds a router output for it.
@@ -55,7 +63,14 @@ const UNKNOWN_ARN: &str =
 const OTHER_UNKNOWN_ARN: &str =
     "arn:aws:mediaconnect:us-east-1:000000000000:routerOutput:eeeeeeeeeeee";
 
-async fn create_router_output(emulator: &Emulator, body: Value) -> (u16, Option<String>, Value) {
+/// Send one CreateRouterOutput request.
+///
+/// `pub(crate)` for the same reason as [`FLOW_ARN`]: the delete/get suite creates what it
+/// then reads through this one helper.
+pub(crate) async fn create_router_output(
+    emulator: &Emulator,
+    body: Value,
+) -> (u16, Option<String>, Value) {
     emulator.send("POST", "/v1/routerOutput", Some(body)).await
 }
 
@@ -87,7 +102,12 @@ async fn batch_get_router_outputs(
 ///
 /// The check runs through the crate's own encoding of the pattern and then re-asserts,
 /// field by field, the parts it fixes, so a bug in that function cannot hide here.
-fn assert_minted_router_output_arn(case: &str, arn: &str, id: &str) {
+///
+/// `region` is the Region the output was created in — a parameter rather than [`REGION`]
+/// because `CreateRouterOutput$RegionName` can name another one. `pub(crate)` so
+/// `tests/all/router_output_lifecycle.rs` asserts minted ARNs through this ONE function
+/// too.
+pub(crate) fn assert_minted_router_output_arn(case: &str, arn: &str, id: &str, region: &str) {
     assert!(
         mc::is_mintable_router_output_arn(arn),
         "case {case:?}: a minted RouterOutputArn must satisfy the modelled pattern, got {arn:?}"
@@ -100,7 +120,7 @@ fn assert_minted_router_output_arn(case: &str, arn: &str, id: &str) {
     );
     assert_eq!(
         (segments[0], segments[2], segments[3], segments[5]),
-        ("arn", "mediaconnect", REGION, "routerOutput"),
+        ("arn", "mediaconnect", region, "routerOutput"),
         "case {case:?}: ARN prefix, service, Region and resource type, got {arn:?}"
     );
     assert!(
@@ -207,8 +227,9 @@ fn standard(protocol_configuration: Value) -> Value {
 }
 
 /// The same configuration as [`standard`], with the `Protocol` the service must report
-/// filled in — what the store must hold afterwards.
-fn standard_with_protocol(protocol_configuration: Value, protocol: &str) -> Value {
+/// filled in — what the store must hold afterwards. `pub(crate)` for the same reason as
+/// [`FLOW_ARN`].
+pub(crate) fn standard_with_protocol(protocol_configuration: Value, protocol: &str) -> Value {
     json!({
         "Standard": {
             "networkInterfaceArn": NETWORK_INTERFACE_ARN,
@@ -435,7 +456,7 @@ async fn create_router_output_persists_what_batch_get_reports() {
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: the create answers an Id: {created}"))
             .to_string();
-        assert_minted_router_output_arn(case, &arn, &id);
+        assert_minted_router_output_arn(case, &arn, &id, REGION);
 
         for (member, expected) in [
             ("name", json!(requested_name)),
@@ -1149,6 +1170,9 @@ fn seed_router_outputs(emulator: &Emulator, count: usize) {
                 routed_input_arn: None,
                 messages: Vec::new(),
                 client_token: None,
+                // A seeded output is live, like a created one: only DeleteRouterOutput sets
+                // the instant the clock completes a delete at.
+                removal_due_at: None,
                 created_at: now,
                 updated_at: now,
             },

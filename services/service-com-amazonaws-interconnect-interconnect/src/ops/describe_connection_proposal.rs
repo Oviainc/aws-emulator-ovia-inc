@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConnectionProposal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConnectionProposal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConnectionProposal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -82,9 +73,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-interconnect-interconne
 // here — hence the `DescribeConnectionProposalError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.interconnect#DescribeConnectionProposal")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.interconnect#DescribeConnectionProposal",
+    extra_errors = ["ResourceNotFoundException", "InterconnectServerException"]
+)]
 #[derive(Debug)]
 pub enum DescribeConnectionProposalErrorModeled {
+    ResourceNotFoundException(ResourceNotFoundException),
+    InterconnectServerException(InterconnectServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -138,18 +134,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConnectionProposal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConnectionProposalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConnectionProposal"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeConnectionProposalErrorModeled::InterconnectServerException(
+                    InterconnectServerException {
+                        message: "the Interconnect connection store is not mounted on this engine"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Reporting only (`@readonly`): the one write below settles transitions the
+        // clock had ALREADY made due and drops records whose retention had run out —
+        // owed at this instant whether or not anybody asked. Describing a proposal
+        // changes nothing about it, so a second call answers identically.
+        let proposal = {
+            let mut store = state.lock();
+            store.materialise_due_transitions(::std::time::Instant::now());
+            // The `activationKey` is the proposal's only handle: the store's
+            // `activationKey` -> connection-id index is what resolves it, and an entry
+            // lives exactly as long as the record it names.
+            let connection_id = store.activation_keys.get(&input.activation_key).cloned();
+            connection_id.and_then(|id| {
+                let stored = store.connections.get(&id)?;
+                let connection = &stored.connection;
+                // `provider` and `location` are documented as belonging to "the
+                // specific Environment of the proposal", so they are read from the
+                // catalog entry the proposal names; the record's own copies (taken
+                // from that entry when it was allocated) answer for an environment
+                // that is no longer in the catalog.
+                let (provider, location) = store
+                    .environments
+                    .get(&connection.environment_id)
+                    .map_or_else(
+                        || (connection.provider.clone(), connection.location.clone()),
+                        |environment| {
+                            (environment.provider.clone(), environment.location.clone())
+                        },
+                    );
+                Some(DescribeConnectionProposalOutput {
+                    bandwidth: connection.bandwidth.clone(),
+                    environment_id: connection.environment_id.clone(),
+                    provider,
+                    location,
+                })
+            })
+        };
+
+        // A key that resolves to no stored proposal is the modelled 404: "the request
+        // specifies a resource that does not exist on the server". `ActivationKey` is
+        // `@sensitive`, so the refusal names the member, never the key's value.
+        let Some(output) = proposal else {
+            return Err(
+                DescribeConnectionProposalErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::proposal_not_retrievable_message()),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(output)
     }
 }

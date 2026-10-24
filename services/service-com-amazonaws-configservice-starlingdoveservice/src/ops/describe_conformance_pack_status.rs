@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConformancePackStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConformancePackStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConformancePackStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the deployment status of the conformance packs this account and Region holds:
+//! which state each pack's deployment has reached, when it was last requested and when
+//! it last completed.
+//!
+//! What this handler enforces, and where each rule comes from:
+//!
+//! * "Provides one or more conformance packs deployment status. If there are no
+//!   conformance packs then you will see an empty result": a name this account holds no
+//!   pack for contributes nothing to the page — this operation models no
+//!   `NoSuchConformancePackException` — and a request naming no pack at all reports
+//!   every pack;
+//! * the state is DERIVED from the clock: a pack is `CREATE_IN_PROGRESS` until the
+//!   instant its deployment is due and `CREATE_COMPLETE` from then on
+//!   ([`crate::state::ConformancePackEntry::state_at`]), so this read changes nothing
+//!   and two reads at one instant agree;
+//! * `Limit` is the page size, with the modelled default of 0 meaning the maximum
+//!   ([`crate::state::DESCRIBE_CONFORMANCE_PACK_STATUS_PAGE_SIZE`]), and a limit outside
+//!   the modelled range is `InvalidLimitException`; `NextToken`
+//!   resumes at the pack name the previous page stopped at; a token outside the opaque
+//!   form this operation issues is `InvalidNextTokenException`.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +98,10 @@ use super::types::*;
 // `DescribeConformancePackStatusError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-configservice-starlingdoveservice.json");
 
+/// The most conformance pack names one request may name (`ConformancePackNamesList`,
+/// `@length(min: 0, max: 25)`).
+const MAX_CONFORMANCE_PACK_NAMES: usize = 25;
+
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `DescribeConformancePackStatusError` alias below. An operation that models no errors
@@ -150,18 +166,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConformancePackStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConformancePackStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConformancePackStatus"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let names = input.conformance_pack_names.unwrap_or_default();
+        // "Comma-separated list of conformance pack names": the modelled list carries at
+        // most 25 of them, which the request boundary enforces; the check stands so a
+        // longer list answers this operation's own modelled
+        // `InvalidParameterValueException` either way, with a message BUILT FROM THE
+        // REQUEST.
+        if names.len() > MAX_CONFORMANCE_PACK_NAMES {
+            return Err(
+                DescribeConformancePackStatusErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Value at 'conformancePackNames' failed to satisfy constraint: \
+                             Member must have length less than or equal to \
+                             {MAX_CONFORMANCE_PACK_NAMES}, and {} names were sent",
+                            names.len(),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The maximum number of conformance packs status returned on each page." The
+        // modelled range (0..20) is refused at the request boundary where the boundary
+        // enforces it; the check stands so a limit outside it answers this operation's
+        // own modelled `InvalidLimitException` either way, with a message BUILT FROM THE
+        // REQUEST. A limit of 0 is the modelled default — "unspecified" — which is the
+        // largest page the model lets one response carry.
+        let requested = input.limit;
+        let page_size = match usize::try_from(requested) {
+            Ok(0) => crate::state::DESCRIBE_CONFORMANCE_PACK_STATUS_PAGE_SIZE,
+            Ok(limit) if limit <= crate::state::DESCRIBE_CONFORMANCE_PACK_STATUS_PAGE_SIZE => limit,
+            _ => {
+                return Err(
+                    DescribeConformancePackStatusErrorModeled::InvalidLimitException(
+                        InvalidLimitException {
+                            message: Some(format!(
+                                "Value '{requested}' at 'limit' failed to satisfy constraint: \
+                                 Member must be between 0 and {}",
+                                crate::state::DESCRIBE_CONFORMANCE_PACK_STATUS_PAGE_SIZE,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        DescribeConformancePackStatusErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "the specified NextToken is not valid; use the NextToken a \
+                                     previous DescribeConformancePackStatus response returned"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // Page over the store's own name ordering, so a token holds the NAME the next
+        // page resumes at and survives packs created or deleted between pages.
+        let mut page = Vec::new();
+        let mut next_token = None;
+        for (name, entry) in &store.conformance_packs {
+            if resume_at.as_ref().is_some_and(|resume_at| name < resume_at) {
+                continue;
+            }
+            if !names.is_empty() && !names.iter().any(|requested| requested == name) {
+                continue;
+            }
+            if page.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(name));
+                break;
+            }
+            page.push(entry.to_status_detail(now));
+        }
+
+        Ok(DescribeConformancePackStatusOutput {
+            conformance_pack_status_details: Some(page),
+            next_token,
+        })
     }
 }

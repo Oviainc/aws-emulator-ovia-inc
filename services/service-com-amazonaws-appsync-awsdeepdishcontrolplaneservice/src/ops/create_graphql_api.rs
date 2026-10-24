@@ -307,7 +307,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let region = request_region(ctx);
+        let region = crate::state::request_region(ctx);
         let mut guard = state.lock();
 
         // The store is bounded, so a repeated create cannot grow it without limit:
@@ -392,7 +392,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The ARN namespace (and endpoint prefix) this service's resources carry.
-const ARN_SERVICE: &str = "appsync";
+const ARN_SERVICE: &str = crate::state::ARN_SERVICE;
 
 /// `ownerContact`'s documented maximum length: "This field accepts any string input
 /// with a length of 0 - 256 characters."
@@ -403,7 +403,7 @@ const OWNER_CONTACT_MAX_LEN: usize = 256;
 const APIS_PER_REGION: usize = 25;
 
 /// The model's documented value for `apiType` when the request omits it.
-const DEFAULT_API_TYPE: &str = "GRAPHQL";
+const DEFAULT_API_TYPE: &str = crate::state::GRAPHQL_API_TYPE;
 
 /// The model's documented value for `visibility` when the request omits it.
 const DEFAULT_VISIBILITY: &str = "GLOBAL";
@@ -491,13 +491,4 @@ fn api_dns(host_label: &str, region: &str) -> std::collections::BTreeMap<String,
             format!("{host_label}.appsync-realtime-api.{region}.amazonaws.com"),
         ),
     ])
-}
-
-/// The region the caller addressed, read from the request's SigV4 credential scope.
-///
-/// Falls back to the emulator's default region for an unsigned request, which carries
-/// no scope to read.
-fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
-    emulator_server::sigv4_credential_scope(&ctx.parts().headers)
-        .map_or_else(|| "us-east-1".to_string(), |scope| scope.region)
 }

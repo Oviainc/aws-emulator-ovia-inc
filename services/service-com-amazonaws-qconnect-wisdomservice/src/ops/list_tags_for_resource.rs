@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: REPORTS the tags persisted on the resource the `resourceArn` names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation is `@readonly` (`smithy_query(query="operation",
+//! operation="ListTagsForResource")`), so it writes nothing: two reads of an unchanged
+//! resource answer alike, and the map it answers with is the one a create or a tag call
+//! persisted on that resource — there is no second copy of a resource's tags.
+//!
+//! `resourceArn` is a full `Arn`, not one family's path label, so the lookup spans every
+//! resource family this store holds a tag map for
+//! ([`crate::state::ComAmazonawsQconnectWisdomserviceState::tags_of_resource`]): an
+//! assistant, a knowledge base, a session or an assistant association. An ARN that names
+//! no resource this account holds — including one this emulator never minted — is the
+//! operation's modelled `ResourceNotFoundException` (HTTP 404).
+//!
+//! The `tags` member is ALWAYS present, and an empty object for a resource carrying no
+//! tag: that is the rule this crate states once in [`crate::state::tags_out`], so a
+//! client reading `response["tags"]` finds a map for every resource it can read.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +144,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // `ListTagsForResource` is `@readonly`: it reports the tag map stored on the
+        // resource and writes nothing, so a read cannot change what a later caller sees.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Mounted on an engine that holds no state: there is nothing to read, and
+            // this operation models no error that says so.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListTagsForResource",
+            ));
+        };
+        let state = state.lock();
+        let Some(tags) = state.tags_of_resource(&input.resource_arn) else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::MESSAGE_RESOURCE_NOT_FOUND.to_string()),
+                    resource_name: Some(input.resource_arn.clone()),
+                },
+            )
+            .into());
+        };
+        Ok(ListTagsForResourceOutput {
+            tags: crate::state::tags_out(tags),
+        })
     }
 }

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNotificationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNotificationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNotificationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts the notification configuration into `crate::state`'s
+//! `notification_configurations` store under the region and `EventType` the request names
+//! ([`crate::state::RegionalName`]), and answers with that event type. The
+//! `DestinationName` is RESOLVED against the destination store `CreateDestination` fills:
+//! a name this account has no destination under is refused with the modelled
+//! `ValidationException` — the model declares no `ResourceNotFoundException` for this
+//! operation — and nothing is created. An event type carries one configuration, so a
+//! second create for the same event type is the modelled `ConflictException`, while a
+//! replayed `ClientToken` (`@idempotencyToken`) answers with the record the first call
+//! created.
 //!
 //! ## Shape of an operation
 //!
@@ -135,6 +137,22 @@ pub struct CreateNotificationConfiguration<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the configuration was created in, the
+/// event type it addresses, and how the call ended. No `DestinationName` and no
+/// `ClientToken`: a log sink needs neither to attribute the change.
+fn audit(akid: &str, region: &str, event_type: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "CreateNotificationConfiguration",
+        akid = %akid,
+        region = %region,
+        event_type = %event_type,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
 impl<Eng> CreateNotificationConfiguration<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -161,18 +179,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNotificationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNotificationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNotificationConfiguration"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region this configuration is created in.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, &input.event_type, "unavailable");
+            CreateNotificationConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the notification-configuration store is unavailable".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        // `EventType` is a modelled enum, so a value outside `EVENT_TYPE_VALUES` is a
+        // client error rather than a stored record. The model's own constraint walk refuses
+        // one before this handler runs; this second line states it through the SAME
+        // formatter, so the two cannot word one refusal two ways.
+        if !EVENT_TYPE_VALUES.contains(&input.event_type.as_str()) {
+            audit(&akid, &region, &input.event_type, "refused");
+            return Err(
+                CreateNotificationConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::service::enum_value_set_refusal(
+                            "eventType",
+                            EVENT_TYPE_VALUES,
+                            &input.event_type,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let created_at = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Retire the idempotency records the clock already made due, before anything reads
+        // them: a token past its TTL neither replays nor occupies the map.
+        store.retire_expired_idempotency_tokens(created_at);
+
+        // A retry with the same `ClientToken` answers with what the first call created,
+        // performing no further action — so it is answered BEFORE the duplicate-event-type
+        // conflict below, which the first call's own record would otherwise raise.
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store.replayed_resource_id(
+                crate::state::NOTIFICATION_CONFIGURATION_RESOURCE_TYPE,
+                token,
+            )
+        });
+        if let Some(created) = replayed
+            .and_then(|event_type| store.notification_configuration_in(&region, &event_type))
+        {
+            let event_type = created.event_type.clone();
+            drop(store);
+            audit(&akid, &region, &event_type, "replayed");
+            return Ok(CreateNotificationConfigurationOutput {
+                event_type: Some(event_type),
+            });
+        }
+
+        // The destination the notifications are to be delivered to is a resource of ANOTHER
+        // kind that this API itself mints (`CreateDestination`), so the reference is
+        // RESOLVED: a name this account has no destination under names nothing to deliver
+        // to, and the configuration is not created. The model declares no
+        // `ResourceNotFoundException` here, so the refusal is the modelled client error —
+        // worded through the one formatter every create of this service states an unknown
+        // reference with.
+        if store
+            .destination_in(&region, &input.destination_name)
+            .is_none()
+        {
+            drop(store);
+            audit(&akid, &region, &input.event_type, "refused");
+            return Err(
+                CreateNotificationConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::unknown_reference_message("DestinationName")),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An event type's notifications go to ONE destination, so an event type that
+        // already has a configuration is a conflict rather than a second record: the caller
+        // re-points the existing one with `UpdateNotificationConfiguration`.
+        if store
+            .notification_configuration_in(&region, &input.event_type)
+            .is_some()
+        {
+            drop(store);
+            audit(&akid, &region, &input.event_type, "conflict");
+            return Err(
+                CreateNotificationConfigurationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(
+                            "a notification configuration already exists for this event type; \
+                             update or delete it instead of creating another"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is bounded: past its maximum a create is refused rather than grown
+        // into. The quota is per region, as the record and the conflict check are.
+        let held = store
+            .notification_configurations
+            .keys()
+            .filter(|key| key.region == region)
+            .count();
+        if held >= crate::state::MAX_NOTIFICATION_CONFIGURATIONS {
+            drop(store);
+            audit(&akid, &region, &input.event_type, "refused");
+            return Err(
+                CreateNotificationConfigurationErrorModeled::ThrottlingException(
+                    ThrottlingException {
+                        message: Some(format!(
+                            "this region holds the maximum of {} notification \
+                             configurations; delete one before creating another",
+                            crate::state::MAX_NOTIFICATION_CONFIGURATIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let configuration = crate::state::NotificationConfiguration {
+            event_type: input.event_type.clone(),
+            region: region.clone(),
+            destination_name: input.destination_name,
+            tags: input.tags.unwrap_or_default(),
+            created_at,
+            // Nothing has re-pointed the configuration since the create, so it was last
+            // updated when it was created.
+            updated_at: created_at,
+        };
+
+        if let Some(token) = input.client_token {
+            // What the token replays into is the configuration's IDENTIFIER, which for this
+            // resource is the event type it addresses.
+            store.record_idempotency_token(
+                crate::state::NOTIFICATION_CONFIGURATION_RESOURCE_TYPE,
+                &token,
+                &input.event_type,
+                created_at,
+            );
+        }
+        store.notification_configurations.insert(
+            crate::state::RegionalName::new(&region, &input.event_type),
+            configuration,
+        );
+        drop(store);
+
+        audit(&akid, &region, &input.event_type, "created");
+        Ok(CreateNotificationConfigurationOutput {
+            event_type: Some(input.event_type),
+        })
     }
 }

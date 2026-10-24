@@ -303,22 +303,34 @@ pub const ACCOUNT_SETTINGS: &[AccountSettingSpec] = &[
     },
 ];
 
-/// The setting `name` addresses, or [`Fault::InvalidParameter`] naming the member and
-/// the set it must come from.
+/// The API parameter both account-setting operations address a setting by
+/// (`smithy_query(query="operation",operation="GetAccountSetting,PutAccountSetting")`:
+/// each input's `name` member).
+const ACCOUNT_SETTING_NAME_PARAMETER: &str = "name";
+
+/// The constraint a setting name this registry does not serve fails: a STABLE phrase
+/// about the parameter, naming no value set.
+///
+/// `name` targets `AccountSettingName`, which
+/// `smithy_query(query="shape",shape="AccountSettingName")` gives as a plain string of
+/// length 1..64 with NO `@enum` trait. So the set of settings a registry serves is not a
+/// constraint of the API, and a name outside it is not an enum-membership failure:
+/// quoting [`ACCOUNT_SETTINGS`] back at the caller would assert a constraint the model
+/// does not declare, publish this emulator's own allow-list, and drift from the real
+/// service as settings are added.
+pub const UNKNOWN_ACCOUNT_SETTING_CONSTRAINT: &str = "Invalid account setting name provided";
+
+/// The setting `name` addresses, or [`Fault::InvalidParameter`] naming the parameter and
+/// the constraint it failed.
 pub fn account_setting_spec(name: &str) -> Result<&'static AccountSettingSpec, Fault> {
     ACCOUNT_SETTINGS
         .iter()
         .find(|spec| spec.name == name)
         .ok_or_else(|| {
-            Fault::InvalidParameter(format!(
-                "Invalid parameter at 'name' failed to satisfy constraint: 'Member must \
-                 satisfy enum value set: [{}]'",
-                ACCOUNT_SETTINGS
-                    .iter()
-                    .map(|spec| spec.name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
+            invalid_parameter_at(
+                ACCOUNT_SETTING_NAME_PARAMETER,
+                UNKNOWN_ACCOUNT_SETTING_CONSTRAINT,
+            )
         })
 }
 
@@ -1272,20 +1284,29 @@ impl LifecyclePreview {
     }
 }
 
-/// ECR's refusal of a document it will not accept, worded to the template it states
+/// ECR's refusal of a parameter it will not accept, worded to the template it states
 /// every such refusal with: `Invalid parameter at '<Parameter>' failed to satisfy
 /// constraint: '<constraint>'`.
 ///
-/// `parameter` is the API-DOCUMENTED label of the request parameter carrying the
-/// document ([`POLICY_TEXT_PARAMETER`], [`LIFECYCLE_POLICY_TEXT_PARAMETER`]), which the
-/// API reference capitalises — not the lower-camel wire member the request spells.
-/// `constraint` is a stable phrase naming the constraint the document failed; neither
-/// half ever carries a parser position or any other detail of how this emulator read the
-/// document.
-pub fn invalid_document(parameter: &str, constraint: &str) -> Fault {
+/// The ONE place that template is written for a refusal this service's own validation
+/// raises (the boundary validator words the constraints the MODEL declares; see
+/// `crate::service`). `parameter` is the API label of the request parameter and
+/// `constraint` a phrase naming what it failed; neither half ever carries a detail of how
+/// this emulator read the value.
+pub fn invalid_parameter_at(parameter: &str, constraint: &str) -> Fault {
     Fault::InvalidParameter(format!(
         "Invalid parameter at '{parameter}' failed to satisfy constraint: '{constraint}'"
     ))
+}
+
+/// [`invalid_parameter_at`] for a DOCUMENT-valued parameter: `parameter` is the
+/// API-DOCUMENTED label of the request parameter carrying the document
+/// ([`POLICY_TEXT_PARAMETER`], [`LIFECYCLE_POLICY_TEXT_PARAMETER`]), which the API
+/// reference capitalises — not the lower-camel wire member the request spells — and
+/// `constraint` is a stable phrase naming the constraint the document failed, never a
+/// parser position.
+pub fn invalid_document(parameter: &str, constraint: &str) -> Fault {
+    invalid_parameter_at(parameter, constraint)
 }
 
 /// The API-documented label of the `policyText` parameter, as a resource-policy refusal

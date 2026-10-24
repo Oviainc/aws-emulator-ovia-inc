@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMultiplex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMultiplex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMultiplex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Updates a multiplex." Each member the request carries replaces the stored
+//! one on the multiplex its `MultiplexId` names, a member it omits leaves that
+//! part of the multiplex as it stands, and the response is the multiplex read
+//! back out of the store. The rules and the writes live in the multiplex slice
+//! of the state (`ComAmazonawsMedialiveMedialiveState::update_multiplex`), so
+//! this handler only turns a store refusal into one of this operation's own
+//! modelled errors.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +154,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMultiplex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMultiplexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMultiplex"))
+        // An update changes a multiplex the store already holds, and its `Arn`
+        // was built from the region it was CREATED in, so nothing here depends
+        // on the region this request was signed for.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let mut state = state.lock();
+        // Transitions the clock had already made due were owed whether or not
+        // this update ran, so they are materialised before anything is read: a
+        // multiplex whose delete has come due is `DELETED`, and that is the
+        // state this update is judged against.
+        state.settle(::std::time::SystemTime::now());
+
+        // The published settings ranges, the multiplex's state, the programs the
+        // `PacketIdentifiersMapping` names and the writes are one step in the
+        // state slice, so this handler cannot check one of them and write past
+        // another.
+        state
+            .update_multiplex(
+                &input.multiplex_id,
+                input.name,
+                input.multiplex_settings,
+                input.packet_identifiers_mapping,
+            )
+            .map_err(|refusal| refused(refusal, &input.multiplex_id))?;
+
+        // The response is the STORED multiplex, read back out of the state the
+        // write above left behind, never the request's own members.
+        let multiplex = state
+            .multiplex_description(&input.multiplex_id)
+            .ok_or_else(|| unreportable(&input.multiplex_id))?;
+        Ok(UpdateMultiplexOutput {
+            multiplex: Some(multiplex),
+        })
     }
 }
+
+/// Turn a store refusal into this operation's own modelled error.
+///
+/// A `MultiplexId` naming no stored multiplex, and a `ProgramName` the
+/// `PacketIdentifiersMapping` names that the multiplex does not hold, are what
+/// this operation's modelled `NotFoundException` is for, worded by the shared
+/// helper every reader of this service uses. A multiplex a delete has already
+/// taken away is a conflict with the state — the same answer
+/// `UpdateMultiplexProgram` gives for the same multiplex. Settings outside the
+/// ranges the model publishes for them are a bad request, worded by the shared
+/// refusal so an update is refused exactly as a create carrying the same
+/// settings is.
+fn refused(
+    refusal: crate::state::MultiplexUpdateRefusal,
+    multiplex_id: &str,
+) -> UpdateMultiplexError {
+    use crate::state::MultiplexUpdateRefusal as Refusal;
+    match refusal {
+        Refusal::NotFound => UpdateMultiplexErrorModeled::NotFoundException(NotFoundException {
+            message: Some(crate::state::not_found_message("Multiplex", multiplex_id)),
+        }),
+        Refusal::ProgramNotFound(program_name) => {
+            UpdateMultiplexErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    "MultiplexProgram",
+                    &program_name,
+                )),
+            })
+        }
+        Refusal::Gone(state) => UpdateMultiplexErrorModeled::ConflictException(ConflictException {
+            message: Some(format!(
+                "Multiplex {multiplex_id} is {state}; it can no longer be updated"
+            )),
+        }),
+        Refusal::Settings(settings) => {
+            UpdateMultiplexErrorModeled::BadRequestException(BadRequestException {
+                message: Some(settings.to_string()),
+            })
+        }
+    }
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to update the multiplex in. A modelled server error,
+/// never a fresh engine (which would drop the write when this request returns).
+fn unavailable() -> UpdateMultiplexError {
+    UpdateMultiplexErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
+}
+
+/// The multiplex the write above accepted could not be read back out of the
+/// store, which the store's own invariant makes unreachable: the write resolved
+/// that id under the same lock this read holds. A modelled server error of its
+/// own rather than the "no store" one, so the two cannot be mistaken for each
+/// other in a log.
+fn unreportable(multiplex_id: &str) -> UpdateMultiplexError {
+    UpdateMultiplexErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(format!(
+            "Multiplex {multiplex_id} could not be read back after the update"
+        )),
+    })
+    .into()
+}
+

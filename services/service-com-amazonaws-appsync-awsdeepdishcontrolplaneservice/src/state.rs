@@ -3,15 +3,17 @@
 //! Engine state for the com-amazonaws-appsync-awsdeepdishcontrolplaneservice service.
 //!
 //! Holds the GraphQL API lifecycle: every `GraphqlApi` the service created, each with
-//! the API keys created under it. A handler reaches it through [`service_state`] and
-//! answers from what is stored here — nothing is recomputed from the request.
+//! the API keys created under it, and every source-API association between two of
+//! them. A handler reaches it through [`service_state`] and answers from what is
+//! stored here — nothing is recomputed from the request.
 
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     AdditionalAuthenticationProvider, ApiKey, EnhancedMetricsConfig, GraphqlApi,
-    LambdaAuthorizerConfig, LogConfig, OpenIDConnectConfig, UserPoolConfig,
+    LambdaAuthorizerConfig, LogConfig, OpenIDConnectConfig, SourceApiAssociation,
+    SourceApiAssociationConfig, UserPoolConfig,
 };
 
 /// One stored `GraphqlApi`, plus the API keys created under it.
@@ -126,11 +128,97 @@ impl ApiKeyRecord {
     }
 }
 
+/// One stored association between a Merged API and one of its source APIs.
+///
+/// Both sides are kept by `apiId` AND by ARN, the two forms the modelled
+/// `SourceApiAssociation` reports and the two forms an `…Identifier` member accepts,
+/// so a reader never has to rebuild either from the request.
+#[derive(Debug, Clone)]
+pub struct SourceApiAssociationRecord {
+    /// Creation order, so a listing over associations has a stable page order the
+    /// opaque `associationId` cannot carry.
+    pub seq: u64,
+    pub association_id: String,
+    pub association_arn: String,
+    pub source_api_id: String,
+    pub source_api_arn: String,
+    pub merged_api_id: String,
+    pub merged_api_arn: String,
+    pub description: Option<String>,
+    /// The `MergeType` the association merges under ([`DEFAULT_MERGE_TYPE`] when the
+    /// request named none).
+    pub merge_type: String,
+    /// The `SourceApiAssociationStatus` the association is in.
+    pub status: String,
+    /// "The detailed message related to the current state of the source API
+    /// association" — the text that goes with [`Self::status`].
+    pub status_detail: String,
+    /// When the association last merged the source API's schema into the Merged API,
+    /// or `None` while it never has.
+    pub last_successful_merge_date: Option<SystemTime>,
+    /// The instant the merge this association scheduled comes due, or `None` once
+    /// there is no merge left owed. Stored rather than slept on: see [`MERGE_SPAN`].
+    pub merge_due_at: Option<SystemTime>,
+}
+
+impl SourceApiAssociationRecord {
+    /// Whether a merge the clock owes this association has not been materialised yet,
+    /// i.e. whether a modification of this association is still in progress.
+    pub fn merge_pending(&self) -> bool {
+        self.merge_due_at.is_some()
+    }
+
+    /// Materialise the merge the CLOCK already made due at `now`.
+    ///
+    /// Owed by the clock alone: the due instant was recorded by the call that
+    /// scheduled the merge, so the same transition is applied whether or not anybody
+    /// read the association in between, and the merge date is the due instant itself
+    /// rather than the moment of the read — so every later read reports the same one.
+    pub fn settle(&mut self, now: SystemTime) {
+        let Some(due) = self.merge_due_at else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.merge_due_at = None;
+        self.status = MERGE_SUCCESS.to_string();
+        self.status_detail = MERGE_SUCCESS_DETAIL.to_string();
+        self.last_successful_merge_date = Some(due);
+    }
+
+    /// This record as the modelled `SourceApiAssociation` shape.
+    ///
+    /// The single projection every operation that reports an association answers
+    /// with, so the create and the reads cannot disagree about one association.
+    pub fn to_source_api_association(&self) -> SourceApiAssociation {
+        SourceApiAssociation {
+            association_id: Some(self.association_id.clone()),
+            association_arn: Some(self.association_arn.clone()),
+            source_api_id: Some(self.source_api_id.clone()),
+            source_api_arn: Some(self.source_api_arn.clone()),
+            merged_api_id: Some(self.merged_api_id.clone()),
+            merged_api_arn: Some(self.merged_api_arn.clone()),
+            description: self.description.clone(),
+            source_api_association_config: Some(SourceApiAssociationConfig {
+                merge_type: Some(self.merge_type.clone()),
+            }),
+            source_api_association_status: Some(self.status.clone()),
+            source_api_association_status_detail: Some(self.status_detail.clone()),
+            last_successful_merge_date: self
+                .last_successful_merge_date
+                .map(::aws_smithy_types::DateTime::from),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-appsync-awsdeepdishcontrolplaneservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
     /// Every created GraphQL API, keyed by its minted `apiId`.
     pub graphql_apis: BTreeMap<String, GraphqlApiRecord>,
+    /// Every source-API association, keyed by its minted `associationId`.
+    pub source_api_associations: BTreeMap<String, SourceApiAssociationRecord>,
     /// Advanced once per minted id, so no id is ever a function of the request.
     id_seed: u64,
     /// Advanced once per created resource, giving each record its creation order.
@@ -138,6 +226,38 @@ pub struct ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
 }
 
 impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
+    /// Apply every merge the clock owes at `now`, so an association reports the same
+    /// state to every caller whether or not another call touched it first.
+    pub fn settle_associations(&mut self, now: SystemTime) {
+        for association in self.source_api_associations.values_mut() {
+            association.settle(now);
+        }
+    }
+
+    /// The association between the Merged API `merged_api_id` and the source API
+    /// `source_api_id`, or `None` when the two are not associated.
+    ///
+    /// A source API is linked to a Merged API at most once, so this is the pair's
+    /// whole association state.
+    pub fn association_for_pair(
+        &self,
+        merged_api_id: &str,
+        source_api_id: &str,
+    ) -> Option<&SourceApiAssociationRecord> {
+        self.source_api_associations.values().find(|association| {
+            association.merged_api_id == merged_api_id && association.source_api_id == source_api_id
+        })
+    }
+
+    /// Drop every association the API `api_id` takes part in, on either side.
+    ///
+    /// An association names two APIs, so it cannot outlive either of them: deleting
+    /// an API deletes the links it was a side of.
+    pub fn remove_api_associations(&mut self, api_id: &str) {
+        self.source_api_associations.retain(|_, association| {
+            association.source_api_id != api_id && association.merged_api_id != api_id
+        });
+    }
     /// Mint a fresh opaque id: 26 lowercase base-32 characters, the shape an AppSync
     /// `apiId` takes.
     ///
@@ -197,6 +317,102 @@ pub const API_NOT_FOUND_MESSAGE: &str = "API not found.";
 /// AppSync's fixed, request-independent text for a `nextToken` a list operation cannot
 /// resume from, carried by `BadRequestException` (HTTP 400).
 pub const INVALID_PAGINATION_TOKEN_MESSAGE: &str = "Invalid pagination token given.";
+
+/// The text a `NotFoundException` (HTTP 404) carries for an association this account
+/// does not hold. The requirement the refusal answers is the status and the error
+/// shape; no recording pins AppSync's own wording, so this states the absent resource.
+pub const ASSOCIATION_NOT_FOUND_MESSAGE: &str = "Source API association not found.";
+
+/// The text `ConcurrentModificationException` (HTTP 409) carries, which the MODEL
+/// states for the shape itself: "Another modification is in progress at this time and
+/// it must complete before you can make your change." It is the error's own
+/// documentation rather than a per-request detail, so it is request-independent and
+/// names nothing of the call that met it.
+pub const CONCURRENT_MODIFICATION_MESSAGE: &str =
+    "Another modification is in progress at this time and it must complete before you can make \
+     your change.";
+
+/// The ARN namespace (and endpoint prefix) this service's resources carry.
+pub const ARN_SERVICE: &str = "appsync";
+
+/// The prefix of every AWS ARN, i.e. what tells an `…Identifier` member's ARN form
+/// apart from its API-id form.
+pub const ARN_PREFIX: &str = "arn:";
+
+/// The `GraphQLApiType` of a standard GraphQL API — one that can be the SOURCE of an
+/// association. Source: the `GraphQLApiType` enum and `GraphqlApi$apiType` ("whether
+/// the GraphQL API is a standard API (GRAPHQL) or merged API (MERGED)").
+pub const GRAPHQL_API_TYPE: &str = "GRAPHQL";
+
+/// The `GraphQLApiType` of a Merged API — the only kind of API source APIs associate
+/// WITH. Source: the `GraphQLApiType` enum.
+pub const MERGED_API_TYPE: &str = "MERGED";
+
+/// The `MergeType` an association takes when `sourceApiAssociationConfig` names none:
+/// "Valid merge types are `MANUAL_MERGE` (default) and `AUTO_MERGE`"
+/// (`SourceApiAssociationConfig$mergeType`).
+pub const DEFAULT_MERGE_TYPE: &str = "MANUAL_MERGE";
+
+/// The `SourceApiAssociationStatus` a fresh association carries: creating it schedules
+/// the merge of the source API's schema into the Merged API, which has not run yet.
+pub const MERGE_SCHEDULED: &str = "MERGE_SCHEDULED";
+
+/// The `SourceApiAssociationStatus` an association reaches once its scheduled merge
+/// has been performed.
+pub const MERGE_SUCCESS: &str = "MERGE_SUCCESS";
+
+/// The `sourceApiAssociationStatusDetail` that goes with [`MERGE_SCHEDULED`].
+pub const MERGE_SCHEDULED_DETAIL: &str =
+    "The source API merge is scheduled and has not been performed yet.";
+
+/// The `sourceApiAssociationStatusDetail` that goes with [`MERGE_SUCCESS`].
+pub const MERGE_SUCCESS_DETAIL: &str = "The source API was merged into the Merged API.";
+
+/// How long after an association is created the merge it scheduled comes due.
+///
+/// A chosen span, inside the emulator's 250-750 ms band for a transition the clock
+/// owes: AppSync reports a new association in the non-terminal [`MERGE_SCHEDULED`]
+/// status, so the span is never zero and a caller reading straight after the create
+/// still observes it. Nothing sleeps for it — the due instant is stored on the record
+/// and [`SourceApiAssociationRecord::settle`] applies it.
+pub const MERGE_SPAN: Duration = Duration::from_millis(500);
+
+/// Whether `candidate` could identify an API at all: an API id ([`is_api_id`]) or a
+/// full resource ARN.
+///
+/// Those are the two forms every `sourceApiIdentifier` / `mergedApiIdentifier` member
+/// documents — "only require the API ID value or ARN of the \[…\] API" — so a value
+/// that is neither names no API and the call is a bad request rather than a not-found.
+pub fn is_api_identifier(candidate: &str) -> bool {
+    candidate.starts_with(ARN_PREFIX) || is_api_id(candidate)
+}
+
+/// The stored API `identifier` names, in either accepted form ([`is_api_identifier`]):
+/// an ARN is matched against the API's own ARN, anything else against its `apiId`.
+/// `None` when this account holds no such API.
+pub fn api_by_identifier<'a>(
+    apis: &'a BTreeMap<String, GraphqlApiRecord>,
+    identifier: &str,
+) -> Option<&'a GraphqlApiRecord> {
+    if identifier.starts_with(ARN_PREFIX) {
+        apis.values().find(|record| record.arn == identifier)
+    } else {
+        apis.get(identifier)
+    }
+}
+
+/// The region the caller addressed, read from the request's SigV4 credential scope.
+///
+/// Every ARN this service mints carries it, so a resource is reported in the region it
+/// was created in. Falls back to [`DEFAULT_REGION`] for an unsigned request, which
+/// carries no scope to read.
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
+}
+
+/// The region an unsigned request is served in, the emulator's default.
+pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

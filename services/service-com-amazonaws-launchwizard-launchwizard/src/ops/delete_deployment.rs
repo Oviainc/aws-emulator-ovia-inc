@@ -168,29 +168,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing — it neither restarts the delete nor resurrects the record — and
         // reports the status the deployment is actually in.
         if !deployment.is_deleting_or_deleted() {
-            deployment.status = crate::state::STATUS_DELETE_IN_PROGRESS.to_string();
+            // The synchronous response reports the status the deployment has JUST
+            // entered, which for a delete that was only now accepted is
+            // `DELETE_INITIATING`: the work has not started yet. The two statuses the
+            // model declares after it — `DELETE_IN_PROGRESS`, then `DELETED` — are
+            // non-terminal/terminal steps the CLOCK owes, so each is scheduled one
+            // `TRANSITION_SPAN` after the previous one and a caller reading straight
+            // back still observes `DELETE_INITIATING`.
+            deployment.status = crate::state::STATUS_DELETE_INITIATING.to_string();
             deployment.modified_at = now;
             deployment.append_event(crate::state::DeploymentEvent::new(
-                "DeleteInProgress",
+                "DeleteInitiating",
                 format!(
-                    "Deployment '{}' is deleting the resources it created.",
+                    "Deletion of deployment '{}' was requested.",
                     deployment.name
                 ),
-                crate::state::EVENT_IN_PROGRESS,
+                crate::state::EVENT_PENDING,
                 now,
             ));
-            // Deleting is not instantaneous: reaching DELETED is owed by the CLOCK one
-            // `TRANSITION_SPAN` from here, so a caller that reads straight back still
-            // sees DELETE_IN_PROGRESS. Any step the create had still owed is dropped:
-            // the deployment is going away instead.
-            let deleted_at = now + crate::state::TRANSITION_SPAN;
+            // Any step the create or an update had still owed is dropped: the
+            // deployment is going away instead.
+            let in_progress_at = now + crate::state::TRANSITION_SPAN;
+            let deleted_at = in_progress_at + crate::state::TRANSITION_SPAN;
+            let name = deployment.name.clone();
             deployment.pending = ::std::collections::VecDeque::from(vec![
+                crate::state::PendingTransition {
+                    due_at: in_progress_at,
+                    status: crate::state::STATUS_DELETE_IN_PROGRESS.to_string(),
+                    event: crate::state::DeploymentEvent::new(
+                        "DeleteInProgress",
+                        format!("Deployment '{name}' is deleting the resources it created."),
+                        crate::state::EVENT_IN_PROGRESS,
+                        in_progress_at,
+                    ),
+                },
                 crate::state::PendingTransition {
                     due_at: deleted_at,
                     status: crate::state::STATUS_DELETED.to_string(),
                     event: crate::state::DeploymentEvent::new(
                         "DeleteCompleted",
-                        format!("Deployment '{}' was deleted.", deployment.name),
+                        format!("Deployment '{name}' was deleted."),
                         crate::state::EVENT_COMPLETED,
                         deleted_at,
                     ),

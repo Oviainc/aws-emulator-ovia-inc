@@ -27,7 +27,7 @@ use crate::ops::types::{
     FipsEndpoints, IamFederationConfigOptions, IamIdentityCenterConfigOptions,
     LifecyclePolicyDetail, LifecyclePolicyErrorDetail, SamlConfigOptions, SecurityConfigDetail,
     SecurityConfigSummary, SecurityPolicyDetail, SecurityPolicySummary, Tag,
-    UpdateCollectionGroupDetail, VectorOptions,
+    UpdateCollectionGroupDetail, UpdateIamIdentityCenterConfigOptions, VectorOptions,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -1248,6 +1248,67 @@ impl SecurityConfigRecord {
             last_modified_date: Some(self.last_modified_date),
         }
     }
+
+    /// Apply `write` to this record; see [`SecurityConfigWrite`] for the rule it follows.
+    pub fn apply(&mut self, write: SecurityConfigWrite) {
+        if write.description.is_some() {
+            self.description = write.description;
+        }
+        // `samlOptions` and `iamFederationOptions` arrive as the WHOLE options structure a
+        // read reports, so the options the request states are the options the
+        // configuration has.
+        if let Some(options) = write.saml_options {
+            self.saml_options = Some(options);
+        }
+        if let Some(options) = write.iam_federation_options {
+            self.iam_federation_options = Some(options);
+        }
+        // `iamIdentityCenterOptionsUpdates` is a different shape from the stored
+        // `IamIdentityCenterConfigOptions`: it carries only the two attributes, so it
+        // PATCHES them and leaves the instance the configuration is integrated with (and
+        // the application members) alone — there is nothing in the request to restate them
+        // from.
+        if let Some(updates) = write.iam_identity_center_updates {
+            if let Some(options) = self.iam_identity_center_options.as_mut() {
+                if updates.user_attribute.is_some() {
+                    options.user_attribute = updates.user_attribute;
+                }
+                if updates.group_attribute.is_some() {
+                    options.group_attribute = updates.group_attribute;
+                }
+            }
+        }
+        self.config_version = write.config_version;
+        self.last_modified_date = write.written_at;
+    }
+}
+
+/// The members ONE write to a stored security configuration replaces, as
+/// `UpdateSecurityConfig` carries them.
+///
+/// Every member a request may name is OPTIONAL on a request whose `id` already identifies
+/// the configuration, and none is documented as clearing what is stored, so a member the
+/// request did not name keeps its stored value — the same partial-write rule
+/// [`PolicyWrite`] follows. The other two members are server-derived: every write mints a
+/// fresh `configVersion`
+/// (see [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::next_policy_version`])
+/// and stamps `lastModifiedDate`.
+#[derive(Debug, Clone)]
+pub struct SecurityConfigWrite {
+    /// The `description` the request named, or `None` when it named none.
+    pub description: Option<String>,
+    /// The `samlOptions` the request named, with the documented `sessionTimeout` default
+    /// already applied; `None` when the request named none.
+    pub saml_options: Option<SamlConfigOptions>,
+    /// The `iamIdentityCenterOptionsUpdates` the request named, which patch the stored
+    /// options rather than replacing them.
+    pub iam_identity_center_updates: Option<UpdateIamIdentityCenterConfigOptions>,
+    /// The `iamFederationOptions` the request named, or `None` when it named none.
+    pub iam_federation_options: Option<IamFederationConfigOptions>,
+    /// The freshly minted `PolicyVersion` this write stores as `configVersion`.
+    pub config_version: String,
+    /// The epoch-millisecond instant of the write, which becomes `lastModifiedDate`.
+    pub written_at: i64,
 }
 
 /// One stored data access policy, keyed by its `(type, name)` pair.

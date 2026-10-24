@@ -680,22 +680,23 @@ async fn delete_is_idempotent_and_observable_from_every_reader() {
         .await;
     let started = first["status"].as_str().unwrap_or_default().to_string();
     assert_eq!(
-        started, "DELETE_IN_PROGRESS",
-        "case {case:?}: the delete must report the transient status it just entered, got {started:?}"
+        started, "DELETE_INITIATING",
+        "case {case:?}: the delete must report the status it just entered, got {started:?}"
     );
     assert!(
         DEPLOYMENT_STATUS_VALUES.contains(&started.as_str()),
         "case {case:?}: {started:?} is not a DeploymentStatus value"
     );
 
-    // Repeating it changes nothing: same status, no error, nothing restarted.
+    // Repeating it changes nothing: no error, nothing restarted, and the status it
+    // reports is the one the clock has reached rather than a restarted first step.
     let repeat = harness
         .ok(case, "/deleteDeployment", json!({"deploymentId": id}))
         .await;
-    assert_eq!(
-        repeat["status"], first["status"],
-        "case {case:?}: a repeated delete must report the same status, got {} then {}",
-        first["status"], repeat["status"]
+    let repeated = repeat["status"].as_str().unwrap_or_default().to_string();
+    assert!(
+        ["DELETE_INITIATING", "DELETE_IN_PROGRESS", "DELETED"].contains(&repeated.as_str()),
+        "case {case:?}: a repeated delete must report where the delete has got to, got {repeated:?}"
     );
 
     // Once the clock owes it, the deployment is DELETED, with deletedAt, everywhere.
@@ -769,9 +770,9 @@ async fn delete_is_idempotent_and_observable_from_every_reader() {
         .clone();
     assert_eq!(
         events.len(),
-        5,
-        "case {case:?}: the create and its two steps, then the delete and its step, append five \
-         events, got {}",
+        6,
+        "case {case:?}: the create and its two steps, then the delete and its two steps, append \
+         six events, got {}",
         events.len()
     );
     for page_size in 1..=events.len() + 1 {
@@ -801,7 +802,7 @@ async fn delete_is_idempotent_and_observable_from_every_reader() {
         .await;
     let token = first_page["nextToken"]
         .as_str()
-        .expect("a five-event history paged at one must hand back a token")
+        .expect("a six-event history paged at one must hand back a token")
         .to_string();
     harness
         .refused(

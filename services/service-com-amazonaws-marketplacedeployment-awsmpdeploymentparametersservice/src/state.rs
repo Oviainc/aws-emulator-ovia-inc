@@ -7,6 +7,12 @@
 //! `ListTagsForResource` report is read out of one of these records, never built
 //! from the request that asked for it.
 //!
+//! A record also carries the EXPIRY the last write named
+//! (`expirationDate`), and that date is enforced here: every operation that
+//! resolves a deployment parameter first materialises the deletion the clock has
+//! made due ([`ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::purge_expired`]),
+//! so no caller ever sees a parameter past its expiration date.
+//!
 //! The AGREEMENTS a deployment parameter can be written against are held here
 //! too ([`ProvisionedAgreement`]). This API models no operation that creates a
 //! product or an agreement — in AWS an agreement appears when a buyer accepts a
@@ -157,6 +163,24 @@ pub const SERVICE_CODE: &str = "aws-marketplace";
 /// a token the service never saw.
 pub const MAX_CLIENT_TOKENS: usize = 1024;
 
+/// A modelled timestamp as whole nanoseconds since the Unix epoch, so a stored
+/// wire instant and an instant of the system clock compare at the full precision
+/// the wire carries.
+fn timestamp_epoch_nanos(at: ::aws_smithy_types::DateTime) -> i128 {
+    i128::from(at.secs()) * 1_000_000_000 + i128::from(at.subsec_nanos())
+}
+
+/// An instant of the system clock as whole nanoseconds since the Unix epoch — the
+/// comparable form of [`timestamp_epoch_nanos`]. An instant BEFORE the epoch is
+/// negative, which is why the error arm is kept rather than saturated to zero: a
+/// clock set before 1970 must not read as "the epoch".
+fn system_time_epoch_nanos(at: SystemTime) -> i128 {
+    match at.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(since) => i128::try_from(since.as_nanos()).unwrap_or(i128::MAX),
+        Err(before) => -i128::try_from(before.duration().as_nanos()).unwrap_or(i128::MAX),
+    }
+}
+
 /// One deployment parameter, as written by `PutDeploymentParameter`.
 ///
 /// `Debug` is hand-written so the secret never reaches a log or a panic message:
@@ -180,7 +204,9 @@ pub struct DeploymentParameterRecord {
     /// operation reports it and nothing logs it.
     pub secret_string: String,
     /// When the parameter expires and is scheduled for deletion, when the last
-    /// write named a date.
+    /// write named a date. ENFORCED: at that instant the record is dropped
+    /// ([`ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::purge_expired`]),
+    /// so no operation resolves it afterwards.
     pub expiration_date: Option<::aws_smithy_types::DateTime>,
     /// Tags, keyed so a later `TagResource` with the same key overwrites.
     pub tags: BTreeMap<String, String>,
@@ -210,6 +236,24 @@ impl std::fmt::Debug for DeploymentParameterRecord {
 }
 
 impl DeploymentParameterRecord {
+    /// Whether the expiry this record carries has already come due at `now`.
+    ///
+    /// `PutDeploymentParameterRequest$expirationDate` is "the date when deployment
+    /// parameters expire and are scheduled for deletion"
+    /// (`smithy_query(query="doc",shape="PutDeploymentParameterRequest",member="expirationDate")`),
+    /// so the stored date is a deadline, not a label: at it the parameter is expired
+    /// and no operation resolves it any more
+    /// ([`ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::purge_expired`]).
+    /// A record the last write named no date for never expires.
+    ///
+    /// The comparison is at the full precision the wire carries (whole nanoseconds
+    /// since the epoch), and it is inclusive: the deadline itself is the instant the
+    /// expiry is due, so a record whose date is exactly `now` is expired.
+    pub fn has_expired(&self, now: SystemTime) -> bool {
+        self.expiration_date
+            .is_some_and(|at| timestamp_epoch_nanos(at) <= system_time_epoch_nanos(now))
+    }
+
     /// The tag map as the modelled `TagsMap` / `Tags` wire shape.
     pub fn tags_map(&self) -> HashMap<String, String> {
         self.tags
@@ -375,6 +419,44 @@ impl ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState {
         self.agreements
             .values()
             .any(|agreement| agreement.catalog == catalog && agreement.covers(product_id))
+    }
+
+    /// Materialise the expiry the clock has already made due at `now`: drop every
+    /// deployment parameter whose `expirationDate` has come, with the identity index
+    /// and the idempotency entries that named it.
+    ///
+    /// The stored date is the one the last write named, "the date when deployment
+    /// parameters expire and are scheduled for deletion" — so the deletion is owed at
+    /// that instant whether or not anybody called, which is why even a REPORTING
+    /// operation may apply it. Every operation that resolves a deployment parameter
+    /// calls this first, so no caller sees a parameter the clock has already taken:
+    /// the tagging operations answer the service's not-found failure for it
+    /// ([`parameter_not_found`]) and a `PutDeploymentParameter` for the same identity
+    /// finds no record to update and mints a fresh resource.
+    ///
+    /// The index is pruned in step with [`Self::parameters`] — the two are written
+    /// together — and so is the `clientToken` ledger, whose entries for a dropped
+    /// record could otherwise only ever replay a resource that is gone.
+    pub fn purge_expired(&mut self, now: SystemTime) {
+        let expired: BTreeSet<String> = self
+            .parameters
+            .iter()
+            .filter(|(_, record)| record.has_expired(now))
+            .map(|(resource_arn, _)| resource_arn.clone())
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        self.parameters
+            .retain(|resource_arn, _| !expired.contains(resource_arn));
+        self.by_name
+            .retain(|_, resource_arn| !expired.contains(resource_arn));
+        self.client_tokens
+            .retain(|_, resource_arn| !expired.contains(resource_arn));
+        // Borrowed as a local so the retain over one field can read the other.
+        let live_tokens = &self.client_tokens;
+        self.client_token_order
+            .retain(|token| live_tokens.contains_key(token));
     }
 
     /// Record that `client_token` wrote the parameter at `resource_arn`, evicting the

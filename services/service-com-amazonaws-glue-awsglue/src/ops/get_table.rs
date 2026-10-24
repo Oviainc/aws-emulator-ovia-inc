@@ -265,9 +265,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(database) = store.database(&catalog_id, &input.database_name) else {
             return Err(GetTableErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(format!(
-                        "Database {} not found in catalog {catalog_id}",
-                        crate::state::fold_name(&input.database_name)
+                    message: Some(crate::state::messages::database_not_found(
+                        &input.database_name,
                     )),
                     from_federation_source: None,
                 },
@@ -278,11 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(entry) = database.tables.get(&crate::state::fold_name(&input.name)) else {
             return Err(GetTableErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(format!(
-                        "Table {} not found in database {}",
-                        crate::state::fold_name(&input.name),
-                        database.name
-                    )),
+                    message: Some(crate::state::messages::TABLE_ENTITY_NOT_FOUND.to_string()),
                     from_federation_source: None,
                 },
             )

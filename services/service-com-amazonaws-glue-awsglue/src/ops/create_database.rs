@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if existing.is_some_and(|catalog| catalog.databases.contains_key(&folded)) {
             return Err(CreateDatabaseErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
-                    message: Some(format!("Database already exists: {folded}")),
+                    message: Some(crate::state::messages::DATABASE_ALREADY_EXISTS.to_string()),
                 },
             )
             .into());

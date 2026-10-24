@@ -148,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(entry) = store.crawlers.get(&input.name) else {
             return Err(GetCrawlerErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(format!("Crawler {} not found", input.name)),
+                    message: Some(crate::state::messages::crawler_not_found(&input.name)),
                     from_federation_source: None,
                 },
             )

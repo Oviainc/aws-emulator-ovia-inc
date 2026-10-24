@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateClusterSecurityGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateClusterSecurityGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateClusterSecurityGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Refuses every request, and stores nothing.
+//!
+//! A cluster security group is EC2-Classic's access-control mechanism: it "control[s]
+//! access to non-VPC clusters" (the modelled doc below), while a cluster inside a VPC
+//! is governed by VPC security groups (`Cluster$VpcSecurityGroups`) instead. Whether
+//! such a group can exist at all is therefore decided by the platforms this service
+//! publishes, and the handler asks exactly that
+//! ([`crate::state::cluster_security_groups_available`], which reads the one published
+//! list, [`crate::state::zone_supported_platforms`]). EC2-Classic is retired, so that
+//! list offers the VPC platform alone: there is no non-VPC cluster for such a group to
+//! govern and no request can create one. The refusal is a client fault: HTTP 400 with
+//! the `InvalidParameterValue` code Amazon Redshift answers a parameter it cannot
+//! honour with ([`crate::scaffolded::Scaffolded::invalid_parameter_value`]), not the
+//! scaffold's 501, which would claim the behaviour is merely unwritten.
+//!
+//! Because nothing is stored, no later `DescribeClusterSecurityGroups` can report a
+//! group this operation "created" — the store is never even opened.
 //!
 //! ## Shape of an operation
 //!
@@ -150,21 +159,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _input: Self::Input,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateClusterSecurityGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterSecurityGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // This operation reads no state and writes none: the engine is held only so the
+        // constructor seam stays identical to every other operation's.
+        let _ = &self.engine;
+
+        // The published platform list decides the answer, not the request: while it
+        // offers no EC2-Classic platform there is nothing a cluster security group
+        // could govern, so no value of `ClusterSecurityGroupName`, `Description` or
+        // `Tags` can make the call succeed and the store is never opened.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateClusterSecurityGroup"))
+        // None of the modelled faults fits — the refusal is not a name collision
+        // (`ClusterSecurityGroupAlreadyExistsFault`), a quota
+        // (`ClusterSecurityGroupQuotaExceededFault`) or a tag problem — so it goes
+        // through the error channel's `InvalidParameterValue`, which is the code AWS
+        // itself answers with and the one a client branches on.
+        if !crate::state::cluster_security_groups_available() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                crate::state::CLUSTER_SECURITY_GROUPS_UNAVAILABLE,
+            ));
+        }
+
+        // Reached only if that list ever offers the EC2-Classic platform again. No
+        // creation path has been written for it — nothing in this service places a
+        // cluster outside a VPC — so the scaffold's 501 ("nobody has written this
+        // yet") is the honest answer, rather than minting a group no cluster here
+        // could be attached to.
+        Err(crate::scaffolded::Scaffolded::not_implemented(
+            <Self as smithy_server_runtime::Operation>::NAME,
+        ))
     }
 }

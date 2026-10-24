@@ -25,6 +25,8 @@ mod deployment_lifecycle;
 mod deployment_stage_release;
 #[path = "all/domain_name_lifecycle.rs"]
 mod domain_name_lifecycle;
+#[path = "all/http_api_servable_stage.rs"]
+mod http_api_servable_stage;
 #[path = "all/integration_deletion.rs"]
 mod integration_deletion;
 #[path = "all/integration_lifecycle.rs"]

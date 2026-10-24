@@ -1710,6 +1710,44 @@ pub fn zone_supported_platforms() -> Vec<SupportedPlatform> {
         .collect()
 }
 
+/// The platform a cluster ran on OUTSIDE a VPC, before EC2-Classic was retired.
+///
+/// Named here only so the capabilities that existed for that platform alone can
+/// be decided from the published platform list rather than from a flag: EC2's
+/// `supported-platforms` account attribute reports `EC2` for EC2-Classic and
+/// `VPC` for the VPC platform, and [`zone_supported_platforms`] publishes only
+/// the latter.
+pub const PLATFORM_EC2_CLASSIC: &str = "EC2";
+
+/// Whether this service offers the platform a cluster security group governs.
+///
+/// A cluster security group is EC2-Classic's access-control mechanism: it
+/// "control[s] access to non-VPC clusters"
+/// (`smithy_query(query="doc", shape="CreateClusterSecurityGroup")`), and a
+/// cluster inside a VPC is governed by VPC security groups
+/// (`Cluster$VpcSecurityGroups`) instead. So the question "can this account hold
+/// a cluster security group at all?" is the question "does any zone it can place
+/// a cluster in offer the EC2-Classic platform?", answered from the one
+/// published platform list rather than from a second, independently maintained
+/// fact.
+pub fn cluster_security_groups_available() -> bool {
+    zone_supported_platforms()
+        .iter()
+        .any(|platform| platform.name.as_deref() == Some(PLATFORM_EC2_CLASSIC))
+}
+
+/// Why a call that would mint a cluster security group is refused.
+///
+/// The text says the capability is gone and names the one that replaced it,
+/// because that — not any value the request carried — is what the caller has to
+/// act on: no name, description or tag list could make such a call succeed. Only
+/// the status (400) and the error code (`InvalidParameterValue`) are wire
+/// requirements; this wording is the service's own account of the rule, which is
+/// why it lives here once rather than being spelled at a call site.
+pub const CLUSTER_SECURITY_GROUPS_UNAVAILABLE: &str =
+    "Cluster security groups are discontinued. Use VPC security groups to control access to an \
+     Amazon Redshift cluster.";
+
 /// One Availability Zone as this service reports it: its name AND the platforms
 /// a cluster in it can run on.
 ///

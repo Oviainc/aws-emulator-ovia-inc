@@ -96,6 +96,16 @@ pub const MESSAGE_SESSION_NOT_FOUND: &str = "Session does not exist.";
 /// assistant does not hold. See [`MESSAGE_ASSISTANT_NOT_FOUND`].
 pub const MESSAGE_ASSOCIATION_NOT_FOUND: &str = "Assistant Association does not exist.";
 
+/// The fixed text for a tagging request addressed to an ARN this account holds no
+/// resource under.
+///
+/// It is the model's own documentation of `ResourceNotFoundException`
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`: "The specified
+/// resource does not exist.") — a tagging operation takes an `Arn` rather than one
+/// family's label, so the refusal names no family. See
+/// [`MESSAGE_ASSISTANT_NOT_FOUND`] for why it carries nothing from the request.
+pub const MESSAGE_RESOURCE_NOT_FOUND: &str = "The specified resource does not exist.";
+
 /// The fixed text of the modelled `ConflictException` a create whose `name` a live
 /// resource already holds is refused with. See [`MESSAGE_ASSISTANT_NOT_FOUND`].
 pub const MESSAGE_NAME_IN_USE: &str = "Name is already in use";
@@ -408,7 +418,11 @@ fn map_out<V: Clone>(map: &HashMap<String, V>) -> Option<HashMap<String, V>> {
 /// resource carries the `tags` member all the same — so a client reading
 /// `response["tags"]` finds a map for every resource rather than having to tell an
 /// untagged resource's absent member from a tagged one's map.
-fn tags_out(tags: &HashMap<String, String>) -> Option<HashMap<String, String>> {
+///
+/// It is the ONE owner of that rule in this crate: every operation that reports a `tags`
+/// member — a resource read, and `ListTagsForResource`, whose whole output is that
+/// member — renders it through here rather than restating the rule.
+pub fn tags_out(tags: &HashMap<String, String>) -> Option<HashMap<String, String>> {
     Some(tags.clone())
 }
 
@@ -1180,6 +1194,57 @@ impl ComAmazonawsQconnectWisdomserviceState {
         (0..MINT_ATTEMPTS as u64)
             .map(|attempt| mint_candidate(seq, attempt))
             .find(|candidate| !self.knowledge_bases.contains_key(candidate))
+    }
+
+    /// The tags persisted on the resource a full resource ARN names, whatever resource
+    /// family that ARN belongs to.
+    ///
+    /// Tagging is a cross-family surface: `ListTagsForResource`, `TagResource` and
+    /// `UntagResource` take an `Arn` rather than one family's path label
+    /// (`smithy_query(query="operation",operation="ListTagsForResource")`), so the lookup
+    /// covers EVERY family this store holds a tag map for — assistants, knowledge bases,
+    /// sessions and assistant associations — and reads the tags off that one stored
+    /// record. Nothing is copied into a second place: a tag a create persisted on its
+    /// resource is the tag reported here, and a resource a delete removed holds none.
+    ///
+    /// The ARN is matched against the one the record itself carries, not merely against
+    /// the id [`resolve_id`] reads out of it, so an ARN that pairs a stored id with
+    /// another region, family or account names NOTHING. `None` therefore means the ARN
+    /// names no resource this account holds.
+    pub fn tags_of_resource(&self, resource_arn: &str) -> Option<&HashMap<String, String>> {
+        // Every ARN this service mints ends in the resource's own id.
+        let id = resolve_id(resource_arn);
+        if let Some(assistant) = self
+            .assistants
+            .get(id)
+            .filter(|assistant| assistant.assistant_arn == resource_arn)
+        {
+            return Some(&assistant.tags);
+        }
+        if let Some(knowledge_base) = self
+            .knowledge_bases
+            .get(id)
+            .filter(|knowledge_base| knowledge_base.knowledge_base_arn == resource_arn)
+        {
+            return Some(&knowledge_base.tags);
+        }
+        if let Some(association) = self
+            .assistant_associations
+            .get(id)
+            .filter(|association| association.assistant_association_arn == resource_arn)
+        {
+            return Some(&association.tags);
+        }
+        // A session is reachable only through its parent assistant, whose id a session
+        // ARN carries in the segment before the session's own ([`session_arn`]). A
+        // single-segment ARN's preceding field still holds the `arn:…:<label>` prefix,
+        // which is no assistant id, so it simply misses.
+        let parent = resource_arn.rsplit('/').nth(1)?;
+        self.assistants
+            .get(parent)
+            .and_then(|assistant| assistant.sessions.get(id))
+            .filter(|session| session.session_arn == resource_arn)
+            .map(|session| &session.tags)
     }
 
     /// Store a knowledge base and index it by name.

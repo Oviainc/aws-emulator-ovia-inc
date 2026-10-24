@@ -4,7 +4,7 @@
 //!
 //! Mints a router output in this service's store and answers with the STORED record, read
 //! back out of the store. The output's identity is the `routerOutput` ARN minted here; the
-//! read side is BatchGetRouterOutput.
+//! read side is BatchGetRouterOutput and GetRouterOutput.
 //!
 //! ## Shape of an operation
 //!
@@ -395,6 +395,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 routed_input_arn: None,
                 messages: Vec::new(),
                 client_token: input.client_token.clone().filter(|t| !t.is_empty()),
+                // The router output this call creates is live: only DeleteRouterOutput sets
+                // the instant the clock completes a delete at.
+                removal_due_at: None,
                 created_at: now,
                 updated_at: now,
             },

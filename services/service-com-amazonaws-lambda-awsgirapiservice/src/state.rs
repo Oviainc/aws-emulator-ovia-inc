@@ -1014,7 +1014,12 @@ pub const MAX_QUEUED_ASYNC_INVOCATIONS: usize = 100;
 /// exceeded the maximum number of aliases allowed per Lambda function"), but neither the
 /// model nor the published quotas carry the number, so this slice picks one and answers
 /// that same modelled error past it.
-pub const MAX_FUNCTION_ALIASES: usize = 100;
+///
+/// The number is picked above the counts a caller is observed to reach: AWS accepts more
+/// than one hundred aliases on a single function, so a ceiling at a hundred would refuse
+/// creates AWS serves. It therefore sits where [`MAX_FUNCTIONS`] does, high enough that
+/// the bound is the store's rather than the API's.
+pub const MAX_FUNCTION_ALIASES: usize = 1_000;
 
 /// The most versions one alias may route to BESIDE the version it invokes.
 ///

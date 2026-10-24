@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/alias_listing.rs"]
+mod alias_listing;
 #[path = "all/async_invocation.rs"]
 mod async_invocation;
 #[path = "all/capacity_provider_bounds.rs"]

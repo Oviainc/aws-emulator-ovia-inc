@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateNatGatewayAddress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateNatGatewayAddress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateNatGatewayAddress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: associates Elastic IP addresses the account holds with one public NAT
+//! gateway of [`crate::state`], persists each association on the gateway AND on the
+//! address record it belongs to, and answers the gateway's addresses as they now stand.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +157,430 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateNatGatewayAddress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateNatGatewayAddressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateNatGatewayAddress"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            AVAILABILITY_MODE_REGIONAL, AVAILABILITY_MODE_ZONAL, CONNECTIVITY_TYPE_PUBLIC,
+            ELASTIC_IP_ASSOCIATION_ID_PREFIX, MAX_EIPS_PER_PUBLIC_NAT_GATEWAY,
+            NAT_GATEWAY_ADDRESS_STATUS_ASSOCIATING, NAT_GATEWAY_ADDRESS_STATUS_SUCCEEDED,
+            NAT_GATEWAY_STATE_AVAILABLE, NETWORK_INTERFACE_ID_PREFIX,
+            NatGatewayAddressTransition, availability_zone_of_region,
+            availability_zones_in_region, incorrect_state, internal_error,
+            is_assignable_subnet_address, is_ipv4_address, network_border_group_of_region,
+            request_region, require_known_address, require_known_nat_gateway,
+            require_service_state, resource_already_associated, resource_count_exceeded,
+        };
+
+        // The Region of the request's SigV4 credential scope: it is the Region whose
+        // Availability Zones the request can name, and whose network border group every
+        // address it associates has to be advertised from.
+        let region = request_region(ctx.parts());
+
+        // "The allocation IDs of EIPs that you want to associate with your NAT gateway"
+        // (`AssociateNatGatewayAddressRequest$AllocationIds`, required): a call naming none
+        // would associate nothing at all.
+        if input.allocation_ids.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must name at least one allocation ID in allocationId",
+            ));
+        }
+        // One allocation id names one address, so naming it twice in one call asks for one
+        // address to be associated twice.
+        let mut named = ::std::collections::BTreeSet::new();
+        for allocation_id in &input.allocation_ids {
+            if !named.insert(allocation_id.as_str()) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{allocation_id}' for allocationId. \
+                     It is named more than once in this request"
+                )));
+            }
+        }
+
+        // "The private IPv4 addresses that you want to assign to the NAT gateway"
+        // (`AssociateNatGatewayAddressRequest$PrivateIpAddresses`): one private address goes
+        // with one EIP, so a request that names any must name one per allocation id; a
+        // request that names none leaves the choice to the service.
+        let requested_private_ips = input.private_ip_addresses.clone().unwrap_or_default();
+        if !requested_private_ips.is_empty()
+            && requested_private_ips.len() != input.allocation_ids.len()
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value for privateIpAddress. The request names {} private IPv4 \
+                 address(es) for {} allocation ID(s), and one address goes with one EIP",
+                requested_private_ips.len(),
+                input.allocation_ids.len()
+            )));
+        }
+        for private_ip in &requested_private_ips {
+            if !is_ipv4_address(private_ip) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{private_ip}' for privateIpAddress. \
+                     It must be an IPv4 address"
+                )));
+            }
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // Every move the clock already owed is applied before anything is read, so this
+        // call acts on the gateway as it stands NOW rather than as it stood when something
+        // last asked about it.
+        store.materialize_due_transitions();
+
+        // The NAT gateway is the resource this call acts on, so it is resolved before
+        // anything is read OFF the network it sits in: an id naming no gateway of the
+        // account is answered as that rather than as something about its subnet or its
+        // addresses. The checks above it are the ones that read the request alone \u2014 the
+        // shape of `allocationId` and `privateIpAddress` \u2014 which the framework's own
+        // deserialization already answers for a malformed value, so a request that carries
+        // neither a usable allocation list nor a known gateway is answered for the member
+        // it got wrong first.
+        let gateway = require_known_nat_gateway(&store, &input.nat_gateway_id)?;
+        let gateway_state = gateway.state.clone().unwrap_or_default();
+        // "The default is public connectivity" (`CreateNatGatewayRequest$ConnectivityType`),
+        // and a gateway stored without an `AvailabilityMode` is a single-zone one, so an
+        // absent member reads as that default rather than as a refusal.
+        let connectivity = gateway
+            .connectivity_type
+            .clone()
+            .unwrap_or_else(|| CONNECTIVITY_TYPE_PUBLIC.to_string());
+        let availability_mode = gateway
+            .availability_mode
+            .clone()
+            .unwrap_or_else(|| AVAILABILITY_MODE_ZONAL.to_string());
+        let gateway_subnet_id = gateway.subnet_id.clone().unwrap_or_default();
+        let gateway_vpc_id = gateway.vpc_id.clone().unwrap_or_default();
+        let held_addresses = gateway.nat_gateway_addresses.clone().unwrap_or_default();
+
+        // "available: The NAT gateway is able to process traffic. This status remains until
+        // you delete the NAT gateway" (`NatGateway$State`): in every other state the
+        // gateway is still coming up, has failed, or is going away, so its addresses are
+        // not the caller's to change.
+        if gateway_state != NAT_GATEWAY_STATE_AVAILABLE {
+            return Err(incorrect_state(format!(
+                "The NAT gateway '{}' is in state '{gateway_state}', which is not a state \
+                 in which an Elastic IP address can be associated with it",
+                input.nat_gateway_id
+            )));
+        }
+        // "Associates Elastic IP addresses (EIPs) and private IPv4 addresses with a public
+        // NAT gateway" (`AssociateNatGatewayAddress`), and "[Public NAT gateway only] The
+        // allocation ID of the Elastic IP address" (`NatGatewayAddress$AllocationId`): a
+        // private NAT gateway has no Elastic IP addresses at all.
+        if connectivity != CONNECTIVITY_TYPE_PUBLIC {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The NAT gateway '{}' has connectivityType '{connectivity}'. An Elastic IP \
+                 address is associated with a public NAT gateway",
+                input.nat_gateway_id
+            )));
+        }
+
+        // "For regional NAT gateways only: The Availability Zone where you want to
+        // associate an Elastic IP address (EIP). The regional NAT gateway uses a separate
+        // EIP in each AZ" (`AssociateNatGatewayAddressRequest$AvailabilityZone`), and "Use
+        // this instead of AvailabilityZone" (`…$AvailabilityZoneId`): the two members name
+        // the one zone two ways, and only a regional gateway has a zone to choose.
+        let zones = availability_zones_in_region(&region);
+        let by_name = match input.availability_zone.as_deref() {
+            Some(zone_name) => Some(availability_zone_of_region(
+                &zones,
+                &region,
+                "availabilityZone",
+                zone_name,
+                |zone| zone.zone_name.as_str(),
+            )?),
+            None => None,
+        };
+        let by_id = match input.availability_zone_id.as_deref() {
+            Some(zone_id) => Some(availability_zone_of_region(
+                &zones,
+                &region,
+                "availabilityZoneId",
+                zone_id,
+                |zone| zone.zone_id.as_str(),
+            )?),
+            None => None,
+        };
+        if let (Some(from_name), Some(from_id)) = (by_name, by_id) {
+            if from_name != from_id {
+                return Err(Scaffolded::invalid_parameter_combination(format!(
+                    "availabilityZone names the Availability Zone '{}' and \
+                     availabilityZoneId names '{}', so they cannot be given together",
+                    from_name.zone_name, from_id.zone_name
+                )));
+            }
+        }
+        let named_zone = by_name.or(by_id);
+        let regional = availability_mode == AVAILABILITY_MODE_REGIONAL;
+        if !regional && named_zone.is_some() {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The NAT gateway '{}' has availabilityMode '{availability_mode}'. \
+                 availabilityZone and availabilityZoneId are for a regional NAT gateway, \
+                 which uses a separate EIP in each Availability Zone",
+                input.nat_gateway_id
+            )));
+        }
+        if regional && named_zone.is_none() {
+            return Err(Scaffolded::missing_parameter(format!(
+                "The NAT gateway '{}' has availabilityMode '{availability_mode}' and uses a \
+                 separate EIP in each Availability Zone, so the request must name the zone \
+                 the EIP is for in availabilityZone or availabilityZoneId",
+                input.nat_gateway_id
+            )));
+        }
+
+        // Which subnet the EIP's private address comes out of: a zonal gateway's own
+        // subnet, and for a regional gateway the subnet its VPC has in the zone the request
+        // named — that gateway "uses a separate EIP in each AZ to handle outbound NAT
+        // traffic from that AZ", and the traffic of a zone leaves through the VPC's subnet
+        // in it.
+        let subnet = match named_zone {
+            Some(zone) => store
+                .subnets
+                .values()
+                .find(|subnet| {
+                    subnet.vpc_id.as_deref() == Some(gateway_vpc_id.as_str())
+                        && subnet.availability_zone.as_deref() == Some(zone.zone_name.as_str())
+                })
+                .ok_or_else(|| {
+                    Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{}' for availabilityZone. The VPC '{gateway_vpc_id}' \
+                         of NAT gateway '{}' has no subnet in that Availability Zone",
+                        zone.zone_name, input.nat_gateway_id
+                    ))
+                })?,
+            None => store.subnets.get(&gateway_subnet_id).ok_or_else(|| {
+                internal_error(format!(
+                    "the NAT gateway '{}' is in the subnet '{gateway_subnet_id}', \
+                     which this account holds no subnet for",
+                    input.nat_gateway_id
+                ))
+            })?,
+        };
+        let subnet_id = subnet.subnet_id.clone().unwrap_or_default();
+        let zone_name = subnet.availability_zone.clone();
+        let zone_id = subnet.availability_zone_id.clone();
+        let subnet_cidr = subnet.cidr_block.clone().ok_or_else(|| {
+            internal_error(format!(
+                "the subnet '{subnet_id}' of NAT gateway '{}' holds no CIDR block",
+                input.nat_gateway_id
+            ))
+        })?;
+
+        // "the network border group of the EIPs must match the network border group of the
+        // Availability Zone (AZ) that the public NAT gateway is in. If it's not the same,
+        // the EIP will fail to associate" (`AssociateNatGatewayAddress`). Every
+        // Availability Zone of a Region advertises from the one border group named for that
+        // Region ([`network_border_group_of_region`]), so this is the group the gateway's
+        // own zone is in.
+        let gateway_border_group = network_border_group_of_region(&region);
+        for allocation_id in &input.allocation_ids {
+            let address = require_known_address(&store, allocation_id)?;
+            // "[Public NAT gateway only] The association ID of the Elastic IP address"
+            // (`NatGatewayAddress$AssociationId`): an address already associated with
+            // something cannot be associated again — `Resource.AlreadyAssociated` is the
+            // failure `NatGateway$FailureCode` itself names for it.
+            if let Some(association_id) = address.association_id.as_deref() {
+                return Err(resource_already_associated(format!(
+                    "The address with allocation ID '{allocation_id}' is already associated \
+                     under association ID '{association_id}'"
+                )));
+            }
+            let border_group = address.network_border_group.clone().unwrap_or_default();
+            if border_group != gateway_border_group {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{allocation_id}' for allocationId. The address is \
+                     advertised from network border group '{border_group}', and the \
+                     Availability Zone of NAT gateway '{}' is in '{gateway_border_group}'",
+                    input.nat_gateway_id
+                )));
+            }
+        }
+
+        // "By default, you can associate up to 2 Elastic IP addresses per public NAT
+        // gateway. You can increase the limit by requesting a quota adjustment"
+        // (`AssociateNatGatewayAddress`): this emulator serves an account at that published
+        // default, so the address past it is refused rather than stored. A regional gateway
+        // "uses a separate EIP in each AZ to handle outbound NAT traffic from that AZ"
+        // (`…$AvailabilityZone`), so what the default counts is the addresses of the NAT in
+        // ONE zone — otherwise a gateway serving three zones could never be given an
+        // address for its third. A single-zone gateway has only its own zone, so its count
+        // is every address it holds.
+        let counted_zone = if regional { zone_name.as_deref() } else { None };
+        let held = store.nat_gateway_eip_count(&input.nat_gateway_id, counted_zone);
+        if held + input.allocation_ids.len() > MAX_EIPS_PER_PUBLIC_NAT_GATEWAY {
+            let where_counted = match counted_zone {
+                Some(zone) => format!(" in the Availability Zone '{zone}'"),
+                None => String::new(),
+            };
+            return Err(resource_count_exceeded(format!(
+                "The NAT gateway '{}' holds {held} of at most \
+                 {MAX_EIPS_PER_PUBLIC_NAT_GATEWAY} Elastic IP addresses{where_counted}, so \
+                 it cannot take {} more",
+                input.nat_gateway_id,
+                input.allocation_ids.len()
+            )));
+        }
+
+        // A private address the request names has to be an address of the subnet the EIP's
+        // traffic leaves through that an interface may be given — AWS reserves five of
+        // every subnet CIDR block — and one NOTHING in the account holds, which is the one
+        // question `subnet_address_in_use` answers: an address is recorded either among the
+        // private addresses handed out or on the resource that holds it (a route server
+        // endpoint's network interface), and a subnet gives neither out twice.
+        let mut taken_in_this_call = ::std::collections::BTreeSet::new();
+        for private_ip in &requested_private_ips {
+            if !is_assignable_subnet_address(&subnet_cidr, private_ip) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{private_ip}' for privateIpAddress. It is not an \
+                     assignable address of the subnet '{subnet_id}' ('{subnet_cidr}')"
+                )));
+            }
+            if store.subnet_address_in_use(private_ip) || !taken_in_this_call.insert(private_ip)
+            {
+                return Err(Scaffolded::invalid_ip_address_in_use(private_ip));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The private address each new EIP gets: the one the request named, or one out of
+        // the subnet when it named none. Every address is taken BEFORE the first one is
+        // stored, and handed back when the subnet runs out, so a call that cannot be
+        // finished does not leave the subnet short of addresses nothing holds.
+        let mut private_ips: Vec<String> = Vec::new();
+        for index in 0..input.allocation_ids.len() {
+            // Each source has its own failure: a named address something took is the
+            // `InvalidIPAddress.InUse` the check above already answers for one, and a
+            // subnet with no free address left is EC2's own
+            // `InsufficientFreeAddressesInSubnet` — so one cause is never reported two
+            // ways.
+            let taken = match requested_private_ips.get(index) {
+                Some(private_ip) => store
+                    .reserve_private_ip(private_ip)
+                    .then(|| private_ip.clone())
+                    .ok_or_else(|| Scaffolded::invalid_ip_address_in_use(private_ip)),
+                None => store
+                    .mint_private_ip_in_cidr(&subnet_cidr)
+                    .ok_or_else(Scaffolded::insufficient_free_addresses),
+            };
+            match taken {
+                Ok(private_ip) => private_ips.push(private_ip),
+                Err(refusal) => {
+                    for private_ip in &private_ips {
+                        store.release_private_ip(private_ip);
+                    }
+                    return Err(refusal);
+                }
+            }
+        }
+
+        // "The ID of the network interface associated with the NAT gateway"
+        // (`NatGatewayAddress$NetworkInterfaceId`): a NAT gateway handles the outbound
+        // traffic of one Availability Zone through ONE network interface, so an EIP joining
+        // a zone the gateway already serves goes on the interface already there, and the
+        // first EIP of a zone gets a fresh one.
+        let interface_in_zone = held_addresses
+            .iter()
+            .find(|address| !regional || address.availability_zone == zone_name)
+            .and_then(|address| address.network_interface_id.clone());
+        let network_interface_id = match interface_in_zone {
+            Some(network_interface_id) => network_interface_id,
+            None => store.next_id(NETWORK_INTERFACE_ID_PREFIX),
+        };
+        let interface_owner_id = ::engine::emulator_account_id().to_string();
+        // "Defines if the IP address is the primary address"
+        // (`NatGatewayAddress$IsPrimary`): the primary address of a NAT gateway is the one
+        // it was created with, so an associated address is primary only on a gateway that
+        // has no primary yet.
+        let has_primary = held_addresses
+            .iter()
+            .any(|address| address.is_primary == Some(true));
+
+        let mut minted: Vec<(String, NatGatewayAddress)> = Vec::new();
+        for (index, allocation_id) in input.allocation_ids.iter().enumerate() {
+            let private_ip = private_ips.get(index).cloned().ok_or_else(|| {
+                internal_error(format!(
+                    "no private IPv4 address was taken for the allocation ID \
+                     '{allocation_id}'"
+                ))
+            })?;
+            let association_id = store.next_id(ELASTIC_IP_ASSOCIATION_ID_PREFIX);
+            let public_ip = store
+                .addresses
+                .get(allocation_id)
+                .and_then(|address| address.public_ip.clone());
+            minted.push((
+                association_id.clone(),
+                NatGatewayAddress {
+                    allocation_id: Some(allocation_id.clone()),
+                    association_id: Some(association_id.clone()),
+                    network_interface_id: Some(network_interface_id.clone()),
+                    private_ip: Some(private_ip.clone()),
+                    public_ip,
+                    is_primary: Some(!has_primary && index == 0),
+                    // Nothing has gone wrong with this association, so there is no
+                    // "address failure message" to report.
+                    failure_message: None,
+                    status: Some(NAT_GATEWAY_ADDRESS_STATUS_ASSOCIATING.to_string()),
+                    availability_zone: zone_name.clone(),
+                    availability_zone_id: zone_id.clone(),
+                },
+            ));
+            // The Elastic IP address is now held by the gateway, written onto the SAME
+            // stored record every address report reads, so `DescribeAddresses` and the
+            // gateway cannot disagree about who holds it — and a second association of the
+            // same address is what the check above refuses.
+            if let Some(stored) = store.addresses.get_mut(allocation_id) {
+                stored.association_id = Some(association_id);
+                stored.network_interface_id = Some(network_interface_id.clone());
+                stored.network_interface_owner_id = Some(interface_owner_id.clone());
+                stored.private_ip_address = Some(private_ip);
+            }
+        }
+
+        let gateway = store
+            .nat_gateways
+            .get_mut(&input.nat_gateway_id)
+            .ok_or_else(|| {
+                internal_error(format!(
+                    "the NAT gateway '{}' could not be read back",
+                    input.nat_gateway_id
+                ))
+            })?;
+        let addresses = gateway.nat_gateway_addresses.get_or_insert_with(Vec::new);
+        for (_, address) in &minted {
+            addresses.push(address.clone());
+        }
+        // Answered out of the store, so the caller sees what a later reader of this gateway
+        // will see rather than the request object: "The IP addresses"
+        // (`AssociateNatGatewayAddressResult$NatGatewayAddresses`) is every address the
+        // gateway now has, not only the ones this call added.
+        let answered = gateway.nat_gateway_addresses.clone().unwrap_or_default();
+        let answered_id = gateway.nat_gateway_id.clone();
+
+        // What the clock now owes each new address: `succeeded`, one `TRANSITION_DELAY`
+        // from now — recorded rather than slept for, so a caller that reads the gateway
+        // straight away still sees the `associating` status an association starts in.
+        for (association_id, _) in minted {
+            store.nat_gateway_address_transitions.insert(
+                association_id,
+                NatGatewayAddressTransition::starting_now(
+                    &input.nat_gateway_id,
+                    NAT_GATEWAY_ADDRESS_STATUS_SUCCEEDED,
+                ),
+            );
+        }
+
+        Ok(AssociateNatGatewayAddressOutput {
+            nat_gateway_id: answered_id,
+            nat_gateway_addresses: Some(answered),
+        })
     }
 }
+

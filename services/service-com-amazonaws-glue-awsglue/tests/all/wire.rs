@@ -105,6 +105,14 @@ pub fn error_code(body: &Value) -> String {
         .to_string()
 }
 
+/// The `Message` member of a failure body, which carries the refusal's wording.
+pub fn error_message(body: &Value) -> String {
+    body.get("Message")
+        .and_then(Value::as_str)
+        .unwrap_or("<no Message>")
+        .to_string()
+}
+
 /// The names in a `GetTables` `TableList`, in the order the service returned them.
 ///
 /// One copy, shared: every suite that pages over tables reads the list the same way.
