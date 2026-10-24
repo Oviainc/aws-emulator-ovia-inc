@@ -19,6 +19,8 @@ mod bridge_members_and_deletion;
 mod bridge_output_admission;
 #[path = "all/create_flow_stored_formats.rs"]
 mod create_flow_stored_formats;
+#[path = "all/create_router_input.rs"]
+mod create_router_input;
 #[path = "all/create_router_network_interface_rules.rs"]
 mod create_router_network_interface_rules;
 #[path = "all/entitlement_listing.rs"]

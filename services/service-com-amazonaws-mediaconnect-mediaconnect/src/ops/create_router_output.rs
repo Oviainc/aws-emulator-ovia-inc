@@ -265,6 +265,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // The state changes and the removals the clock already owes are materialised before
+        // anything is read, the way DeleteRouterOutput and the reporting operations do it, so
+        // the replay below, the store bound and the record this call stores all answer from
+        // the store as of `now`.
+        store.settle_due_transitions(now);
 
         // `ClientToken` is the request's `@idempotencyToken`, "a unique identifier for the
         // request to ensure idempotency": a create replaying a token this store already
