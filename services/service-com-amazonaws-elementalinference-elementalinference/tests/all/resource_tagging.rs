@@ -33,7 +33,7 @@
 //!   walk, the KEY by the handler, since that walk reads a map entry's key as the path
 //!   its value is reported under rather than checking it.
 
-use crate::harness::{call, output_config, past_the_transition_span, router};
+use crate::harness::{call, output_config, past_the_transition_span, router, tags_path};
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
     invalid_tag_key_message, too_many_tags_message, MAX_TAGS_PER_RESOURCE, NOT_FOUND_MESSAGE,
@@ -47,23 +47,9 @@ use std::collections::BTreeMap;
 /// on both, since the rule is about a RESOURCE and not about either kind.
 const KINDS: [&str; 2] = ["feed", "dictionary"];
 
-/// The path a `TagResource` request goes to, with the ARN percent-encoded.
-///
-/// `resourceArn` is an `@httpLabel` bound to one path segment, so a client encodes
-/// every character that is not unreserved (RFC 3986) — notably the `/` before the
-/// resource id, which would otherwise read as a further path segment.
-fn tags_path(resource_arn: &str) -> String {
-    let encoded: String = resource_arn
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                char::from(byte).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect();
-    format!("/v1/tags/{encoded}")
-}
+// The path a `TagResource` request goes to, with the ARN percent-encoded, comes from
+// the one encoder every suite that drives a tagging route shares
+// (`crate::harness::tags_path`).
 
 /// A `TagMap` body member built from a list of pairs.
 fn tag_object(tags: &[(String, String)]) -> Value {

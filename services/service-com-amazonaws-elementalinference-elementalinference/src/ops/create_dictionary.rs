@@ -220,18 +220,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle_due_transitions(now);
 
-        // The dictionary store is BOUNDED: past the quota the service refuses the
-        // create rather than growing its state by another record, which is also what
-        // the real service answers once an account's quota is exhausted.
-        if state.dictionaries.len() >= crate::state::MAX_DICTIONARIES {
+        // The dictionary store is BOUNDED, and a service quota is a PER-REGION figure:
+        // past the Region's quota the service refuses the create rather than growing
+        // its state by another record, which is also what the real service answers once
+        // that Region's quota is exhausted.
+        if let Some(message) = state.dictionary_quota_refusal(&region) {
             return Err(CreateDictionaryErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: format!(
-                        "This account already holds the maximum of {} dictionaries. \
-                         Delete unused dictionaries or request a quota increase.",
-                        crate::state::MAX_DICTIONARIES
-                    ),
-                },
+                ServiceQuotaExceededException { message },
             )
             .into());
         }
@@ -243,6 +238,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let dictionary = crate::state::Dictionary {
             arn: crate::state::dictionary_arn(&region, &id),
             id,
+            // This service is REGIONAL: the dictionary belongs to the endpoint it was
+            // created through, which is the Region the request was signed for — the same
+            // Region its ARN carries — and every later read and mutation resolves its id
+            // within that Region.
+            region: region.clone(),
             name: input.name,
             language: input.language,
             // The payload is optional; a dictionary created without one holds no
@@ -256,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which feeds reference a dictionary is derived from the feed store, and the
         // id minted a moment ago is one nothing can name yet, so this list is empty by
         // construction — it reads the derived fact rather than asserting it.
-        let references = state.feeds_referencing(&dictionary.id);
+        let references = state.feeds_referencing(&region, &dictionary.id);
 
         // Built from the record that is about to be stored, so GetDictionary answers
         // with exactly these values.
