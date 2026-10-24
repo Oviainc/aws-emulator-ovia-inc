@@ -16,7 +16,7 @@ use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 
 use crate::ops::types::{
     ConflictException, LockConfiguration, ResourceNotFoundException, ResourceTag, RetentionPeriod,
-    RuleSummary, Tag, ValidationException,
+    RuleSummary, ServiceQuotaExceededException, Tag, ValidationException,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -58,6 +58,50 @@ pub const MAX_RULES: usize = 1000;
 /// models `ServiceQuotaExceededException` too, and `TagResource` — so no sequence of
 /// calls can leave a rule carrying more tags than the quota allows.
 pub const MAX_TAGS_PER_RULE: usize = 50;
+
+/// The number of retention rules one resource tag key and value pair may select, after
+/// which selecting on it again is refused with the modelled
+/// `ServiceQuotaExceededException`.
+///
+/// The model states the bound on the member that carries the pairs: `ResourceTags` —
+/// "You can add the same tag key and value pair to a maximum or five retention rules"
+/// (smithy_query(query="doc", shape="CreateRuleRequest"/"UpdateRuleRequest",
+/// member="ResourceTags")).
+///
+/// BOTH operations that can put a pair over it are held to it — `CreateRule` and
+/// `UpdateRule`, the two that accept `ResourceTags` — so no sequence of calls can leave
+/// one pair selecting more rules than the quota allows.
+pub const MAX_RULES_PER_RESOURCE_TAG: usize = 5;
+
+/// `ServiceQuotaExceededExceptionReason`'s sole value.
+/// Source: smithy_query(query="shape", shape="ServiceQuotaExceededExceptionReason").
+pub const SERVICE_QUOTA_REASON_EXCEEDED: &str = "SERVICE_QUOTA_EXCEEDED";
+
+/// A resource tag as the five-rules-per-pair quota identifies it: the key together with
+/// the value, where a tag that carries no value is the empty value (`ResourceTagValue`
+/// is optional and bounded at `{0,256}`, so "no value" and "the empty value" select the
+/// same resources).
+fn resource_tag_pair(tag: &ResourceTag) -> (&str, &str) {
+    (
+        tag.resource_tag_key.as_str(),
+        tag.resource_tag_value.as_deref().unwrap_or_default(),
+    )
+}
+
+/// The modelled 402 for a request that would push a resource tag key and value pair
+/// past [`MAX_RULES_PER_RESOURCE_TAG`].
+///
+/// The message states the quota, not the pair the request named: the bound is a fact of
+/// the service, and nothing of the request is echoed back.
+pub fn resource_tag_quota_exceeded() -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: Some(format!(
+            "The request would exceed the quota of {MAX_RULES_PER_RESOURCE_TAG} retention \
+             rules per resource tag key and value pair"
+        )),
+        reason: Some(SERVICE_QUOTA_REASON_EXCEEDED.to_string()),
+    }
+}
 
 /// Assign `tags` to the tag list `held`, keyed by tag key.
 ///
@@ -593,6 +637,38 @@ impl ComAmazonawsRbinAmazonrecyclebinState {
     pub fn rule_by_arn_mut(&mut self, rule_arn: &str) -> Option<&mut Rule> {
         let identifier = self.arn_index.get(rule_arn)?.clone();
         self.rules.get_mut(&identifier)
+    }
+
+    /// Whether assigning `tags` as a rule's resource tags would make some tag key and
+    /// value pair the selector of more retention rules than
+    /// [`MAX_RULES_PER_RESOURCE_TAG`] allows.
+    ///
+    /// A pair is counted over the rules OTHER than `excluding`, the rule the request is
+    /// assigning to: a rule already selecting on a pair does not count against itself,
+    /// so re-sending what a rule already holds is never refused. A create names no rule
+    /// and passes `None`. The pairs the request repeats are counted once, since a rule
+    /// selects on a pair whether it names it once or twice.
+    pub fn exceeds_resource_tag_quota(
+        &self,
+        tags: &[ResourceTag],
+        excluding: Option<&str>,
+    ) -> bool {
+        let mut counted: BTreeSet<(&str, &str)> = BTreeSet::new();
+        tags.iter().any(|tag| {
+            let pair = resource_tag_pair(tag);
+            counted.insert(pair)
+                && self
+                    .rules
+                    .values()
+                    .filter(|rule| excluding.is_none_or(|identifier| rule.identifier != identifier))
+                    .filter(|rule| {
+                        rule.resource_tags
+                            .iter()
+                            .any(|held| resource_tag_pair(held) == pair)
+                    })
+                    .count()
+                    >= MAX_RULES_PER_RESOURCE_TAG
+        })
     }
 
     /// The rules to walk for a page, starting after `after` when a `NextToken`

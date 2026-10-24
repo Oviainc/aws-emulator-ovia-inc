@@ -264,6 +264,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let now = ::std::time::SystemTime::now();
+        // One resource tag key and value pair selects a bounded number of retention
+        // rules, so a create that would make a pair the selector of one rule too many is
+        // refused before any rule is minted. No rule is excluded from the count: the
+        // rule this request would create does not exist yet.
+        if store.exceeds_resource_tag_quota(&resource_tags, None) {
+            return Err(CreateRuleErrorModeled::ServiceQuotaExceededException(
+                crate::state::resource_tag_quota_exceeded(),
+            )
+            .into());
+        }
         let identifier = store.mint_identifier();
         let rule_arn = ::engine::emulator_arn("rbin", &region, &format!("rule/{identifier}"));
         // A rule created WITH a lock configuration starts out `locked`; one created

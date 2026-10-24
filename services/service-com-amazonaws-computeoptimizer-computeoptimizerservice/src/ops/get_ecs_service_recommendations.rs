@@ -845,48 +845,39 @@ impl RequestedFilters {
 /// The filters a request carries, or the modelled refusal for a filter the service does not
 /// define: an `ECSServiceRecommendationFilterName` outside the enum, or a value outside the
 /// enum the named member takes.
+///
+/// The vocabulary is the service's own ([`crate::state::ecs_filter_rejection`]), shared with
+/// the EXPORT of the same recommendations, so this reader and that export admit exactly the
+/// same filter set. (A name outside the modelled enum is unreachable from the wire: the
+/// framework's constraint walk refuses it with a `ValidationException` before this handler
+/// runs. The VALUES, by contrast, are a plain `FilterValues` string list that nothing before
+/// this point constrains.)
 fn requested_filters(
     filters: Option<&[ECSServiceRecommendationFilter]>,
 ) -> Result<RequestedFilters, GetECSServiceRecommendationsError> {
+    let filters = filters.unwrap_or(&[]);
+    if let Some(reason) = crate::state::ecs_filter_rejection(filters) {
+        return Err(invalid(reason));
+    }
     let mut requested = RequestedFilters::default();
-    for filter in filters.unwrap_or(&[]) {
-        let Some(name) = filter.name.as_deref() else {
-            return Err(invalid(
-                "The value supplied for parameter filters is not valid: every filter must name \
-                 the member it filters on.",
-            ));
-        };
-        let (values, allowed) = match name {
-            "Finding" => (
-                &mut requested.findings,
-                E_C_S_SERVICE_RECOMMENDATION_FINDING_VALUES,
-            ),
-            "FindingReasonCode" => (
-                &mut requested.finding_reason_codes,
-                E_C_S_SERVICE_RECOMMENDATION_FINDING_REASON_CODE_VALUES,
-            ),
+    for filter in filters {
+        let values = match filter.name.as_deref() {
+            Some(crate::state::ECS_FILTER_FINDING) => &mut requested.findings,
+            Some(crate::state::ECS_FILTER_FINDING_REASON_CODE) => {
+                &mut requested.finding_reason_codes
+            }
+            // Unreachable: the check above admits only the two names the model declares. A
+            // name it ever admitted that this reader did not know how to apply would be
+            // REFUSED here rather than silently collected under the wrong member.
             other => {
-                // Unreachable from the wire: `ECSServiceRecommendationFilterName` is a
-                // modelled enum, so the framework's constraint walk refuses a name outside
-                // it with a `ValidationException` before this handler runs. The arm keeps
-                // this reader total rather than silently ignoring such a filter. The
-                // VALUES, by contrast, are a plain `FilterValues` string list that nothing
-                // before this point constrains.
                 return Err(invalid(format!(
-                    "The value supplied for parameter filters is not valid: {other} is not an \
-                     Amazon ECS service recommendation filter name."
+                    "The value supplied for parameter filters is not valid: {} is not a filter \
+                     name this reader applies.",
+                    other.unwrap_or_default()
                 )))
             }
         };
-        for value in filter.values.iter().flatten() {
-            if !allowed.contains(&value.as_str()) {
-                return Err(invalid(format!(
-                    "The value supplied for parameter filters is not valid: {value} is not a \
-                     value the {name} filter accepts."
-                )));
-            }
-            values.push(value.clone());
-        }
+        values.extend(filter.values.iter().flatten().cloned());
     }
     Ok(requested)
 }
