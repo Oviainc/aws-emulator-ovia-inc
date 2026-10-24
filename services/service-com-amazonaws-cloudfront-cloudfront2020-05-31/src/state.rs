@@ -3076,6 +3076,34 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         Some(stored)
     }
 
+    /// Replace the configuration of the origin access control `id` names, and report the
+    /// record as it now stands.
+    ///
+    /// `UpdateOriginAccessControl` submits a whole `OriginAccessControlConfig` as its
+    /// payload, so the stored configuration becomes the one submitted, down to the members
+    /// the request left out, and the version token is freshly minted — "the new version of
+    /// the origin access control after it has been updated" — so the token the caller
+    /// matched on no longer satisfies an `If-Match` against this control. Nothing else
+    /// about a control changes: the id is the one it was created under, and a control
+    /// carries no status, no last-modified time and no propagation deadline.
+    ///
+    /// `None` when the store holds no such control, checked BEFORE the mint so a version
+    /// token is never spent on a control that is not there.
+    pub fn apply_origin_access_control_config(
+        &mut self,
+        id: &str,
+        config: OriginAccessControlConfig,
+    ) -> Option<&StoredOriginAccessControl> {
+        if !self.origin_access_controls.contains_key(id) {
+            return None;
+        }
+        let etag = self.next_etag();
+        let stored = self.origin_access_controls.get_mut(id)?;
+        stored.config = config;
+        stored.etag = etag;
+        Some(stored)
+    }
+
     /// Replace the comment of the key value store `name` names, and report the record as
     /// it now stands.
     ///
