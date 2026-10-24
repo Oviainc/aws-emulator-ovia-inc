@@ -11,7 +11,7 @@
 //! The rules under test, each asserted over a TABLE of inputs rather than one case:
 //!
 //! * what a mutating call persists is what a later reporting call returns, for any
-//!   `Manifest` document and any `remediationTypes` list;
+//!   well-formed `Manifest` document and any `remediationTypes` list;
 //! * `latestAvailableVersion` is the NUMERICALLY later of the deployed version and the
 //!   catalog's newest version, so it is never older than what is deployed;
 //! * an identifier a mutating call returns resolves, and an identifier no call returned
@@ -173,12 +173,35 @@ pub(crate) async fn dispatch_in_region(
     }
 }
 
-/// A minimal well-formed manifest, for the cases whose subject is not the manifest.
-fn simple_manifest() -> serde_json::Value {
+/// A well-formed landing zone manifest governing `regions`.
+///
+/// Carries every member `state::REQUIRED_MANIFEST_MEMBERS` names — the required
+/// parameters of the example manifest the user guide publishes for `CreateLandingZone`
+/// ("Launch your landing zone") — so a row whose subject is not the manifest is never
+/// refused for its manifest. Shared with the sibling suites in this test target.
+pub(crate) fn manifest_governing(regions: &[&str]) -> serde_json::Value {
     serde_json::json!({
-        "governedRegions": ["us-west-2"],
-        "organizationStructure": { "security": { "name": "Security" } }
+        "governedRegions": regions,
+        "organizationStructure": {
+            "security": { "name": "Security" },
+            "sandbox": { "name": "Sandbox" }
+        },
+        "centralizedLogging": {
+            "accountId": "222222222222",
+            "configurations": {
+                "loggingBucket": { "retentionDays": 60 },
+                "accessLoggingBucket": { "retentionDays": 3650 }
+            },
+            "enabled": true
+        },
+        "securityRoles": { "accountId": "333333333333" },
+        "accessManagement": { "enabled": true }
     })
+}
+
+/// A minimal well-formed manifest, for the cases whose subject is not the manifest.
+pub(crate) fn simple_manifest() -> serde_json::Value {
+    manifest_governing(&["us-west-2"])
 }
 
 /// Create one landing zone with `version` and `manifest`, asserting it succeeded.
@@ -501,37 +524,54 @@ async fn the_landing_zone_lifecycle_is_served_from_the_store() {
 }
 
 /// RULE: `GetLandingZone` returns the `Manifest` document `CreateLandingZone` was given,
-/// for ANY shape of document — the manifest is opaque to the service.
+/// unchanged — the service stores the configuration document it was handed and neither
+/// normalises it nor drops what it does not read, because the manifest's full schema "is
+/// not published, by design" (`UpdateLandingZoneInput$manifest`).
 ///
-/// The rows differ along the document's own structure: nesting, arrays, scalars of each
-/// JSON type, an empty object, and a key order the service must not reorder away.
+/// Every row is a manifest the service accepts (it declares the documented required
+/// parameters); the rows differ along the structure AROUND them: how many governed
+/// regions, unknown scalar members of each JSON type, a null-valued member, deep nesting,
+/// and numbers of each width.
 #[tokio::test]
-async fn any_manifest_document_round_trips_unchanged() {
+async fn a_well_formed_manifest_round_trips_unchanged() {
+    /// A well-formed manifest with `extras`' members added beside the required ones.
+    fn manifest_with(extras: serde_json::Value) -> serde_json::Value {
+        let mut manifest = simple_manifest();
+        for (key, value) in extras.as_object().expect("the extras are an object") {
+            manifest[key.as_str()] = value.clone();
+        }
+        manifest
+    }
+
     let cases: Vec<(&str, serde_json::Value)> = vec![
-        ("empty object", serde_json::json!({})),
-        ("flat scalars", serde_json::json!({ "a": 1, "b": "two", "c": true })),
-        ("null member", serde_json::json!({ "retain": serde_json::Value::Null })),
+        ("the required parameters alone", simple_manifest()),
+        ("no governed regions", manifest_governing(&[])),
         (
-            "nested arrays and objects",
-            serde_json::json!({
-                "governedRegions": ["us-west-2", "eu-west-1"],
-                "organizationStructure": {
-                    "security": { "name": "Security" },
-                    "sandbox": { "name": "Sandbox" }
-                },
-                "accessManagement": { "enabled": false }
-            }),
+            "several governed regions, in the manifest's own order",
+            manifest_governing(&["us-west-2", "eu-west-1", "ap-south-1"]),
         ),
         (
-            "deeply nested",
-            serde_json::json!({ "a": { "b": { "c": { "d": { "e": [1, [2, [3]]] } } } } }),
+            "unknown scalar members of each JSON type",
+            manifest_with(serde_json::json!({ "a": 1, "b": "two", "c": true })),
+        ),
+        (
+            "a null-valued unknown member",
+            manifest_with(serde_json::json!({ "retain": serde_json::Value::Null })),
+        ),
+        (
+            "a deeply nested unknown member",
+            manifest_with(serde_json::json!({ "a": { "b": { "c": { "d": { "e": [1, [2, [3]]] } } } } })),
         ),
         (
             "numbers of each width",
-            serde_json::json!({ "int": -7, "big": 9007199254740991i64, "frac": 1.5 }),
+            manifest_with(
+                serde_json::json!({ "int": -7, "big": 9007199254740991i64, "frac": 1.5 }),
+            ),
         ),
-        ("array at the root", serde_json::json!([1, "two", { "three": 3 }])),
-        ("string at the root", serde_json::json!("a manifest can be any document")),
+        (
+            "an unknown member that is an array at the top level",
+            manifest_with(serde_json::json!({ "extra": [1, "two", { "three": 3 }] })),
+        ),
     ];
 
     for (case, manifest) in cases {
@@ -558,27 +598,27 @@ async fn any_manifest_document_round_trips_unchanged() {
 /// RULE: `latestAvailableVersion` is the NUMERICALLY later of the deployed version and
 /// the catalog's newest version, so it is never older than what is deployed.
 ///
-/// The catalog's newest version is `3.3` (`crate::state::CATALOG_LANDING_ZONE_VERSION`).
-/// Rows span: below the catalog, equal to it, above it, a minor component that is larger
-/// numerically but smaller lexicographically (`3.10`), and both published length bounds
-/// of `LandingZoneVersion` (len 3..10).
+/// Over the wire the deployed version can only be one the catalog offers (that is
+/// `only_a_version_the_catalog_offers_is_accepted`'s subject), so the wire rows span the
+/// catalog's ends and its middle, and the numeric comparison itself is asserted directly
+/// over rows a catalog retune could produce: a minor that is larger numerically but
+/// smaller lexicographically, a deployed version beyond the catalog, and one neither
+/// side can order.
 #[tokio::test]
 async fn latest_available_version_is_the_numerically_later_of_deployed_and_catalog() {
-    let cases = [
-        ("below the catalog", "2.0", "3.3"),
-        ("one minor below", "3.2", "3.3"),
-        ("equal to the catalog", "3.3", "3.3"),
-        ("above the catalog", "4.0", "4.0"),
-        // 3.10 is numerically newer than 3.3 but lexicographically smaller.
-        ("minor compared numerically", "3.10", "3.10"),
-        // 10.0 is numerically newer than 3.3 but lexicographically smaller.
-        ("major compared numerically", "10.0", "10.0"),
-        // The published length bounds of LandingZoneVersion: min 3 and max 10.
-        ("shortest accepted version", "1.0", "3.3"),
-        ("longest accepted version", "1234.56789", "1234.56789"),
-    ];
+    use service_com_amazonaws_controltower_awscontroltowerapis::state::{
+        latest_available_version, CATALOG_LANDING_ZONE_VERSION, CATALOG_LANDING_ZONE_VERSIONS,
+    };
 
-    for (case, deployed, expected_latest) in cases {
+    let oldest = CATALOG_LANDING_ZONE_VERSIONS
+        .first()
+        .expect("the catalog offers at least one version");
+    let middle = CATALOG_LANDING_ZONE_VERSIONS[CATALOG_LANDING_ZONE_VERSIONS.len() / 2];
+    for (case, deployed) in [
+        ("the catalog's oldest version", *oldest),
+        ("a version in the middle of the catalog", middle),
+        ("the catalog's newest version", CATALOG_LANDING_ZONE_VERSION),
+    ] {
         let router = emulator();
         let created = create(&router, deployed, simple_manifest()).await;
         let arn = created.string("arn");
@@ -599,8 +639,32 @@ async fn latest_available_version_is_the_numerically_later_of_deployed_and_catal
             landing_zone
                 .get("latestAvailableVersion")
                 .and_then(|v| v.as_str()),
-            Some(expected_latest),
-            "case {case:?}: expected latestAvailableVersion {expected_latest:?}, got {landing_zone:?}"
+            Some(CATALOG_LANDING_ZONE_VERSION),
+            "case {case:?}: expected latestAvailableVersion \
+             {CATALOG_LANDING_ZONE_VERSION:?}, got {landing_zone:?}"
+        );
+    }
+
+    // (case, deployed, catalog, the latest available version)
+    for (case, deployed, catalog, expected) in [
+        ("below the catalog", "2.0", "3.3", "3.3"),
+        ("one minor below", "3.2", "3.3", "3.3"),
+        ("equal to the catalog", "3.3", "3.3", "3.3"),
+        ("above the catalog", "4.0", "3.3", "4.0"),
+        // 3.10 is numerically newer than 3.3 but lexicographically smaller.
+        ("minor compared numerically", "3.10", "3.3", "3.10"),
+        ("catalog minor compared numerically", "3.3", "3.10", "3.10"),
+        // 10.0 is numerically newer than 3.3 but lexicographically smaller.
+        ("major compared numerically", "10.0", "3.3", "10.0"),
+        // The pattern leaves the separator unescaped, so a value this cannot order is
+        // its own latest available version rather than being reported as older.
+        ("a version with no numeric order", "3x3", "3.3", "3x3"),
+    ] {
+        let actual = latest_available_version(deployed, catalog);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected latest_available_version({deployed:?}, {catalog:?}) \
+             to be {expected:?}, got {actual:?}"
         );
     }
 }
@@ -667,6 +731,22 @@ async fn values_outside_a_modeled_bound_are_refused_and_persist_nothing() {
             "no manifest to describe the landing zone with",
             "/create-landingzone",
             serde_json::json!({ "version": "3.3" }),
+            "ValidationException",
+        ),
+        (
+            // Satisfies `LandingZoneVersion`'s length and pattern, so the front door
+            // passes it; the catalog of offered versions is the handler's rule.
+            "a version the catalog does not offer",
+            "/create-landingzone",
+            serde_json::json!({ "version": "9.9", "manifest": simple_manifest() }),
+            "ValidationException",
+        ),
+        (
+            // `Manifest` is a document, so no modeled constraint describes its members:
+            // the configuration document's required parameters are the handler's rule.
+            "a manifest that declares none of the required parameters",
+            "/create-landingzone",
+            serde_json::json!({ "version": "3.3", "manifest": {} }),
             "ValidationException",
         ),
     ];

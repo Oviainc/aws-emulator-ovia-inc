@@ -239,6 +239,12 @@ pub const RESOURCE_TYPE_PEERED_VPC: &str = "PeeredVpc";
 /// three kinds of resource an alarm monitors.
 pub const RESOURCE_TYPE_LOAD_BALANCER: &str = "LoadBalancer";
 
+/// The `resourceType` an SSL/TLS certificate of a load balancer and its
+/// operations report, from the same modelled `ResourceType` enum — the value the
+/// modelled `LoadBalancerTlsCertificate$resourceType` member carries ("The
+/// resource type (`LoadBalancerTlsCertificate`)").
+pub const RESOURCE_TYPE_LOAD_BALANCER_TLS_CERTIFICATE: &str = "LoadBalancerTlsCertificate";
+
 /// The resource portion a load balancer ARN carries before its id. Mirrors the
 /// `Instance/<uuid>` form the modelled `Instance$arn` documentation shows, with
 /// this resource's own `ResourceType` value.
@@ -484,6 +490,9 @@ pub const OPERATION_TYPE_CREATE_LOAD_BALANCER: &str = "CreateLoadBalancer";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_ATTACH_INSTANCES_TO_LOAD_BALANCER: &str =
     "AttachInstancesToLoadBalancer";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_DELETE_LOAD_BALANCER_TLS_CERTIFICATE: &str =
+    "DeleteLoadBalancerTlsCertificate";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK_SNAPSHOT: &str = "CreateDiskSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -8479,7 +8488,8 @@ impl ComAmazonawsLightsailLightsail20161128State {
     }
 
     /// The load balancer `name` names in `region`, for an operation the spec says
-    /// mutates it — registering an instance with it, or releasing one.
+    /// mutates it — registering an instance with it, releasing one, or removing
+    /// an SSL/TLS certificate it holds.
     ///
     /// The `(region, name)` pair is this record's store key, so neither may be
     /// reassigned through this handle; no operation in this slice renames a load

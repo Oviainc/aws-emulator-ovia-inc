@@ -22,7 +22,7 @@
 //! ListEnabledBaselinesMaxResults,ListControlOperationsNextToken")` on this crate's
 //! `smithy-model/`.
 
-use crate::landing_zone_lifecycle::{call, emulator};
+use crate::landing_zone_lifecycle::{call, emulator, simple_manifest};
 
 /// The error code the front door names an input-validation refusal with.
 const FRONT_DOOR_CODE: &str = "BadRequestException";
@@ -142,7 +142,7 @@ async fn a_modeled_constraint_violation_is_a_front_door_bad_request() {
             "/create-landingzone",
             serde_json::json!({
                 "version": "3",
-                "manifest": { "governedRegions": ["us-west-2"] }
+                "manifest": simple_manifest()
             }),
         ),
     ];
@@ -292,7 +292,7 @@ async fn a_handler_refusal_keeps_its_modeled_error() {
         "/create-landingzone",
         serde_json::json!({
             "version": "3.3",
-            "manifest": { "governedRegions": ["us-west-2"] }
+            "manifest": simple_manifest()
         }),
     )
     .await;

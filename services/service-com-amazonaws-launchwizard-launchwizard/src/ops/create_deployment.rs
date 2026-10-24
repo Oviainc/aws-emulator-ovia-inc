@@ -230,12 +230,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // The versions this deployment deploys are the catalogue's for the pattern it
-        // is created against: `CreateDeployment` models no version members, so the
-        // record names the version it was resolved against rather than nothing, and
+        // is created against — the pattern's CURRENT version, the newest one the
+        // catalogue publishes for it: `CreateDeployment` models no version members, so
+        // the record names the version it was resolved against rather than nothing, and
         // `UpdateDeployment` is what moves it to another one. Cloned here so the
         // catalogue borrow ends before the store is written to below.
         let workload_version_name = pattern.workload_version_name.clone();
-        let pattern_version_name = pattern.pattern_version_name.clone();
+        // Every catalogue entry publishes at least one version
+        // (`state::CATALOGUE_PATTERN_VERSIONS`), so a pattern with none is a broken
+        // store rather than a deployment with no version: answered as the modelled
+        // server error instead of storing an empty version name.
+        let Some(pattern_version) = pattern.current_version() else {
+            return Err(
+                CreateDeploymentErrorModeled::InternalServerException(InternalServerException {
+                    message: Some(
+                        "the Launch Wizard catalogue holds no version for this deployment pattern"
+                            .to_string(),
+                    ),
+                })
+                .into(),
+            );
+        };
+        let pattern_version_name = pattern_version.version_name.clone();
 
         // The settings are judged against the specification schema THIS pattern
         // publishes — the same `state::specification_warnings` an update is judged by,

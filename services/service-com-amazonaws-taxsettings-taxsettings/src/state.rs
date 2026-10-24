@@ -8,18 +8,18 @@
 //! `GetTaxRegistration` and `ListTaxRegistrations` report one record the same
 //! way instead of each rebuilding it from the raw fields.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant, SystemTime};
 
 use ::aws_smithy_types::base64;
 
 use crate::ops::types::{
     AccountMetaData, AdditionalInfoRequest, AdditionalInfoResponse, Address, Authority,
-    ConflictException, IndonesiaAdditionalInfo, InternalServerException, Jurisdiction,
-    ResourceNotFoundException, SupplementalTaxRegistration, SupplementalTaxRegistrationEntry,
-    TaxDocumentMetadata, TaxExemption, TaxExemptionDetails, TaxExemptionType, TaxRegistration,
-    TaxRegistrationEntry, TaxRegistrationWithJurisdiction, ValidationException,
-    ValidationExceptionField,
+    CaseCreationLimitExceededException, ConflictException, IndonesiaAdditionalInfo,
+    InternalServerException, Jurisdiction, ResourceNotFoundException, SupplementalTaxRegistration,
+    SupplementalTaxRegistrationEntry, TaxDocumentMetadata, TaxExemption, TaxExemptionDetails,
+    TaxExemptionType, TaxRegistration, TaxRegistrationEntry, TaxRegistrationWithJurisdiction,
+    ValidationException, ValidationExceptionField,
 };
 
 /// The `TaxRegistrationStatus` values, from the model's enum
@@ -205,6 +205,12 @@ pub const MAX_STORED_SUPPLEMENTAL_REGISTRATIONS: usize = 1_000;
 
 /// The page size a listing request selects: what it asked for, else
 /// [`DEFAULT_PAGE_SIZE`], never more than [`MAX_PAGE_SIZE`] and never zero.
+///
+/// A `maxResults` outside the model's 1..=1000 range never reaches here: the
+/// boundary validator refuses it with a `ValidationException` before the handler
+/// runs, as `tests/all/tax_exemptions.rs` pins on each bound and one past it. The
+/// clamp is therefore the SERVER's ceiling on a page, not a coercion of a value a
+/// client could have sent.
 pub fn page_size(max_results: Option<i32>) -> usize {
     max_results
         .and_then(|max| usize::try_from(max).ok())
@@ -252,12 +258,17 @@ pub struct ComAmazonawsTaxsettingsTaxsettingsState {
     /// can name the key the previous page stopped after, the same way
     /// [`Self::registrations`] does. An account with no exemption has no entry
     /// here — never an empty vector — so "this service holds exemptions for the
-    /// account" is one question with one answer.
+    /// account" is one question with one answer. Within an account the records
+    /// keep the order they were first recorded in, so every reader reports one
+    /// account's exemptions one way.
     ///
     /// `PutTaxExemption` is the writer AWS models for this map (it submits an
-    /// exemption certificate for review); it is still a scaffold stub with its
-    /// own issue, so today the readers report what is seeded here.
+    /// exemption certificate for review) and writes it through
+    /// [`Self::store_exemptions`].
     pub exemptions: BTreeMap<String, Vec<StoredTaxExemption>>,
+    /// How many support cases `PutTaxExemption` has opened. The next `caseId` is
+    /// derived from it, so every submission gets its own.
+    pub minted_exemption_cases: u64,
 }
 
 impl ComAmazonawsTaxsettingsTaxsettingsState {
@@ -420,6 +431,95 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     pub fn mint_supplemental_authority_id(&mut self) -> String {
         self.minted_authority_ids = self.minted_authority_ids.saturating_add(1);
         format!("supplemental-trn-{:08}", self.minted_authority_ids)
+    }
+
+    /// Mint the id of the support case a `PutTaxExemption` submission opens.
+    ///
+    /// `caseId` is SERVER-generated (no request member carries one) and the model
+    /// constrains it only as a `GenericString` of 1..=200 characters, so AWS
+    /// publishes no format for it: this mints a short opaque id from the service's
+    /// own counter, unique per submission, which is every invariant the member
+    /// has.
+    pub fn mint_exemption_case_id(&mut self) -> String {
+        self.minted_exemption_cases = self.minted_exemption_cases.saturating_add(1);
+        format!("tax-exemption-case-{:08}", self.minted_exemption_cases)
+    }
+
+    /// How many exemption records the store holds, across every account.
+    pub fn stored_exemption_count(&self) -> usize {
+        self.exemptions.values().map(Vec::len).sum()
+    }
+
+    /// Record the exemption `exemption_type` and `authority` identify for every
+    /// account of `account_ids`, as submitted at `recorded_at`.
+    ///
+    /// The one place an exemption becomes a stored record. The exemption's
+    /// identity is its type and the jurisdiction it applies in — the request
+    /// carries no exemption id — so submitting the same pair for an account again
+    /// REPLACES that account's record in place, which is what makes this a `Put`
+    /// rather than an append; case and padding in the jurisdiction do not make a
+    /// second exemption ([`is_same_exemption`]).
+    ///
+    /// The record is stored in [`EXEMPTION_STATUS_PENDING`], the status the model
+    /// gives an exemption whose certificate has not been reviewed: a submission
+    /// attaches the certificate to a support case for review, and granting the
+    /// exemption is that reviewer's decision, not something the clock makes due
+    /// (see [`StoredTaxExemption::reported_status`]). It carries no effective or
+    /// expiration date either: both are facts about the submitted certificate,
+    /// which nothing here reads.
+    ///
+    /// `accountIds` is caller-supplied (up to 550 ids per call), so a submission
+    /// that would ADD records past [`MAX_STORED_EXEMPTIONS`] is refused whole,
+    /// before any record is written: a partially applied submission would report
+    /// one support case covering accounts it did not cover. Replacing exemptions
+    /// the accounts already hold is always allowed, because it adds nothing.
+    ///
+    /// Both passes walk only the accounts the request names plus the records they
+    /// hold, and the count they are checked against is bounded by
+    /// [`MAX_STORED_EXEMPTIONS`]; a larger bound would want that count kept
+    /// incrementally rather than summed per submission.
+    pub fn store_exemptions(
+        &mut self,
+        account_ids: &[String],
+        exemption_type: &TaxExemptionTypeRow,
+        authority: &Authority,
+        recorded_at: SystemTime,
+    ) -> Result<(), CaseCreationLimitExceededException> {
+        let description = exemption_type.1;
+        let distinct: BTreeSet<&str> = account_ids.iter().map(String::as_str).collect();
+        let additional = distinct
+            .iter()
+            .filter(|account_id| {
+                self.exemptions.get(**account_id).is_none_or(|held| {
+                    !held
+                        .iter()
+                        .any(|stored| is_same_exemption(stored, description, authority))
+                })
+            })
+            .count();
+        if self.stored_exemption_count() + additional > MAX_STORED_EXEMPTIONS {
+            return Err(exemption_store_full());
+        }
+
+        let submitted = StoredTaxExemption {
+            authority: normalized_authority(authority),
+            exemption_type: exemption_type_of(exemption_type),
+            effective_date: None,
+            expiration_date: None,
+            system_effective_date: Some(recorded_at),
+            status: EXEMPTION_STATUS_PENDING.to_string(),
+        };
+        for account_id in distinct {
+            let held = self.exemptions.entry(account_id.to_string()).or_default();
+            match held
+                .iter()
+                .position(|stored| is_same_exemption(stored, description, authority))
+            {
+                Some(index) => held[index] = submitted.clone(),
+                None => held.push(submitted.clone()),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1854,20 +1954,185 @@ const UNITED_STATES: &[JurisdictionRow] = &[("US", None)];
 pub fn tax_exemption_type_catalog() -> Vec<TaxExemptionType> {
     TAX_EXEMPTION_TYPE_CATALOG
         .iter()
-        .map(|(display_name, description, jurisdictions)| TaxExemptionType {
-            display_name: Some((*display_name).to_string()),
-            description: Some((*description).to_string()),
-            applicable_jurisdictions: Some(
-                jurisdictions
-                    .iter()
-                    .map(|(country, state)| Authority {
-                        country: (*country).to_string(),
-                        state: state.map(std::string::ToString::to_string),
-                    })
-                    .collect(),
-            ),
-        })
+        .map(exemption_type_of)
         .collect()
+}
+
+/// One published row as the modelled `TaxExemptionType` shape, which is how both
+/// the catalog listing and a stored exemption report the type it was granted
+/// under: one projection, so the two cannot describe one type differently.
+pub fn exemption_type_of(
+    (display_name, description, jurisdictions): &TaxExemptionTypeRow,
+) -> TaxExemptionType {
+    TaxExemptionType {
+        display_name: Some((*display_name).to_string()),
+        description: Some((*description).to_string()),
+        applicable_jurisdictions: Some(
+            jurisdictions
+                .iter()
+                .map(|(country, state)| Authority {
+                    country: (*country).to_string(),
+                    state: state.map(std::string::ToString::to_string),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// The published row a caller names by `exemption_type`.
+///
+/// `PutTaxExemptionRequest$exemptionType` documents "Use the supported tax
+/// exemption type description", so the `description` of a
+/// [`TAX_EXEMPTION_TYPE_CATALOG`] entry is the token a type is named by; the
+/// `displayName` is accepted for the same entry, because it is the catalog's
+/// other identifying member and that wording is this emulator's own (see
+/// [`TAX_EXEMPTION_TYPE_CATALOG`]) rather than something a client could have read
+/// off AWS. Matching ignores case and surrounding whitespace, neither of which
+/// distinguishes one published type from another.
+pub fn find_exemption_type(exemption_type: &str) -> Option<&'static TaxExemptionTypeRow> {
+    let wanted = exemption_type.trim();
+    TAX_EXEMPTION_TYPE_CATALOG
+        .iter()
+        .find(|(display_name, description, _)| {
+            description.eq_ignore_ascii_case(wanted) || display_name.eq_ignore_ascii_case(wanted)
+        })
+}
+
+/// Refuse an `exemptionType` the published catalog does not name, answering the
+/// row it does name.
+///
+/// The exemption types are a collection the SERVICE publishes
+/// (`GetTaxExemptionTypes`), and the write documents that a request names one of
+/// them, so a request naming anything else asks for an exemption this service
+/// does not offer: a field violation naming that parameter, never a stored record
+/// under a type no reader could describe.
+pub fn check_exemption_type(
+    exemption_type: &str,
+) -> Result<&'static TaxExemptionTypeRow, ValidationException> {
+    find_exemption_type(exemption_type).ok_or_else(|| {
+        // The message names the member and what it must satisfy, never the value
+        // that was refused — the shape every refusal of this service takes.
+        validation(
+            ERROR_CODE_FIELD_VALIDATION_FAILED,
+            "exemptionType",
+            "exemptionType must be the description of a tax exemption type \
+             GetTaxExemptionTypes publishes.",
+        )
+    })
+}
+
+/// Refuse an `authority` outside the jurisdictions the exemption type applies
+/// in.
+///
+/// A published type carries the `applicableJurisdictions` it applies in, so an
+/// exemption asked for in any other jurisdiction is one this service does not
+/// offer. A jurisdiction naming a country only applies throughout that country,
+/// so the request may name a state of it (a certificate is held in one) or none;
+/// a jurisdiction naming a state applies in that state alone.
+pub fn check_exemption_authority(
+    (_, description, jurisdictions): &TaxExemptionTypeRow,
+    authority: &Authority,
+) -> Result<(), ValidationException> {
+    let applies = jurisdictions.iter().any(|(country, state)| {
+        country.eq_ignore_ascii_case(authority.country.trim())
+            && (*state).is_none_or(|state| {
+                authority
+                    .state
+                    .as_deref()
+                    .is_some_and(|submitted| submitted.trim().eq_ignore_ascii_case(state))
+            })
+    });
+    if applies {
+        return Ok(());
+    }
+    Err(validation(
+        ERROR_CODE_FIELD_VALIDATION_FAILED,
+        "authority",
+        format!(
+            "The {description} tax exemption does not apply in the jurisdiction this request \
+             names. Use a jurisdiction GetTaxExemptionTypes publishes for that type."
+        ),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Writing a tax exemption
+//
+// `PutTaxExemption` is the one writer of
+// [`ComAmazonawsTaxsettingsTaxsettingsState::exemptions`]; the record it stores
+// and the projection every reader of one reports are [`StoredTaxExemption`],
+// above. What lives here is what a submission needs on top of that record: the
+// bound the store keeps, and the identity two submissions share.
+// ---------------------------------------------------------------------------
+
+/// The most tax exemption records this emulator keeps resident, across every
+/// account.
+///
+/// `accountIds` is caller-supplied (up to 550 ids per call), so without a bound a
+/// caller could grow the store by hundreds of records per request, and this
+/// service models no operation that deletes an exemption. A submission that would
+/// ADD records past this bound is refused with `PutTaxExemption`'s modelled
+/// `CaseCreationLimitExceededException` — the refusal AWS gives when no further
+/// support case may be opened, and each submission opens one — while replacing
+/// exemptions the accounts already hold is always allowed, because it adds
+/// nothing.
+pub const MAX_STORED_EXEMPTIONS: usize = 1_000;
+
+/// `authority` as a record stores it: the country upper-cased, because
+/// `Authority$country` is a two-letter code whose case carries no meaning, and
+/// the state trimmed but otherwise as submitted, being a name.
+pub fn normalized_authority(authority: &Authority) -> Authority {
+    Authority {
+        country: authority.country.trim().to_uppercase(),
+        state: authority
+            .state
+            .as_deref()
+            .map(|state| state.trim().to_string()),
+    }
+}
+
+/// Whether `stored` is the same exemption as the one `description` and
+/// `authority` name.
+///
+/// The type and the jurisdiction are the identity a submission addresses — the
+/// request carries no exemption id — so a second submission of the same pair
+/// replaces the account's record rather than adding one beside it. Case and
+/// padding make no second exemption: they are compared the way
+/// [`check_exemption_authority`] admits a jurisdiction, so what the admission
+/// check treats as one jurisdiction the store treats as one record.
+pub fn is_same_exemption(
+    stored: &StoredTaxExemption,
+    description: &str,
+    authority: &Authority,
+) -> bool {
+    let same_state = match (stored.authority.state.as_deref(), authority.state.as_deref()) {
+        (Some(held), Some(submitted)) => held.trim().eq_ignore_ascii_case(submitted.trim()),
+        (None, None) => true,
+        _ => false,
+    };
+    stored
+        .exemption_type
+        .description
+        .as_deref()
+        .is_some_and(|held| held.eq_ignore_ascii_case(description))
+        && stored
+            .authority
+            .country
+            .trim()
+            .eq_ignore_ascii_case(authority.country.trim())
+        && same_state
+}
+
+/// This service's modelled `CaseCreationLimitExceededException` (HTTP 413) for a
+/// submission that would take the store past [`MAX_STORED_EXEMPTIONS`]. It
+/// carries its `message` only, for the reason [`no_tax_registration`] gives.
+pub fn exemption_store_full() -> CaseCreationLimitExceededException {
+    CaseCreationLimitExceededException {
+        message: format!(
+            "This emulator keeps at most {MAX_STORED_EXEMPTIONS} tax exemptions resident, so no \
+             further exemption case can be created."
+        ),
+    }
 }
 
 /// The `authorityId` a supplemental-listing page cursor names, or a

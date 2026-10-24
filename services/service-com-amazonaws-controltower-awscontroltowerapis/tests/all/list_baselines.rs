@@ -38,7 +38,9 @@ use smithy_server_runtime::MultiServiceRouter;
 // serves a baseline under, reused rather than re-formatted here so the two suites cannot
 // disagree about that form.
 use crate::baseline_catalog::served_arn_in;
-use crate::landing_zone_lifecycle::{call, call_in_region, emulator, Answer, SIGNED_REGION};
+use crate::landing_zone_lifecycle::{
+    call, call_in_region, emulator, simple_manifest, Answer, SIGNED_REGION,
+};
 
 /// The region these tests sign for, and therefore the region of every ARN the service
 /// mints for them: the harness's own signing region rather than a second literal.
@@ -393,10 +395,7 @@ async fn no_call_changes_the_listing() {
         "/create-landingzone",
         serde_json::json!({
             "version": "3.3",
-            "manifest": {
-                "governedRegions": ["us-west-2"],
-                "organizationStructure": { "security": { "name": "Security" } }
-            }
+            "manifest": simple_manifest()
         }),
     )
     .await;

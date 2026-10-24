@@ -71,6 +71,9 @@ mod state_roundtrip;
 #[path = "all/sync_job.rs"]
 mod sync_job;
 
+#[path = "all/sync_job_listing.rs"]
+mod sync_job_listing;
+
 #[path = "all/workspace_entity_lifecycle.rs"]
 mod workspace_entity_lifecycle;
 

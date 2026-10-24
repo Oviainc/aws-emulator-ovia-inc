@@ -17,6 +17,8 @@ mod documents;
 mod instance_properties;
 #[path = "all/managed_node_information.rs"]
 mod managed_node_information;
+#[path = "all/parameter_deletion.rs"]
+mod parameter_deletion;
 #[path = "all/parameter_store.rs"]
 mod parameter_store;
 #[path = "all/parameters_by_path.rs"]

@@ -27,6 +27,8 @@ mod front_door_validation;
 mod landing_zone_lifecycle;
 #[path = "all/landing_zone_update.rs"]
 mod landing_zone_update;
+#[path = "all/landing_zone_validation.rs"]
+mod landing_zone_validation;
 #[path = "all/list_baselines.rs"]
 mod list_baselines;
 #[path = "all/resource_tags.rs"]
