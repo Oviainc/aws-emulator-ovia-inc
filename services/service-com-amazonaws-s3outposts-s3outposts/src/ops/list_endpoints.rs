@@ -180,9 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut endpoints = Vec::with_capacity(page_size);
         let mut next_token = None;
         for (key, endpoint) in &store.endpoints {
-            // This listing reports the caller's own endpoints; the ones another
-            // account owns on a shared Outpost are what `ListSharedEndpoints`
-            // reports.
+            // This listing reports the caller's own endpoints, across every
+            // Outpost it has them on; `ListSharedEndpoints` is the listing
+            // scoped to one named Outpost.
             if endpoint.owner_account != caller {
                 continue;
             }
