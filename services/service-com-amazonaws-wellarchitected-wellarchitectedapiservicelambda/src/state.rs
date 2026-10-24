@@ -5,7 +5,8 @@
 //! The workload lifecycle (`CreateWorkload`, `GetWorkload`, `ListWorkloads`,
 //! `UpdateWorkload`, `DeleteWorkload`), the milestones recorded against a workload
 //! (`CreateMilestone`, `GetMilestone`, `ListMilestones`), the review templates
-//! (`CreateReviewTemplate`, `GetReviewTemplate`, `DeleteReviewTemplate`), the answers of
+//! (`CreateReviewTemplate`, `GetReviewTemplate`, `ListReviewTemplates`,
+//! `DeleteReviewTemplate`), the answers of
 //! a workload's lens reviews (`ListAnswers`) and the answers of a review template's lens
 //! reviews (`ListReviewTemplateAnswers`) are backed entirely by the maps below, so a
 //! create is visible to the next request on the same engine. The custom lenses
@@ -49,6 +50,7 @@ use crate::ops::types::{
     Profile, ProfileQuestion,
     ResourceNotFoundException,
     ReviewTemplate, ReviewTemplateLensReview, ReviewTemplatePillarReviewSummary,
+    ReviewTemplateSummary,
     ShareInvitation, ShareInvitationSummary, Tag, Workload, WorkloadDiscoveryConfig,
     WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput, WorkloadShare,
     WorkloadShareSummary, WorkloadSummary, APPLICATION_TYPE_VALUES, CONTEXT_TYPE_VALUES,
@@ -1750,6 +1752,26 @@ impl ReviewTemplateRecord {
             // operation that returns this shape models a paging member to continue, so
             // there is nothing to hand back.
             next_token: None,
+        }
+    }
+
+    /// The `ReviewTemplateSummary` shape `ListReviewTemplates` reports for this template:
+    /// "Summary of a review template" — the members of the stored template a LIST reports,
+    /// projected from the same state [`Self::to_review_template`] projects the full shape
+    /// from, so a summary and a `GetReviewTemplate` of the same template cannot disagree.
+    ///
+    /// `ReviewTemplateSummary` models no `Notes`, `Tags`, `QuestionCounts` or
+    /// `ShareInvitationId` member (`smithy_query(query="shape",
+    /// shape="ReviewTemplateSummary")`), so a summary carries only what it declares.
+    pub fn to_summary(&self) -> ReviewTemplateSummary {
+        ReviewTemplateSummary {
+            description: Some(self.description.clone()),
+            lenses: Some(self.lenses.clone()),
+            owner: Some(self.owner.clone()),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+            template_arn: Some(self.template_arn.clone()),
+            template_name: Some(self.template_name.clone()),
+            update_status: Some(REVIEW_TEMPLATE_UPDATE_STATUS_CURRENT.to_string()),
         }
     }
 
@@ -3678,6 +3700,21 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         None
     }
 
+    /// The stable list order `ListReviewTemplates` pages over: `TemplateArn`, which is
+    /// also what [`Self::review_templates`] is keyed by.
+    ///
+    /// The model publishes no order for `ReviewTemplates`, so this is the emulator's own.
+    /// What it has to be is TOTAL and stable — the `NextToken` carries the ARN of the
+    /// last template a page served, so a key that moved or repeated would serve a
+    /// template twice or skip it. The ARN is the only member of a template that can do
+    /// neither: it is unique and it is fixed for the template's whole life, where
+    /// `TemplateName` is a member `UpdateReviewTemplate` can move.
+    pub fn review_template_order(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.review_templates.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
     /// The service's stable list order: workload name, then id to break ties between
     /// two names that normalize apart but sort equal.
     pub fn workload_order(&self) -> Vec<(String, String)> {
@@ -3998,6 +4035,21 @@ pub fn encode_milestone_next_token(milestone_number: i32) -> String {
 pub fn decode_milestone_next_token(token: &str) -> Option<i32> {
     let cursor = decode_cursor(token)?;
     i32::try_from(cursor.get("m")?.as_i64()?).ok()
+}
+
+/// Encode a `ListReviewTemplates` cursor: the `TemplateArn` last served, in the same
+/// opaque scheme as [`encode_next_token`]. Templates are enumerated in `TemplateArn`
+/// order ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::review_template_order`]),
+/// so that ARN is the whole cursor. Its own key, so a cursor issued by another paginated
+/// operation is not a cursor here.
+pub fn encode_review_template_next_token(template_arn: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "t": template_arn }))
+}
+
+/// The `TemplateArn` a `ListReviewTemplates` `NextToken` points just past, or `None` when
+/// the token is not one this service issued.
+pub fn decode_review_template_next_token(token: &str) -> Option<String> {
+    Some(decode_cursor(token)?.get("t")?.as_str()?.to_string())
 }
 
 /// Encode a `ListAgentContexts` cursor: the context `UUID` last served, in the same
