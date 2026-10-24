@@ -177,6 +177,37 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic `InvalidParameterValue` error shape.
+static INVALID_PARAMETER_VALUE_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#InvalidParameterValue$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `InvalidParameterValue` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the
+/// shape is not in any service's model, so it must not collide with a modeled one. It
+/// exists because `InvalidParameterValue` — not the synthetic `ValidationException`
+/// above — is the error code Amazon Redshift answers a request whose parameters it
+/// cannot honour with, including a request for a capability the account's platform
+/// does not offer at all, and the error code is what a client branches on.
+pub static INVALID_PARAMETER_VALUE_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#InvalidParameterValue",
+        "smithy.framework",
+        "InvalidParameterValue",
+    ),
+    ShapeType::Structure,
+    &[&INVALID_PARAMETER_VALUE_MESSAGE],
+);
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -196,6 +227,12 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// The request named a parameter value this service cannot honour, with HTTP 400
+    /// and the error code `InvalidParameterValue` — the code Amazon Redshift itself
+    /// answers such a request with, and the one its clients branch on. The payload is
+    /// the same single `message` member; only the wire code differs from
+    /// [`Scaffolded::ValidationException`].
+    InvalidParameterValue(ValidationException),
 }
 
 impl<E> Scaffolded<E> {
@@ -221,6 +258,18 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Refuse the request with HTTP 400 `InvalidParameterValue`.
+    ///
+    /// This is the refusal Amazon Redshift itself answers a request it cannot honour
+    /// the parameters of with, including a request for a capability the account's
+    /// platform no longer offers, so no value of that parameter could succeed. The
+    /// model declares no client-input error for it, so the code lives here rather than
+    /// on an operation's error enum; say what cannot be honoured, because the caller
+    /// has to decide what to send — or whether to call at all — from this text alone.
+    pub fn invalid_parameter_value(message: impl Into<String>) -> Self {
+        Self::InvalidParameterValue(ValidationException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -229,6 +278,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::InvalidParameterValue(e) => write!(f, "{e}"),
         }
     }
 }
@@ -241,6 +291,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::InvalidParameterValue(e) => e.source(),
         }
     }
 }
@@ -255,6 +306,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::InvalidParameterValue(e) => e,
         }
     }
 
@@ -263,6 +315,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::InvalidParameterValue(_) => &INVALID_PARAMETER_VALUE_SCHEMA,
         }
     }
 
@@ -275,6 +328,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            Self::InvalidParameterValue(_) => "InvalidParameterValue",
         }
     }
 
@@ -287,6 +341,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            Self::InvalidParameterValue(_) => 400,
         }
     }
 
@@ -299,6 +354,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            // Same reason again; `<Code>InvalidParameterValue</Code>` comes from
+            // `shape_name` above, which is already the code AWS answers with.
+            Self::InvalidParameterValue(_) => None,
         }
     }
 }

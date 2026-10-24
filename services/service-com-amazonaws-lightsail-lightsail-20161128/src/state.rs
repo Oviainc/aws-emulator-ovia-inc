@@ -15,7 +15,8 @@
 //! emulator holds, Amazon S3's own, which this module provisions a bucket in
 //! ([`claim_bucket_object_store`]) rather than keeping a second object map here —
 //! the **managed relational database** (a MySQL or PostgreSQL database the service
-//! runs for the account), the **load balancer** (a regional resource that spreads
+//! runs for the account) together with the **database snapshot** (a point-in-time
+//! copy of one), the **load balancer** (a regional resource that spreads
 //! HTTP traffic across the instances attached to it), the **static IP** (a public
 //! IPv4 address the account reserves and attaches to an instance), the append-only
 //! **operation log** every mutating call
@@ -110,6 +111,15 @@ pub const RESOURCE_TYPE_RELATIONAL_DATABASE: &str = "RelationalDatabase";
 /// id. Mirrors the `Instance/<uuid>` form the modelled `Instance$arn`
 /// documentation shows, with this resource's own `ResourceType` value.
 pub const RELATIONAL_DATABASE_ARN_RESOURCE_PREFIX: &str = "RelationalDatabase/";
+
+/// The `resourceType` a managed relational database SNAPSHOT reports, from the
+/// same modelled `ResourceType` enum.
+pub const RESOURCE_TYPE_RELATIONAL_DATABASE_SNAPSHOT: &str = "RelationalDatabaseSnapshot";
+
+/// The resource portion a managed relational database snapshot's ARN carries
+/// before its id. Mirrors the `Instance/<uuid>` form the modelled `Instance$arn`
+/// documentation shows, with this resource's own `ResourceType` value.
+pub const RELATIONAL_DATABASE_SNAPSHOT_ARN_RESOURCE_PREFIX: &str = "RelationalDatabaseSnapshot/";
 
 /// The resource portion a bucket ARN carries before its id. Mirrors the
 /// `Instance/<uuid>` form the modelled `Instance$arn` documentation shows, with
@@ -319,7 +329,8 @@ pub const RECORD_STATE_SUCCEEDED: &str = "Succeeded";
 
 /// A state the clock already owes a resource whose state is a plain NAME: a
 /// block storage disk's `DiskState` value, a disk snapshot's
-/// `DiskSnapshotState` value, or a managed relational database's `state`.
+/// `DiskSnapshotState` value, a managed relational database's `state`, or one of
+/// that database's snapshots' `state`.
 ///
 /// Separate from [`DueTransition`] because those states are names with no
 /// numeric code, where an instance's is an EC2 `InstanceState` (a code and a
@@ -352,6 +363,19 @@ impl DueNamedState {
 pub const RELATIONAL_DATABASE_STATE_CREATING: &str = "creating";
 /// See [`RELATIONAL_DATABASE_STATE_CREATING`].
 pub const RELATIONAL_DATABASE_STATE_AVAILABLE: &str = "available";
+
+/// `RelationalDatabaseSnapshot$state` values this slice uses — "The state of the
+/// database snapshot", a plain string in the model with no enum behind it.
+///
+/// A Lightsail database snapshot is an Amazon RDS DB snapshot, and the member
+/// carries RDS's own DB snapshot status values: `creating` while the snapshot is
+/// being taken and `available` once it can be restored from (Amazon RDS API
+/// Reference, `DBSnapshot$Status`). RDS's third value, `failed`, describes a
+/// snapshot whose copy failed, which this store cannot produce — nothing here
+/// fails a copy.
+pub const RELATIONAL_DATABASE_SNAPSHOT_STATE_CREATING: &str = "creating";
+/// See [`RELATIONAL_DATABASE_SNAPSHOT_STATE_CREATING`].
+pub const RELATIONAL_DATABASE_SNAPSHOT_STATE_AVAILABLE: &str = "available";
 
 // ---------------------------------------------------------------------------
 // Operation log
@@ -396,6 +420,9 @@ pub const OPERATION_TYPE_DETACH_INSTANCES_FROM_LOAD_BALANCER: &str =
     "DetachInstancesFromLoadBalancer";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE: &str = "CreateRelationalDatabase";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE_SNAPSHOT: &str =
+    "CreateRelationalDatabaseSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_UPDATE_RELATIONAL_DATABASE_PARAMETERS: &str =
     "UpdateRelationalDatabaseParameters";
@@ -488,6 +515,12 @@ pub const MAX_RELATIONAL_DATABASES: usize = 500;
 /// refused with the modelled `InvalidInputException`.
 pub const MAX_DISK_SNAPSHOTS: usize = 500;
 
+/// The most managed relational database snapshots this emulator will hold.
+///
+/// Emulator resource guard, NOT an AWS quota: a create that would exceed it is
+/// refused with the modelled `InvalidInputException`.
+pub const MAX_RELATIONAL_DATABASE_SNAPSHOTS: usize = 500;
+
 /// The most export snapshot records this emulator will hold.
 ///
 /// Emulator resource guard, NOT an AWS quota: every `ExportSnapshot` call adds a
@@ -538,6 +571,15 @@ pub const MAX_OPERATION_HISTORY: usize = 2_000;
 /// CHOSEN: Lightsail publishes no page size for this operation, only that the
 /// response carries a `nextPageToken` when more instances remain.
 pub const INSTANCE_PAGE_SIZE: usize = 10;
+
+/// How many database snapshots one `GetRelationalDatabaseSnapshots` page
+/// carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that the
+/// response carries a `nextPageToken` when more snapshots remain. Matches
+/// [`INSTANCE_PAGE_SIZE`], so every stored-resource listing in this slice pages
+/// the same way.
+pub const RELATIONAL_DATABASE_SNAPSHOT_PAGE_SIZE: usize = 10;
 
 /// How many export snapshot records one `GetExportSnapshotRecords` page carries.
 ///
@@ -5388,6 +5430,74 @@ impl StoredRelationalDatabase {
     }
 }
 
+/// One stored managed relational database snapshot: every member
+/// `GetRelationalDatabaseSnapshot` and `GetRelationalDatabaseSnapshots` report,
+/// plus the clock-owed transition its state is waiting on.
+///
+/// A snapshot is a point-in-time copy, so everything it says about its SOURCE is
+/// copied out of the source record at the instant the snapshot was taken and
+/// never followed afterwards: the snapshot keeps reporting the engine, version,
+/// disk size, bundle and blueprint the database had then, even after the
+/// database is resized or deleted.
+#[derive(Debug, Clone)]
+pub struct StoredRelationalDatabaseSnapshot {
+    /// The snapshot name the request named, kept verbatim — it is this record's
+    /// store key and the `name` every read reports.
+    pub name: String,
+    pub arn: String,
+    pub support_code: String,
+    pub created_at_ms: i64,
+    pub location: StoredLocation,
+    pub tags: Vec<Tag>,
+    /// The source database's engine, copied from its blueprint.
+    pub engine: String,
+    /// The source database's engine version, copied from its blueprint.
+    pub engine_version: String,
+    /// The size of the snapshotted database disk in GB, copied from the source
+    /// database's bundle.
+    pub size_in_gb: i32,
+    /// The current state: [`RELATIONAL_DATABASE_SNAPSHOT_STATE_CREATING`] or
+    /// [`RELATIONAL_DATABASE_SNAPSHOT_STATE_AVAILABLE`].
+    pub state: &'static str,
+    /// The state the clock owes this snapshot, while one is outstanding.
+    pub due: Option<DueNamedState>,
+    /// The name of the database the snapshot was taken of.
+    pub from_relational_database_name: String,
+    /// That database's ARN.
+    pub from_relational_database_arn: String,
+    /// That database's bundle id.
+    pub from_relational_database_bundle_id: String,
+    /// That database's blueprint id.
+    pub from_relational_database_blueprint_id: String,
+}
+
+impl StoredRelationalDatabaseSnapshot {
+    /// This record as the modelled `RelationalDatabaseSnapshot`.
+    pub fn view(&self) -> crate::ops::types::RelationalDatabaseSnapshot {
+        crate::ops::types::RelationalDatabaseSnapshot {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            support_code: Some(self.support_code.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            location: Some(self.location.view()),
+            resource_type: Some(RESOURCE_TYPE_RELATIONAL_DATABASE_SNAPSHOT.to_string()),
+            tags: Some(self.tags.clone()),
+            engine: Some(self.engine.clone()),
+            engine_version: Some(self.engine_version.clone()),
+            size_in_gb: Some(self.size_in_gb),
+            state: Some(self.state.to_string()),
+            from_relational_database_name: Some(self.from_relational_database_name.clone()),
+            from_relational_database_arn: Some(self.from_relational_database_arn.clone()),
+            from_relational_database_bundle_id: Some(
+                self.from_relational_database_bundle_id.clone(),
+            ),
+            from_relational_database_blueprint_id: Some(
+                self.from_relational_database_blueprint_id.clone(),
+            ),
+        }
+    }
+}
+
 /// One entry of the operation log: what a mutating call did, and when.
 #[derive(Debug, Clone)]
 pub struct StoredOperation {
@@ -6925,6 +7035,11 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// every database operation takes. A `BTreeMap` so `GetRelationalDatabases`
     /// walks a stable, total order and a page token can name the next database.
     pub relational_databases: BTreeMap<String, StoredRelationalDatabase>,
+    /// Every managed relational database snapshot, keyed by its snapshot name —
+    /// the identifier every database snapshot operation takes. A `BTreeMap` so
+    /// `GetRelationalDatabaseSnapshots` walks a stable, total order and a page
+    /// token can name the next snapshot.
+    pub relational_database_snapshots: BTreeMap<String, StoredRelationalDatabaseSnapshot>,
     /// Every static IP, keyed by its static IP name — the identifier every static
     /// IP operation takes, and the same key an instance is held under, because a
     /// static IP is attached to an instance by name. A `BTreeMap` so
@@ -7221,6 +7336,24 @@ impl ComAmazonawsLightsailLightsail20161128State {
         name: &str,
     ) -> Option<&mut StoredRelationalDatabase> {
         self.relational_databases.get_mut(name)
+    }
+
+    /// The managed relational database snapshot `name` names, for a reporting
+    /// operation.
+    pub fn relational_database_snapshot(
+        &self,
+        name: &str,
+    ) -> Option<&StoredRelationalDatabaseSnapshot> {
+        self.relational_database_snapshots.get(name)
+    }
+
+    /// Store a newly created managed relational database snapshot.
+    pub fn insert_relational_database_snapshot(
+        &mut self,
+        snapshot: StoredRelationalDatabaseSnapshot,
+    ) {
+        self.relational_database_snapshots
+            .insert(snapshot.name.clone(), snapshot);
     }
 
     /// The alarm `name` names, for a reporting operation.
@@ -7521,7 +7654,7 @@ impl ComAmazonawsLightsailLightsail20161128State {
 
     /// Materialise every transition the clock had already made due at `now_ms`:
     /// an instance, a disk, a disk snapshot, an export snapshot record, a managed
-    /// relational database or a load balancer
+    /// relational database, one of its snapshots, or a load balancer
     /// settles into the state it was owed, a container service walks
     /// into the phase it was owed (activating the deployment that was waiting),
     /// and an operation whose work is done settles into `Succeeded`.
@@ -7533,7 +7666,8 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// Every walk is bounded by [`MAX_INSTANCES`], [`MAX_DISKS`],
     /// [`MAX_DISK_SNAPSHOTS`], [`MAX_EXPORT_SNAPSHOT_RECORDS`],
     /// [`MAX_CONTAINER_SERVICES`],
-    /// [`MAX_RELATIONAL_DATABASES`], [`MAX_LOAD_BALANCERS_PER_REGION`] and
+    /// [`MAX_RELATIONAL_DATABASES`],
+    /// [`MAX_RELATIONAL_DATABASE_SNAPSHOTS`], [`MAX_LOAD_BALANCERS_PER_REGION`] and
     /// [`MAX_OPERATION_HISTORY`], and a record drops out of the work as soon as
     /// it has nothing outstanding.
     fn advance_clock(&mut self, now_ms: i64) {
@@ -7587,6 +7721,13 @@ impl ComAmazonawsLightsailLightsail20161128State {
             if due.at_ms <= now_ms {
                 database.state = due.state;
                 database.due = None;
+            }
+        }
+        for snapshot in self.relational_database_snapshots.values_mut() {
+            let Some(due) = snapshot.due else { continue };
+            if due.at_ms <= now_ms {
+                snapshot.state = due.state;
+                snapshot.due = None;
             }
         }
         for balancer in self.load_balancers.values_mut() {
@@ -7974,6 +8115,15 @@ pub fn disk_snapshot_arn(region: &str, id: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("{DISK_SNAPSHOT_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The ARN of the managed relational database snapshot `id` in `region`.
+pub fn relational_database_snapshot_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{RELATIONAL_DATABASE_SNAPSHOT_ARN_RESOURCE_PREFIX}{id}"),
     )
 }
 

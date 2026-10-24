@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNotification
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNotification`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNotification::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches a notification, with the subscribers supplied for it, to the budget that
+//! `(AccountId, BudgetName)` names: "you must create the budget before you create the
+//! associated notification", so a budget this account does not hold is a
+//! `NotFoundException`. A notification carries no id — what it alerts on identifies it
+//! ([`crate::state::same_notification`]) — so a repeat of one the budget already holds
+//! is a `DuplicateRecordException`, and the documented notification and per-type
+//! subscriber limits are answered with `CreationLimitExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +157,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNotification` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNotificationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNotification"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateNotificationErrorModeled::InternalErrorException(InternalErrorException {
+                message: Some(
+                    "budgets is mounted on an engine that holds no state for it".to_string(),
+                ),
+            })
+        })?;
+
+        // The modelled `BudgetName` `@pattern` the boundary validator cannot compile —
+        // refused as the request-validation failure it is (HTTP 400
+        // `ValidationException`), naming the member path and the constraint.
+        if let Some(message) =
+            crate::state::budget_name_violation(&["BudgetName"], &input.budget_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // "A notification can have one SNS subscriber and up to 10 email subscribers,
+        // for a total of 11 subscribers" — the PER-TYPE halves, which no constraint
+        // trait can express. The total and the at-least-one are the modelled
+        // `@length(1, 11)` on `Subscribers`, already refused before this handler runs.
+        crate::state::subscriber_limit_violation(&input.subscribers).map_err(|message| {
+            CreateNotificationErrorModeled::CreationLimitExceededException(
+                CreationLimitExceededException {
+                    message: Some(message),
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+        // "You must create the budget before you create the associated notification":
+        // a notification is held inside the budget that owns it, so a budget this
+        // account does not hold is the resource this call cannot locate.
+        let stored = store
+            .budgets
+            .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
+            .ok_or_else(|| {
+                CreateNotificationErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!(
+                        "Unable to create notification: {} - the budget doesn't exist.",
+                        input.budget_name
+                    )),
+                })
+            })?;
+
+        // What a notification alerts on identifies it, so a budget cannot hold two of
+        // them: a repeat of one it already has is the duplicate record — not a second
+        // notification, and not an overwrite of the first one's subscribers.
+        if crate::state::find_notification(stored, &input.notification).is_some() {
+            return Err(CreateNotificationErrorModeled::DuplicateRecordException(
+                DuplicateRecordException {
+                    message: Some(format!(
+                        "Unable to create notification: {} - the notification already exists.",
+                        input.budget_name
+                    )),
+                },
+            )
+            .into());
+        }
+        // "A budget can have up to ten notifications."
+        if stored.notifications.len() >= crate::state::MAX_NOTIFICATIONS_PER_BUDGET {
+            return Err(CreateNotificationErrorModeled::CreationLimitExceededException(
+                CreationLimitExceededException {
+                    message: Some(format!(
+                        "Unable to create notification: {} - a budget can have at most {} \
+                         notifications.",
+                        input.budget_name,
+                        crate::state::MAX_NOTIFICATIONS_PER_BUDGET
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut notification = input.notification;
+        // The one member of a notification the SERVICE owns rather than the caller —
+        // the alarm state a new notification starts in — is materialised here, so every
+        // later read reports what was stored rather than recomputing it.
+        crate::state::stamp_notification(&mut notification);
+        stored.notifications.push(crate::state::StoredNotification {
+            notification,
+            subscribers: input.subscribers,
+        });
+
+        Ok(CreateNotificationOutput {})
     }
 }

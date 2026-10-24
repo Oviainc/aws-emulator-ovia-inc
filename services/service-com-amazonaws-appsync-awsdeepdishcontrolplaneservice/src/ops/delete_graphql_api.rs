@@ -162,13 +162,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Removing the record removes the API keys held under it with it, so a later
-        // `ListApiKeys` on the same id answers `NotFoundException` too.
-        if state.lock().graphql_apis.remove(&input.api_id).is_none() {
+        // `ListApiKeys` on the same id answers `NotFoundException` too. An association
+        // names two APIs, so the links this API was a side of go with it.
+        let mut guard = state.lock();
+        if guard.graphql_apis.remove(&input.api_id).is_none() {
             return Err(DeleteGraphqlApiErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         }
+        guard.remove_api_associations(&input.api_id);
 
         Ok(DeleteGraphqlApiOutput {})
     }

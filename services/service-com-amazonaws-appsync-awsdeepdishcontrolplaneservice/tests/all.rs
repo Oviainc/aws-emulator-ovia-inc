@@ -17,5 +17,7 @@ mod error_contract;
 mod graphql_api_create_rules;
 #[path = "all/graphql_api_lifecycle.rs"]
 mod graphql_api_lifecycle;
+#[path = "all/source_api_association.rs"]
+mod source_api_association;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

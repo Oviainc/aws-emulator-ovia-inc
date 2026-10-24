@@ -19,6 +19,8 @@
 
 use std::collections::BTreeMap;
 
+use aws_smithy_types::date_time::Format;
+use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
 use service_com_amazonaws_detective_amazondetective::state::{
     GRAPH_NOT_FOUND_MESSAGE, NOT_INGESTED_FOR_REASON,
@@ -68,6 +70,24 @@ fn reported_ids(answer: &Value, member: &str, case: &str) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+/// A rendered ISO8601 `date-time` as epoch milliseconds, so two instants compare as
+/// INSTANTS.
+///
+/// They must not be compared as strings: the rendered form trims trailing zeros from
+/// its fractional seconds, so an earlier instant can sort after a later one
+/// (`…:56.28Z` > `…:56.284Z`, because `Z` > `4`) — which made the chronology
+/// assertion below fail whenever the earlier of two instants landed on a whole
+/// multiple of ten milliseconds. The sibling `datasource_package_ingest` suite parses
+/// for the same reason.
+fn epoch_millis(case: &str, rendered: &str) -> i64 {
+    let parsed = DateTime::from_str(rendered, Format::DateTime).unwrap_or_else(|error| {
+        panic!("case {case:?}: {rendered:?} is not a date-time timestamp: {error}")
+    });
+    parsed.to_millis().unwrap_or_else(|error| {
+        panic!("case {case:?}: {rendered:?} does not convert to millis: {error}")
+    })
 }
 
 /// One account's `DatasourcePackageIngestHistory` as `{package: {state: timestamp}}`,
@@ -442,12 +462,14 @@ async fn the_reported_history_follows_the_graphs_package_changes_and_a_read_chan
             if state == eks_state {
                 continue;
             }
-            // Every date renders in the same ISO8601 `date-time` form, so they compare in
-            // chronological order as strings: the state the package is in now is the one
-            // it entered last.
+            // Compared as INSTANTS (see `epoch_millis`): the state the package is in
+            // now is the one it entered last.
+            let when_millis = epoch_millis(case, when);
+            let entered_millis = epoch_millis(case, &entered);
             assert!(
-                when.as_str() < entered.as_str(),
-                "case {case:?}: expected {state} earlier than {eks_state}, got {eks:?}"
+                when_millis < entered_millis,
+                "case {case:?}: expected {state} ({when_millis} ms) earlier than \
+                 {eks_state} ({entered_millis} ms), got {eks:?}"
             );
             // A state the package did not re-enter keeps the date it already carried.
             if let Some(earlier) = previous_eks.as_ref().and_then(|prev| prev.get(state)) {

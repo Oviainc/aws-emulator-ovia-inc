@@ -170,8 +170,8 @@ async fn reported_notifications(
 }
 
 /// Every subscriber address the STORE still holds for a budget, in notification order.
-/// Read from the state struct directly because `DescribeSubscribersForNotification` is
-/// still a scaffold under its own issue.
+/// Read from the state struct directly, so what the deletion did to the store is
+/// asserted independently of any read operation's own projection.
 fn stored_addresses(
     engine: &Arc<engine::InMemoryEngine>,
     account_id: &str,
