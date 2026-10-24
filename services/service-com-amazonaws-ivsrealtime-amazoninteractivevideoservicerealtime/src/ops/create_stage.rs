@@ -187,6 +187,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A tag key in the reserved `aws:` namespace is AWS's own to write (see
+        // [`crate::state::RESERVED_TAG_KEY_PREFIX`]): the documented tagging restrictions
+        // `tags` defers to are the same ones `TagResource` enforces, so a create cannot
+        // persist a key a later `TagResource` would refuse. Checked before anything is
+        // minted or persisted, so a refused request leaves no stage.
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tag_keys_unreserved(
+            Self::NAME,
+            "tags",
+            tags.keys().map(String::as_str),
+        )
+        .map_err(|message| {
+            crate::state::validation_failed(
+                CreateStageErrorModeled::ValidationException,
+                message,
+            )
+        })?;
+
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
 
@@ -247,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name,
             // A stage AWS has just created holds no session yet.
             active_session_id: None,
-            tags: input.tags.unwrap_or_default(),
+            tags,
             // The configuration's documented defaults are applied in one place, so the
             // stage a create attaches one to and the stage an update attaches one to
             // report the same members.

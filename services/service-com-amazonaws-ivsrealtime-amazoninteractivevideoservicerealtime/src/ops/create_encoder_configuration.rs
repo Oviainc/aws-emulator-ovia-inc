@@ -197,6 +197,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // A tag key in the reserved `aws:` namespace is AWS's own to write (see
+        // [`crate::state::RESERVED_TAG_KEY_PREFIX`]): refused here, before anything is
+        // minted or persisted, so a refused request leaves no configuration — the same
+        // rule, enforced the same way, as the one `CreateStage` and `TagResource` apply.
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tag_keys_unreserved(
+            Self::NAME,
+            "tags",
+            tags.keys().map(String::as_str),
+        )
+        .map_err(|message| {
+            crate::state::validation_failed(
+                CreateEncoderConfigurationErrorModeled::ValidationException,
+                message,
+            )
+        })?;
+
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
 
@@ -231,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: arn.clone(),
             name: input.name,
             video,
-            tags: input.tags.unwrap_or_default(),
+            tags,
             sequence,
         };
 

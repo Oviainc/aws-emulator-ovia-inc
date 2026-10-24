@@ -7,7 +7,10 @@
 //! succeeds and changes nothing.
 //!
 //! The `resourceArn` is checked the way `ListTagsForResource` checks it (see that file
-//! for why the modelled pattern cannot be enforced literally).
+//! for why the modelled pattern cannot be enforced literally), and a key in the reserved
+//! `aws:` namespace is refused: the AWS-wide tagging restrictions `tagKeys` defers to
+//! make such a key AWS's own, which a caller may neither edit nor delete (see
+//! [`crate::state::RESERVED_TAG_KEY_PREFIX`]).
 //!
 //! ## Shape of an operation
 //!
@@ -149,6 +152,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         crate::state::check_resource_arn(Self::NAME, &input.resource_arn).map_err(|message| {
+            crate::state::validation_failed(
+                UntagResourceErrorModeled::ValidationException,
+                message,
+            )
+        })?;
+
+        // The reserved `aws:` namespace cannot be DELETED by a caller either — "You can't
+        // edit or delete tag keys or values with this prefix" is the same documented
+        // restriction `tagKeys` defers to (see
+        // [`crate::state::RESERVED_TAG_KEY_PREFIX`]) — so a key claiming it is refused
+        // before the resource is resolved and before any key is removed.
+        crate::state::check_tag_keys_unreserved(
+            Self::NAME,
+            "tagKeys",
+            input.tag_keys.iter().map(String::as_str),
+        )
+        .map_err(|message| {
             crate::state::validation_failed(
                 UntagResourceErrorModeled::ValidationException,
                 message,
