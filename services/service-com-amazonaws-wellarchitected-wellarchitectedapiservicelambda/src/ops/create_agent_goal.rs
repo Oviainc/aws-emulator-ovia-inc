@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAgentGoal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAgentGoal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: records a new optimization goal against the agent profile the
+//! request's `profileArn` resolves to and answers its `GoalSummary` — the request's
+//! members plus the `UUID` the service mints and the `createdBy` / `createdAt` it owns.
+//! A `profileArn` that names no stored agent profile is a `ResourceNotFoundException`
+//! (404); a profile already holding the goal quota is a
+//! `ServiceQuotaExceededException` (402).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAgentGoal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `clientToken` makes the create idempotent: the same token with the same parameters
+//! answers the goal the original request created, and the same token with different
+//! parameters is a `ConflictException` (409).
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +157,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAgentGoal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAgentGoalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAgentGoal"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAgentGoalErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool agent profile store is unavailable".to_string(),
+            })
+        })?;
+
+        // Defence in depth for a caller that builds the input directly: `Pillar` is an
+        // enum, so the boundary walk in `crate::service` already refuses a value outside
+        // its published set with this same 400 before the handler runs. It is kept so a
+        // goal is never STORED naming a pillar the enum does not publish.
+        if let Some(unknown) = input
+            .pillars
+            .iter()
+            .find(|pillar| !PILLAR_VALUES.contains(&pillar.as_str()))
+        {
+            return Err(CreateAgentGoalErrorModeled::ValidationException(
+                crate::state::member_constraint_exception(
+                    crate::state::PILLARS_MEMBER,
+                    &format!(
+                        "Member must satisfy enum value set: [{}], got {unknown}",
+                        PILLAR_VALUES.join(", ")
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "description": &input.description,
+            "pillars": &input.pillars,
+            "profileArn": &input.profile_arn,
+            "title": &input.title,
+        }));
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken` replay: the same token with the same parameters answers the
+        // goal the original request created instead of recording a second one. The token
+        // is OPTIONAL on this operation, so a request that carries none is never a replay.
+        if let Some(client_token) = input.client_token.clone() {
+            if let Some(token) = store.create_agent_goal_tokens.get(&client_token) {
+                let (profile_arn, goal_id) = (token.profile_arn.clone(), token.goal_id.clone());
+                if token.fingerprint != fingerprint {
+                    return Err(CreateAgentGoalErrorModeled::ConflictException(
+                        crate::state::idempotency_token_conflict(
+                            crate::state::AGENT_GOAL_RESOURCE_TYPE,
+                            crate::state::agent_goal_resource_id(&profile_arn, &goal_id),
+                            &client_token,
+                        ),
+                    )
+                    .into());
+                }
+                if let Some(existing) = store.agent_goal(&profile_arn, &goal_id) {
+                    return Ok(CreateAgentGoalOutput {
+                        goal: existing.to_summary(),
+                    });
+                }
+                // The token names a goal that is no longer stored (`DeleteAgentGoal`
+                // forgets the tokens of the goal it removes, so this is a goal whose
+                // PROFILE is gone), so there is no original result to answer with: forget
+                // the token and let this request be judged on its own.
+                store.create_agent_goal_tokens.forget(&client_token);
+            }
+        }
+
+        // "Creates an optimization goal associated with a profile": the profile the goal
+        // is associated with is resolved by this lookup, so a well-formed ARN that names
+        // no stored profile is its 404 and nothing is recorded.
+        if !store.agent_profiles.contains_key(&input.profile_arn) {
+            return Err(CreateAgentGoalErrorModeled::ResourceNotFoundException(
+                crate::state::agent_profile_not_found(&input.profile_arn),
+            )
+            .into());
+        }
+
+        // Goals are metered per profile, and this operation models
+        // `ServiceQuotaExceededException` for the case. Refusing here is also what keeps
+        // the store bounded: a goal and its create token are both 1:1 with a live goal.
+        if store.agent_goal_count(&input.profile_arn)
+            >= crate::state::MAX_GOALS_PER_AGENT_PROFILE
+        {
+            return Err(CreateAgentGoalErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The agent profile with ARN {} already holds the maximum of {} goals",
+                        input.profile_arn,
+                        crate::state::MAX_GOALS_PER_AGENT_PROFILE
+                    ),
+                    resource_id: Some(input.profile_arn.clone()),
+                    resource_type: Some(crate::state::AGENT_GOAL_RESOURCE_TYPE.to_string()),
+                    // `QuotaCode` and `ServiceCode` are modelled `@required`. The service
+                    // code is this service's own signing name; the model publishes no
+                    // numeric Service Quotas code for this quota, so the quota is named
+                    // by what it meters.
+                    quota_code: "GoalsPerAgentProfile".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_agent_goal_id();
+        let record = crate::state::AgentGoalRecord {
+            id: id.clone(),
+            profile_arn: input.profile_arn.clone(),
+            pillars: input.pillars,
+            title: input.title,
+            description: input.description,
+            // "The identifier of the user or system that created this goal": every request
+            // this emulator serves is attributed to its one account, so that is the
+            // identity the create is recorded under — never a value read off the request.
+            created_by: ::engine::emulator_account_id().to_string(),
+            created_at: std::time::SystemTime::now(),
+            // Nothing has modified a goal that has just been created, so the
+            // `lastModified…` members are absent rather than echoing the create.
+            last_modified_by: None,
+            last_modified_at: None,
+        };
+        let goal = record.to_summary();
+        store
+            .agent_goals
+            .entry(input.profile_arn.clone())
+            .or_default()
+            .insert(id.clone(), record);
+        // Written through the ledger's bounded `remember`, which holds the remembered
+        // tokens at `MAX_REMEMBERED_REQUEST_TOKENS` by forgetting the oldest: the token is
+        // caller-chosen, so the ledger cannot be allowed to grow with the stream of them.
+        if let Some(client_token) = input.client_token {
+            store.create_agent_goal_tokens.remember(
+                client_token,
+                crate::state::CreateAgentGoalToken {
+                    profile_arn: input.profile_arn,
+                    goal_id: id,
+                    fingerprint,
+                },
+            );
+        }
+
+        Ok(CreateAgentGoalOutput { goal })
     }
 }

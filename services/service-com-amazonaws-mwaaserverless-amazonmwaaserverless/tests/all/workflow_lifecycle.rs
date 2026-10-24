@@ -97,6 +97,14 @@ impl Harness {
             .map_or(0, |workflow| workflow.runs.len())
     }
 
+    /// The engine this emulator reads and writes, so a suite can inspect or seed a
+    /// record no modelled operation of this service creates — a run's task
+    /// instances, which come into being only when something executes a workflow
+    /// definition and nothing in this emulator does.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
+    }
+
     /// The `(WorkflowVersion, IsLatestVersion)` pairs the STORE holds for a workflow,
     /// in the order the versions were appended — the only way to show which single
     /// version is flagged latest while `ListWorkflowVersions` is still a stub.

@@ -58,7 +58,8 @@ pub(crate) struct Harness {
     router: MultiServiceRouter,
     /// The same engine the registered service holds, so a test can place a stored
     /// application into a status AWS's own review workflow produces and no operation in
-    /// this slice reaches — see [`Harness::place_status`].
+    /// this slice reaches (see [`Harness::place_status`]), or grant an allocation AWS's own
+    /// fulfillment workflow produces (see [`Harness::engine`]).
     engine: Arc<engine::InMemoryEngine>,
 }
 
@@ -94,6 +95,13 @@ impl Harness {
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
         Self { router, engine }
+    }
+
+    /// The engine this harness's service runs on, for the parts of the service's state no
+    /// operation on the wire writes — the partner entitlement above, and the benefit
+    /// allocations `tests/all/benefit_allocations.rs` has AWS grant.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     /// Put one stored application into `status`, directly in the store.

@@ -40,7 +40,15 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
-//! ## This service's one edited seam: the front door
+//! ## This service's edited seams: the front door, and how a refusal is stated
+//!
+//! A refusal the front door does NOT own — a value bound to the request URI —
+//! keeps the modelled `ValidationException` and is stated through
+//! [`Service::override_refusal`] in the words AWS uses, which
+//! [`service_common::aws_validation_refusal`] owns for every service on a JSON
+//! protocol.
+//!
+//! ## The front door
 //!
 //! Network Monitor rejects a request BODY that breaks a modelled constraint at
 //! its front door, before the request reaches the application code that raises
@@ -313,16 +321,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording, which for this restJson1 service is 400 `ValidationException`
-        // — the error EVERY Network Monitor operation models for a parameter that
-        // is not valid, and what the service answers for a value bound to the
-        // request URI (`GET /monitors/{monitorName}` with an over-long name) and
-        // for a body member the codec cannot read. The one refusal this service
-        // words differently is a body that breaks a modelled constraint, which
-        // `FrontDoor` answers before the framework's walk is reached.
-        let _ = refusal;
-        None
+        // service state it. What reaches here is a value bound to the request URI
+        // (`GET /monitors/{monitorName}` with an over-long name, a `probeId` label
+        // outside its pattern) — a body that breaks a modelled constraint is
+        // answered by `FrontDoor` before the framework's walk is reached.
+        //
+        // The wording is AWS's own, which `service_common` owns for every
+        // service on a JSON protocol: the same 400 `ValidationException` and the
+        // same `N validation error(s) detected: Value '<value>' at '<path>'
+        // failed to satisfy constraint: <requirement>` envelope the framework
+        // renders, with the ONE difference AWS has — a `@pattern` requirement is
+        // quoted as the expression a value must satisfy, without the `^`/`$` the
+        // model wraps it in to make the match total. The check still uses the
+        // model's pattern as written; only the rendering drops them, so a client
+        // that lifts the expression out of the message gets the one AWS
+        // advertises. `None` for anything that is not a constraint refusal keeps
+        // the framework's wording.
+        service_common::aws_validation_refusal(refusal)
     }
 
     fn override_routing_error(

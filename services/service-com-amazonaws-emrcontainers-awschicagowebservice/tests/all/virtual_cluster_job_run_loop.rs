@@ -248,7 +248,7 @@ pub(crate) fn instant_millis(value: &Value, pointer: &str, case: &str) -> i64 {
 }
 
 /// An instant as a query-string value: ISO-8601 with its colons percent-encoded.
-fn query_instant(millis: i64) -> String {
+pub(crate) fn query_instant(millis: i64) -> String {
     state::date_time(millis)
         .fmt(Format::DateTime)
         .expect("a stored instant renders as date-time")

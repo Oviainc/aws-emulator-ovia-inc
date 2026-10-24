@@ -246,7 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 modified_at: Some(crate::state::timestamp(run.modified_at)),
                 duration: run.duration,
                 error_message: run.error_message.clone(),
-                task_instances: Some(run.task_instances.clone()),
+                task_instances: Some(run.task_instance_ids()),
                 run_state: Some(run.status.clone()),
             }),
         })

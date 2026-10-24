@@ -198,6 +198,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = state.mint_id();
+        // The minting counter doubles as the creation sequence, so two configurations
+        // created in the same millisecond still have a total order for
+        // `ListSecurityConfigurations` to page through.
+        let sequence = state.id_counter;
         let arn = crate::state::security_configuration_arn(&region, &id);
         // A security configuration is a template: EMR on EKS models no status for it, so
         // it is usable as soon as it is created and owes the clock no later transition.
@@ -213,6 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The principal this request authenticated as, recorded now so every later
             // read of the configuration attributes it to the identity that created it.
             created_by: crate::state::caller_identity_arn(),
+            sequence,
         };
         state.insert_security_configuration(record);
 

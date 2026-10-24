@@ -49,6 +49,8 @@ mod dedicated_hosts;
 mod default_network;
 #[path = "all/delete_coip_pool.rs"]
 mod delete_coip_pool;
+#[path = "all/delete_network_interface.rs"]
+mod delete_network_interface;
 #[path = "all/delete_security_group.rs"]
 mod delete_security_group;
 #[path = "all/delete_vpc.rs"]

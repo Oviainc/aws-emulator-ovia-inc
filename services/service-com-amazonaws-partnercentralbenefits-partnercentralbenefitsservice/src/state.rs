@@ -6,7 +6,10 @@
 //!
 //! * the **benefit catalog** — service-owned, read-only data. The API models no
 //!   `CreateBenefit`, so the catalogs and the benefits inside them are seeded here, at
-//!   state init, and `ListBenefits` reports them from the store like any other read.
+//!   state init, and `ListBenefits` reports them from the store like any other read. The
+//!   **benefit allocations** AWS has granted are service-owned in the same way (the API
+//!   models no `CreateBenefitAllocation`), so they are seeded beside the benefits they
+//!   draw from and `ListBenefitAllocations` reports them from the store.
 //! * the **benefit application** — created, updated, submitted and cancelled by the
 //!   caller. Every application is stored exactly once, keyed by its
 //!   `benappl-[0-9a-z]{14}` id inside the catalog it was created in, so each operation
@@ -109,6 +112,10 @@ pub const BENEFIT_ID_PREFIX: &str = "ben-";
 /// `BenefitApplicationId` pattern `^benappl-[0-9a-z]{14}$`.
 pub const APPLICATION_ID_PREFIX: &str = "benappl-";
 
+/// The prefix a benefit-allocation id carries, from the modelled `BenefitAllocationId`
+/// pattern `^benalloc-[0-9a-z]{14}$`.
+pub const ALLOCATION_ID_PREFIX: &str = "benalloc-";
+
 /// How many characters follow the prefix in either id, from those same patterns.
 pub const ID_BODY_LEN: usize = 14;
 
@@ -177,6 +184,26 @@ pub const BENEFIT_STATUS_ACTIVE: &str = "ACTIVE";
 /// See [`BENEFIT_STATUS_ACTIVE`].
 pub const BENEFIT_STATUS_INACTIVE: &str = "INACTIVE";
 
+/// The `BenefitAllocationStatus` of an allocation inside its term and not yet consumed;
+/// one of the three values the model declares for that enum (`ACTIVE | INACTIVE |
+/// FULFILLED`, see `crate::ops::types::BENEFIT_ALLOCATION_STATUS_VALUES`).
+pub const ALLOCATION_STATUS_ACTIVE: &str = "ACTIVE";
+/// The `BenefitAllocationStatus` of an allocation that is no longer usable — the status
+/// an expiry leaves behind (see [`BenefitAllocation::expire_due`]).
+pub const ALLOCATION_STATUS_INACTIVE: &str = "INACTIVE";
+/// The `BenefitAllocationStatus` of an allocation whose benefit has been delivered in
+/// full. Terminal: an expiry does not move it, because there is nothing left to expire.
+pub const ALLOCATION_STATUS_FULFILLED: &str = "FULFILLED";
+
+/// The `StatusReason` an expired allocation reports (`BenefitAllocationSummary$StatusReason`:
+/// "additional information explaining the current status of the benefit allocation").
+///
+/// AWS publishes no wording for this member, so the sentence is the emulator's own; what
+/// is not chosen is the FACT it reports — the allocation's `ExpiresAt` has passed, which
+/// the model documents as the instant it "expires and is no longer usable".
+pub const ALLOCATION_EXPIRED_REASON: &str =
+    "The allocation's term ended at its ExpiresAt and it is no longer usable.";
+
 /// The largest page either list operation builds, and the size applied when the request
 /// names no `MaxResults`. It is the maximum of the modelled `MaxResults` range
 /// (`range {min: 1, max: 100}`), which the centralized walk already refuses values
@@ -191,6 +218,27 @@ pub const MAX_PAGE_SIZE: i32 = 100;
 /// grow the process's memory without limit. `client_tokens` holds at most one entry per
 /// application created, so it is bounded by the same count.
 pub const MAX_APPLICATIONS_PER_CATALOG: usize = 500;
+
+/// The most benefit allocations this emulator holds in one catalog.
+///
+/// The catalog is seeded with [`SEEDED_ALLOCATIONS`] and grown only by
+/// [`ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState::grant_allocation`],
+/// which no request from the wire reaches, so this is a store guard rather than a quota a
+/// caller can push against. CHOSEN, like [`MAX_APPLICATIONS_PER_CATALOG`]: AWS publishes
+/// no quota for allocations per partner.
+pub const MAX_ALLOCATIONS_PER_CATALOG: usize = 500;
+
+/// Milliseconds in a day, the unit the seeded allocation terms below are written in.
+const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
+
+/// The term a granted benefit allocation runs for, from `StartsAt` to `ExpiresAt`.
+///
+/// CHOSEN, not an AWS duration: AWS documents `ExpiresAt` ("the timestamp when the benefit
+/// allocation expires and is no longer usable") but publishes no default term for an
+/// allocation, and no input member carries one. A year is the term AWS partner funding
+/// benefits are granted for in practice, and keeps a granted allocation inside its window
+/// for the whole life of an emulator process.
+pub const ALLOCATION_TERM_MILLIS: i64 = 365 * MILLIS_PER_DAY;
 
 /// The most amendments one `AmendBenefitApplication` request may carry.
 ///
@@ -366,6 +414,77 @@ const SEEDED_BENEFITS: &[SeededBenefit] = &[
     },
 ];
 
+/// One benefit allocation the service has granted, before its per-catalog ids and its
+/// timestamps are derived.
+struct SeededAllocation {
+    /// The `name` of the [`SEEDED_BENEFITS`] entry this allocation is based on; the
+    /// allocation's `BenefitId`, fulfillment types, description and applicable benefits
+    /// all come from that benefit.
+    benefit_name: &'static str,
+    /// `BenefitAllocationSummary$Name` (modelled length 1..255).
+    name: &'static str,
+    /// The `BenefitAllocationStatus` the allocation was GRANTED with. The term below may
+    /// have closed since, in which case the first read materialises the expiry the clock
+    /// already made due — see [`BenefitAllocation::expire_due`].
+    status: &'static str,
+    /// `BenefitAllocationSummary$StatusReason`, where the status has one to explain.
+    status_reason: Option<&'static str>,
+    /// How long before state init the allocation was created, in days.
+    created_days_ago: i64,
+    /// The term, in days, from `StartsAt` (= creation) to `ExpiresAt`.
+    term_days: i64,
+}
+
+/// The benefit allocations every catalog is seeded with.
+///
+/// The allocation is service-owned data like the benefit catalog it draws from: AWS grants
+/// one when it fulfills a partner's benefit, and this API models no operation that creates
+/// one, so the set is seeded here and every read reports it from the store.
+///
+/// Each `status` is a value of the model's `BenefitAllocationStatus` enum
+/// (`crate::ops::types::BENEFIT_ALLOCATION_STATUS_VALUES`, i.e. `ACTIVE | INACTIVE |
+/// FULFILLED`) and each `benefit_name` names a row of [`SEEDED_BENEFITS`]. The set
+/// deliberately spans every `FulfillmentType` (`CASH`, `CREDITS`, `ACCESS`, and a benefit
+/// carrying two of them), an allocation inside its term, one already fulfilled, and one
+/// whose term closed before state init — so a filtered `ListBenefitAllocations` has
+/// something to include and something to exclude whichever filter it is given.
+const SEEDED_ALLOCATIONS: &[SeededAllocation] = &[
+    SeededAllocation {
+        benefit_name: "Marketing Development Funds",
+        name: "Marketing Development Funds allocation",
+        status: ALLOCATION_STATUS_ACTIVE,
+        status_reason: None,
+        created_days_ago: 30,
+        term_days: 365,
+    },
+    SeededAllocation {
+        benefit_name: "Promotional Credits",
+        name: "Promotional Credits allocation",
+        status: ALLOCATION_STATUS_FULFILLED,
+        status_reason: Some("The allocated credits were issued in full."),
+        created_days_ago: 60,
+        term_days: 365,
+    },
+    SeededAllocation {
+        benefit_name: "Partner Training Access",
+        name: "Partner Training Access allocation",
+        status: ALLOCATION_STATUS_ACTIVE,
+        status_reason: None,
+        // Granted more than a term ago, so its `ExpiresAt` is already past: the expiry is
+        // what moves it to `INACTIVE`, rather than a status seeded as already moved.
+        created_days_ago: 400,
+        term_days: 365,
+    },
+    SeededAllocation {
+        benefit_name: "Migration Acceleration Funding",
+        name: "Migration Acceleration Funding allocation",
+        status: ALLOCATION_STATUS_ACTIVE,
+        status_reason: None,
+        created_days_ago: 10,
+        term_days: 365,
+    },
+];
+
 /// File extension -> the `FileType` a `FileDetail` reports for it.
 ///
 /// Every value is one of the model's own `FileType` enum values, whose catalog is
@@ -410,6 +529,70 @@ pub struct Benefit {
     pub benefit_request_schema: Option<Document>,
     /// A `BenefitStatus` value.
     pub status: String,
+}
+
+/// One benefit allocation the service has granted: the record every allocation operation
+/// reads.
+///
+/// Granted by AWS when it fulfills a benefit for a partner — this API models no operation
+/// that creates one — so the record arrives from [`SEEDED_ALLOCATIONS`] or from
+/// [`ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState::grant_allocation`],
+/// and every operation reports it from here. The ARN is NOT stored: it carries the region
+/// the request was signed for, so it is built per read with [`allocation_arn`], exactly as
+/// a benefit's is.
+#[derive(Debug, Clone)]
+pub struct BenefitAllocation {
+    /// `benalloc-` + 14 `[0-9a-z]` characters, from the modelled `BenefitAllocationId`.
+    pub id: String,
+    pub catalog: String,
+    /// The `ben-...` id of the benefit this allocation is based on.
+    pub benefit_id: String,
+    /// The `benappl-...` id of the application that resulted in this allocation, where one
+    /// did. Absent on an allocation AWS granted directly, which is what every seeded
+    /// allocation is: the model makes the member optional for exactly that case.
+    pub benefit_application_id: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    /// A `BenefitAllocationStatus` value.
+    pub status: String,
+    pub status_reason: Option<String>,
+    /// `FulfillmentType` values: the ones the benefit this allocation is based on offers.
+    pub fulfillment_types: Vec<String>,
+    /// The `ben-...` ids of the benefits this allocation can be applied to.
+    pub applicable_benefit_ids: Vec<String>,
+    pub created_at_millis: i64,
+    pub updated_at_millis: i64,
+    /// When the allocation becomes active and usable.
+    pub starts_at_millis: i64,
+    /// When the allocation expires and is no longer usable.
+    pub expires_at_millis: i64,
+}
+
+impl BenefitAllocation {
+    /// Whether this allocation's term has closed at `now_millis` — `ExpiresAt` is the
+    /// instant the model documents it "expires and is no longer usable" at, so the term is
+    /// closed from that instant on.
+    pub fn has_expired(&self, now_millis: i64) -> bool {
+        now_millis >= self.expires_at_millis
+    }
+
+    /// Materialise the expiry the clock has already made due, and report whether this call
+    /// is what materialised it.
+    ///
+    /// An `ACTIVE` allocation past its `ExpiresAt` is no longer usable, so it is
+    /// `INACTIVE` whether or not anybody has looked at it: the change was owed at that
+    /// instant, which is why a reporting operation may apply it. `FULFILLED` is terminal —
+    /// the benefit was delivered, so there is nothing left to expire — and an allocation
+    /// already `INACTIVE` has nowhere to move.
+    pub fn expire_due(&mut self, now_millis: i64) -> bool {
+        if self.status != ALLOCATION_STATUS_ACTIVE || !self.has_expired(now_millis) {
+            return false;
+        }
+        self.status = ALLOCATION_STATUS_INACTIVE.to_string();
+        self.status_reason = Some(ALLOCATION_EXPIRED_REASON.to_string());
+        self.updated_at_millis = bump_millis(self.updated_at_millis, now_millis);
+        true
+    }
 }
 
 /// One amendment request `AmendBenefitApplication` applied to a benefit application.
@@ -564,9 +747,11 @@ impl BenefitApplication {
         }
     }
 
-    /// A list member, omitted from the wire when nothing was ever stored for it.
+    /// A list member, omitted from the wire when nothing was ever stored for it. The one
+    /// implementation is the free [`optional_list`], which the allocation summaries reach
+    /// directly.
     pub fn optional_list<T: Clone>(values: &[T]) -> Option<Vec<T>> {
-        (!values.is_empty()).then(|| values.to_vec())
+        optional_list(values)
     }
 
     /// `BenefitApplicationSummary$BenefitApplicationDetails`, which the model types as
@@ -597,8 +782,8 @@ impl BenefitApplication {
     }
 }
 
-/// One benefit catalog: its seeded benefits, the applications created in it, and the
-/// `ClientToken`s those creates were made with.
+/// One benefit catalog: its seeded benefits and allocations, the applications created in
+/// it, and the `ClientToken`s those creates were made with.
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     /// Benefits by `ben-...` id, in one stable order so `ListBenefits` can page.
@@ -606,14 +791,18 @@ pub struct Catalog {
     /// Applications by `benappl-...` id, in one stable order so
     /// `ListBenefitApplications` can page.
     pub applications: BTreeMap<String, BenefitApplication>,
+    /// Allocations by `benalloc-...` id, in one stable order so
+    /// `ListBenefitAllocations` can page.
+    pub allocations: BTreeMap<String, BenefitAllocation>,
     /// `ClientToken` -> the application id the create it completed minted.
     pub client_tokens: BTreeMap<String, String>,
 }
 
 impl Catalog {
-    /// The catalog named `catalog`, with [`SEEDED_BENEFITS`] in it.
-    fn seeded(catalog: &str) -> Self {
-        let benefits = SEEDED_BENEFITS
+    /// The catalog named `catalog`, with [`SEEDED_BENEFITS`] and the
+    /// [`SEEDED_ALLOCATIONS`] drawn from them in it, as of `seeded_at_millis`.
+    fn seeded(catalog: &str, seeded_at_millis: i64) -> Self {
+        let benefits: BTreeMap<String, Benefit> = SEEDED_BENEFITS
             .iter()
             .map(|seed| {
                 let id = benefit_id(catalog, seed.name);
@@ -633,9 +822,45 @@ impl Catalog {
                 (id, benefit)
             })
             .collect();
+        // Each seeded allocation names the benefit it is based on, so a row whose benefit
+        // is not in the catalog seeds nothing rather than an allocation pointing at a
+        // benefit no read can resolve.
+        let allocations = SEEDED_ALLOCATIONS
+            .iter()
+            .filter_map(|seed| {
+                let benefit = benefits
+                    .values()
+                    .find(|benefit| benefit.name == seed.benefit_name)?;
+                let created_at_millis =
+                    seeded_at_millis - seed.created_days_ago * MILLIS_PER_DAY;
+                let id = allocation_id(catalog, seed.name);
+                let allocation = BenefitAllocation {
+                    id: id.clone(),
+                    catalog: catalog.to_string(),
+                    benefit_id: benefit.id.clone(),
+                    // Seeded allocations are granted directly, not through an
+                    // application, so they carry no `BenefitApplicationId`.
+                    benefit_application_id: None,
+                    name: seed.name.to_string(),
+                    description: Some(benefit.description.clone()),
+                    status: seed.status.to_string(),
+                    status_reason: seed.status_reason.map(str::to_string),
+                    fulfillment_types: benefit.fulfillment_types.clone(),
+                    applicable_benefit_ids: applicable_benefit_ids(&benefits, benefit),
+                    created_at_millis,
+                    // Nothing has changed a seeded allocation since it was granted; an
+                    // expiry that falls due is what moves this on.
+                    updated_at_millis: created_at_millis,
+                    starts_at_millis: created_at_millis,
+                    expires_at_millis: created_at_millis + seed.term_days * MILLIS_PER_DAY,
+                };
+                Some((id, allocation))
+            })
+            .collect();
         Self {
             benefits,
             applications: BTreeMap::new(),
+            allocations,
             client_tokens: BTreeMap::new(),
         }
     }
@@ -657,18 +882,49 @@ impl Catalog {
     }
 }
 
+/// The `ben-...` ids of the benefits an allocation based on `base` can be applied to: the
+/// catalog's `ACTIVE` benefits that share at least one partner program with it, and `base`
+/// itself whatever its status.
+///
+/// `ApplicableBenefitIds` is "the identifiers of the benefits applicable for this
+/// allocation", and what makes a benefit applicable is the program the allocation was
+/// granted under; a benefit that is no longer offered cannot be applied for, so an
+/// `INACTIVE` one is not applicable — except the allocation's own benefit, which the
+/// allocation already applies to however the catalog has moved on since. Walked over the
+/// catalog's id-keyed map, so the list is in one stable order.
+fn applicable_benefit_ids(benefits: &BTreeMap<String, Benefit>, base: &Benefit) -> Vec<String> {
+    benefits
+        .values()
+        .filter(|candidate| {
+            candidate.id == base.id
+                || (candidate.status == BENEFIT_STATUS_ACTIVE
+                    && candidate
+                        .programs
+                        .iter()
+                        .any(|program| base.programs.contains(program)))
+        })
+        .map(|candidate| candidate.id.clone())
+        .collect()
+}
+
 /// The resource-type segment a benefit ARN carries.
 pub const BENEFIT_RESOURCE: &str = "benefit";
 /// The resource-type segment a benefit-application ARN carries.
 pub const APPLICATION_RESOURCE: &str = "benefit-application";
+/// The resource-type segment a benefit-allocation ARN carries, from the modelled
+/// `BenefitAllocation` resource's own ARN template
+/// (`catalog/{CatalogName}/benefit-allocation/benalloc-{BenefitAllocationId}`, see
+/// `smithy_query(query="shape",shape="BenefitAllocation")`).
+pub const ALLOCATION_RESOURCE: &str = "benefit-allocation";
 
 /// Per-service state for com-amazonaws-partnercentralbenefits-partnercentralbenefitsservice. A handler reaches it through [`service_state`].
 ///
 /// BOUNDED: `CreateBenefitApplication` refuses a create that would take a catalog past
 /// [`MAX_APPLICATIONS_PER_CATALOG`], the catalog set is fixed by [`SEEDED_CATALOGS`],
-/// `arns` and `client_tokens` carry at most one entry per stored application, and one
-/// application records at most [`MAX_AMENDMENT_HISTORY`] amendments — so no caller can
-/// grow this store without limit.
+/// `arns` and `client_tokens` carry at most one entry per stored application, one
+/// application records at most [`MAX_AMENDMENT_HISTORY`] amendments, and a catalog holds
+/// at most [`MAX_ALLOCATIONS_PER_CATALOG`] allocations — so no caller can grow this store
+/// without limit.
 #[derive(Debug)]
 pub struct ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     /// Every catalog, keyed by the `Catalog` input string.
@@ -695,10 +951,15 @@ impl Default for ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsservice
     /// is seeded here, where the engine first touches this service's state.
     fn default() -> Self {
         Self {
-            catalogs: SEEDED_CATALOGS
-                .iter()
-                .map(|name| ((*name).to_string(), Catalog::seeded(name)))
-                .collect(),
+            catalogs: {
+                // One instant for every catalog, so two catalogs' seeded allocations
+                // carry the same timestamps rather than drifting by the seeding loop.
+                let seeded_at_millis = now_millis();
+                SEEDED_CATALOGS
+                    .iter()
+                    .map(|name| ((*name).to_string(), Catalog::seeded(name, seeded_at_millis)))
+                    .collect()
+            },
             partner_accounts: BTreeSet::new(),
             arns: HashMap::new(),
             id_sequence: 0,
@@ -784,6 +1045,81 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
         }
     }
 
+    /// Record an allocation AWS granted for a benefit, and report the id it minted.
+    ///
+    /// `None` when the catalog does not exist, when it holds no benefit `benefit_identifier`
+    /// names, when `application_identifier` names no application of it, or when the catalog
+    /// already holds [`MAX_ALLOCATIONS_PER_CATALOG`] allocations. Both identifiers accept
+    /// either form their modelled patterns allow (a bare id or an ARN), resolved exactly as
+    /// every operation resolves them.
+    ///
+    /// No modelled operation reaches this, and deliberately so: granting an allocation is
+    /// what AWS's own fulfillment workflow does once it approves a partner's application,
+    /// and this API models no operation that creates one — just as it models no partner
+    /// registration, which is why [`Self::grant_partner_entitlement`] is reached the same
+    /// way. So a grant arrives from OUTSIDE the API, which in this emulator means an
+    /// in-process caller holding the shared engine; nothing on the wire can grant itself an
+    /// allocation.
+    ///
+    /// The allocation runs for [`ALLOCATION_TERM_MILLIS`] from `now_millis`, and its
+    /// description, fulfillment types and applicable benefits are the benefit's own rather
+    /// than values the caller supplies.
+    pub fn grant_allocation(
+        &mut self,
+        catalog: &str,
+        benefit_identifier: &str,
+        application_identifier: Option<&str>,
+        name: &str,
+        now_millis: i64,
+    ) -> Option<String> {
+        let benefit_id = self
+            .catalogs
+            .get(catalog)?
+            .resolve_benefit_id(catalog, benefit_identifier)?;
+        let benefit_application_id = match application_identifier {
+            Some(identifier) => Some(self.resolve_application_id(catalog, identifier)?),
+            None => None,
+        };
+        if self.catalogs.get(catalog)?.allocations.len() >= MAX_ALLOCATIONS_PER_CATALOG {
+            return None;
+        }
+        let stored = self.catalogs.get(catalog)?;
+        let benefit = stored.benefits.get(&benefit_id)?.clone();
+        let applicable_benefit_ids = applicable_benefit_ids(&stored.benefits, &benefit);
+        let id = self.mint_allocation_id(now_millis);
+        let allocation = BenefitAllocation {
+            id: id.clone(),
+            catalog: catalog.to_string(),
+            benefit_id,
+            benefit_application_id,
+            name: name.to_string(),
+            description: Some(benefit.description.clone()),
+            status: ALLOCATION_STATUS_ACTIVE.to_string(),
+            status_reason: None,
+            fulfillment_types: benefit.fulfillment_types.clone(),
+            applicable_benefit_ids,
+            created_at_millis: now_millis,
+            updated_at_millis: now_millis,
+            starts_at_millis: now_millis,
+            expires_at_millis: now_millis.saturating_add(ALLOCATION_TERM_MILLIS),
+        };
+        self.catalogs
+            .get_mut(catalog)?
+            .allocations
+            .insert(id.clone(), allocation);
+        Some(id)
+    }
+
+    /// Materialise, in `catalog`, every allocation expiry `now_millis` has already made
+    /// due — see [`BenefitAllocation::expire_due`] for why a reporting operation may.
+    pub fn expire_allocations_due(&mut self, catalog: &str, now_millis: i64) {
+        if let Some(catalog) = self.catalogs.get_mut(catalog) {
+            for allocation in catalog.allocations.values_mut() {
+                allocation.expire_due(now_millis);
+            }
+        }
+    }
+
     /// The resource a tagging operation's `resourceArn` names, for a report of its tags.
     ///
     /// The tagging operations (`TagResource`, `UntagResource`, `ListTagsForResource`)
@@ -812,26 +1148,53 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     }
 
     /// A `benappl-[0-9a-z]{14}` id no stored application is using.
+    pub fn mint_application_id(&mut self, now_millis: i64) -> String {
+        self.mint_id(
+            APPLICATION_ID_PREFIX,
+            now_millis,
+            Self::holds_application,
+            Self::application_count,
+        )
+    }
+
+    /// A `benalloc-[0-9a-z]{14}` id no stored allocation is using.
+    pub fn mint_allocation_id(&mut self, now_millis: i64) -> String {
+        self.mint_id(
+            ALLOCATION_ID_PREFIX,
+            now_millis,
+            Self::holds_allocation,
+            Self::allocation_count,
+        )
+    }
+
+    /// An id of `prefix`'s kind that no stored record of that kind is using, where `holds`
+    /// answers whether one is and `count` how many there are.
     ///
     /// The sequence number makes two ids minted in the same millisecond differ, and the
     /// mixing step keeps them from being consecutive, so a caller cannot derive the next
     /// id from the last.
-    pub fn mint_application_id(&mut self, now_millis: i64) -> String {
+    fn mint_id(
+        &mut self,
+        prefix: &str,
+        now_millis: i64,
+        holds: fn(&Self, &str) -> bool,
+        count: fn(&Self) -> usize,
+    ) -> String {
         for _ in 0..1024 {
             self.id_sequence = self.id_sequence.wrapping_add(1);
             let seed = splitmix64((now_millis as u64) ^ self.id_sequence.rotate_left(17));
-            let candidate = format!("{APPLICATION_ID_PREFIX}{}", id_body(seed));
-            if !self.holds_application(&candidate) {
+            let candidate = format!("{prefix}{}", id_body(seed));
+            if !holds(self, &candidate) {
                 return candidate;
             }
         }
         // Bounded fallback, so a pathological clock can never spin here: the
         // zero-padded decimals are also `[0-9a-z]{14}`, and there are always more of
-        // them than there are stored applications.
-        (0u64..=self.application_count() as u64)
-            .map(|n| format!("{APPLICATION_ID_PREFIX}{n:014}"))
-            .find(|candidate| !self.holds_application(candidate))
-            .unwrap_or_else(|| format!("{APPLICATION_ID_PREFIX}{:014}", self.application_count()))
+        // them than there are stored records.
+        (0u64..=count(self) as u64)
+            .map(|n| format!("{prefix}{n:014}"))
+            .find(|candidate| !holds(self, candidate))
+            .unwrap_or_else(|| format!("{prefix}{:014}", count(self)))
     }
 
     fn holds_application(&self, id: &str) -> bool {
@@ -844,6 +1207,19 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
         self.catalogs
             .values()
             .map(|catalog| catalog.applications.len())
+            .sum()
+    }
+
+    fn holds_allocation(&self, id: &str) -> bool {
+        self.catalogs
+            .values()
+            .any(|catalog| catalog.allocations.contains_key(id))
+    }
+
+    fn allocation_count(&self) -> usize {
+        self.catalogs
+            .values()
+            .map(|catalog| catalog.allocations.len())
             .sum()
     }
 }
@@ -1052,6 +1428,15 @@ fn benefit_id(catalog: &str, name: &str) -> String {
     format!("{BENEFIT_ID_PREFIX}{}", id_body(seed))
 }
 
+/// The id of the seeded allocation named `name` in `catalog`, derived from both exactly as
+/// a seeded benefit's is (see [`benefit_id`]), so it too is stable across runs and distinct
+/// per catalog. A GRANTED allocation's id is minted instead, by
+/// [`ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState::mint_allocation_id`].
+fn allocation_id(catalog: &str, name: &str) -> String {
+    let seed = fnv1a64(format!("{catalog}/{name}").as_bytes());
+    format!("{ALLOCATION_ID_PREFIX}{}", id_body(seed))
+}
+
 /// [`ID_BODY_LEN`] characters drawn from [`ID_ALPHABET`] by mixing `seed`.
 fn id_body(seed: u64) -> String {
     let mut state = seed;
@@ -1170,6 +1555,11 @@ pub fn application_arn(region: &str, catalog: &str, id: &str) -> String {
 /// The ARN of the benefit `id` of `catalog`, in `region`.
 pub fn benefit_arn(region: &str, catalog: &str, id: &str) -> String {
     resource_arn(region, catalog, BENEFIT_RESOURCE, id)
+}
+
+/// The ARN of the benefit allocation `id` of `catalog`, in `region`.
+pub fn allocation_arn(region: &str, catalog: &str, id: &str) -> String {
+    resource_arn(region, catalog, ALLOCATION_RESOURCE, id)
 }
 
 /// `arn:aws:partnercentral:{region}:{account}:catalog/{catalog}/{resource}/{id}`.
@@ -1327,6 +1717,11 @@ pub fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
 /// rendered by accident.
 pub fn catalog_not_found_message(catalog: Option<&str>) -> String {
     not_found_message(CATALOG_KIND, catalog.unwrap_or(CATALOG_ABSENT))
+}
+
+/// A list member, omitted from the wire when nothing was ever stored for it.
+pub fn optional_list<T: Clone>(values: &[T]) -> Option<Vec<T>> {
+    (!values.is_empty()).then(|| values.to_vec())
 }
 
 /// Whether `values` carries at least one entry of `filter`. An empty or absent filter

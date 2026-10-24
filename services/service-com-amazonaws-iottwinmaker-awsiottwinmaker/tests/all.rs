@@ -38,6 +38,9 @@ mod resource_tags;
 #[path = "all/scene_lifecycle.rs"]
 mod scene_lifecycle;
 
+#[path = "all/scene_read.rs"]
+mod scene_read;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

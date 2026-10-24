@@ -5,6 +5,12 @@
 //! Removes the named tag keys from an existing export definition's tag set — only those
 //! keys: every other tag stays readable through `ListTagsForResource`.
 //!
+//! Like every other tagging operation of this service it decides two things before it
+//! touches the store: whether the caller's IAM policies allow `bcm-data-exports:
+//! UntagResource` on the resource it names (the modelled `AccessDeniedException`), and
+//! whether the `ResourceArn` names this account at all (the modelled
+//! `ValidationException`) — see `crate::state::validate_taggable_resource_arn`.
+//!
 //! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
 //! reaching this service's state and the modelled contract still apply.
 //!
@@ -143,12 +149,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UntagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: "The export store is unavailable.".to_string(),
             })
         })?;
+
+        // Authorization comes first: the model declares `AccessDeniedException` (403) for
+        // this operation, and AWS refuses a caller whose identity holds no permission for
+        // it before anything is read or written — so a refused caller changes no tag and
+        // learns nothing about what this account holds. See `crate::state::authorization`.
+        crate::state::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::UNTAG_RESOURCE,
+            &input.resource_arn,
+        )
+        .map_err(UntagResourceErrorModeled::AccessDeniedException)?;
+
+        // The ARN's ACCOUNT is validated BEFORE the store is consulted, for the reason
+        // `list_tags_for_resource` and `tag_resource` state: an ARN naming another account
+        // is unusable whatever this account holds, so it is a `ValidationException` (400)
+        // and not a `ResourceNotFoundException`, and the answer must not depend on a lookup
+        // AWS never performs.
+        crate::state::validate_taggable_resource_arn(&input.resource_arn)
+            .map_err(UntagResourceErrorModeled::ValidationException)?;
 
         let mut store = state.lock();
         let stored = store.exports.get_mut(&input.resource_arn).ok_or_else(|| {
