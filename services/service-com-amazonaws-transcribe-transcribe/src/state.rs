@@ -4,7 +4,9 @@
 //!
 //! Several resource families live here: the transcription-job lifecycle — the stored
 //! record, the clock-owed status transitions, and the projections of a record onto
-//! the modelled `TranscriptionJob` / `TranscriptionJobSummary` shapes — the
+//! the modelled `TranscriptionJob` / `TranscriptionJobSummary` shapes — the MEDICAL
+//! transcription jobs ([`MedicalTranscriptionJobRecord`]), a family of its own with
+//! the same lifecycle projected onto `MedicalTranscriptionJob` — the
 //! custom-vocabulary family (vocabularies and vocabulary filters), with its own
 //! records, its `PENDING` -> `READY` transition and its projections onto
 //! `VocabularyInfo` / `VocabularyFilterInfo` — the custom MEDICAL vocabularies
@@ -67,7 +69,11 @@
 //! the `MedicalScribeOutput.TranscriptFileUri` / `ClinicalDocumentUri` a completed
 //! job reports name locations nothing writes to or serves (see
 //! [`medical_scribe_output_uri`]), and a `FailureReason` stays absent because nothing
-//! this emulator does can fail a job it accepted.
+//! this emulator does can fail a job it accepted. A MEDICAL transcription job is the
+//! transcription-job RECORD again, under its own name: no audio is transcribed and no
+//! personal health information is identified, so the
+//! `MedicalTranscript.TranscriptFileUri` a completed job reports names a location
+//! nothing writes to or serves (see [`MedicalTranscriptionJobRecord`]).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -77,7 +83,8 @@ use crate::ops::types::{
     ChannelDefinition, ContentRedaction, EncryptionConfiguration, InputDataConfig,
     JobExecutionSettings, LanguageIdSettings, LanguageModel, Media,
     MedicalScribeChannelDefinition, MedicalScribeJob, MedicalScribeOutput,
-    MedicalScribeSettings, ModelSettings, Rule, Settings, SubtitlesOutput, Tag,
+    MedicalScribeSettings, MedicalTranscript, MedicalTranscriptionJob,
+    MedicalTranscriptionSetting, ModelSettings, Rule, Settings, SubtitlesOutput, Tag,
     ToxicityDetectionSettings, Transcript, TranscriptionJob, TranscriptionJobSummary,
     VocabularyFilterInfo, VocabularyInfo, MEDICAL_SCRIBE_LANGUAGE_CODE_VALUES,
 };
@@ -196,6 +203,15 @@ pub const MAX_LIST_MAX_RESULTS: usize = 100;
 /// caller that never deletes cannot grow it without end, and
 /// `DeleteTranscriptionJob` is what makes room again.
 pub const MAX_TRANSCRIPTION_JOBS: usize = 100;
+
+/// The most MEDICAL transcription jobs this emulator holds for an account.
+///
+/// Amazon Transcribe Medical answers the same `LimitExceededException` for an
+/// exceeded quota, so this family is bounded by the same published batch-job figure
+/// the non-medical family uses ([`MAX_TRANSCRIPTION_JOBS`]): a caller that never
+/// deletes cannot grow the store without end, and `DeleteMedicalTranscriptionJob` is
+/// what makes room again.
+pub const MAX_MEDICAL_TRANSCRIPTION_JOBS: usize = MAX_TRANSCRIPTION_JOBS;
 
 /// The most Call Analytics jobs this emulator holds for an account.
 ///
@@ -334,6 +350,12 @@ pub const MAX_LANGUAGE_MODELS: usize = 100;
 /// (`^arn:aws(-[^:]+)?:transcribe:[a-zA-Z0-9-]*:[0-9]{12}:[a-zA-Z-]*/[0-9a-zA-Z._-]+$`),
 /// and as the Amazon Transcribe "Tagging resources" guide lists it.
 pub const RESOURCE_TYPE_TRANSCRIPTION_JOB: &str = "transcription-job";
+/// The ARN resource type of a MEDICAL transcription job, as the model's own
+/// `ResourceArn` doc lists it among the valid `resource-type` values
+/// (`smithy_query(query="doc", shape="TagResourceRequest", member="ResourceArn")`) —
+/// a resource type of its own, so a medical transcription job and a transcription job
+/// of the same name are two resources. See [`RESOURCE_TYPE_TRANSCRIPTION_JOB`].
+pub const RESOURCE_TYPE_MEDICAL_TRANSCRIPTION_JOB: &str = "medical-transcription-job";
 /// The ARN resource type of a custom vocabulary. See
 /// [`RESOURCE_TYPE_TRANSCRIPTION_JOB`].
 pub const RESOURCE_TYPE_VOCABULARY: &str = "vocabulary";
@@ -394,6 +416,8 @@ pub const KIND_RESOURCE: &str = "resource";
 pub enum ResourceFamily {
     /// [`RESOURCE_TYPE_TRANSCRIPTION_JOB`].
     TranscriptionJob,
+    /// [`RESOURCE_TYPE_MEDICAL_TRANSCRIPTION_JOB`].
+    MedicalTranscriptionJob,
     /// [`RESOURCE_TYPE_VOCABULARY`].
     Vocabulary,
     /// [`RESOURCE_TYPE_MEDICAL_VOCABULARY`].
@@ -415,6 +439,7 @@ impl ResourceFamily {
     pub fn from_resource_type(resource_type: &str) -> Option<Self> {
         match resource_type {
             RESOURCE_TYPE_TRANSCRIPTION_JOB => Some(Self::TranscriptionJob),
+            RESOURCE_TYPE_MEDICAL_TRANSCRIPTION_JOB => Some(Self::MedicalTranscriptionJob),
             RESOURCE_TYPE_VOCABULARY => Some(Self::Vocabulary),
             RESOURCE_TYPE_MEDICAL_VOCABULARY => Some(Self::MedicalVocabulary),
             RESOURCE_TYPE_VOCABULARY_FILTER => Some(Self::VocabularyFilter),
@@ -429,6 +454,7 @@ impl ResourceFamily {
     pub fn resource_type(self) -> &'static str {
         match self {
             Self::TranscriptionJob => RESOURCE_TYPE_TRANSCRIPTION_JOB,
+            Self::MedicalTranscriptionJob => RESOURCE_TYPE_MEDICAL_TRANSCRIPTION_JOB,
             Self::Vocabulary => RESOURCE_TYPE_VOCABULARY,
             Self::MedicalVocabulary => RESOURCE_TYPE_MEDICAL_VOCABULARY,
             Self::VocabularyFilter => RESOURCE_TYPE_VOCABULARY_FILTER,
@@ -440,12 +466,14 @@ impl ResourceFamily {
 
     /// The word this service's own client-error messages name this family by.
     ///
-    /// A Medical Scribe job is a "job" like the transcription-job family: the
-    /// recorded Medical Scribe not-found response reads "The requested job couldn't be
-    /// found."
+    /// A Medical Scribe job and a medical transcription job are each a "job" like the
+    /// transcription-job family: the recorded not-found response of every job family
+    /// reads "The requested job couldn't be found."
     pub fn kind(self) -> &'static str {
         match self {
-            Self::TranscriptionJob | Self::MedicalScribeJob => KIND_JOB,
+            Self::TranscriptionJob | Self::MedicalTranscriptionJob | Self::MedicalScribeJob => {
+                KIND_JOB
+            }
             Self::Vocabulary => KIND_VOCABULARY,
             Self::MedicalVocabulary => KIND_MEDICAL_VOCABULARY,
             Self::VocabularyFilter => KIND_VOCABULARY_FILTER,
@@ -460,8 +488,8 @@ impl ResourceFamily {
 ///
 /// Reads [`ResourceFamily`]'s own mapping, so the kind a refusal names and the store a
 /// tag lookup reaches cannot disagree about which ARN names which family. A type
-/// segment naming a family this emulator holds no records of (a medical transcription
-/// job, whose start is still a stub) gets the neutral [`KIND_RESOURCE`].
+/// segment that names no family of this mapping at all gets the neutral
+/// [`KIND_RESOURCE`].
 pub fn resource_kind(resource_type: &str) -> &'static str {
     ResourceFamily::from_resource_type(resource_type).map_or(KIND_RESOURCE, ResourceFamily::kind)
 }
@@ -507,6 +535,11 @@ pub struct ComAmazonawsTranscribeTranscribeState {
     /// Every transcription job this account has started, keyed by its name (which
     /// `StartTranscriptionJob` requires to be unique).
     pub transcription_jobs: BTreeMap<String, TranscriptionJobRecord>,
+    /// Every MEDICAL transcription job this account has started, keyed by its name
+    /// (which `StartMedicalTranscriptionJob` requires to be unique within an account).
+    /// A family of its own: a medical transcription job and a transcription job may
+    /// share a name.
+    pub medical_transcription_jobs: BTreeMap<String, MedicalTranscriptionJobRecord>,
     /// Every custom vocabulary this account holds, keyed by its name (which
     /// `CreateVocabulary` requires to be unique within an account).
     pub vocabularies: BTreeMap<String, VocabularyRecord>,
@@ -567,6 +600,22 @@ impl ComAmazonawsTranscribeTranscribeState {
         let mut records: Vec<&TranscriptionJobRecord> = self.transcription_jobs.values().collect();
         records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
         records
+    }
+
+    /// The MEDICAL transcription job named `name`, with every clock-owed transition of
+    /// it already materialised, or `None` when this account has started no such job.
+    ///
+    /// The single lookup for this family, so every operation that reads or deletes a
+    /// medical transcription job sees the same status: the one the clock already owed
+    /// it.
+    pub fn medical_transcription_job_mut(
+        &mut self,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<&mut MedicalTranscriptionJobRecord> {
+        let record = self.medical_transcription_jobs.get_mut(name)?;
+        record.advance_clock(now);
+        Some(record)
     }
 
     /// The Medical Scribe job named `name`, with every clock-owed transition of it
@@ -705,6 +754,10 @@ impl ComAmazonawsTranscribeTranscribeState {
                 .transcription_jobs
                 .get(&resource.name)
                 .map(|record| &record.tags),
+            ResourceFamily::MedicalTranscriptionJob => self
+                .medical_transcription_jobs
+                .get(&resource.name)
+                .map(|record| &record.tags),
             ResourceFamily::Vocabulary => self
                 .vocabularies
                 .get(&resource.name)
@@ -746,6 +799,10 @@ impl ComAmazonawsTranscribeTranscribeState {
         match ResourceFamily::from_resource_type(&resource.resource_type)? {
             ResourceFamily::TranscriptionJob => self
                 .transcription_jobs
+                .get_mut(&resource.name)
+                .map(|record| &mut record.tags),
+            ResourceFamily::MedicalTranscriptionJob => self
+                .medical_transcription_jobs
                 .get_mut(&resource.name)
                 .map(|record| &mut record.tags),
             ResourceFamily::Vocabulary => self
@@ -1567,6 +1624,127 @@ impl TranscriptionJobRecord {
             identified_language_score: None,
             language_codes: None,
             toxicity_detection: self.toxicity_detection.clone(),
+        }
+    }
+}
+
+/// One stored MEDICAL transcription job (Amazon Transcribe Medical): exactly what the
+/// request asked for, plus the lifecycle facts the service itself owns (status,
+/// timestamps and the location its transcript would be written to).
+///
+/// NOTHING IS TRANSCRIBED, exactly as for the non-medical family (see this module's
+/// header): the `MedicalTranscript.TranscriptFileUri` a completed job reports names a
+/// location nothing writes to or serves, and no PHI is identified. The job RECORD is
+/// what this emulates.
+///
+/// `StartMedicalTranscriptionJob` has no deferred-execution member of any kind
+/// (`smithy_query(query="operation", operation="StartMedicalTranscriptionJob")` lists
+/// no `JobExecutionSettings`), so a job of this family is processing from the moment
+/// it is started and has exactly one clock-owed transition, `IN_PROGRESS` ->
+/// `COMPLETED`.
+#[derive(Debug, Clone)]
+pub struct MedicalTranscriptionJobRecord {
+    /// `MedicalTranscriptionJobName`, also this record's key in the store.
+    pub name: String,
+    /// Creation order, newest = largest. Also the cursor a listing of this family
+    /// would page with.
+    pub sequence: u64,
+    /// `TranscriptionJobStatus`: [`STATUS_IN_PROGRESS`] until the clock owes it
+    /// [`STATUS_COMPLETED`]. The enum's other two values are modelled but unreached —
+    /// nothing queues such a job and nothing this emulator does can fail one.
+    pub status: String,
+    /// `LanguageCode`, a REQUIRED member the operation narrows to one value: "US
+    /// English (en-US) is the only valid value for medical transcription jobs"
+    /// ([`MEDICAL_LANGUAGE_CODE`]).
+    pub language_code: String,
+    pub media: Media,
+    pub media_format: Option<String>,
+    pub media_sample_rate_hertz: Option<i32>,
+    /// `OutputBucketName`, a REQUIRED member of the start request: the bucket the
+    /// reported transcript URI names, so this family has no service-managed branch as
+    /// [`output_uri`] has.
+    pub output_bucket_name: String,
+    pub output_key: Option<String>,
+    /// `OutputEncryptionKMSKeyId`: the key the transcript would be encrypted with.
+    /// Recorded as asked for; nothing encrypts anything, because nothing is written.
+    pub output_encryption_kms_key_id: Option<String>,
+    /// `KMSEncryptionContext`, recorded for the same reason as
+    /// [`Self::output_encryption_kms_key_id`].
+    pub kms_encryption_context: Option<std::collections::HashMap<String, String>>,
+    pub settings: Option<MedicalTranscriptionSetting>,
+    pub content_identification_type: Option<String>,
+    pub specialty: String,
+    /// `Type`: whether the media is a `CONVERSATION` or a `DICTATION`. Named
+    /// `job_type` here because `type` is a Rust keyword.
+    pub job_type: String,
+    /// Where the transcript was written; `None` until the job completes.
+    pub transcript: Option<MedicalTranscript>,
+    /// `FailureReason`, set only on a `FAILED` job — which none of this emulator's are.
+    pub failure_reason: Option<String>,
+    pub creation_time: SystemTime,
+    pub start_time: Option<SystemTime>,
+    pub completion_time: Option<SystemTime>,
+    /// When `IN_PROGRESS` -> `COMPLETED` falls due.
+    pub completion_due: SystemTime,
+    pub tags: Vec<Tag>,
+}
+
+impl MedicalTranscriptionJobRecord {
+    /// Materialise the status transition the CLOCK already owes this job: it was due
+    /// at the stored instant whether or not anybody called. A reporting operation
+    /// (`Get`) runs this before projecting the record, and that is the only write it
+    /// performs.
+    ///
+    /// Completing a job records WHERE its transcript would be written (see the module
+    /// header); it does not write anything there.
+    pub fn advance_clock(&mut self, now: SystemTime) {
+        if self.status != STATUS_IN_PROGRESS || now < self.completion_due {
+            return;
+        }
+        self.status = STATUS_COMPLETED.to_string();
+        self.completion_time = Some(self.completion_due);
+        self.transcript = Some(MedicalTranscript {
+            // The same `OutputKey` rule the non-medical family applies, which this
+            // operation documents in the same words — so one implementation
+            // ([`output_uri`]) answers for both. `OutputBucketName` is REQUIRED for
+            // this family, so the transcript is always in the caller's bucket and the
+            // `region` argument (which only the service-managed branch reads) cannot
+            // reach the URI.
+            transcript_file_uri: Some(output_uri(
+                Some(&self.output_bucket_name),
+                self.output_key.as_deref(),
+                &self.name,
+                DEFAULT_REGION,
+                "json",
+            )),
+        });
+    }
+
+    /// This record as the modelled `MedicalTranscriptionJob` shape, which is the whole
+    /// answer of `StartMedicalTranscriptionJob` and `GetMedicalTranscriptionJob`.
+    ///
+    /// `Tags` is left ABSENT for a job carrying none rather than reported as an empty
+    /// list, for the reason [`CallAnalyticsCategoryRecord::to_properties`] gives:
+    /// `TagList` is modelled `length {min 1, max 200}`, so an empty list is not a
+    /// value of that shape.
+    pub fn to_job(&self) -> MedicalTranscriptionJob {
+        MedicalTranscriptionJob {
+            medical_transcription_job_name: Some(self.name.clone()),
+            transcription_job_status: Some(self.status.clone()),
+            language_code: Some(self.language_code.clone()),
+            media_sample_rate_hertz: self.media_sample_rate_hertz,
+            media_format: self.media_format.clone(),
+            media: Some(self.media.clone()),
+            transcript: self.transcript.clone(),
+            start_time: self.start_time.map(to_date_time),
+            creation_time: Some(to_date_time(self.creation_time)),
+            completion_time: self.completion_time.map(to_date_time),
+            failure_reason: self.failure_reason.clone(),
+            settings: self.settings.clone(),
+            content_identification_type: self.content_identification_type.clone(),
+            specialty: Some(self.specialty.clone()),
+            r#type: Some(self.job_type.clone()),
+            tags: (!self.tags.is_empty()).then(|| self.tags.clone()),
         }
     }
 }

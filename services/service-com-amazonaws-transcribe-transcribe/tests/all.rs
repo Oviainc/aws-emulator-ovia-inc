@@ -25,6 +25,8 @@ mod client_error_wire_status;
 mod language_models;
 #[path = "all/medical_scribe_jobs.rs"]
 mod medical_scribe_jobs;
+#[path = "all/medical_transcription_jobs.rs"]
+mod medical_transcription_jobs;
 #[path = "all/medical_vocabularies.rs"]
 mod medical_vocabularies;
 #[path = "all/rpc_success_status.rs"]

@@ -931,7 +931,14 @@ async fn tags_round_trip_on_each_taggable_resource() {
     let unknown: Vec<(&str, String)> = vec![
         ("a vocabulary that does not exist", arn("vocabulary", "never-created")),
         ("a job that does not exist", arn("transcription-job", "never-started")),
-        ("a resource type this emulator holds none of", arn("medical-transcription-job", "any-job")),
+        (
+            "a medical transcription job that does not exist",
+            arn("medical-transcription-job", "never-started"),
+        ),
+        // The `TranscribeArn` pattern admits this `<type>` segment, but the model's
+        // own `ResourceArn` doc does not list it among the valid resource-types and no
+        // resource family of this service answers to it.
+        ("a resource type that names no family at all", arn("call-analytics-job", "any-job")),
     ];
     for (case, resource_arn) in unknown {
         transcribe

@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartMedicalTranscriptionJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartMedicalTranscriptionJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Records one MEDICAL transcription job (Amazon Transcribe Medical) and answers the
+//! record it just stored, which `GetMedicalTranscriptionJob` reads back. A job is
+//! `IN_PROGRESS` from the moment it is started — the operation models no deferred
+//! execution — and the clock owes it `COMPLETED` a
+//! [`crate::state::JOB_TRANSITION_DELAY`] later.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartMedicalTranscriptionJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! NOTHING IS TRANSCRIBED: no audio is transcribed and no personal health information
+//! is identified, so the `MedicalTranscript.TranscriptFileUri` a completed job reports
+//! names a location nothing writes to (see
+//! [`crate::state::MedicalTranscriptionJobRecord`]). The job RECORD is what this
+//! emulates.
+//!
+//! The rules the model's own constraint traits cannot express — `Media.MediaFileUri`,
+//! and a `LanguageCode` that must be `en-US` because the member targets the
+//! service-wide language enum — are refused with the modelled `BadRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -241,18 +247,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartMedicalTranscriptionJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartMedicalTranscriptionJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartMedicalTranscriptionJob"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                StartMedicalTranscriptionJobErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some(
+                            "this service is mounted on an engine that holds no Transcribe state"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `Media` is required but every member of it is optional, so the boundary
+        // validator cannot refuse a `Media` that names no media file. The operation
+        // documents `Media (MediaFileUri)` as a required request parameter.
+        if input
+            .media
+            .media_file_uri
+            .as_deref()
+            .is_none_or(|uri| uri.trim().is_empty())
+        {
+            return Err(bad_request(
+                "The required parameter Media.MediaFileUri is missing from your request. \
+                 Specify the Amazon S3 location of your media file and try your request again.",
+            ));
+        }
+
+        // "US English (en-US) is the only valid value for medical transcription jobs.
+        // Any other value you enter for language code results in a BadRequestException
+        // error." The member targets the service-wide `LanguageCode` enum, so the
+        // model's own constraint traits cannot express that narrowing: this is where a
+        // request in any other language is refused.
+        if input.language_code != crate::state::MEDICAL_LANGUAGE_CODE {
+            return Err(bad_request(&format!(
+                "{code} is the only valid LanguageCode for a medical transcription job. \
+                 Correct your request and try again.",
+                code = crate::state::MEDICAL_LANGUAGE_CODE,
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "This name is case sensitive, cannot contain spaces, and must be unique
+        // within an Amazon Web Services account. If you try to create a new job with
+        // the same name as an existing job, you get a ConflictException error."
+        if store
+            .medical_transcription_jobs
+            .contains_key(&input.medical_transcription_job_name)
+        {
+            return Err(StartMedicalTranscriptionJobErrorModeled::ConflictException(
+                ConflictException {
+                    // The kind, not the caller's name — see
+                    // [`crate::state::name_already_exists_message`].
+                    message: Some(crate::state::name_already_exists_message(
+                        crate::state::KIND_JOB,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The account's job quota: a start beyond
+        // `crate::state::MAX_MEDICAL_TRANSCRIPTION_JOBS` is refused with the error
+        // this operation models for an exceeded quota rather than growing the store
+        // without bound.
+        if store.medical_transcription_jobs.len() >= crate::state::MAX_MEDICAL_TRANSCRIPTION_JOBS {
+            return Err(
+                StartMedicalTranscriptionJobErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "You have reached the limit of {} medical transcription jobs for \
+                             this account. Delete a job you no longer need and try your \
+                             request again.",
+                            crate::state::MAX_MEDICAL_TRANSCRIPTION_JOBS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let sequence = store.next_sequence();
+        let record = crate::state::MedicalTranscriptionJobRecord {
+            name: input.medical_transcription_job_name.clone(),
+            sequence,
+            // No member of this operation asks for deferred execution, so the job is
+            // processing from the moment it is started.
+            status: crate::state::STATUS_IN_PROGRESS.to_string(),
+            language_code: input.language_code,
+            media: input.media,
+            media_format: input.media_format,
+            media_sample_rate_hertz: input.media_sample_rate_hertz,
+            output_bucket_name: input.output_bucket_name,
+            output_key: input.output_key,
+            output_encryption_kms_key_id: input.output_encryption_kms_key_id,
+            kms_encryption_context: input.kms_encryption_context,
+            settings: input.settings,
+            content_identification_type: input.content_identification_type,
+            specialty: input.specialty,
+            job_type: input.r#type,
+            // Filled in when the job completes and the transcript location exists.
+            transcript: None,
+            failure_reason: None,
+            creation_time: now,
+            start_time: Some(now),
+            completion_time: None,
+            completion_due: now + crate::state::JOB_TRANSITION_DELAY,
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        // The response is the record just stored, never the request echoed back.
+        let job = record.to_job();
+        ::tracing::info!(
+            operation = "StartMedicalTranscriptionJob",
+            job = %record.name,
+            status = %record.status,
+            "medical transcription job started"
+        );
+        store
+            .medical_transcription_jobs
+            .insert(record.name.clone(), record);
+
+        Ok(StartMedicalTranscriptionJobOutput {
+            medical_transcription_job: Some(job),
+        })
     }
+}
+
+/// A `BadRequestException` (HTTP 400) refusing a request the model's own constraint
+/// traits cannot express — the error this operation models for a request that "didn't
+/// pass one or more validation tests".
+fn bad_request(message: &str) -> StartMedicalTranscriptionJobError {
+    StartMedicalTranscriptionJobErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

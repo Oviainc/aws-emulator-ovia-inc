@@ -66,8 +66,8 @@ struct Family {
 /// implements. `TagList` is accepted by each of these creates
 /// (`smithy_query(query="operation", operation="StartTranscriptionJob,CreateVocabulary,\
 /// CreateMedicalVocabulary,CreateVocabularyFilter,CreateLanguageModel,\
-/// CreateCallAnalyticsCategory,StartMedicalScribeJob")`), so each family's records
-/// carry a tag set the three tagging operations own.
+/// CreateCallAnalyticsCategory,StartMedicalScribeJob,StartMedicalTranscriptionJob")`), so
+/// each family's records carry a tag set the three tagging operations own.
 fn families() -> Vec<Family> {
     vec![
         Family {
@@ -85,6 +85,28 @@ fn families() -> Vec<Family> {
                 operation: "GetTranscriptionJob",
                 name_member: "TranscriptionJobName",
                 record: "TranscriptionJob",
+            }),
+        },
+        Family {
+            case: "medical transcription job",
+            resource_type: "medical-transcription-job",
+            create: "StartMedicalTranscriptionJob",
+            base_request: |name| {
+                json!({
+                    "MedicalTranscriptionJobName": name,
+                    // "US English (en-US) is the only valid value for medical
+                    // transcription jobs" (model doc for this request's LanguageCode).
+                    "LanguageCode": "en-US",
+                    "Media": {"MediaFileUri": "s3://example-media/dictation.wav"},
+                    "OutputBucketName": "example-medical-output",
+                    "Specialty": "PRIMARYCARE",
+                    "Type": "DICTATION"
+                })
+            },
+            reader: Some(Reader {
+                operation: "GetMedicalTranscriptionJob",
+                name_member: "MedicalTranscriptionJobName",
+                record: "MedicalTranscriptionJob",
             }),
         },
         Family {
@@ -547,7 +569,7 @@ async fn one_arn_reaches_one_record() {
 }
 
 /// RULE, the other side: an ARN whose `<name>` names no stored record of its family —
-/// and an ARN whose `<type>` names a family this emulator stores no records of at all —
+/// and an ARN whose `<type>` names no resource family of this service at all —
 /// is REFUSED by all three tagging operations, rather than answered with an empty tag
 /// set or silently tagging nothing.
 #[tokio::test]
@@ -555,14 +577,14 @@ async fn an_arn_naming_no_stored_record_is_refused() {
     let transcribe = Transcribe::new();
     let families = families();
 
-    // Every family's own type segment, plus one for a family whose records this
-    // emulator holds none of (`StartMedicalTranscriptionJob` is still a stub), which
-    // the model's own `ResourceArn` doc lists as a valid resource-type.
+    // Every family's own type segment, plus one the `TranscribeArn` pattern's
+    // `<type>` segment admits that the model's own `ResourceArn` doc does not list and
+    // no resource family of this service answers to.
     let mut resource_types: Vec<&str> = families
         .iter()
         .map(|family| family.resource_type)
         .collect();
-    resource_types.push("medical-transcription-job");
+    resource_types.push("call-analytics-job");
 
     for resource_type in resource_types {
         let arn = format!(
