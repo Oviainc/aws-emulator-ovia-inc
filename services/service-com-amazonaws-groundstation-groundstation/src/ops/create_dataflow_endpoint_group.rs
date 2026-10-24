@@ -178,8 +178,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(CreateDataflowEndpointGroupErrorModeled::InvalidParameterException)?;
 
         // Every endpoint of the group, as this service will store it: one endpoint per
-        // `EndpointDetails`, each carrying the security details Ground Station connects
-        // the stream with, and all of them of the same kind.
+        // `EndpointDetails`, each carrying whatever its kind needs to be attached, and all
+        // of them of the same kind.
         let mut stored_endpoints: Vec<EndpointDetails> =
             Vec::with_capacity(input.endpoint_details.len());
         let mut group_kind: Option<(usize, crate::state::EndpointKind)> = None;
@@ -204,16 +204,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             };
 
-            // Ground Station connects every endpoint of a group through the customer's
-            // VPC, with the subnets, security groups and role `securityDetails` carries,
-            // so an endpoint that names none cannot be attached.
-            if details.security_details.is_none() {
+            // `securityDetails` is the VPC placement triple Ground Station needs to put
+            // "elastic network interfaces to send streams to your instances"
+            // (`smithy_query(query="doc", shape="SecurityDetails")`), which is how the
+            // service itself connects a `DataflowEndpoint`'s stream — so a dataflow
+            // endpoint that names none cannot be attached. An AWS Ground Station Agent
+            // endpoint's stream is carried by the agent the customer runs on their own
+            // instance, so it is fully described by the members ITS shape marks
+            // `@required` (`name`, `egressAddress`, `ingressAddress`), and the model
+            // leaves `securityDetails` optional for exactly that reason: it is not
+            // demanded of one. See `EndpointKind::requires_security_details`.
+            if kind.requires_security_details() && details.security_details.is_none() {
                 return Err(invalid_parameter(
                     "securityDetails",
                     format!(
-                        "endpointDetails[{index}] names no securityDetails; every endpoint \
-                         in a dataflow endpoint group requires the subnetIds, \
-                         securityGroupIds and roleArn its streams are connected with"
+                        "endpointDetails[{index}] is {} and names no securityDetails; a \
+                         dataflow endpoint requires the subnetIds, securityGroupIds and \
+                         roleArn Ground Station connects its streams with",
+                        kind.description()
                     ),
                 ));
             }

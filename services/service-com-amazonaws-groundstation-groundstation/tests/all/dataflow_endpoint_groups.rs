@@ -13,8 +13,11 @@
 //! * `healthStatus`/`healthReasons` are "ignored when calling
 //!   `CreateDataflowEndpointGroup`" (the model's own words), so the service reports the
 //!   health IT observes whatever the request asked for;
-//! * every endpoint of a group needs the `securityDetails` its streams are connected
-//!   with, each `EndpointDetails` names exactly one endpoint, and one group may not mix
+//! * `securityDetails` is the VPC placement triple Ground Station needs to connect a
+//!   DATAFLOW endpoint's stream, so only that kind is refused without it, while an AWS
+//!   Ground Station Agent endpoint — whose stream the customer's own agent carries — is
+//!   created from its own required members alone;
+//! * each `EndpointDetails` names exactly one endpoint, and one group may not mix
 //!   AWS Ground Station Agent endpoints with dataflow endpoints — each refused with
 //!   `InvalidParameterException` (HTTP 431), and nothing stored;
 //! * a dataflow endpoint is admitted `creating` and becomes `created` when the clock
@@ -66,6 +69,16 @@ struct Kind {
     /// The one `CapabilityHealthReason` the service reports for a freshly created
     /// endpoint of this kind.
     health_reason: &'static str,
+    /// Whether an endpoint of this kind can only be created WITH `securityDetails`.
+    ///
+    /// `securityDetails` carries "a list of subnets, a list of security groups and a role
+    /// to connect streams to instances" (`smithy_query(query="doc",
+    /// shape="SecurityDetails")`) — the elastic network interfaces Ground Station places
+    /// to deliver a `DataflowEndpoint`'s stream. An agent endpoint's stream is carried by
+    /// the agent the customer runs on their own instance, and `EndpointDetails` leaves the
+    /// member optional (`smithy_query(query="shape", shape="EndpointDetails")`), so one is
+    /// created without it.
+    needs_security_details: bool,
 }
 
 /// The four endpoint members of `EndpointDetails`, one row each.
@@ -88,6 +101,7 @@ fn endpoint_kinds() -> Vec<Kind> {
             // attaching it when the create answers.
             derived: ("status", json!(ENDPOINT_CREATING)),
             health_reason: REASON_INITIALIZING_DATAPLANE,
+            needs_security_details: true,
         },
         Kind {
             label: "an AWS Ground Station Agent endpoint",
@@ -108,6 +122,7 @@ fn endpoint_kinds() -> Vec<Kind> {
             }),
             derived: ("agentStatus", json!(AGENT_INACTIVE)),
             health_reason: REASON_NO_REGISTERED_AGENT,
+            needs_security_details: false,
         },
         Kind {
             label: "an uplink agent endpoint",
@@ -130,6 +145,7 @@ fn endpoint_kinds() -> Vec<Kind> {
             }),
             derived: ("agentStatus", json!(AGENT_INACTIVE)),
             health_reason: REASON_NO_REGISTERED_AGENT,
+            needs_security_details: false,
         },
         Kind {
             label: "a downlink agent endpoint",
@@ -152,6 +168,7 @@ fn endpoint_kinds() -> Vec<Kind> {
             }),
             derived: ("agentStatus", json!(AGENT_INACTIVE)),
             health_reason: REASON_NO_REGISTERED_AGENT,
+            needs_security_details: false,
         },
     ]
 }
@@ -235,6 +252,7 @@ async fn a_created_group_reads_back_every_endpoint_kind_it_was_created_with() {
             body,
             derived,
             health_reason,
+            needs_security_details: _,
         } = kind;
         let request = json!({
             "endpointDetails": [details(member, &body, true)],
@@ -367,41 +385,158 @@ async fn the_health_a_request_asks_for_is_ignored_and_the_observed_health_report
 }
 
 #[tokio::test]
-async fn an_endpoint_without_security_details_is_refused_whatever_kind_it_is() {
+async fn security_details_are_demanded_only_of_the_endpoint_kind_whose_streams_need_them() {
     let router = harness();
 
+    // One row per endpoint member of `EndpointDetails`, each created with NO
+    // `securityDetails`: the member is optional in the model, and the subnet/security
+    // group/role triple it carries is the elastic-network-interface placement Ground
+    // Station performs for a `DataflowEndpoint` only — an AWS Ground Station Agent
+    // endpoint's stream is carried by the agent on the customer's own instance, so it is
+    // described by `name` + `egressAddress` + `ingressAddress` alone.
+    let mut accepted_ids = Vec::new();
     for kind in endpoint_kinds() {
-        let refused = create_group(
+        let reply = create_group(
             &router,
             json!({"endpointDetails": [details(kind.member, &kind.body, false)]}),
         )
         .await;
+
+        if kind.needs_security_details {
+            assert_eq!(
+                reply.status, 431,
+                "case {}: expected 431, got {} {}",
+                kind.label, reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error_code(),
+                "InvalidParameterException",
+                "case {}: wrong error shape, got {}",
+                kind.label,
+                reply.body
+            );
+            assert_eq!(
+                reply.field("parameterName"),
+                &json!("securityDetails"),
+                "case {}: the refusal must name the missing member, got {}",
+                kind.label,
+                reply.body
+            );
+            assert!(
+                reply.string("message").contains("securityDetails"),
+                "case {}: the refusal must say what is missing, got {}",
+                kind.label,
+                reply.body
+            );
+            continue;
+        }
+
         assert_eq!(
-            refused.status, 431,
-            "case {}: expected 431, got {} {}",
-            kind.label, refused.status, refused.body
+            reply.status, 200,
+            "case {}: an endpoint whose streams need no VPC placement is created without \
+             securityDetails, got {} {}",
+            kind.label, reply.status, reply.body
         );
-        assert_eq!(
-            refused.error_code(),
-            "InvalidParameterException",
-            "case {}: wrong error shape, got {}",
-            kind.label,
-            refused.body
-        );
-        assert_eq!(
-            refused.field("parameterName"),
-            &json!("securityDetails"),
-            "case {}: the refusal must name the missing member, got {}",
-            kind.label,
-            refused.body
-        );
+        let id = reply.string("dataflowEndpointGroupId");
         assert!(
-            refused.string("message").contains("securityDetails"),
-            "case {}: the refusal must say what is missing, got {}",
-            kind.label,
-            refused.body
+            is_uuid(&id),
+            "case {}: the minted id must be a lowercase uuid, got {id:?}",
+            kind.label
         );
+
+        // The group is read back from state: the endpoint it holds is the one the request
+        // described, still carrying no `securityDetails`, plus the members the service
+        // owns.
+        let read = get_group(&router, &id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {}: expected GetDataflowEndpointGroup 200, got {} {}",
+            kind.label, read.status, read.body
+        );
+        let endpoints = read.field("endpointsDetails").as_array().unwrap_or_else(|| {
+            panic!(
+                "case {}: endpointsDetails is not a list: {}",
+                kind.label, read.body
+            )
+        });
+        assert_eq!(
+            endpoints.len(),
+            1,
+            "case {}: the group holds the one endpoint it was created with, got {:?}",
+            kind.label,
+            endpoints
+        );
+        let endpoint = &endpoints[0];
+        assert!(
+            endpoint.get("securityDetails").is_none_or(Value::is_null),
+            "case {}: a group created without securityDetails must report none, got \
+             {endpoint}",
+            kind.label
+        );
+        assert_eq!(
+            endpoint.get(kind.member),
+            Some(&with_member(&kind.body, kind.derived.0, &kind.derived.1)),
+            "case {}: the endpoint must read back as it was created, plus the service's \
+             own {}, got {endpoint}",
+            kind.label,
+            kind.derived.0
+        );
+        assert_eq!(
+            endpoint.get("healthStatus").and_then(Value::as_str),
+            Some(HEALTH_UNHEALTHY),
+            "case {}: a freshly created endpoint is not healthy yet, got {endpoint}",
+            kind.label
+        );
+        assert_eq!(
+            endpoint.get("healthReasons"),
+            Some(&json!([kind.health_reason])),
+            "case {}: wrong healthReasons, got {endpoint}",
+            kind.label
+        );
+        accepted_ids.push(id);
     }
+
+    // Only the accepted creates are stored: the refused one left nothing behind.
+    let mut listed = listed_ids(&router, None, accepted_ids.len()).await;
+    listed.sort();
+    accepted_ids.sort();
+    assert_eq!(
+        listed, accepted_ids,
+        "only the groups that were accepted may be stored: expected {accepted_ids:?}, \
+         got {listed:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_endpoint_group_without_security_details_mixes_no_better_than_one_with() {
+    let router = harness();
+    let kinds = endpoint_kinds();
+    let dataflow = &kinds[0];
+    let agent = &kinds[1];
+
+    // Dropping `securityDetails` from the agent item changes nothing about the
+    // same-type rule: a group still may not mix the two kinds, and the refusal is about
+    // `endpointDetails`, not the absent member.
+    let reply = create_group(
+        &router,
+        json!({"endpointDetails": [
+            details(agent.member, &agent.body, false),
+            details(dataflow.member, &dataflow.body, true),
+        ]}),
+    )
+    .await;
+    assert_eq!(
+        reply.status, 431,
+        "case an agent endpoint without securityDetails then a dataflow endpoint: \
+         expected 431, got {} {}",
+        reply.status, reply.body
+    );
+    assert_eq!(
+        reply.field("parameterName"),
+        &json!("endpointDetails"),
+        "case a mixed group: the refusal must name the member it is about, got {}",
+        reply.body
+    );
 
     let listed = listed_ids(&router, None, 0).await;
     assert!(
