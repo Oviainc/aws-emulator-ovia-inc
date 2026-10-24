@@ -15,6 +15,8 @@
 mod change_progress;
 #[path = "all/data_source_registry.rs"]
 mod data_source_registry;
+#[path = "all/default_application_setting.rs"]
+mod default_application_setting;
 #[path = "all/domain_health.rs"]
 mod domain_health;
 #[path = "all/domain_lifecycle.rs"]

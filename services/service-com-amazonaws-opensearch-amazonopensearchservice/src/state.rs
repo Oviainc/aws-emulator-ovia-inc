@@ -1122,6 +1122,14 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     pub domains: BTreeMap<String, Domain>,
     /// Drives [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_endpoint_suffix`].
     pub endpoint_suffix_seq: u64,
+    /// The default-application setting: the ARN of the application that is the
+    /// account's default, or `None` while no default is set.
+    ///
+    /// ONE account-scoped value rather than a flag on a per-application record:
+    /// `PutDefaultApplicationSetting` sets or clears it and
+    /// `GetDefaultApplicationSetting` reports it, so the two cannot disagree about
+    /// which application is the default.
+    pub default_application_arn: Option<String>,
 }
 
 /// The characters a domain endpoint's opaque suffix is built from.
@@ -1420,6 +1428,47 @@ pub fn change_not_found(domain_name: &str, change_id: Option<&str>) -> ResourceN
             }
             None => format!("No configuration change found for domain {domain_name}"),
         }),
+    }
+}
+
+/// The number of colon-separated fields an ARN carries:
+/// `arn:<partition>:<service>:<region>:<account-id>:<resource>`. The resource field
+/// may itself contain colons, so it is the LAST field and is not split further.
+const ARN_FIELDS: usize = 6;
+
+/// Whether `value` has ARN syntax: the `arn` literal, a partition, a service and a
+/// non-empty resource, with the Region and account-id fields allowed to be empty
+/// (service-wide and account-less ARNs leave them so).
+///
+/// The `ARN` shape is `@length(min: 20, max: 2048)` with pattern `.*`, so the request
+/// boundary enforces only the length: an operation that takes an ARN checks the
+/// syntax itself rather than storing a value no ARN parser would accept — the same
+/// reasoning as [`is_guid`]. It is a SYNTAX test only: resolving an ARN to a stored
+/// resource is the job of whichever registry owns that resource.
+pub fn is_arn(value: &str) -> bool {
+    let fields: Vec<&str> = value.splitn(ARN_FIELDS, ':').collect();
+    fields.len() == ARN_FIELDS
+        && fields[0] == "arn"
+        && !fields[1].is_empty()
+        && !fields[2].is_empty()
+        && !fields[5].is_empty()
+}
+
+/// The `ValidationException` payload for a member that must carry an ARN and does
+/// not. It names the member and the value that could not be read as one, so the
+/// caller can tell which input it was.
+pub fn malformed_arn(member: &str, value: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!("{member} is not a valid ARN: {value}")),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for a read of the default-application
+/// setting made while no default application is set — the state the setting is in
+/// before any `PutDefaultApplicationSetting`, and after one that cleared it.
+pub fn default_application_not_set() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some("No default application is set for this account.".to_string()),
     }
 }
 

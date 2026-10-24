@@ -31,3 +31,21 @@ botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling
 Boot the opensearch emulator
 Call GetDefaultApplicationSetting and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution
+`GetDefaultApplicationSetting` is implemented: it reports the account-scoped
+default-application setting the service's state now holds
+(`default_application_arn`), and refuses with the modelled
+`ResourceNotFoundException` (409) while no default is set, as the operation
+documents. It is a pure read.
+
+Its writer, `PutDefaultApplicationSetting`, was a stub with no issue of its own and
+is implemented in the same change: `setAsDefault` true points the setting at the
+ARN in the request, false clears it when that ARN is the one in effect, and either
+way the answer reports the setting in effect after the call — so a cleared setting
+answers with no `applicationArn` member at all. The ARN is checked for ARN syntax
+only; resolving it to a stored application needs the application registry that
+`CreateApplication` (`20261024T055421Z-opensearch-createapplication-stub.md`) owns.
+
+Both recorded units get past this operation and now stop at that `CreateApplication`
+stub.
