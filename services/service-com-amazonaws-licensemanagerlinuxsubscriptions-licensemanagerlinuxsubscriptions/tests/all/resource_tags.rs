@@ -216,12 +216,12 @@ fn generated_pairs(count: usize) -> Vec<(String, String)> {
 /// Put a subscription provider carrying `tags` in the store and return its ARN.
 ///
 /// The provider is seeded DIRECTLY, through the same `engine.state::<…>()` seam the
-/// handlers use, because these rules are about the TAG slice of a provider whose
-/// registration has settled in an accepted state, which `RegisterSubscriptionProvider`
-/// cannot produce here: validating a provider access token needs trust material this
-/// emulator does not hold, so a registration it creates settles `INVALID` (the create
-/// path itself is covered by `tests/all/subscription_provider_registration.rs`). The
-/// `secret` keeps each seeded record distinct.
+/// handlers use, because these rules are about the TAG slice of a provider that is already
+/// usable: `RegisterSubscriptionProvider` creates one over the wire and it becomes usable
+/// on the clock (the create path is covered by
+/// `tests/all/subscription_provider_registration.rs`), so a suite about tags would
+/// otherwise wait out that span once per row. The `secret` keeps each seeded record
+/// distinct.
 async fn register(h: &Harness, case: &str, secret: &str, tags: &[(String, String)]) -> String {
     let store = h.engine.state::<ServiceState>();
     let mut guard = store.lock();
@@ -242,6 +242,7 @@ async fn register(h: &Harness, case: &str, secret: &str, tags: &[(String, String
             secret.to_string(),
             PROVIDER_STATUS_ACTIVE.to_string(),
             tags.iter().cloned().collect(),
+            std::time::SystemTime::now(),
         ),
     );
     guard.provider_order.push(arn.clone());
