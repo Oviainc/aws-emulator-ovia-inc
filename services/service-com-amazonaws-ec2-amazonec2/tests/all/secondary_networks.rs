@@ -23,8 +23,10 @@
 //!    `delete-complete` / `disassociated`, the store keeps reporting the network in those
 //!    states (`DescribeSecondaryNetworks` documents both among its `state` filter's
 //!    values), a repeat of the delete reports that same deletion without restarting its
-//!    clock, and an id the account holds no network for is refused with EC2's own
-//!    `Invalid<Resource>Id.NotFound` code while nothing changes.
+//!    clock, and an id this service cannot resolve is refused with EC2's own code for the
+//!    question it could not answer — `Invalid<Resource>Id.Malformed` for something that is
+//!    not an id of this kind at all, before any lookup, and `Invalid<Resource>Id.NotFound`
+//!    for a well-formed id no network has — while nothing changes.
 //!
 //! Each table row is a distinct input along what the rule generalises over — the block's
 //! prefix length at each published bound and one past it, a block whose host bits are set,
@@ -37,7 +39,7 @@ use service_com_amazonaws_ec2_amazonec2 as ec2;
 use ec2::ops::types::SECONDARY_NETWORK_TYPE_VALUES;
 use ec2::state::{
     MAX_CLIENT_TOKEN_CHARS, MAX_SECONDARY_NETWORK_IPV4_PREFIX, MIN_SECONDARY_NETWORK_IPV4_PREFIX,
-    TRANSITION_DELAY,
+    SECONDARY_NETWORK_ID_PREFIX, TRANSITION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -150,6 +152,15 @@ async fn described_ids(
          body {body}"
     );
     elements(&body, "secondaryNetworkId")
+}
+
+/// A WELL-FORMED secondary network id — the long EC2 resource id form under this
+/// resource's own prefix, which is what the service mints — that no account of this test
+/// file holds a network for: the mint counts up from one, so an all-`f` suffix is never
+/// issued. The prefix comes from the service rather than a literal, so the two cannot
+/// drift.
+fn unknown_network_id() -> String {
+    format!("{SECONDARY_NETWORK_ID_PREFIX}-0ffffffffffffffff")
 }
 
 /// One `MaxResults` parameter.
@@ -405,10 +416,51 @@ async fn every_stored_network_is_reported_and_a_later_create_is_visible() {
     );
 }
 
+/// Whether `id` is a long-form EC2 id of `prefix` that this service could have ISSUED: 17
+/// lowercase hexadecimal digits, leading digit `0`, not all `0` — the form the mint produces
+/// and the form the malformed-id refusal is defined against (the same reading
+/// `tests/all/capacity_reservation_fleets.rs` writes for `crf-…` ids).
+fn is_issued_long_id(prefix: &str, id: &str) -> bool {
+    let Some(suffix) = id
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    suffix.len() == 17
+        && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && suffix.bytes().all(|byte| !byte.is_ascii_uppercase())
+        && suffix.starts_with('0')
+        && suffix.bytes().any(|byte| byte != b'0')
+}
+
+/// Every id this service MINTS is one it also accepts: the id form the mint produces and
+/// the form the malformed-id refusal is defined against are the same one, so no network can
+/// be created under an id its own delete would call malformed.
+#[tokio::test]
+async fn every_minted_id_is_one_this_service_accepts() {
+    let router = emulator();
+    let seeded = seed(&router).await;
+
+    for id in &seeded.ids {
+        assert!(
+            is_issued_long_id(SECONDARY_NETWORK_ID_PREFIX, id),
+            "case {id:?}: expected an id of the form \
+             {SECONDARY_NETWORK_ID_PREFIX}-<17 lowercase hex digits, leading 0, not all 0>, \
+             got {id:?}"
+        );
+        // And the delete resolves it rather than refusing its form.
+        let (status, body) = delete(&router, &[p("SecondaryNetworkId", id.clone())]).await;
+        assert_eq!(
+            status, 200,
+            "case {id:?}: a minted id must resolve, got {status} with body {body}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RULE 2: the clock owns the transition
 // ---------------------------------------------------------------------------
-
 /// A new network is `create-in-progress` with its block `associating`; the clock moves both
 /// on with nobody asking, and reading them never writes.
 #[tokio::test]
@@ -799,25 +851,46 @@ async fn secondary_network_ids_narrow_the_report_to_the_ids_named() {
     }
 }
 
-/// A `SecondaryNetworkIds` entry that names no network of the account is refused — even
-/// alongside ids that do exist.
+/// A `SecondaryNetworkIds` entry this service cannot resolve is refused — even alongside
+/// ids that do exist — and with the SAME code `DeleteSecondaryNetwork` answers for it: the
+/// id's form is read before the lookup wherever an id of this kind is read, so a reader and
+/// a writer never disagree about what an id is.
 #[tokio::test]
 async fn a_secondary_network_id_that_names_no_network_is_refused() {
     let router = emulator();
     let seeded = seed(&router).await;
     let known = seeded.ids[0].clone();
 
-    // Rows: an id of this service's own id form that nothing has, a short-form id, a value
-    // that is not an id at all, and an unknown id carried beside a known one, in both
-    // orders.
-    let cases: Vec<Vec<String>> = vec![
-        vec!["sn-0ffffffffffffffff".to_string()],
-        vec!["sn-0abc1234".to_string()],
-        vec!["not-a-secondary-network-id".to_string()],
-        vec![known.clone(), "sn-0ffffffffffffffff".to_string()],
-        vec!["sn-0ffffffffffffffff".to_string(), known],
+    // Rows: a well-formed id of this service's own form that nothing has (alone, and beside
+    // a known id in both orders) — not found; then a short-form id, a value that is not an
+    // id at all, and an unresolvable id beside a known one — malformed.
+    let cases: Vec<(Vec<String>, &str)> = vec![
+        (
+            vec![unknown_network_id()],
+            "InvalidSecondaryNetworkId.NotFound",
+        ),
+        (
+            vec![known.clone(), unknown_network_id()],
+            "InvalidSecondaryNetworkId.NotFound",
+        ),
+        (
+            vec![unknown_network_id(), known.clone()],
+            "InvalidSecondaryNetworkId.NotFound",
+        ),
+        (
+            vec![format!("{SECONDARY_NETWORK_ID_PREFIX}-0abc1234")],
+            "InvalidSecondaryNetworkId.Malformed",
+        ),
+        (
+            vec!["not-a-secondary-network-id".to_string()],
+            "InvalidSecondaryNetworkId.Malformed",
+        ),
+        (
+            vec![known, "not-a-secondary-network-id".to_string()],
+            "InvalidSecondaryNetworkId.Malformed",
+        ),
     ];
-    for ids in cases {
+    for (ids, expected_code) in cases {
         let borrowed: Vec<&str> = ids.iter().map(String::as_str).collect();
         let case = format!("SecondaryNetworkIds={borrowed:?}");
         let (status, body) = describe(&router, &indexed("SecondaryNetworkId", &borrowed)).await;
@@ -827,8 +900,8 @@ async fn a_secondary_network_id_that_names_no_network_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidSecondaryNetworkId.NotFound",
-            "case {case:?}: expected InvalidSecondaryNetworkId.NotFound, got {body}"
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
         );
         assert!(
             elements(&body, "secondaryNetworkId").is_empty(),
@@ -1377,36 +1450,86 @@ async fn deleting_a_network_hands_it_to_the_clock_and_the_store_keeps_reporting_
     }
 }
 
-/// An id the account holds no network for is refused with EC2's own
-/// `Invalid<Resource>Id.NotFound` code — `SecondaryNetworkId` publishes no pattern, so
-/// every shape of unknown id is answered the same way — and nothing is deleted.
+/// An id this service cannot resolve is refused with EC2's own code for the question it
+/// could not answer, and nothing is deleted: something that is not a secondary network id
+/// at all is `InvalidSecondaryNetworkId.Malformed` BEFORE any lookup, while a well-formed
+/// id the account holds no network for is `InvalidSecondaryNetworkId.NotFound`.
 #[tokio::test]
 async fn deleting_an_id_no_network_has_is_refused_and_changes_nothing() {
     let router = emulator();
     let seeded = seed(&router).await;
 
-    // Rows: the id form this service mints but no network has, the same form at its
-    // extremes, an id of another EC2 resource family, text that is no id at all, the
-    // right id in the wrong case, and the empty id.
-    let unknown = [
-        "sn-0123456789abcdef0",
-        "sn-00000000000000000",
-        "vpc-0123456789abcdef0",
-        "not-a-secondary-network-id",
-        "SN-0123456789ABCDEF0",
-        "",
+    // Rows: every way an id can fall outside the form this service issues — `<prefix>-<17
+    // lowercase hex digits>`, leading `0`, not all `0` — and then the one way it can be
+    // inside that form and still resolve to nothing. The all-zero suffix is the row the
+    // recorded corpus probes; the others vary the prefix, the suffix length, its alphabet,
+    // its case and its leading digit.
+    let rows: Vec<(String, &str)> = vec![
+        (
+            format!("{SECONDARY_NETWORK_ID_PREFIX}-00000000000000000"),
+            "InvalidSecondaryNetworkId.Malformed",
+        ),
+        (
+            format!("{SECONDARY_NETWORK_ID_PREFIX}-10000000000000000"),
+            "InvalidSecondaryNetworkId.Malformed",
+        ),
+        (
+            format!("{SECONDARY_NETWORK_ID_PREFIX}-0abc1234"),
+            "InvalidSecondaryNetworkId.Malformed",
+        ),
+        (
+            format!("{SECONDARY_NETWORK_ID_PREFIX}-0123456789abcdefg"),
+            "InvalidSecondaryNetworkId.Malformed",
+        ),
+        (
+            format!("{SECONDARY_NETWORK_ID_PREFIX}-0123456789ABCDEF0"),
+            "InvalidSecondaryNetworkId.Malformed",
+        ),
+        (
+            format!("{SECONDARY_NETWORK_ID_PREFIX}-0123456789abcdef00"),
+            "InvalidSecondaryNetworkId.Malformed",
+        ),
+        (
+            "vpc-0123456789abcdef0".to_string(),
+            "InvalidSecondaryNetworkId.Malformed",
+        ),
+        (
+            "not-a-secondary-network-id".to_string(),
+            "InvalidSecondaryNetworkId.Malformed",
+        ),
+        (
+            SECONDARY_NETWORK_ID_PREFIX.to_uppercase() + "-0123456789ABCDEF0",
+            "InvalidSecondaryNetworkId.Malformed",
+        ),
+        (String::new(), "InvalidSecondaryNetworkId.Malformed"),
+        (
+            unknown_network_id(),
+            "InvalidSecondaryNetworkId.NotFound",
+        ),
+        (
+            format!("{SECONDARY_NETWORK_ID_PREFIX}-0123456789abcdef0"),
+            "InvalidSecondaryNetworkId.NotFound",
+        ),
     ];
-    for id in unknown {
-        let (status, body) = delete(&router, &[p("SecondaryNetworkId", id)]).await;
+    for (id, expected_code) in rows {
+        let (status, body) = delete(&router, &[p("SecondaryNetworkId", id.clone())]).await;
         assert_eq!(
             status, 400,
             "case {id:?}: expected HTTP 400, got {status} with body {body}"
         );
         assert_eq!(
             error_code(&body),
-            "InvalidSecondaryNetworkId.NotFound",
-            "case {id:?}: expected InvalidSecondaryNetworkId.NotFound, got {body}"
+            expected_code,
+            "case {id:?}: expected {expected_code}, got {body}"
         );
+        // The message is built from the request, so it names the value it refused.
+        if !id.is_empty() {
+            let message = unescaped(&element(&body, "Message").unwrap_or_default());
+            assert!(
+                message.contains(&id),
+                "case {id:?}: expected the refusal to name the id it refused, got {message:?}"
+            );
+        }
         assert!(
             elements(&body, "secondaryNetworkId").is_empty(),
             "case {id:?}: a refused delete reports no network, got {body}"
@@ -1519,25 +1642,31 @@ async fn a_dry_run_delete_reports_the_permitted_outcome_without_deleting() {
         "delete DryRun=true: a dry run deletes nothing, got {read}"
     );
 
-    // A dry run naming a network the account does not hold is refused with that reason.
-    let (status, body) = delete(
-        &router,
-        &[
-            p("SecondaryNetworkId", "sn-0123456789abcdef0"),
-            p("DryRun", "true"),
-        ],
-    )
-    .await;
-    assert_eq!(
-        status, 400,
-        "delete DryRun=true on an unknown id: expected HTTP 400, got {status} with body {body}"
-    );
-    assert_eq!(
-        error_code(&body),
-        "InvalidSecondaryNetworkId.NotFound",
-        "delete DryRun=true on an unknown id: expected InvalidSecondaryNetworkId.NotFound, \
-         got {body}"
-    );
+    // A dry run naming a network the account does not hold is refused with that reason, and
+    // one naming something that is not a secondary network id at all with the malformed
+    // reason the lookup never gets to.
+    for (id, expected_code) in [
+        (unknown_network_id(), "InvalidSecondaryNetworkId.NotFound"),
+        (
+            "not-a-secondary-network-id".to_string(),
+            "InvalidSecondaryNetworkId.Malformed",
+        ),
+    ] {
+        let (status, body) = delete(
+            &router,
+            &[p("SecondaryNetworkId", id.clone()), p("DryRun", "true")],
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "delete DryRun=true on {id:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            expected_code,
+            "delete DryRun=true on {id:?}: expected {expected_code}, got {body}"
+        );
+    }
 
     let (status, body) = delete(
         &router,

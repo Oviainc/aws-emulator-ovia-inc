@@ -19,6 +19,8 @@ mod account_and_platform_catalog;
 mod application_version_updates;
 #[path = "all/application_versions.rs"]
 mod application_versions;
+#[path = "all/configuration_templates.rs"]
+mod configuration_templates;
 #[path = "all/describe_application_versions.rs"]
 mod describe_application_versions;
 #[path = "all/dns_availability.rs"]

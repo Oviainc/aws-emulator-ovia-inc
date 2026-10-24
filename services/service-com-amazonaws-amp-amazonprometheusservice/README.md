@@ -26,6 +26,20 @@ service-com-amazonaws-amp-amazonprometheusservice/
     └── ops/              # ONE FILE PER OPERATION
 ```
 
+## Where this emulator reads a member's constraint differently
+
+The model JSON in `smithy-model/` is kept EXACTLY as shipped — nothing in this crate
+edits it. Where a RECORDED live refusal shows the service applying a different
+constraint from the published one, the member carries `skip_validation` on its input
+type in `src/ops/types/` and `src/state.rs` re-declares that one member's constraints
+in the framework's own trait form, checked by the framework's own constraint walk and
+refused through this service's own validation composition. Every such reading is listed
+here:
+
+| Member | Published constraint | Enforced as | Why |
+|---|---|---|---|
+| `CreateWorkspace$kmsKeyArn` (`com.amazonaws.amp#KmsKeyArn`) | `@pattern(^arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/[-a-f0-9]+$)`, `@length(20..2048)` | `crate::state::KMS_KEY_ARN_PATTERN` — the same pattern with the key-id segment as `.+` — plus the same `@length(20..2048)` | The recorded live refusal quotes the constraint the service applies, `…:key/.+`, so the published pattern made this emulator refuse key ARNs AWS accepts (multi-region `key/mrk-…` keys among them) and report a requirement no aps response states. See the "KmsKeyArn's key-id segment" section on `src/ops/create_workspace.rs` and `crate::state::check_kms_key_arn`; `tests/all/kms_key_arn_and_parent_resolution.rs` holds both halves of the rule. |
+
 ## Implementing an operation
 
 Each file in `src/ops/` owns exactly one operation and declares which one

@@ -231,6 +231,9 @@ async fn a_scope_reaches_succeeded_once_the_clock_owes_it() {
     );
 }
 
+/// A `scopeId` of the form this service generates that the store holds nothing
+/// under is the modelled 404. A `scopeId` of ANOTHER form never reaches that path —
+/// it is a request-shape fault, pinned in `wire_status_and_error_classes.rs`.
 #[tokio::test]
 async fn get_scope_on_an_id_the_store_does_not_hold_is_404() {
     let emulator = Emulator::new();
@@ -243,8 +246,10 @@ async fn get_scope_on_an_id_the_store_does_not_hold_is_404() {
     for case in [
         "00000000-0000-4000-8000-000000000000",
         "ffffffff-ffff-4fff-8fff-ffffffffffff",
-        "not-a-scope-id",
-        "0",
+        // The same hex in upper case: still a well-formed identifier, so still the
+        // not-found path rather than a refusal of the request's shape.
+        "FFFFFFFF-FFFF-4FFF-8FFF-FFFFFFFFFFFE",
+        "11111111-2222-3333-4444-555555555555",
     ] {
         assert_ne!(case, known, "the unknown-id table must not name a real scope");
         let answer = emulator.get_scope(case).await;
@@ -557,6 +562,11 @@ async fn a_monitor_reaches_active_once_the_clock_owes_it() {
     );
 }
 
+/// RULE: `CreateMonitor` models no `ResourceNotFoundException`, so a `scopeArn` that
+/// resolves to no scope is refused with the modelled `AccessDeniedException` (403) —
+/// the whole table is pinned in `wire_status_and_error_classes.rs`; this row keeps
+/// the lifecycle suite's own anchors (a live monitor ARN, another service's ARN) and
+/// proves the refused create stored nothing.
 #[tokio::test]
 async fn create_monitor_refuses_a_scope_arn_that_names_no_scope() {
     let emulator = Emulator::new();
@@ -604,14 +614,14 @@ async fn create_monitor_refuses_a_scope_arn_that_names_no_scope() {
             }))
             .await;
         assert_eq!(
-            answer.status, 400,
-            "case {case:?}: expected 400, got {} with body {}",
+            answer.status, 403,
+            "case {case:?}: expected 403, got {} with body {}",
             answer.status, answer.body
         );
         assert!(
-            answer.error_type.contains("ValidationException")
-                || answer.text("__type").contains("ValidationException"),
-            "case {case:?}: expected ValidationException, got {:?} / body {}",
+            answer.error_type.contains("AccessDeniedException")
+                || answer.text("__type").contains("AccessDeniedException"),
+            "case {case:?}: expected AccessDeniedException, got {:?} / body {}",
             answer.error_type,
             answer.body
         );
@@ -1286,8 +1296,9 @@ async fn a_deleted_scope_is_gone_for_every_later_reader() {
     }
 }
 
-/// Deleting an id the store does not hold is the modelled 404, whatever form the id
-/// takes, and the delete leaves the store alone.
+/// Deleting a WELL-FORMED id the store does not hold is the modelled 404, and the
+/// delete leaves the store alone. An id of another form is refused for its shape
+/// instead (`wire_status_and_error_classes.rs`).
 #[tokio::test]
 async fn delete_scope_on_an_id_the_store_does_not_hold_is_404() {
     let emulator = Emulator::new();
@@ -1323,10 +1334,13 @@ async fn delete_scope_on_an_id_the_store_does_not_hold_is_404() {
             "the id of a scope deleted earlier in this test",
             deleted_id.clone(),
         ),
-        ("an id that is not UUID-shaped", "not-a-scope".to_string()),
         (
-            "a monitor-style name in the scope id position",
-            "scope_1.live-2".to_string(),
+            "a UUID-shaped id whose version and variant nibbles are other values",
+            "abcdef01-2345-1678-9abc-def012345678".to_string(),
+        ),
+        (
+            "the same id in upper-case hex",
+            "ABCDEF01-2345-1678-9ABC-DEF012345679".to_string(),
         ),
     ];
 
@@ -1412,7 +1426,7 @@ async fn deleting_a_scope_retires_its_arn_and_frees_its_client_token() {
             }))
             .await;
         assert_eq!(
-            refused.status, 400,
+            refused.status, 403,
             "case {case:?}: a retired scopeArn is refused, got {} with body {}",
             refused.status, refused.body
         );

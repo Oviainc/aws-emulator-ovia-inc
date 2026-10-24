@@ -209,15 +209,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.resource_lifecycle_config.as_ref(),
             ),
             // A configuration template is a separate resource, created by
-            // `CreateConfigurationTemplate` (still scaffolded). This list is
-            // reported from what the store holds, so it starts empty rather than
-            // naming a template nothing holds.
-            configuration_templates: Vec::new(),
+            // `CreateConfigurationTemplate`. The list DescribeApplications
+            // reports is read from the template store, so there is nothing to
+            // carry on the record itself.
             tags: input.tags.unwrap_or_default(),
             pending_deletion: None,
         };
-        // "Creates an application that has … no application versions."
-        let description = application.to_description(Vec::new());
+        // "Creates an application that has … no application versions." and no
+        // configuration templates: both lists are read from their own stores,
+        // which hold nothing for an application that has just been created.
+        let description = application.to_description(Vec::new(), Vec::new());
         let application_name = application.name.clone();
         store
             .applications

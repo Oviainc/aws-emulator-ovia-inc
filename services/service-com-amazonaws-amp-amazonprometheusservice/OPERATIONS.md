@@ -121,7 +121,7 @@ contents — read that shape in the model above when you need its own members.
 
 - **Route:** `POST /workspaces -> 202`
 - **Traits:** @idempotent
-- **Input:** `alias` (string, len 1..100), `clientToken` (string, len 1..64, pattern ^[!-~]+$, @idempotencyToken), `tags` (map<string,string>, len ..50), `kmsKeyArn` (string, len 20..2048, pattern ^arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/[-a-f0-9]+$)
+- **Input:** `alias` (string, len 1..100), `clientToken` (string, len 1..64, pattern ^[!-~]+$, @idempotencyToken), `tags` (map<string,string>, len ..50), `kmsKeyArn` (string, len 20..2048, pattern ^arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/[-a-f0-9]+$ — enforced as `key/.+`, the constraint the live service applies; see README, "Where this emulator reads a member's constraint differently")
 - **Output:** `workspaceId` (string, len 1..64, pattern [0-9A-Za-z][-.0-9A-Z_a-z]*, required), `arn` (string, pattern ^arn:aws[-a-z]*:aps:[-a-z0-9]+:[0-9]{12}:workspace/.+$, required), `status` (WorkspaceStatus, required), `tags` (map<string,string>, len ..50), `kmsKeyArn` (string, len 20..2048, pattern ^arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/[-a-f0-9]+$)
 - **Errors:** `AccessDeniedException (HTTP 403)`, `ConflictException (HTTP 409)`, `InternalServerException (HTTP 500)`, `ServiceQuotaExceededException (HTTP 402)`, `ThrottlingException (HTTP 429)`, `ValidationException (HTTP 400)`
 

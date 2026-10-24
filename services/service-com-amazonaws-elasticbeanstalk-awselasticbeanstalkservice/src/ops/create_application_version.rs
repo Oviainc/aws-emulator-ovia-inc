@@ -259,7 +259,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // carries the service's version-lifecycle defaults.
                 resource_lifecycle_config:
                     crate::state::resource_lifecycle_config_with_defaults(None),
-                configuration_templates: Vec::new(),
+                // A configuration template is a separate resource, created by
+                // `CreateConfigurationTemplate`. The list
+                // DescribeApplications reports is read from the template
+                // store, so there is nothing to carry on the record itself.
                 tags: Vec::new(),
                 pending_deletion: None,
             };
