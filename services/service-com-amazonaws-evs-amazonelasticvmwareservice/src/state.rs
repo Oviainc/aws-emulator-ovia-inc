@@ -106,6 +106,18 @@ pub const CONNECTOR_ACTIVE: &str = "ACTIVE";
 /// See [`CONNECTOR_CREATING`].
 pub const CONNECTOR_DELETED: &str = "DELETED";
 
+/// The `ConnectorType` of a connector to a vCenter Server appliance: "VCENTER:
+/// Connector to a vCenter Server appliance. Required for features that depend on
+/// vCenter, such as Windows Server license-included"
+/// (`smithy_query(query="doc", shape="CreateEnvironmentConnectorRequest",
+/// member="type")`).
+///
+/// Windows Server license-included IS the entitlement surface (`EntitlementType` has
+/// the single value `WINDOWS_SERVER`), so it is the type of connector an entitlement is
+/// created through: "using the provided vCenter Server connector" (`CreateEntitlement`
+/// doc).
+pub const CONNECTOR_TYPE_VCENTER: &str = "VCENTER";
+
 /// The `EntitlementStatus` values a stored entitlement moves through.
 ///
 /// The model declares `CREATING | CREATED | DELETED | AT_RISK | ENTITLEMENT_REMOVED |
@@ -1612,6 +1624,25 @@ pub fn live_connector_of_type<'a>(
     environment.connectors.values().find(|connector| {
         connector.connector_type == connector_type && connector.state != CONNECTOR_DELETED
     })
+}
+
+/// The live connector `connector_id` names in this environment, if any: the record a
+/// request that addresses a connector by id resolves to.
+///
+/// The id is scoped to the environment, exactly as `UpdateEnvironmentConnector` reads
+/// it, and a connector that has reached `DELETED` resolves to nothing: "The resource
+/// might not be specified correctly, or it may have a `state` of `DELETED`"
+/// (`ResourceNotFoundException` doc). Every other `ConnectorState` is live — the
+/// connection is being established (`CREATING`), reconfigured (`UPDATING`) or up
+/// (`ACTIVE`) — so the record exists and is the one the request named.
+pub fn live_connector<'a>(
+    environment: &'a StoredEnvironment,
+    connector_id: &str,
+) -> Option<&'a StoredConnector> {
+    environment
+        .connectors
+        .get(connector_id)
+        .filter(|connector| connector.state != CONNECTOR_DELETED)
 }
 
 /// The largest page a `@paginated` operation of this service returns when the caller

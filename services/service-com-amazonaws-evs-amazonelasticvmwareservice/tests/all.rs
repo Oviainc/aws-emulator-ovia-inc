@@ -24,6 +24,8 @@ mod connectors;
 mod connectors_and_hosts;
 #[path = "all/create_environment_validation.rs"]
 mod create_environment_validation;
+#[path = "all/entitlement_connector.rs"]
+mod entitlement_connector;
 #[path = "all/entitlements.rs"]
 mod entitlements;
 #[path = "all/environment_deletion_hosts.rs"]
