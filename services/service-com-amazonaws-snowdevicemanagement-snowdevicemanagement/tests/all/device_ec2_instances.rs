@@ -14,8 +14,10 @@
 //!    instance of one device is never visible through another;
 //! 2. every reported instance's `state.code` is the low byte the model documents for its
 //!    `state.name`, and its `rootDeviceName` is one of its block device mappings;
-//! 3. a request addressed to a device the account does not manage is refused with HTTP
-//!    403 `AccessDeniedException` whose message discloses nothing about the id;
+//! 3. a `managedDeviceId` that names no device of the account in the signed Region is
+//!    refused with the modelled HTTP 404 `ResourceNotFoundException` — the same answer
+//!    the sibling id-addressed operations give for the same condition — whatever was
+//!    asked of it;
 //! 4. the operation is a report: two identical calls answer identically.
 //!
 //! Each case is a TABLE whose rows differ along what the rule generalises over — the
@@ -427,14 +429,14 @@ async fn an_instance_of_one_device_is_not_visible_through_another() {
 }
 
 #[tokio::test]
-async fn a_device_the_account_does_not_manage_is_refused_without_disclosing_it() {
+async fn a_device_the_account_does_not_manage_is_not_found() {
     let router = emulator();
     let managed = inventory(&router).await;
     let held = device_instance_ids(0);
-    let mut messages: BTreeSet<String> = BTreeSet::new();
+    let mut codes: BTreeSet<String> = BTreeSet::new();
 
-    // The table rows: the shape of the unmanaged id × what was asked of it. The gate is
-    // ahead of the instance ids, so every row is refused the same way.
+    // The table rows: the shape of the unknown id × what was asked of it. The id is
+    // resolved ahead of the instance ids, so every row is the same refusal.
     for device in unmanaged_device_ids() {
         assert!(
             !managed.contains(&device),
@@ -444,33 +446,32 @@ async fn a_device_the_account_does_not_manage_is_refused_without_disclosing_it()
             let case = format!("device {device:?} with {} requested id(s)", requested.len());
             let answer = describe_instances(&router, &device, &requested).await;
             assert_eq!(
-                answer.status, 403,
-                "case {case:?}: expected HTTP 403, got {} with {}",
+                answer.status, 404,
+                "case {case:?}: expected HTTP 404, got {} with {}",
                 answer.status, answer.body
             );
             assert!(
-                answer.error_code().contains("AccessDeniedException"),
-                "case {case:?}: expected an AccessDeniedException, got {}",
+                answer.error_code().contains("ResourceNotFoundException"),
+                "case {case:?}: expected a ResourceNotFoundException, got {}",
                 answer.body
             );
-            let message = answer.error_message().to_string();
             assert!(
-                !message.is_empty() && !message.contains(&device),
-                "case {case:?}: the refusal must say nothing about the id asked for, got \
-                 {message:?}"
+                !answer.error_message().is_empty(),
+                "case {case:?}: the refusal carries a message, got {}",
+                answer.body
             );
-            messages.insert(message);
+            codes.insert(answer.error_code().to_string());
         }
     }
 
     assert_eq!(
-        messages.len(),
+        codes.len(),
         1,
-        "case \"no leak\": one refusal answers every unmanaged device, or the message \
-         itself tells the caller which ids exist; got {messages:?}"
+        "case \"one refusal\": an id that names no device is one outcome, whatever its \
+         shape and whatever was asked of it; got {codes:?}"
     );
 
-    // The gate did not disturb the devices the account does manage.
+    // The refusals did not disturb the devices the account does manage.
     let case = "a managed device after the refusals";
     let answer = describe_instances(&router, &managed[0], &held).await;
     assert_eq!(

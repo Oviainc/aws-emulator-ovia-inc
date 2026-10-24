@@ -112,16 +112,17 @@ pub const MAX_TAG_VALUE_LENGTH: usize = 256;
 pub const TAG_RESOURCE_INVALID_ARN_MESSAGE: &str = "Invalid input resource arn";
 
 /// What the account-level device gate ([`no_devices_in_region`],
-/// [`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::gated_device`]) is
-/// refused with.
+/// [`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::has_activated_device`])
+/// is refused with.
 ///
 /// Recorded behaviour of the real service: a request to a Region where the account
-/// has no Snow device with Snow Device Management activated — or one addressed to a
-/// device outside that inventory — is refused with `AccessDeniedException` (the
-/// model gives the shape and its `@httpError 403`; it gives no text), and the
-/// refusal names device/region availability rather than an IAM principal: it never
-/// says whether that id exists, which is why one message answers every such
-/// request.
+/// has no Snow device with Snow Device Management activated is refused with
+/// `AccessDeniedException` (the model gives the shape and its `@httpError 403`; it
+/// gives no text), and the refusal names device/region availability rather than an
+/// IAM principal: it never says whether any id exists, which is why one message
+/// answers every such request. It is an ACCOUNT-level precondition only: past it,
+/// an id that names no record is the modelled `ResourceNotFoundException`
+/// ([`not_found`]).
 pub const NO_DEVICES_MESSAGE: &str = "No devices found in this region.";
 
 /// The root device volume of every Amazon EC2 instance the fixture places on a
@@ -514,25 +515,6 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
             activated.push(managed_device_id);
         }
         activated
-    }
-
-    /// The managed device `managed_device_id` names in `region`, or the device
-    /// gate's refusal — [`NO_DEVICES_MESSAGE`] as an `AccessDeniedException`.
-    ///
-    /// Snow Device Management manages devices the account already ordered and
-    /// activated in a Region, so a request addressed to a device outside that
-    /// inventory is refused rather than resolved: the caller learns neither
-    /// whether the id exists nor anything about it, and a Region with no
-    /// activated device at all is refused the same way. Every operation that
-    /// takes a `managedDeviceId` declares `AccessDeniedException` (`@httpError
-    /// 403`), which is what this refusal is reported as.
-    pub fn gated_device(
-        &self,
-        region: &str,
-        managed_device_id: &str,
-    ) -> Result<&Device, AccessDeniedException> {
-        self.device_in(region, managed_device_id)
-            .ok_or_else(no_devices_in_region)
     }
 
     /// Mint an unused task id. `TaskId` is bounded 1..64 and otherwise
