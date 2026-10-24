@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStateMachineVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStateMachineVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: a REPORTING operation. It pages the version records a published
+//! `CreateStateMachine` or `UpdateStateMachine` stored, newest first.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStateMachineVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request this operation cannot serve is refused with one of the operation's own
+//! modelled errors; it never answers 501.
+//!
+//! The only write it makes is `ComAmazonawsSfnAwsstepfunctionsState::settle`: a state
+//! machine whose removal the clock already owed takes its versions with it, so this
+//! listing does not name them.
+//!
+//! An ARN that names no state machine is reported as a state machine with no
+//! versions rather than as a resource that is absent: this operation models only
+//! `InvalidArn`, `InvalidToken` and `ValidationException`
+//! (`smithy_query(query="operation",operation="ListStateMachineVersions")`), unlike
+//! `ListStateMachineAliases` and `ListExecutions`, which both model
+//! `StateMachineDoesNotExist`.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +169,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStateMachineVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStateMachineVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStateMachineVersions"))
+        // `maxResults` (0..1000), `nextToken` (len 1..1024) and `stateMachineArn`
+        // (len 1..256) are modelled, so the centralized walk has already refused
+        // anything outside them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The ARN is judged BEFORE anything is resolved from it: text that is not a
+        // well-formed state machine ARN of this service, in the region this endpoint
+        // serves, is a defect in the REQUEST, which `InvalidArn` reports.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        let parsed =
+            match crate::state::read_state_machine_arn(&input.state_machine_arn, &endpoint_region) {
+                Ok(parsed) => parsed,
+                Err(message) => {
+                    return Err(ListStateMachineVersionsErrorModeled::InvalidArn(InvalidArn {
+                        message: Some(message),
+                    })
+                    .into())
+                }
+            };
+
+        // "A qualified state machine ARN can either refer to a Distributed Map state
+        // defined within a state machine, a version ARN, or an alias ARN." This
+        // operation lists "versions for the specified state machine", so none of the
+        // three is an ARN whose versions it can list: a Distributed Map state is
+        // refused through the modelled `API_DOES_NOT_SUPPORT_LABELED_ARNS` reason, and
+        // a version or an alias is a resource that has no versions of its own.
+        if parsed.label().is_some() {
+            return Err(ListStateMachineVersionsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::LABELED_ARN_MESSAGE.to_string()),
+                    reason: Some(crate::state::VALIDATION_REASON_LABELED_ARN.to_string()),
+                },
+            )
+            .into());
+        }
+        if parsed.qualifier.is_some() {
+            return Err(ListStateMachineVersionsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "'{}' is a qualified ARN, naming a version or an alias, which has no \
+                         versions of its own",
+                        input.state_machine_arn
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // "The value of nextToken is a unique pagination token for each page": a token
+        // this service never issued is the modelled `InvalidToken`.
+        let Some(offset) = crate::state::page_offset(input.next_token.as_deref()) else {
+            return Err(ListStateMachineVersionsErrorModeled::InvalidToken(
+                InvalidToken {
+                    message: Some("nextToken is not a token this service issued".to_string()),
+                },
+            )
+            .into());
+        };
+        let page = crate::state::page_size(input.max_results);
+
+        let mut store = state.lock();
+        // The one write a report may make: a state machine whose removal the clock
+        // already owed is gone, and its versions went with it, so this listing does
+        // not name them.
+        store.settle(crate::state::now());
+
+        // "The results are sorted in descending order of the version creation time."
+        let versions = store.versions_newest_first(&input.state_machine_arn);
+        let total = versions.len();
+        let state_machine_versions: Vec<StateMachineVersionListItem> = versions
+            .iter()
+            .skip(offset)
+            .take(page)
+            .map(|version| StateMachineVersionListItem {
+                state_machine_version_arn: version.arn.clone(),
+                creation_date: crate::state::to_date_time(version.creation_date),
+            })
+            .collect();
+
+        let next_token =
+            crate::state::next_page_token(offset, state_machine_versions.len(), total);
+        Ok(ListStateMachineVersionsOutput {
+            state_machine_versions,
+            next_token,
+        })
     }
 }

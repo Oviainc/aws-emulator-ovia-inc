@@ -1121,20 +1121,49 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .map_or(0, |machine| machine.retained_bytes)
     }
 
-    /// The published versions of one state machine, in version order.    ///
+    /// The published versions of one state machine, in version order.
+    pub fn versions_of(&self, state_machine_arn: &str) -> Vec<&StateMachineVersion> {
+        let mut versions = self.versions_unordered(state_machine_arn);
+        versions.sort_by_key(|version| version.version);
+        versions
+    }
+
+    /// The published versions of one state machine, NEWEST FIRST.
+    ///
+    /// From `ListStateMachineVersions`' own documentation: "The results are sorted in
+    /// descending order of the version creation time." The comparator is keyed on
+    /// that documented sort key — the creation time — rather than on the version
+    /// order [`ComAmazonawsSfnAwsstepfunctionsState::versions_of`] reversed, so the
+    /// order still follows the clock if a version is ever stored out of number
+    /// order; two versions published inside one clock tick carry the same creation
+    /// time, so the version number — which only ever increases
+    /// ([`ComAmazonawsSfnAwsstepfunctionsState::publish_state_machine_version`]) —
+    /// breaks the tie, keeping the order total so a page token means the same thing
+    /// on the next call.
+    pub fn versions_newest_first(&self, state_machine_arn: &str) -> Vec<&StateMachineVersion> {
+        let mut versions = self.versions_unordered(state_machine_arn);
+        versions.sort_by(|left, right| {
+            right
+                .creation_date
+                .cmp(&left.creation_date)
+                .then_with(|| right.version.cmp(&left.version))
+        });
+        versions
+    }
+
+    /// The published versions of one state machine, in no particular order.
+    ///
     /// Every version ARN of one state machine begins with its ARN and a colon, so
     /// this is a range scan over the contiguous block rather than a filter over
-    /// every version in the store.
-    pub fn versions_of(&self, state_machine_arn: &str) -> Vec<&StateMachineVersion> {
+    /// every version in the store. It is what both ordered accessors above sort, so
+    /// each of them sorts the scan exactly once.
+    fn versions_unordered(&self, state_machine_arn: &str) -> Vec<&StateMachineVersion> {
         let prefix = format!("{state_machine_arn}:");
-        let mut versions: Vec<&StateMachineVersion> = self
-            .state_machine_versions
+        self.state_machine_versions
             .range(prefix.clone()..)
             .take_while(|(arn, _)| arn.starts_with(&prefix))
             .map(|(_, version)| version)
-            .collect();
-        versions.sort_by_key(|version| version.version);
-        versions
+            .collect()
     }
 
     /// Apply `update` to the state machine `arn` names: every member the update
