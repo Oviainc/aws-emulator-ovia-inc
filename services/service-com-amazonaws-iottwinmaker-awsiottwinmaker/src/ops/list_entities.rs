@@ -293,24 +293,18 @@ fn matches_filter(entity: &crate::state::Entity, filter: Option<&ListEntitiesFil
 
 /// The envelope a `nextToken` of this service carries, so a token minted
 /// elsewhere — for another workspace, or by hand — is recognisably not one of
-/// ours.
+/// ours. The token itself is the shape every paginated operation of this service
+/// mints ([`crate::state::encode_page_token`]), scoped to the workspace whose
+/// page it is.
 const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:entities:1:";
 
 /// The opaque `nextToken` for a page of `workspace_id` starting at `entity_id`.
-///
-/// Hex so the token is opaque to a caller and safe in a JSON body, over an
-/// envelope that names the listing it belongs to and the resume KEY rather than
-/// an offset.
 fn encode_next_token(workspace_id: &str, entity_id: &str) -> String {
-    ::hex::encode(format!("{NEXT_TOKEN_PREFIX}{workspace_id}/{entity_id}"))
+    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id], entity_id)
 }
 
 /// The entity id inside a `nextToken` minted for `workspace_id`, or `None` when
 /// the token is not one this service minted for that workspace.
 fn decode_next_token(token: &str, workspace_id: &str) -> Option<String> {
-    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    let body = decoded.strip_prefix(NEXT_TOKEN_PREFIX)?;
-    let (token_workspace_id, entity_id) = body.split_once('/')?;
-    (token_workspace_id == workspace_id && !entity_id.is_empty())
-        .then(|| entity_id.to_string())
+    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id], token)
 }

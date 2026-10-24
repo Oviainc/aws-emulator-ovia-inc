@@ -12,13 +12,14 @@
 //! `authorityId` it already has, and a TRN the account does not hold yet gets a
 //! freshly minted one.
 //!
-//! WHICH JURISDICTIONS may hold a supplemental TRN is a separate rule, recorded
-//! and filed as its own issue
-//! (`issues/.../taxsettings-supplemental-trn-and-batch-tax-registration-write-paths.md`,
-//! cause 3: entries for some countries are refused with the modelled
-//! `ValidationException`). This handler applies the rules the model states for
-//! the entry and does not guess that country set; the refusal belongs in the
-//! check sequence below when that issue is fixed.
+//! WHICH JURISDICTIONS may hold a supplemental TRN is a rule of its own, and it
+//! is applied here: supplemental registration is supported in a bounded set of
+//! jurisdictions ([`crate::state::SUPPLEMENTAL_TRN_COUNTRIES`]), and an entry
+//! whose `address.countryCode` is not one of them is refused with the modelled
+//! `ValidationException` before anything is stored. The model names no
+//! jurisdiction — see that constant for where the set comes from, and why
+//! refusing is the right answer for a country this emulator has no evidence AWS
+//! accepts.
 //!
 //! ## Shape of an operation
 //!
@@ -163,6 +164,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let entry = &input.tax_registration_entry;
+
+        // Supplemental registration is supported in a bounded set of
+        // jurisdictions, and an entry for any other country is refused before
+        // anything is stored — the rule the module header states.
+        crate::state::check_supplemental_jurisdiction(entry)
+            .map_err(PutSupplementalTaxRegistrationErrorModeled::ValidationException)?;
 
         // `registrationId`, `legalName` and the address lines carry the model's
         // non-blank pattern `^(?!\s*$)[\s\S]+$`, a negative lookahead the

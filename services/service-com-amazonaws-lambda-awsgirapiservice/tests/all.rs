@@ -17,6 +17,8 @@ mod account_settings;
 mod async_invocation;
 #[path = "all/capacity_provider_bounds.rs"]
 mod capacity_provider_bounds;
+#[path = "all/capacity_provider_listing.rs"]
+mod capacity_provider_listing;
 #[path = "all/capacity_provider_naming.rs"]
 mod capacity_provider_naming;
 #[path = "all/capacity_providers.rs"]

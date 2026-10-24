@@ -29,8 +29,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    count, create_cluster, identity_document, list, ok, refusal, refused, register_definition,
-    service, string, ACCOUNT, SIGNED_REGION,
+    count, create_cluster, identity_document, list, ok, refusal, refused, register_capacity,
+    register_definition, service, string, ACCOUNT, SIGNED_REGION,
 };
 
 /// Long enough for one clock-owed transition (`state::TRANSITION_SPAN` is 500 ms) to fall
@@ -181,6 +181,10 @@ async fn deleting_a_cluster_leaves_an_inactive_tombstone_every_reader_sees() {
             }
             Emptied::StoppedTask => {
                 register_definition(&router, &format!("{name}family"), case).await;
+                // A task placed with the EC2 launch type runs on an instance registered
+                // to the cluster, so the cluster needs one before `RunTask` places it.
+                // The delete that follows releases it with the cluster.
+                register_capacity(&router, name, case).await;
                 let run = ok(
                     &router,
                     "RunTask",
@@ -408,6 +412,9 @@ async fn a_cluster_delete_is_refused_only_while_it_holds_something_unreleased() 
             }
             Holding::LiveTask | Holding::StoppingTask | Holding::StoppedTask => {
                 register_definition(&router, &format!("{name}family"), case).await;
+                // The EC2 launch type places the task on an instance registered to the
+                // cluster, so the cluster needs one before `RunTask` places it.
+                register_capacity(&router, name, case).await;
                 let run = ok(
                     &router,
                     "RunTask",
@@ -670,7 +677,7 @@ async fn described_clusters_follow_the_requested_order_and_always_carry_their_li
         );
         assert_eq!(
             list(&cluster, "statistics", case).len(),
-            8,
+            16,
             "case {case:?}: expected the launch-type statistics of {name:?}, got \
              {cluster}"
         );

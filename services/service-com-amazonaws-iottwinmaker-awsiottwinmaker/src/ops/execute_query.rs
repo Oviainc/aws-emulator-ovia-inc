@@ -1994,28 +1994,27 @@ fn unbind(binding: &mut Binding, slot: Option<usize>) {
 // ---------------------------------------------------------------------------
 
 /// The envelope a `nextToken` of this operation carries, so a token minted elsewhere —
-/// by another listing, or by hand — is recognisably not one of ours.
+/// by another listing, or by hand — is recognisably not one of ours. The token itself is
+/// the shape every paginated operation of this service mints
+/// ([`crate::state::encode_page_token`]), scoped to the workspace AND the statement the
+/// offset belongs to: the row set is recomputed per call, so an offset only means
+/// something for the same query. The statement goes last, where the envelope lets a scope
+/// part carry newlines of its own.
 const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:query:1:";
 
 /// The opaque `nextToken` for the page of this query's rows starting at `offset`.
-///
-/// Hex so the token is opaque to a caller and safe in a JSON body, over an envelope
-/// carrying the workspace and the statement the offset belongs to: the row set is
-/// recomputed per call, so an offset only means something for the same query.
 fn encode_next_token(offset: usize, workspace_id: &str, statement: &str) -> String {
-    ::hex::encode(format!(
-        "{NEXT_TOKEN_PREFIX}{offset}:{workspace_id}\n{statement}"
-    ))
+    crate::state::encode_page_token(
+        NEXT_TOKEN_PREFIX,
+        &[workspace_id, statement],
+        &offset.to_string(),
+    )
 }
 
 /// The row offset inside a `nextToken` minted for this workspace and statement, or
 /// `None` when the token is not one of ours or belongs to another query.
 fn decode_next_token(token: &str, workspace_id: &str, statement: &str) -> Option<usize> {
-    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    let body = decoded.strip_prefix(NEXT_TOKEN_PREFIX)?;
-    let (offset, rest) = body.split_once(':')?;
-    let (token_workspace_id, token_statement) = rest.split_once('\n')?;
-    (token_workspace_id == workspace_id && token_statement == statement)
-        .then(|| offset.parse::<usize>().ok())
-        .flatten()
+    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id, statement], token)?
+        .parse::<usize>()
+        .ok()
 }

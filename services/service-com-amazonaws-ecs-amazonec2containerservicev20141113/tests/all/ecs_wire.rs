@@ -202,6 +202,35 @@ pub(crate) async fn create_cluster(
     string(&body["cluster"], "clusterArn", case)
 }
 
+/// The EC2 instance id the shared capacity helper registers. One per cluster is enough:
+/// a container instance is registered INTO a cluster, so the same instance id in another
+/// cluster is another registration.
+const CAPACITY_INSTANCE_ID: &str = "i-0c0ffee0c0ffee0c0";
+
+/// Create a cluster and register ONE container instance into it, so a task placed with
+/// a launch type whose capacity is registered to the cluster has somewhere to run —
+/// `RunTask` refuses a cluster with none ("The EC2 launch type runs your tasks on Amazon
+/// EC2 instances registered to your cluster"). Returns the cluster's ARN.
+pub(crate) async fn cluster_with_capacity(
+    router: &MultiServiceRouter,
+    name: &str,
+    case: &str,
+) -> String {
+    let arn = create_cluster(router, name, case).await;
+    register_capacity(router, name, case).await;
+    arn
+}
+
+/// Register ONE container instance into an EXISTING cluster, for a suite that created
+/// the cluster itself. Returns the container instance's ARN.
+pub(crate) async fn register_capacity(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    case: &str,
+) -> String {
+    register_instance(router, cluster, CAPACITY_INSTANCE_ID, case).await
+}
+
 /// Register one revision of `family` with a single container and return its ARN. The
 /// suites that need a plain revision share this one; a suite that needs a revision of a
 /// particular SHAPE (Fargate-compatible, a named container) builds its own.
