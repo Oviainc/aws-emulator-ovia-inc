@@ -215,6 +215,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),
             })
         })?;
+        // The region this request addresses: the probe is attached to a monitor
+        // of THIS region, and its ARN names this region.
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
@@ -238,23 +240,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A repeat carrying the same idempotency token is a RETRY: it replays
         // the probe that token already minted rather than minting a second one.
+        // A token replays only in the region it was sent to.
         if let Some(token) = input.client_token.as_deref() {
             let replayed = store
-                .client_tokens
-                .get(token)
+                .client_token_record(&region, token)
                 .filter(|record| record.monitor_name == input.monitor_name)
                 .and_then(|record| record.probe_id.clone());
             if let Some(probe) = replayed.and_then(|probe_id| {
                 store
-                    .monitors
-                    .get(&input.monitor_name)
+                    .monitor(&region, &input.monitor_name)
                     .and_then(|monitor| monitor.probes.get(&probe_id))
             }) {
                 return Ok(output_for(probe));
             }
         }
 
-        if !store.monitors.contains_key(&input.monitor_name) {
+        if store.monitor(&region, &input.monitor_name).is_none() {
             return Err(CreateProbeErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::monitor_not_found_message(
@@ -265,8 +266,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let probe_count = store
-            .monitors
-            .get(&input.monitor_name)
+            .monitor(&region, &input.monitor_name)
             .map_or(0, |monitor| monitor.probes.len());
         if probe_count >= crate::state::MAX_PROBES_PER_MONITOR {
             return Err(CreateProbeErrorModeled::ServiceQuotaExceededException(
@@ -292,11 +292,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(validation)?;
         let probe_id = probe.probe_id.clone();
-        let monitor = store.monitors.get_mut(&input.monitor_name).ok_or_else(|| {
-            CreateProbeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::monitor_not_found_message(&input.monitor_name)),
-            })
-        })?;
+        let monitor = store
+            .monitor_mut(&region, &input.monitor_name)
+            .ok_or_else(|| {
+                CreateProbeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::monitor_not_found_message(&input.monitor_name)),
+                })
+            })?;
         monitor.probes.insert(probe_id.clone(), probe);
         // The monitor changed: it now holds a probe, so it is owed the
         // `PENDING` -> `ACTIVE` transition and its `modifiedAt` moves.
@@ -304,7 +306,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         monitor.schedule_activation(now);
 
         if let Some(token) = input.client_token {
-            store.client_tokens.insert(
+            store.record_client_token(
+                &region,
                 token,
                 crate::state::ClientTokenRecord {
                     monitor_name: input.monitor_name.clone(),
@@ -316,8 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answered from the STORED probe, so what the caller is told is what a
         // later `GetMonitor` lists.
         let stored = store
-            .monitors
-            .get(&input.monitor_name)
+            .monitor(&region, &input.monitor_name)
             .and_then(|monitor| monitor.probes.get(&probe_id))
             .ok_or_else(|| {
                 CreateProbeErrorModeled::InternalServerException(InternalServerException {

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCatalogItems
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCatalogItems`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the catalog of orderable hardware configurations this service
+//! publishes, in the catalog's stable order, narrowed by each filter the caller sent
+//! and cut into pages of at most `MaxResults` with the modelled `NextToken` the next
+//! page resumes from. A read: it never changes what a later caller sees.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCatalogItems::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The catalog is seeded in
+//! [`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::default`] from
+//! [`crate::state::catalog_item_catalog`] and no operation mutates it, so this
+//! operation only reads.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +147,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // The catalog is the same for every caller, so nothing here reads the
+        // request's metadata; the whole answer comes from `input` and the store.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCatalogItems` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCatalogItemsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCatalogItems"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListCatalogItemsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+
+        // The resume point the caller's token names. A token this service did not
+        // issue for THIS list is a bad request, not an empty page — the same rule
+        // every other list in this service applies to theirs.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::CATALOG_ITEM_PAGE, token).ok_or_else(
+                    || {
+                        ListCatalogItemsErrorModeled::ValidationException(ValidationException {
+                            message: Some(crate::state::page_token_report("ListCatalogItems")),
+                        })
+                    },
+                )?,
+            ),
+            None => None,
+        };
+        let size = crate::state::page_size(input.max_results);
+        // Each filter is a LIST of accepted values for ONE fact about an item, so an
+        // item is reported when EVERY filter the request carried accepts it, and a
+        // filter accepts it when ANY one of that filter's values matches — "the
+        // results include only the resources that match all of the specified
+        // filters", and within one filter "items that match any of the values". A
+        // filter the request did not carry accepts everything. A value outside a
+        // modelled enum never reaches here: the framework refuses it as a 400
+        // `ValidationException` before this handler runs. A selected item is reported
+        // WHOLE — a filter narrows which items a page holds, never what one of them
+        // says about itself.
+        let classes = input.item_class_filter.unwrap_or_default();
+        let storage = input.supported_storage_filter.unwrap_or_default();
+        let families = input.ec2_family_filter.unwrap_or_default();
+
+        let store = state.lock();
+        let (catalog_items, next_token) = crate::state::page(
+            crate::state::CATALOG_ITEM_PAGE,
+            store
+                .catalog_items
+                .iter()
+                .filter(|record| {
+                    record.is_class(&classes)
+                        && record.supports_storage(&storage)
+                        && record.offers_family(&families)
+                })
+                .map(|record| (record.sequence, record.item.clone())),
+            after,
+            size,
+        );
+
+        Ok(ListCatalogItemsOutput {
+            catalog_items: Some(catalog_items),
+            next_token,
+        })
     }
 }

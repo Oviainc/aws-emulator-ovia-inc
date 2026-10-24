@@ -486,6 +486,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                     state: crate::state::PENDING,
                     due: Some(due),
+                    // A restored virtual computer holds no Amazon DCV session
+                    // access: a GUI session runs on a RUNNING computer and is
+                    // created by `CreateGUISessionAccessDetails`, not carried
+                    // over from the snapshot.
+                    gui_session: None,
                 });
                 // Each mapped disk is restored as a block storage disk of its
                 // own and attached to the new instance at the device path it was
