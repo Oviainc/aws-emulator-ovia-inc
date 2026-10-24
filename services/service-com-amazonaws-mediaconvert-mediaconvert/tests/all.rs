@@ -23,6 +23,8 @@ mod idempotent_repeats;
 mod job_engine_versions;
 #[path = "all/job_lifecycle.rs"]
 mod job_lifecycle;
+#[path = "all/job_search.rs"]
+mod job_search;
 #[path = "all/job_template_crud.rs"]
 mod job_template_crud;
 #[path = "all/job_templates.rs"]
