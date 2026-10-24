@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags carried by the resource the request names, read from this
+//! service's store: the tag map is whatever the resource holds at the time of the
+//! call, so it is exactly what the create (and any later tag write) persisted. A
+//! pure read — nothing about the resource changes because its tags were listed.
+//!
+//! `ResourceArn` admits exactly one resource kind (`^arn:aws:appsync:…:apis/…$`), so
+//! the resource named is a GraphQL API, resolved by its own stored ARN; an ARN this
+//! account holds no API for is a 404 `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +151,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // A pure read: the tags reported are the ones the resource holds, and
+        // nothing about them depends on this request's metadata.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let guard = state.lock();
+
+        // `ResourceArn` is constrained to the ARN of ONE resource kind — an AppSync
+        // GraphQL API — and that constraint is enforced before this handler runs, so
+        // the value here is a well-formed API ARN and the only question left is
+        // whether this account holds the API it names.
+        let Some(record) = crate::state::api_by_identifier(&guard.graphql_apis, &input.resource_arn)
+        else {
+            return Err(ListTagsForResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // The tag map is reported whether or not the resource carries tags, so a
+        // caller reads the same member on every resource and an untagged resource is
+        // an EMPTY map rather than an absent one. `TagMap`'s modelled minimum length
+        // of 1 bounds what a tag WRITE may carry, not what a listing reports; the
+        // same choice is made by the `GraphqlApi` projection in `crate::state`,
+        // where a recording pinned it.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(crate::state::map_out(&record.tags)),
+        })
     }
 }
