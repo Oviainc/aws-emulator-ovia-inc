@@ -15,6 +15,10 @@
 //!
 //! Every handler reads and writes the one record below through [`service_state`];
 //! nothing in this service answers from a literal.
+//!
+//! Both resources are REGIONAL, as AWS Signer is: a profile and the jobs, tags
+//! and permissions that hang off it belong to the region whose endpoint created
+//! them, and no other region's endpoint resolves them (see [`ProfileKey`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
@@ -139,11 +143,28 @@ pub fn default_signature_validity_period() -> SignatureValidityPeriod {
 /// the record and materialised by whichever later call reads it — nothing sleeps.
 pub const JOB_COMPLETION_SPAN: Duration = Duration::from_millis(500);
 
+/// The key one signing profile — and everything that belongs to it — is held
+/// under: the region the resource lives in, then its `profileName`.
+///
+/// AWS Signer is a regional service, so a profile is a resource OF the region
+/// whose endpoint created it: the same name in two regions names two independent
+/// profiles, and neither is reachable through the other's endpoint. The region
+/// comes first so the keys of one region are a contiguous range of the map,
+/// ordered by name — the stable total order the profile pagination token indexes
+/// into.
+pub type ProfileKey = (String, String);
+
+/// The [`ProfileKey`] of `profile_name` in `region`.
+pub fn profile_key(region: &str, profile_name: &str) -> ProfileKey {
+    (region.to_string(), profile_name.to_string())
+}
+
 /// One signing profile, as this emulator persists it.
 ///
-/// `arn` and `profile_version_arn` are stored rather than recomputed per read, so
-/// a profile created by a request signed for one region keeps reporting that
-/// region's ARN.
+/// `arn` and `profile_version_arn` are stored rather than recomputed per read;
+/// the region they name is the one the profile is keyed under (see
+/// [`ProfileKey`]), so a profile's own ARN always names the region whose endpoint
+/// serves it.
 #[derive(Debug, Clone)]
 pub struct SigningProfileRecord {
     pub profile_name: String,
@@ -283,6 +304,10 @@ impl SigningProfileRecord {
 #[derive(Debug, Clone)]
 pub struct SigningJobRecord {
     pub job_id: String,
+    /// The region this job was started in — the one whose endpoint reports it.
+    /// A job belongs to the region of the profile it signs with, which is the
+    /// region the `StartSigningJob` was signed for.
+    pub region: String,
     pub profile_name: String,
     pub profile_version: String,
     pub platform_id: String,
@@ -341,21 +366,26 @@ pub mod permissions;
 /// Per-service state for com-amazonaws-signer-wallabyservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSignerWallabyserviceState {
-    /// Every signing profile, keyed by `profileName` — the name every operation
-    /// and every profile ARN resolves through. A `BTreeMap` is what gives
-    /// `ListSigningProfiles` the stable total order its pagination token indexes
-    /// into.
-    pub profiles: BTreeMap<String, SigningProfileRecord>,
+    /// Every signing profile, keyed by [`ProfileKey`] — the region it lives in
+    /// and the `profileName` every operation and every profile ARN resolves
+    /// through. A `BTreeMap` is what gives `ListSigningProfiles` the stable total
+    /// order its pagination token indexes into, within one region.
+    pub profiles: BTreeMap<ProfileKey, SigningProfileRecord>,
     /// Every signing job, keyed by `jobId`; ids sort in the order they were
-    /// minted.
+    /// minted. Which region a job belongs to is [`SigningJobRecord::region`] —
+    /// a job id is unique across the store, so another region's id resolves to no
+    /// job at all rather than to a different one.
     pub jobs: BTreeMap<String, SigningJobRecord>,
     /// A `StartSigningJob` `clientRequestToken` to the job that token started, so
-    /// a retried start answers with the first job instead of a second one.
-    pub job_tokens: HashMap<String, String>,
+    /// a retried start answers with the first job instead of a second one. Keyed
+    /// by `(region, clientRequestToken)`: the token is a fact of the region's
+    /// endpoint that served it, so replaying it elsewhere starts that region's own
+    /// job.
+    pub job_tokens: HashMap<(String, String), String>,
     /// The cross-account permission policy of every profile that has one, keyed by
-    /// `profileName` — the same key [`Self::profiles`] uses, so a policy always
+    /// the same [`ProfileKey`] [`Self::profiles`] uses, so a policy always
     /// resolves through the profile it belongs to.
-    pub profile_permissions: BTreeMap<String, permissions::ProfilePermissionPolicy>,
+    pub profile_permissions: BTreeMap<ProfileKey, permissions::ProfilePermissionPolicy>,
     /// The counter profile versions are minted from.
     pub profile_version_seq: u64,
     /// The counter profile tokens are minted from.
@@ -418,26 +448,125 @@ impl ComAmazonawsSignerWallabyserviceState {
         uuid_shaped(PERMISSION_REVISION_NAMESPACE, self.permission_revision_seq)
     }
 
-    /// The job `job_id` names, with any completion the clock owes it already
-    /// materialised.
-    pub fn settled_job_mut(&mut self, job_id: &str, now: SystemTime) -> Option<&mut SigningJobRecord> {
-        let job = self.jobs.get_mut(job_id)?;
+    /// The profile `profile_name` names IN `region`, or `None` when that region
+    /// holds none of that name.
+    pub fn profile(&self, region: &str, profile_name: &str) -> Option<&SigningProfileRecord> {
+        self.profiles.get(&profile_key(region, profile_name))
+    }
+
+    /// [`Self::profile`], for a call that CHANGES the profile.
+    pub fn profile_mut(
+        &mut self,
+        region: &str,
+        profile_name: &str,
+    ) -> Option<&mut SigningProfileRecord> {
+        self.profiles.get_mut(&profile_key(region, profile_name))
+    }
+
+    /// Store `record` as `region`'s profile of that name, replacing whatever that
+    /// region held under it; another region's profile of the same name is left
+    /// alone.
+    pub fn insert_profile(&mut self, region: &str, record: SigningProfileRecord) {
+        let key = profile_key(region, &record.profile_name);
+        self.profiles.insert(key, record);
+    }
+
+    /// Every profile `region` holds, as `(profileName, profile)` in name order —
+    /// and nothing from any other region.
+    pub fn profiles_in<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = (&'a str, &'a SigningProfileRecord)> + 'a {
+        self.profiles
+            .range(profile_key(region, "")..)
+            .take_while(move |((profile_region, _), _)| profile_region == region)
+            .map(|((_, profile_name), profile)| (profile_name.as_str(), profile))
+    }
+
+    /// The permission policy of `region`'s profile of that name, or `None` when
+    /// nobody has granted anything on it.
+    pub fn profile_policy(
+        &self,
+        region: &str,
+        profile_name: &str,
+    ) -> Option<&permissions::ProfilePermissionPolicy> {
+        self.profile_permissions
+            .get(&profile_key(region, profile_name))
+    }
+
+    /// [`Self::profile_policy`], for a call that CHANGES an EXISTING policy.
+    pub fn profile_policy_mut(
+        &mut self,
+        region: &str,
+        profile_name: &str,
+    ) -> Option<&mut permissions::ProfilePermissionPolicy> {
+        self.profile_permissions
+            .get_mut(&profile_key(region, profile_name))
+    }
+
+    /// [`Self::profile_policy`], for a call that CHANGES the policy, creating the
+    /// empty policy when the profile holds none yet.
+    pub fn profile_policy_entry(
+        &mut self,
+        region: &str,
+        profile_name: &str,
+    ) -> &mut permissions::ProfilePermissionPolicy {
+        self.profile_permissions
+            .entry(profile_key(region, profile_name))
+            .or_default()
+    }
+
+    /// The job `job_id` names in `region`, with any completion the clock owes it
+    /// already materialised.
+    pub fn settled_job_mut(
+        &mut self,
+        region: &str,
+        job_id: &str,
+        now: SystemTime,
+    ) -> Option<&mut SigningJobRecord> {
+        let job = self
+            .jobs
+            .get_mut(job_id)
+            .filter(|job| job.region == region)?;
         job.settle(now);
         Some(job)
     }
 
-    /// The profile a tagging call's `resourceArn` names.
+    /// The job `region`'s endpoint already started for `client_request_token`, so
+    /// a repeated token answers with that job instead of starting a second one.
+    pub fn job_for_token(
+        &self,
+        region: &str,
+        client_request_token: &str,
+    ) -> Option<&SigningJobRecord> {
+        let job_id = self
+            .job_tokens
+            .get(&(region.to_string(), client_request_token.to_string()))?;
+        self.jobs.get(job_id)
+    }
+
+    /// Remember that `region`'s `client_request_token` started `job_id`.
+    pub fn record_job_token(&mut self, region: &str, client_request_token: &str, job_id: String) {
+        self.job_tokens
+            .insert((region.to_string(), client_request_token.to_string()), job_id);
+    }
+
+    /// The profile a tagging call's `resourceArn` names, as served by `region`'s
+    /// endpoint.
     ///
-    /// Resolution is by the ARN the profile was STORED with, so a label naming
-    /// another account's or another region's signing profile resolves to nothing
-    /// rather than to this account's profile of the same name.
+    /// Resolution is by the name the ARN carries, confirmed against the ARN the
+    /// profile was STORED with — so a label naming another account's or another
+    /// region's signing profile resolves to nothing rather than to this region's
+    /// profile of the same name. The ARN's own region has to be the region whose
+    /// endpoint is answering, because that is the only region whose resources
+    /// that endpoint holds.
     pub fn profile_for_tagging(
         &self,
+        region: &str,
         resource_arn: &str,
     ) -> Result<&SigningProfileRecord, TaggingArnProblem> {
-        let name = profile_name_in_arn(resource_arn).ok_or(TaggingArnProblem::Malformed)?;
-        self.profiles
-            .get(name)
+        let name = self.tagged_profile_name(region, resource_arn)?;
+        self.profile(region, name)
             .filter(|profile| profile.arn == resource_arn)
             .ok_or(TaggingArnProblem::NoSuchProfile)
     }
@@ -445,13 +574,29 @@ impl ComAmazonawsSignerWallabyserviceState {
     /// [`Self::profile_for_tagging`], for a call that CHANGES the profile's tags.
     pub fn profile_for_tagging_mut(
         &mut self,
+        region: &str,
         resource_arn: &str,
     ) -> Result<&mut SigningProfileRecord, TaggingArnProblem> {
-        let name = profile_name_in_arn(resource_arn).ok_or(TaggingArnProblem::Malformed)?;
+        let key = profile_key(region, self.tagged_profile_name(region, resource_arn)?);
         self.profiles
-            .get_mut(name)
+            .get_mut(&key)
             .filter(|profile| profile.arn == resource_arn)
             .ok_or(TaggingArnProblem::NoSuchProfile)
+    }
+
+    /// The profile name a tagging call's `resourceArn` names, for a call `region`
+    /// could serve at all.
+    fn tagged_profile_name<'a>(
+        &self,
+        region: &str,
+        resource_arn: &'a str,
+    ) -> Result<&'a str, TaggingArnProblem> {
+        let (arn_region, name) =
+            profile_region_and_name_in_arn(resource_arn).ok_or(TaggingArnProblem::Malformed)?;
+        if arn_region != region {
+            return Err(TaggingArnProblem::NoSuchProfile);
+        }
+        Ok(name)
     }
 }
 
@@ -524,16 +669,25 @@ pub fn profile_arn(profile_name: &str, region: &str) -> String {
 /// [`profile_arn`] for the whole form.
 const PROFILE_ARN_RESOURCE_PREFIX: &str = "/signing-profiles/";
 
-/// The profile name inside `arn`, when `arn` is a well-formed AWS Signer
-/// signing-profile ARN — `arn:<partition>:signer:<region>:<account>:/signing-profiles/<name>`,
-/// the form [`profile_arn`] builds.
+/// The profile name inside `arn` — [`profile_region_and_name_in_arn`] without
+/// the region, for a caller that only needs the name.
+pub fn profile_name_in_arn(arn: &str) -> Option<&str> {
+    profile_region_and_name_in_arn(arn).map(|(_, name)| name)
+}
+
+/// The region and the profile name inside `arn`, when `arn` is a well-formed AWS
+/// Signer signing-profile ARN —
+/// `arn:<partition>:signer:<region>:<account>:/signing-profiles/<name>`, the form
+/// [`profile_arn`] builds.
 ///
+/// Both fields are part of a profile's identity: Signer is regional, so the
+/// region an ARN names is the region whose profile it names (see [`ProfileKey`]).
 /// `None` for anything else: an ARN of another service, one whose resource is not
 /// a signing profile, one carrying a profile VERSION after the name (tags belong
 /// to the profile, not to one of its versions), or a name outside
 /// [`is_profile_name`]'s alphabet. It is a judgement on the STRING alone, so it
 /// says nothing about whether such a profile exists.
-pub fn profile_name_in_arn(arn: &str) -> Option<&str> {
+pub fn profile_region_and_name_in_arn(arn: &str) -> Option<(&str, &str)> {
     // `arn : partition : service : region : account : resource`, and the resource
     // is the remainder because it carries `:` of its own in other ARN forms.
     let mut fields = arn.splitn(6, ':');
@@ -548,11 +702,12 @@ pub fn profile_name_in_arn(arn: &str) -> Option<&str> {
     }
     // Region and account: present, and non-empty for a profile ARN (Signer is a
     // regional service and a profile belongs to one account).
-    if fields.next()?.is_empty() || fields.next()?.is_empty() {
+    let region = fields.next()?;
+    if region.is_empty() || fields.next()?.is_empty() {
         return None;
     }
     let name = fields.next()?.strip_prefix(PROFILE_ARN_RESOURCE_PREFIX)?;
-    is_profile_name(name).then_some(name)
+    is_profile_name(name).then_some((region, name))
 }
 
 /// Why a tagging call could not reach a signing profile through its
@@ -893,7 +1048,9 @@ pub fn is_profile_name(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-/// The region this request was signed for — what a profile ARN names.
+/// The region this request was signed for — the region whose endpoint is being
+/// addressed, which is the region its resources live in and the one a profile ARN
+/// names.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)

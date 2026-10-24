@@ -172,7 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Signer is regional: a job is reported by the region whose endpoint
+        // started it, and by no other region's.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DescribeSigningJobErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {
@@ -185,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        let Some(job) = store.settled_job_mut(&input.job_id, now) else {
+        let Some(job) = store.settled_job_mut(&region, &input.job_id, now) else {
             return Err(
                 // A job-specific `code`: the discriminator a client branches on
                 // must tell a missing JOB apart from any other 404 this service

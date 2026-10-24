@@ -207,7 +207,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Signer is regional: the grant is written on the profile held by the
+        // region whose endpoint it was signed for, and on no other region's.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 AddProfilePermissionErrorModeled::InternalServiceErrorException(
@@ -244,7 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The grant is written against a profile, and against one of that
         // profile's versions when it names one.
-        let Some(profile) = store.profiles.get(&input.profile_name) else {
+        let Some(profile) = store.profile(&region, &input.profile_name) else {
             return Err(profile_not_found(&input.profile_name));
         };
         if let Some(version) = input.profile_version.as_deref() {
@@ -259,8 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // holding a superseded revision is told rather than silently overwriting.
         // A request naming none carries no precondition — the member is optional.
         let current_revision = store
-            .profile_permissions
-            .get(&input.profile_name)
+            .profile_policy(&region, &input.profile_name)
             .map(|policy| policy.revision_id.clone());
         if let Some(named) = input.revision_id.as_deref() {
             if current_revision.as_deref() != Some(named) {
@@ -275,8 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A statement id identifies a statement WITHIN the policy, so the policy
         // cannot hold two of them; replacing one means removing it first.
         if store
-            .profile_permissions
-            .get(&input.profile_name)
+            .profile_policy(&region, &input.profile_name)
             .is_some_and(|policy| policy.statements.contains_key(&input.statement_id))
         {
             return Err(conflict(format!(
@@ -299,10 +299,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that policy does.
         let resulting_size = {
             let profile = store
-                .profiles
-                .get(&input.profile_name)
+                .profile(&region, &input.profile_name)
                 .expect("the profile resolved above is still in the store");
-            match store.profile_permissions.get(&input.profile_name) {
+            match store.profile_policy(&region, &input.profile_name) {
                 Some(policy) => policy.policy_size_bytes_with(profile, &statement),
                 // A profile holding no policy yet is measured as the empty policy
                 // this grant would create it with.
@@ -328,10 +327,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The write moves the policy to a fresh revision, which is what this call
         // answers with and what every later read of the policy reports.
         let revision_id = store.mint_permission_revision_id();
-        let policy = store
-            .profile_permissions
-            .entry(input.profile_name)
-            .or_default();
+        let policy = store.profile_policy_entry(&region, &input.profile_name);
         policy.revision_id = revision_id;
         policy.statements.insert(input.statement_id, statement);
 

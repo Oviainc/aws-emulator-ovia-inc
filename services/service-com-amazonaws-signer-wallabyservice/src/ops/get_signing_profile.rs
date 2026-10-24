@@ -2,8 +2,10 @@
 
 //! @op GetSigningProfile
 //!
-//! Implemented: reports the stored signing profile `profileName` names, or the
-//! modelled `ResourceNotFoundException` when this account holds none. Reporting
+//! Implemented: reports the stored signing profile `profileName` names in the
+//! region this request was signed for, or the modelled
+//! `ResourceNotFoundException` when that region holds none (Signer is regional,
+//! so another region's profile of the same name is not this one). Reporting
 //! only — it writes nothing.
 //!
 //! Beside the modelled members the answer carries `profileToken` and `platform`,
@@ -185,7 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Signer is regional: this read resolves a profile of the region whose
+        // endpoint the request was signed for, and nothing of any other region.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetSigningProfileErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {
@@ -206,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let store = state.lock();
-        let Some(profile) = store.profiles.get(&input.profile_name) else {
+        let Some(profile) = store.profile(&region, &input.profile_name) else {
             return Err(profile_not_found(&input.profile_name, None));
         };
 
