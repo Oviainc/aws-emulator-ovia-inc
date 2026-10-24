@@ -25,6 +25,8 @@ mod image_set_copy;
 mod image_set_deletion;
 #[path = "all/image_set_properties.rs"]
 mod image_set_properties;
+#[path = "all/image_set_search.rs"]
+mod image_set_search;
 #[path = "all/image_set_version_listing.rs"]
 mod image_set_version_listing;
 #[path = "all/import_job_listing.rs"]

@@ -64,7 +64,7 @@ fn make_supplemental_validations_due(engine: &Arc<engine::InMemoryEngine>) {
 /// A supplemental entry for `country_code` registering `registration_id`.
 /// Everything else satisfies every constraint on
 /// `SupplementalTaxRegistrationEntry`.
-fn entry_for(country_code: &str, registration_id: &str, legal_name: &str) -> Value {
+pub(crate) fn entry_for(country_code: &str, registration_id: &str, legal_name: &str) -> Value {
     json!({
         "registrationId": registration_id,
         "registrationType": "VAT",
@@ -166,7 +166,10 @@ fn round_trip_cases() -> Vec<Case> {
 
 /// Store `entry` and answer the whole call, asserting nothing: a case that
 /// expects a refusal reads the same answer.
-async fn put(router: &smithy_server_runtime::MultiServiceRouter, entry: &Value) -> Answer {
+pub(crate) async fn put(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    entry: &Value,
+) -> Answer {
     call(
         router,
         "PutSupplementalTaxRegistration",
@@ -253,7 +256,7 @@ async fn only_a_supported_jurisdiction_can_hold_a_supplemental_registration() {
 }
 
 /// Every supplemental TRN the listing reports, following its cursor to the end.
-async fn list_all(
+pub(crate) async fn list_all(
     router: &smithy_server_runtime::MultiServiceRouter,
     page_size: Option<i64>,
 ) -> Vec<Value> {

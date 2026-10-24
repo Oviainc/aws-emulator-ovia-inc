@@ -25,6 +25,8 @@ mod deployment_update;
 mod harness;
 #[path = "all/not_found_contract.rs"]
 mod not_found_contract;
+#[path = "all/pattern_specification_schemas.rs"]
+mod pattern_specification_schemas;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]

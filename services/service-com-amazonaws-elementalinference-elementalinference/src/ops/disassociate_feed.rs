@@ -178,8 +178,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata.
-        let _ = ctx;
+        // request metadata — here the Region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DisassociateFeedErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -194,7 +194,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle_due_transitions(now);
 
-        let Some(feed) = state.feeds.get_mut(&input.id) else {
+        // The feed is resolved WITHIN the request's Region, as every other id-based
+        // operation resolves it: another Region's feed is not this endpoint's to release.
+        let Some(feed) = state.feed_mut(&region, &input.id) else {
             return Err(DisassociateFeedErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::NOT_FOUND_MESSAGE.to_string(),

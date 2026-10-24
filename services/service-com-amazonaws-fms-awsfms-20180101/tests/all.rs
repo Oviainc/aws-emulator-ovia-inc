@@ -39,6 +39,8 @@ mod error_message_members;
 mod managed_list_deletion;
 #[path = "all/member_accounts.rs"]
 mod member_accounts;
+#[path = "all/notification_channel_deletion.rs"]
+mod notification_channel_deletion;
 #[path = "all/policy_administrator_gate.rs"]
 mod policy_administrator_gate;
 #[path = "all/policy_document_validation.rs"]

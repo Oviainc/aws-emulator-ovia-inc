@@ -61,6 +61,12 @@
 //! [`ComAmazonawsCloudwatchlogsLogs20140328State::delivery_destinations`], each one a
 //! [`DeliveryDestinationRecord`], keyed by the name that identifies one.
 //!
+//! The account's delivery sources — each "a logical object that represents the resource that
+//! is actually sending the logs", which `PutDeliverySource` creates or updates and
+//! `GetDeliverySource` reports — live in
+//! [`ComAmazonawsCloudwatchlogsLogs20140328State::delivery_sources`], each one a
+//! [`DeliverySourceRecord`], keyed by the name that identifies one.
+//!
 //! The account's logical destinations — each "a cross-account destination that receives
 //! subscription log events", which `PutDestination` creates or updates and
 //! `DescribeDestinations` reports — live in
@@ -739,6 +745,18 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// another log group), so it lives here rather than on [`LogGroupRecord`]: deleting the
     /// log group it points at does not delete the destination.
     pub delivery_destinations: BTreeMap<String, DeliveryDestinationRecord>,
+    /// Every delivery source of this account — the resource `PutDeliverySource` creates or
+    /// updates and `GetDeliverySource` / `DescribeDeliverySources` report — keyed by
+    /// `DeliverySource$name`, which is the only thing that identifies one ("This name must be
+    /// unique for all delivery sources in your account"). A `BTreeMap` so
+    /// `DescribeDeliverySources` enumerates in source-name order without re-sorting, which is
+    /// also what makes its pagination cursor stable.
+    ///
+    /// A delivery source is a LOGICAL object naming the resource of another service that
+    /// sends the logs, so it lives here rather than on [`LogGroupRecord`]: no log group owns
+    /// one, and a delivery pairs it with a destination by the name it is stored under
+    /// ([`DeliveryRecord::delivery_source_name`]).
+    pub delivery_sources: BTreeMap<String, DeliverySourceRecord>,
     /// Every logical destination of this account — the resource `PutDestination` creates or
     /// updates, `DescribeDestinations` reports and `DeleteDestination` removes — keyed by
     /// `Destination$destinationName`, the one member every other destination operation
@@ -829,6 +847,14 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
                 .destinations
                 .get(name)
                 .map(|destination| &destination.tags),
+            TaggedResource::DeliverySource(name) => self
+                .delivery_sources
+                .get(name)
+                .map(|source| &source.tags),
+            TaggedResource::DeliveryDestination(name) => self
+                .delivery_destinations
+                .get(name)
+                .map(|destination| &destination.tags),
         }
     }
 
@@ -847,6 +873,14 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
                 .map(|delivery| &mut delivery.tags),
             TaggedResource::Destination(name) => self
                 .destinations
+                .get_mut(name)
+                .map(|destination| &mut destination.tags),
+            TaggedResource::DeliverySource(name) => self
+                .delivery_sources
+                .get_mut(name)
+                .map(|source| &mut source.tags),
+            TaggedResource::DeliveryDestination(name) => self
+                .delivery_destinations
                 .get_mut(name)
                 .map(|destination| &mut destination.tags),
         }
@@ -1391,6 +1425,122 @@ impl DeliveryDestinationRecord {
 /// name.
 pub fn delivery_destination_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("logs", region, &format!("delivery-destination:{name}"))
+}
+
+/// THE EMULATOR'S OWN CEILING on the delivery sources one account holds, not a quota cited
+/// from AWS: each source keeps its configuration and tag set in memory for as long as the
+/// process runs and nothing expires one, so `PutDeliverySource` refuses to CREATE more than
+/// this many with the `ServiceQuotaExceededException` it models ("This request exceeds a
+/// service quota") rather than growing without bound on request. A put that UPDATES a source
+/// already stored is never refused by it: it adds nothing.
+pub const MAX_DELIVERY_SOURCES: usize = 1_000;
+
+/// One delivery source — "a logical object that represents the resource that is actually
+/// sending the logs" — as it is stored. Every member of the model's `DeliverySource` shape is
+/// reported from this record, so `GetDeliverySource` answers from state alone.
+#[derive(Debug, Clone)]
+pub struct DeliverySourceRecord {
+    /// `DeliverySource$name` — "The unique name of the delivery source." Also the key the
+    /// store enumerates by, because the name "must be unique for all delivery sources in your
+    /// account".
+    pub name: String,
+    /// `DeliverySource$arn` — "The Amazon Resource Name (ARN) that uniquely identifies this
+    /// delivery source", as [`delivery_source_arn`] builds it.
+    pub arn: String,
+    /// `DeliverySource$resourceArns` — "This array contains the ARN of the Amazon Web Services
+    /// resource that sends logs and is represented by this delivery source. Currently, only
+    /// one ARN can be in the array."
+    pub resource_arns: Vec<String>,
+    /// `DeliverySource$service` — "The Amazon Web Services service that is sending logs",
+    /// DERIVED from the resource that sends them ([`delivery_source_service`]) rather than
+    /// taken from the caller, who never states it: `PutDeliverySource` has no `service`
+    /// member. `None` for a resource ARN naming no service namespace.
+    pub service: Option<String>,
+    /// `DeliverySource$logType` — "The type of log that the source is sending."
+    pub log_type: String,
+    /// `DeliverySource$deliverySourceConfiguration` — "The map of key-value pairs that
+    /// configure the delivery source." A `BTreeMap` so the stored order is stable; the
+    /// modelled map has no minimum length, so a source configured with none reports no member
+    /// at all.
+    pub source_configuration: BTreeMap<String, String>,
+    /// `DeliverySource$tags` — "The tags that have been assigned to this delivery source." A
+    /// `BTreeMap` so the stored order is stable; `Tags` is `@length(min: 1)`, so a source
+    /// carrying none reports no member at all.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl DeliverySourceRecord {
+    /// A brand-new delivery source for one resource, with its ARN and its `service` DERIVED
+    /// rather than taken from the caller: the ARN identifies the logical object this service
+    /// just created, and the service sending the logs is a fact about the resource named.
+    ///
+    /// The optional members a put may name — the configuration map and `tags` — are left at
+    /// their "the request named none" value and set on the returned record by the caller that
+    /// has them.
+    pub fn new(region: &str, name: &str, resource_arn: &str, log_type: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            arn: delivery_source_arn(region, name),
+            resource_arns: vec![resource_arn.to_string()],
+            service: delivery_source_service(resource_arn).map(ToString::to_string),
+            log_type: log_type.to_string(),
+            source_configuration: BTreeMap::new(),
+            tags: BTreeMap::new(),
+        }
+    }
+
+    /// This source as the model's `DeliverySource` structure, which is what
+    /// `PutDeliverySource`, `GetDeliverySource` and `DescribeDeliverySources` all report, so
+    /// one record renders the same way through any of them.
+    ///
+    /// `status` and `statusReason` are left unreported: the model documents both as "defined
+    /// for selective log types", and nothing in this store makes the resource behind a source
+    /// disappear (the one `statusReason` the model enumerates says the resource "has been
+    /// deleted"), so there is no state to report them from.
+    pub fn reported(&self) -> crate::ops::types::DeliverySource {
+        crate::ops::types::DeliverySource {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            resource_arns: Some(self.resource_arns.clone()),
+            service: self.service.clone(),
+            log_type: Some(self.log_type.clone()),
+            tags: (!self.tags.is_empty()).then(|| {
+                self.tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+            delivery_source_configuration: (!self.source_configuration.is_empty()).then(|| {
+                self.source_configuration
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+            status: None,
+            status_reason: None,
+        }
+    }
+}
+
+/// A delivery source's ARN, the form `DeliverySource$arn` ("The Amazon Resource Name (ARN)
+/// that uniquely identifies this delivery source") carries: a `delivery-source` resource of
+/// this service, identified by the source's own name.
+pub fn delivery_source_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn("logs", region, &format!("delivery-source:{name}"))
+}
+
+/// The Amazon Web Services service that sends a delivery source's logs: the service
+/// namespace of the resource ARN the source represents, or `None` for a value that is not an
+/// ARN or names no namespace.
+///
+/// `DeliverySource$service` is "The Amazon Web Services service that is sending logs" and no
+/// input member states it, so it is read off `resourceArn` — "The ARN of the Amazon Web
+/// Services resource that is generating and sending logs" — exactly as a delivery reads its
+/// destination's type off the destination ARN ([`delivery_destination_type_for_arn`]).
+pub fn delivery_source_service(resource_arn: &str) -> Option<&str> {
+    arn_service_and_resource(resource_arn)
+        .map(|(service, _resource)| service)
+        .filter(|service| !service.is_empty())
 }
 
 /// The number of logical destinations one account holds: CloudWatch Logs documents a quota
@@ -3897,7 +4047,10 @@ pub fn is_log_group_arn(arn: &str) -> bool {
 /// arn:aws:logs:Region:account-id:destination:destination-name". A delivery is here as well,
 /// because the model gives that resource its own tag member (`Delivery$tags`: "The tags that
 /// have been assigned to this delivery") and this service stores it
-/// ([`DeliveryRecord::tags`]).
+/// ([`DeliveryRecord::tags`]). The delivery source and the delivery destination are here for
+/// the same reason: each carries its own tag member (`DeliverySource$tags`,
+/// `DeliveryDestination$tags`) and this service stores it ([`DeliverySourceRecord::tags`],
+/// [`DeliveryDestinationRecord::tags`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaggedResource {
     /// One log group, by the name the store is keyed by.
@@ -3906,6 +4059,10 @@ pub enum TaggedResource {
     Destination(String),
     /// One delivery, by the `Delivery$id` the store is keyed by.
     Delivery(String),
+    /// One delivery source, by the `DeliverySource$name` the store is keyed by.
+    DeliverySource(String),
+    /// One delivery destination, by the `DeliveryDestination$name` the store is keyed by.
+    DeliveryDestination(String),
 }
 
 impl TaggedResource {
@@ -3916,6 +4073,8 @@ impl TaggedResource {
             Self::LogGroup(_) => "log group",
             Self::Destination(_) => "destination",
             Self::Delivery(_) => "delivery",
+            Self::DeliverySource(_) => "delivery source",
+            Self::DeliveryDestination(_) => "delivery destination",
         }
     }
 }
@@ -3926,6 +4085,14 @@ const DESTINATION_ARN_PREFIX: &str = "destination:";
 
 /// The ARN resource-segment prefix of a delivery, as [`delivery_arn`] builds one.
 const DELIVERY_ARN_PREFIX: &str = "delivery:";
+
+/// The ARN resource-segment prefix of a delivery source, as [`delivery_source_arn`] builds
+/// one.
+const DELIVERY_SOURCE_ARN_PREFIX: &str = "delivery-source:";
+
+/// The ARN resource-segment prefix of a delivery destination, as
+/// [`delivery_destination_arn`] builds one.
+const DELIVERY_DESTINATION_ARN_PREFIX: &str = "delivery-destination:";
 
 /// The resource a tagging operation's `resourceArn` names ([`TaggedResource`]), or `None`
 /// for an ARN that names no CloudWatch Logs resource carrying tags — another service's
@@ -3946,6 +4113,12 @@ pub fn tagged_resource(arn: &str) -> Option<TaggedResource> {
     }
     if let Some(name) = resource.strip_prefix(DESTINATION_ARN_PREFIX) {
         return (!name.is_empty()).then(|| TaggedResource::Destination(name.to_string()));
+    }
+    if let Some(name) = resource.strip_prefix(DELIVERY_SOURCE_ARN_PREFIX) {
+        return (!name.is_empty()).then(|| TaggedResource::DeliverySource(name.to_string()));
+    }
+    if let Some(name) = resource.strip_prefix(DELIVERY_DESTINATION_ARN_PREFIX) {
+        return (!name.is_empty()).then(|| TaggedResource::DeliveryDestination(name.to_string()));
     }
     if let Some(id) = resource.strip_prefix(DELIVERY_ARN_PREFIX) {
         return (!id.is_empty()).then(|| TaggedResource::Delivery(id.to_string()));

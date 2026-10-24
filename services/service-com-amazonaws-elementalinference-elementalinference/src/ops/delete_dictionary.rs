@@ -159,8 +159,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata.
-        let _ = ctx;
+        // request metadata — here the Region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteDictionaryErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -179,10 +179,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // fact that makes a dictionary REFERENCED is what refuses its delete, except
         // that a feed whose own deletion has already been accepted is on its way out and
         // holds nothing back.
-        let blocking = state.feeds_blocking_delete(&input.id);
-        let references = state.feeds_referencing(&input.id);
+        let blocking = state.feeds_blocking_delete(&region, &input.id);
+        let references = state.feeds_referencing(&region, &input.id);
 
-        let Some(dictionary) = state.dictionaries.get_mut(&input.id) else {
+        // The dictionary is resolved WITHIN the request's Region: a delete may only
+        // accept the removal of a dictionary this endpoint holds, so an id naming
+        // another Region's dictionary earns the modelled not-found refusal.
+        let Some(dictionary) = state.dictionary_mut(&region, &input.id) else {
             return Err(DeleteDictionaryErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::NOT_FOUND_MESSAGE.to_string(),

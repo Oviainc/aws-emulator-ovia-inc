@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFeed
-//! IMPLEMENTED: reports the stored feed, or `ResourceNotFoundException` (HTTP 404)
-//! for an id no live feed has. Reporting only: it materialises the feed transitions
+//! IMPLEMENTED: reports the stored feed of the request's Region, or
+//! `ResourceNotFoundException` (HTTP 404) for an id no live feed of that Region has.
+//! Reporting only: it materialises the feed transitions
 //! the clock already owes (they were due at this instant whether or not anybody
 //! called) and writes nothing else.
 //!
@@ -157,8 +158,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata.
-        let _ = ctx;
+        // request metadata — here the Region this request was signed for, which is the
+        // endpoint the feed must belong to.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetFeedErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -172,7 +174,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle_due_transitions(std::time::Instant::now());
 
-        let Some(feed) = state.feeds.get(&input.id) else {
+        // The id is resolved WITHIN the request's Region: the service is regional, so
+        // an id that names a feed of another Region names no feed of this endpoint and
+        // earns the same not-found refusal as an id nothing was ever minted for.
+        let Some(feed) = state.feed(&region, &input.id) else {
             return Err(GetFeedErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::NOT_FOUND_MESSAGE.to_string(),

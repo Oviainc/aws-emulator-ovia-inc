@@ -146,8 +146,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata.
-        let _ = ctx;
+        // request metadata — here the Region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 ExportDictionaryEntriesErrorModeled::InternalServerErrorException(
@@ -163,7 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle_due_transitions(std::time::Instant::now());
 
-        let Some(dictionary) = state.dictionaries.get(&input.id) else {
+        // The id is resolved WITHIN the request's Region, as `GetDictionary` resolves
+        // it: another Region's dictionary holds no entries this endpoint can export.
+        let Some(dictionary) = state.dictionary(&region, &input.id) else {
             return Err(
                 ExportDictionaryEntriesErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
