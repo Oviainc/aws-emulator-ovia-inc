@@ -1328,31 +1328,28 @@ async fn list_packaging_groups_max_results_and_next_token_follow_their_modelled_
     );
 }
 
-/// A packaging group is removed whatever still references it, and its tags go with it.
+/// A packaging group is removed only while no PackagingConfiguration references it, and
+/// its tags go with it.
 ///
 /// A PackagingConfiguration names the group it packages for by `PackagingGroupId`
-/// (`CreatePackagingConfiguration` refuses one that resolves to no stored group), so a
-/// dependency REFUSAL would be a plausible rule — and this suite asserted one until the
-/// wire corpus contradicted it: the recorded teardown
-/// `mediapackage-vod-packaging-configuration-multi-format#teardown#11` deletes a group
-/// that still holds the configurations the fixture created and AWS answers it HTTP 204,
-/// with the following `DescribePackagingGroup` answering 404. Replaying that corpus
-/// against the refusal reported `expected HTTP 204, actual HTTP 422;
-/// UnprocessableEntityException: id cannot be deleted because it has attached packaging
-/// configurations` and left the group readable, so the rule this suite now asserts is
-/// the recorded one: the delete succeeds whatever the group holds, answering 204 (the
-/// status `src/ops/delete_packaging_group.rs` documents against the model's 202), the
-/// group reads back the modelled `NotFoundException` (404), and its tags are gone with
-/// it. Nothing is cascaded: a configuration or an asset of the deleted group is still
-/// its own resource, addressed by its own id. (The recording evidences the 204 and the
-/// following 404 only; that the children SURVIVE is the modelled default — each has its
-/// own delete operation and this one declares no error for a non-empty group — so a
-/// later recording could revise it.)
+/// (`CreatePackagingConfiguration` refuses one that resolves to no stored group), and
+/// the service protects that reference: while any stored configuration still names the
+/// group, `DeletePackagingGroup` is refused with the modelled
+/// `UnprocessableEntityException` (422) and the group is left exactly as it was —
+/// recorded as behavioural unit
+/// `mediapackage-vod.delete-packaging-group-with-dependent-configs-rejected`. Delete the
+/// dependents first and the identical delete succeeds, answering 204 (the status
+/// `src/ops/delete_packaging_group.rs` documents against the model's 202), after which
+/// the group reads back the modelled `NotFoundException` (404) and its tags are gone
+/// with it. Nothing is cascaded: the assets the group held are still their own
+/// resources, each addressed by its own id.
 ///
 /// The rows span the dependent count (none, one, several), the packaging format each
-/// dependent was created with, and whether the group also holds assets.
+/// dependent was created with, and whether the group also holds assets. The full
+/// dependency table — the refusal's effect-freedom, the id forms, and a configuration
+/// of ANOTHER group protecting nothing — is `tests/all/packaging_group_deletion.rs`.
 #[tokio::test]
-async fn a_packaging_group_is_deletable_whatever_still_references_it() {
+async fn a_packaging_group_is_deletable_only_while_nothing_references_it() {
     // (case, the package blocks of the configurations created in the group, how many
     // assets the group holds)
     let cases: Vec<(&str, Vec<Value>, usize)> = vec![
@@ -1390,25 +1387,63 @@ async fn a_packaging_group_is_deletable_whatever_still_references_it() {
             create_asset(&router, &format!("asset-{index}"), "del-group").await;
         }
 
+        // While a dependent is stored the delete is refused and removes nothing.
+        if !packages.is_empty() {
+            let (status, body) = call(&router, "DELETE", "/packaging_groups/del-group", None).await;
+            assert_eq!(
+                status, 422,
+                "case {case:?}: DeletePackagingGroup with {} configuration(s) still \
+                 stored must be refused as unprocessable, got {status} and body {body}",
+                packages.len()
+            );
+            let (status, described) =
+                call(&router, "GET", "/packaging_groups/del-group", None).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the refused delete must leave the group readable, got \
+                 {status} and body {described}"
+            );
+            // The dependents are deleted through their own operation, which is what
+            // lifts the protection.
+            for index in 0..packages.len() {
+                let (status, body) = call(
+                    &router,
+                    "DELETE",
+                    &format!("/packaging_configurations/cfg-{index}"),
+                    None,
+                )
+                .await;
+                assert_eq!(
+                    status, 204,
+                    "case {case:?}: DeletePackagingConfiguration cfg-{index}, got {status} \
+                     and body {body}"
+                );
+            }
+        }
+
         let (status, body) = call(&router, "DELETE", "/packaging_groups/del-group", None).await;
         assert_eq!(
             status, 204,
-            "case {case:?}: expected the recorded 204 No Content for a group holding {} \
-             configuration(s) and {assets} asset(s) (the model declares 202 — see \
-             `src/ops/delete_packaging_group.rs`), got {status} and body {body}",
-            packages.len()
+            "case {case:?}: expected the recorded 204 No Content for a group holding no \
+             configuration and {assets} asset(s) (the model declares 202 — see \
+             `src/ops/delete_packaging_group.rs`), got {status} and body {body}"
         );
-        // Nothing is cascaded: each configuration the group held is still its own
-        // resource, readable by its own id, and the state the engine holds says so.
+        // Nothing is cascaded: the assets the group held are still stored, each its own
+        // resource addressed by its own id, and the state the engine holds says so.
         {
             let store = engine.state::<vod::ComAmazonawsMediapackagevodMediapackagevodState>();
-            let held = store.lock().packaging_configurations.len();
+            let state = store.lock();
+            let held_configs = state.packaging_configurations.len();
+            let held_assets = state.assets.len();
             assert_eq!(
-                held,
-                packages.len(),
-                "case {case:?}: deleting the group must not remove its configurations, \
-                 {held} of {} left",
-                packages.len()
+                held_configs, 0,
+                "case {case:?}: every dependent was deleted before the group, \
+                 {held_configs} left"
+            );
+            assert_eq!(
+                held_assets, assets,
+                "case {case:?}: deleting the group must not remove its assets, \
+                 {held_assets} of {assets} left"
             );
         }
 
