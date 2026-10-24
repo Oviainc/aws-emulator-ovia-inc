@@ -1906,7 +1906,13 @@ impl Repo {
 pub struct CreationTemplate {
     pub prefix: String,
     pub description: Option<String>,
-    pub encryption_config: Option<EncryptionConfigurationForRepositoryCreationTemplate>,
+    /// Always present, the way a repository's own [`Repo::encryption_config`] is:
+    /// `EncryptionConfigurationForRepositoryCreationTemplate$encryptionType` is a
+    /// REQUIRED member, so a template carries a resolved encryption posture from the
+    /// moment it is created — the configuration the create named, or
+    /// [`default_template_encryption`] when it named none. Every operation that reports
+    /// the template therefore reports the member.
+    pub encryption_config: EncryptionConfigurationForRepositoryCreationTemplate,
     pub resource_tags: Vec<Tag>,
     pub image_tag_mutability: String,
     pub image_tag_mutability_exclusion_filters: Vec<ImageTagMutabilityExclusionFilter>,
@@ -1918,6 +1924,16 @@ pub struct CreationTemplate {
     pub updated_at: SystemTime,
 }
 
+/// The encryption configuration a repository creation template created without one
+/// resolves to: the service default encryption type, with no caller key beside it (the
+/// S3-managed type takes none).
+pub fn default_template_encryption() -> EncryptionConfigurationForRepositoryCreationTemplate {
+    EncryptionConfigurationForRepositoryCreationTemplate {
+        encryption_type: DEFAULT_ENCRYPTION_TYPE.to_string(),
+        kms_key: None,
+    }
+}
+
 impl CreationTemplate {
     /// The `RepositoryCreationTemplate` every operation that reports this template
     /// returns, derived from the stored record alone.
@@ -1925,7 +1941,7 @@ impl CreationTemplate {
         RepositoryCreationTemplate {
             prefix: Some(self.prefix.clone()),
             description: self.description.clone(),
-            encryption_configuration: self.encryption_config.clone(),
+            encryption_configuration: Some(self.encryption_config.clone()),
             // An empty list is reported as an absent member: nothing was applied.
             resource_tags: if self.resource_tags.is_empty() {
                 None
