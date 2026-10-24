@@ -33,6 +33,8 @@ mod ecs_wire;
 mod error_messages;
 #[path = "all/list_services.rs"]
 mod list_services;
+#[path = "all/list_task_definitions.rs"]
+mod list_task_definitions;
 #[path = "all/load_balancer_target_groups.rs"]
 mod load_balancer_target_groups;
 #[path = "all/resource_tags.rs"]
