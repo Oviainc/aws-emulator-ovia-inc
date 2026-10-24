@@ -11,9 +11,12 @@
 //! data store the service does not hold is refused with the modelled
 //! `ResourceNotFoundException`, never with an empty page.
 //!
-//! `StartFHIRExportJob` — the operation that MINTS a job record — is still a
-//! scaffold stub with its own issue, so the rows below are seeded into the SAME
-//! store this handler reads, through the shared engine the harness exposes.
+//! `StartFHIRExportJob` — the operation that MINTS a job record — starts a job
+//! in one status and leaves the rest to the clock, so the rows below are seeded
+//! directly into the SAME store this handler reads, through the shared engine
+//! the harness exposes, to put a job in each status the model declares without
+//! waiting for one. What a STARTED job reports is pinned by
+//! `tests/all/fhir_export_job_start.rs`.
 //! Every `ListFHIRExportJobs` call itself goes over the real awsJson1_0 wire
 //! through `MultiServiceRouter::dispatch` — the entry point `core/router`
 //! serves — so routing, deserialization, the modelled constraints and the error
@@ -132,7 +135,14 @@ fn seed_jobs(service: &HealthLake, datastore_id: &str, seeds: &[Seed]) -> Vec<St
                     datastore_id: datastore_id.to_string(),
                     name: seed.name.map(str::to_string),
                     status: seed.status,
-                    pending: seed.pending.map(|next| (armed_at + JOB_TRANSITION, next)),
+                    // A seeded transition carries no `Message`: these rows are
+                    // about what a listing REPORTS, not about why a job ended.
+                    // `StartFHIRExportJob` is what writes a message beside an
+                    // owed status — `tests/all/fhir_export_job_start.rs` pins
+                    // that.
+                    pending: seed
+                        .pending
+                        .map(|next| (armed_at + JOB_TRANSITION, next, None)),
                     submitted_at: ::aws_smithy_types::DateTime::from_secs(
                         BASE_SECS + seed.submitted_after_base,
                     ),
@@ -140,6 +150,10 @@ fn seed_jobs(service: &HealthLake, datastore_id: &str, seeds: &[Seed]) -> Vec<St
                     output_data_config: output_data_config(seed.id),
                     data_access_role_arn: Some(DATA_ACCESS_ROLE_ARN.to_string()),
                     message: None,
+                    // Seeded rather than started, so no `ClientToken` named
+                    // these jobs and no request fingerprinted to them.
+                    client_token: None,
+                    request_fingerprint: String::new(),
                 },
             );
         }

@@ -522,6 +522,10 @@ async fn a_job_id_no_record_holds_is_refused_with_the_fixed_not_found_sentence()
                     ),
                 data_access_role_arn: Some(DATA_ACCESS_ROLE_ARN.to_string()),
                 message: None,
+                // Seeded rather than started, so no `ClientToken` named this
+                // job and no request fingerprinted to it.
+                client_token: None,
+                request_fingerprint: String::new(),
             },
         );
     }

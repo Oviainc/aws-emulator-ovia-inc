@@ -17,11 +17,11 @@
 //! record back, version by version.
 //!
 //! The FHIR export job is the third: a job record belongs to the data store it
-//! exports and `ListFHIRExportJobs` reports the records held here, filtered and
-//! paged. `StartFHIRExportJob` is the operation that MINTS one; it is still a
-//! scaffold stub (its own issue), so until it is written the only records in
-//! [`ComAmazonawsHealthlakeHealthlakeState::export_jobs`] are the ones a test
-//! seeds.
+//! exports, `StartFHIRExportJob` MINTS one here, and `DescribeFHIRExportJob` /
+//! `ListFHIRExportJobs` both read the SAME record back — one by `JobId`, the
+//! other filtered and paged — so a started job is observable identically
+//! through either of them, and a data store's jobs are dropped with the data
+//! store itself.
 //!
 //! The data transformation job is the fourth: a job record is addressed by its
 //! own `JobId` and `DescribeDataTransformationJob` reports the record held
@@ -61,6 +61,29 @@ pub const LIFECYCLE_TRANSITION: Duration = Duration::from_millis(500);
 /// here it is stored, never slept on.
 pub const DELETED_RETENTION: Duration = Duration::from_secs(60);
 
+/// How long after the call that starts it a FHIR export job's pending status
+/// transition falls due.
+///
+/// AWS documents no duration for an export run, so this span is CHOSEN, for the
+/// reason [`LIFECYCLE_TRANSITION`] is: it is non-zero, so a caller that
+/// describes the job immediately after starting it still observes the
+/// `SUBMITTED` status it was answered with, and short enough that nothing waits
+/// long for the settled one. It is never slept on — the due instant is stored
+/// on the record and materialised by the next call that reads it.
+pub const EXPORT_JOB_RUN: Duration = Duration::from_millis(500);
+
+/// The most FHIR export jobs this emulator holds at once, across every data
+/// store.
+///
+/// A ceiling, not a claim about any AWS quota: it exists so a
+/// `StartFHIRExportJob` loop cannot grow the emulator's heap without bound, and
+/// it also bounds the per-request
+/// [`ComAmazonawsHealthlakeHealthlakeState::settle_export_jobs`] walk.
+/// `StartFHIRExportJob` refuses past it with the `ThrottlingException` it models
+/// — the only quota-shaped refusal that operation declares, the same one
+/// `CreateFHIRDatastore` answers a full registry with.
+pub const MAX_EXPORT_JOBS: usize = 200;
+
 /// The region stamped into an ARN and an endpoint when the request carries no
 /// SigV4 credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -76,15 +99,47 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// so none of them can drift into echoing the identifier.
 pub const DATASTORE_NOT_FOUND_MESSAGE: &str = "Could not find specified datastore.";
 
-/// The sentence this service refuses a mutation with when the target data store
-/// exists but its `DatastoreStatus` is a lifecycle TRANSITION state (`CREATING`
-/// or `DELETING`), beside the `ConflictException` (HTTP 409) the model documents
-/// as "The data store is in a transition state and the user requested action
-/// cannot be performed."
+/// The sentence this service's `ResourceNotFoundException` carries when the
+/// request names an export job the data store it names holds no record of.
 ///
-/// `action` names the refused mutation. The status is the SERVICE's own state,
+/// Fixed, for the reason [`DATASTORE_NOT_FOUND_MESSAGE`] is: the same sentence
+/// whatever `JobId` was asked about, so a not-found answer never quotes the
+/// request back at the caller. Every export-job not-found path in this crate
+/// states it through this one constant.
+pub const EXPORT_JOB_NOT_FOUND_MESSAGE: &str = "Could not find specified export job.";
+
+/// Why a started export job ends in the modelled `FAILED` status: this emulator
+/// cannot transmit the data store's FHIR resources to the destination Amazon S3
+/// bucket the request named, so an export that has anything to transmit reports
+/// the service's own failure rather than a transfer nothing ran.
+///
+/// `resources` is how many FHIR resources the data store held when the job was
+/// started — the service's own state, not caller input, so the sentence states
+/// it and quotes nothing from the request. The wording stays inside the modelled
+/// `Message` alphabet (`^([\p{L}\p{Z}\p{N}_.:/=+\-%@]*)$`, len 1..2048), so the
+/// text a job reports is one the model would admit.
+pub fn export_not_transmitted_message(resources: usize) -> String {
+    format!(
+        "This emulator cannot transmit the data store FHIR resources to the destination Amazon \
+         S3 bucket. Resources held: {resources}."
+    )
+}
+
+/// The sentence this service refuses an operation with when the target data
+/// store exists but its `DatastoreStatus` is a lifecycle TRANSITION state
+/// (`CREATING` or `DELETING`).
+///
+/// It is the text beside the `ConflictException` (HTTP 409) the model documents
+/// as "The data store is in a transition state and the user requested action
+/// cannot be performed." for the operations that model one, and beside the
+/// modelled `ValidationException` for an operation the model gives no
+/// `ConflictException` (`StartFHIRExportJob`): the SENTENCE is the same whatever
+/// shape carries it, so one data store's refusals cannot disagree about why the
+/// call was refused.
+///
+/// `action` names the refused operation. The status is the SERVICE's own state,
 /// so the sentence states it; like [`DATASTORE_NOT_FOUND_MESSAGE`] it quotes
-/// nothing from the request. Every mutation in this crate states its
+/// nothing from the request. Every operation in this crate states its
 /// resource-state conflict through this one function, so none of them can drift
 /// into a different shape of refusal or into echoing the identifier.
 pub fn datastore_in_transition_message(status: DatastoreStatus, action: DatastoreAction) -> String {
@@ -95,16 +150,19 @@ pub fn datastore_in_transition_message(status: DatastoreStatus, action: Datastor
     )
 }
 
-/// A mutation of a data store record, as [`datastore_in_transition_message`]
+/// An operation on a data store record, as [`datastore_in_transition_message`]
 /// names it when the record's state refuses it.
 ///
-/// A typed value rather than a free-form word: the two mutations of this
-/// resource cannot drift into two different spellings of the same sentence, and
-/// a new one has to add its variant here.
+/// A typed value rather than a free-form word: the operations of this resource
+/// cannot drift into different spellings of the same sentence, and a new one has
+/// to add its variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatastoreAction {
     Update,
     Delete,
+    /// Starting a FHIR export job on the data store, which reads it rather than
+    /// changing it but still needs a settled, usable data store to export from.
+    ExportFrom,
 }
 
 impl DatastoreAction {
@@ -113,6 +171,7 @@ impl DatastoreAction {
         match self {
             Self::Update => "updated",
             Self::Delete => "deleted",
+            Self::ExportFrom => "exported from",
         }
     }
 }
@@ -690,10 +749,14 @@ pub struct ExportJob {
     pub name: Option<String>,
     pub status: JobStatus,
     /// The next transition the clock owes this job, as `(due instant, next
-    /// status)`. `None` when the job is not waiting on the clock. A job that
-    /// moves through several statuses re-arms this as each one falls due, so
-    /// one slot carries one step.
-    pub pending: Option<(Instant, JobStatus)>,
+    /// status, the message that status comes with)`. `None` when the job is not
+    /// waiting on the clock. A job that moves through several statuses re-arms
+    /// this as each one falls due, so one slot carries one step.
+    ///
+    /// The message travels WITH the status it explains, so a record cannot
+    /// report a failure's text while it is still running: [`ExportJob::settle`]
+    /// writes both in the same step.
+    pub pending: Option<(Instant, JobStatus, Option<String>)>,
     /// `SubmitTime`: the instant the job was started.
     pub submitted_at: ::aws_smithy_types::DateTime,
     /// `EndTime`: the instant the job reached a terminal status, written ONCE
@@ -705,6 +768,17 @@ pub struct ExportJob {
     pub data_access_role_arn: Option<String>,
     /// `Message`: why the job ended as it did, when there is anything to say.
     pub message: Option<String>,
+    /// The `ClientToken` the request that started this job carried, if any.
+    ///
+    /// Held ON the job rather than in a second map beside the registry, so a
+    /// token is dropped with the job it started (and so with the data store the
+    /// job belonged to) and cannot resolve to a record that is gone.
+    pub client_token: Option<String>,
+    /// A fingerprint of the request that started this job, so a `ClientToken`
+    /// reused with a DIFFERENT request is refused rather than silently answered
+    /// with this job. Built by the operation that mints the record through
+    /// [`request_fingerprint`].
+    pub request_fingerprint: String,
 }
 
 impl ExportJob {
@@ -730,14 +804,21 @@ impl ExportJob {
     /// reporting operation applying it is the record catching up with the clock
     /// rather than a read with a side effect.
     fn settle(&mut self, now: Instant) {
-        let Some((due, next)) = self.pending else {
-            return;
-        };
-        if now < due {
+        if self
+            .pending
+            .as_ref()
+            .is_none_or(|(due, _, _)| now < *due)
+        {
             return;
         }
+        let Some((_, next, message)) = self.pending.take() else {
+            return;
+        };
         self.status = next;
-        self.pending = None;
+        // The `Message` is the one the owed status comes with — including none,
+        // so a status that explains itself cannot inherit an earlier step's
+        // text.
+        self.message = message;
         // `EndTime` is owed once, by the step that reaches a status the job
         // never leaves, and is then stored — never re-derived per read.
         if next.is_terminal() && self.ended_at.is_none() {
@@ -1091,8 +1172,12 @@ pub struct ComAmazonawsHealthlakeHealthlakeState {
     /// Every FHIR export job, by `JobId`. A `BTreeMap` so
     /// `ListFHIRExportJobs` pages in a stable, resumable order. A job's record
     /// is dropped with the data store it belongs to, by this state's own
-    /// `forget_export_jobs_for`.
+    /// `forget_export_jobs_for`. Bounded by [`MAX_EXPORT_JOBS`], which
+    /// `StartFHIRExportJob` — the only operation that mints one — refuses past.
     pub export_jobs: BTreeMap<String, ExportJob>,
+    /// How many FHIR export jobs have been started, mixed into the next `JobId`
+    /// so two starts in the same clock tick still get distinct ones.
+    pub export_jobs_started: u64,
     /// Every data transformation job, by `JobId` — the identifier
     /// `DescribeDataTransformationJob` addresses one by. A `BTreeMap` so
     /// `ListDataTransformationJobs` can page in a stable, resumable order once
@@ -1180,15 +1265,41 @@ impl ComAmazonawsHealthlakeHealthlakeState {
     /// The companion of [`Self::settle_lifecycle`] for the job records: called
     /// by the operations that REPORT a job's status as well as by any that
     /// change it, because the transition was owed at this instant whether or
-    /// not anybody called. The walk is over the job records the store holds;
-    /// the ceiling on how many of those there can be belongs with the operation
-    /// that MINTS them (`StartFHIRExportJob`, still a scaffold stub), which is
-    /// the only place a job count can be refused, so none is asserted here.
+    /// not anybody called. The walk is over the job records the store holds,
+    /// which [`MAX_EXPORT_JOBS`] bounds — refused by the operation that MINTS
+    /// them (`StartFHIRExportJob`), the only place a job count can be refused —
+    /// so it costs the same whatever a caller does.
     pub fn settle_export_jobs(&mut self) {
         let now = Instant::now();
         for job in self.export_jobs.values_mut() {
             job.settle(now);
         }
+    }
+
+    /// Mint an unused `JobId`: 32 lowercase hex characters, which satisfies the
+    /// modelled `JobId` bounds (len 1..32, and an alphabet that admits hex) and
+    /// is the form every other identifier this service mints takes.
+    pub fn next_export_job_id(&mut self, started_at: SystemTime) -> String {
+        loop {
+            self.export_jobs_started += 1;
+            let id = mint_hex_id(EXPORT_JOB_MINT_DOMAIN, self.export_jobs_started, started_at);
+            if !self.export_jobs.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// The export job one `ClientToken` started, or `None` when no held job was
+    /// started with that token.
+    ///
+    /// The token is held ON the job record, so this is a walk over the jobs
+    /// [`MAX_EXPORT_JOBS`] bounds rather than a second map to keep in step with
+    /// the first — and a token whose job is gone (with the data store it
+    /// exported from) resolves to nothing, as it must.
+    pub fn export_job_for_client_token(&self, token: &str) -> Option<&ExportJob> {
+        self.export_jobs
+            .values()
+            .find(|job| job.client_token.as_deref() == Some(token))
     }
 
     /// Materialise every transformation job transition the clock has ALREADY
@@ -1357,6 +1468,13 @@ impl ComAmazonawsHealthlakeHealthlakeState {
         }
     }
 }
+
+/// The mint domain a FHIR export job's `JobId` is derived under, so it cannot
+/// collide with a control-plane resource's id for the same counter and instant.
+/// Like a FHIR resource, and unlike the data store and the profile, an export
+/// job has no ARN, so the domain is named here rather than taken from an ARN
+/// prefix.
+const EXPORT_JOB_MINT_DOMAIN: &str = "export-job/";
 
 /// The mint domain a FHIR resource's logical id is derived under, so it cannot
 /// collide with a control-plane resource's id for the same counter and instant.
