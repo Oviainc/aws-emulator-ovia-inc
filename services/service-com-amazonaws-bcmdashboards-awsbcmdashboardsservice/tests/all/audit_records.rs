@@ -212,6 +212,20 @@ async fn state_changing_operations_emit_one_audit_record_each() {
         "SUCCESS",
     );
 
+    // Adding a tag changes the stored record, so it accounts for itself.
+    ok_call(
+        &router,
+        "TagResource",
+        &json!({"resourceArn": arn, "resourceTags": [{"key": "team", "value": "finops"}]}),
+    )
+    .await;
+    assert_record(
+        &capture.record_for("TagResource"),
+        "TagResource",
+        &arn,
+        "SUCCESS",
+    );
+
     // Removing a tag changes the stored record too, so it accounts for itself.
     ok_call(
         &router,
@@ -277,6 +291,13 @@ async fn refused_state_changes_are_audited_with_their_outcome() {
         (
             "UntagResource",
             json!({"resourceArn": absent, "resourceTagKeys": ["env"]}),
+            400,
+            absent,
+            "ResourceNotFoundException",
+        ),
+        (
+            "TagResource",
+            json!({"resourceArn": absent, "resourceTags": [{"key": "env", "value": "prod"}]}),
             400,
             absent,
             "ResourceNotFoundException",

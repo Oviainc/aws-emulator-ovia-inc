@@ -189,9 +189,17 @@ async fn every_routed_response_announces_the_services_media_type() {
             status: 400,
         },
         Case {
-            label: "the scaffold's 501: an operation nobody has implemented yet",
+            label: "a handler success: a tag merge",
             operation: "TagResource",
             body: json!({"resourceArn": arn, "resourceTags": [{"key": "team", "value": "finops"}]}),
+            status: 200,
+        },
+        Case {
+            // `DeleteScheduledReport` still carries the scaffold marker in
+            // `src/ops/delete_scheduled_report.rs`, so it is this suite's 501 row.
+            label: "the scaffold's 501: an operation nobody has implemented yet",
+            operation: "DeleteScheduledReport",
+            body: json!({"arn": "arn:aws:bcm-dashboards::123456789012:scheduled-report/never-created"}),
             status: 501,
         },
         // Last: it removes the fixture every row above reads.

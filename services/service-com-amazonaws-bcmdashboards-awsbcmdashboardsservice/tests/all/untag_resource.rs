@@ -30,7 +30,7 @@ use super::dashboard_lifecycle::{call, error_code, ok_call, router};
 const EXECUTION_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/BCMDashboardsReportRole";
 
 /// Borrowed literals as owned `(key, value)` pairs.
-fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
     entries
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -43,7 +43,7 @@ fn key_list(keys: &[&str]) -> Vec<String> {
 }
 
 /// `(key, value)` pairs rendered as the modelled `ResourceTagList` wire shape.
-fn tags_json(tags: &[(String, String)]) -> Value {
+pub(crate) fn tags_json(tags: &[(String, String)]) -> Value {
     Value::Array(
         tags.iter()
             .map(|(key, value)| json!({"key": key, "value": value}))
@@ -52,7 +52,7 @@ fn tags_json(tags: &[(String, String)]) -> Value {
 }
 
 /// Create a dashboard carrying `tags` and return the ARN it was stored under.
-async fn create_dashboard_with_tags(
+pub(crate) async fn create_dashboard_with_tags(
     router: &MultiServiceRouter,
     name: &str,
     tags: &[(String, String)],
@@ -70,7 +70,7 @@ async fn create_dashboard_with_tags(
 }
 
 /// The tags `ListTagsForResource` reports for `arn`, in the order it reported them.
-async fn stored_tags(
+pub(crate) async fn stored_tags(
     router: &MultiServiceRouter,
     arn: &str,
     case: &str,
@@ -571,12 +571,12 @@ async fn untag_resource_honours_the_modelled_key_constraints() {
 /// `[dev-dependencies]` entry also edits the workspace `Cargo.lock` — the one file
 /// every other landing change edits too — which is what kept this change from merging.
 /// The generator is therefore 15 lines of arithmetic here rather than a dependency.
-struct Xorshift(u64);
+pub(crate) struct Xorshift(u64);
 
 impl Xorshift {
     /// Seed the generator. The state is forced odd so it can never be the zero state,
     /// which xorshift maps to itself.
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self(seed | 1)
     }
 
@@ -590,7 +590,7 @@ impl Xorshift {
     }
 
     /// A value in `0..bound`, or 0 when `bound` is 0.
-    fn below(&mut self, bound: usize) -> usize {
+    pub(crate) fn below(&mut self, bound: usize) -> usize {
         let Ok(bound) = u64::try_from(bound) else {
             return 0;
         };
@@ -603,7 +603,7 @@ impl Xorshift {
     /// A key of 1..=3 characters drawn from a three-letter alphabet, so a generated
     /// removal list overlaps the generated tag keys partly, wholly or not at all — the
     /// three cases the table above spells out by hand — and may repeat a key.
-    fn key(&mut self) -> String {
+    pub(crate) fn key(&mut self) -> String {
         const ALPHABET: &[u8] = b"abc";
         let length = 1 + self.below(ALPHABET.len());
         (0..length)
@@ -613,7 +613,7 @@ impl Xorshift {
 
     /// A tag value of 0..=4 digits — the empty string included, which
     /// `ResourceTagValue` (length 0..256) admits.
-    fn value(&mut self) -> String {
+    pub(crate) fn value(&mut self) -> String {
         const DIGITS: &[u8] = b"0123456789";
         let length = self.below(5);
         (0..length)
