@@ -242,10 +242,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .manual_snapshot_retention_period
                 .unwrap_or(st::MANUAL_RETENTION_INDEFINITE)
         });
-        if manual_retention != st::MANUAL_RETENTION_INDEFINITE
-            && !(st::MANUAL_RETENTION_BOUNDS.0..=st::MANUAL_RETENTION_BOUNDS.1)
-                .contains(&manual_retention)
-        {
+        // One rule for the published range, shared with `ModifyClusterSnapshot`:
+        // the "indefinitely" sentinel, or a day count inside the documented
+        // bounds.
+        if !st::manual_retention_admitted(manual_retention) {
             return Err(CreateClusterSnapshotErrorModeled::InvalidRetentionPeriodFault(
                 InvalidRetentionPeriodFault {
                     message: Some(format!(

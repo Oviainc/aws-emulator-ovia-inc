@@ -31,6 +31,8 @@ mod existence_preconditions;
 mod maintenance_tracks;
 #[path = "all/modify_cluster_parameter_group.rs"]
 mod modify_cluster_parameter_group;
+#[path = "all/modify_cluster_snapshot.rs"]
+mod modify_cluster_snapshot;
 #[path = "all/orderable_cluster_options.rs"]
 mod orderable_cluster_options;
 #[path = "all/resource_tags.rs"]

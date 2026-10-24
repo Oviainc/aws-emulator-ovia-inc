@@ -806,6 +806,120 @@ pub const MANUAL_RETENTION_BOUNDS: (i32, i32) = (1, 3653);
 /// The sentinel manual retention period meaning "retained indefinitely".
 pub const MANUAL_RETENTION_INDEFINITE: i32 = -1;
 
+/// Whether a manual retention period is one this service admits: the
+/// "indefinitely" sentinel, or a day count inside [`MANUAL_RETENTION_BOUNDS`].
+///
+/// Source: the doc sentence on [`MANUAL_RETENTION_BOUNDS`], which every member
+/// carrying a manual retention period repeats — "The value must be either -1 or
+/// an integer between 1 and 3,653."
+pub fn manual_retention_admitted(period: i32) -> bool {
+    period == MANUAL_RETENTION_INDEFINITE
+        || (MANUAL_RETENTION_BOUNDS.0..=MANUAL_RETENTION_BOUNDS.1).contains(&period)
+}
+
+/// The number of seconds in one day: a manual retention period is a count of
+/// days, and every instant this service derives from one is measured in seconds.
+const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+
+/// When a manual retention period of `period` days set on a snapshot taken at
+/// `created_at` ENDS, in epoch seconds — `None` for a snapshot retained
+/// indefinitely, or one whose record carries no creation time.
+///
+/// The window is counted from the snapshot's own `SnapshotCreateTime`, "the time
+/// (in UTC format) when Amazon Redshift began the snapshot"
+/// (`smithy_query(query="doc", shape="Snapshot", member="SnapshotCreateTime")`).
+/// That is what makes `smithy_query(query="doc",
+/// shape="ModifyClusterSnapshotMessage", member="ManualSnapshotRetentionPeriod")`
+/// — "If the manual snapshot falls outside of the new retention period, you can
+/// specify the force option to immediately delete the snapshot" — possible at
+/// all: a window counted from the call that sets it could never already have
+/// ended.
+pub fn manual_retention_end(
+    created_at: Option<::aws_smithy_types::DateTime>,
+    period: i32,
+) -> Option<i64> {
+    if period == MANUAL_RETENTION_INDEFINITE {
+        return None;
+    }
+    created_at.map(|created| created.secs() + i64::from(period) * SECONDS_PER_DAY)
+}
+
+/// Whether the manual retention period `period` of a snapshot taken at
+/// `created_at` has ALREADY passed at `now`.
+///
+/// This is the condition `smithy_query(query="doc",
+/// shape="ModifyClusterSnapshotMessage", member="Force")` overrides — "a Boolean
+/// option to override an exception if the retention period has already passed".
+pub fn manual_retention_has_passed(
+    created_at: Option<::aws_smithy_types::DateTime>,
+    period: i32,
+    now: ::aws_smithy_types::DateTime,
+) -> bool {
+    manual_retention_end(created_at, period).is_some_and(|end| end <= now.secs())
+}
+
+/// `Snapshot$ManualSnapshotRemainingDays`: "the number of days until a manual
+/// snapshot will pass its retention period"
+/// (`smithy_query(query="doc", shape="Snapshot",
+/// member="ManualSnapshotRemainingDays")`).
+///
+/// Counted from `now` to the end of the window ([`manual_retention_end`]) and
+/// rounded UP, so a snapshot taken today under a period of `n` days has `n` days
+/// remaining and the count reaches zero only once the period has passed.
+/// `None` for a snapshot retained indefinitely: it never passes a period.
+pub fn manual_snapshot_remaining_days(
+    created_at: Option<::aws_smithy_types::DateTime>,
+    period: i32,
+    now: ::aws_smithy_types::DateTime,
+) -> Option<i32> {
+    let end = manual_retention_end(created_at, period)?;
+    let remaining = end - now.secs();
+    if remaining <= 0 {
+        return Some(0);
+    }
+    let days = (remaining as u64).div_ceil(SECONDS_PER_DAY as u64);
+    Some(i32::try_from(days).unwrap_or(i32::MAX))
+}
+
+/// Set a snapshot's manual retention period and every member it DERIVES.
+///
+/// One rule for the create, the modify and the read, so no two paths can report
+/// different retention bookkeeping for the same period.
+pub fn apply_manual_retention(
+    snapshot: &mut Snapshot,
+    period: i32,
+    now: ::aws_smithy_types::DateTime,
+) {
+    snapshot.manual_snapshot_retention_period = Some(period);
+    refresh_manual_retention(snapshot, now);
+}
+
+/// Recompute the members a snapshot DERIVES from the manual retention period it
+/// already carries, as of `now`.
+///
+/// `SnapshotRetentionStartTime` is "a timestamp representing the start of the
+/// retention period for the snapshot" (`smithy_query(query="doc",
+/// shape="Snapshot", member="SnapshotRetentionStartTime")`), which is the instant
+/// the window [`manual_retention_end`] measures starts at; a snapshot retained
+/// indefinitely is under no retention period, so it reports neither member.
+///
+/// Called by [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::settle`]:
+/// the remaining-day count falls as the clock advances whether or not anybody
+/// calls, so recomputing it on a read shows nothing a later caller could not
+/// already have observed.
+pub fn refresh_manual_retention(snapshot: &mut Snapshot, now: ::aws_smithy_types::DateTime) {
+    let period = snapshot
+        .manual_snapshot_retention_period
+        .unwrap_or(MANUAL_RETENTION_INDEFINITE);
+    snapshot.snapshot_retention_start_time = if period == MANUAL_RETENTION_INDEFINITE {
+        None
+    } else {
+        snapshot.snapshot_create_time
+    };
+    snapshot.manual_snapshot_remaining_days =
+        manual_snapshot_remaining_days(snapshot.snapshot_create_time, period, now);
+}
+
 /// The documented `MaxRecords` window every paginated Redshift `Describe*`
 /// operation shares: default 100, minimum 20, maximum 100.
 ///
@@ -826,6 +940,13 @@ pub const STATUS_CREATING: &str = "creating";
 pub const STATUS_AVAILABLE: &str = "available";
 /// `ClusterStatus` a `DeleteCluster` response reports.
 pub const STATUS_DELETING: &str = "deleting";
+
+/// The snapshot `Status` a snapshot this service no longer holds reports.
+///
+/// Source: `smithy_query(query="doc", shape="Snapshot", member="Status")` —
+/// "DeleteClusterSnapshot returns status as \"deleted\"": the record a call
+/// reports back after removing it from the store.
+pub const STATUS_DELETED: &str = "deleted";
 
 /// `RestoreStatus$Status` while the cluster a `RestoreFromClusterSnapshot`
 /// minted is still being provisioned.
@@ -1309,6 +1430,10 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             {
                 stored.snapshot.status = Some(STATUS_AVAILABLE.to_string());
             }
+            // How many days are left of a snapshot's manual retention period is
+            // derived from that period and the snapshot's own creation time, so
+            // it falls with the clock whether or not anybody called.
+            refresh_manual_retention(&mut stored.snapshot, wall);
         }
     }
 
@@ -2871,6 +2996,10 @@ pub fn subnet_record(subnet_identifier: &str, region: &str) -> Subnet {
 /// member="Status")` states "CreateClusterSnapshot and CopyClusterSnapshot
 /// returns status as \"creating\"". [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::settle`]
 /// moves it to `available` once [`PROVISIONING_SPAN`] has passed.
+///
+/// The manual retention period is applied through [`apply_manual_retention`],
+/// the one rule for it, so a snapshot a create minted reports the same retention
+/// bookkeeping a `ModifyClusterSnapshot` would leave for the same period.
 pub fn snapshot_of(
     cluster: &Cluster,
     snapshot_identifier: &str,
@@ -2880,7 +3009,7 @@ pub fn snapshot_of(
     region: &str,
 ) -> Snapshot {
     let cluster_identifier = cluster.cluster_identifier.clone().unwrap_or_default();
-    Snapshot {
+    let mut snapshot = Snapshot {
         snapshot_identifier: Some(snapshot_identifier.to_string()),
         cluster_identifier: Some(cluster_identifier.clone()),
         snapshot_create_time: Some(created_at),
@@ -2904,7 +3033,6 @@ pub fn snapshot_of(
         tags: Some(tags),
         enhanced_vpc_routing: cluster.enhanced_vpc_routing,
         maintenance_track_name: cluster.maintenance_track_name.clone(),
-        manual_snapshot_retention_period: Some(manual_retention_period),
         master_password_secret_arn: cluster.master_password_secret_arn.clone(),
         master_password_secret_kms_key_id: cluster.master_password_secret_kms_key_id.clone(),
         snapshot_arn: Some(snapshot_arn(
@@ -2913,7 +3041,9 @@ pub fn snapshot_of(
             region,
         )),
         ..Default::default()
-    }
+    };
+    apply_manual_retention(&mut snapshot, manual_retention_period, created_at);
+    snapshot
 }
 
 /// Resolve the `ClusterType` / `NumberOfNodes` pair a request asks for, or say
