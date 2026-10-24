@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ForgetDevice
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ForgetDevice`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ForgetDevice::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Forgets one device of the signed-in user the presented access token names: the
+//! stored device is removed, so a later read of it finds nothing and a later sign-in
+//! from it is a sign-in from a device the pool does not recognise.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +186,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ForgetDevice` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ForgetDeviceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ForgetDevice"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        // "Authorize this action with a signed-in user's access token" (this
+        // operation's documentation): the device forgotten is that user's, so a
+        // request that presents no token this emulator issued names no user.
+        let (user_pool_id, username) = {
+            let (pool, user) = guard
+                .signed_in_user(input.access_token.as_deref().unwrap_or_default(), now)
+                .map_err(token_rejected)?;
+            if !pool.remembers_devices() {
+                return Err(device_remembering_not_configured());
+            }
+            (pool.id.clone(), user.username.clone())
+        };
+
+        let pool = guard
+            .pool_mut(&user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&user_pool_id))?;
+        let user = pool.user_mut(&username).ok_or_else(user_not_found)?;
+        user.devices
+            .remove(&input.device_key)
+            .ok_or_else(device_not_found)?;
+
+        Ok(ForgetDeviceOutput)
     }
 }
+
+/// This operation's answer to an `AccessToken` that names no signed-in user,
+/// which is also what an absent one gets: every rejection of the token itself is
+/// `NotAuthorizedException`, while a token whose pool or user has since been
+/// deleted answers for the resource that is gone.
+fn token_rejected(rejection: crate::state::TokenRejection) -> ForgetDeviceError {
+    match rejection {
+        crate::state::TokenRejection::NotAnAccessToken => not_authorized("Invalid Access Token"),
+        crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        crate::state::TokenRejection::PoolGone => {
+            ForgetDeviceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                // The caller named no pool — the token did — so this message
+                // names none either.
+                message: Some("User pool does not exist.".to_string()),
+            })
+            .into()
+        }
+        crate::state::TokenRejection::UserGone => user_not_found(),
+    }
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> ForgetDeviceError {
+    ForgetDeviceErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a pool that is gone between
+/// the token's issue and this call.
+fn user_pool_not_found(user_pool_id: &str) -> ForgetDeviceError {
+    ForgetDeviceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `UserNotFoundException` for an absent user. Carries the
+/// fixed message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no
+/// username.
+fn user_not_found() -> ForgetDeviceError {
+    ForgetDeviceErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The refusal a device operation owes on a pool that activated no device
+/// remembering at all.
+fn device_remembering_not_configured() -> ForgetDeviceError {
+    ForgetDeviceErrorModeled::InvalidUserPoolConfigurationException(
+        InvalidUserPoolConfigurationException {
+            message: Some(crate::state::DEVICE_REMEMBERING_NOT_CONFIGURED_MESSAGE.to_string()),
+        },
+    )
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a `DeviceKey` the signed-in
+/// user holds no device for.
+fn device_not_found() -> ForgetDeviceError {
+    ForgetDeviceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::DEVICE_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> ForgetDeviceError {
+    ForgetDeviceErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
+}
+

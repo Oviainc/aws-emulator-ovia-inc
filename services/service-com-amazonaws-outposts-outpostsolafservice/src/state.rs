@@ -12,7 +12,8 @@
 //! clock owes, allocating the
 //! tunnel an Outpost-server installation connection is reported as, cutting an
 //! ordered list into pages with the modelled `Token` the next page resumes from, the
-//! orderable-instance-type catalog this service publishes, and
+//! orderable-instance-type catalog and the catalog of orderable hardware
+//! configurations this service publishes, and
 //! the two rules this service words its refusals by — the `NotFoundException`
 //! identifier echo and the value-omitting `ValidationException` report.
 
@@ -22,9 +23,9 @@ use sha2::{Digest, Sha256};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    Address, AssetInfo, AssetInstance, CapacityTaskFailure, ConnectionDetails,
-    DetailedInstanceTypeItem, FormFactorConfig, InstanceTypeCapacity, InstancesToExclude, Order,
-    Outpost, PricingOption, PrivateConnectivityConfig, Quote, Site,
+    Address, AssetInfo, AssetInstance, CapacityTaskFailure, CatalogItem, ConnectionDetails,
+    DetailedInstanceTypeItem, EC2Capacity, FormFactorConfig, InstanceTypeCapacity,
+    InstancesToExclude, Order, Outpost, PricingOption, PrivateConnectivityConfig, Quote, Site,
 };
 
 /// The region every minted ARN falls back to when the request carries no SigV4
@@ -1129,6 +1130,23 @@ impl OrderableInstanceTypeRecord {
             .flatten()
             .any(|config| config.outpost_generation.as_deref() == Some(generation))
     }
+
+    /// Whether this instance type is offered on `form_factor` hardware of
+    /// `generation`: whether ANY of its `FormFactorConfigs` names that PAIR.
+    ///
+    /// The narrower question [`Self::is_orderable_in`] asks of the generation alone,
+    /// asked of one whole configuration — which is what tells which instance types a
+    /// given piece of hardware runs (see [`catalog_item_catalog`]).
+    pub fn is_offered_as(&self, form_factor: &str, generation: &str) -> bool {
+        self.instance_type
+            .form_factor_configs
+            .iter()
+            .flatten()
+            .any(|config| {
+                config.form_factor.as_deref() == Some(form_factor)
+                    && config.outpost_generation.as_deref() == Some(generation)
+            })
+    }
 }
 
 /// The whole orderable-instance-type catalog, expanded from [`ORDERABLE_FAMILIES`]
@@ -1191,6 +1209,413 @@ pub fn orderable_instance_type_catalog() -> Vec<OrderableInstanceTypeRecord> {
         .collect()
 }
 
+/// The `CatalogItemClass` an Outposts RACK configuration is published as, from the
+/// modelled value set [`crate::ops::types::CATALOG_ITEM_CLASS_VALUES`] (`RACK` |
+/// `SERVER`).
+///
+/// A class names the same kind of hardware the modelled `FormFactor` does
+/// ([`FORM_FACTOR_RACK`]), which is what lets a configuration's class select the
+/// instance types an Outpost of that hardware runs (see [`catalog_item_catalog`]).
+pub const CATALOG_ITEM_CLASS_RACK: &str = "RACK";
+
+/// The `CatalogItemClass` an Outposts SERVER configuration is published as. See
+/// [`CATALOG_ITEM_CLASS_RACK`].
+pub const CATALOG_ITEM_CLASS_SERVER: &str = "SERVER";
+
+/// The `CatalogItemStatus` a configuration that can still be ordered carries, from
+/// the modelled value set [`crate::ops::types::CATALOG_ITEM_STATUS_VALUES`]
+/// (`AVAILABLE` | `DISCONTINUED`).
+pub const CATALOG_ITEM_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// The `CatalogItemStatus` a configuration that is no longer offered carries.
+///
+/// A discontinued item stays IN the catalog — it is still what an Outpost already
+/// installed was ordered as — so a read of the catalog reports it; the operation
+/// models no status filter to leave it out with. See
+/// [`CATALOG_ITEM_STATUS_AVAILABLE`].
+pub const CATALOG_ITEM_STATUS_DISCONTINUED: &str = "DISCONTINUED";
+
+/// The Amazon EBS storage option, from the modelled `SupportedStorageEnum` value set
+/// [`crate::ops::types::SUPPORTED_STORAGE_ENUM_VALUES`] (`EBS` | `S3`).
+pub const SUPPORTED_STORAGE_EBS: &str = "EBS";
+
+/// The Amazon S3 storage option. See [`SUPPORTED_STORAGE_EBS`].
+pub const SUPPORTED_STORAGE_S3: &str = "S3";
+
+/// The `RackScalingType` of a configuration that scales as one rack, from the
+/// modelled value set [`crate::ops::types::RACK_SCALING_TYPE_VALUES`]
+/// (`SINGLE_RACK` | `MULTI_RACK`), which `CatalogItem$RackScalingType` documents as
+/// its valid values.
+pub const RACK_SCALING_TYPE_SINGLE_RACK: &str = "SINGLE_RACK";
+
+/// The `RackScalingType` of a configuration that scales across racks. See
+/// [`RACK_SCALING_TYPE_SINGLE_RACK`].
+pub const RACK_SCALING_TYPE_MULTI_RACK: &str = "MULTI_RACK";
+
+/// The literal prefix every `SkuCode` carries, as the modelled pattern
+/// `^OR-[A-Z0-9]{7}$` spells it.
+const SKU_PREFIX: &str = "OR-";
+
+/// How many characters of [`SKU_ALPHABET`] follow that prefix, from the same pattern.
+const SKU_BODY: usize = 7;
+
+/// The alphabet a `SkuCode`'s body is drawn from, from the same pattern's
+/// `[A-Z0-9]`.
+const SKU_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+/// The `SkuCode` a hardware configuration is published under, derived from `seed`:
+/// the configuration's own facts.
+///
+/// A SKU is not a resource a caller creates, so it is DERIVED rather than minted —
+/// the same configuration is published under the same code in every process, which
+/// is what lets a caller that read a SKU out of the catalog read that item back by
+/// it later. The rendering is exactly the modelled `SkuCode` pattern.
+fn sku_code(seed: &str) -> String {
+    let digest = Sha256::digest(seed.as_bytes());
+    let body: String = digest
+        .iter()
+        .take(SKU_BODY)
+        .map(|byte| char::from(SKU_ALPHABET[usize::from(*byte) % SKU_ALPHABET.len()]))
+        .collect();
+    format!("{SKU_PREFIX}{body}")
+}
+
+/// One hardware configuration in the catalog this service publishes: what it is,
+/// what it draws and weighs, how it attaches to the Region, which storage it
+/// supports and how much EC2 capacity it carries.
+struct CatalogConfiguration {
+    /// The `CatalogItemClass` the configuration is published as.
+    item_class: &'static str,
+    /// The `OutpostGeneration` of its hardware, which together with `item_class`
+    /// selects the instance types it runs. Not reported: the modelled `CatalogItem`
+    /// carries neither the class nor the generation, only what they imply.
+    generation: &'static str,
+    /// The `CatalogItemStatus` the configuration is published in.
+    item_status: &'static str,
+    /// `PowerKva`: the power the configuration draws.
+    power_kva: f32,
+    /// `WeightLbs`: what the configuration weighs.
+    weight_lbs: i32,
+    /// `SupportedUplinkGbps`: the uplink speeds it supports for the connection to
+    /// the Region.
+    supported_uplink_gbps: &'static [i32],
+    /// `SupportedStorage`: the storage options it supports.
+    supported_storage: &'static [&'static str],
+    /// `RackScalingType`, or `None` for a configuration rack scaling does not apply
+    /// to — a single server is not a rack, so it scales as neither one rack nor
+    /// several, and the member is omitted rather than given a value the hardware has
+    /// no answer for.
+    rack_scaling_type: Option<&'static str>,
+    /// How many vCPUs of EC2 capacity the configuration carries, which is what the
+    /// `Quantity` of each of its EC2 capacities is computed from (see
+    /// [`ec2_capacities`]). Not reported: the modelled `CatalogItem` reports the
+    /// capacity per family rather than one total.
+    capacity_vcpus: i32,
+}
+
+impl CatalogConfiguration {
+    /// The seed [`sku_code`] derives this configuration's `CatalogItemId` from:
+    /// every fact that distinguishes it from another row, so two different
+    /// configurations are never published under one SKU.
+    fn sku_seed(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{:?}|{:?}|{}",
+            self.item_class,
+            self.generation,
+            self.item_status,
+            self.power_kva,
+            self.weight_lbs,
+            self.capacity_vcpus,
+            self.supported_uplink_gbps,
+            self.supported_storage,
+            self.rack_scaling_type.unwrap_or_default(),
+        )
+    }
+}
+
+/// The catalog of orderable hardware configurations this service publishes.
+///
+/// Three sources meet in these rows. The uplink speeds are the modelled `UplinkGbps`
+/// set (`UPLINK_1G` | `UPLINK_10G` | `UPLINK_40G` | `UPLINK_100G`), read as the
+/// Gbps figures the member's own `SupportedUplinkGbps` integers report. A rack's
+/// power draws are the modelled `PowerDrawKva` set (`POWER_5_KVA` …
+/// `POWER_30_KVA`), which is what a site declares it can provide at a rack position,
+/// and a rack's weight stays inside the modelled `MaximumSupportedWeightLbs` set
+/// (`MAX_1400_LBS` … `MAX_2000_LBS`, above which the model's own `NO_LIMIT` begins)
+/// so a published rack is one a site can declare support for. WHICH configurations
+/// are offered — their storage options, how much EC2 capacity each carries and which
+/// are still available — is this emulator's own catalog assignment, exactly as
+/// [`ORDERABLE_FAMILIES`]'s generation assignment is: AWS prices a configuration per
+/// quote rather than publishing a machine-readable catalog. A server is not a rack,
+/// so its power and weight are the hardware's own rather than a rack position's.
+const CATALOG_ITEMS: &[CatalogConfiguration] = &[
+    CatalogConfiguration {
+        item_class: CATALOG_ITEM_CLASS_RACK,
+        generation: OUTPOST_GENERATION_1,
+        item_status: CATALOG_ITEM_STATUS_AVAILABLE,
+        power_kva: 5.0,
+        weight_lbs: 1400,
+        supported_uplink_gbps: &[1, 10, 40, 100],
+        supported_storage: &[SUPPORTED_STORAGE_EBS, SUPPORTED_STORAGE_S3],
+        rack_scaling_type: Some(RACK_SCALING_TYPE_SINGLE_RACK),
+        capacity_vcpus: 480,
+    },
+    CatalogConfiguration {
+        item_class: CATALOG_ITEM_CLASS_RACK,
+        generation: OUTPOST_GENERATION_1,
+        item_status: CATALOG_ITEM_STATUS_AVAILABLE,
+        power_kva: 10.0,
+        weight_lbs: 1600,
+        supported_uplink_gbps: &[10, 40, 100],
+        supported_storage: &[SUPPORTED_STORAGE_EBS, SUPPORTED_STORAGE_S3],
+        rack_scaling_type: Some(RACK_SCALING_TYPE_SINGLE_RACK),
+        capacity_vcpus: 960,
+    },
+    CatalogConfiguration {
+        item_class: CATALOG_ITEM_CLASS_RACK,
+        generation: OUTPOST_GENERATION_1,
+        item_status: CATALOG_ITEM_STATUS_AVAILABLE,
+        power_kva: 15.0,
+        weight_lbs: 1800,
+        supported_uplink_gbps: &[10, 40, 100],
+        supported_storage: &[SUPPORTED_STORAGE_EBS, SUPPORTED_STORAGE_S3],
+        rack_scaling_type: Some(RACK_SCALING_TYPE_MULTI_RACK),
+        capacity_vcpus: 1440,
+    },
+    CatalogConfiguration {
+        item_class: CATALOG_ITEM_CLASS_RACK,
+        generation: OUTPOST_GENERATION_1,
+        item_status: CATALOG_ITEM_STATUS_DISCONTINUED,
+        power_kva: 5.0,
+        weight_lbs: 1400,
+        supported_uplink_gbps: &[1, 10],
+        supported_storage: &[SUPPORTED_STORAGE_EBS],
+        rack_scaling_type: Some(RACK_SCALING_TYPE_SINGLE_RACK),
+        capacity_vcpus: 240,
+    },
+    CatalogConfiguration {
+        item_class: CATALOG_ITEM_CLASS_RACK,
+        generation: OUTPOST_GENERATION_2,
+        item_status: CATALOG_ITEM_STATUS_AVAILABLE,
+        power_kva: 10.0,
+        weight_lbs: 1800,
+        supported_uplink_gbps: &[10, 40, 100],
+        supported_storage: &[SUPPORTED_STORAGE_EBS, SUPPORTED_STORAGE_S3],
+        rack_scaling_type: Some(RACK_SCALING_TYPE_SINGLE_RACK),
+        capacity_vcpus: 1280,
+    },
+    CatalogConfiguration {
+        item_class: CATALOG_ITEM_CLASS_RACK,
+        generation: OUTPOST_GENERATION_2,
+        item_status: CATALOG_ITEM_STATUS_AVAILABLE,
+        power_kva: 30.0,
+        weight_lbs: 2000,
+        supported_uplink_gbps: &[40, 100],
+        supported_storage: &[SUPPORTED_STORAGE_EBS, SUPPORTED_STORAGE_S3],
+        rack_scaling_type: Some(RACK_SCALING_TYPE_MULTI_RACK),
+        capacity_vcpus: 2560,
+    },
+    CatalogConfiguration {
+        item_class: CATALOG_ITEM_CLASS_SERVER,
+        generation: OUTPOST_GENERATION_1,
+        item_status: CATALOG_ITEM_STATUS_AVAILABLE,
+        power_kva: 0.5,
+        weight_lbs: 50,
+        supported_uplink_gbps: &[1, 10],
+        supported_storage: &[SUPPORTED_STORAGE_EBS],
+        rack_scaling_type: None,
+        capacity_vcpus: 64,
+    },
+    CatalogConfiguration {
+        item_class: CATALOG_ITEM_CLASS_SERVER,
+        generation: OUTPOST_GENERATION_1,
+        item_status: CATALOG_ITEM_STATUS_AVAILABLE,
+        power_kva: 1.0,
+        weight_lbs: 70,
+        supported_uplink_gbps: &[1, 10],
+        supported_storage: &[SUPPORTED_STORAGE_EBS],
+        rack_scaling_type: None,
+        capacity_vcpus: 128,
+    },
+];
+
+/// One entry of the catalog of items: the modelled [`CatalogItem`] as a read of the
+/// catalog reports it, plus the entry's position in the catalog's stable order and
+/// the one fact a filter selects on that the projection does not carry.
+///
+/// The catalog is REFERENCE data, not a resource a caller creates, so the sequence is
+/// the entry's position in that order rather than a creation counter — exactly as
+/// [`OrderableInstanceTypeRecord::sequence`] is.
+#[derive(Debug, Clone)]
+pub struct CatalogItemRecord {
+    /// Position in the catalog's stable order. See [`SiteRecord::sequence`].
+    pub sequence: u64,
+    /// The `CatalogItemClass` of this item: what `ListCatalogItems$ItemClassFilter`
+    /// selects on.
+    ///
+    /// Held BESIDE the projection because the modelled `CatalogItem` carries no
+    /// class member: the class narrows which items an answer holds, and is never
+    /// reported.
+    pub item_class: String,
+    /// The entry as a read of the catalog reports it.
+    pub item: CatalogItem,
+}
+
+impl CatalogItemRecord {
+    /// Whether this item is of ANY of the classes a filter names.
+    ///
+    /// "For a filter where you can specify multiple values, the results include
+    /// items that match any of the values that you specify for the filter", as the
+    /// operation documents it — so a filter carrying no value at all narrows
+    /// nothing, exactly as an absent one does.
+    pub fn is_class(&self, classes: &[String]) -> bool {
+        classes.is_empty() || classes.contains(&self.item_class)
+    }
+
+    /// Whether this item supports ANY of the storage options a filter names. See
+    /// [`Self::is_class`].
+    pub fn supports_storage(&self, options: &[String]) -> bool {
+        options.is_empty()
+            || self
+                .item
+                .supported_storage
+                .iter()
+                .flatten()
+                .any(|supported| options.contains(supported))
+    }
+
+    /// Whether this item carries EC2 capacity of ANY of the instance families a
+    /// filter names. See [`Self::is_class`].
+    pub fn offers_family(&self, families: &[String]) -> bool {
+        families.is_empty()
+            || self.item.ec2_capacities.iter().flatten().any(|capacity| {
+                capacity
+                    .family
+                    .as_ref()
+                    .is_some_and(|family| families.contains(family))
+            })
+    }
+}
+
+/// The EC2 capacity one configuration carries: one entry per instance FAMILY the
+/// hardware runs, naming the largest size of that family and how many of that size
+/// the configuration's compute capacity provides.
+///
+/// Which families a configuration runs is not a second catalog: it is the
+/// orderable-instance-type catalog ([`orderable_instance_type_catalog`]) narrowed to
+/// the configuration's own form factor and generation, so an item can never offer
+/// capacity of a family this service does not publish as orderable on that hardware.
+fn ec2_capacities(
+    instance_types: &[OrderableInstanceTypeRecord],
+    config: &CatalogConfiguration,
+) -> Vec<EC2Capacity> {
+    let mut largest: BTreeMap<String, (i32, String)> = BTreeMap::new();
+    for record in instance_types
+        .iter()
+        .filter(|record| record.is_offered_as(config.item_class, config.generation))
+    {
+        let Some(instance_type) = record.instance_type.instance_type.as_deref() else {
+            continue;
+        };
+        let Some((family, _)) = instance_type.split_once('.') else {
+            continue;
+        };
+        let vcpus = record.instance_type.vcp_us.unwrap_or_default();
+        let entry = largest
+            .entry(family.to_string())
+            .or_insert_with(|| (vcpus, instance_type.to_string()));
+        if vcpus > entry.0 {
+            *entry = (vcpus, instance_type.to_string());
+        }
+    }
+    largest
+        .into_iter()
+        .map(|(family, (vcpus, max_size))| EC2Capacity {
+            family: Some(family),
+            max_size: Some(max_size),
+            // How many instances of that largest size the configuration's compute
+            // capacity runs, which is the figure `Quantity` reports: a whole number
+            // of hosts, and at least one, because a family the hardware runs at all
+            // runs one of them.
+            quantity: Some((config.capacity_vcpus / vcpus.max(1)).max(1).to_string()),
+        })
+        .collect()
+}
+
+/// The whole catalog of items this service publishes, expanded from
+/// [`CATALOG_ITEMS`] and ordered by `CatalogItemId`.
+///
+/// The order is by the published SKU so it is stable across processes — a page token
+/// names a position in it, so the order a caller pages through must not depend on how
+/// the table above happens to be written.
+pub fn catalog_item_catalog() -> Vec<CatalogItemRecord> {
+    // The catalog may only ever name values the model declares, so the table is
+    // checked against the GENERATED value sets rather than trusted to agree with
+    // them: a model that renames a class, a status, a storage option or a scaling
+    // type trips this in every debug build instead of letting the catalog report an
+    // unmodelled member.
+    debug_assert!(
+        CATALOG_ITEMS.iter().all(|config| {
+            crate::ops::types::CATALOG_ITEM_CLASS_VALUES.contains(&config.item_class)
+                && crate::ops::types::FORM_FACTOR_VALUES.contains(&config.item_class)
+                && crate::ops::types::OUTPOST_GENERATION_VALUES.contains(&config.generation)
+                && crate::ops::types::CATALOG_ITEM_STATUS_VALUES.contains(&config.item_status)
+                && config
+                    .supported_storage
+                    .iter()
+                    .all(|option| crate::ops::types::SUPPORTED_STORAGE_ENUM_VALUES.contains(option))
+                && config.rack_scaling_type.is_none_or(|scaling| {
+                    crate::ops::types::RACK_SCALING_TYPE_VALUES.contains(&scaling)
+                })
+        }),
+        "every catalog configuration names a modelled class, status, storage option and \
+         scaling type"
+    );
+    let instance_types = orderable_instance_type_catalog();
+    let mut items: Vec<(String, CatalogItem)> = CATALOG_ITEMS
+        .iter()
+        .map(|config| {
+            (
+                config.item_class.to_string(),
+                CatalogItem {
+                    catalog_item_id: Some(sku_code(&config.sku_seed())),
+                    item_status: Some(config.item_status.to_string()),
+                    ec2_capacities: Some(ec2_capacities(&instance_types, config)),
+                    power_kva: Some(config.power_kva),
+                    weight_lbs: Some(config.weight_lbs),
+                    supported_uplink_gbps: Some(config.supported_uplink_gbps.to_vec()),
+                    supported_storage: Some(
+                        config
+                            .supported_storage
+                            .iter()
+                            .map(|option| (*option).to_string())
+                            .collect(),
+                    ),
+                    rack_scaling_type: config
+                        .rack_scaling_type
+                        .map(|scaling| scaling.to_string()),
+                },
+            )
+        })
+        .collect();
+    items.sort_by(|(_, left), (_, right)| left.catalog_item_id.cmp(&right.catalog_item_id));
+    debug_assert!(
+        items
+            .windows(2)
+            .all(|pair| pair[0].1.catalog_item_id != pair[1].1.catalog_item_id),
+        "no two catalog configurations are published under one SkuCode"
+    );
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(index, (item_class, item))| CatalogItemRecord {
+            sequence: u64::try_from(index).unwrap_or_default() + 1,
+            item_class,
+            item,
+        })
+        .collect()
+}
+
 /// Per-service state for com-amazonaws-outposts-outpostsolafservice. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsOutpostsOutpostsolafserviceState {
@@ -1229,6 +1654,14 @@ pub struct ComAmazonawsOutpostsOutpostsolafserviceState {
     /// [`orderable_instance_type_catalog`] and no operation mutates it, so every
     /// read of it answers the same catalog.
     pub orderable_instance_types: Vec<OrderableInstanceTypeRecord>,
+    /// The catalog of items `ListCatalogItems` reports, in its stable order.
+    ///
+    /// Reference data rather than a caller's resource, exactly as
+    /// [`Self::orderable_instance_types`] is: it is seeded in
+    /// [`ComAmazonawsOutpostsOutpostsolafserviceState::default`] from
+    /// [`catalog_item_catalog`] and no operation mutates it, so every read of it
+    /// answers the same catalog.
+    pub catalog_items: Vec<CatalogItemRecord>,
     /// How many resources this store has created. Doubles as the monotonically
     /// increasing creation order every record records and every page token names,
     /// and as part of each minted id's seed so no two ids collide.
@@ -1249,6 +1682,7 @@ impl Default for ComAmazonawsOutpostsOutpostsolafserviceState {
             connections: BTreeMap::new(),
             connection_server_public_key: None,
             orderable_instance_types: orderable_instance_type_catalog(),
+            catalog_items: catalog_item_catalog(),
             created: 0,
         }
     }
@@ -2511,6 +2945,14 @@ pub const SITE_PAGE: &str = "sites";
 
 /// The stamp a `ListOrderableInstanceTypes` page token carries. See [`OUTPOST_PAGE`].
 pub const ORDERABLE_INSTANCE_TYPE_PAGE: &str = "instanceTypes";
+
+/// The stamp a `ListCatalogItems` page token carries.
+///
+/// What it pages through is the catalog of orderable hardware CONFIGURATIONS, a
+/// different list from the instance types those configurations run
+/// ([`ORDERABLE_INSTANCE_TYPE_PAGE`]), so a token issued for one of them is not a
+/// boundary of the other. See [`OUTPOST_PAGE`].
+pub const CATALOG_ITEM_PAGE: &str = "catalogItems";
 
 /// The stamp a `ListAssets` page token carries.
 ///

@@ -5,19 +5,16 @@
 //! Removes tags from one Firewall Manager resource, named by a generic
 //! `ResourceArn`.
 //!
-//! Administrator-gated, like every organisation-scoped Firewall Manager
-//! operation: with no Firewall Manager default administrator association for the
-//! organisation the call is refused by [`crate::state::require_administrator`]
-//! BEFORE the ARN's form is checked and before anything is looked up or written
-//! — so an unauthorised caller learns nothing about what the organisation holds
-//! and leaves the stored tag sets untouched. The association is
-//! organisation-wide (one default administrator, whose `AdminScope` is the whole
-//! organisation), so the gate answers the same in every Region and the request's
-//! Region only composes the refusal's message.
-//! With an administrator associated, a malformed ARN is a `ValidationException`,
-//! an ARN naming no stored resource is `ResourceNotFoundException`, and the
-//! named keys are dropped from the resource's persisted tag set while every
-//! other key it carries is left alone.
+//! NOT administrator-gated. A resource-level tagging call names its target by
+//! the model's generic `ResourceArn` and nothing else, so it is answered from
+//! that ARN alone: the ARN's FORM first (a string that is not an ARN is a 400
+//! `ValidationException`), then the ARN's RESOLUTION against the resources this
+//! service stores (an ARN naming none of them is the modelled
+//! `ResourceNotFoundException`), and otherwise the named keys are dropped from
+//! the resource's persisted tag set while every other key it carries is left
+//! alone. No Firewall Manager administrator association is required or consulted
+//! — the operation models no authorization error, and `AccessDeniedException` is
+//! not in its error union.
 //!
 //! ## Shape of an operation
 //!
@@ -153,10 +150,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata.
+        // The engine is reachable from `&self` (constructor-injected).
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalErrorException(
                 InternalErrorException {
@@ -166,19 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // The authorization gate FIRST, on the ordering
-        // [`crate::state::require_administrator`]'s own documentation states, and
-        // the same ordering this operation's sibling tag writer follows: this is
-        // an organisation-scoped call, so it is answered only while the
-        // organisation has a Firewall Manager administrator, and the decision is
-        // taken before the ARN's form, the `TagKeys` and any lookup — hence the
-        // lock is held across the request-local checks below rather than taken
-        // after them.
-        crate::state::require_administrator(&store, &region)?;
 
-        // The ARN's FORM next: a string that is not an ARN at all is a caller
+        // The ARN's FORM FIRST: a string that is not an ARN at all is a caller
         // programming error, refused before anything is looked up or written.
         // The modelled `ResourceArn` pattern cannot express this, so the service
         // check does — as a 400 `ValidationException`, never a 501.

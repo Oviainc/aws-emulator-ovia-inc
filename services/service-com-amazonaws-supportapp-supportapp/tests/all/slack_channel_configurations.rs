@@ -32,13 +32,10 @@ use smithy_server_runtime::MultiServiceRouter;
 /// no assertion depends on it.
 const REGION: &str = "us-east-1";
 
-/// `ListSlackChannelConfigurations` reports at most this many configurations per page
-/// (`CHANNEL_PAGE_SIZE` in `src/state.rs`; the service publishes no page size).
-const CHANNEL_PAGE_SIZE: usize = 10;
-
 /// The account's documented maximum number of Slack channel configurations
 /// (`CreateSlackChannelConfiguration` doc: "You can add up to 20 Slack channels for
-/// your account").
+/// your account"). It bounds the whole listing, which is why the listing is reported
+/// in one response.
 const MAX_SLACK_CHANNEL_CONFIGURATIONS: usize = 20;
 
 /// `accountAlias` is `len 1..30, pattern ^[\w\- ]+$`
@@ -208,27 +205,19 @@ impl Emulator {
     }
 
     /// The single stored configuration for `(team_id, channel_id)` as the listing
-    /// reports it, or `None` when the listing does not hold it. Walks every page, so a
-    /// configuration on a later page is still found.
+    /// reports it, or `None` when the listing does not hold it. One call is enough: the
+    /// listing reports every stored configuration.
     pub(crate) async fn listed(&self, team_id: &str, channel_id: &str) -> Option<Value> {
-        let mut token: Option<String> = None;
-        loop {
-            let page = self.list(token.as_deref()).await;
-            assert_eq!(
-                page.status, 200,
-                "listing must answer HTTP 200, got {} / {}",
-                page.status, page.body
-            );
-            let found = page.configurations().into_iter().find(|item| {
-                item.get("teamId").and_then(Value::as_str) == Some(team_id)
-                    && item.get("channelId").and_then(Value::as_str) == Some(channel_id)
-            });
-            if found.is_some() {
-                return found;
-            }
-            token = page.string("nextToken");
-            token.as_ref()?;
-        }
+        let reply = self.list(None).await;
+        assert_eq!(
+            reply.status, 200,
+            "listing must answer HTTP 200, got {} / {}",
+            reply.status, reply.body
+        );
+        reply.configurations().into_iter().find(|item| {
+            item.get("teamId").and_then(Value::as_str) == Some(team_id)
+                && item.get("channelId").and_then(Value::as_str) == Some(channel_id)
+        })
     }
 }
 
@@ -859,29 +848,26 @@ async fn delete_removes_only_the_named_configuration() {
     );
 }
 
-/// Walk every page `ListSlackChannelConfigurations` offers and return the
-/// `(teamId, channelId)` pairs it reported, in order, asserting each page honours the
-/// page size.
-async fn drain_pages(emulator: &Emulator, label: &str) -> Vec<(String, String)> {
-    let mut reported = Vec::new();
-    let mut token: Option<String> = None;
-    // One more round trip than there can be pages, so a non-terminating cursor fails
-    // loudly instead of looping forever.
-    for _ in 0..64 {
-        let page = emulator.list(token.as_deref()).await;
-        assert_eq!(
-            page.status, 200,
-            "case {label:?}: expected HTTP 200 for a page, got {} / {}",
-            page.status, page.body
-        );
-        let items = page.configurations();
-        assert!(
-            items.len() <= CHANNEL_PAGE_SIZE,
-            "case {label:?}: expected at most {CHANNEL_PAGE_SIZE} configurations per page, got {}",
-            items.len()
-        );
-        for item in &items {
-            reported.push((
+/// The `(teamId, channelId)` pairs `ListSlackChannelConfigurations` reports, in the
+/// order it reported them, asserting the listing came back WHOLE: one HTTP 200 with
+/// every stored configuration and no `nextToken`.
+async fn listed_pairs(emulator: &Emulator, label: &str) -> Vec<(String, String)> {
+    let reply = emulator.list(None).await;
+    assert_eq!(
+        reply.status, 200,
+        "case {label:?}: expected HTTP 200 for the listing, got {} / {}",
+        reply.status, reply.body
+    );
+    assert!(
+        reply.string("nextToken").is_none(),
+        "case {label:?}: expected no nextToken on a listing the account quota bounds, got {}",
+        reply.body
+    );
+    reply
+        .configurations()
+        .iter()
+        .map(|item| {
+            (
                 item.get("teamId")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
@@ -890,25 +876,23 @@ async fn drain_pages(emulator: &Emulator, label: &str) -> Vec<(String, String)> 
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
-            ));
-        }
-        token = page.string("nextToken");
-        if token.is_none() {
-            return reported;
-        }
-    }
-    panic!("case {label:?}: the cursor never terminated after 64 pages");
+            )
+        })
+        .collect()
 }
 
 #[tokio::test]
-async fn pagination_reports_every_stored_configuration_exactly_once() {
-    // Rows differ in how many configurations are stored: none, one, exactly a page,
-    // one past a page, and the account's documented maximum — which is two full pages.
+async fn the_listing_reports_every_stored_configuration_in_one_response() {
+    // Rows differ in how many configurations are stored: none, one, a handful, the
+    // twelve of the recorded case, one short of the documented account maximum, and
+    // that maximum itself. Whatever the count, the account cannot hold more than the
+    // quota, so the listing is never split.
     for stored in [
         0usize,
         1,
-        CHANNEL_PAGE_SIZE,
-        CHANNEL_PAGE_SIZE + 1,
+        3,
+        12,
+        MAX_SLACK_CHANNEL_CONFIGURATIONS - 1,
         MAX_SLACK_CHANNEL_CONFIGURATIONS,
     ] {
         let emulator = Emulator::new();
@@ -939,7 +923,7 @@ async fn pagination_reports_every_stored_configuration_exactly_once() {
         expected.sort();
 
         let label = format!("{stored} stored");
-        let reported = drain_pages(&emulator, &label).await;
+        let reported = listed_pairs(&emulator, &label).await;
         assert_eq!(
             reported, expected,
             "case {label:?}: expected every stored pair once in key order, got {reported:?}"
@@ -1001,7 +985,7 @@ async fn a_create_past_the_documented_channel_quota_is_refused() {
 
     // A full account still reports exactly its quota, and reconfiguring a channel it
     // already holds is the conflict, not the quota: that create adds nothing.
-    let stored = drain_pages(&emulator, "a full account").await;
+    let stored = listed_pairs(&emulator, "a full account").await;
     assert_eq!(
         stored.len(),
         MAX_SLACK_CHANNEL_CONFIGURATIONS,
@@ -1045,7 +1029,7 @@ async fn a_create_past_the_documented_channel_quota_is_refused() {
 }
 
 #[tokio::test]
-async fn a_next_token_this_service_did_not_mint_is_refused() {
+async fn a_next_token_no_listing_returned_is_refused() {
     let emulator = Emulator::new();
     for index in 0..3 {
         emulator
@@ -1058,14 +1042,14 @@ async fn a_next_token_this_service_did_not_mint_is_refused() {
             .await;
     }
 
-    // Tokens differing in why they are not cursors: not hex at all, odd-length hex,
-    // hex that decodes to bytes that are not text, and hex of a single key with no
-    // separator.
+    // Tokens differing in form: not hex at all, odd-length hex, hex that decodes to
+    // bytes that are not text, and hex of a key. No listing of this service returns a
+    // token, so none of them names a position.
     for token in ["not-a-cursor", "abc", "fffe", "5430313241424344454647"] {
         let reply = emulator.list(Some(token)).await;
         assert_eq!(
             reply.status, 400,
-            "case {token:?}: expected HTTP 400 for a foreign nextToken, got {} / {}",
+            "case {token:?}: expected HTTP 400 for a nextToken no listing returned, got {} / {}",
             reply.status, reply.body
         );
         assert_eq!(

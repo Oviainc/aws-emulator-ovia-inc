@@ -331,6 +331,11 @@ pub const STATE_TRANSITION_MILLIS: i64 = 500;
 /// A state change the clock already owes an instance.
 #[derive(Debug, Clone, Copy)]
 pub struct DueTransition {
+    /// Epoch milliseconds at which this change STARTED being owed: the instant
+    /// of the call that scheduled it. It is what a progress report measures
+    /// from, so the progress follows the transition that was actually scheduled
+    /// rather than assuming every one spans the same time.
+    pub started_at_ms: i64,
     /// Epoch milliseconds at which the change became (or becomes) due.
     pub at_ms: i64,
     /// The state the instance settles into.
@@ -341,9 +346,17 @@ impl DueTransition {
     /// The transition `state`, due [`STATE_TRANSITION_MILLIS`] after `now_ms`.
     pub fn after(now_ms: i64, state: Lifecycle) -> Self {
         Self {
+            started_at_ms: now_ms,
             at_ms: now_ms.saturating_add(STATE_TRANSITION_MILLIS),
             state,
         }
+    }
+
+    /// How far through this transition the instant `now_ms` is, as a whole
+    /// percentage — what an operation reporting the progress of the work that
+    /// scheduled it answers with.
+    pub fn percentage_complete_at(&self, now_ms: i64) -> i32 {
+        elapsed_percentage(self.started_at_ms, self.at_ms, now_ms)
     }
 }
 
@@ -4334,6 +4347,11 @@ pub struct StoredInstance {
     pub state: Lifecycle,
     /// The state the clock owes this instance, while one is outstanding.
     pub due: Option<DueTransition>,
+    /// The GUI (Amazon DCV) session access `CreateGUISessionAccessDetails`
+    /// created for this virtual computer, while one exists. A session runs ON
+    /// the instance, so it lives on the instance's own record: deleting the
+    /// instance takes its session with it.
+    pub gui_session: Option<StoredGuiSession>,
 }
 
 /// The device path an instance's system disk is exposed at.
@@ -4545,6 +4563,194 @@ impl StoredInstance {
                 },
             ),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GUI (Amazon DCV) sessions
+// ---------------------------------------------------------------------------
+
+/// The modelled `Status` values a virtual computer's GUI session reports, from
+/// the `Status` enum (`crate::ops::types::STATUS_VALUES`).
+///
+/// `notStarted` is reported when no session is up and nothing is bringing one
+/// up — which is every state of a virtual computer that is not running, because
+/// an Amazon DCV session runs ON that computer.
+pub const GUI_SESSION_STATUS_NOT_STARTED: &str = "notStarted";
+/// The virtual computer the session would run on is still being set up, so the
+/// session cannot be brought up yet.
+pub const GUI_SESSION_STATUS_SETTING_UP_INSTANCE: &str = "settingUpInstance";
+/// The session's access details exist and the session is coming up.
+pub const GUI_SESSION_STATUS_STARTING: &str = "starting";
+/// The session is serving: its two URLs reach a session that is up.
+pub const GUI_SESSION_STATUS_STARTED: &str = "started";
+/// The session's active window ([`GUI_SESSION_ACTIVE_MILLIS`]) has run out. The
+/// caller resumes it with `StartGUISession` — "Use this action to resume the
+/// session after it expires" (the modelled `StartGUISession` documentation) —
+/// which is why creating access details does NOT silently start a second hour.
+pub const GUI_SESSION_STATUS_START_EXPIRED: &str = "startExpired";
+
+/// How long a GUI session stays active once it has started.
+///
+/// AWS DOCUMENTED, not chosen: "The session will be active for 1 hour" — the
+/// modelled `StartGUISession` documentation — so the window keeps that value
+/// rather than being shortened to something a test can wait out.
+pub const GUI_SESSION_ACTIVE_MILLIS: i64 = 60 * 60 * 1_000;
+
+/// The name of the PRIMARY session of the pair this service creates: "The
+/// primary URL initiates a web-based Amazon DCV session to the virtual
+/// computer's application" (the modelled `CreateGUISessionAccessDetails`
+/// documentation), so the primary session is the APPLICATION one.
+pub const GUI_SESSION_NAME_APPLICATION: &str = "application";
+
+/// The name of the secondary session: "The secondary URL initiates a web-based
+/// Amazon DCV session to the virtual computer's operating session" — the
+/// operating system of the virtual computer, from the same documentation.
+pub const GUI_SESSION_NAME_OPERATING_SYSTEM: &str = "operating-system";
+
+/// The path space a virtual computer's GUI session URLs are published under,
+/// beneath the endpoint the emulator is reached on.
+///
+/// `Session$url` is "The session URL", which AWS publishes in its own Amazon DCV
+/// zone. This emulator owns no DNS zone, and a literal AWS hostname would send
+/// the next client out of the emulator entirely (see [`request_endpoint`]), so
+/// the address names the endpoint THIS request arrived at and carries the
+/// session it addresses in the path — the same convention a container service's
+/// public URL follows (see [`CONTAINER_SERVICE_PUBLIC_PATH_PREFIX`]). The prefix
+/// names this service and this resource, so it cannot collide with another
+/// service's modelled URI space.
+///
+/// What the address identifies is real — the session this store created, under
+/// the endpoint the caller reached — but the Amazon DCV session PROTOCOL is not
+/// emulated: nothing here serves a remote desktop, so following the URL is not
+/// answered by this service. The URL is the control-plane value the operation
+/// models, not a promise of a GUI.
+pub const GUI_SESSION_PATH_PREFIX: &str = "/lightsail-gui-session";
+
+/// The URL of the `session_name` session of the virtual computer
+/// `resource_name`, whose access details carry `token`, as announced to a caller
+/// that reached this emulator at `endpoint` (its `Host`/`:authority`).
+///
+/// The token is in the address because the URL addresses ONE session of the
+/// pair this call created, not the virtual computer: a URL created for an
+/// earlier session is a different address.
+///
+/// `https`, because the emulator serves one TLS listener
+/// (`emulator_server::serve_emulator_until_shutdown`) and no plaintext one, so
+/// that is the scheme its own endpoint answers on.
+pub fn gui_session_url(
+    endpoint: &str,
+    resource_name: &str,
+    token: &str,
+    session_name: &str,
+) -> String {
+    format!("https://{endpoint}{GUI_SESSION_PATH_PREFIX}/{resource_name}/{token}/{session_name}")
+}
+
+/// How far through the span `start_ms`..`end_ms` the instant `now_ms` is, as a
+/// whole percentage in `0..=100`.
+///
+/// This is what a `percentageComplete` member reports: a span that has not begun
+/// is 0, one that is over is 100, and a span of zero or negative length is
+/// complete (there is nothing left to wait for).
+pub fn elapsed_percentage(start_ms: i64, end_ms: i64, now_ms: i64) -> i32 {
+    let span = end_ms.saturating_sub(start_ms);
+    if span <= 0 {
+        return 100;
+    }
+    let elapsed = now_ms.saturating_sub(start_ms).clamp(0, span);
+    i32::try_from(elapsed.saturating_mul(100) / span).unwrap_or(100)
+}
+
+/// The GUI (Amazon DCV) session access this store has created for one virtual
+/// computer: the token its URLs are addressed by, and the two instants that
+/// decide the session's status — when it finishes coming up, and when its active
+/// window runs out.
+///
+/// The URLs themselves are NOT stored: they are built per request from the
+/// endpoint that request arrived at (see [`gui_session_url`]), so a caller that
+/// reaches the emulator on a different address is told an address it can reach.
+#[derive(Debug, Clone)]
+pub struct StoredGuiSession {
+    /// The token both of this session pair's URLs carry, minted by the store's
+    /// own allocator ([`ComAmazonawsLightsailLightsail20161128State::mint_uuid`]).
+    pub token: String,
+    /// When the access details were created.
+    pub created_at_ms: i64,
+    /// The instant the clock owes the session its `started` status.
+    pub starts_at_ms: i64,
+}
+
+impl StoredGuiSession {
+    /// Access details minted at `now_ms` carrying `token`, for a session that is
+    /// still coming up.
+    ///
+    /// The session is `starting` for [`STATE_TRANSITION_MILLIS`] — a non-zero
+    /// span, so a caller that reads straight after the call still observes the
+    /// transient status — and `started` after it.
+    pub fn starting(token: String, now_ms: i64) -> Self {
+        Self {
+            token,
+            created_at_ms: now_ms,
+            starts_at_ms: now_ms.saturating_add(STATE_TRANSITION_MILLIS),
+        }
+    }
+
+    /// The instant this session's active window runs out: an hour after it
+    /// started (see [`GUI_SESSION_ACTIVE_MILLIS`]).
+    pub fn expires_at_ms(&self) -> i64 {
+        self.starts_at_ms.saturating_add(GUI_SESSION_ACTIVE_MILLIS)
+    }
+
+    /// Whether this session is still within its active window at `now_ms`.
+    pub fn is_live_at(&self, now_ms: i64) -> bool {
+        now_ms < self.expires_at_ms()
+    }
+
+    /// The modelled `Status` this session is in at `now_ms`: `starting` until it
+    /// has come up, `started` for its active hour, and `startExpired` once that
+    /// hour has run out.
+    pub fn status_at(&self, now_ms: i64) -> &'static str {
+        if !self.is_live_at(now_ms) {
+            GUI_SESSION_STATUS_START_EXPIRED
+        } else if now_ms < self.starts_at_ms {
+            GUI_SESSION_STATUS_STARTING
+        } else {
+            GUI_SESSION_STATUS_STARTED
+        }
+    }
+
+    /// `percentageComplete` for this session at `now_ms`: how far it is through
+    /// coming up, and 100 once it is up — the start it reports the completion of
+    /// is over, whether the session is still serving or its hour has run out.
+    pub fn percentage_complete_at(&self, now_ms: i64) -> i32 {
+        if now_ms < self.starts_at_ms {
+            elapsed_percentage(self.created_at_ms, self.starts_at_ms, now_ms)
+        } else {
+            100
+        }
+    }
+
+    /// The pair of modelled `Session`s this access carries for the virtual
+    /// computer `resource_name`: the primary (application) session first, then
+    /// the secondary (operating system) one.
+    ///
+    /// A request that names no host at all names no endpoint to announce, so
+    /// `url` is omitted rather than filled with an address nothing serves — the
+    /// same rule a container service's `url` follows.
+    pub fn views(&self, resource_name: &str, endpoint: Option<&str>) -> Vec<crate::ops::types::Session> {
+        [
+            (GUI_SESSION_NAME_APPLICATION, true),
+            (GUI_SESSION_NAME_OPERATING_SYSTEM, false),
+        ]
+        .into_iter()
+        .map(|(name, is_primary)| crate::ops::types::Session {
+            name: Some(name.to_string()),
+            url: endpoint
+                .map(|endpoint| gui_session_url(endpoint, resource_name, &self.token, name)),
+            is_primary: Some(is_primary),
+        })
+        .collect()
     }
 }
 
@@ -8486,6 +8692,24 @@ impl ComAmazonawsLightsailLightsail20161128State {
         self.instances.insert(instance.name.clone(), instance);
     }
 
+    /// Create the GUI (Amazon DCV) session access of the virtual computer
+    /// `name`, answering what was stored — or `None` when no instance of that
+    /// name is stored, in which case nothing was written and no id was spent.
+    ///
+    /// The presence check comes BEFORE the mint on purpose: a call that resolves
+    /// no instance must not consume an identifier, and the mint and the write
+    /// live together here so no caller can be answered with a session the store
+    /// does not hold.
+    pub fn create_gui_session(&mut self, name: &str, now_ms: i64) -> Option<StoredGuiSession> {
+        if !self.instances.contains_key(name) {
+            return None;
+        }
+        let token = self.mint_uuid();
+        let session = StoredGuiSession::starting(token, now_ms);
+        self.instances.get_mut(name)?.gui_session = Some(session.clone());
+        Some(session)
+    }
+
     /// The domain recordset `name` names, for a reporting operation.
     pub fn domain(&self, name: &str) -> Option<&StoredDomain> {
         self.domains.get(name)
@@ -9483,10 +9707,21 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// record drops out of the work as soon as it has nothing outstanding.
     fn advance_clock(&mut self, now_ms: i64) {
         for instance in self.instances.values_mut() {
-            let Some(due) = instance.due else { continue };
-            if due.at_ms <= now_ms {
-                instance.state = due.state;
-                instance.due = None;
+            if let Some(due) = instance.due {
+                if due.at_ms <= now_ms {
+                    instance.state = due.state;
+                    instance.due = None;
+                }
+            }
+            // An Amazon DCV session runs ON the instance, so it does not survive
+            // the instance leaving `running`: the session was gone the instant
+            // the computer stopped serving, whether or not anybody asked, so the
+            // access is released here rather than by whoever happens to look. A
+            // session whose hour has run out WHILE the computer kept running is
+            // left where it is: `CreateGUISessionAccessDetails` reports it as
+            // `startExpired`, which is what tells a caller to resume it.
+            if instance.state != RUNNING && instance.gui_session.is_some() {
+                instance.gui_session = None;
             }
         }
         for disk in self.disks.values_mut() {

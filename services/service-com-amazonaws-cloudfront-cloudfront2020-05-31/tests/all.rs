@@ -59,6 +59,8 @@ mod monitoring_subscription;
 mod origin_access_control_delete;
 #[path = "all/origin_access_control_lifecycle.rs"]
 mod origin_access_control_lifecycle;
+#[path = "all/origin_access_control_update.rs"]
+mod origin_access_control_update;
 #[path = "all/origin_access_identity_lifecycle.rs"]
 mod origin_access_identity_lifecycle;
 #[path = "all/origin_access_identity_list.rs"]

@@ -21,6 +21,8 @@ mod admin_user_pool_lifecycle;
 mod clock_dependent_state;
 #[path = "all/delete_group.rs"]
 mod delete_group;
+#[path = "all/device_remembering.rs"]
+mod device_remembering;
 #[path = "all/error_message_wording.rs"]
 mod error_message_wording;
 #[path = "all/group_lifecycle.rs"]

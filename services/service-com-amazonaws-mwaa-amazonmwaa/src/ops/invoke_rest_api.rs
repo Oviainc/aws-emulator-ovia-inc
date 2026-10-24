@@ -2,21 +2,45 @@
 
 //! @op InvokeRestApi
 //!
-//! Resolves the STORED environment the request names and refuses a name that resolves to
-//! nothing with HTTP 404. This operation is served through the environment-scoped data
-//! endpoint (`@endpoint` host prefix `env.`), whose front door words that refusal and
-//! carries it as its own document payload — a root-level JSON string with no error-code
-//! member — rather than as a serialized modeled exception; the status and the
-//! `x-amzn-errortype` code stay the modeled ones. The reshaping lives in
-//! [`crate::service::env_endpoint`], which serves this operation.
+//! Routes the call to the Apache Airflow REST API of the STORED environment the request
+//! names, over that environment's own Apache Airflow metadata
+//! ([`crate::state::AirflowMetadata`]), and reports what that API answered: the HTTP
+//! status in `RestApiStatusCode` and the JSON document in `RestApiResponse`. A name that
+//! resolves to nothing is refused with HTTP 404 by the environment-scoped data endpoint
+//! that fronts this operation (`@endpoint` host prefix `env.`), whose wording and payload
+//! shape live in [`crate::service::env_endpoint`].
 //!
-//! What this emulator does NOT do is the call itself: `InvokeRestApi` forwards to the
-//! Apache Airflow REST API of the environment's web server, and no Apache Airflow runs in
-//! this process. A `RestApiStatusCode` and a `RestApiResponse` synthesised here would
-//! describe a call nothing made, and `RestApiServerException` would report the failure of
-//! a server that never ran — so an invocation against an environment that DOES exist
-//! answers the scaffold's HTTP 501 `NotImplemented` instead, which claims nothing about
-//! Apache Airflow's behaviour.
+//! `Method`, `Path`, `QueryParameters` and `Body` are all acted on: the path selects the
+//! Apache Airflow resource, the method what is done to it, the query parameters page a
+//! collection, and the body carries the entity a write creates or changes.
+//!
+//! ## How an Apache Airflow answer becomes this operation's answer
+//!
+//! The operation is a PROXY, so the Apache Airflow status decides which of its modelled
+//! answers the caller gets, by CLASS and not per endpoint:
+//!
+//! * `2xx` — the operation's own HTTP 200, carrying that status and that document.
+//! * `4xx` — `RestApiClientException`, carrying the same pair.
+//! * `5xx` — `RestApiServerException`, carrying the same pair.
+//!
+//! ## What this environment's Apache Airflow API serves
+//!
+//! Everything below is computed from the environment's stored state, and a write through
+//! this operation is visible to the next read through it:
+//!
+//! * `GET /version` — the Apache Airflow version the stored environment runs.
+//! * `/variables` and `/variables/{key}` — the variables in the environment's metadata
+//!   database: list, create-or-replace, read, change and delete.
+//! * `/pools` and `/pools/{name}` — its slot pools, seeded with Apache Airflow's own
+//!   `default_pool`: list, create, read, change and delete.
+//! * `GET /dags` — the environment's DAG inventory, which is EMPTY and whose
+//!   `total_entries` is therefore 0, so every path under `/dags/{dag_id}` resolves to
+//!   nothing: a DAG and its `dag_id` are defined by the Python DAG file the environment
+//!   loads from Amazon S3, and knowing which DAGs a file defines means importing it,
+//!   which no Apache Airflow DAG processor in this process does. Reporting a DAG, a DAG
+//!   run or a task instance anyway would describe work nothing ran.
+//! * Any other path — that API's own not-found answer; a path it serves called with a
+//!   method it does not — its method-not-allowed answer.
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +121,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use ::aws_smithy_types::{Document, Number};
+
+use crate::state::{AirflowMetadata, AirflowPool, AirflowVariable, EnvironmentRecord};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -184,17 +212,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // The transition the clock already owes, materialised before anything is read.
         store.settle(now);
-        let known = store.contains(&region, &input.name);
-        drop(store);
 
-        if !known {
-            // There is no web server to invoke anything on. This operation is served
-            // through the environment data endpoint's proxy (`@endpoint` host prefix
-            // `env.`), so the refusal is that endpoint's: HTTP 404 with the modeled
-            // `ResourceNotFoundException` code, and the endpoint's own fixed wording,
-            // which names no environment. `crate::service::env_endpoint` then carries it
-            // as the endpoint's document payload instead of as a serialized exception
-            // object.
+        // The Apache Airflow REST API this call reaches is the one the STORED environment's
+        // web server serves, so a name that resolves to nothing — in the Region this
+        // request was signed for — has no API to call.
+        //
+        // This operation is served through the environment data endpoint's proxy
+        // (`@endpoint` host prefix `env.`), so the refusal is that endpoint's: HTTP 404 with
+        // the modeled `ResourceNotFoundException` code, and the endpoint's own fixed
+        // wording, which names no environment. `crate::service::env_endpoint` then carries
+        // it as the endpoint's document payload instead of as a serialized exception
+        // object.
+        let Some(environment) = store.environment_mut(&region, &input.name) else {
             return Err(InvokeRestApiErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(
@@ -203,19 +232,673 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        }
+        };
 
-        // The environment exists, so this call reaches the Apache Airflow REST API of its
-        // web server — which this emulator does not run (see the module docs). Nothing
-        // about that call is invented here.
-        Err(crate::scaffolded::Scaffolded::NotImplemented(
-            crate::scaffolded::NotImplemented {
-                message: format!(
-                    "the Apache Airflow REST API of environment {} is not served by this \
-                     emulator, so {} {} was not invoked",
-                    input.name, input.method, input.path
-                ),
-            },
-        ))
+        let call = Call::new(&input);
+        let answer = serve(environment, &call);
+        drop(store);
+        proxied(answer)
     }
+}
+
+/// One call to an environment's Apache Airflow REST API, as this operation's input states
+/// it: the method, the path split into its segments, and the query parameters and body as
+/// the caller supplied them.
+struct Call<'r> {
+    method: &'r str,
+    path: &'r str,
+    /// `path` without its empty segments, so a trailing or doubled `/` addresses the same
+    /// resource as the plain path does.
+    segments: Vec<&'r str>,
+    query: Option<&'r Document>,
+    body: Option<&'r Document>,
+}
+
+impl<'r> Call<'r> {
+    fn new(input: &'r InvokeRestApiInput) -> Self {
+        Self {
+            method: input.method.as_str(),
+            path: input.path.as_str(),
+            segments: input
+                .path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .collect(),
+            query: input.query_parameters.as_ref(),
+            body: input.body.as_ref(),
+        }
+    }
+}
+
+/// What one Apache Airflow REST API call answered: its HTTP status, and its JSON document
+/// where that status carries one (a `204` carries none).
+struct AirflowAnswer {
+    status: i32,
+    document: Option<Document>,
+}
+
+/// Apache Airflow's `GET` method, the only one its read-only endpoints serve.
+const GET: &str = "GET";
+/// Apache Airflow's `POST` method, which creates an entity in a collection.
+const POST: &str = "POST";
+/// Apache Airflow's `PATCH` method, which changes an entity.
+const PATCH: &str = "PATCH";
+/// Apache Airflow's `DELETE` method, which removes an entity.
+const DELETE: &str = "DELETE";
+
+/// How many entries a collection endpoint returns when the call pages it with no `limit`,
+/// and the most it returns for any `limit`.
+///
+/// Apache Airflow's REST API pages every collection with `limit` and `offset` and caps the
+/// page at its maximum page limit; this is the emulator's own page size, deliberately
+/// equal to the cap, so one unparameterised call cannot materialise a response that grows
+/// with the stored entry count.
+const PAGE_LIMIT: usize = 100;
+
+/// The window a collection call asked for: how many entries, from which offset.
+struct PageWindow {
+    limit: usize,
+    offset: usize,
+}
+
+/// How many slots of a pool are in use here.
+///
+/// Every slot counter an Apache Airflow pool reports counts TASK INSTANCES the scheduler
+/// placed in that pool, and nothing in this process schedules a task instance (see this
+/// module's docs on the DAG inventory), so each counter is zero and every configured slot
+/// is open. Zero is computed, not assumed: it is the count of task instances this store
+/// holds.
+const SLOTS_IN_USE: i64 = 0;
+
+/// Serve one Apache Airflow REST API call against the environment's own state.
+///
+/// Takes the environment mutably because the API's writes are writes to that
+/// environment's metadata: a `GET` reaches nothing that changes what a later caller sees,
+/// while a `POST`, `PATCH` or `DELETE` is the change the caller asked Apache Airflow to
+/// make.
+fn serve(environment: &mut EnvironmentRecord, call: &Call<'_>) -> AirflowAnswer {
+    match call.segments.as_slice() {
+        ["version"] => match call.method {
+            GET => airflow_version(environment),
+            _ => method_not_allowed(call),
+        },
+        ["variables"] => match call.method {
+            GET => list_variables(&environment.airflow, call),
+            POST => set_variable(&mut environment.airflow, call),
+            _ => method_not_allowed(call),
+        },
+        ["variables", key] => match call.method {
+            GET => read_variable(&environment.airflow, key),
+            PATCH => change_variable(&mut environment.airflow, key, call),
+            DELETE => delete_variable(&mut environment.airflow, key),
+            _ => method_not_allowed(call),
+        },
+        ["pools"] => match call.method {
+            GET => list_pools(&environment.airflow, call),
+            POST => create_pool(&mut environment.airflow, call),
+            _ => method_not_allowed(call),
+        },
+        ["pools", name] => match call.method {
+            GET => read_pool(&environment.airflow, name),
+            PATCH => change_pool(&mut environment.airflow, name, call),
+            DELETE => delete_pool(&mut environment.airflow, name),
+            _ => method_not_allowed(call),
+        },
+        ["dags"] => match call.method {
+            GET => list_dags(call),
+            _ => method_not_allowed(call),
+        },
+        // Everything under `/dags/{dag_id}` — the DAG itself, its DAG runs, their task
+        // instances — is addressed THROUGH a DAG, so the DAG has to resolve before the
+        // method or the rest of the path means anything, and no DAG resolves here.
+        ["dags", dag_id, ..] => dag_not_found(dag_id),
+        _ => path_not_found(call),
+    }
+}
+
+/// The caller's answer for what the Apache Airflow REST API answered: a success carries
+/// the status and the document, and a failure carries the same pair in the modelled
+/// exception its CLASS selects.
+fn proxied(answer: AirflowAnswer) -> Result<InvokeRestApiOutput, InvokeRestApiError> {
+    match answer.status {
+        200..=299 => Ok(InvokeRestApiOutput {
+            rest_api_status_code: Some(answer.status),
+            rest_api_response: answer.document,
+        }),
+        400..=499 => Err(InvokeRestApiErrorModeled::RestApiClientException(
+            RestApiClientException {
+                rest_api_status_code: Some(answer.status),
+                rest_api_response: answer.document,
+            },
+        )
+        .into()),
+        // Any other status is a server-side failure of the call, which is the other
+        // modelled exception. Nothing this emulator serves answers one: a
+        // `RestApiServerException` would otherwise report the failure of a server that
+        // never ran.
+        _ => Err(InvokeRestApiErrorModeled::RestApiServerException(
+            RestApiServerException {
+                rest_api_status_code: Some(answer.status),
+                rest_api_response: answer.document,
+            },
+        )
+        .into()),
+    }
+}
+
+impl AirflowAnswer {
+    /// A `200` carrying `document`.
+    fn ok(document: Document) -> Self {
+        Self {
+            status: 200,
+            document: Some(document),
+        }
+    }
+
+    /// A `204`, which carries no document: the answer to a delete.
+    fn no_content() -> Self {
+        Self {
+            status: 204,
+            document: None,
+        }
+    }
+
+    /// A failure as that API reports one: a problem document (`type`, `title`, `status`,
+    /// `detail`) naming the status, a title for its class and the detail of this one
+    /// failure.
+    ///
+    /// `type` is the `about:blank` the problem-document format itself defines for a
+    /// problem with no further type beyond its status code.
+    fn problem(status: i32, title: &str, detail: String) -> Self {
+        Self {
+            status,
+            document: Some(object([
+                ("type", Document::String("about:blank".to_string())),
+                ("title", Document::String(title.to_string())),
+                ("status", integer(i64::from(status))),
+                ("detail", Document::String(detail)),
+            ])),
+        }
+    }
+
+    /// The answer to a call whose request this API cannot act on.
+    fn bad_request(detail: String) -> Self {
+        Self::problem(400, "Bad Request", detail)
+    }
+
+    /// The answer to a call addressing something this API holds nothing for.
+    fn not_found(detail: String) -> Self {
+        Self::problem(404, "Not Found", detail)
+    }
+
+    /// The answer to a create of an entity whose key is taken.
+    fn conflict(detail: String) -> Self {
+        Self::problem(409, "Conflict", detail)
+    }
+}
+
+/// `GET /version`: the Apache Airflow version this environment runs, read from the stored
+/// record rather than from any default. The build the version was cut from is not
+/// something this emulator holds, so it reports none.
+fn airflow_version(environment: &EnvironmentRecord) -> AirflowAnswer {
+    AirflowAnswer::ok(object([
+        (
+            "version",
+            Document::String(environment.spec.airflow_version.clone()),
+        ),
+        ("git_version", Document::Null),
+    ]))
+}
+
+/// `GET /dags`: the environment's DAG inventory, which holds nothing — see this module's
+/// docs. The page the call asked for is still resolved, so a call paging the collection
+/// with an unusable `limit` or `offset` is refused here exactly as it is on a collection
+/// that does hold entries.
+fn list_dags(call: &Call<'_>) -> AirflowAnswer {
+    let window = match page_window(call.query) {
+        Ok(window) => window,
+        Err(refusal) => return refusal,
+    };
+    collection("dags", Vec::new(), &window)
+}
+
+/// `GET /variables`: the environment's variables, in key order.
+fn list_variables(metadata: &AirflowMetadata, call: &Call<'_>) -> AirflowAnswer {
+    let window = match page_window(call.query) {
+        Ok(window) => window,
+        Err(refusal) => return refusal,
+    };
+    let entries = metadata.variables.values().map(variable_document).collect();
+    collection("variables", entries, &window)
+}
+
+/// `POST /variables`: set the variable the body names, whether or not the key is already
+/// taken — a variable's key is its identity, and this endpoint SETS the value under that
+/// key rather than refusing a key that exists.
+fn set_variable(metadata: &mut AirflowMetadata, call: &Call<'_>) -> AirflowAnswer {
+    let requested = match requested_variable(call.body) {
+        Ok(requested) => requested,
+        Err(refusal) => return refusal,
+    };
+    let fresh = !metadata.variables.contains_key(&requested.key);
+    if fresh && metadata.variables.len() >= crate::state::MAX_AIRFLOW_VARIABLES {
+        return AirflowAnswer::bad_request(format!(
+            "this emulator holds at most {} variables for one environment",
+            crate::state::MAX_AIRFLOW_VARIABLES
+        ));
+    }
+    let key = requested.key.clone();
+    metadata.variables.insert(key.clone(), requested);
+    stored_variable(metadata, &key)
+}
+
+/// `GET /variables/{key}`.
+fn read_variable(metadata: &AirflowMetadata, key: &str) -> AirflowAnswer {
+    match metadata.variables.get(key) {
+        Some(variable) => AirflowAnswer::ok(variable_document(variable)),
+        None => AirflowAnswer::not_found(no_such_variable(key)),
+    }
+}
+
+/// `PATCH /variables/{key}`: change the variable the path names. A body keyed to a
+/// different variable is refused rather than silently moving the value to another key.
+fn change_variable(metadata: &mut AirflowMetadata, key: &str, call: &Call<'_>) -> AirflowAnswer {
+    let requested = match requested_variable(call.body) {
+        Ok(requested) => requested,
+        Err(refusal) => return refusal,
+    };
+    if requested.key != key {
+        return AirflowAnswer::bad_request(format!(
+            "the key {:?} in the request body does not name the variable {key:?} in the path",
+            requested.key
+        ));
+    }
+    if !metadata.variables.contains_key(key) {
+        return AirflowAnswer::not_found(no_such_variable(key));
+    }
+    metadata.variables.insert(key.to_string(), requested);
+    stored_variable(metadata, key)
+}
+
+/// `DELETE /variables/{key}`.
+fn delete_variable(metadata: &mut AirflowMetadata, key: &str) -> AirflowAnswer {
+    match metadata.variables.remove(key) {
+        Some(_) => AirflowAnswer::no_content(),
+        None => AirflowAnswer::not_found(no_such_variable(key)),
+    }
+}
+
+/// `GET /pools`: the environment's slot pools, in name order.
+fn list_pools(metadata: &AirflowMetadata, call: &Call<'_>) -> AirflowAnswer {
+    let window = match page_window(call.query) {
+        Ok(window) => window,
+        Err(refusal) => return refusal,
+    };
+    let entries = metadata.pools.values().map(pool_document).collect();
+    collection("pools", entries, &window)
+}
+
+/// `POST /pools`: create the pool the body names. A pool's name is its identity, so a
+/// name already taken is a conflict rather than a replacement.
+fn create_pool(metadata: &mut AirflowMetadata, call: &Call<'_>) -> AirflowAnswer {
+    let requested = match requested_pool(call.body) {
+        Ok(requested) => requested,
+        Err(refusal) => return refusal,
+    };
+    if metadata.pools.contains_key(&requested.name) {
+        return AirflowAnswer::conflict(format!("the pool {:?} already exists", requested.name));
+    }
+    if metadata.pools.len() >= crate::state::MAX_AIRFLOW_POOLS {
+        return AirflowAnswer::bad_request(format!(
+            "this emulator holds at most {} pools for one environment",
+            crate::state::MAX_AIRFLOW_POOLS
+        ));
+    }
+    let name = requested.name.clone();
+    metadata.pools.insert(name.clone(), requested);
+    stored_pool(metadata, &name)
+}
+
+/// `GET /pools/{name}`.
+fn read_pool(metadata: &AirflowMetadata, name: &str) -> AirflowAnswer {
+    match metadata.pools.get(name) {
+        Some(pool) => AirflowAnswer::ok(pool_document(pool)),
+        None => AirflowAnswer::not_found(no_such_pool(name)),
+    }
+}
+
+/// `PATCH /pools/{name}`: change the pool the path names. As for a variable, a body naming
+/// a different pool is refused rather than renaming the one the path addresses.
+fn change_pool(metadata: &mut AirflowMetadata, name: &str, call: &Call<'_>) -> AirflowAnswer {
+    let requested = match requested_pool(call.body) {
+        Ok(requested) => requested,
+        Err(refusal) => return refusal,
+    };
+    if requested.name != name {
+        return AirflowAnswer::bad_request(format!(
+            "the name {:?} in the request body does not name the pool {name:?} in the path",
+            requested.name
+        ));
+    }
+    if !metadata.pools.contains_key(name) {
+        return AirflowAnswer::not_found(no_such_pool(name));
+    }
+    metadata.pools.insert(name.to_string(), requested);
+    stored_pool(metadata, name)
+}
+
+/// `DELETE /pools/{name}`. Apache Airflow's own default pool is the pool a task with no
+/// pool of its own runs in, so it is not one a caller can take away.
+fn delete_pool(metadata: &mut AirflowMetadata, name: &str) -> AirflowAnswer {
+    if name == crate::state::DEFAULT_POOL_NAME {
+        return AirflowAnswer::bad_request(format!(
+            "the {} cannot be deleted",
+            crate::state::DEFAULT_POOL_NAME
+        ));
+    }
+    match metadata.pools.remove(name) {
+        Some(_) => AirflowAnswer::no_content(),
+        None => AirflowAnswer::not_found(no_such_pool(name)),
+    }
+}
+
+/// The answer to a call on a path this API serves with a method it does not.
+fn method_not_allowed(call: &Call<'_>) -> AirflowAnswer {
+    AirflowAnswer::problem(
+        405,
+        "Method Not Allowed",
+        format!("{} is not allowed on {}", call.method, call.path),
+    )
+}
+
+/// The answer to a call on a path this environment's Apache Airflow REST API does not
+/// serve.
+///
+/// The detail says that THIS API serves no such path, and claims nothing about what the
+/// Apache Airflow REST API serves in general: the paths this one answers are the ones this
+/// module's docs list, and a path outside them may well be one Apache Airflow itself
+/// serves.
+fn path_not_found(call: &Call<'_>) -> AirflowAnswer {
+    AirflowAnswer::not_found(format!(
+        "{} is not one of the paths this environment's Apache Airflow REST API serves",
+        call.path
+    ))
+}
+
+/// The answer to a call addressed through a DAG the environment holds none of.
+fn dag_not_found(dag_id: &str) -> AirflowAnswer {
+    AirflowAnswer::not_found(format!("no DAG with dag_id {dag_id:?} was found"))
+}
+
+/// Why a variable the path named could not be read, changed or deleted.
+fn no_such_variable(key: &str) -> String {
+    format!("no variable with key {key:?} was found")
+}
+
+/// Why a pool the path named could not be read, changed or deleted.
+fn no_such_pool(name: &str) -> String {
+    format!("no pool with name {name:?} was found")
+}
+
+/// Answer a variable write from the STORED record, so what the caller is told cannot
+/// differ from what the next read of it reports.
+fn stored_variable(metadata: &AirflowMetadata, key: &str) -> AirflowAnswer {
+    read_variable(metadata, key)
+}
+
+/// Answer a pool write from the STORED record, for the same reason.
+fn stored_pool(metadata: &AirflowMetadata, name: &str) -> AirflowAnswer {
+    read_pool(metadata, name)
+}
+
+/// One variable as that API reports it.
+fn variable_document(variable: &AirflowVariable) -> Document {
+    object([
+        ("key", Document::String(variable.key.clone())),
+        ("value", Document::String(variable.value.clone())),
+        ("description", nullable(variable.description.as_deref())),
+    ])
+}
+
+/// One slot pool as that API reports it: its stored configuration, and the slot counts
+/// computed from the task instances in it ([`SLOTS_IN_USE`]).
+fn pool_document(pool: &AirflowPool) -> Document {
+    object([
+        ("name", Document::String(pool.name.clone())),
+        ("slots", integer(pool.slots)),
+        ("description", nullable(pool.description.as_deref())),
+        ("include_deferred", Document::Bool(pool.include_deferred)),
+        ("occupied_slots", integer(SLOTS_IN_USE)),
+        ("running_slots", integer(SLOTS_IN_USE)),
+        ("queued_slots", integer(SLOTS_IN_USE)),
+        ("scheduled_slots", integer(SLOTS_IN_USE)),
+        ("deferred_slots", integer(SLOTS_IN_USE)),
+        ("open_slots", integer(pool.slots - SLOTS_IN_USE)),
+    ])
+}
+
+/// A collection answer: the page of `entries` the window selects under `member`, beside
+/// the `total_entries` the whole collection holds.
+fn collection(member: &str, entries: Vec<Document>, window: &PageWindow) -> AirflowAnswer {
+    let total = entries.len();
+    let page: Vec<Document> = entries
+        .into_iter()
+        .skip(window.offset)
+        .take(window.limit)
+        .collect();
+    AirflowAnswer::ok(Document::Object(
+        [
+            (member.to_string(), Document::Array(page)),
+            ("total_entries".to_string(), count(total)),
+        ]
+        .into(),
+    ))
+}
+
+/// The page a collection call asked for: its `limit` and `offset` query parameters, or
+/// [`PAGE_LIMIT`] and the start of the collection when it named none.
+///
+/// A limit past [`PAGE_LIMIT`] is capped to it, and a limit of none at all — an absent
+/// parameter, or one asking for no entry — falls back to that same page size, since a page
+/// of no entries is not a page the parameter selects. A negative limit, and an offset
+/// before the start of the collection, name no page at all and are refused.
+fn page_window(query: Option<&Document>) -> Result<PageWindow, AirflowAnswer> {
+    let limit = whole_parameter(query, "limit")?;
+    let offset = whole_parameter(query, "offset")?;
+    for (name, value) in [("limit", limit), ("offset", offset)] {
+        if value.is_some_and(|value| value < 0) {
+            return Err(AirflowAnswer::bad_request(format!(
+                "{name} must not be negative"
+            )));
+        }
+    }
+    let limit = limit
+        .and_then(|limit| usize::try_from(limit).ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(PAGE_LIMIT)
+        .min(PAGE_LIMIT);
+    let offset = offset
+        .and_then(|offset| usize::try_from(offset).ok())
+        .unwrap_or_default();
+    Ok(PageWindow { limit, offset })
+}
+
+/// The variable a write's body states, or why that body states none.
+fn requested_variable(body: Option<&Document>) -> Result<AirflowVariable, AirflowAnswer> {
+    let body = object_body(body)?;
+    let key = required_text(body, "key")?;
+    let value = required_text(body, "value")?;
+    let description = optional_text(body, "description")?;
+    bounded(&key, "key", crate::state::MAX_AIRFLOW_KEY_LENGTH)?;
+    bounded(&value, "value", crate::state::MAX_AIRFLOW_VALUE_LENGTH)?;
+    if let Some(description) = description.as_deref() {
+        bounded(
+            description,
+            "description",
+            crate::state::MAX_AIRFLOW_VALUE_LENGTH,
+        )?;
+    }
+    Ok(AirflowVariable {
+        key,
+        value,
+        description,
+    })
+}
+
+/// The pool a write's body states, or why that body states none.
+fn requested_pool(body: Option<&Document>) -> Result<AirflowPool, AirflowAnswer> {
+    let body = object_body(body)?;
+    let name = required_text(body, "name")?;
+    let Some(slots) = member(body, "slots").and_then(whole) else {
+        return Err(AirflowAnswer::bad_request(
+            "the request body must carry the member \"slots\" as a whole number".to_string(),
+        ));
+    };
+    // A pool's slots are how many slots it HOLDS, so a count below none is not a pool this
+    // store can hold.
+    if slots < 0 {
+        return Err(AirflowAnswer::bad_request(format!(
+            "the member \"slots\" must not be negative, got {slots}"
+        )));
+    }
+    let description = optional_text(body, "description")?;
+    bounded(&name, "name", crate::state::MAX_AIRFLOW_KEY_LENGTH)?;
+    if let Some(description) = description.as_deref() {
+        bounded(
+            description,
+            "description",
+            crate::state::MAX_AIRFLOW_VALUE_LENGTH,
+        )?;
+    }
+    let include_deferred = match member(body, "include_deferred") {
+        Some(Document::Bool(include)) => *include,
+        Some(Document::Null) | None => false,
+        Some(_) => {
+            return Err(AirflowAnswer::bad_request(
+                "the member \"include_deferred\" must be a boolean".to_string(),
+            ))
+        }
+    };
+    Ok(AirflowPool {
+        name,
+        slots,
+        description,
+        include_deferred,
+    })
+}
+
+/// A write's body as the JSON object every one of these endpoints takes.
+fn object_body(body: Option<&Document>) -> Result<&Document, AirflowAnswer> {
+    match body {
+        Some(body @ Document::Object(_)) => Ok(body),
+        _ => Err(AirflowAnswer::bad_request(
+            "the request body must be a JSON object".to_string(),
+        )),
+    }
+}
+
+/// A member a body has to carry as a non-empty string.
+fn required_text(body: &Document, name: &str) -> Result<String, AirflowAnswer> {
+    match member(body, name).and_then(text) {
+        Some(value) if !value.is_empty() => Ok(value.to_string()),
+        _ => Err(AirflowAnswer::bad_request(format!(
+            "the request body must carry the member {name:?} as a non-empty string"
+        ))),
+    }
+}
+
+/// A member a body may carry as a string; `null` and an absent member both state none.
+fn optional_text(body: &Document, name: &str) -> Result<Option<String>, AirflowAnswer> {
+    match member(body, name) {
+        Some(Document::String(value)) => Ok(Some(value.clone())),
+        Some(Document::Null) | None => Ok(None),
+        Some(_) => Err(AirflowAnswer::bad_request(format!(
+            "the member {name:?} must be a string"
+        ))),
+    }
+}
+
+/// Refuse a value this store will not hold at that length.
+fn bounded(value: &str, name: &str, longest: usize) -> Result<(), AirflowAnswer> {
+    if value.chars().count() > longest {
+        return Err(AirflowAnswer::bad_request(format!(
+            "this emulator holds a {name} of at most {longest} characters"
+        )));
+    }
+    Ok(())
+}
+
+/// A query parameter as a whole number, or why it is not one. An absent parameter is
+/// `None` rather than a refusal.
+fn whole_parameter(
+    query: Option<&Document>,
+    name: &str,
+) -> Result<Option<i64>, AirflowAnswer> {
+    let Some(value) = query.and_then(|query| member(query, name)) else {
+        return Ok(None);
+    };
+    if matches!(value, Document::Null) {
+        return Ok(None);
+    }
+    whole(value).map(Some).ok_or_else(|| {
+        AirflowAnswer::bad_request(format!("{name} must be a whole number"))
+    })
+}
+
+/// One member of a document that is an object.
+fn member<'d>(document: &'d Document, name: &str) -> Option<&'d Document> {
+    match document {
+        Document::Object(members) => members.get(name),
+        _ => None,
+    }
+}
+
+/// A document as the string it carries, if it carries one.
+fn text(document: &Document) -> Option<&str> {
+    match document {
+        Document::String(value) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+/// A document as the whole number it carries. A query parameter travels as text on an HTTP
+/// query string, so a number spelled as a string counts as one.
+fn whole(document: &Document) -> Option<i64> {
+    match document {
+        Document::Number(Number::PosInt(value)) => i64::try_from(*value).ok(),
+        Document::Number(Number::NegInt(value)) => Some(*value),
+        Document::String(value) => value.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// A JSON object of the members given, in the order written.
+fn object<const N: usize>(members: [(&str, Document); N]) -> Document {
+    Document::Object(
+        members
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect(),
+    )
+}
+
+/// A string member that may carry nothing, as the `null` a JSON document spells that with.
+fn nullable(value: Option<&str>) -> Document {
+    match value {
+        Some(value) => Document::String(value.to_string()),
+        None => Document::Null,
+    }
+}
+
+/// A whole number as a JSON number.
+fn integer(value: i64) -> Document {
+    match u64::try_from(value) {
+        Ok(unsigned) => Document::Number(Number::PosInt(unsigned)),
+        Err(_) => Document::Number(Number::NegInt(value)),
+    }
+}
+
+/// A count as a JSON number.
+fn count(value: usize) -> Document {
+    Document::Number(Number::PosInt(u64::try_from(value).unwrap_or(u64::MAX)))
 }

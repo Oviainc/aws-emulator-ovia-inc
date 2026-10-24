@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // `resourceArn`'s length bound and `^arn:.*$` pattern, and every tag
         // key's and value's own length bounds, are refused by the framework
@@ -171,11 +171,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),
             })
         })?;
+        // Only the resources of the region this request was signed for are
+        // reachable, so an ARN naming another region's monitor or probe names
+        // nothing this endpoint can tag.
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
         let target = store
-            .resolve_tagged_resource(&input.resource_arn)
+            .resolve_tagged_resource(&region, &input.resource_arn)
             .ok_or_else(|| not_found(&input.resource_arn))?;
         let tags = store.tags_mut(&target).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {

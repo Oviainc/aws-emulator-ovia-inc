@@ -81,22 +81,21 @@ fn assert_workspace_conflict(case: &str, team_id: &str, reply: &Reply) {
     );
 }
 
-/// The team ids the workspace listing reports on its first page, which is every
-/// registered workspace while the account holds fewer than a page of them.
+/// The team ids the workspace listing reports, which is every registered workspace:
+/// the listing is bounded by the documented workspace quota and comes back whole.
 async fn listed_team_ids(emulator: &Emulator, case: &str) -> Vec<String> {
-    let page = list_workspaces(emulator, None).await;
+    let reply = list_workspaces(emulator, None).await;
     assert_eq!(
-        page.status, 200,
+        reply.status, 200,
         "case {case:?}: the workspace listing must answer HTTP 200, got {} / {}",
-        page.status, page.body
+        reply.status, reply.body
     );
     assert!(
-        page.string("nextToken").is_none(),
-        "case {case:?}: these tables register fewer than a page, so the listing must \
-         offer no nextToken, got {}",
-        page.body
+        reply.string("nextToken").is_none(),
+        "case {case:?}: the listing is reported whole, so it must offer no nextToken, got {}",
+        reply.body
     );
-    reported_team_ids(&reported(&page))
+    reported_team_ids(&reported(&reply))
 }
 
 /// A channel create body for `(team_id, channel_id)` that satisfies every modelled

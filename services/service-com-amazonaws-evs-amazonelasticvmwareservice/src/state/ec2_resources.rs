@@ -13,6 +13,12 @@
 //! copy of what IAM knows. Nothing is cached: a VPC created a moment ago is usable at
 //! once, and one that has been deleted stops being usable at once.
 //!
+//! Every other member of such a request that names an EC2 resource of the caller's
+//! network is resolved in that same store, and against the same VPC: the security groups
+//! that "allow traffic between the Amazon EVS control plane and your VPC"
+//! ([`security_group_failures`]) and the blocks the VLAN subnets are provisioned from
+//! ([`vlan_placement_failures`]).
+//!
 //! A host is placed on EC2 resources of the caller's account the same way: a
 //! `placementGroupId` is "the unique ID of the placement group where the host is placed"
 //! and a `dedicatedHostId` "the unique ID of the Amazon EC2 Dedicated Host", and Amazon
@@ -137,6 +143,75 @@ pub fn network_failures<Eng: Send + Sync + 'static>(
     } else {
         vec![invalid_subnet_clause(service_access_subnet_id, vpc_id)]
     }
+}
+
+/// The clause stated for a `securityGroups` entry that is not a security group of the VPC
+/// the request named — because the account holds no group with that id, or because the
+/// group it holds belongs to another VPC.
+///
+/// `member` is the PATH of the entry that named it, so the clause points at the element
+/// the caller wrote. Stated in the same form as [`invalid_subnet_clause`], because it is
+/// the same kind of failure: a member naming a network resource of the VPC the
+/// environment is deployed into.
+pub fn invalid_security_group_clause(
+    member: &str,
+    group_id: &str,
+    vpc_id: &str,
+) -> ValidationExceptionField {
+    super::field_failure_stated(
+        member,
+        format!(
+            "The security group id {group_id} given for {member} is not valid or does not \
+             exist in VPC {vpc_id}. Please verify the security group id exists in the VPC \
+             and is valid."
+        ),
+    )
+}
+
+/// One security group a request named, and the path of the member that named it, so a
+/// refusal names the element the caller wrote.
+#[derive(Debug, Clone, Copy)]
+pub struct SecurityGroupReference<'a> {
+    /// The path of the member this id came from.
+    pub member: &'a str,
+    /// The `GroupId` the request supplied.
+    pub group_id: &'a str,
+}
+
+/// Every failure of the precondition that each security group a request names is a
+/// security group OF the VPC the environment is deployed into.
+///
+/// The groups "allow traffic between the Amazon EVS control plane and your VPC for Amazon
+/// EVS service access" (`ServiceAccessSecurityGroups` doc) and Amazon EVS creates none of
+/// them, so each id names a group the account already holds; a security group is scoped
+/// to one VPC (`SecurityGroup$VpcId`), so a group of some other VPC cannot carry that
+/// VPC's traffic. The same rule [`network_failures`] applies to `serviceAccessSubnetId`,
+/// asked of the same store.
+///
+/// An unknown VPC leaves nothing to judge the groups against, so nothing is reported —
+/// [`invalid_vpc_clause`] is the clause for that — and so does an unreadable EC2 store.
+pub fn security_group_failures<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    vpc_id: &str,
+    groups: &[SecurityGroupReference<'_>],
+) -> Vec<ValidationExceptionField> {
+    let Some(state) = ec2_state(engine) else {
+        return Vec::new();
+    };
+    let store = state.lock();
+    if !store.vpcs.contains_key(vpc_id) {
+        return Vec::new();
+    }
+    groups
+        .iter()
+        .filter(|group| {
+            store
+                .security_groups
+                .get(group.group_id)
+                .is_none_or(|held| held.vpc_id.as_deref() != Some(vpc_id))
+        })
+        .map(|group| invalid_security_group_clause(group.member, group.group_id, vpc_id))
+        .collect()
 }
 
 /// The clause stated for a `placementGroupId` the account's own Amazon EC2 store holds no

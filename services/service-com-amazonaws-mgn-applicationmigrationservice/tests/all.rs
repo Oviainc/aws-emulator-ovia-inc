@@ -19,6 +19,8 @@ mod network_migration_definition;
 mod network_migration_definition_listing;
 #[path = "all/request_body_validation.rs"]
 mod request_body_validation;
+#[path = "all/resource_not_found_payload.rs"]
+mod resource_not_found_payload;
 #[path = "all/source_server_discovery.rs"]
 mod source_server_discovery;
 #[path = "all/state_roundtrip.rs"]

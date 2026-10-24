@@ -239,27 +239,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.name,
             )));
         }
+        // The resource-query rules this service decides in one place, so every
+        // operation that takes a `ResourceQuery` refuses the same documents.
         if let Some(query) = &input.resource_query {
-            if !QUERY_TYPE_VALUES.contains(&query.r#type.as_str()) {
-                return Err(bad_request(format!(
-                    "ResourceQuery.Type {} is not valid: expected one of {}",
-                    query.r#type,
-                    QUERY_TYPE_VALUES.join(", "),
-                )));
-            }
-            // The model documents `ResourceQuery$Query` as "The query that defines a
-            // group or a search" in JSON — an object: `{"ResourceTypeFilters":[..],
-            // "TagFilters":[..]}` for a tag query, `{"StackIdentifier":".."}` for a
-            // stack query. A body that is not a JSON object defines no query. Which
-            // keys a given `Type` accepts is not refused here: the slice stores the
-            // query without running it.
-            if !serde_json::from_str::<serde_json::Value>(&query.query)
-                .is_ok_and(|parsed| parsed.is_object())
-            {
-                return Err(bad_request(
-                    "ResourceQuery.Query is not valid: it must be a JSON object",
-                ));
-            }
+            crate::state::check_resource_query(query).map_err(bad_request)?;
         }
 
         // The tag rules this service decides in one place, so a create that carries
@@ -326,6 +309,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing has been grouped or ungrouped in a group that was just
             // created, so `ListGroupingStatuses` has nothing to report for it.
             grouping_statuses: std::collections::BTreeMap::new(),
+            // Minted only if the group later hosts a resource whose ARN
+            // qualifies the group's name, so a group that hosts none carries
+            // none.
+            application_id: None,
         };
         // Reported from the record that is about to be stored, so the response and
         // the store cannot disagree.
