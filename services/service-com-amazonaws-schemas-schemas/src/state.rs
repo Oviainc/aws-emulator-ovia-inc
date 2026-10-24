@@ -29,6 +29,13 @@ pub struct ComAmazonawsSchemasSchemasState {
     /// Source of resource-policy revision ids, so every revision this process mints
     /// is distinct. See [`ComAmazonawsSchemasSchemasState::mint_policy_revision_id`].
     pub next_policy_revision_seq: u64,
+    /// Discoverers by `DiscovererId`, as `CreateDiscoverer` minted them. A discoverer
+    /// belongs to no registry — it is keyed by the id the service minted for it, which
+    /// is what every other discoverer operation names it by.
+    pub discoverers: BTreeMap<String, Discoverer>,
+    /// Source of the ids `CreateDiscoverer` mints. See
+    /// [`ComAmazonawsSchemasSchemasState::mint_discoverer_id`].
+    pub next_discoverer_seq: u64,
 }
 
 impl ComAmazonawsSchemasSchemasState {
@@ -46,6 +53,33 @@ impl ComAmazonawsSchemasSchemasState {
         let seq = self.next_policy_revision_seq;
         format!("{:08x}-0000-4000-8000-{seq:012x}", seq & 0xffff_ffff)
     }
+
+    /// Mint the id of a new discoverer.
+    ///
+    /// `DiscovererId` is modelled as a plain `__string` with no pattern, so its form
+    /// is the service's: an OPAQUE, server-minted identifier a caller can only read
+    /// back, rendered here as 32 lower-case hex digits. It is a digest of this store's
+    /// discoverer counter, so no two discoverers of a process ever share one and a
+    /// deleted id is never minted again, and the counter is not readable from the id.
+    pub fn mint_discoverer_id(&mut self) -> String {
+        self.next_discoverer_seq = self.next_discoverer_seq.saturating_add(1);
+        let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(
+            [b"schemas-discoverer".as_slice(), &self.next_discoverer_seq.to_be_bytes()].concat(),
+        );
+        ::hex::encode(&digest[..16])
+    }
+
+    /// The discoverer this store holds for `source_arn`, if it holds one.
+    ///
+    /// A discoverer is the service's subscription to ONE event source, so the source
+    /// ARN identifies it as surely as its minted id does: this is what makes a second
+    /// `CreateDiscoverer` for the same source a conflict rather than a second
+    /// subscription.
+    pub fn discoverer_for_source(&self, source_arn: &str) -> Option<&Discoverer> {
+        self.discoverers
+            .values()
+            .find(|discoverer| discoverer.source_arn == source_arn)
+    }
 }
 
 /// A fresh store already holds the service-owned registries: they exist in every
@@ -56,6 +90,9 @@ impl Default for ComAmazonawsSchemasSchemasState {
         Self {
             registries: aws_managed_registries(),
             next_policy_revision_seq: 0,
+            // No discoverer exists until a caller creates one: AWS seeds none.
+            discoverers: BTreeMap::new(),
+            next_discoverer_seq: 0,
         }
     }
 }
@@ -109,6 +146,54 @@ pub struct ResourcePolicy {
     /// The revision this policy is at, minted by
     /// [`ComAmazonawsSchemasSchemasState::mint_policy_revision_id`] on every write.
     pub revision_id: String,
+}
+
+/// Whether a discoverer is discovering schemas from its source, or is paused.
+///
+/// The two states `DiscovererState` models ([`crate::ops::types::DISCOVERER_STATE_VALUES`]);
+/// stored as this enum rather than as the wire string so no other value can ever be
+/// persisted into the member. There is no transient state between the two: AWS answers a
+/// discoverer `STARTED` or `STOPPED` and nothing in between, so a start or a stop is
+/// complete when it answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscovererState {
+    /// Discovering schemas from the source — the state a created discoverer is in.
+    Started,
+    /// Paused by `StopDiscoverer`: the discoverer still exists and still names its
+    /// source, and discovers nothing until it is started again.
+    Stopped,
+}
+
+impl DiscovererState {
+    /// This state as `DiscovererState` renders it on the wire — one of
+    /// [`crate::ops::types::DISCOVERER_STATE_VALUES`].
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Started => "STARTED",
+            Self::Stopped => "STOPPED",
+        }
+    }
+}
+
+/// A discoverer, as `CreateDiscoverer` persisted it and as every later discoverer
+/// operation reads and writes it.
+#[derive(Debug, Clone)]
+pub struct Discoverer {
+    /// The id the service minted for this discoverer
+    /// ([`ComAmazonawsSchemasSchemasState::mint_discoverer_id`]); the key it is stored
+    /// under and the only name a caller has for it.
+    pub id: String,
+    /// `arn:aws:schemas:<region>:<account>:discoverer/<id>`, minted at create time.
+    pub arn: String,
+    /// The event source this discoverer discovers schemas from, as the request named it.
+    pub source_arn: String,
+    pub description: Option<String>,
+    /// Whether the discoverer is discovering or paused — what `StartDiscoverer` and
+    /// `StopDiscoverer` move.
+    pub state: DiscovererState,
+    /// Whether schemas of events another account sent to the source are discovered too.
+    pub cross_account: bool,
+    pub tags: BTreeMap<String, String>,
 }
 
 /// The bytes a policy document is stored and reported as: the document re-encoded as
@@ -2376,6 +2461,11 @@ pub fn schema_arn(region: &str, registry: &str, schema: &str) -> String {
     ::engine::emulator_arn("schemas", region, &format!("schema/{registry}/{schema}"))
 }
 
+/// `arn:aws:schemas:<region>:<account>:discoverer/<id>`.
+pub fn discoverer_arn(region: &str, discoverer_id: &str) -> String {
+    ::engine::emulator_arn("schemas", region, &format!("discoverer/{discoverer_id}"))
+}
+
 /// Store the `Tags` member of a request. An absent map and an empty one are the same
 /// thing: a resource with no tags.
 pub fn tags_from_input(tags: Option<&HashMap<String, String>>) -> BTreeMap<String, String> {
@@ -2579,6 +2669,11 @@ pub const MAX_REGISTRIES: usize = 500;
 
 /// See [`MAX_REGISTRIES`].
 pub const MAX_SCHEMAS_PER_REGISTRY: usize = 500;
+
+/// See [`MAX_REGISTRIES`]. The ceiling on how many discoverers a caller may hold:
+/// `CreateDiscoverer` mints one record per call and only a delete removes one, so
+/// without it the discoverer map grows for as long as a client keeps creating.
+pub const MAX_DISCOVERERS: usize = 500;
 
 /// See [`MAX_REGISTRIES`]. Counted over every version of every schema in every
 /// registry a CALLER owns, which is everything a caller's `Content` can make this
@@ -2903,6 +2998,57 @@ pub fn schema_not_found(schema: &str) -> NotFoundException {
 /// AWS's own, built from the request's `RegistryName`.
 pub fn registry_already_exists(registry: &str) -> ConflictException {
     already_exists(format!("Registry with name {registry} already exists."))
+}
+
+/// Message for a discoverer this store does not hold, named by the request's
+/// `DiscovererId`. The sentence is the service's own template for a missing resource —
+/// "«Resource» with «identifier» «value» does not exist.", as [`registry_not_found`]
+/// carries it.
+pub fn discoverer_not_found(discoverer_id: &str) -> NotFoundException {
+    not_found(format!(
+        "Discoverer with ID {discoverer_id} does not exist."
+    ))
+}
+
+/// Refuse a `CreateDiscoverer` for a source this store already discovers.
+///
+/// A discoverer IS the subscription to one event source, so a second one for the same
+/// source is the same resource asked for twice. Built from the request's `SourceArn`,
+/// as the other already-exists sentences are built from the member that identifies the
+/// resource.
+pub fn discoverer_already_exists(source_arn: &str) -> ConflictException {
+    already_exists(format!(
+        "Discoverer for source {source_arn} already exists."
+    ))
+}
+
+/// Refuse a `SourceArn` that is not an ARN.
+///
+/// A discoverer discovers schemas from an event source IDENTIFIED BY ITS ARN, so a
+/// value that is not an ARN names no source. The model bounds only the length
+/// (`__stringMin20Max1600`), so the form is the handler's to refuse. Names the member
+/// and what it must carry, never the value.
+pub fn source_arn_not_an_arn() -> BadRequestException {
+    bad_request(
+        "SourceArn must be the ARN of the event source to discover schemas from, \
+         in the form arn:<partition>:<service>:<region>:<account>:<resource>.",
+    )
+}
+
+/// Whether `candidate` is an ARN: the `arn` scheme and the six colon-separated fields
+/// every ARN has, the last of which (the resource) is non-empty.
+///
+/// The partition, region and account fields are NOT required to be non-empty — a
+/// service-wide or account-wide ARN leaves some of them blank — so what this checks is
+/// the form, not which resource the ARN names.
+pub fn is_arn(candidate: &str) -> bool {
+    let mut fields = candidate.splitn(6, ':');
+    fields.next() == Some("arn")
+        && fields.next().is_some()
+        && fields.next().is_some_and(|service| !service.is_empty())
+        && fields.next().is_some()
+        && fields.next().is_some()
+        && fields.next().is_some_and(|resource| !resource.is_empty())
 }
 
 /// Refuse a `CreateSchema` for a name its registry already holds. The template is
