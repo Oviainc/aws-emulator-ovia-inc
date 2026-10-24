@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCustomDetectionRuleAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCustomDetectionRuleAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCustomDetectionRuleAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the custom detection rule associations the account holds
+//! through the Region serving the request, narrowed by the `RuleId` and `Mode`
+//! filters the request names, in `(RuleId, Mode)` order and one page at a time. A
+//! pure REPORT: nothing here writes to the store, so no number of list calls
+//! changes what a later caller sees.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +146,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCustomDetectionRuleAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCustomDetectionRuleAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListCustomDetectionRuleAssociationsErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        // A pure report: the lock is taken immutably, and an association has no
+        // status the clock owes it a move on, so there is nothing a read here could
+        // materialise.
+        let state = state.lock();
+
+        // "Returns all custom detection rule associations for your account. You can
+        // filter by rule ID and mode"
+        // (`smithy_query(query="doc",shape="ListCustomDetectionRuleAssociations")`):
+        // both filters are OPTIONAL and each narrows by EQUALITY on the member the
+        // summary reports, so a request naming neither reports the Region's whole
+        // set. `RuleId` carries its own length and pattern constraints and `Mode` is
+        // a modelled enum, both refused at the request boundary, so a filter that
+        // reaches here is a well-formed value that simply may select nothing — and
+        // selecting nothing is an empty page, not an error: this operation models no
+        // `ResourceNotFoundException`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCustomDetectionRuleAssociations"))
+        // The store is keyed `(region, RuleId, Mode)` and ordered by that key, so
+        // iterating it yields one Region's associations in `(RuleId, Mode)` order.
+        // A TOTAL order is what makes a page token mean the same thing on the call
+        // that handed it back.
+        let selected: Vec<&crate::state::DetectionRuleAssociationRecord> = state
+            .custom_detection_rule_associations
+            .values()
+            .filter(|record| record.region == region)
+            .filter(|record| {
+                input
+                    .rule_id
+                    .as_deref()
+                    .is_none_or(|rule_id| record.rule_id == rule_id)
+            })
+            .filter(|record| input.mode.as_deref().is_none_or(|mode| record.mode == mode))
+            .collect();
+
+        // The page is the WINDOW the token addresses, taken over the ordered
+        // selection ITSELF: `paginate_window` hands back that run of it, so the
+        // answer keeps the `(RuleId, Mode)` order with no parallel id list to page
+        // in its stead and no second lookup to resolve each entry back.
+        let (window, next_token) = crate::state::paginate_window(
+            selected.len(),
+            input.max_results,
+            input.next_token.as_deref(),
+            MAX_ASSOCIATIONS_PER_PAGE,
+        )
+        .map_err(|_| {
+            // Under the error CLASS, naming the parameter at fault and not quoting
+            // the token back.
+            bad_request(crate::state::invalid_parameter_message(
+                crate::state::NEXT_TOKEN_MEMBER,
+            ))
+        })?;
+
+        let rule_associations: Vec<AssociationSummary> = selected[window]
+            .iter()
+            .map(|record| summary(record))
+            .collect();
+
+        Ok(ListCustomDetectionRuleAssociationsOutput {
+            rule_associations,
+            next_token,
+        })
     }
+}
+
+/// One page's ceiling. `MaxResults` is "The maximum number of results to return in a
+/// single page. Minimum value of 1, maximum value of 100"
+/// (`smithy_query(operation="ListCustomDetectionRuleAssociations")`), so a request
+/// that names no page size is served the largest page that member can ask for.
+const MAX_ASSOCIATIONS_PER_PAGE: usize = 100;
+
+/// The `AssociationSummary` projection of a stored association.
+///
+/// `AssociationSummary` is `AssociationDetail` without `AccountId`
+/// (`smithy_query(shape="AssociationSummary,AssociationDetail")`), so every member
+/// is read off the same record the detail read reports and only the `Arn` is
+/// derived — through the shared
+/// [`crate::state::custom_detection_rule_association_arn`], so a list and a read
+/// cannot report different ARNs for one association.
+///
+/// `ExpiresAt` is the shape's only optional member and GuardDuty documents no
+/// lifetime for an association, so it is reported ABSENT rather than filled with an
+/// invented instant — exactly as
+/// [`crate::state::detection_rule_association_view`] reports it.
+fn summary(record: &crate::state::DetectionRuleAssociationRecord) -> AssociationSummary {
+    AssociationSummary {
+        association_id: record.association_id.clone(),
+        arn: crate::state::custom_detection_rule_association_arn(
+            &record.region,
+            &record.rule_id,
+            &record.association_id,
+        ),
+        rule_id: record.rule_id.clone(),
+        mode: record.mode.clone(),
+        created_at: ::aws_smithy_types::DateTime::from_millis(record.created_at_millis),
+        updated_at: ::aws_smithy_types::DateTime::from_millis(record.updated_at_millis),
+        expires_at: None,
+    }
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type` member.
+fn bad_request(message: impl Into<String>) -> ListCustomDetectionRuleAssociationsError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }
