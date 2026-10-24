@@ -18,7 +18,8 @@
 //! Nothing here is mutated by a request. Every operation this crate implements is
 //! `@readonly`, so even their pagination carries no server-side cursor: a `NextToken`
 //! is a self-describing, opaque string (see [`encode_page_token`]) rather than an
-//! entry written into state by a read.
+//! entry written into state by a read, and so is the `QueryId` a Suggest query-term
+//! suggestion hands out (see [`encode_query_id`]).
 
 use std::collections::BTreeMap;
 
@@ -26,7 +27,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     AccessPoint, Address, BusinessChain, Category, ContactDetails, Contacts, Country, FoodType,
-    OpeningHours, Region, StreetComponents, SubRegion, TimeZone, ValidationException,
+    Highlight, OpeningHours, Region, StreetComponents, SubRegion, TimeZone, ValidationException,
     ValidationExceptionField,
 };
 
@@ -188,6 +189,19 @@ pub const FEATURE_CONTACT: &str = "Contact";
 /// See [`FEATURE_ACCESS`].
 pub const FEATURE_TIME_ZONE: &str = "TimeZone";
 
+/// `SuggestResultItemType` values, from the model's enum of the same name: what
+/// one suggestion IS — a place the query names, or a query term to search with.
+pub const SUGGEST_ITEM_PLACE: &str = "Place";
+/// See [`SUGGEST_ITEM_PLACE`].
+pub const SUGGEST_ITEM_QUERY: &str = "Query";
+
+/// `QueryType` values, from the model's enum of the same name: the kinds of term
+/// a `Query` suggestion can stand for. A food type is neither, so the catalog's
+/// food-type vocabulary names no query suggestion of its own.
+pub const QUERY_TYPE_CATEGORY: &str = "Category";
+/// See [`QUERY_TYPE_CATEGORY`].
+pub const QUERY_TYPE_BUSINESS_CHAIN: &str = "BusinessChain";
+
 /// `ValidationExceptionReason` values, from the model's enum of the same name.
 pub const REASON_MISSING: &str = "Missing";
 /// See [`REASON_MISSING`].
@@ -228,6 +242,15 @@ pub const AUTOCOMPLETE_MAX_RESULTS_CEILING: i32 = 20;
 pub const QUERY_RADIUS_MIN: i64 = 1;
 /// See [`QUERY_RADIUS_MIN`].
 pub const QUERY_RADIUS_MAX: i64 = 21_000_000;
+
+/// The inclusive maximum of Suggest's modeled `MaxQueryRefinements` range
+/// (`range 1..10`), which is also the maximum length of the `QueryRefinementList`
+/// they are reported in (`len 0..10`).
+///
+/// The model documents no default for `MaxQueryRefinements`, so a request that
+/// asks for no narrower bound is answered with as many refinements as the modeled
+/// list carries.
+pub const QUERY_REFINEMENTS_CEILING: i32 = 10;
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -325,6 +348,16 @@ pub fn normalize_tokens(text: &str) -> Vec<String> {
         .map(|character| if character.is_alphanumeric() { character } else { ' ' })
         .collect::<String>()
         .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The words of a piece of text AS IT SPELLS THEM: the same runs of alphanumeric
+/// characters [`normalize_tokens`] splits on, each keeping its own casing, so a
+/// word taken from the catalog is reported the way the catalog writes it.
+pub fn display_words(text: &str) -> Vec<String> {
+    text.split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
         .map(str::to_string)
         .collect()
 }
@@ -507,6 +540,23 @@ impl<'a> QueryTokens<'a> {
     /// Did the caller send any query text at all?
     pub fn is_empty(&self) -> bool {
         self.tokens.is_empty()
+    }
+
+    /// Each token with the span it occupies in the query: the text AS THE CALLER
+    /// TYPED IT, the normalized token it indexes as, and the `[start, end)` CHAR
+    /// span — the indices a `QueryRefinement` reports.
+    pub fn spans(&self) -> Vec<(&str, &str, i32, i32)> {
+        self.tokens
+            .iter()
+            .map(|token| {
+                (
+                    &self.text[token.byte_start..token.byte_end],
+                    token.text.as_str(),
+                    token.start as i32,
+                    token.end as i32,
+                )
+            })
+            .collect()
     }
 }
 
@@ -695,6 +745,24 @@ pub fn highlight_matches(text: &str, query_tokens: &[String]) -> Vec<TextHighlig
         .collect()
 }
 
+/// The modeled `Highlight` list for one piece of a result's text, or `None` when
+/// the query named none of it: every `HighlightList` member is optional on every
+/// shape that carries one, so "the query matched nothing here" is an ABSENT member
+/// rather than an empty list.
+pub fn modeled_highlights(text: &str, query_tokens: &[String]) -> Option<Vec<Highlight>> {
+    let found = highlight_matches(text, query_tokens);
+    (!found.is_empty()).then(|| {
+        found
+            .into_iter()
+            .map(|section| Highlight {
+                start_index: Some(section.start_index),
+                end_index: Some(section.end_index),
+                value: Some(section.value),
+            })
+            .collect()
+    })
+}
+
 /// One component of a place that a query matched: how well, and the span of the
 /// query it was recognized in.
 #[derive(Debug, Clone)]
@@ -775,6 +843,38 @@ pub struct Scored {
     /// [`order_by_relevance`]: ComAmazonawsGeoplacesPlacesserviceState::order_by_relevance
     pub name_score: f64,
     pub distance: i64,
+}
+
+/// One query TERM a free-form query names: a category or a business chain the
+/// catalog holds, as [`ComAmazonawsGeoplacesPlacesserviceState::query_terms`]
+/// finds it. It is what a `Query` suggestion stands for — the follow-on query a
+/// caller can run instead of one place.
+#[derive(Debug, Clone)]
+pub struct QueryTerm {
+    /// The term as the catalog spells it, which is the suggestion's `Title`.
+    pub term: String,
+    /// `SuggestQueryResult$QueryType`: [`QUERY_TYPE_CATEGORY`] or
+    /// [`QUERY_TYPE_BUSINESS_CHAIN`].
+    pub query_type: &'static str,
+    /// How much of the query the term's own words accounted for, scored the way
+    /// [`PlaceRecord::text_score`] scores a record. Never reported — it only
+    /// ranks two terms the query named.
+    pub score: f64,
+}
+
+/// One refinement of a query: the span of the caller's text that names a word
+/// only in part, and the catalog word it completes to — the modeled
+/// `QueryRefinement`.
+#[derive(Debug, Clone)]
+pub struct Refinement {
+    /// `QueryRefinement$OriginalTerm`: the span AS THE CALLER TYPED IT.
+    pub original_term: String,
+    /// `QueryRefinement$RefinedTerm`: the word to use in its place.
+    pub refined_term: String,
+    /// `QueryRefinement$StartIndex`: the first char of the original term.
+    pub start_index: i32,
+    /// `QueryRefinement$EndIndex`: one past its last char.
+    pub end_index: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -2218,6 +2318,35 @@ pub fn check_max_results_up_to(
     }
 }
 
+/// Refuse a `MaxQueryRefinements` outside Suggest's modeled `range 1..10`
+/// ([`QUERY_REFINEMENTS_CEILING`]), so an in-process caller is held to the same
+/// bound as a client on the wire.
+pub fn check_max_query_refinements(
+    max_query_refinements: Option<i32>,
+) -> Result<(), ValidationException> {
+    let Some(requested) = max_query_refinements else {
+        return Ok(());
+    };
+    let broken = if requested < 1 {
+        Some(must_not_be_less_than("MaxQueryRefinements", "1"))
+    } else if requested > QUERY_REFINEMENTS_CEILING {
+        Some(must_not_be_greater_than(
+            "MaxQueryRefinements",
+            &QUERY_REFINEMENTS_CEILING.to_string(),
+        ))
+    } else {
+        None
+    };
+    match broken {
+        Some(message) => Err(validation_exception(
+            REASON_FIELD_VALIDATION_FAILED,
+            "MaxQueryRefinements",
+            message,
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Refuse a `QueryRadius` outside the modeled `DistanceMeters` range
 /// (`range 1..21000000`).
 pub fn check_query_radius(radius: Option<i64>) -> Result<(), ValidationException> {
@@ -2483,6 +2612,41 @@ pub fn decode_page_token(token: &str, operation: &str, fingerprint: &str) -> Opt
     offset.parse().ok()
 }
 
+/// What a `QueryId` names, so an id minted for one purpose is not read as
+/// another kind of opaque token.
+const QUERY_ID_KIND: &str = "SuggestQuery";
+
+/// Encode the opaque `QueryId` of a query-term suggestion: the kind of term
+/// (`SuggestQueryResult$QueryType`) and the term itself.
+///
+/// "The query Id returned by the suggest API. If passed in the request, the
+/// SearchText API will preform a SearchText query with the improved query terms
+/// for the original query made to the suggest API"
+/// (`SearchTextRequest$QueryId`): the id stands for a QUERY, so the query travels
+/// inside it and the SearchText call it is handed to runs that query — nothing is
+/// written into state by the read that minted it.
+pub fn encode_query_id(query_type: &str, term: &str) -> String {
+    hex::encode(format!(
+        "{QUERY_ID_KIND}{TOKEN_SEPARATOR}{query_type}{TOKEN_SEPARATOR}{term}"
+    ))
+}
+
+/// Decode a `QueryId` back to the `(QueryType, term)` it names, refusing one this
+/// service never minted.
+pub fn decode_query_id(query_id: &str) -> Option<(String, String)> {
+    let decoded = String::from_utf8(hex::decode(query_id).ok()?).ok()?;
+    let mut fields = decoded.split(TOKEN_SEPARATOR);
+    let (Some(kind), Some(query_type), Some(term), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return None;
+    };
+    if kind != QUERY_ID_KIND || term.is_empty() {
+        return None;
+    }
+    Some((query_type.to_string(), term.to_string()))
+}
+
 /// One page of candidates, and the token that resumes after it.
 #[derive(Debug)]
 pub struct Page {
@@ -2591,6 +2755,144 @@ impl ComAmazonawsGeoplacesPlacesserviceState {
                 })
             })
             .collect()
+    }
+
+    /// The query TERMS a free-form query names: the categories and the business
+    /// chains carried by the records it matched, whose own words account for every
+    /// word of the query.
+    ///
+    /// Suggest answers "relevant places, points of interest, QUERY TERMS or
+    /// SEARCH CATEGORY" and "possible matches or refinements that can be used to
+    /// formulate a more accurate query", and `QueryType` enumerates exactly two
+    /// kinds of such term — a category and a business chain — so these are the
+    /// terms a `Query` suggestion can stand for. Best-matching term first, then
+    /// alphabetically, so one catalog always suggests the same terms in the same
+    /// order.
+    pub fn query_terms(&self, query: &str, candidates: &[Scored]) -> Vec<QueryTerm> {
+        let tokens = normalize_tokens(query);
+        let mut found: Vec<QueryTerm> = Vec::new();
+        for candidate in candidates {
+            let place = &self.places[candidate.index];
+            let vocabulary = place
+                .categories
+                .iter()
+                .map(|category| (QUERY_TYPE_CATEGORY, category.name.clone()))
+                .chain(
+                    place
+                        .business_chains
+                        .iter()
+                        .map(|chain| (QUERY_TYPE_BUSINESS_CHAIN, chain.clone())),
+                );
+            for (query_type, term) in vocabulary {
+                // The term answers the query only when its own words account for
+                // every word the caller typed: a query naming a place and nothing
+                // about what it IS suggests no category to search by.
+                let Some(score) = score_against(&normalize_tokens(&term), &tokens) else {
+                    continue;
+                };
+                if found
+                    .iter()
+                    .any(|kept| kept.query_type == query_type && kept.term == term)
+                {
+                    continue;
+                }
+                found.push(QueryTerm {
+                    term,
+                    query_type,
+                    score,
+                });
+            }
+        }
+        found.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.term.cmp(&right.term))
+        });
+        found
+    }
+
+    /// The refinements of a free-form query: for each word the caller typed that
+    /// is NOT a whole word of anything the query matched, the shortest word of
+    /// those matches it is the leading part of, reported with the span it
+    /// replaces.
+    ///
+    /// A `QueryRefinement` is "the query term to be used in place of the original
+    /// term" with the `[StartIndex, EndIndex)` span of that original term, so a
+    /// refinement is a WORD-level substitution grounded in the catalog's own text:
+    /// a partially typed word is refined to the word it completes to. A word that
+    /// already spells a term of a matched record is complete, so there is nothing
+    /// to refine about it. At most `limit` refinements are reported, in the order
+    /// the words occur in the query.
+    pub fn query_refinements(
+        &self,
+        query: &str,
+        candidates: &[Scored],
+        limit: usize,
+    ) -> Vec<Refinement> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let vocabulary = self.refinement_vocabulary(candidates);
+        let complete: Vec<String> = vocabulary
+            .iter()
+            .map(|word| word.to_lowercase())
+            .collect();
+        let mut refinements: Vec<Refinement> = Vec::new();
+        for (typed, normalized, start_index, end_index) in QueryTokens::new(query).spans() {
+            if complete.iter().any(|word| word == normalized) {
+                continue;
+            }
+            let completion = vocabulary
+                .iter()
+                .filter(|word| {
+                    let lowered = word.to_lowercase();
+                    lowered != normalized && lowered.starts_with(normalized)
+                })
+                .min_by(|left, right| {
+                    left.chars()
+                        .count()
+                        .cmp(&right.chars().count())
+                        .then_with(|| left.cmp(right))
+                });
+            let Some(completion) = completion else {
+                continue;
+            };
+            refinements.push(Refinement {
+                original_term: typed.to_string(),
+                refined_term: completion.clone(),
+                start_index,
+                end_index,
+            });
+            if refinements.len() == limit {
+                break;
+            }
+        }
+        refinements
+    }
+
+    /// The words a refinement may complete a partially typed word to: the words
+    /// of the text the matched records REPORT (every name they are known by and
+    /// their assembled label) and of the vocabulary they are found by (their
+    /// categories, food types and business chains), each kept as the catalog
+    /// spells it, sorted and deduplicated so one query always refines to the same
+    /// word.
+    fn refinement_vocabulary(&self, candidates: &[Scored]) -> Vec<String> {
+        let mut words: Vec<String> = Vec::new();
+        for candidate in candidates {
+            let place = &self.places[candidate.index];
+            let mut sources: Vec<String> = place.names().map(str::to_string).collect();
+            sources.push(place.assembled_label());
+            sources.extend(place.categories.iter().map(|category| category.name.clone()));
+            sources.extend(place.food_types.iter().cloned());
+            sources.extend(place.business_chains.iter().cloned());
+            for source in &sources {
+                words.extend(display_words(source));
+            }
+        }
+        words.sort();
+        words.dedup();
+        words
     }
 
     /// Every record a structured query matches, in no particular order.
