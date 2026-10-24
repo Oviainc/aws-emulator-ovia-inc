@@ -90,6 +90,18 @@ pub const MAX_DASHBOARDS: usize = 1_000;
 /// create that would enter the store above this ceiling.
 pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
+/// The tag-key prefix Amazon Web Services reserves for the tags it generates itself.
+///
+/// AWS's tagging rules state that the `aws:` prefix is reserved for AWS use and that a
+/// caller can neither create nor edit nor delete a tag key carrying it, so every path
+/// on this surface that takes a caller-supplied tag key refuses one in this namespace
+/// instead of storing or removing it ([`check_tag_keys_not_reserved`]). The model cannot
+/// express the rule — `ResourceTagKey`'s pattern is `^[\S\s]*$`
+/// (`smithy_query(query="shape",shape="ResourceTagKey")`) — so the handlers enforce it.
+/// The comparison is case-insensitive, because the prefix is reserved however it is
+/// cased.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
 /// How the TAGGING path words a `ResourceArn` that resolves to no stored resource.
 ///
 /// A constant, carrying nothing from the request — which is what the recorded
@@ -550,6 +562,51 @@ pub fn duplicate_dashboard_name_message(name: &str) -> String {
         "name: a dashboard named '{name}' already exists in this account; \
          the name of a dashboard must be unique within your account"
     )
+}
+
+/// Whether `key` is a tag key Amazon Web Services reserves for itself (see
+/// [`RESERVED_TAG_KEY_PREFIX`]).
+///
+/// `str::get` rather than a byte-range slice (`key[..4]`), which PANICS when the key
+/// carries a multi-byte character straddling that byte index — `ResourceTagKey`'s
+/// modelled pattern is `^[\S\s]*$`, which admits any character at all, so such a key
+/// passes boundary validation and reaches this helper. `get` answers `None` for a key
+/// shorter than the prefix or one whose boundary falls mid-character, which is exactly
+/// "not reserved".
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// `Ok(())` when no key in `keys` is in the reserved namespace, or the refusal message
+/// for the ones that are — the text a `ValidationException` carries.
+///
+/// One helper so every operation that takes caller-supplied tag keys —
+/// `CreateDashboard` and `CreateScheduledReport` at create time, `TagResource` and
+/// `UntagResource` afterwards — refuses that one namespace the same way and cannot drift
+/// apart. The message is built from the request, the way the boundary validator words a
+/// refusal: it names the member that broke the rule, the offending keys and the rule
+/// itself. The offenders are sorted and deduplicated so one request that names a key
+/// twice reports it once and the text does not depend on iteration order.
+pub fn check_tag_keys_not_reserved<'a>(
+    member: &str,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    let mut reserved: Vec<&str> = keys
+        .into_iter()
+        .filter(|key| is_reserved_tag_key(key))
+        .collect();
+    if reserved.is_empty() {
+        return Ok(());
+    }
+    reserved.sort_unstable();
+    reserved.dedup();
+    Err(format!(
+        "{member}: the '{RESERVED_TAG_KEY_PREFIX}' prefix is reserved for tags Amazon Web \
+         Services generates and cannot be set or removed by a caller, so these keys are not \
+         allowed: {}",
+        reserved.join(", ")
+    ))
 }
 
 /// The `scheduleConfig` to store for a create or an update: the supplied config with

@@ -10,6 +10,13 @@
 //! ARN, as `crate::scaffolded::Scaffolded::resource_not_found` renders it (the model's
 //! `@httpError` for that shape is 404, which is not what the recorded service answers).
 //!
+//! A key in the namespace Amazon Web Services reserves for itself
+//! ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched however it is cased) names a tag
+//! AWS generates, which a caller may neither set nor delete: naming one is refused with
+//! this operation's modelled `ValidationException` (HTTP 400) and removes NOTHING, so the
+//! other keys the request names keep their tags. The refusal is decided from the request
+//! alone, before the ARN is resolved.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -150,6 +157,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let mut state = state.lock();
+
+        // A key in the reserved `aws:` namespace names a tag AWS generates, which a
+        // caller can neither edit nor delete, so naming one is refused from the REQUEST
+        // alone before the ARN is resolved and removes nothing — not even the keys of the
+        // same request that are a caller's to remove.
+        if let Err(message) = crate::state::check_tag_keys_not_reserved(
+            "resourceTagKeys",
+            input.resource_tag_keys.iter().map(String::as_str),
+        ) {
+            crate::state::record_state_change(
+                ctx,
+                Self::NAME,
+                &input.resource_arn,
+                "ValidationException",
+            );
+            return Err(
+                UntagResourceErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
 
         // The ARN is resolved against the stored resources first, so untagging a
         // resource that does not exist is refused instead of silently succeeding.

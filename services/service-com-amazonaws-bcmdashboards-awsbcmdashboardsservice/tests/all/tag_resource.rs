@@ -106,18 +106,20 @@ fn merge_cases() -> Vec<Case> {
         },
         Case {
             // `^[\S\s]*$` constrains neither key nor value text, so both may hold spaces,
-            // punctuation, a reserved-looking prefix or non-ASCII text, and a VALUE may be
-            // empty (`ResourceTagValue` length 0..256).
+            // punctuation, a reserved-LOOKING prefix or non-ASCII text, and a VALUE may be
+            // empty (`ResourceTagValue` length 0..256). The prefix the service actually
+            // reserves is `aws:`, which the sibling `reserved_tag_keys` suite pins;
+            // `aws-cost centre` is outside it and so an ordinary key.
             label: "keys and values the pattern allows but ASCII words do not cover"
                 .to_string(),
-            initial: pairs(&[("aws:cost centre", "finance ops"), ("клиент", "Ёлка")]),
+            initial: pairs(&[("aws-cost centre", "finance ops"), ("клиент", "Ёлка")]),
             apply: pairs(&[
-                ("aws:cost centre", "platform ops"),
+                ("aws-cost centre", "platform ops"),
                 ("клиент", ""),
                 ("emoji 🎉", "party"),
             ]),
             expected: pairs(&[
-                ("aws:cost centre", "platform ops"),
+                ("aws-cost centre", "platform ops"),
                 ("клиент", ""),
                 ("emoji 🎉", "party"),
             ]),

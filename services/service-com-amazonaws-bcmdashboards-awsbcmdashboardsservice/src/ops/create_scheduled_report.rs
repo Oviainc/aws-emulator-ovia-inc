@@ -182,6 +182,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let requested = input.scheduled_report;
 
+        // Tag-on-create takes caller-supplied tag keys, so the reserved `aws:` namespace
+        // is refused here exactly as `TagResource` refuses it: a request naming such a key
+        // creates NO report — no ARN is minted and the request's `clientToken` stays free —
+        // rather than creating one that carries a tag only AWS may set.
+        if let Err(message) = crate::state::check_tag_keys_not_reserved(
+            "resourceTags",
+            input
+                .resource_tags
+                .iter()
+                .flatten()
+                .map(|tag| tag.key.as_str()),
+        ) {
+            crate::state::record_state_change(ctx, Self::NAME, "-", "ValidationException");
+            return Err(CreateScheduledReportErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
         // A scheduled report reports on a dashboard, so the dashboard it names has to
         // be one this account stores. This operation models no
         // `ResourceNotFoundException`, so the refusal is its modelled

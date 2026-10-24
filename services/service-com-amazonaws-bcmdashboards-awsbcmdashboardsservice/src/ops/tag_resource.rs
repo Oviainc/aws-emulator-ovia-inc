@@ -15,6 +15,14 @@
 //! `@httpError` for that shape is 404, which is not what the recorded service
 //! answers).
 //!
+//! A tag key in the namespace Amazon Web Services reserves for itself
+//! ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched however it is cased) is not a key
+//! a caller may set: such a request is refused with this operation's modelled
+//! `ValidationException` (HTTP 400) and stores NOTHING, so none of its other tags are
+//! applied either. The refusal is decided from the request alone, before the ARN is
+//! resolved, so a reserved key is refused as such whether or not the ARN names a stored
+//! resource.
+//!
 //! The stored tag list is bounded by [`crate::state::MAX_TAGS_PER_RESOURCE`]: the
 //! modelled `resourceTags` length bounds one REQUEST, not the list a merge grows, so a
 //! merge that would carry a resource past that ceiling is refused with this operation's
@@ -160,6 +168,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let mut state = state.lock();
+
+        // The reserved `aws:` namespace is refused from the REQUEST alone, before the ARN
+        // is resolved and before anything is written: a key AWS reserves for its own
+        // generated tags is not a key a caller may set, so a request carrying one stores
+        // none of its tags rather than half of them. The model cannot express the rule
+        // (`ResourceTagKey`'s pattern is `^[\S\s]*$`), so the handler enforces it.
+        if let Err(message) = crate::state::check_tag_keys_not_reserved(
+            "resourceTags",
+            input.resource_tags.iter().map(|tag| tag.key.as_str()),
+        ) {
+            crate::state::record_state_change(
+                ctx,
+                Self::NAME,
+                &input.resource_arn,
+                "ValidationException",
+            );
+            return Err(
+                TagResourceErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
 
         // The ARN is resolved against the stored resources first — both resource types
         // `ResourceArn` admits — so tagging a resource that does not exist is refused

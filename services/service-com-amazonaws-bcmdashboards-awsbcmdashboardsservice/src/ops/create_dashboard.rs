@@ -174,6 +174,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
+        // Tag-on-create takes caller-supplied tag keys, so the reserved `aws:` namespace
+        // is refused here exactly as `TagResource` refuses it: a request naming such a key
+        // creates NO dashboard at all — no ARN is minted and no widget id consumed — rather
+        // than creating one that carries a tag only AWS may set.
+        if let Err(message) = crate::state::check_tag_keys_not_reserved(
+            "resourceTags",
+            input
+                .resource_tags
+                .iter()
+                .flatten()
+                .map(|tag| tag.key.as_str()),
+        ) {
+            crate::state::record_state_change(ctx, Self::NAME, "-", "ValidationException");
+            return Err(CreateDashboardErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
         // A dashboard's name identifies it within the account: `name` is documented as
         // "The name of the dashboard. The name must be unique within your account."
         // (`smithy_query(query="doc",shape="CreateDashboardRequest",member="name")`), so a
