@@ -20,13 +20,10 @@
 //! bound of every interval member; and ARNs differing in partition, resource type, id and
 //! length, including each published bound of `GatewayArn` and one past it.
 //!
-//! `PutBandwidthRateLimitSchedule` is the operation that SETS the schedule and is still a
-//! scaffold answering 501 under its own stub issue
-//! (`issues/things-that-do-not-work/20261024T030827Z-backup-gateway-putbandwidthratelimitschedule-stub.md`),
-//! so the store is the only place a schedule can come from until it is implemented —
-//! seeded here through the same `bandwidth_rate_limit_intervals` field that handler will
-//! write, which is exactly what the sibling `hypervisor_property_mappings` suite does for
-//! the mappings its own scaffolded writer owns.
+//! The schedules read here are seeded straight onto the stored record, through the same
+//! `bandwidth_rate_limit_intervals` field `PutBandwidthRateLimitSchedule` writes, so this
+//! suite asserts the READ on its own; the sibling `put_bandwidth_rate_limit_schedule`
+//! suite drives that writer over the wire and reuses the table and helpers below.
 
 use std::sync::Arc;
 
@@ -76,7 +73,7 @@ pub(crate) fn arn_of_length(len: usize) -> String {
 /// One modelled `BandwidthRateLimitInterval`
 /// (`smithy_query(query="shape",shape="BandwidthRateLimitInterval")`: every member
 /// required but `AverageUploadRateLimitInBitsPerSec`).
-fn interval(
+pub(crate) fn interval(
     start_hour: i32,
     start_minute: i32,
     end_hour: i32,
@@ -98,7 +95,7 @@ fn interval(
 /// stored order. `AverageUploadRateLimitInBitsPerSec` is absent where it was not set:
 /// "This field does not appear in the response if the upload rate limit is not set"
 /// (`smithy_query(query="shape",shape="BandwidthRateLimitInterval")`).
-fn expected_intervals(intervals: &[BandwidthRateLimitInterval]) -> Value {
+pub(crate) fn expected_intervals(intervals: &[BandwidthRateLimitInterval]) -> Value {
     Value::Array(
         intervals
             .iter()
@@ -119,7 +116,7 @@ fn expected_intervals(intervals: &[BandwidthRateLimitInterval]) -> Value {
     )
 }
 
-async fn get_schedule(router: &MultiServiceRouter, arn: &str) -> Reply {
+pub(crate) async fn get_schedule(router: &MultiServiceRouter, arn: &str) -> Reply {
     call(
         router,
         "GetBandwidthRateLimitSchedule",
@@ -145,7 +142,7 @@ fn set_schedule(
 
 /// The intervals PERSISTED on the record under `arn`, rendered for comparison: what a read
 /// must not have changed.
-fn persisted_intervals(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> String {
+pub(crate) fn persisted_intervals(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> String {
     let state = service_state(&**engine).expect("the in-memory engine must expose this state");
     let store = state.lock();
     let record = store
@@ -156,7 +153,7 @@ fn persisted_intervals(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> Strin
 
 /// The rows of the schedule table: schedules spanning interval count, order, the optional
 /// upload rate limit and each published bound of every interval member.
-fn schedule_rows() -> Vec<(&'static str, Vec<BandwidthRateLimitInterval>)> {
+pub(crate) fn schedule_rows() -> Vec<(&'static str, Vec<BandwidthRateLimitInterval>)> {
     // The full 20-interval maximum of `BandwidthRateLimitIntervals`
     // (`@length(min: 0, max: 20)`), one per hour so no two rows are alike.
     let twenty: Vec<BandwidthRateLimitInterval> = (0..20)
