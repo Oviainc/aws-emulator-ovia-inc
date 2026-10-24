@@ -251,14 +251,16 @@ pub(crate) fn tags_by_key(value: Option<&Value>) -> Vec<(String, String)> {
 /// request carried comes back as sent, the members the SERVICE owns are its own, and the
 /// members DERIVED from the stored profile answer for that profile's aggregation scope.
 ///
-/// The one place this projection is pinned, so a change to it is re-pinned once: both
-/// `CreateAgentProfile` and `GetAgentProfile` answer the same stored record through their
-/// own output shape, and the suites in this crate check both against it. `reader` names
+/// The one place this projection is pinned, so a change to it is re-pinned once:
+/// `CreateAgentProfile`, `GetAgentProfile` and the `AgentProfileSummary` entries
+/// `ListAgentProfiles` reports all answer the same stored record through their own shape,
+/// and the suites in this crate check each against it. `projection` is the JSON carrying
+/// it — a single-profile answer's body, or one entry of a list's `items`. `reader` names
 /// the operation whose answer is under test, `expected_protection` the
 /// `deletionProtection` the row must read back (the value sent, or the modelled
 /// `default: true`), and `eligible` whether the profile names a scope to analyse.
 pub(crate) fn assert_profile_projection(
-    answer: &Answer,
+    projection: &Value,
     sent: &Value,
     case: &str,
     reader: &str,
@@ -275,29 +277,29 @@ pub(crate) fn assert_profile_projection(
         "aggregationConfiguration",
     ] {
         assert_eq!(
-            answer.body.get(member_name),
+            projection.get(member_name),
             sent.get(member_name),
-            "case {case:?}/{reader}: expected {member_name} as sent, got {answer:?}"
+            "case {case:?}/{reader}: expected {member_name} as sent, got {projection:?}"
         );
     }
     assert_eq!(
-        tags_by_key(answer.body.get("tags")),
+        tags_by_key(projection.get("tags")),
         tags_by_key(sent.get("tags")),
-        "case {case:?}/{reader}: expected the tags as sent, got {answer:?}"
+        "case {case:?}/{reader}: expected the tags as sent, got {projection:?}"
     );
     assert_eq!(
-        answer.body.get("deletionProtection").and_then(Value::as_bool),
+        projection.get("deletionProtection").and_then(Value::as_bool),
         Some(expected_protection),
         "case {case:?}/{reader}: expected deletionProtection {expected_protection}, \
-         got {answer:?}"
+         got {projection:?}"
     );
     assert_eq!(
-        answer.body.get("createdBy").and_then(Value::as_str),
+        projection.get("createdBy").and_then(Value::as_str),
         Some(engine::emulator_account_id()),
         "case {case:?}/{reader}: createdBy must be the account the request is attributed \
-         to, got {answer:?}"
+         to, got {projection:?}"
     );
-    assert_create_instant(answer.body.get("createdAt"), case, "createdAt");
+    assert_create_instant(projection.get("createdAt"), case, "createdAt");
 
     // A profile is eligible for generation exactly when it names a scope to analyse, and
     // `fieldErrors` says so when it names none.
@@ -306,19 +308,19 @@ pub(crate) fn assert_profile_projection(
         "eligibleForArchitectureGeneration",
     ] {
         assert_eq!(
-            answer.body.get(derived).and_then(Value::as_bool),
+            projection.get(derived).and_then(Value::as_bool),
             Some(eligible),
-            "case {case:?}/{reader}: expected {derived} {eligible}, got {answer:?}"
+            "case {case:?}/{reader}: expected {derived} {eligible}, got {projection:?}"
         );
     }
-    let field_errors = answer.body.get("fieldErrors");
+    let field_errors = projection.get("fieldErrors");
     if eligible {
         assert!(
             field_errors.is_none_or(|errors| errors
                 .as_object()
                 .is_some_and(serde_json::Map::is_empty)),
             "case {case:?}/{reader}: an eligible profile reports no fieldErrors, \
-             got {answer:?}"
+             got {projection:?}"
         );
     } else {
         assert_eq!(
@@ -330,7 +332,7 @@ pub(crate) fn assert_profile_projection(
                  recommendations."
             ),
             "case {case:?}/{reader}: an ineligible profile must say which member leaves \
-             it so, got {answer:?}"
+             it so, got {projection:?}"
         );
     }
 }
@@ -1021,7 +1023,7 @@ async fn a_created_agent_profile_round_trips_with_its_derived_members() {
 
         for (reader, answer) in [("CreateAgentProfile", &created), ("GetAgentProfile", &fetched)] {
             assert_profile_projection(
-                answer,
+                &answer.body,
                 &body,
                 case,
                 reader,

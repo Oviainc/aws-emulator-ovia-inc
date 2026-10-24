@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAgentProfiles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAgentProfiles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAgentProfiles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Lists optimization profiles in your account": one page of the `AgentProfileSummary`
+//! projections of the profiles `CreateAgentProfile` minted, in `AgentProfileArn` order,
+//! resumed from the opaque `nextToken` a previous page issued. A reporting operation —
+//! modelled `@readonly` — so it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -146,20 +142,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAgentProfiles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAgentProfilesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAgentProfiles"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAgentProfilesErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool agent profile store is unavailable".to_string(),
+            })
+        })?;
+
+        // `maxResults` is modelled `@default(100)`, so it arrives as a value rather than
+        // an option; the clamp restates the member's `@range(min: 1, max: 1000)`.
+        let page_size = crate::state::agent_list_page_size(input.max_results);
+
+        // An opaque token this service did not issue is a bad request, not an empty page.
+        // A token is this service's own cursor, not a value a caller composes: it cannot
+        // be corrected, only obtained again, so the refusal is classified `CANNOT_PARSE`
+        // ("restart the pagination") rather than as a field rule to fix — and it still
+        // names the member whose value could not be decoded.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_agent_profile_next_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListAgentProfilesErrorModeled::ValidationException(
+                        crate::state::cannot_parse_exception(
+                            crate::state::NEXT_TOKEN_MEMBER,
+                            crate::state::INVALID_NEXT_TOKEN_MESSAGE,
+                        ),
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let store = state.lock();
+        // Every stored profile of this account, in `AgentProfileArn` order: the profiles
+        // are held keyed by that ARN in an unordered map, so the order is imposed here
+        // rather than read off the map's iteration, which no two runs share. An ARN is
+        // minted once and never reused, so it both totally orders the set and is the
+        // whole cursor: the cursor is start-EXCLUSIVE, so a page resumes just past the
+        // last ARN already returned and every profile is enumerated exactly once across
+        // the pages.
+        let mut arns: Vec<&String> = store
+            .agent_profiles
+            .keys()
+            .filter(|arn| cursor.as_ref().is_none_or(|last| *arn > last))
+            .collect();
+        arns.sort();
+
+        let page = &arns[..arns.len().min(page_size)];
+        // A cursor is issued only when the selection did NOT fit in this page, so the
+        // last page omits `nextToken` and a caller following it terminates.
+        let next_token = match page.last() {
+            Some(last) if arns.len() > page.len() => {
+                Some(crate::state::encode_agent_profile_next_token(last))
+            }
+            _ => None,
+        };
+
+        Ok(ListAgentProfilesOutput {
+            items: page
+                .iter()
+                .map(|arn| {
+                    store
+                        .agent_profiles
+                        .get(*arn)
+                        .expect("the ARN was taken from this map under the same lock")
+                        .to_summary()
+                })
+                .collect(),
+            next_token,
+        })
     }
 }

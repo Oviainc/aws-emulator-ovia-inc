@@ -17,8 +17,9 @@
 //! lenses beside the AWS-official lens this emulator ships. The Well-Architected Tool
 //! profiles (`CreateProfile`, `GetProfile`) are backed the same way, each keyed by the
 //! `ProfileArn` the create minted. The agent profiles
-//! (`CreateAgentProfile`, `GetAgentProfile`) and the optimization goals recorded against
-//! one (`CreateAgentGoal`, `GetAgentGoal`, `DeleteAgentGoal`) are backed the same way,
+//! (`CreateAgentProfile`, `GetAgentProfile`, `ListAgentProfiles`) and the optimization
+//! goals recorded against one (`CreateAgentGoal`, `GetAgentGoal`, `DeleteAgentGoal`) are
+//! backed the same way,
 //! each goal keyed under the profile it belongs to. The contexts recorded against a
 //! profile (`CreateAgentContext`, `GetAgentContext`, `ListAgentContexts`) are held
 //! exactly like the goals, keyed under the profile they belong to. The record types and
@@ -44,7 +45,8 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AggregationConfiguration, Choice, ConflictException, ContextContent, ContextSummary,
+    AgentProfileSummary, AggregationConfiguration, Choice, ConflictException, ContextContent,
+    ContextSummary,
     GoalSummary, LensSummary, Milestone,
     MilestoneSummary,
     Profile, ProfileQuestion,
@@ -3217,6 +3219,40 @@ impl AgentProfileRecord {
         })
     }
 
+    /// The `AgentProfileSummary` projection the profile LIST reports
+    /// (`ListAgentProfilesResponse$items`), so one place decides how a stored profile is
+    /// summarised.
+    ///
+    /// The same members `CreateAgentProfile` and `GetAgentProfile` answer from the same
+    /// record — the model declares `AgentProfileSummary` as its own structure
+    /// (`smithy_query(query="shape", shape="AgentProfileSummary")`), so this is a third
+    /// Rust type over the one stored record — with the reporting members
+    /// (`eligibleFor…`, `fieldErrors`, `tags`) DERIVED from it rather than held twice, so
+    /// a listed profile cannot disagree with the one a read of it reports.
+    pub fn to_summary(&self) -> AgentProfileSummary {
+        AgentProfileSummary {
+            name: self.name.clone(),
+            display_name: self.display_name.clone(),
+            description: self.description.clone(),
+            business_overview: self.business_overview.clone(),
+            pillars: self.pillars.clone(),
+            deletion_protection: self.deletion_protection,
+            execution_role_arn: self.execution_role_arn.clone(),
+            aggregation_configuration: self.aggregation_configuration.clone(),
+            arn: self.arn.clone(),
+            eligible_for_scheduled_generation: Some(self.eligible_for_generation()),
+            eligible_for_architecture_generation: Some(self.eligible_for_generation()),
+            field_errors: self.field_errors(),
+            tags: self.tag_list(),
+            created_by: self.created_by.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            last_modified_by: self.last_modified_by.clone(),
+            last_modified_at: self
+                .last_modified_at
+                .map(::aws_smithy_types::DateTime::from),
+        }
+    }
+
     /// The profile's tags as the wire carries them, or `None` when it has none: the
     /// modelled `Tags` member is a list of `Tag` key/value pairs
     /// (`smithy_query(query="shape", shape="Tag")`).
@@ -4222,6 +4258,21 @@ pub fn encode_agent_context_next_token(context_id: &str) -> String {
 /// the token is not one this service issued.
 pub fn decode_agent_context_next_token(token: &str) -> Option<String> {
     Some(decode_cursor(token)?.get("x")?.as_str()?.to_string())
+}
+
+/// Encode a `ListAgentProfiles` cursor: the `AgentProfileArn` last served, in the same
+/// opaque scheme as [`encode_next_token`]. Profiles are enumerated in ARN order and an
+/// ARN is never reused ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::mint_agent_profile_arn`]),
+/// so that ARN is the whole cursor. Its own key, so a cursor issued by another paginated
+/// operation is not a cursor here.
+pub fn encode_agent_profile_next_token(profile_arn: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "p": profile_arn }))
+}
+
+/// The `AgentProfileArn` a `ListAgentProfiles` `NextToken` points just past, or `None`
+/// when the token is not one this service issued.
+pub fn decode_agent_profile_next_token(token: &str) -> Option<String> {
+    Some(decode_cursor(token)?.get("p")?.as_str()?.to_string())
 }
 
 /// What a `NextToken` this service did not issue is answered with. The token is this

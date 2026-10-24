@@ -20,6 +20,9 @@ mod agent_goals;
 #[path = "all/agent_profile_lifecycle.rs"]
 mod agent_profile_lifecycle;
 
+#[path = "all/agent_profile_listing.rs"]
+mod agent_profile_listing;
+
 #[path = "all/custom_lens_import.rs"]
 mod custom_lens_import;
 

@@ -156,7 +156,7 @@ async fn a_read_is_answered_from_the_profile_its_arn_identifies() {
 
         // The stored, service-owned and derived members, against the body THIS row sent.
         assert_profile_projection(
-            &fetched,
+            &fetched.body,
             body,
             case,
             "GetAgentProfile",
