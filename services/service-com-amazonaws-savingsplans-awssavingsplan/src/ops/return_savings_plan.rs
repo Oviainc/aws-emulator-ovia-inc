@@ -5,6 +5,15 @@
 //! Returns a purchased Savings Plan: the stored plan moves out of the states a
 //! return is accepted from, which a later `DescribeSavingsPlans` reports.
 //!
+//! A return is bounded twice over: by the plan's own return window, and by the
+//! account's per-calendar-month return allowance
+//! ([`crate::state::MAX_RETURNS_PER_CALENDAR_MONTH`] and
+//! [`crate::state::MAX_RETURNED_COMMITMENT_UNITS_PER_CALENDAR_MONTH`]). The
+//! first is a property of the request's plan, so it is refused as a
+//! `ValidationException`; the second is a quota, so it is refused with this
+//! operation's modelled `ServiceQuotaExceededException` (402) and leaves the
+//! plan returnable.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -136,7 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{format_millis, STATE_RETURNED, RETURN_WINDOW_MILLIS};
+        use crate::state::{format_millis, RETURN_WINDOW_MILLIS};
         let now = crate::state::now_millis();
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ReturnSavingsPlanErrorModeled::InternalServerException(InternalServerException {
@@ -166,7 +175,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let plan = store.plan_mut(&input.savings_plan_id).ok_or_else(|| {
+        // Everything the refusals below need from the plan, read before any
+        // write: the quota check that follows reads the WHOLE store, so the
+        // plan cannot stay mutably borrowed across it.
+        let plan = store.plan(&input.savings_plan_id).ok_or_else(|| {
             ReturnSavingsPlanErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: format!(
                     "no Savings Plan with id '{}'",
@@ -174,6 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             })
         })?;
+        let plan_state = plan.state.clone();
+        let commitment_units = plan.commitment_units;
+        let window_closes_millis = plan.return_window_closes_millis();
+        let returnable = plan.is_returnable(now);
 
         // A return is accepted only from a plan that has STARTED and been paid
         // for, and only inside its return window. A plan whose term has not
@@ -181,26 +197,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // returned; anything else has already left the states a return is
         // accepted from, so a second return is refused rather than quietly
         // succeeding.
-        if plan.is_returnable(now) {
-            plan.state = STATE_RETURNED.to_string();
-        } else if matches!(
-            plan.state.as_str(),
-            crate::state::STATE_PAYMENT_PENDING | crate::state::STATE_ACTIVE
-        ) {
-            return Err(validation(format!(
-                "Savings Plan '{}' can no longer be returned: its return window closed at {} \
-                 ({} ms after the purchase)",
-                input.savings_plan_id,
-                format_millis(plan.return_window_closes_millis()),
-                RETURN_WINDOW_MILLIS
-            )));
-        } else {
+        if !returnable {
+            if matches!(
+                plan_state.as_str(),
+                crate::state::STATE_PAYMENT_PENDING | crate::state::STATE_ACTIVE
+            ) {
+                return Err(validation(format!(
+                    "Savings Plan '{}' can no longer be returned: its return window closed at {} \
+                     ({} ms after the purchase)",
+                    input.savings_plan_id,
+                    format_millis(window_closes_millis),
+                    RETURN_WINDOW_MILLIS
+                )));
+            }
             // The refusal names the state it refused, so the one sentence
             // covers every state a return is not accepted from.
             return Err(validation(format!(
-                "Savings Plans in {} state cannot be returned.",
-                plan.state
+                "Savings Plans in {plan_state} state cannot be returned."
             )));
+        }
+
+        // The window is not the only bound on a return: the account's returns
+        // are also capped per calendar month, in plans and in the commitment
+        // they carry. Exhausting that allowance is a QUOTA, so it answers with
+        // the operation's modelled `ServiceQuotaExceededException` (402) — and,
+        // being checked before the write below, it leaves the plan in the state
+        // it was returnable from.
+        if let Some(message) = store.return_allowance_exceeded(commitment_units, now) {
+            return Err(
+                ReturnSavingsPlanErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException { message },
+                )
+                .into(),
+            );
+        }
+
+        // The plan is returnable and the return fits the allowance: record it,
+        // which is also what the allowance is counted from.
+        match store.plan_mut(&input.savings_plan_id) {
+            Some(plan) => plan.mark_returned(now),
+            // Unreachable: the plan was found above and the store is locked for
+            // the whole call. Answered rather than panicked on the request path.
+            None => {
+                return Err(ReturnSavingsPlanErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!(
+                            "Savings Plan '{}' disappeared while its return was being recorded",
+                            input.savings_plan_id
+                        ),
+                    },
+                )
+                .into())
+            }
         }
 
         if let Some(token) = client_token {

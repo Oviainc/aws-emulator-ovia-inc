@@ -128,6 +128,71 @@ pub fn billing_period_key(value: &str) -> Option<i64> {
     (1..=12).contains(&month).then_some(year * 12 + month)
 }
 
+/// The CURRENT billing period: the month a billing read uses when the request names
+/// none (`ListCustomLineItems`: "If you don't provide a billing period, the current
+/// billing period is used").
+///
+/// Built from the SAME clock as [`now_millis`] and rendered in the form
+/// `BillingPeriod`'s pattern accepts (`^\d{4}-(0?[1-9]|1[012])$`), so it is a value a
+/// caller could have sent and [`billing_period_key`] reads it back. Billing is
+/// reported in UTC, so the month is the UTC one.
+///
+/// A `BillingPeriod` is exactly the `<year>-<month>` head of the ISO 8601 date-time
+/// (`YYYY-MM-DDThh:mm:ssZ`) the SAME instant renders as, so the calendar conversion is
+/// `aws_smithy_types::DateTime` — the formatter this emulator already serializes its
+/// `@timestampFormat("date-time")` members with — rather than a second date library or
+/// hand-written civil-calendar arithmetic.
+pub fn current_billing_period() -> String {
+    ::aws_smithy_types::DateTime::from_millis(now_millis())
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
+        .and_then(|rendered| rendered.get(.."YYYY-MM".len()).map(str::to_string))
+        // Unreachable for a clock the formatter accepts; the epoch month is still a
+        // billing period, so a read is answered rather than failed.
+        .unwrap_or_else(|| "1970-01".to_string())
+}
+
+/// Is `billing_period` inside the half-open range `[start, end)` a custom line item or
+/// a resource association carries?
+///
+/// The member names carry the rule — `InclusiveStartBillingPeriod` is in the range and
+/// `ExclusiveEndBillingPeriod` is not — and an ABSENT bound is open, so a resource
+/// stored without a range covers every billing period. A `billing_period` that is not
+/// a billing period at all covers nothing.
+pub fn billing_period_range_covers(
+    inclusive_start: Option<&str>,
+    exclusive_end: Option<&str>,
+    billing_period: &str,
+) -> bool {
+    let Some(wanted) = billing_period_key(billing_period) else {
+        return false;
+    };
+    let after_start = inclusive_start
+        .and_then(billing_period_key)
+        .is_none_or(|start| wanted >= start);
+    let before_end = exclusive_end
+        .and_then(billing_period_key)
+        .is_none_or(|end| wanted < end);
+    after_start && before_end
+}
+
+/// The `CurrencyCode` a custom line item's charge value is denominated in, DERIVED
+/// from the PARTITION of its ARN.
+///
+/// `CurrencyCode` has exactly two values
+/// ([`crate::ops::types::CURRENCY_CODE_VALUES`]: `CNY`, `USD`) and the modelled charge
+/// value is documented "in USD" (`ListCustomLineItemFlatChargeDetails.ChargeValue`),
+/// while the only other partition the `CustomLineItemArn` pattern admits is China
+/// (`arn:aws-cn`), which bills in CNY. So the partition the resource lives in decides,
+/// and nothing stores a currency beside the item.
+pub fn custom_line_item_currency_code(arn: &str) -> &'static str {
+    if arn.starts_with("arn:aws-cn:") {
+        "CNY"
+    } else {
+        "USD"
+    }
+}
+
 /// A `PricingPlanArn` as this service stores it. See [`normalize_billing_group_arn`].
 ///
 /// A bare AWS-managed id resolves to the ARN Amazon Web Services owns (account
@@ -403,20 +468,11 @@ impl ResourceAssociationRecord {
     /// (`InclusiveStartBillingPeriod` / `ExclusiveEndBillingPeriod`); an absent
     /// bound is open, so an association made without a range covers every period.
     pub fn covers(&self, billing_period: &str) -> bool {
-        let Some(wanted) = billing_period_key(billing_period) else {
-            return false;
-        };
-        let after_start = self
-            .inclusive_start_billing_period
-            .as_deref()
-            .and_then(billing_period_key)
-            .is_none_or(|start| wanted >= start);
-        let before_end = self
-            .exclusive_end_billing_period
-            .as_deref()
-            .and_then(billing_period_key)
-            .is_none_or(|end| wanted < end);
-        after_start && before_end
+        billing_period_range_covers(
+            self.inclusive_start_billing_period.as_deref(),
+            self.exclusive_end_billing_period.as_deref(),
+            billing_period,
+        )
     }
 }
 
@@ -464,6 +520,17 @@ impl CustomLineItemRecord {
     /// line item."
     pub fn association_size(&self) -> i64 {
         i64::try_from(self.associated_resources.len()).unwrap_or(i64::MAX)
+    }
+
+    /// Is this custom line item in effect during `billing_period`? The
+    /// `BillingPeriodRange` the create set is half-open, and an item stored without one
+    /// applies to every billing period — see [`billing_period_range_covers`].
+    pub fn covers(&self, billing_period: &str) -> bool {
+        billing_period_range_covers(
+            self.inclusive_start_billing_period.as_deref(),
+            self.exclusive_end_billing_period.as_deref(),
+            billing_period,
+        )
     }
 
     /// The association for `arn`, if this item already holds one.
