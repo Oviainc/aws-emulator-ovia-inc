@@ -197,8 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // One primary contact per account: the put replaces the whole structure,
         // so a member the request leaves out is absent afterwards rather than
-        // carried over from an earlier put.
-        account.contact_information = Some(input.contact_information);
+        // carried over from an earlier put or from the contact the record was
+        // created with.
+        account.contact_information = input.contact_information;
 
         Ok(PutContactInformationOutput)
     }
