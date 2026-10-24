@@ -6,11 +6,15 @@
 //! application-scoped operation (`RegisterApplication`, `GetApplication`,
 //! `ListApplications`, `StartApplication`, `StopApplication`,
 //! `DeregisterApplication`) resolves the SAME [`StoredApplication`] out of
-//! [`ComAmazonawsSsmsapSsmsapState::applications`], and every call that changes one
-//! files a [`StoredOperation`] in [`ComAmazonawsSsmsapSsmsapState::operations`] that
-//! `GetOperation` reads back. So a register is observable by every later read, a
-//! deregister by every later call, and an `OperationId` handed to a caller always
-//! names a record that exists.
+//! [`RegionState::applications`], and every call that changes one files a
+//! [`StoredOperation`] in [`RegionState::operations`] that `GetOperation` reads back.
+//! So a register is observable by every later read, a deregister by every later call,
+//! and an `OperationId` handed to a caller always names a record that exists.
+//!
+//! Those records are held PER REGION: the service is regional, so the store is a
+//! [`RegionState`] per Region ([`ComAmazonawsSsmsapSsmsapState::region`]) and a handler
+//! only ever reaches the partition of the Region its request was signed for
+//! ([`request_region`]).
 //!
 //! The record is the stored half; the wire half (`Application`, `ApplicationSummary`,
 //! `Operation`) is PROJECTED from it by [`StoredApplication::view`] /
@@ -97,18 +101,32 @@ pub const APPLICATION_RESOURCE_TYPE: &str = "APPLICATION";
 /// ([`StoredApplication::settle`] / [`StoredOperation::settle`]); nothing ever sleeps.
 pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
 
-/// How many applications this emulator will hold.
+/// How many applications this emulator will hold PER REGION.
 ///
 /// The real service caps registered applications per account per Region with a service
-/// quota. This number is NOT a fidelity claim about the published quota: it is the
-/// emulator's own ceiling, generous enough that no realistic workflow meets it, so a
-/// caller looping on `RegisterApplication` cannot grow this process's memory without
-/// bound. It is reported with `ConflictException`, which `RegisterApplication` models.
+/// quota, so the ceiling is per Region here too. This number is NOT a fidelity claim
+/// about the published quota: it is the emulator's own ceiling, generous enough that no
+/// realistic workflow meets it, so a caller looping on `RegisterApplication` cannot grow
+/// this process's memory without bound. It is reported with `ConflictException`, which
+/// `RegisterApplication` models.
 pub const MAX_APPLICATIONS: usize = 1_000;
 
-/// How many operation records are retained. Beyond this the oldest record that has
-/// already reached a terminal status is dropped first, so a caller polling a fresh
-/// operation can still resolve it.
+/// How many Region partitions this emulator will hold.
+///
+/// The store is partitioned per Region (see [`RegionState`]) and the Region comes from
+/// the caller's own SigV4 credential scope, so without a ceiling a caller could mint a
+/// partition per made-up Region. Comfortably more than the Regions AWS operates, so no
+/// real multi-Region workflow meets it; with [`MAX_APPLICATIONS`] and
+/// [`MAX_RETAINED_OPERATIONS`] it is what bounds the whole store. Like the application
+/// ceiling it is reported with `ConflictException`, which `RegisterApplication` models,
+/// and a partition left empty is dropped
+/// ([`ComAmazonawsSsmsapSsmsapState::forget_region_if_empty`]) so only Regions that
+/// hold something count against it.
+pub const MAX_REGIONS: usize = 64;
+
+/// How many operation records are retained per Region. Beyond this the oldest record
+/// that has already reached a terminal status is dropped first, so a caller polling a
+/// fresh operation can still resolve it.
 pub const MAX_RETAINED_OPERATIONS: usize = 10_000;
 
 /// The page size `ListApplications` uses when the caller names no `MaxResults`, and
@@ -286,26 +304,38 @@ impl StoredOperation {
     }
 }
 
-/// Per-service state for com-amazonaws-ssmsap-ssmsap. A handler reaches it through [`service_state`].
+/// Everything Systems Manager for SAP holds in ONE Region: the applications registered
+/// there, the operation records filed there, and their tags.
+///
+/// The service is regional, so a registration lives in the account AND the Region it was
+/// made in: that is why every application ARN embeds a Region
+/// ([`application_arn`]) and why this crate's refusals state the account and Region the
+/// lookup ran in. The store is therefore partitioned per Region and a handler reaches
+/// ONLY the partition of the Region its request was signed for
+/// ([`ComAmazonawsSsmsapSsmsapState::region`] /
+/// [`ComAmazonawsSsmsapSsmsapState::region_entry`]): nothing registered at one regional
+/// endpoint is listed, read, controlled or deregistered through another, and an
+/// `ApplicationId` in use in one Region is free in every other.
 ///
 /// `applications` and `operations` are `BTreeMap`s rather than `HashMap`s because
 /// `ListApplications` pages over the first: iteration order has to be the same for the
 /// call that hands out a `NextToken` and the call that resumes from it, and id order is
 /// that stable order.
 #[derive(Debug, Default)]
-pub struct ComAmazonawsSsmsapSsmsapState {
-    /// Every registered application, keyed by `ApplicationId`.
+pub struct RegionState {
+    /// Every application registered in this Region, keyed by `ApplicationId`.
     pub applications: BTreeMap<String, StoredApplication>,
-    /// Every operation record, keyed by `OperationId`. Bounded by
+    /// Every operation record filed in this Region, keyed by `OperationId`. Bounded by
     /// [`MAX_RETAINED_OPERATIONS`].
     pub operations: BTreeMap<String, StoredOperation>,
     /// Tags by resource ARN — written by `RegisterApplication`'s `Tags` and read by
     /// `GetApplication`/`ListApplications`, so the later tagging APIs
     /// (`TagResource`/`UntagResource`/`ListTagsForResource`) have one place to join.
+    /// An application ARN embeds its Region, so these keys are this Region's ARNs.
     pub tags_by_arn: HashMap<String, HashMap<String, String>>,
 }
 
-impl ComAmazonawsSsmsapSsmsapState {
+impl RegionState {
     /// Materialise every status change the clock already owes, on applications and on
     /// operations alike.
     ///
@@ -320,8 +350,19 @@ impl ComAmazonawsSsmsapSsmsapState {
         }
     }
 
+    /// Whether this Region holds nothing at all — the state an unused partition is in,
+    /// and the one a partition returns to when its last application is deregistered.
+    pub fn is_empty(&self) -> bool {
+        self.applications.is_empty() && self.operations.is_empty() && self.tags_by_arn.is_empty()
+    }
+
     /// Resolve the application a request names by its id, its ARN, or its AppRegistry
-    /// ARN — the three members `GetApplication` accepts — to a stored `ApplicationId`.
+    /// ARN — the three members `GetApplication` accepts — to an `ApplicationId` stored
+    /// IN THIS REGION.
+    ///
+    /// So a reference to an application of another Region resolves to nothing here,
+    /// including an ARN: an application ARN embeds the Region it was registered in, so
+    /// it cannot match a record of this one.
     pub fn resolve_application_id(
         &self,
         application_id: Option<&str>,
@@ -425,6 +466,73 @@ impl ComAmazonawsSsmsapSsmsapState {
                 }
                 None => break,
             }
+        }
+    }
+}
+
+/// Per-service state for com-amazonaws-ssmsap-ssmsap. A handler reaches it through [`service_state`].
+///
+/// Systems Manager for SAP is a REGIONAL service, so the store holds one
+/// [`RegionState`] per Region rather than one flat set of applications: every handler
+/// resolves the Region its request was signed for ([`request_region`]) and then reaches
+/// that Region's partition alone. The partitions are a `BTreeMap` so the store has one
+/// stable order whatever order Regions were first written in.
+#[derive(Debug, Default)]
+pub struct ComAmazonawsSsmsapSsmsapState {
+    /// One partition per Region that holds something. Bounded by [`MAX_REGIONS`];
+    /// written only through [`Self::region_entry`], so a READ never mints one.
+    regions: BTreeMap<String, RegionState>,
+}
+
+impl ComAmazonawsSsmsapSsmsapState {
+    /// Materialise every status change the clock already owes, in every Region.
+    ///
+    /// Every handler calls this first. It is not restricted to the request's Region
+    /// because the change was due at its own instant everywhere, whether or not
+    /// anybody called at that endpoint.
+    pub fn settle(&mut self, now: SystemTime) {
+        for region in self.regions.values_mut() {
+            region.settle(now);
+        }
+    }
+
+    /// What a request signed for `region` may observe: that Region's partition, and
+    /// nothing else.
+    ///
+    /// A Region nothing has ever been stored in reads as an EMPTY partition, so a read
+    /// answers honestly for any Region a caller names WITHOUT minting a partition for
+    /// it — which is what keeps [`MAX_REGIONS`] a bound on what was actually written.
+    pub fn region(&self, region: &str) -> &RegionState {
+        static EMPTY: ::std::sync::OnceLock<RegionState> = ::std::sync::OnceLock::new();
+        self.regions
+            .get(region)
+            .unwrap_or_else(|| EMPTY.get_or_init(RegionState::default))
+    }
+
+    /// The partition of `region` for WRITING, created when this is the first thing
+    /// stored there. A caller that has already found a resource in `region` through
+    /// [`Self::region`] creates nothing by reaching for it.
+    pub fn region_entry(&mut self, region: &str) -> &mut RegionState {
+        self.regions.entry(region.to_string()).or_default()
+    }
+
+    /// Whether the store already holds a partition for `region`.
+    pub fn holds_region(&self, region: &str) -> bool {
+        self.regions.contains_key(region)
+    }
+
+    /// How many Region partitions the store holds, which [`MAX_REGIONS`] bounds.
+    pub fn region_count(&self) -> usize {
+        self.regions.len()
+    }
+
+    /// Drop `region`'s partition once nothing is left in it, so a Region that held an
+    /// application and no longer does stops counting against [`MAX_REGIONS`]. Dropping
+    /// an EMPTY partition changes nothing a caller can observe: an absent partition and
+    /// an empty one read the same ([`Self::region`]).
+    pub fn forget_region_if_empty(&mut self, region: &str) {
+        if self.regions.get(region).is_some_and(RegionState::is_empty) {
+            self.regions.remove(region);
         }
     }
 }

@@ -37,6 +37,8 @@ mod flow_source_failover_bound;
 mod flow_source_metadata;
 #[path = "all/flow_sources.rs"]
 mod flow_sources;
+#[path = "all/gateway_instances.rs"]
+mod gateway_instances;
 #[path = "all/gateway_lifecycle.rs"]
 mod gateway_lifecycle;
 #[path = "all/lifecycle_preconditions.rs"]

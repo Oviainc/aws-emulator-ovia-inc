@@ -423,6 +423,19 @@ pub const MAX_CHANGE_SETS: usize = 2_000;
 pub struct StoredParameter {
     pub key: String,
     pub value: String,
+    /// Whether the TEMPLATE in force declares this parameter `NoEcho` — "whether to mask
+    /// the parameter value to prevent it from being displayed in the console, command line
+    /// tools, or API" ([`template::DeclaredParameter::no_echo`]).
+    ///
+    /// Recorded where the parameter set is resolved against a template body
+    /// ([`parameters_in_force`], [`record_no_echo`]) rather than re-read on every
+    /// describe: a read must not re-parse a caller-sized body under the store lock, and
+    /// the declaration that governs the value is the one it was submitted against.
+    ///
+    /// The VALUE is still stored as submitted — a `Ref` to the parameter has to resolve to
+    /// what the stack was deployed with — and the mask is applied where CloudFormation
+    /// echoes the parameter back ([`parameter_views`]).
+    pub no_echo: bool,
 }
 
 /// One resource a stack's template declares, as this emulator records it.
@@ -1888,13 +1901,25 @@ pub fn merged_parameters(
                     .ok_or_else(|| {
                         format!("Parameters: [{key}] has no previous value on this stack")
                     })?;
-                return Ok(StoredParameter { key, value });
+                return Ok(StoredParameter {
+                    key,
+                    value,
+                    no_echo: false,
+                });
             }
             let value = parameter
                 .parameter_value
                 .clone()
                 .ok_or_else(|| format!("Parameters: [{key}] must have values"))?;
-            Ok(StoredParameter { key, value })
+            Ok(StoredParameter {
+                key,
+                value,
+                // Whether the template masks the parameter is a property of the TEMPLATE,
+                // which this resolution does not read: the caller records it with
+                // [`record_no_echo`] (or resolves through [`parameters_in_force`], which
+                // does) once the body the parameters belong to is known.
+                no_echo: false,
+            })
         })
         .collect()
 }
@@ -1946,9 +1971,8 @@ pub fn parameters_in_force(
     template_body: &str,
     supplied: Vec<StoredParameter>,
 ) -> Vec<StoredParameter> {
-    let declared = template::parse(template_body)
-        .map(|parsed| parsed.parameter_defaults())
-        .unwrap_or_default();
+    let template = template::parse(template_body).unwrap_or_default();
+    let declared = template.parameter_defaults();
     let supplied_by_key: ::std::collections::HashMap<&str, &StoredParameter> = supplied
         .iter()
         .map(|parameter| (parameter.key.as_str(), parameter))
@@ -1964,6 +1988,7 @@ pub fn parameters_in_force(
             in_force.push(StoredParameter {
                 key: key.clone(),
                 value,
+                no_echo: false,
             });
         }
     }
@@ -1972,7 +1997,36 @@ pub fn parameters_in_force(
             in_force.push(parameter);
         }
     }
+    // The template this set was resolved against is the one that says which of its
+    // parameters are masked, so the flag is recorded here, off the parse this function
+    // already did.
+    mark_no_echo(&template, &mut in_force);
     in_force
+}
+
+/// Record, on each stored parameter, whether `template_body` declares it `NoEcho`.
+///
+/// For the callers that resolve a parameter set WITHOUT the template's declared defaults
+/// (`CreateChangeSet`, which carries the parameters its update would apply): the masking
+/// rule is a property of the declaration, so every stored set that a template body governs
+/// goes through this or through [`parameters_in_force`]. A body this service cannot read
+/// declares nothing, which leaves every parameter unmasked rather than guessing.
+pub fn record_no_echo(template_body: &str, parameters: &mut [StoredParameter]) {
+    let template = template::parse(template_body).unwrap_or_default();
+    mark_no_echo(&template, parameters);
+}
+
+/// Copy the parsed template's `NoEcho` declarations onto the parameters it governs.
+///
+/// A parameter the template does not declare at all carries no declaration, so it is not
+/// masked: the mask is what a DECLARATION asks for.
+fn mark_no_echo(template: &template::Template, parameters: &mut [StoredParameter]) {
+    for parameter in parameters {
+        parameter.no_echo = template
+            .parameters
+            .iter()
+            .any(|declared| declared.key == parameter.key && declared.no_echo);
+    }
 }
 
 /// The region the request was signed for, or [`DEFAULT_REGION`] for an unsigned one.
@@ -2269,9 +2323,24 @@ pub fn last_operation_views(
     )
 }
 
+/// The string CloudFormation reports in place of a `NoEcho` parameter's value.
+///
+/// `NoEcho`: "whether to mask the parameter value to prevent it from being displayed in
+/// the console, command line tools, or API". AWS documents the masked value as four
+/// asterisks, and the mask is a FIXED string — it is not as long as the value it stands
+/// for, since its length would be the one thing a mask must not disclose.
+pub const NO_ECHO_MASK: &str = "****";
+
 /// Stored parameters as the modelled `Parameters` member. `UsePreviousValue` is a
 /// request-time instruction, so it is never reported back; `ResolvedValue` belongs to
 /// SSM-typed parameters, which this emulator does not resolve.
+///
+/// A parameter the template in force declares `NoEcho` is reported with
+/// [`NO_ECHO_MASK`] in place of its value: CloudFormation masks such a parameter wherever
+/// it echoes parameters back, so this is the ONE projection of a stored parameter onto the
+/// wire and every operation that reports `Parameters` (`DescribeStacks`,
+/// `DescribeChangeSet`) goes through it. The stored value is untouched — a `Ref` to the
+/// parameter still resolves to what the stack was deployed with.
 pub fn parameter_views(
     parameters: &[StoredParameter],
 ) -> Option<Vec<crate::ops::types::Parameter>> {
@@ -2280,7 +2349,11 @@ pub fn parameter_views(
             .iter()
             .map(|parameter| crate::ops::types::Parameter {
                 parameter_key: Some(parameter.key.clone()),
-                parameter_value: Some(parameter.value.clone()),
+                parameter_value: Some(if parameter.no_echo {
+                    NO_ECHO_MASK.to_string()
+                } else {
+                    parameter.value.clone()
+                }),
                 use_previous_value: None,
                 resolved_value: None,
             })

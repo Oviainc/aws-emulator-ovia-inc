@@ -33,6 +33,8 @@ mod db_instance_envelope;
 mod db_instance_stop;
 #[path = "all/db_instances.rs"]
 mod db_instances;
+#[path = "all/db_subnet_group_deletion.rs"]
+mod db_subnet_group_deletion;
 #[path = "all/docdb_query_surface.rs"]
 mod docdb_query_surface;
 #[path = "all/engine_version_families.rs"]

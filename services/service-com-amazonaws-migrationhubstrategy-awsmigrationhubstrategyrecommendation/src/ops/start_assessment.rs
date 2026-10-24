@@ -192,6 +192,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_bucket_usable(input.s3bucket_for_report_data.as_deref())
             .map_err(StartAssessmentErrorModeled::ValidationException)?;
 
+        // Enum membership, on every member of this request whose target shape is an
+        // enumeration: `assessmentDataSourceType` (`AssessmentDataSourceType`) and, one
+        // level down, each `assessmentTargets` entry's `condition` (`Condition`). The
+        // boundary validator does not enforce an enum's value list, so a value the model
+        // does not declare is refused here — the same refusal `ListServers` and
+        // `StartRecommendationReportGeneration` give an undeclared value of their own —
+        // rather than being persisted and echoed back by `GetAssessment` as a condition
+        // that does not exist. Decided before the store is touched, so a refused start
+        // leaves no assessment behind.
+        crate::state::check_enum(
+            input.assessment_data_source_type.as_deref(),
+            ASSESSMENT_DATA_SOURCE_TYPE_VALUES,
+        )
+        .map_err(StartAssessmentErrorModeled::ValidationException)?;
+        let assessment_targets = input.assessment_targets.unwrap_or_default();
+        for target in &assessment_targets {
+            crate::state::check_enum(Some(target.condition.as_str()), CONDITION_VALUES)
+                .map_err(StartAssessmentErrorModeled::ValidationException)?;
+        }
+
         let mut store = state.lock();
 
         // The store is bounded: past its quota an assessment is refused rather than
@@ -222,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the assessment `COMPLETE` once the completion span has passed, and
             // `StopAssessment` can still stop it until then.
             status: crate::state::ASSESSMENT_IN_PROGRESS.to_string(),
-            assessment_targets: input.assessment_targets.unwrap_or_default(),
+            assessment_targets,
             assessment_data_source_type: input.assessment_data_source_type,
             s3bucket_for_analysis_data: input.s3bucket_for_analysis_data,
             s3bucket_for_report_data: input.s3bucket_for_report_data,

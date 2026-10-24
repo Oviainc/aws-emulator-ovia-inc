@@ -141,7 +141,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The Region this request was signed for: a read resolves an application
+        // registered at THIS regional endpoint and no others.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetApplicationErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
@@ -163,15 +165,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let resolved = state.resolve_application_id(
+        let region_state = state.region(&region);
+        let resolved = region_state.resolve_application_id(
             input.application_id.as_deref(),
             input.application_arn.as_deref(),
             input.app_registry_arn.as_deref(),
         );
         let Some(id) = resolved else {
-            // No application answers the reference. This operation models no
-            // `ResourceNotFoundException`, so the reference itself is what is refused —
-            // and nothing is fabricated in its place.
+            // No application of this Region answers the reference. This operation models
+            // no `ResourceNotFoundException`, so the reference itself is what is refused
+            // — and nothing is fabricated in its place.
             let reference = input
                 .application_id
                 .or(input.application_arn)
@@ -183,12 +186,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let application = state
+        let application = region_state
             .applications
             .get(&id)
-            .expect("the resolved id names a stored application");
+            .expect("the resolved id names an application stored in this region");
         let view = application.view();
-        let tags = state.tags_for(&application.arn);
+        let tags = region_state.tags_for(&application.arn);
 
         Ok(GetApplicationOutput {
             application: Some(view),

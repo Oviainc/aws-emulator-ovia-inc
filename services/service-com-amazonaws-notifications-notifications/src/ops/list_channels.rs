@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListChannels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListChannels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListChannels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +110,17 @@ impl From<ListChannelsErrorModeled> for ListChannelsError {
     }
 }
 
+/// The page size this operation uses when a request names none: "The default
+/// value is 20", from the `maxResults` member's own documentation. The modelled
+/// range (1..100) bounds what a request may ask for, and the boundary validator
+/// refuses anything outside it before this handler runs.
+const DEFAULT_MAX_RESULTS: usize = 20;
+
+// The page token codec every paginated listing in this service shares: the
+// cursor here is the association sequence of the last channel on the page, and
+// the next page is everything associated after it.
+use crate::state::{decode_page_token, encode_page_token};
+
 /// The `ListChannels` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -155,18 +157,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListChannels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListChannelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListChannels"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListChannelsErrorModeled::InternalServerException(InternalServerException {
+                message: "the notifications store is unavailable".to_string(),
+            })
+        })?;
+        let store = state.lock();
+
+        // The listing is "a list of Channels for a NotificationConfiguration":
+        // an arn naming none is a reference to a resource that does not exist,
+        // not an empty page.
+        if !store
+            .configurations
+            .contains_key(&input.notification_configuration_arn)
+        {
+            return Err(ListChannelsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no NotificationConfiguration exists with arn {}",
+                        input.notification_configuration_arn
+                    ),
+                    resource_id: input.notification_configuration_arn.clone(),
+                },
+            )
+            .into());
+        }
+
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                // A token this process never issued is refused, rather than
+                // silently restarting the listing at the first channel.
+                ListChannelsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                    reason: Some("fieldValidationFailed".to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "nextToken".to_string(),
+                        message: "the value is not a pagination token this service issued"
+                            .to_string(),
+                    }]),
+                })
+            })?),
+            None => None,
+        };
+
+        // Association order, so a listing is stable and a page token keeps its
+        // meaning across associations and disassociations.
+        let channels = store.channels_in_association_order(&input.notification_configuration_arn);
+
+        let start = match resume_after {
+            Some(cursor) => channels
+                .iter()
+                .position(|(_, sequence)| *sequence > cursor)
+                .unwrap_or(channels.len()),
+            None => 0,
+        };
+        let page_size = match input.max_results {
+            Some(requested) => usize::try_from(requested).map_err(|_| {
+                // The modelled range (1..100) makes this unreachable through the
+                // boundary validator; refuse rather than quietly substituting a
+                // page size the caller did not ask for.
+                ListChannelsErrorModeled::ValidationException(ValidationException {
+                    message: "maxResults must be a positive count".to_string(),
+                    reason: Some("fieldValidationFailed".to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "maxResults".to_string(),
+                        message: "the value is not a positive count".to_string(),
+                    }]),
+                })
+            })?,
+            None => DEFAULT_MAX_RESULTS,
+        };
+
+        let page: Vec<(&str, u64)> = channels
+            .iter()
+            .skip(start)
+            .take(page_size)
+            .copied()
+            .collect();
+
+        // A token is emitted only while channels remain behind this page; the
+        // final page carries none.
+        let next_token = match page.last() {
+            Some((_, sequence)) if start + page.len() < channels.len() => {
+                Some(encode_page_token(*sequence))
+            }
+            _ => None,
+        };
+
+        Ok(ListChannelsOutput {
+            next_token,
+            channels: page.into_iter().map(|(arn, _)| arn.to_string()).collect(),
+        })
     }
 }

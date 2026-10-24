@@ -172,6 +172,24 @@ impl CampaignState {
             _ => None,
         }
     }
+
+    /// Whether a campaign in this state still takes a change to its configuration
+    /// (the flow it is associated with, its source, its schedule, its limits).
+    ///
+    /// `Completed` and `Failed` are the terminal states — [`Self::after`] moves
+    /// nothing out of either — so a campaign in one of them will never run again and
+    /// its configuration can no longer affect anything; a configuration change is
+    /// refused there with `InvalidCampaignStateException`, which is exactly the error
+    /// the model declares for every campaign-configuration operation
+    /// (`UpdateCampaignFlowAssociation`, `UpdateCampaignSource`, …) and does NOT
+    /// declare for `UpdateCampaignName`, the one update that is independent of how
+    /// the campaign runs. Every non-terminal state takes the change.
+    ///
+    /// Shared by the configuration operations so two of them cannot disagree about
+    /// which states are still configurable.
+    pub fn accepts_configuration_change(self) -> bool {
+        !matches!(self, Self::Completed | Self::Failed)
+    }
 }
 
 /// A lifecycle action a `StartCampaign` / `PauseCampaign` / `StopCampaign` call

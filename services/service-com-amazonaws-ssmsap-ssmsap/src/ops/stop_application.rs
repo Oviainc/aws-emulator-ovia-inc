@@ -147,7 +147,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The Region this request was signed for: a control call reaches an application
+        // registered at THIS regional endpoint and no others.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StopApplicationErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
@@ -170,7 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let Some(application) = state.applications.get(&input.application_id) else {
+        let Some(mut application) = state
+            .region(&region)
+            .applications
+            .get(&input.application_id)
+            .cloned()
+        else {
             return Err(StopApplicationErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::application_not_found_message(
                     &input.application_id,
@@ -191,7 +198,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut application = application.clone();
         application.status = crate::state::APPLICATION_STATUS_STOPPING.to_string();
         application.last_updated = now;
         application.pending = Some(crate::state::PendingTransition {
@@ -215,13 +221,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let operation_id = state.record_operation(
+        // The application was just found in this Region, so reaching for the partition
+        // to write mints nothing.
+        let region_state = state.region_entry(&region);
+        let operation_id = region_state.record_operation(
             crate::state::OPERATION_TYPE_STOP_APPLICATION,
             &application,
             properties,
             now,
         );
-        state
+        region_state
             .applications
             .insert(input.application_id, application);
 

@@ -896,7 +896,11 @@ async fn delete_bridge_removes_the_bridge_from_the_store() {
 /// through it), but the rest are still values of the modelled `BridgeState` enum a stored
 /// bridge can carry, so the table below covers the whole enum from the store rather than
 /// leaving most of it unasserted.
-fn force_bridge_state(emulator: &Emulator, arn: &str, bridge_state: &str) {
+///
+/// `pub(crate)` because the gateway-instance suite (`tests/all/gateway_instances.rs`) needs
+/// RUNNING bridges placed on a gateway, which is the same "a bridge is in the state the
+/// store holds" seam.
+pub(crate) fn force_bridge_state(emulator: &Emulator, arn: &str, bridge_state: &str) {
     let state = emulator
         .engine
         .state::<mc::ComAmazonawsMediaconnectMediaconnectState>();

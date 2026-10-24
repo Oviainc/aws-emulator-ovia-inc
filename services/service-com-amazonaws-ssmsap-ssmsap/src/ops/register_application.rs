@@ -167,6 +167,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The Region this request was signed for: the registration is made in THIS
+        // Region, which is also the Region its ARN carries.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             RegisterApplicationErrorModeled::InternalServerException(
                 crate::state::store_unavailable(),
@@ -204,7 +207,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(RegisterApplicationErrorModeled::ValidationException)?;
 
-        if state.applications.contains_key(&input.application_id) {
+        // An `ApplicationId` is unique within an account AND a Region, so one already
+        // registered HERE conflicts while the same id in another Region does not.
+        if state
+            .region(&region)
+            .applications
+            .contains_key(&input.application_id)
+        {
             return Err(RegisterApplicationErrorModeled::ConflictException(
                 crate::state::conflict(format!(
                     "An application with ID {} is already registered in this account and Region",
@@ -214,9 +223,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if state.applications.len() >= crate::state::MAX_APPLICATIONS {
-            // The emulator's own store ceiling, expressed with an error this operation
-            // models rather than by growing without bound.
+        if state.region(&region).applications.len() >= crate::state::MAX_APPLICATIONS {
+            // The emulator's own per-Region store ceiling, expressed with an error this
+            // operation models rather than by growing without bound.
             return Err(RegisterApplicationErrorModeled::ConflictException(
                 crate::state::conflict(format!(
                     "Cannot register application {}: this account and Region already hold {} applications",
@@ -227,7 +236,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let region = crate::state::request_region(ctx.parts());
+        if !state.holds_region(&region) && state.region_count() >= crate::state::MAX_REGIONS {
+            // The emulator's own ceiling on how many Regions it keeps a partition for;
+            // the Region comes from the caller's credential scope, so this is what stops
+            // made-up Regions growing the store without bound.
+            return Err(RegisterApplicationErrorModeled::ConflictException(
+                crate::state::conflict(format!(
+                    "Cannot register application {} in {region}: this emulator holds applications in at most {} Regions",
+                    input.application_id,
+                    crate::state::MAX_REGIONS
+                )),
+            )
+            .into());
+        }
+
         let arn = crate::state::application_arn(&region, &input.application_id);
 
         // The emulator discovers nothing on the registered instances, so the only
@@ -273,12 +295,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
         };
 
+        // This Region's partition, created when this is its first registration.
+        let region_state = state.region_entry(&region);
+
         if let Some(tags) = input.tags.filter(|tags| !tags.is_empty()) {
             // Keyed by ARN, so the tagging APIs join on the same place.
-            state.tags_by_arn.insert(arn, tags);
+            region_state.tags_by_arn.insert(arn, tags);
         }
 
-        let operation_id = state.record_operation(
+        let operation_id = region_state.record_operation(
             crate::state::OPERATION_TYPE_REGISTER_APPLICATION,
             &application,
             // This call carries no parameters beyond the resource it names, which the
@@ -287,7 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         );
         let view = application.view();
-        state
+        region_state
             .applications
             .insert(input.application_id, application);
 

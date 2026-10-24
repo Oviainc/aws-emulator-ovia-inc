@@ -348,6 +348,15 @@ pub struct ModelEntry {
     /// the Anthropic Claude family — and a model outside that set is refused
     /// rather than answered with another tokenizer's count.
     pub supports_count_tokens: bool,
+    /// Whether the model is invocable ASYNCHRONOUSLY, through
+    /// `StartAsyncInvoke`. Asynchronous invocation is published per model, not
+    /// per account — "Use asynchronous invocation for video generation" and
+    /// "Supported foundation models in Amazon Bedrock" in the Amazon Bedrock
+    /// User Guide list the video-generation models as the ones it serves,
+    /// because the result of an asynchronous invocation is an artifact written
+    /// to Amazon S3 rather than a response body — so a model outside that set
+    /// must be refused at submit time rather than let into the async pipeline.
+    pub supports_async_invoke: bool,
     /// The model's own ceiling on generated tokens, which caps
     /// `inferenceConfig.maxTokens`. Zero for a model that generates no text.
     pub max_output_tokens: u32,
@@ -383,6 +392,10 @@ fn seed_models() -> Vec<ModelEntry> {
         // models"); the recorded corpus shows the service refusing the count for
         // a model outside that set rather than answering one.
         supports_count_tokens: matches!(family, ModelFamily::AnthropicMessages),
+        // No text model is invocable asynchronously: `StartAsyncInvoke`'s result
+        // is an artifact written to Amazon S3, which is what the video
+        // generation models produce.
+        supports_async_invoke: false,
         max_output_tokens: max,
     };
     // A recognised model whose modality this emulator computes nothing for.
@@ -393,6 +406,21 @@ fn seed_models() -> Vec<ModelEntry> {
         lifecycle: ModelLifecycle::Active,
         supports_converse: false,
         supports_count_tokens: false,
+        supports_async_invoke: false,
+        max_output_tokens: 0,
+    };
+    // A video generation model: recognised, served by `StartAsyncInvoke` only
+    // ("Use asynchronous invocation for video generation" in the Amazon Bedrock
+    // User Guide — a video model has no synchronous `InvokeModel` envelope), and
+    // carrying a `modelInput` schema in [`async_model_input_schema`].
+    let async_video = |model_id: &str| ModelEntry {
+        model_id: model_id.to_string(),
+        family: None,
+        modality: ModelModality::Video,
+        lifecycle: ModelLifecycle::Active,
+        supports_converse: false,
+        supports_count_tokens: false,
+        supports_async_invoke: true,
         max_output_tokens: 0,
     };
     // A model past its end of life: recognised, not servable.
@@ -403,10 +431,11 @@ fn seed_models() -> Vec<ModelEntry> {
         lifecycle: ModelLifecycle::EndOfLife,
         supports_converse: false,
         supports_count_tokens: false,
+        supports_async_invoke: false,
         max_output_tokens: 0,
     };
     use ModelFamily::{AnthropicMessages, CohereCommand, Llama, Mistral, Nova, TitanText};
-    use ModelModality::{Embedding, Image, Text, Video};
+    use ModelModality::{Embedding, Image, Text};
     vec![
         // Anthropic Claude — 4k max output tokens on Claude 3, 8k on 3.5 and
         // 3.7 ("Inference parameters for foundation models", Anthropic Claude).
@@ -457,8 +486,13 @@ fn seed_models() -> Vec<ModelEntry> {
         unserved("amazon.titan-image-generator-v1", Image),
         unserved("amazon.titan-image-generator-v2:0", Image),
         unserved("amazon.nova-canvas-v1:0", Image),
-        unserved("amazon.nova-reel-v1:0", Video),
-        unserved("amazon.nova-reel-v1:1", Video),
+        // The video generation models, which are the models `StartAsyncInvoke`
+        // serves. Ids from "Supported foundation models in Amazon Bedrock";
+        // their `modelInput` schemas are in [`async_model_input_schema`], which
+        // must carry one for every id listed here.
+        async_video("amazon.nova-reel-v1:0"),
+        async_video("amazon.nova-reel-v1:1"),
+        async_video("luma.ray-v2:0"),
         // Past end of life ("Model lifecycle"). Amazon Titan Text Express and
         // the first generation of Anthropic Claude on Bedrock are there: the
         // recorded corpus shows the service answering 404 with the end-of-life
@@ -669,6 +703,374 @@ pub const ASYNC_INVOKE_SETTLE_MILLIS: i64 = 500;
 pub const ASYNC_INVOKE_FAILURE_MESSAGE: &str =
     "This Amazon Bedrock Runtime emulator does not run model inference for asynchronous \
      invocations, so no output was written to the configured S3 location.";
+
+/// The service's message for a `modelId` that names a model this service
+/// recognises but which is not invocable asynchronously
+/// ([`ModelEntry::supports_async_invoke`]).
+pub const ASYNC_INVOKE_UNSUPPORTED_MESSAGE: &str =
+    "The provided model doesn't support async inference.";
+
+/// The ids `StartAsyncInvoke` serves: the video generation models, which are the
+/// models AWS publishes asynchronous invocation for ("Use asynchronous
+/// invocation for video generation" in the Amazon Bedrock User Guide).
+///
+/// The inventory ([`seed_models`]) marks exactly these
+/// [`ModelEntry::supports_async_invoke`], and [`async_model_input_rules`]
+/// carries one request schema per id; the crate's tests pin all three lists
+/// against each other, so a model cannot be made async-capable without the
+/// schema its `modelInput` is then checked against.
+pub const ASYNC_INVOKE_MODEL_IDS: [&str; 3] = [
+    "amazon.nova-reel-v1:0",
+    "amazon.nova-reel-v1:1",
+    "luma.ray-v2:0",
+];
+
+/// The envelope Bedrock states a `modelInput` schema violation in: the
+/// provider's own JSON-Schema complaint, wrapped in the service's wording.
+///
+/// `detail` is built from the request — the failing member's JSON pointer and
+/// the constraint it broke — so the whole message is a function of the request
+/// and the model's published schema, never a fixed string.
+pub fn malformed_model_input_message(detail: &str) -> String {
+    format!("Malformed input request: {detail}, reformat your input and try again.")
+}
+
+/// One constraint of a model's published `modelInput` request schema.
+///
+/// The variants are the kinds of constraint the providers' request tables state:
+/// a member that must be there, its type, a published value set, and a numeric
+/// span with the step it advances in.
+#[derive(Debug, Clone, Copy)]
+enum InputConstraint {
+    /// The member must be present and not null.
+    Required,
+    /// A string of `min_length` to `max_length` characters.
+    Text {
+        min_length: usize,
+        max_length: usize,
+    },
+    /// A boolean.
+    Flag,
+    /// An array.
+    Items,
+    /// One of the published string values.
+    OneOfText(&'static [&'static str]),
+    /// One of the published integer values.
+    OneOfNumber(&'static [i64]),
+    /// An integer in `min..=max`, in whole steps of `step` (`1` for a span that
+    /// publishes no step).
+    Span { min: i64, max: i64, step: i64 },
+}
+
+/// One rule of a model's published request schema.
+#[derive(Debug, Clone, Copy)]
+struct InputRule {
+    /// The member the rule constrains, as its path from the root of
+    /// `modelInput` — which is what lets the refusal name it by the JSON
+    /// pointer the provider's own complaint carries.
+    path: &'static [&'static str],
+    constraint: InputConstraint,
+    /// `Some((member, value))` for a rule the request's own discriminator
+    /// selects: a Nova Reel `taskType` chooses both the parameter block that
+    /// carries the prompt and the duration the generation may run for.
+    when: Option<(&'static str, &'static str)>,
+}
+
+/// A rule that applies to every request for the model.
+const fn rule(path: &'static [&'static str], constraint: InputConstraint) -> InputRule {
+    InputRule {
+        path,
+        constraint,
+        when: None,
+    }
+}
+
+/// A rule stating that the member at `path` must be there.
+const fn required(path: &'static [&'static str]) -> InputRule {
+    rule(path, InputConstraint::Required)
+}
+
+/// A rule that applies only to a request whose `discriminator` member carries
+/// `value`.
+const fn when(
+    discriminator: &'static str,
+    value: &'static str,
+    path: &'static [&'static str],
+    constraint: InputConstraint,
+) -> InputRule {
+    InputRule {
+        path,
+        constraint,
+        when: Some((discriminator, value)),
+    }
+}
+
+/// The prompt a video generation model takes: 1 to 4000 characters.
+const PROMPT_TEXT: InputConstraint = InputConstraint::Text {
+    min_length: 1,
+    max_length: 4000,
+};
+/// `seed`: the signed 32-bit range less one.
+const SEED: InputConstraint = InputConstraint::Span {
+    min: 0,
+    max: 2_147_483_646,
+    step: 1,
+};
+/// `fps` and `dimension`: one published value each.
+const FPS: InputConstraint = InputConstraint::OneOfNumber(&[24]);
+const DIMENSION: InputConstraint = InputConstraint::OneOfText(&["1280x720"]);
+
+/// Amazon Nova Reel 1.0: a single-shot 6-second generation.
+static NOVA_REEL_V1_0_RULES: &[InputRule] = &[
+    required(&["taskType"]),
+    rule(&["taskType"], InputConstraint::OneOfText(&["TEXT_VIDEO"])),
+    required(&["textToVideoParams"]),
+    required(&["textToVideoParams", "text"]),
+    rule(&["textToVideoParams", "text"], PROMPT_TEXT),
+    rule(&["textToVideoParams", "images"], InputConstraint::Items),
+    rule(
+        &["videoGenerationConfig", "durationSeconds"],
+        InputConstraint::OneOfNumber(&[6]),
+    ),
+    rule(&["videoGenerationConfig", "fps"], FPS),
+    rule(&["videoGenerationConfig", "dimension"], DIMENSION),
+    rule(&["videoGenerationConfig", "seed"], SEED),
+];
+
+/// Amazon Nova Reel 1.1, which adds the multi-shot task types: an automated
+/// multi-shot generation runs 12 to 120 seconds in whole 6-second shots.
+static NOVA_REEL_V1_1_RULES: &[InputRule] = &[
+    required(&["taskType"]),
+    rule(
+        &["taskType"],
+        InputConstraint::OneOfText(&["TEXT_VIDEO", "MULTI_SHOT_AUTOMATED", "MULTI_SHOT_MANUAL"]),
+    ),
+    when(
+        "taskType",
+        "TEXT_VIDEO",
+        &["textToVideoParams"],
+        InputConstraint::Required,
+    ),
+    required(&["textToVideoParams", "text"]),
+    rule(&["textToVideoParams", "text"], PROMPT_TEXT),
+    rule(&["textToVideoParams", "images"], InputConstraint::Items),
+    when(
+        "taskType",
+        "MULTI_SHOT_AUTOMATED",
+        &["multiShotAutomatedParams"],
+        InputConstraint::Required,
+    ),
+    required(&["multiShotAutomatedParams", "text"]),
+    rule(&["multiShotAutomatedParams", "text"], PROMPT_TEXT),
+    when(
+        "taskType",
+        "TEXT_VIDEO",
+        &["videoGenerationConfig", "durationSeconds"],
+        InputConstraint::OneOfNumber(&[6]),
+    ),
+    when(
+        "taskType",
+        "MULTI_SHOT_AUTOMATED",
+        &["videoGenerationConfig", "durationSeconds"],
+        InputConstraint::Span {
+            min: 12,
+            max: 120,
+            step: 6,
+        },
+    ),
+    rule(
+        &["videoGenerationConfig", "durationSeconds"],
+        InputConstraint::Span {
+            min: 6,
+            max: 120,
+            step: 6,
+        },
+    ),
+    rule(&["videoGenerationConfig", "fps"], FPS),
+    rule(&["videoGenerationConfig", "dimension"], DIMENSION),
+    rule(&["videoGenerationConfig", "seed"], SEED),
+];
+
+/// Luma AI Ray v2, whose request is the prompt plus four published value sets.
+static LUMA_RAY_V2_RULES: &[InputRule] = &[
+    required(&["prompt"]),
+    // The provider publishes no ceiling on the prompt's length.
+    rule(
+        &["prompt"],
+        InputConstraint::Text {
+            min_length: 1,
+            max_length: usize::MAX,
+        },
+    ),
+    rule(
+        &["aspect_ratio"],
+        InputConstraint::OneOfText(&["1:1", "3:4", "4:3", "9:16", "16:9", "9:21", "21:9"]),
+    ),
+    rule(&["loop"], InputConstraint::Flag),
+    rule(&["duration"], InputConstraint::OneOfText(&["5s", "9s"])),
+    rule(&["resolution"], InputConstraint::OneOfText(&["540p", "720p"])),
+];
+
+/// The published request schema of the model `model_id`'s `modelInput`, or
+/// `None` when this service serves no asynchronous invocation for that model.
+///
+/// Sources, both in the Amazon Bedrock User Guide: "Amazon Nova Reel" under
+/// "Video generation models" for the two Nova Reel ids (`taskType`, the
+/// `textToVideoParams`/`multiShot*` parameter blocks, and the
+/// `videoGenerationConfig` whose `durationSeconds`, `fps` and `dimension` each
+/// publish a single accepted value for a 6-second generation, with `seed`
+/// bounded by the signed 32-bit range less one), and "Luma AI Ray v2" for
+/// `luma.ray-v2` (`prompt` required, with `aspect_ratio`, `loop`, `duration`
+/// and `resolution` each published as a value set).
+///
+/// Unlisted members are NOT refused: these rules state what the provider
+/// publishes, and a member this transcription does not carry is no evidence
+/// that the provider rejects it.
+fn async_model_input_rules(model_id: &str) -> Option<&'static [InputRule]> {
+    match model_id {
+        "amazon.nova-reel-v1:0" => Some(NOVA_REEL_V1_0_RULES),
+        "amazon.nova-reel-v1:1" => Some(NOVA_REEL_V1_1_RULES),
+        "luma.ray-v2:0" => Some(LUMA_RAY_V2_RULES),
+        _ => None,
+    }
+}
+
+/// The JSON pointer of the member at `path`, as the provider's complaint names
+/// it: `#` for the root of `modelInput`, `#/a/b` for a nested member.
+fn input_pointer(path: &[&str]) -> String {
+    if path.is_empty() {
+        return "#".to_string();
+    }
+    format!("#/{}", path.join("/"))
+}
+
+/// A submitted value as this wording shows it: a JSON string reads bare (`… 7s
+/// is not a valid enum value`), every other value as JSON.
+fn shown_input_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// How a `modelInput` broke the invoked model's published request schema, as the
+/// detail of a [`malformed_model_input_message`], or `None` when it satisfies it
+/// (and when the model publishes no schema here).
+///
+/// Several violations are reported as ONE: the first rule of the model's schema
+/// the request breaks, in the order the schema states them, so the refusal a
+/// request draws is fixed by the schema and never by map iteration order.
+pub fn async_model_input_violation(
+    model_id: &str,
+    model_input: &serde_json::Value,
+) -> Option<String> {
+    let rules = async_model_input_rules(model_id)?;
+    if !model_input.is_object() {
+        return Some(format!(
+            "#: {} is not of the expected type",
+            shown_input_value(model_input)
+        ));
+    }
+    rules
+        .iter()
+        .find_map(|rule| input_rule_violation(rule, model_input))
+}
+
+/// How `root` breaks `rule`, as the provider states it — the failing member's
+/// pointer, then the constraint it broke and the value that broke it — or `None`
+/// when the rule is satisfied or does not apply to this request.
+///
+/// A member the request does not carry is answered by its own `Required` rule
+/// and by nothing else, so an absent optional member and an absent parent are
+/// both silent here rather than reported twice.
+fn input_rule_violation(rule: &InputRule, root: &serde_json::Value) -> Option<String> {
+    if let Some((discriminator, value)) = rule.when {
+        if root.get(discriminator).and_then(serde_json::Value::as_str) != Some(value) {
+            return None;
+        }
+    }
+    let (name, parent_path) = rule.path.split_last()?;
+    let mut parent = root;
+    for (depth, segment) in parent_path.iter().enumerate() {
+        let next = parent.get(*segment).filter(|value| !value.is_null())?;
+        if !next.is_object() {
+            return Some(format!(
+                "{}: {} is not of the expected type",
+                input_pointer(&parent_path[..=depth]),
+                shown_input_value(next)
+            ));
+        }
+        parent = next;
+    }
+    let pointer = input_pointer(rule.path);
+    let Some(member) = parent.get(*name).filter(|value| !value.is_null()) else {
+        return matches!(rule.constraint, InputConstraint::Required).then(|| {
+            format!(
+                "{}: required key [{name}] not found",
+                input_pointer(parent_path)
+            )
+        });
+    };
+    let shown = shown_input_value(member);
+    let wrong_type = || Some(format!("{pointer}: {shown} is not of the expected type"));
+    let not_in_set = || Some(format!("{pointer}: {shown} is not a valid enum value"));
+    match rule.constraint {
+        InputConstraint::Required => None,
+        InputConstraint::Text {
+            min_length,
+            max_length,
+        } => {
+            let Some(text) = member.as_str() else {
+                return wrong_type();
+            };
+            let length = text.chars().count();
+            if length < min_length {
+                return Some(format!(
+                    "{pointer}: expected minLength: {min_length}, actual: {length}"
+                ));
+            }
+            if length > max_length {
+                return Some(format!(
+                    "{pointer}: expected maxLength: {max_length}, actual: {length}"
+                ));
+            }
+            None
+        }
+        InputConstraint::Flag if member.is_boolean() => None,
+        InputConstraint::Flag => wrong_type(),
+        InputConstraint::Items if member.is_array() => None,
+        InputConstraint::Items => wrong_type(),
+        InputConstraint::OneOfText(values) => {
+            if member.as_str().is_some_and(|text| values.contains(&text)) {
+                None
+            } else {
+                not_in_set()
+            }
+        }
+        InputConstraint::OneOfNumber(values) => {
+            if member.as_i64().is_some_and(|number| values.contains(&number)) {
+                None
+            } else {
+                not_in_set()
+            }
+        }
+        InputConstraint::Span { min, max, step } => {
+            let Some(number) = member.as_i64() else {
+                return wrong_type();
+            };
+            if number < min {
+                return Some(format!("{pointer}: {shown} is not greater or equal to {min}"));
+            }
+            if number > max {
+                return Some(format!("{pointer}: {shown} is not less or equal to {max}"));
+            }
+            if step > 1 && number % step != 0 {
+                return Some(format!("{pointer}: {shown} is not a multiple of {step}"));
+            }
+            None
+        }
+    }
+}
 
 /// One async invocation, exactly as `StartAsyncInvoke` stored it.
 #[derive(Debug, Clone)]

@@ -39,10 +39,14 @@ mod extension_registry;
 mod generated_physical_names;
 #[path = "all/nested_resource_outputs.rs"]
 mod nested_resource_outputs;
+#[path = "all/no_echo_parameters.rs"]
+mod no_echo_parameters;
 #[path = "all/provisioned_resources.rs"]
 mod provisioned_resources;
 #[path = "all/published_type_schema.rs"]
 mod published_type_schema;
+#[path = "all/rds_stack_resources.rs"]
+mod rds_stack_resources;
 #[path = "all/resolved_properties.rs"]
 mod resolved_properties;
 #[path = "all/sam_transform.rs"]

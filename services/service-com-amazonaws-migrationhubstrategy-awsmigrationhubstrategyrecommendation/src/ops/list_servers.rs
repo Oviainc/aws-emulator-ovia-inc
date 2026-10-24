@@ -295,19 +295,11 @@ fn descending(sort: Option<&str>) -> Result<bool, ListServersError> {
 }
 
 /// Refuse a `groupIdFilter` entry whose `name` is not a `GroupName` the model declares —
-/// again a value the boundary validator lets through.
+/// again a value the boundary validator lets through. The membership test is the
+/// service's [`crate::state::check_group_names`]; this wrapper lifts its refusal into
+/// this operation's error channel.
 fn check_group_filter(groups: &[Group]) -> Result<(), ListServersError> {
-    let declared = |group: &Group| {
-        group
-            .name
-            .as_deref()
-            .is_none_or(|name| GROUP_NAME_VALUES.contains(&name))
-    };
-    if groups.iter().all(declared) {
-        Ok(())
-    } else {
-        Err(refused())
-    }
+    crate::state::check_group_names(groups).map_err(|_| refused())
 }
 
 /// The `ListServers` operation.

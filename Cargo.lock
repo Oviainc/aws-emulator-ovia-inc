@@ -6378,6 +6378,7 @@ dependencies = [
  "serde_json",
  "service-com-amazonaws-codepipeline-codepipeline-20150709",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
+ "service-com-amazonaws-rds-amazonrdsv19",
  "service-com-amazonaws-s3-amazons3",
  "service-com-amazonaws-sns-amazonsimplenotificationservice",
  "service-common",

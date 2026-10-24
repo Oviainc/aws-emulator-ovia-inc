@@ -83,11 +83,14 @@ pub struct NotificationConfigurationRecord {
     /// [`ComAmazonawsNotificationsNotificationsState::refresh_event_rule_sources`],
     /// never written by hand: the rules are the one stored copy.
     pub event_rule_sources: BTreeSet<String>,
-    /// The arns of the channels associated with this configuration — what
-    /// `ListNotificationConfigurations`'s `channelArn` filter matches a
-    /// configuration on. Empty on every record today: `AssociateChannel` is
-    /// still a 501 stub, and it is the operation that will write here.
-    pub channel_arns: BTreeSet<String>,
+    /// The channels associated with this configuration, each mapped to the
+    /// association sequence it was given — what `ListChannels` reports and pages
+    /// through, and what `ListNotificationConfigurations`'s `channelArn` filter
+    /// matches a configuration on. `AssociateChannel` inserts an entry and
+    /// `DisassociateChannel` removes one; the sequence is kept on a repeat of an
+    /// association that already holds, so an idempotent re-association never
+    /// reorders a listing.
+    pub channel_arns: BTreeMap<String, u64>,
     /// Creation order within this store. `ListNotificationConfigurations`
     /// reports configurations in this order and pages through it, so a listing
     /// is stable and a page token keeps meaning across inserts and deletes.
@@ -193,6 +196,21 @@ pub const EVENT_RULE_TRANSITION_SPAN: Duration = Duration::from_millis(500);
 /// this case: `ServiceQuotaExceededException` (HTTP 402, "Request would cause a
 /// service quota to be exceeded").
 pub const MAX_EVENT_RULES_PER_CONFIGURATION: usize = 100;
+
+/// The most channels one `NotificationConfiguration` is associated with at
+/// once.
+///
+/// A record's `channel_arns` grows by one entry per `AssociateChannel` request
+/// naming a channel it does not already hold, and shrinks only on an explicit
+/// `DisassociateChannel`, so without a ceiling its entry count — and the size of
+/// every `ListChannels` page computed over it — is set by how many requests a
+/// caller makes. AWS bounds the same thing with an adjustable per-account
+/// service quota which is not in the model, so this number is the EMULATOR's own
+/// bound rather than a claim about AWS's, while the refusal it produces is the
+/// error the model declares for exactly this case on `AssociateChannel`:
+/// `ServiceQuotaExceededException` (HTTP 402, "Request would cause a service
+/// quota to be exceeded").
+pub const MAX_CHANNELS_PER_CONFIGURATION: usize = 100;
 
 /// The most Regions one `EventRule` covers.
 ///
@@ -488,6 +506,13 @@ pub struct ComAmazonawsNotificationsNotificationsState {
     /// record's [`NotificationHubRecord::sequence`], so a listing's order and its
     /// page tokens survive a deregister and a re-register of the same region.
     pub hubs_registered: u64,
+    /// How many channel associations this store has ever made. Doubles as the
+    /// next association's sequence in a record's
+    /// [`NotificationConfigurationRecord::channel_arns`], so a `ListChannels`
+    /// page token keeps its meaning across associations and disassociations —
+    /// including a re-association of a channel that was removed, which lands
+    /// after the associations that outlived it.
+    pub channel_associations_minted: u64,
     /// Service Trust Enablement between User Notifications and Amazon Web
     /// Services Organizations for this account. One record per account, holding
     /// `DISABLED` until an enable asks for trust.
@@ -527,6 +552,57 @@ impl ComAmazonawsNotificationsNotificationsState {
             self.configurations.values().collect();
         records.sort_by_key(|record| record.sequence);
         records
+    }
+
+    /// Associate `channel_arn` with `configuration_arn`, and report whether that
+    /// changed the stored record.
+    ///
+    /// `AssociateChannel` is `@idempotent`: a repeat of an association the
+    /// record already holds keeps the sequence the first one was given and
+    /// reports `false`, so neither the listing's order nor the mint counter
+    /// moves. `false` is also the answer when no configuration carries
+    /// `configuration_arn` — the caller establishes that first and refuses with
+    /// the modelled not-found error.
+    pub fn associate_channel(&mut self, configuration_arn: &str, channel_arn: &str) -> bool {
+        let sequence = self.channel_associations_minted + 1;
+        let Some(record) = self.configurations.get_mut(configuration_arn) else {
+            return false;
+        };
+        if record.channel_arns.contains_key(channel_arn) {
+            return false;
+        }
+        record
+            .channel_arns
+            .insert(channel_arn.to_string(), sequence);
+        self.channel_associations_minted = sequence;
+        true
+    }
+
+    /// Remove the association between `channel_arn` and `configuration_arn`, and
+    /// report whether the record held one. `false` leaves the store untouched,
+    /// which is what lets the caller refuse a disassociation of a channel this
+    /// configuration is not associated with.
+    pub fn disassociate_channel(&mut self, configuration_arn: &str, channel_arn: &str) -> bool {
+        self.configurations
+            .get_mut(configuration_arn)
+            .is_some_and(|record| record.channel_arns.remove(channel_arn).is_some())
+    }
+
+    /// The channels associated with `configuration_arn` in association order,
+    /// each with its association sequence — the order `ListChannels` reports and
+    /// pages through. Empty for a configuration the store does not hold, which
+    /// the caller refuses before it gets here.
+    pub fn channels_in_association_order(&self, configuration_arn: &str) -> Vec<(&str, u64)> {
+        let Some(record) = self.configurations.get(configuration_arn) else {
+            return Vec::new();
+        };
+        let mut channels: Vec<(&str, u64)> = record
+            .channel_arns
+            .iter()
+            .map(|(arn, sequence)| (arn.as_str(), *sequence))
+            .collect();
+        channels.sort_by_key(|(_, sequence)| *sequence);
+        channels
     }
 
     /// How many `EventRule`s one configuration holds.

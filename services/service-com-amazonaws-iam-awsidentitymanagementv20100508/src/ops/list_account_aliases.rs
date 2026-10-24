@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAccountAliases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAccountAliases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAccountAliases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the alias the account holds.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +149,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAccountAliases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAccountAliasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAccountAliases"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAccountAliasesErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The page resumes strictly after the POSITION in the collection's order
+        // that the marker names, exactly as every other list operation in this
+        // service does (`crate::ops::list_users`), so a token this service's
+        // encoding cannot have produced is refused rather than silently read as
+        // "start from the beginning".
+        let resume_after = match &input.marker {
+            Some(marker) => {
+                match crate::state::decode_marker(
+                    crate::state::MARKER_SCOPE_ACCOUNT_ALIASES,
+                    marker,
+                ) {
+                    Some(key) => Some(key),
+                    None => {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            "Invalid Marker: the value is not a marker this service issued",
+                        ))
+                    }
+                }
+            }
+            None => None,
+        };
+        // `maxItemsType` is range 1..1000 and the boundary validator has already
+        // refused anything outside it, so the only choice left here is the default
+        // for an absent `MaxItems`. `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // A read: it reports the alias the account holds and writes nothing. The
+        // account holds at most one ("Note: you can have only one"), so the stored
+        // `Option` IS the collection and the alias itself is its key.
+        let store = state.lock();
+        let mut account_aliases: Vec<String> = store
+            .account_alias
+            .iter()
+            .filter(|alias| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|position| alias.as_str() > position)
+            })
+            .cloned()
+            .collect();
+
+        // Truncation is decided from the collection rather than from its size being
+        // known to be one: a page carries at most `MaxItems` entries and hands out a
+        // marker only when an entry is left over.
+        let is_truncated = account_aliases.len() > page_size;
+        account_aliases.truncate(page_size);
+        let marker = match account_aliases.last() {
+            Some(last) if is_truncated => Some(crate::state::encode_marker(
+                crate::state::MARKER_SCOPE_ACCOUNT_ALIASES,
+                last,
+            )),
+            _ => None,
+        };
+
+        Ok(ListAccountAliasesOutput {
+            account_aliases,
+            is_truncated,
+            marker,
+        })
     }
 }

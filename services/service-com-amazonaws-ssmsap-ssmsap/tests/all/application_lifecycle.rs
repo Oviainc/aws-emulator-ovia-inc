@@ -108,18 +108,26 @@ impl Emulator {
         Self { router }
     }
 
+    /// Dispatch to this service's [`REGION`] endpoint — what every suite that cares
+    /// about one region's behaviour uses.
     pub(crate) async fn send(&self, path: &str, body: Value) -> Reply {
+        self.send_in_region(REGION, path, body).await
+    }
+
+    /// Dispatch signed for `region`, which is the regional endpoint the call reaches:
+    /// the region-scoping suite drives the SAME harness at more than one of them.
+    pub(crate) async fn send_in_region(&self, region: &str, path: &str, body: Value) -> Reply {
         let payload = serde_json::to_vec(&body).expect("the request body serializes");
         let request = http::Request::builder()
             .method("POST")
-            .uri(format!("https://ssm-sap.{REGION}.amazonaws.com{path}"))
+            .uri(format!("https://ssm-sap.{region}.amazonaws.com{path}"))
             // The SigV4 credential scope is what routes the request to this service and
             // what names the region its ARNs carry. Signatures are not verified unless
             // the process turns authentication on.
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/ssm-sap/aws4_request, SignedHeaders=host, Signature=0000"
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/ssm-sap/aws4_request, SignedHeaders=host, Signature=0000"
                 ),
             )
             .header("content-type", "application/json")

@@ -9,7 +9,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::ops::types::{ExportFilter, ResourceNotFoundException, VectorSearchConfiguration};
+use crate::ops::types::{
+    ExportFilter, ImportOptions, ResourceNotFoundException, VectorSearchConfiguration,
+};
 
 /// The ARN namespace (and SigV4 signing name) of this service, from the model's
 /// `aws.api#service` trait:
@@ -56,7 +58,7 @@ pub const QUERY_RUN_SPAN: Duration = Duration::from_millis(750);
 ///
 /// Every variant's wire form is one of the modelled `GraphStatus` values
 /// (`crate::ops::types::GRAPH_STATUS_VALUES`). The statuses this slice never
-/// produces (`FAILED`, `IMPORTING`, `RESETTING`) belong to operations that are
+/// produces (`FAILED`, `RESETTING`) belong to operations that are
 /// still scaffolded, and are added with them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphStatus {
@@ -69,6 +71,9 @@ pub enum GraphStatus {
     /// `CreateGraphSnapshot` has accepted a snapshot of the graph; the graph is
     /// being snapshotted and is not reconfigurable until that finishes.
     Snapshotting,
+    /// `StartImportTask` has accepted a bulk import into the graph; the graph is
+    /// loading data and is not reconfigurable until the task stops.
+    Importing,
     /// `StopGraph` has accepted the stop; the graph is winding down.
     Stopping,
     /// The graph is stopped: it exists and keeps its configuration and data, but it
@@ -88,6 +93,7 @@ impl GraphStatus {
             Self::Available => "AVAILABLE",
             Self::Updating => "UPDATING",
             Self::Snapshotting => "SNAPSHOTTING",
+            Self::Importing => "IMPORTING",
             Self::Stopping => "STOPPING",
             Self::Stopped => "STOPPED",
             Self::Starting => "STARTING",
@@ -240,6 +246,138 @@ impl Snapshot {
             self.status = SnapshotStatus::Available;
             self.settles_at = None;
         }
+    }
+}
+
+/// The lifecycle statuses this slice of the emulator puts an import task into.
+///
+/// Every variant's wire form is one of the modelled `ImportTaskStatus` values
+/// (`crate::ops::types::IMPORT_TASK_STATUS_VALUES`). The values that report a STAGE
+/// of a running bulk load (`ANALYZING_DATA`, `EXPORTING`, `IMPORTING`,
+/// `REPROVISIONING`, `ROLLING_BACK`, `SUCCEEDED`) are deliberately never produced:
+/// nothing in this emulator reads a task's `source`, so no task may report a stage —
+/// or a success — of a load nothing performed. An accepted task therefore stops in
+/// the modelled `FAILED` status carrying [`IMPORT_NOT_RUN_REASON`], and `DELETED`
+/// joins this enum with the operation that would produce it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportTaskStatus {
+    /// `StartImportTask` has accepted the task; it has not stopped yet.
+    Initializing,
+    /// `CancelImportTask` has accepted the cancellation; the task is winding down.
+    Cancelling,
+    /// The task stopped because it was cancelled.
+    Cancelled,
+    /// The task stopped without importing the data.
+    Failed,
+}
+
+impl ImportTaskStatus {
+    /// This status as the modelled `ImportTaskStatus` enum value.
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Initializing => "INITIALIZING",
+            Self::Cancelling => "CANCELLING",
+            Self::Cancelled => "CANCELLED",
+            Self::Failed => "FAILED",
+        }
+    }
+
+    /// Whether this is a TERMINAL status: the task has stopped, so the clock owes it
+    /// nothing more and its outcome can no longer change.
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Cancelled | Self::Failed)
+    }
+
+    /// Whether a task in this status can still be cancelled: only one whose import is
+    /// in flight. A task that has stopped has no work left to stop, and one already
+    /// `CANCELLING` is stopping already — each is a conflict rather than a second
+    /// cancellation.
+    pub const fn is_cancellable(self) -> bool {
+        matches!(self, Self::Initializing)
+    }
+}
+
+/// A status change the clock owes an import task: the status it lands in, the reason
+/// that status carries, and the instant from which it is due.
+///
+/// The reason travels with the target because a task's `statusReason` is a property
+/// of the status it settles into — why the load stopped — and the two must never be
+/// read apart.
+#[derive(Debug, Clone)]
+pub struct ImportTaskTransition {
+    /// The status the task takes once this transition falls due.
+    pub settled_status: ImportTaskStatus,
+    /// The `statusReason` the settled status carries, if any.
+    pub settled_reason: Option<String>,
+    /// The instant from which the transition is due.
+    pub due: Instant,
+}
+
+/// One stored import task: every member `GetImportTask` reports, plus the status
+/// change the clock still owes it, if any.
+///
+/// A task is a resource in its own right — it is read by its own `t-` id and outlives
+/// the load it describes — so it is stored beside the graphs rather than inside the
+/// graph record.
+#[derive(Debug, Clone)]
+pub struct ImportTask {
+    pub id: String,
+    /// The graph the data is imported INTO, kept as the graph's id (not a borrow), so
+    /// deleting that graph leaves the task's provenance intact.
+    pub graph_id: String,
+    pub source: String,
+    pub format: Option<String>,
+    pub parquet_type: Option<String>,
+    pub blank_node_handling: Option<String>,
+    pub fail_on_error: bool,
+    pub role_arn: String,
+    pub import_options: Option<ImportOptions>,
+    pub status: ImportTaskStatus,
+    pub status_reason: Option<String>,
+    /// How many times this task has been run. One per accepted `StartImportTask`:
+    /// nothing in this emulator retries a task, so the stored count is what
+    /// `GetImportTask` reports rather than a number invented per read.
+    pub attempt_number: i32,
+    /// The status change the clock owes this task, and when it falls due. `None` once
+    /// there is nothing outstanding.
+    pub pending: Option<ImportTaskTransition>,
+}
+
+impl ImportTask {
+    /// Materialise the transition the clock has already made due.
+    ///
+    /// The same one write a reporting operation may make as [`Graph::settle`]: the
+    /// task would have reached this status at its `due` instant whether or not
+    /// anybody read it, so applying it on read is bookkeeping rather than a state
+    /// change caused by the read.
+    pub fn settle(&mut self, now: Instant) {
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
+        if now >= pending.due {
+            self.status = pending.settled_status;
+            self.status_reason = pending.settled_reason.clone();
+            self.pending = None;
+        }
+    }
+
+    /// Report `transient` now and settle into `settled` (with `reason`)
+    /// [`PROVISIONING_SPAN`] after `now`: the shape of every import-task transition
+    /// an operation accepts, so a caller that reads the task straight after the call
+    /// still observes the transient status.
+    pub fn begin_transition(
+        &mut self,
+        transient: ImportTaskStatus,
+        settled: ImportTaskStatus,
+        reason: Option<String>,
+        now: Instant,
+    ) {
+        self.status = transient;
+        self.pending = Some(ImportTaskTransition {
+            settled_status: settled,
+            settled_reason: reason,
+            due: now + PROVISIONING_SPAN,
+        });
     }
 }
 
@@ -543,6 +681,9 @@ pub struct ComAmazonawsNeptunegraphAmazonneptunegraphState {
     /// `snapshotName` -> snapshot id: the uniqueness index behind
     /// `CreateGraphSnapshot`'s `ConflictException`.
     pub snapshot_names: HashMap<String, String>,
+    /// Every stored import task, keyed by its minted `t-xxxxxxxxxx` id. A `BTreeMap`
+    /// so `ListImportTasks` has one stable total order to page over.
+    pub import_tasks: BTreeMap<String, ImportTask>,
     /// Every in-flight query, keyed by the graph it runs on and then by its own id. A
     /// `BTreeMap` of `BTreeMap`s so `ListQueries` — which lists the queries of ONE
     /// graph — has one stable total order to report, and so a query id is resolved
@@ -558,6 +699,8 @@ pub struct ComAmazonawsNeptunegraphAmazonneptunegraphState {
     pub id_counter: u64,
     /// Feeds the snapshot-id generator, so ids are unique within a store.
     pub snapshot_id_counter: u64,
+    /// Feeds the import-task-id generator, so ids are unique within a store.
+    pub import_task_id_counter: u64,
     /// Feeds the export-task-id generator, so ids are unique within a store.
     pub export_task_id_counter: u64,
 }
@@ -587,13 +730,38 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         }
     }
 
+    /// Mint an id no task in this store holds, matching the modelled `TaskId`
+    /// pattern `^t-[a-z0-9]{10}$`.
+    pub fn next_import_task_id(&mut self) -> String {
+        loop {
+            self.import_task_id_counter = self.import_task_id_counter.wrapping_add(1);
+            let id = encode_resource_id(
+                TASK_ID_PREFIX,
+                scramble(self.import_task_id_counter) % BASE36_POW10,
+            );
+            if !self.holds_task_id(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// Whether this store already holds a task under `id`, in EITHER task map.
+    ///
+    /// Import and export tasks share ONE modelled id space (`TaskId`'s
+    /// `^t-[a-z0-9]{10}$`), so an id minted for one must not be an id the other
+    /// already holds: two resources would otherwise answer to the same identifier,
+    /// each through its own read.
+    pub fn holds_task_id(&self, id: &str) -> bool {
+        self.import_tasks.contains_key(id) || self.export_tasks.contains_key(id)
+    }
+
     /// Store a new graph and index its name.
     pub fn insert_graph(&mut self, graph: Graph) {
         self.graph_names.insert(graph.name.clone(), graph.id.clone());
         self.graphs.insert(graph.id.clone(), graph);
     }
 
-    /// Mint an id no export task in this store holds, matching the modelled
+    /// Mint an id no task in this store holds, matching the modelled
     /// `ExportTaskId` pattern `^t-[a-z0-9]{10}$`.
     pub fn next_export_task_id(&mut self) -> String {
         loop {
@@ -602,7 +770,9 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
                 EXPORT_TASK_ID_PREFIX,
                 scramble(self.export_task_id_counter) % BASE36_POW10,
             );
-            if !self.export_tasks.contains_key(&id) {
+            // The task-id space is shared with the import tasks, so an id either map
+            // already holds is skipped (see `holds_task_id`).
+            if !self.holds_task_id(&id) {
                 return id;
             }
         }
@@ -628,11 +798,18 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         self.snapshots.insert(snapshot.id.clone(), snapshot);
     }
 
+    /// Store a new import task. Tasks are keyed by their minted id alone: the model
+    /// gives a task no name, so there is no second index to keep in step.
+    pub fn insert_import_task(&mut self, task: ImportTask) {
+        self.import_tasks.insert(task.id.clone(), task);
+    }
+
     /// Drop a graph, its name index entry and every query that was running on it.
     ///
     /// A query exists only while the graph it runs on does, so a deleted graph takes
     /// its in-flight queries with it rather than leaving entries a later `GetQuery` on
-    /// a re-minted id could find.
+    /// a re-minted id could find. An import task is NOT dropped with its graph: it is
+    /// read by its own id and keeps the provenance of the load it describes.
     pub fn remove_graph(&mut self, id: &str) -> Option<Graph> {
         let graph = self.graphs.remove(id)?;
         self.graph_names.remove(&graph.name);
@@ -742,6 +919,9 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         for snapshot in self.snapshots.values_mut() {
             snapshot.settle(now);
         }
+        for task in self.import_tasks.values_mut() {
+            task.settle(now);
+        }
         for task in self.export_tasks.values_mut() {
             task.settle(now);
         }
@@ -753,6 +933,21 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         let snapshot = self.snapshots.get_mut(id)?;
         snapshot.settle(now);
         Some(snapshot)
+    }
+
+    /// Apply the import-task transition the clock has made due, then borrow one task.
+    pub fn settled_import_task(&mut self, id: &str, now: Instant) -> Option<&ImportTask> {
+        let task = self.import_tasks.get_mut(id)?;
+        task.settle(now);
+        Some(task)
+    }
+
+    /// Apply the import-task transition the clock has made due, then borrow one task
+    /// mutably.
+    pub fn settled_import_task_mut(&mut self, id: &str, now: Instant) -> Option<&mut ImportTask> {
+        let task = self.import_tasks.get_mut(id)?;
+        task.settle(now);
+        Some(task)
     }
 
     /// The tag map of the resource `arn` names, or `None` when this store holds no
@@ -844,6 +1039,44 @@ pub const MAX_GRAPHS: usize = 100;
 /// this condition. Set well above any realistic use of a local emulator.
 pub const MAX_SNAPSHOTS: usize = 100;
 
+/// The most import tasks one store holds.
+///
+/// Emulator resource guard, NOT a quota AWS publishes, and the same bound
+/// [`MAX_GRAPHS`] puts on the graph map: the store is shared process-wide and grows
+/// by one entry per `StartImportTask`, and a task is never reclaimed, so without a
+/// ceiling repeated calls grow the emulator's memory without bound. `StartImportTask`
+/// models no quota error, so reaching the ceiling is reported with the
+/// `ConflictException` (409) it does model — the request conflicts with what the store
+/// already holds. Set well above any realistic use of a local emulator.
+pub const MAX_IMPORT_TASKS: usize = 100;
+
+/// The most characters an import task's `source` may carry.
+///
+/// The model puts no `@length` on `source`
+/// (`smithy_query(query="operation",operation="StartImportTask")`), so this is the
+/// store's own bound on a caller-sized string, set to the 1024 characters the
+/// service's other S3-location members are modelled with (`NeptuneImportOptions`'s
+/// `s3ExportPath`, `s3ExportKmsKeyId`: `@length(1..1024)`).
+pub const MAX_IMPORT_SOURCE_CHARS: usize = 1024;
+
+/// The prefix the service reserves for import- and export-task ids, from the modelled
+/// `TaskId` pattern `^t-[a-z0-9]{10}$`.
+pub const TASK_ID_PREFIX: &str = "t-";
+
+/// The `statusReason` of an import task that stopped `FAILED` because nothing read
+/// its source.
+///
+/// This emulator has no bulk loader: no component reads a task's `source`, so an
+/// accepted import can never load data. Rather than report a stage, a count or a
+/// `SUCCEEDED` status for a load nothing performed, the clock settles every accepted
+/// task into the modelled `FAILED` status carrying this reason, which says exactly
+/// that.
+pub const IMPORT_NOT_RUN_REASON: &str = "This emulator runs no bulk data load: no import engine read the task's source, so the task stopped without importing data.";
+
+/// The `statusReason` of an import task that stopped because it was cancelled.
+pub const IMPORT_CANCELLED_REASON: &str =
+    "The import task was cancelled by a CancelImportTask request.";
+
 /// The most export tasks one store holds.
 ///
 /// Emulator resource guard, NOT a quota AWS publishes, and the same bound
@@ -902,13 +1135,24 @@ pub fn is_snapshot_id(value: &str) -> bool {
     is_resource_id(value, "gs-")
 }
 
-/// Whether `value` matches the modelled `ExportTaskId` pattern `^t-[a-z0-9]{10}$`.
-pub fn is_export_task_id(value: &str) -> bool {
-    is_resource_id(value, EXPORT_TASK_ID_PREFIX)
+/// Whether `value` matches the modelled `TaskId` pattern `^t-[a-z0-9]{10}$`.
+///
+/// One predicate for the whole task-id space: the model spells the same pattern for
+/// an import task and an export task, and this service mints both from it.
+pub fn is_task_id(value: &str) -> bool {
+    is_resource_id(value, TASK_ID_PREFIX)
 }
 
-/// The prefix the modelled `ExportTaskId` pattern `^t-[a-z0-9]{10}$` requires.
-pub const EXPORT_TASK_ID_PREFIX: &str = "t-";
+/// Whether `value` matches the modelled `ExportTaskId` pattern `^t-[a-z0-9]{10}$` —
+/// the same check as [`is_task_id`], under the name the export surface reads it by.
+pub fn is_export_task_id(value: &str) -> bool {
+    is_task_id(value)
+}
+
+/// The prefix the modelled `ExportTaskId` pattern `^t-[a-z0-9]{10}$` requires: the
+/// same task-id space [`TASK_ID_PREFIX`] names, since the model gives an import task
+/// and an export task one id pattern.
+pub const EXPORT_TASK_ID_PREFIX: &str = TASK_ID_PREFIX;
 
 /// The scheme an Amazon S3 URI is spelled with, which an export `destination` has to
 /// carry: the member is documented as "The Amazon S3 URI where data will be exported
@@ -1045,6 +1289,22 @@ pub fn snapshot_not_found(snapshot_identifier: &str) -> ResourceNotFoundExceptio
     }
 }
 
+/// The modelled `ResourceNotFoundException` for a `taskIdentifier` that names no
+/// stored import task.
+///
+/// The task namespace is per-account like the graph and snapshot namespaces, so the
+/// failure names the account the lookup was resolved in beside the identifier the
+/// request asked for — the same two facts [`graph_not_found`] reports, and for the
+/// same reason.
+pub fn import_task_not_found(task_identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!(
+            "No import task found for customer [{}] with task id [{task_identifier}]",
+            caller_account_id()
+        ),
+    }
+}
+
 /// The modelled `ResourceNotFoundException` for a `queryId` that names no query in
 /// flight on the graph the request named.
 ///
@@ -1149,6 +1409,16 @@ pub fn constraint_clause(member_path: &str, value: Option<&str>, requirement: &s
         None => "Value null".to_string(),
     };
     format!("{subject} at '{member_path}' failed to satisfy constraint: {requirement}")
+}
+
+/// One clause of a `ValidationException` message for a LENGTH violation: the member
+/// path and the requirement it failed, WITHOUT the value.
+///
+/// A value that broke a length bound is exactly the value that must not be echoed — a
+/// refusal would otherwise carry the whole oversized string back — so this clause
+/// states the member and the bound and nothing else.
+pub fn length_clause(member_path: &str, requirement: &str) -> String {
+    format!("Value at '{member_path}' failed to satisfy constraint: {requirement}")
 }
 
 /// The requirement clause for a `@pattern` violation: the expression the value had to
@@ -1311,6 +1581,50 @@ macro_rules! snapshot_record_output {
 }
 
 snapshot_record_output!(CreateGraphSnapshotOutput, GetGraphSnapshotOutput);
+
+/// The `*Output` shapes that carry a whole import-task record differ only in the
+/// members they add, so the members they SHARE are rendered by one macro rather than
+/// one hand-copied field list per operation, which could drift apart.
+///
+/// Each entry names the binding the stored record is reached through, because macro
+/// hygiene puts a binding the macro itself introduces out of reach of the extra
+/// members an entry spells.
+macro_rules! import_task_record_output {
+    ($($ty:ident ($task:ident) { $($extra:tt)* }),+ $(,)?) => {$(
+        impl From<&ImportTask> for crate::ops::types::$ty {
+            fn from($task: &ImportTask) -> Self {
+                Self {
+                    task_id: $task.id.clone(),
+                    graph_id: Some($task.graph_id.clone()),
+                    source: $task.source.clone(),
+                    format: $task.format.clone(),
+                    parquet_type: $task.parquet_type.clone(),
+                    role_arn: $task.role_arn.clone(),
+                    status: $task.status.as_wire().to_string(),
+                    $($extra)*
+                }
+            }
+        }
+    )+};
+}
+
+import_task_record_output!(
+    // `CancelImportTaskOutput` carries only the shared members.
+    CancelImportTaskOutput(task) {},
+    StartImportTaskOutput(task) {
+        import_options: task.import_options.clone(),
+    },
+    // `GetImportTaskOutput` is the only projection that reports the task's progress.
+    // `importTaskDetails` stays ABSENT: it carries the statement, dictionary-entry
+    // and error counts of a load, and nothing in this emulator ran one, so there are
+    // no counts to report (see `IMPORT_NOT_RUN_REASON`).
+    GetImportTaskOutput(task) {
+        import_options: task.import_options.clone(),
+        import_task_details: None,
+        attempt_number: Some(task.attempt_number),
+        status_reason: task.status_reason.clone(),
+    },
+);
 
 /// `StartExportTask` reports the record it stored. The listing projection
 /// (`ExportTaskSummary`) and `CancelExportTaskOutput` join this rendering with the
@@ -1966,6 +2280,7 @@ mod tests {
             GraphStatus::Available,
             GraphStatus::Updating,
             GraphStatus::Snapshotting,
+            GraphStatus::Importing,
             GraphStatus::Stopping,
             GraphStatus::Stopped,
             GraphStatus::Starting,
@@ -1982,6 +2297,189 @@ mod tests {
             assert!(
                 crate::ops::types::SNAPSHOT_STATUS_VALUES.contains(&wire),
                 "case {status:?}: {wire:?} is not a modelled SnapshotStatus value"
+            );
+        }
+        for status in [
+            ImportTaskStatus::Initializing,
+            ImportTaskStatus::Cancelling,
+            ImportTaskStatus::Cancelled,
+            ImportTaskStatus::Failed,
+        ] {
+            let wire = status.as_wire();
+            assert!(
+                crate::ops::types::IMPORT_TASK_STATUS_VALUES.contains(&wire),
+                "case {status:?}: {wire:?} is not a modelled ImportTaskStatus value"
+            );
+        }
+    }
+
+    /// Every minted import-task id matches the modelled `TaskId` pattern and no id
+    /// repeats, which is what lets a task be read back by the id it was minted with.
+    #[test]
+    fn minted_import_task_ids_match_the_modelled_pattern_and_are_unique() {
+        let mut state = ComAmazonawsNeptunegraphAmazonneptunegraphState::default();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..2_000 {
+            let id = state.next_import_task_id();
+            assert!(
+                is_task_id(&id),
+                "id {id:?}: expected a match for ^t-[a-z0-9]{{10}}$"
+            );
+            assert!(seen.insert(id.clone()), "id {id:?}: minted twice");
+        }
+    }
+
+    /// An import task's pending transition is owed at a FUTURE instant, carries the
+    /// reason the settled status reports, and is applied exactly once — over a row
+    /// per transition this slice owes a task.
+    #[test]
+    fn a_pending_import_task_transition_settles_only_once_it_is_due() {
+        // (case, the transient status, the status it settles into, its reason)
+        let cases: Vec<(&str, ImportTaskStatus, ImportTaskStatus, Option<&str>)> = vec![
+            (
+                "an accepted task nothing loads",
+                ImportTaskStatus::Initializing,
+                ImportTaskStatus::Failed,
+                Some(IMPORT_NOT_RUN_REASON),
+            ),
+            (
+                "a cancelled task",
+                ImportTaskStatus::Cancelling,
+                ImportTaskStatus::Cancelled,
+                Some(IMPORT_CANCELLED_REASON),
+            ),
+            (
+                "a transition that carries no reason",
+                ImportTaskStatus::Cancelling,
+                ImportTaskStatus::Cancelled,
+                None,
+            ),
+        ];
+        for (case, transient, settled, reason) in cases {
+            let now = Instant::now();
+            let mut task = sample_import_task("t-0123456789", "g-0123456789");
+            task.begin_transition(transient, settled, reason.map(str::to_string), now);
+
+            task.settle(now);
+            assert_eq!(
+                task.status, transient,
+                "case {case:?} not-yet-due: expected {transient:?}, got {:?}",
+                task.status
+            );
+
+            task.settle(now + PROVISIONING_SPAN);
+            assert_eq!(
+                task.status, settled,
+                "case {case:?} due: expected {settled:?}, got {:?}",
+                task.status
+            );
+            assert_eq!(
+                task.status_reason.as_deref(),
+                reason,
+                "case {case:?} due: expected statusReason {reason:?}, got {:?}",
+                task.status_reason
+            );
+            assert!(
+                task.pending.is_none(),
+                "case {case:?} due: the settled transition must be cleared"
+            );
+        }
+    }
+
+    /// Only a task whose import is in flight can be cancelled, and only a stopped one
+    /// is terminal — one row per status this slice stores.
+    #[test]
+    fn cancellability_is_decided_by_the_stored_status() {
+        // (status, cancellable, terminal)
+        for (status, cancellable, terminal) in [
+            (ImportTaskStatus::Initializing, true, false),
+            (ImportTaskStatus::Cancelling, false, false),
+            (ImportTaskStatus::Cancelled, false, true),
+            (ImportTaskStatus::Failed, false, true),
+        ] {
+            let actual = status.is_cancellable();
+            assert_eq!(
+                actual, cancellable,
+                "case {status:?}: expected cancellable={cancellable}, got {actual}"
+            );
+            let actual_terminal = status.is_terminal();
+            assert_eq!(
+                actual_terminal, terminal,
+                "case {status:?}: expected terminal={terminal}, got {actual_terminal}"
+            );
+        }
+    }
+
+    /// A stored import task with the members every test here needs and nothing else
+    /// set.
+    fn sample_import_task(id: &str, graph_id: &str) -> ImportTask {
+        ImportTask {
+            id: id.to_string(),
+            graph_id: graph_id.to_string(),
+            source: "s3://example-bucket/data/".to_string(),
+            format: None,
+            parquet_type: None,
+            blank_node_handling: None,
+            fail_on_error: true,
+            role_arn: "arn:aws:iam::000000000000:role/example".to_string(),
+            import_options: None,
+            status: ImportTaskStatus::Initializing,
+            status_reason: None,
+            attempt_number: 1,
+            pending: None,
+        }
+    }
+
+    /// A stored export task with the members every test here needs and nothing else
+    /// set.
+    fn sample_export_task(id: &str, graph_id: &str) -> ExportTask {
+        let now = Instant::now();
+        ExportTask {
+            id: id.to_string(),
+            arn: ::engine::emulator_arn(ARN_NAMESPACE, "us-east-1", &format!("export-task/{id}")),
+            source_graph_id: graph_id.to_string(),
+            role_arn: "arn:aws:iam::000000000000:role/example".to_string(),
+            format: "CSV".to_string(),
+            parquet_type: None,
+            destination: "s3://example-bucket/export/".to_string(),
+            kms_key_identifier:
+                "arn:aws:kms:us-east-1:000000000000:key/12345678-1234-1234-1234-123456789012"
+                    .to_string(),
+            export_filter: None,
+            status: ExportTaskStatus::Initializing,
+            status_reason: None,
+            tags: BTreeMap::new(),
+            start_time: SystemTime::UNIX_EPOCH,
+            started_at: now,
+            settles_at: None,
+        }
+    }
+
+    /// An import task and an export task are addressed in ONE modelled id space
+    /// (`TaskId`'s `^t-[a-z0-9]{10}$`), so no id minted for either is ever an id the
+    /// other already holds — asserted by alternating the two generators, which is what
+    /// forces each to skip what the other has filed.
+    #[test]
+    fn minted_task_ids_are_unique_across_the_import_and_export_task_maps() {
+        let mut state = ComAmazonawsNeptunegraphAmazonneptunegraphState::default();
+        let mut seen = std::collections::BTreeSet::new();
+        for index in 0..1_000 {
+            let (kind, id) = if index % 2 == 0 {
+                let id = state.next_import_task_id();
+                state.insert_import_task(sample_import_task(&id, "g-0123456789"));
+                ("an import task", id)
+            } else {
+                let id = state.next_export_task_id();
+                state.insert_export_task(sample_export_task(&id, "g-0123456789"));
+                ("an export task", id)
+            };
+            assert!(
+                is_task_id(&id),
+                "case {kind} ({id:?}): expected a match for ^t-[a-z0-9]{{10}}$"
+            );
+            assert!(
+                seen.insert(id.clone()),
+                "case {kind} ({id:?}): minted twice across the shared task-id space"
             );
         }
     }
