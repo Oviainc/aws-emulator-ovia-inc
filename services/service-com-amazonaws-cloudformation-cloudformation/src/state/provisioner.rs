@@ -30,6 +30,10 @@
 //! * `AWS::KinesisFirehose::DeliveryStream`'s properties ARE `CreateDeliveryStream`'s own
 //!   members, so the evaluated property document is the request, passed through verbatim
 //!   with the one member CloudFormation decides (the name) set on the way out;
+//! * `AWS::CloudWatch::MetricStream`'s are `PutMetricStream`'s own members the same way,
+//!   and that one call is documented "Creates or updates a metric stream" — so it is also
+//!   this type's UPDATE, the one arm here that can apply a changed declaration to a
+//!   resource the stack already has;
 //! * `AWS::CodePipeline::Pipeline`'s are the same document with one transformation: they
 //!   are `PipelineDeclaration`'s members spelled with an upper-case initial, so
 //!   [`camel_cased`] lower-cases each key's first letter and the document is the
@@ -85,8 +89,8 @@ use super::provisioning::{
     AWS_JSON_1_0, AWS_JSON_1_1,
 };
 use super::template::{
-    ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
-    SNS_TOPIC, SQS_QUEUE, WAF_REGIONAL_IP_SET,
+    CLOUDWATCH_METRIC_STREAM, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, FIREHOSE_DELIVERY_STREAM,
+    FIS_EXPERIMENT_TEMPLATE, SNS_TOPIC, SQS_QUEUE, WAF_REGIONAL_IP_SET,
 };
 use super::StoredResource;
 
@@ -110,6 +114,7 @@ const NOT_IMPLEMENTED: &str = "NotImplemented";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Provisioner {
     FirehoseDeliveryStream,
+    CloudWatchMetricStream,
     EcrPublicRepository,
     S3Bucket,
     IamRole,
@@ -126,6 +131,7 @@ pub(super) enum Provisioner {
 pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
     match resource_type {
         FIREHOSE_DELIVERY_STREAM => Some(Provisioner::FirehoseDeliveryStream),
+        CLOUDWATCH_METRIC_STREAM => Some(Provisioner::CloudWatchMetricStream),
         ECR_PUBLIC_REPOSITORY => Some(Provisioner::EcrPublicRepository),
         S3_BUCKET => Some(Provisioner::S3Bucket),
         IAM_ROLE => Some(Provisioner::IamRole),
@@ -154,6 +160,7 @@ impl Provisioner {
     ) -> Result<Created, Refusal> {
         match self {
             Self::FirehoseDeliveryStream => create_delivery_stream(ctx, region, resource).await,
+            Self::CloudWatchMetricStream => put_metric_stream(ctx, region, resource).await,
             Self::EcrPublicRepository => create_public_repository(ctx, region, resource).await,
             Self::S3Bucket => create_bucket(ctx, region, resource).await,
             Self::IamRole => create_role(ctx, region, resource).await,
@@ -191,6 +198,20 @@ impl Provisioner {
     ) -> Result<Option<Created>, Refusal> {
         match self {
             Self::SqsQueue => update_queue(ctx, region, resource, declared).await.map(Some),
+            // CloudWatch's own `PutMetricStream` is documented "Creates or updates a metric
+            // stream", so the call that created the stream is the call that applies a
+            // changed declaration to it — under the name the stack gave it, with the
+            // configuration the template now declares.
+            Self::CloudWatchMetricStream => {
+                put_metric_stream_configuration(
+                    ctx,
+                    region,
+                    &resource.physical_resource_id,
+                    declared,
+                )
+                .await
+                .map(Some)
+            }
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -212,6 +233,9 @@ impl Provisioner {
         match self {
             Self::FirehoseDeliveryStream => {
                 delete_delivery_stream(ctx, region, physical_resource_id).await
+            }
+            Self::CloudWatchMetricStream => {
+                delete_metric_stream(ctx, region, physical_resource_id).await
             }
             Self::EcrPublicRepository => {
                 delete_public_repository(ctx, region, physical_resource_id).await
@@ -253,6 +277,9 @@ impl Provisioner {
         match self {
             Self::FirehoseDeliveryStream => {
                 describe_delivery_stream(ctx, region, physical_resource_id).await
+            }
+            Self::CloudWatchMetricStream => {
+                describe_metric_stream(ctx, region, physical_resource_id).await
             }
             Self::EcrPublicRepository => {
                 describe_public_repository(ctx, region, physical_resource_id).await
@@ -367,6 +394,128 @@ async fn describe_delivery_stream(
     .await
     {
         Ok(answer) => Ok(Some(reported_member(&answer, "DeliveryStreamDescription"))),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Amazon CloudWatch: AWS::CloudWatch::MetricStream
+// ---------------------------------------------------------------------------
+
+/// Amazon CloudWatch's signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: monitoring`, service shape `GraniteServiceVersion20100801`), whose
+/// protocol list starts with `awsJson1_0` — the wire this call is written on, as the
+/// service's own suites drive it.
+const CLOUDWATCH_SIGNING_NAME: &str = "monitoring";
+const CLOUDWATCH_TARGET_PREFIX: &str = "GraniteServiceVersion20100801";
+
+/// Create — or update — the metric stream an `AWS::CloudWatch::MetricStream` declares.
+///
+/// The type's properties ARE `PutMetricStream`'s own members: `FirehoseArn`, `RoleArn`,
+/// `OutputFormat`, `IncludeFilters`, `ExcludeFilters`, `StatisticsConfigurations`,
+/// `IncludeLinkedAccountsMetrics` and `Tags` are named identically on both sides (AWS's
+/// resource reference for the type against `PutMetricStreamInput`), so the resolved
+/// property document IS the request, with the one member CloudFormation decides — the
+/// stream's name, which is this resource's physical id — set on the way out.
+///
+/// The same call serves an UPDATE of the stream: "Creates or updates a metric stream …
+/// When you use PutMetricStream to create a new metric stream, the stream is created in
+/// the running state. If you use it to update an existing stream, the state of the stream
+/// is not changed" (`PutMetricStream`). That is why [`put_metric_stream_configuration`] is
+/// also the type's [`Provisioner::update`]: a deployment that changes a declared filter
+/// reaches CloudWatch as the configuration the template now declares, under the same name.
+async fn put_metric_stream(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    put_metric_stream_configuration(
+        ctx,
+        region,
+        &resource.physical_resource_id,
+        &resource.properties,
+    )
+    .await
+}
+
+/// `PutMetricStream` with `properties` as the request and `name` as the one member
+/// CloudFormation decides — the call behind both this type's create and its update, so the
+/// two cannot send a different request for the same declaration. `properties` is the
+/// configuration to put: the resource's own on a create, and the document the deployment
+/// DECLARES on an update.
+async fn put_metric_stream_configuration(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+    properties: &Value,
+) -> Result<Created, Refusal> {
+    let mut request = match properties {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    request.insert("Name".to_string(), Value::String(name.to_string()));
+    let reported = call_json_rpc(
+        ctx,
+        CLOUDWATCH_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{CLOUDWATCH_TARGET_PREFIX}.PutMetricStream"),
+        &Value::Object(request),
+    )
+    .await?;
+    let mut attributes = BTreeMap::new();
+    if let Some(arn) = reported.get("Arn").and_then(Value::as_str) {
+        attributes.insert("Arn".to_string(), arn.to_string());
+    }
+    Ok(Created::attributes(attributes))
+}
+
+/// Delete the metric stream a stack created: "Permanently deletes the metric stream that
+/// you specify."
+///
+/// `DeleteMetricStream` models no not-found error at all (`InternalServiceFault`,
+/// `InvalidParameterValueException` and `MissingRequiredParameterException` are its whole
+/// error list), unlike `GetMetricStream`, so a stream CloudWatch no longer holds is not
+/// refused and there is no not-found code to treat as success here.
+async fn delete_metric_stream(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "Name": physical_resource_id });
+    call_json_rpc(
+        ctx,
+        CLOUDWATCH_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{CLOUDWATCH_TARGET_PREFIX}.DeleteMetricStream"),
+        &request,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The metric stream's configuration as CloudWatch reports it, for drift detection: the
+/// `GetMetricStream` answer, whose members are the type's own property names. A stream
+/// CloudWatch no longer holds (`ResourceNotFoundException`) was deleted.
+async fn describe_metric_stream(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "Name": physical_resource_id });
+    match call_json_rpc(
+        ctx,
+        CLOUDWATCH_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{CLOUDWATCH_TARGET_PREFIX}.GetMetricStream"),
+        &request,
+    )
+    .await
+    {
+        Ok(answer) => Ok(Some(answer)),
         Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
