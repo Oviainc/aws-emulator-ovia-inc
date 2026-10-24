@@ -4,8 +4,9 @@
 //! the rules more than one operation in the site + Outpost lifecycle applies: id
 //! and ARN minting, resolving the `id OR ARN` identifier forms the modelled
 //! `@httpLabel` patterns accept, projecting a resource's tag map and an Outpost's
-//! two Availability Zone identities, materialising the Outpost lifecycle transition
-//! two Availability Zone identities, materialising the Outpost lifecycle transition,
+//! two Availability Zone identities, selecting a site's two addresses by the
+//! modelled `AddressType` and keeping the `Site` projection of the operating one in
+//! step with it, materialising the Outpost lifecycle transition,
 //! the quote expiry and the capacity-task progression the clock owes, cutting an
 //! ordered list into pages with the modelled `Token` the next page resumes from, and
 //! the two rules this service words its refusals by — the `NotFoundException`
@@ -171,6 +172,92 @@ pub struct SiteRecord {
     /// The full shipping address the caller supplied. `Site` carries no shipping
     /// member at all, so this is the only place it is kept.
     pub shipping_address: Option<Address>,
+}
+
+/// Which of a site's two addresses a modelled `AddressType` value names.
+///
+/// The model declares exactly two (`OPERATING_ADDRESS | SHIPPING_ADDRESS`, see
+/// [`crate::ops::types::shared_types::ADDRESS_TYPE_VALUES`]) and a site holds one
+/// of each, so every operation that reads or writes a site address selects the
+/// slot through this one type rather than matching the wire string itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiteAddressKind {
+    /// The address the site itself is at: the one `Site` projects its
+    /// `OperatingAddress{CountryCode,StateOrRegion,City}` members from.
+    Operating,
+    /// The address the site's hardware is shipped to. `Site` carries no
+    /// projection of it.
+    Shipping,
+}
+
+impl SiteAddressKind {
+    /// The slot a modelled `AddressType` value names, or `None` for a value the
+    /// modelled enum does not declare.
+    ///
+    /// The boundary refuses an unmodelled enum value before a handler runs, so
+    /// `None` is the belt-and-braces branch a handler answers as the modelled
+    /// `ValidationException` ([`address_type_value_report`]) rather than assuming
+    /// one of the two.
+    pub fn from_address_type(address_type: &str) -> Option<Self> {
+        match address_type {
+            ADDRESS_TYPE_OPERATING => Some(Self::Operating),
+            ADDRESS_TYPE_SHIPPING => Some(Self::Shipping),
+            _ => None,
+        }
+    }
+
+    /// The modelled `AddressType` value this slot is named by on the wire — what
+    /// an operation that reports the type it acted on answers with.
+    pub fn address_type(self) -> &'static str {
+        match self {
+            Self::Operating => ADDRESS_TYPE_OPERATING,
+            Self::Shipping => ADDRESS_TYPE_SHIPPING,
+        }
+    }
+}
+
+/// The `AddressType` value naming a site's operating address, as the modelled
+/// `AddressType` enum spells it. See [`SiteAddressKind`].
+pub const ADDRESS_TYPE_OPERATING: &str = "OPERATING_ADDRESS";
+
+/// The `AddressType` value naming a site's shipping address. See
+/// [`ADDRESS_TYPE_OPERATING`].
+pub const ADDRESS_TYPE_SHIPPING: &str = "SHIPPING_ADDRESS";
+
+impl SiteRecord {
+    /// This site's address of the given kind, or `None` when the site carries
+    /// none of that kind.
+    ///
+    /// `Site` projects only three members of the operating address, so the whole
+    /// [`Address`] a caller sent is kept on the record and read back from here —
+    /// which is what makes a site address a round trip.
+    pub fn address(&self, kind: SiteAddressKind) -> Option<&Address> {
+        match kind {
+            SiteAddressKind::Operating => self.operating_address.as_ref(),
+            SiteAddressKind::Shipping => self.shipping_address.as_ref(),
+        }
+    }
+
+    /// Store `address` as this site's address of the given kind, replacing
+    /// whatever it held before.
+    ///
+    /// Writing the OPERATING address re-derives the three members `Site` projects
+    /// from it ([`operating_address_projection`]), so the site every later
+    /// `GetSite` / `ListSites` answers can never disagree with the address
+    /// `GetSiteAddress` answers.
+    pub fn set_address(&mut self, kind: SiteAddressKind, address: Address) {
+        match kind {
+            SiteAddressKind::Operating => {
+                self.operating_address = Some(address);
+                let (country_code, state_or_region, city) =
+                    operating_address_projection(self.operating_address.as_ref());
+                self.site.operating_address_country_code = country_code;
+                self.site.operating_address_state_or_region = state_or_region;
+                self.site.operating_address_city = city;
+            }
+            SiteAddressKind::Shipping => self.shipping_address = Some(address),
+        }
+    }
 }
 
 /// A persisted Outpost: the modelled [`Outpost`] plus its creation order, the
@@ -542,6 +629,18 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         self.capacity_tasks
             .values()
             .find(|task| task.order_id.as_deref() == Some(order_id) && task.is_active())
+    }
+
+    /// The Outpost that still belongs to `site_id`, if the store holds one.
+    ///
+    /// An Outpost names the site it lives at, so what this answers is whether that
+    /// site still has hardware at it: the fact `DeleteSite` refuses a delete on and
+    /// a change to the site's OPERATING address conflicts with. Stated once here so
+    /// the two cannot disagree about what "the site still has an Outpost" means.
+    pub fn outpost_at_site(&self, site_id: &str) -> Option<&OutpostRecord> {
+        self.outposts
+            .values()
+            .find(|record| record.outpost.site_id.as_deref() == Some(site_id))
     }
 
     /// Every `BlockingResourceType` this store observes still associated with
@@ -1118,6 +1217,10 @@ pub const RESOURCE_ARN_MEMBER: &str = "resourceArn";
 /// See [`SITE_ID_MEMBER`].
 pub const TAGS_MEMBER: &str = "tags";
 
+/// The validation-path name of the `AddressType` input member the two site-address
+/// operations take. See [`SITE_ID_MEMBER`].
+pub const ADDRESS_TYPE_MEMBER: &str = "addressType";
+
 /// How many entries the modelled `TagMap` holds (`@length(min: 1, max: 50)`).
 ///
 /// It is the bound on a RESOURCE's tag map and not only on one request's: the
@@ -1254,6 +1357,42 @@ pub fn outpost_id_pattern_report() -> String {
 /// so the caller can poll exactly that one.
 pub fn capacity_task_conflict(resource_type: &str, resource_id: &str, active: &str) -> String {
     format!("{resource_type} {resource_id} already has an active capacity task: {active}")
+}
+
+/// The report an `AddressType` outside the modelled enum states, for a handler
+/// that selects a site's address slot from it itself.
+///
+/// The boundary refuses such a value first — the modelled `AddressType` is an
+/// enum, so its value set is validated before a handler runs — so this is the
+/// modelled fallback, worded by the same rule as every other constraint this
+/// service reports. See [`site_id_pattern_report`].
+pub fn address_type_value_report() -> String {
+    constraint_report(
+        ADDRESS_TYPE_MEMBER,
+        ViolationKind::EnumValue(
+            crate::ops::types::ADDRESS_TYPE_VALUES
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        ),
+    )
+}
+
+/// How this service states that a site's OPERATING address cannot be changed
+/// while an Outpost still belongs to that site.
+///
+/// AWS documents the rule — "You can update the operating address before you
+/// place an order at the site, or after all Outposts that belong to the site have
+/// been deactivated" (`UpdateSiteAddress`) — but publishes no wording for the
+/// refusal, so the sentence is the emulator's own; what a caller branches on is
+/// the `ConflictException` code (HTTP 409) and the `ResourceId` / `ResourceType`
+/// members naming the Outpost that holds the address, which is the one the caller
+/// has to deactivate first.
+pub fn site_address_conflict(site_id: &str, outpost_id: &str) -> String {
+    format!(
+        "the operating address of site {site_id} cannot be updated while Outpost \
+         {outpost_id} belongs to it"
+    )
 }
 
 /// The `ResourceType` a capacity-task conflict on an Outpost names, from the

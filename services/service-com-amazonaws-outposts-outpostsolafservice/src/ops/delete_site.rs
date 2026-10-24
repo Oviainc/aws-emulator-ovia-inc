@@ -169,11 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // site being in some transient state, so it is the modelled
         // `ValidationException` (400) — `ConflictException` (409) would tell an SDK
         // retry policy and a client's conflict branch that waiting might help.
-        if store
-            .outposts
-            .values()
-            .any(|record| record.outpost.site_id.as_deref() == Some(site_id.as_str()))
-        {
+        if store.outpost_at_site(&site_id).is_some() {
             return Err(DeleteSiteErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(format!(

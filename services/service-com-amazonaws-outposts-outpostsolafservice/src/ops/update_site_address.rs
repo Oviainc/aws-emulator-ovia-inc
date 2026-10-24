@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSiteAddress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSiteAddress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: writes the whole `Address` the request carries into the slot its
+//! `AddressType` names on the stored site the `SiteId` resolves to — the bare id or the
+//! full ARN the modelled label pattern accepts — and answers the address as stored, with
+//! the type it was stored under. Writing the OPERATING address re-derives the three
+//! members `Site` projects from it, so `GetSite` and `ListSites` stay in step with
+//! `GetSiteAddress`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSiteAddress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The documented limit on WHEN the operating address may change — "You can update the
+//! operating address before you place an order at the site, or after all Outposts that
+//! belong to the site have been deactivated" — is the modelled `ConflictException` (409)
+//! while an Outpost still belongs to the site; see
+//! [`crate::state::site_address_conflict`].
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +157,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSiteAddress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSiteAddressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSiteAddress"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateSiteAddressErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+        // Which of the site's two addresses this call is about. The modelled
+        // `AddressType` enum is validated at the boundary, so an unmodelled value
+        // never reaches here; it is still refused as that modelled constraint rather
+        // than silently taken for one of the two.
+        let kind = crate::state::SiteAddressKind::from_address_type(&input.address_type)
+            .ok_or_else(|| {
+                UpdateSiteAddressErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::address_type_value_report()),
+                })
+            })?;
+        // `SiteId` accepts the bare id or the full site ARN; both name the same
+        // stored record.
+        let site_id = crate::state::resolve_site_id(&input.site_id).ok_or_else(|| {
+            UpdateSiteAddressErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::site_id_pattern_report()),
+            })
+        })?;
+
+        // How this operation states that the `SiteId` names no site this store
+        // holds: the identifier echo of the value AS SUPPLIED — not of `site_id`,
+        // which is the bare id an ARN resolved to.
+        let not_found = || {
+            UpdateSiteAddressErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::SITE_ID_MEMBER,
+                    &input.site_id,
+                )),
+            })
+        };
+
+        let mut store = state.lock();
+        // An identifier that names no site is answered before anything about a
+        // site's Outposts is read.
+        if !store.sites.contains_key(&site_id) {
+            return Err(not_found().into());
+        }
+        // The Outpost that holds the site's OPERATING address, read before the
+        // mutable borrow below. A shipping address is unaffected: the documented
+        // limit is on the address the site itself is at.
+        let blocking = match kind {
+            crate::state::SiteAddressKind::Operating => store
+                .outpost_at_site(&site_id)
+                .and_then(|record| record.outpost.outpost_id.clone()),
+            crate::state::SiteAddressKind::Shipping => None,
+        };
+        // An Outpost at the site still depends on where that site is, so the
+        // operating address is held until no Outpost belongs to it. Nothing is
+        // written: the stored addresses are left exactly as they were.
+        if let Some(outpost_id) = blocking {
+            return Err(UpdateSiteAddressErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::site_address_conflict(&site_id, &outpost_id)),
+                    resource_id: Some(outpost_id),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_OUTPOST.to_string()),
+                },
+            )
+            .into());
+        }
+        let record = store.sites.get_mut(&site_id).ok_or_else(not_found)?;
+        // The whole address replaces the stored one of that type: `Address` is one
+        // `@required` structure, not a set of patchable members, so there is nothing
+        // to merge.
+        record.set_address(kind, input.address);
+
+        Ok(UpdateSiteAddressOutput {
+            // Answered from what was stored, so the reply cannot differ from what
+            // `GetSiteAddress` answers next.
+            address: record.address(kind).cloned(),
+            address_type: Some(kind.address_type().to_string()),
+        })
     }
 }
