@@ -1,15 +1,37 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPackageVersionAsset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPackageVersionAsset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPackageVersionAsset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Downloads ONE asset of a stored package version, byte for byte as
+//! `PublishPackageVersion` was given it.
+//!
+//! The read walks the whole coordinate a CodeArtifact asset is addressed by — domain
+//! (optionally pinned to its `domainOwner`), repository, the `(format, namespace,
+//! package)` triple that identifies a package, the version string, and finally the asset
+//! NAME inside that version — and answers with the stored bytes as the HTTP payload plus
+//! the asset's name, the version and the version's current `versionRevision` in headers
+//! (`X-AssetName`, `X-PackageVersion`, `X-PackageVersionRevision`). Every step that does
+//! not resolve is `ResourceNotFoundException` (404) naming the resource that was missing
+//! in `resourceType`/`resourceId`, so a client can tell an unknown repository from an
+//! unknown version or an unknown asset.
+//!
+//! `packageVersionRevision` is a PRECONDITION on the version's content, not part of its
+//! address: this store holds exactly the current revision of each version (a revision is
+//! derived from the content it describes — [`crate::state::PackageVersion::revision`]), so
+//! a request pinned to any other revision is refused with `ConflictException` (409), "the
+//! operation did not succeed because prerequisites are not met". That is the same
+//! precondition the batch operations of this service report as the
+//! `PackageVersionErrorCode` `MISMATCHED_REVISION`; it is a conflict rather than a
+//! not-found because the version IS held, at a revision other than the one asked for.
+//!
+//! A version's STATUS is not a gate here, and deliberately: the only status that makes an
+//! asset unavailable in this store is `Disposed`, whose assets `DisposePackageVersions`
+//! deleted, and that version holds no asset to find, so it answers 404 on the asset like
+//! any other name the version does not hold. No modelled text makes any other status
+//! refuse this read.
+//!
+//! This is a REPORTING operation: the store guard is taken immutably, so nothing a later
+//! caller sees can move because an asset was downloaded.
 //!
 //! ## Shape of an operation
 //!
@@ -184,20 +206,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPackageVersionAsset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPackageVersionAssetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPackageVersionAsset"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetPackageVersionAssetErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        // A read: the guard is taken immutably, so no later caller sees anything move
+        // because this asset was downloaded.
+        let store = state.lock();
+
+        let Some(domain) = store.domain(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(not_found(
+                crate::state::domain_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                ),
+                &input.domain,
+                crate::state::DOMAIN_RESOURCE_TYPE,
+            ));
+        };
+        let Some(repository) = domain.repositories.get(&input.repository) else {
+            return Err(not_found(
+                crate::state::repository_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                    &input.repository,
+                ),
+                &input.repository,
+                crate::state::REPOSITORY_RESOURCE_TYPE,
+            ));
+        };
+        // A package is identified by its whole `(format, namespace, name)` triple: the
+        // same name in another format, or under another namespace, is another package.
+        let Some(package) =
+            repository.package(&input.format, input.namespace.as_deref(), &input.package)
+        else {
+            return Err(not_found(
+                crate::state::package_coordinate_not_found_message(
+                    &input.format,
+                    input.namespace.as_deref(),
+                    &input.package,
+                    &input.repository,
+                ),
+                &input.package,
+                PACKAGE_RESOURCE_TYPE,
+            ));
+        };
+        // The package exists; the version it was asked for may not. Reported as the
+        // package-version that is missing, by its fully-qualified identity inside the
+        // repository, so a client can tell this from an unknown package name.
+        let Some(version) = package.versions.get(&input.package_version) else {
+            return Err(not_found(
+                crate::state::package_version_not_found_message(
+                    &input.package,
+                    &input.package_version,
+                    &input.repository,
+                ),
+                &crate::state::package_version_resource_id(
+                    input.namespace.as_deref(),
+                    &input.package,
+                    &input.package_version,
+                ),
+                PACKAGE_VERSION_RESOURCE_TYPE,
+            ));
+        };
+
+        // Computed once: it is both the precondition this request may pin and the
+        // revision the answer reports.
+        let revision = version.revision();
+        if let Some(expected) = &input.package_version_revision {
+            if &revision != expected {
+                return Err(GetPackageVersionAssetErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "Package version {} {} is at revision {}, not the requested revision {}.",
+                            input.package, input.package_version, revision, expected
+                        ),
+                        resource_id: Some(crate::state::package_version_resource_id(
+                            input.namespace.as_deref(),
+                            &input.package,
+                            &input.package_version,
+                        )),
+                        resource_type: Some(PACKAGE_VERSION_RESOURCE_TYPE.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(asset) = version.assets.get(&input.asset) else {
+            return Err(not_found(
+                format!(
+                    "Asset {} not found in package version {} {} in repository {}.",
+                    input.asset, input.package, input.package_version, input.repository
+                ),
+                &input.asset,
+                ASSET_RESOURCE_TYPE,
+            ));
+        };
+
+        Ok(GetPackageVersionAssetOutput {
+            // Verbatim: the stored bytes are what was published, and this operation is
+            // the download path for them.
+            asset: asset.content().to_vec(),
+            // The STORED name, not the requested string — the lookup is exact, so they
+            // agree, and the answer reports the record.
+            asset_name: Some(asset.name().to_string()),
+            package_version: Some(version.version.clone()),
+            package_version_revision: Some(revision),
+        })
     }
+}
+
+/// `ResourceType$package` — the type a refusal reports for a package coordinate.
+/// (`ResourceType` models exactly `asset`, `domain`, `package`, `package-version` and
+/// `repository`; see `RESOURCE_TYPE_VALUES` in [`super::types`].)
+const PACKAGE_RESOURCE_TYPE: &str = "package";
+
+/// `ResourceType$package-version`.
+const PACKAGE_VERSION_RESOURCE_TYPE: &str = "package-version";
+
+/// `ResourceType$asset`.
+const ASSET_RESOURCE_TYPE: &str = "asset";
+
+/// A `ResourceNotFoundException` (404) naming the resource that was addressed, so a
+/// caller can tell an unknown domain or repository from an unknown package, version or
+/// asset.
+fn not_found(
+    message: String,
+    resource_id: &str,
+    resource_type: &str,
+) -> GetPackageVersionAssetError {
+    GetPackageVersionAssetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    })
+    .into()
 }
