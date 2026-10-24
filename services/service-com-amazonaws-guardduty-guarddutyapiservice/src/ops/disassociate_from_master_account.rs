@@ -1,15 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateFromMasterAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateFromMasterAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: the DEPRECATED name of the MEMBER side of the GuardDuty association —
+//! "this operation is deprecated, use DisassociateFromAdministratorAccount instead"
+//! (`smithy_query(operation="DisassociateFromMasterAccount")`). The two names are ONE
+//! behaviour: it drops the administrator relationship the account that owns
+//! `DetectorId` accepted an invitation into, so the administrator reads
+//! (`GetMasterAccount` / `GetAdministratorAccount`) report none afterwards. The lookup
+//! and the write go through
+//! [`crate::state::ComAmazonawsGuarddutyGuarddutyapiserviceState::disassociate_detector_from_administrator`],
+//! the seam this operation SHARES with
+//! [`crate::ops::disassociate_from_administrator_account`], so the two names cannot
+//! disagree; it advances the mutation clock only on the path that writes.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateFromMasterAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Nothing else moves. The member records this detector's account ADMINISTERS are the
+//! other side of the relationship and are untouched, and the accepted invitation is
+//! not put back in the inbox: "the member account details obtained from the
+//! CreateMembers API, including the associated email addresses, are retained. This is
+//! done so that the delegated administrator can invoke the InviteMembers API without
+//! the need to invoke the CreateMembers API again" (the modelled contract below) —
+//! re-association is the administrator's call, through a fresh invitation.
+//!
+//! An account that has accepted no invitation has no relationship to leave, so the
+//! call is refused with HTTP 400 under the `InvalidInputException` class
+//! ([`crate::state::NO_ADMINISTRATOR_MESSAGE`]) and writes nothing: this operation
+//! models no per-account result the way `DisassociateMembers`' `UnprocessedAccounts`
+//! does, so its only client-error channel is the `BadRequestException` envelope. A
+//! `DetectorId` this account/Region does not own is refused the same way.
+//!
+//! The contract below also refuses a disassociation "with autoEnableOrganizationMembers
+//! configuration for your organization set to ALL" under the modern name. That
+//! configuration is not modelled yet, so no request can set it and no call can be
+//! refused for it; when it is, that refusal belongs on the shared state seam.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +163,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateFromMasterAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateFromMasterAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateFromMasterAccount"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DisassociateFromMasterAccountErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        let mut state = state.lock();
+        // One lookup, in the store: only the Region's endpoint that serves the
+        // detector holds the relationship, and only the account that owns it can
+        // leave that relationship. The seam advances the mutation clock ONLY on the
+        // path that writes, so neither refusal below moves it.
+        match state.disassociate_detector_from_administrator(&region, &input.detector_id) {
+            // The detector is not one this account/Region holds.
+            None => Err(not_owned(&input.detector_id)),
+            // It is, but its account has accepted no invitation, so there is no
+            // relationship to leave. Reported as the absence rather than as a hollow
+            // success: this operation models no per-account result.
+            Some(false) => Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::NO_ADMINISTRATOR_MESSAGE,
+            )),
+            Some(true) => Ok(DisassociateFromMasterAccountOutput {}),
+        }
     }
+}
+
+/// Refuse a well-formed `DetectorId` this account/Region does not own, and a value
+/// that is not a detector id at all as the parameter failure it is.
+///
+/// GuardDuty does not distinguish "never existed" from "belongs to someone else",
+/// which is also what keeps one account from probing another's detector ids.
+fn not_owned(detector_id: &str) -> DisassociateFromMasterAccountError {
+    crate::scaffolded::Scaffolded::invalid_input(crate::state::detector_id_rejection(detector_id))
 }

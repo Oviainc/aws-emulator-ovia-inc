@@ -33,8 +33,8 @@
 //! The deprecated twin `DisassociateFromMasterAccount` ("this operation is deprecated,
 //! use DisassociateFromAdministratorAccount instead",
 //! `smithy_query(operation="DisassociateFromMasterAccount")`) is one behaviour under the
-//! old name and is still a scaffold with a stub issue of its own; the state helper above
-//! is the seam it shares, so the two cannot disagree once it is written.
+//! old name and is implemented over the same state seam above, so the two cannot
+//! disagree.
 //!
 //! This is the ONLY file to touch for this operation.
 //!

@@ -55,6 +55,8 @@ mod malware_scan_description;
 mod malware_scan_lifecycle;
 #[path = "all/malware_scan_settings.rs"]
 mod malware_scan_settings;
+#[path = "all/master_account_disassociation.rs"]
+mod master_account_disassociation;
 #[path = "all/member_accounts.rs"]
 mod member_accounts;
 #[path = "all/member_association.rs"]
