@@ -17,6 +17,14 @@
 //! `ResourceNotFoundException` for this operation, so an unknown workspace is a
 //! `ValidationException` too.
 //!
+//! The `externalId` filter selects on "the external-Id property of a
+//! component", which is the property whose definition carries `isExternalId`.
+//! That definition normally lives on the component TYPE the component
+//! instantiates, so the filter is resolved through
+//! [`crate::state::Workspace::component_external_ids`] and a component that
+//! supplies only the VALUE of its type's external-id property is still
+//! selected.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -235,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut matching = workspace
             .entities
             .values()
-            .filter(|entity| matches_filter(entity, filter))
+            .filter(|entity| matches_filter(workspace, entity, filter))
             .skip_while(|entity| {
                 resume_at
                     .as_deref()
@@ -273,7 +281,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// Whether `entity` is in the list the single accepted filter selects. With no
 /// filter every entity of the workspace is.
-fn matches_filter(entity: &crate::state::Entity, filter: Option<&ListEntitiesFilter>) -> bool {
+///
+/// `workspace` is the entity's own workspace, which the `externalId` filter
+/// needs: which property of a component is its external id is declared on a
+/// component TYPE, so the filter is answered against the workspace's component
+/// types rather than off the entity alone.
+fn matches_filter(
+    workspace: &crate::state::Workspace,
+    entity: &crate::state::Entity,
+    filter: Option<&ListEntitiesFilter>,
+) -> bool {
     match filter {
         None => true,
         Some(ListEntitiesFilter::parentEntityId(parent_entity_id)) => {
@@ -287,8 +304,35 @@ fn matches_filter(entity: &crate::state::Entity, filter: Option<&ListEntitiesFil
         Some(ListEntitiesFilter::externalId(external_id)) => entity
             .components
             .values()
-            .any(|component| component.external_ids().any(|id| id == external_id)),
+            .any(|component| carries_external_id(workspace, component, external_id)),
     }
+}
+
+/// Whether `component`, or any composite component inside it, carries
+/// `external_id` as the value of its external-id property.
+///
+/// A composite component is a component of the entity too — `GetEntity` reports
+/// it as one — and it carries a `componentTypeId` and properties of its own, so
+/// the external id it names is resolved the same way the holding component's
+/// is: through [`crate::state::Workspace::component_external_ids`], which reads
+/// `isExternalId` off the EFFECTIVE definition of each property rather than off
+/// an entity-local one.
+fn carries_external_id(
+    workspace: &crate::state::Workspace,
+    component: &crate::state::ComponentRecord,
+    external_id: &str,
+) -> bool {
+    workspace
+        .component_external_ids(component.component_type_id.as_deref(), &component.properties)
+        .contains(external_id)
+        || component.composite_components.values().any(|composite| {
+            workspace
+                .component_external_ids(
+                    Some(composite.component_type_id.as_str()),
+                    &composite.properties,
+                )
+                .contains(external_id)
+        })
 }
 
 /// The envelope a `nextToken` of this service carries, so a token minted
