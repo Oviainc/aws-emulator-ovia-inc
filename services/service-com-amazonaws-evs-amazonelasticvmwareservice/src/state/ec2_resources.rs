@@ -731,9 +731,9 @@ fn environment_zone(
 /// when it cannot take `count` more — `None` when there is room (or no readable store,
 /// which refuses nothing).
 ///
-/// A READ, so a create can refuse on the EC2 subnet ceiling BEFORE it reserves anything
-/// of its own: [`provision_vlan_subnets`] enforces the same ceiling, and writes nothing
-/// when it is reached, but by then the create has already taken an environment slot.
+/// A READ, so a create can refuse on the EC2 subnet ceiling BEFORE it mints anything of
+/// its own: [`provision_vlan_subnets`] enforces the same ceiling and writes nothing when
+/// it is reached, but by then the create has already minted an environment id.
 pub fn subnet_room_shortfall<Eng: Send + Sync + 'static>(
     engine: &Eng,
     count: usize,

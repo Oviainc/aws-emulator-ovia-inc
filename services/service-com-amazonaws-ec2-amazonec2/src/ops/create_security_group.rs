@@ -227,8 +227,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state_handle.lock();
 
         // "The ID of the VPC. Required for a nondefault VPC" (`$VpcId`): a request that
-        // names none creates the group in the account's DEFAULT VPC, which is also the VPC
-        // an instance launched without a subnet lands in.
+        // names none creates the group in the DEFAULT VPC OF THE REGION it is signed for,
+        // which is also the VPC an instance launched there without a subnet lands in.
         let vpc_id = match input.vpc_id.as_deref().filter(|id| !id.is_empty()) {
             Some(vpc_id) => {
                 if !store.vpcs.contains_key(vpc_id) {
@@ -236,10 +236,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 vpc_id.to_string()
             }
-            None => match store.default_vpc_id() {
-                Some(default_vpc) => default_vpc,
-                None => return Err(state::vpc_id_not_specified()),
-            },
+            None => {
+                // The Region's ambient default network is the account's whatever it has
+                // created ("when you create an AWS account, we create a default VPC for
+                // you in each AWS Region" — Amazon VPC User Guide, "Default VPCs"), so it
+                // is materialised here before the fall-back is resolved. A Region whose
+                // default VPC has been deleted has none to fall back on.
+                store.ensure_default_network(&region);
+                match store.default_vpc_id(&region) {
+                    Some(default_vpc) => default_vpc,
+                    None => return Err(state::vpc_id_not_specified()),
+                }
+            }
         };
 
         // "You can't have two security groups for the same VPC with the same name"
