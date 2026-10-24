@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetInstanceAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetInstanceAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Resets one attribute of one instance to its default value.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetInstanceAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `Attribute` names the attribute to reset, and only the three a caller may reset are
+//! accepted (`crate::state::RESETTABLE_INSTANCE_ATTRIBUTES`): `kernel` and `ramdisk` go
+//! back to the ones the instance's AMI carries
+//! (`crate::state::ComAmazonawsEc2Amazonec2State::image_kernel_and_ramdisk`),
+//! `sourceDestCheck` back to `crate::state::DEFAULT_SOURCE_DEST_CHECK`. The restored
+//! value is written on the stored instance, so `DescribeInstances` reports it from then
+//! on. Refusals, through [`crate::scaffolded`]: HTTP 400 `InvalidParameterValue`
+//! for an attribute outside that set, HTTP 400 `InvalidInstanceID.Malformed` /
+//! `InvalidInstanceID.NotFound` for an id this account cannot resolve, HTTP 400
+//! `IncorrectInstanceState` when the instance's state does not admit the reset
+//! (`kernel` and `ramdisk` need a stopped instance), and HTTP 412 `DryRunOperation`
+//! for a dry run that would have succeeded.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +161,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetInstanceAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetInstanceAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetInstanceAttribute"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            require_known_instance, require_service_state, InstanceStateName,
+            DEFAULT_SOURCE_DEST_CHECK, INSTANCE_ATTRIBUTE_KERNEL, INSTANCE_ATTRIBUTE_RAMDISK,
+            INSTANCE_ATTRIBUTE_SOURCE_DEST_CHECK, RESETTABLE_INSTANCE_ATTRIBUTES,
+        };
+
+        // "You can only reset the following attributes: kernel | ramdisk |
+        // sourceDestCheck" (`ResetInstanceAttributeRequest$Attribute`). Every other
+        // `InstanceAttributeName` is a well-formed value this operation cannot act on, so
+        // it is refused with the code EC2 answers a value it rejects with rather than
+        // silently doing nothing. The modelled enum constraint is refused by the request
+        // walk before this handler runs; this narrows that enum to the resettable subset
+        // the operation documents.
+        let attribute = input.attribute.as_str();
+        if !RESETTABLE_INSTANCE_ATTRIBUTES.contains(&attribute) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Value ({attribute}) for parameter attribute is invalid. \
+                 You can only reset the following attributes: {resettable}",
+                resettable = RESETTABLE_INSTANCE_ATTRIBUTES.join(" | "),
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // A state the clock already owes this instance is materialised before its state is
+        // read, so the precondition below is judged on the state the same instant's
+        // `DescribeInstances` would report.
+        store.materialize_due_transitions();
+
+        // The one definition of how this service resolves an instance id: malformed before
+        // unknown.
+        require_known_instance(&store, &input.instance_id)?;
+        let Some(instance) = store.instances.get(&input.instance_id) else {
+            return Err(Scaffolded::invalid_instance_id_not_found(&input.instance_id));
+        };
+
+        // "To reset the kernel or ramdisk, the instance must be in a stopped state. To
+        // reset the sourceDestCheck, the instance can be either running or stopped"
+        // (`ResetInstanceAttribute`). `pending` and `stopping` are transient states on
+        // their way to exactly `running` and `stopped`, so they are admitted for
+        // `sourceDestCheck`; an instance on its way to `terminated` has no attributes left
+        // to reset, and one that is not stopped cannot have its kernel or RAM disk
+        // swapped.
+        let instance_state = instance.state;
+        let admitted = if attribute == INSTANCE_ATTRIBUTE_SOURCE_DEST_CHECK {
+            !instance_state.is_terminating()
+        } else {
+            instance_state == InstanceStateName::Stopped
+        };
+        if !admitted {
+            return Err(Scaffolded::incorrect_instance_state(
+                &input.instance_id,
+                instance_state.as_str(),
+                &format!("reset for the {attribute} attribute"),
+            ));
+        }
+
+        // The default this reset restores for `kernel` and `ramdisk`: the pair the
+        // instance's own AMI carries, read through the same helper the launch path uses.
+        let image_id = instance.image_id.clone();
+        let (image_kernel_id, image_ramdisk_id) =
+            store.image_kernel_and_ramdisk(image_id.as_deref());
+
+        // DryRun sits after every check that could refuse the request and before the one
+        // write: "If you have the required permissions, the error response is
+        // DryRunOperation" (`DryRun`), so a request that would have been refused is
+        // refused with that reason instead, and one that would have succeeded leaves the
+        // instance untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let Some(instance) = store.instances.get_mut(&input.instance_id) else {
+            return Err(Scaffolded::invalid_instance_id_not_found(&input.instance_id));
+        };
+        // Exactly the attribute the request named goes back to its default; every other
+        // attribute of the instance is left as it stands.
+        match attribute {
+            INSTANCE_ATTRIBUTE_KERNEL => instance.kernel_id = image_kernel_id,
+            INSTANCE_ATTRIBUTE_RAMDISK => instance.ramdisk_id = image_ramdisk_id,
+            INSTANCE_ATTRIBUTE_SOURCE_DEST_CHECK => {
+                instance.source_dest_check = DEFAULT_SOURCE_DEST_CHECK;
+            }
+            // The guard above admits only the three arms named here.
+            other => {
+                return Err(Scaffolded::internal_error(format!(
+                    "'{other}' is not a resettable attribute of an instance"
+                )))
+            }
+        }
+
+        Ok(ResetInstanceAttributeOutput)
     }
 }
