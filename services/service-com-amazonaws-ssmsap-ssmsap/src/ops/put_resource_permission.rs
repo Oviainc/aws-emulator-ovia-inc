@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Grants a source resource permission to take a `PermissionActionType` on a target
+//! resource, and answers the target's resulting policy document.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The grant is the (target resource ARN, action type, source resource ARN) triple
+//! held in [`crate::state::ComAmazonawsSsmsapSsmsapState::resource_permissions`], so
+//! granting the same triple twice leaves ONE grant and the response is the same
+//! document both times. The `Policy` this returns is not assembled here: it is
+//! projected from the stored grants by
+//! [`crate::state::ComAmazonawsSsmsapSsmsapState::resource_policy`], the same
+//! projection `GetResourcePermission` reads back, narrowed to the `ActionType` this
+//! call named ("the policy that adds permissions on the target database").
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +144,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePermission"))
+        // The Region this request was signed for: the grant is made in THIS Region's
+        // partition, so a permission granted at one regional endpoint is neither read
+        // nor reported through another.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutResourcePermissionErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+        // Every handler materialises what the clock already owes first, so this call
+        // reports the same thing about every resource as any other call at this instant.
+        state.settle(::std::time::SystemTime::now());
+
+        // `ActionType`, `ResourceArn` and `SourceResourceArn` are all modelled
+        // `@required` with their own constraints, so reaching here means each is
+        // present and well formed. Nothing else about the two ARNs can be checked
+        // against state: this emulator holds no database or component registry (both
+        // `GetDatabase` and `ListDatabases` are still scaffolds), so it cannot tell a
+        // target that exists from one that does not, and answering the modelled
+        // `ResourceNotFoundException` here would refuse requests that are valid.
+        // The emulator's own ceiling on how many Regions it keeps a partition for; the
+        // Region comes from the caller's credential scope, so this is what stops
+        // made-up Regions growing the store without bound. Checked BEFORE
+        // `region_entry` mints one, so a refused grant leaves no partition behind.
+        if !state.holds_region(&region) && state.region_count() >= crate::state::MAX_REGIONS {
+            return Err(PutResourcePermissionErrorModeled::ValidationException(
+                crate::state::validation(format!(
+                    "Cannot grant {} on {} in {region}: this emulator holds permissions in at most {} Regions",
+                    input.action_type,
+                    input.resource_arn,
+                    crate::state::MAX_REGIONS
+                )),
+            )
+            .into());
+        }
+
+        let outcome = state.region_entry(&region).grant_resource_permission(
+            &input.resource_arn,
+            &input.action_type,
+            &input.source_resource_arn,
+        );
+        if let Err(refusal) = outcome {
+            // A refused grant leaves nothing behind — including the partition this call
+            // may have just minted for a Region that holds nothing else.
+            state.forget_region_if_empty(&region);
+            return Err(PutResourcePermissionErrorModeled::ValidationException(refusal).into());
+        }
+
+        // The grant just made is part of the document, so this always renders at least
+        // one statement.
+        let policy = state
+            .region(&region)
+            .resource_policy(&input.resource_arn, Some(&input.action_type));
+
+        Ok(PutResourcePermissionOutput { policy })
     }
 }

@@ -27,8 +27,14 @@
 //! [`StoredApplication::view`] / [`StoredApplication::summary`] /
 //! [`StoredOperation::view`] / [`StoredConfigurationCheckOperation::view`], so no
 //! handler assembles a response member by hand.
+//!
+//! Resource permissions work the same way: `PutResourcePermission` grants and
+//! `GetResourcePermission` reads the SAME triples in [`RegionState::resource_permissions`],
+//! and the `Policy` document both report is PROJECTED from them by
+//! [`RegionState::resource_policy`] — so a grant is observable by every later read in
+//! that Region and neither handler writes a policy document of its own.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -146,6 +152,45 @@ pub const MAX_RETAINED_OPERATIONS: usize = 10_000;
 /// the ceiling it clamps a requested page to: the model's own `MaxResults` range is
 /// 1..50, so 50 is both the largest page the API allows and the default page.
 pub const MAX_PAGE_SIZE: i32 = 50;
+
+/// The `Version` of a rendered resource policy document: the current IAM policy
+/// language version, which is what every AWS resource policy document carries.
+pub const POLICY_VERSION: &str = "2012-10-17";
+
+/// The `Effect` of a statement a resource permission grant renders to. A grant adds
+/// permission, so the statement it renders to allows.
+pub const POLICY_EFFECT_ALLOW: &str = "Allow";
+
+/// How many distinct target resources one Region will hold permissions for, and how
+/// many source resources may be granted one action type on one target.
+///
+/// The real service caps a resource policy by document size rather than by grant
+/// count, so neither number is a fidelity claim about a published quota: together they
+/// are the emulator's own ceiling, generous enough that no realistic workflow meets
+/// them, so a caller looping on `PutResourcePermission` cannot grow this process's
+/// memory without bound. Both are checked in constant time and reported with
+/// `ValidationException`, which `PutResourcePermission` models.
+pub const MAX_PERMISSIONED_RESOURCES: usize = 1_000;
+
+/// How many source resources may hold one action type on one target. See
+/// [`MAX_PERMISSIONED_RESOURCES`].
+pub const MAX_PERMISSION_SOURCES_PER_RESOURCE: usize = 100;
+
+/// The grants held for ONE resource: `PermissionActionType` -> the source resource
+/// ARNs permitted to take that action on it.
+///
+/// `BTreeMap`/`BTreeSet` rather than the hashed containers because the rendered policy
+/// document's statement order has to be the same for every read of an unchanged
+/// resource, and because a repeated grant of the same triple must be the same single
+/// statement (the set is what makes `PutResourcePermission` idempotent).
+pub type ResourceGrants = BTreeMap<String, BTreeSet<String>>;
+
+/// The `Action` a statement names for `action_type`: this service's ARN namespace
+/// (its IAM action prefix, [`ARN_SERVICE`]) and the `PermissionActionType` the grant
+/// was made with, which is how an IAM action is spelled.
+pub fn permission_policy_action(action_type: &str) -> String {
+    format!("{ARN_SERVICE}:{action_type}")
+}
 
 /// A status change the clock owes an application: at `due_at` the application takes
 /// `status`/`discovery_status`, whether or not anybody called.
@@ -430,7 +475,8 @@ pub fn configuration_checks_to_run(requested: Option<&[String]>) -> Vec<String> 
 }
 
 /// Everything Systems Manager for SAP holds in ONE Region: the applications registered
-/// there, the operation records filed there, and their tags.
+/// there, the operation records filed there, their tags, and the resource permissions
+/// granted there.
 ///
 /// The service is regional, so a registration lives in the account AND the Region it was
 /// made in: that is why every application ARN embeds a Region
@@ -464,6 +510,13 @@ pub struct RegionState {
     /// (`TagResource`/`UntagResource`/`ListTagsForResource`) have one place to join.
     /// An application ARN embeds its Region, so these keys are this Region's ARNs.
     pub tags_by_arn: HashMap<String, HashMap<String, String>>,
+    /// The resource permission grants held for each target resource ARN, written by
+    /// `PutResourcePermission` and read by `GetResourcePermission`, so both report one
+    /// policy for a resource rather than two copies of it.
+    ///
+    /// A `BTreeMap` for the same reason as [`ResourceGrants`]: the policy document a
+    /// read renders has to be byte-identical between reads of an unchanged resource.
+    pub resource_permissions: BTreeMap<String, ResourceGrants>,
 }
 
 impl RegionState {
@@ -491,6 +544,7 @@ impl RegionState {
             && self.operations.is_empty()
             && self.configuration_check_operations.is_empty()
             && self.tags_by_arn.is_empty()
+            && self.resource_permissions.is_empty()
     }
 
     /// Resolve the application a request names by its id, its ARN, or its AppRegistry
@@ -535,6 +589,86 @@ impl RegionState {
             .get(arn)
             .filter(|tags| !tags.is_empty())
             .cloned()
+    }
+
+    /// Permit `source_resource_arn` to take `action_type` on `resource_arn`.
+    ///
+    /// Adding a grant that is already held changes nothing — the grant is the
+    /// (resource, action type, source) triple, so a repeated `PutResourcePermission`
+    /// leaves one statement rather than a duplicate — and `Ok(false)` reports that
+    /// nothing was added. Refuses with the modelled `ValidationException` at the
+    /// store ceilings ([`MAX_PERMISSIONED_RESOURCES`],
+    /// [`MAX_PERMISSION_SOURCES_PER_RESOURCE`]), and writes nothing when it refuses.
+    pub fn grant_resource_permission(
+        &mut self,
+        resource_arn: &str,
+        action_type: &str,
+        source_resource_arn: &str,
+    ) -> Result<bool, ValidationException> {
+        let held_for_resource = self.resource_permissions.get(resource_arn);
+        let held_sources = held_for_resource.and_then(|grants| grants.get(action_type));
+        if held_sources.is_some_and(|sources| sources.contains(source_resource_arn)) {
+            return Ok(false);
+        }
+        if held_for_resource.is_none()
+            && self.resource_permissions.len() >= MAX_PERMISSIONED_RESOURCES
+        {
+            return Err(validation(format!(
+                "this emulator holds permissions for at most {MAX_PERMISSIONED_RESOURCES} resources per Region"
+            )));
+        }
+        if held_sources.map_or(0, BTreeSet::len) >= MAX_PERMISSION_SOURCES_PER_RESOURCE {
+            return Err(validation(format!(
+                "this emulator holds at most {MAX_PERMISSION_SOURCES_PER_RESOURCE} {action_type} permissions on one resource"
+            )));
+        }
+        self.resource_permissions
+            .entry(resource_arn.to_string())
+            .or_default()
+            .entry(action_type.to_string())
+            .or_default()
+            .insert(source_resource_arn.to_string());
+        Ok(true)
+    }
+
+    /// The resource policy document held for `resource_arn`, narrowed to
+    /// `action_type` when the caller names one, and `None` when no grant matches —
+    /// a resource nobody has granted anything on carries no policy, and nothing is
+    /// fabricated in its place.
+    ///
+    /// The document is PROJECTED from the stored grants, one `Allow` statement per
+    /// (action type, source resource) pair in the stable order the containers hold
+    /// them, so two reads of an unchanged resource render the same bytes and the
+    /// statement a grant added disappears exactly when the grant does.
+    pub fn resource_policy(&self, resource_arn: &str, action_type: Option<&str>) -> Option<String> {
+        let grants = self.resource_permissions.get(resource_arn)?;
+        let statements: Vec<::serde_json::Value> = grants
+            .iter()
+            .filter(|(action, _)| action_type.is_none_or(|wanted| wanted == action.as_str()))
+            .flat_map(|(action, sources)| {
+                let action = permission_policy_action(action);
+                sources.iter().map(move |source| {
+                    ::serde_json::json!({
+                        "Effect": POLICY_EFFECT_ALLOW,
+                        // A resource policy names WHO is permitted; for a resource
+                        // permission that is the source resource the caller granted.
+                        "Principal": { "AWS": source },
+                        "Action": action,
+                        "Resource": resource_arn,
+                    })
+                })
+            })
+            .collect();
+        if statements.is_empty() {
+            return None;
+        }
+        Some(
+            ::serde_json::json!({
+                "Version": POLICY_VERSION,
+                "Statement": statements,
+            })
+            .to_string(),
+        )
     }
 
     /// File an operation record against `application` and return its `OperationId`.
