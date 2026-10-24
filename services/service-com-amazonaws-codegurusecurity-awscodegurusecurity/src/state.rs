@@ -93,10 +93,15 @@ pub const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
 /// `ErrorCode`, from `types::shared_types::ERROR_CODE_VALUES`. `BatchGetFindings`
 /// classifies each identifier it cannot resolve with one of these.
 pub const ERROR_CODE_INVALID_SCAN_NAME: &str = "INVALID_SCAN_NAME";
-/// `ErrorCode`; see [`ERROR_CODE_INVALID_SCAN_NAME`].
+/// `ErrorCode`; see [`ERROR_CODE_INVALID_SCAN_NAME`]. The classification for an
+/// identifier that is well formed and names nothing this account holds.
 pub const ERROR_CODE_ITEM_DOES_NOT_EXIST: &str = "ITEM_DOES_NOT_EXIST";
 /// `ErrorCode`; see [`ERROR_CODE_INVALID_SCAN_NAME`].
 pub const ERROR_CODE_DUPLICATE_IDENTIFIER: &str = "DUPLICATE_IDENTIFIER";
+/// `ErrorCode`; see [`ERROR_CODE_INVALID_SCAN_NAME`]. The classification for an
+/// identifier whose `findingId` is not a value this service hands out at all
+/// ([`is_minted_identifier`]).
+pub const ERROR_CODE_INVALID_FINDING_ID: &str = "INVALID_FINDING_ID";
 
 /// The signing name this service answers under, used for its ARNs and for the
 /// `serviceCode` of a quota refusal.
@@ -929,9 +934,87 @@ fn is_account_id(account_id: &str) -> bool {
 
 /// `[a-zA-Z0-9-_$:.]*`.
 fn is_scan_name(scan_name: &str) -> bool {
-    scan_name
+    scan_name.chars().all(is_scan_name_char)
+}
+
+/// One character of `[a-zA-Z0-9-_$:.]`, the class both [`SCAN_NAME_ARN_PATTERN`] and the
+/// modelled `ScanName` shape spell for a scan name.
+fn is_scan_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '$' | ':' | '.')
+}
+
+/// The `@length` bounds of the modelled `ScanName` shape, in characters
+/// (`smithy_query(query="shape",shape="ScanName")`: length 1..140, pattern
+/// `^[a-zA-Z0-9-_$:.]*$`).
+///
+/// This is the service's own notion of a name that IS a scan name: every INPUT member
+/// that takes one targets `ScanName`, so the request boundary enforces it before a
+/// handler ever sees the value. An operation that takes a scan name as an unconstrained
+/// `String` — `FindingIdentifier$scanName` is the only one — has to apply the same
+/// notion itself, which is what [`is_valid_scan_name`] is for.
+pub const SCAN_NAME_MIN_LEN: usize = 1;
+/// The upper `@length` bound of `ScanName`; see [`SCAN_NAME_MIN_LEN`].
+pub const SCAN_NAME_MAX_LEN: usize = 140;
+
+/// The character [`reportable_scan_name`] reports in place of one the `ScanName` pattern
+/// does not admit. Inside the pattern's class, so the reduced name is always a value the
+/// constrained shape accepts.
+const SCAN_NAME_FILLER: char = '_';
+
+/// True when `value` is a scan name of this service: the modelled `ScanName` shape's
+/// `@length` and `@pattern` both hold (see [`SCAN_NAME_MIN_LEN`]).
+pub fn is_valid_scan_name(value: &str) -> bool {
+    let length = value.chars().count();
+    (SCAN_NAME_MIN_LEN..=SCAN_NAME_MAX_LEN).contains(&length) && is_scan_name(value)
+}
+
+/// `value` as a member whose target shape is `ScanName` may report it.
+///
+/// A valid scan name is reported verbatim. One that is not is reduced to the constrained
+/// shape — each character the pattern does not admit replaced by [`SCAN_NAME_FILLER`],
+/// the result cut to [`SCAN_NAME_MAX_LEN`] characters and, where the value was empty,
+/// reported as the filler alone (the shape's minimum length is 1) — so a response never
+/// carries a value its own member's shape forbids. The verbatim value belongs in the
+/// unconstrained `message` beside it, which is where the caller reads what was rejected.
+pub fn reportable_scan_name(value: &str) -> String {
+    if is_valid_scan_name(value) {
+        return value.to_string();
+    }
+    let reduced: String = value
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '$' | ':' | '.'))
+        .take(SCAN_NAME_MAX_LEN)
+        .map(|c| if is_scan_name_char(c) { c } else { SCAN_NAME_FILLER })
+        .collect();
+    if reduced.is_empty() {
+        return SCAN_NAME_FILLER.to_string();
+    }
+    reduced
+}
+
+/// The hex-digit group widths of the modelled `Uuid` pattern, in order
+/// (`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`, from
+/// `smithy_query(query="shape",shape="Uuid")`).
+const UUID_GROUP_WIDTHS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// True when `value` has the form of an identifier this service hands out.
+///
+/// The model gives every server-generated identifier of this service the `Uuid` shape
+/// (`runId`, `codeArtifactId`), and [`mint_uuid`] is the single place one is minted, so a
+/// value outside that form is not an identifier this service ever issued. `findingId` is
+/// documented as such an issued value (`FindingIdentifier$findingId`: "You retrieve the
+/// findingId when you call GetFindings") while carrying no constraint of its own, so a
+/// handler that is handed one judges its form with this.
+pub fn is_minted_identifier(value: &str) -> bool {
+    let mut groups = value.split('-');
+    for width in UUID_GROUP_WIDTHS {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        if group.len() != width || !group.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return false;
+        }
+    }
+    groups.next().is_none()
 }
 
 /// Mint a server-generated identifier in the textual form the `Uuid` shape requires
