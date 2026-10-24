@@ -234,8 +234,8 @@ async fn deleting_an_action_reports_what_went_away_and_leaves_nothing_behind() {
             "case {case:?}: expected a created action to be armed, got {}",
             read["Action"]["Status"]
         );
-        // The tags supplied with the action are persisted with it (nothing reports an
-        // action's tags yet: budgets' `ListTagsForResource` is still a scaffold).
+        // The tags supplied with the action are persisted with it, which
+        // `ListTagsForResource` reports (asserted by the `resource_tags` suite).
         assert_eq!(
             stored_actions(&engine, &account_id, &budget_name),
             vec![(action_id.clone(), supplied_tags(&create))],

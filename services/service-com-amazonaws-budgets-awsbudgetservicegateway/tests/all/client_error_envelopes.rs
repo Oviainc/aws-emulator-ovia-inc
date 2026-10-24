@@ -203,10 +203,13 @@ async fn a_scaffolded_operation_still_answers_501() {
     // rather than the validation layer in front of it.
     for (operation, request) in [
         (
-            "TagResource",
+            // `TagResource` and `ListTagsForResource` are implemented now (they write
+            // and read a budget's tag set), so `UntagResource` is the tagging stub row
+            // here, still under its own issue.
+            "UntagResource",
             json!({
                 "ResourceARN": format!("arn:aws:budgets::{account_id}:budget/stub"),
-                "ResourceTags": [{"Key": "owner", "Value": "platform"}]
+                "ResourceTagKeys": ["owner"]
             }),
         ),
         (
