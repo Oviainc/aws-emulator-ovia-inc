@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRelationalDatabaseParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRelationalDatabaseParameters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRelationalDatabaseParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does
+//!
+//! Sets runtime parameters on ONE managed relational database's parameter group.
+//! Every entry of `parameters` is resolved against the catalog of the database's
+//! own ENGINE ([`crate::state::RELATIONAL_DATABASE_PARAMETERS`]) and checked —
+//! the parameter must exist there, must be modifiable, must carry a value its
+//! data type and published value set admit, and may only be applied
+//! `immediate` when the engine can take it while it runs — BEFORE the first
+//! write, so a refused request changes nothing.
+//!
+//! An applied value is carried by the parameter group at once, which is why
+//! `GetRelationalDatabaseParameters` reports it straight away; whether the
+//! RUNNING engine has loaded it is what
+//! `RelationalDatabase$parameterApplyStatus` reports instead — `in-sync` while
+//! every applied value is loaded, `pending-reboot` while one waits for the
+//! reboot `RebootRelationalDatabase` performs.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +179,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRelationalDatabaseParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRelationalDatabaseParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRelationalDatabaseParameters"))
+        // A database is addressed by name alone, and the parameters it offers
+        // follow its engine — nothing about the request metadata takes part.
+        let _ = ctx;
+
+        // `relationalDatabaseName` and `parameters` are modelled `@required`
+        // members and the name carries the modelled `ResourceName` pattern, so
+        // the centralized walk refused anything outside them before this body
+        // ran. What is left is what the model cannot express: the list must name
+        // at least one parameter and no more than AWS modifies in one call, the
+        // database must exist, and each entry must name a modifiable parameter
+        // of that database's engine with a value and an apply method the
+        // parameter admits.
+        if input.parameters.is_empty() {
+            return Err(invalid(
+                "parameters carries no entry: name at least one parameter to update".to_string(),
+            ));
+        }
+        if input.parameters.len() > crate::state::MAX_RELATIONAL_DATABASE_PARAMETER_UPDATES {
+            return Err(invalid(format!(
+                "parameters carries {} entries, more than the {} that can be modified in a \
+                 single request",
+                input.parameters.len(),
+                crate::state::MAX_RELATIONAL_DATABASE_PARAMETER_UPDATES
+            )));
+        }
+
+        let name = input.relational_database_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            let (engine, location) = {
+                let database = store
+                    .relational_database(&name)
+                    .ok_or_else(|| not_found(&name))?;
+                (database.blueprint.engine, database.location.clone())
+            };
+
+            // EVERY entry is resolved before the first write, so a request with
+            // one bad entry sets none of the others either.
+            let updates = input
+                .parameters
+                .iter()
+                .enumerate()
+                .map(|(index, requested)| {
+                    crate::state::relational_database_parameter_update(
+                        engine,
+                        &format!("parameters[{index}]"),
+                        requested,
+                    )
+                    .map_err(invalid)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let database = store
+                .relational_database_mut(&name)
+                .ok_or_else(|| not_found(&name))?;
+            // The list is applied in the order the request carries it, so an
+            // entry that names a parameter an earlier entry already set wins.
+            for update in updates {
+                database.set_parameter(update);
+            }
+
+            // `operations` is a list because other Lightsail calls act on
+            // several resources at once; this one acts on exactly one database,
+            // so it answers exactly one entry. The parameter group holds the new
+            // values by the time this call answers, so the entry is terminal
+            // rather than one the clock still owes — what a value applied
+            // `pending-reboot` still waits for is reported by the database's own
+            // `parameterApplyStatus`, not by this operation.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_UPDATE_RELATIONAL_DATABASE_PARAMETERS,
+                crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+                &name,
+                &location,
+                None,
+            );
+            Ok(UpdateRelationalDatabaseParametersOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No managed relational database of that name is stored: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// requested name.
+fn not_found(name: &str) -> UpdateRelationalDatabaseParametersError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+        name,
+    )
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the entry
+/// and the member that are wrong and the constraint they broke.
+fn invalid(message: String) -> UpdateRelationalDatabaseParametersError {
+    UpdateRelationalDatabaseParametersErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> UpdateRelationalDatabaseParametersError {
+    UpdateRelationalDatabaseParametersErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail relational database store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
