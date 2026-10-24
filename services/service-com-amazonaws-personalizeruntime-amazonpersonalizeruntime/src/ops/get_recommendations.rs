@@ -22,7 +22,9 @@
 //!    of its STORED `base_score` and the request's `userId`/`itemId`/`context`, so an
 //!    identical request returns an identical ordering (the operation is
 //!    `@idempotent`). The list is reported "sorted in descending order by prediction
-//!    score", normalized to sum to 1.0.
+//!    score". The scores are normalized across the whole filter-surviving candidate
+//!    set BEFORE `numResults` and any promotion decide which candidates come back, so
+//!    one item's score is the same whatever the request asked for.
 //! 5. **Promote.** A `promotions` entry takes `percentPromotedItems` of the returned
 //!    slots from the entries its own filter selects; each such item carries
 //!    `promotionName` and the documented `reason` "Promoted item".
@@ -278,6 +280,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (index, score)
             })
             .collect();
+        // The reported score of an item is a property of the resolved resource, the
+        // request's personalization inputs and the item, so the denominator is the
+        // WHOLE filter-surviving candidate set and is settled before `numResults` or a
+        // promotion selects which candidates come back. A response that reports fewer
+        // items reports each of them with the same score a larger one would, and sums
+        // to at most 1.0.
+        scoring::normalize_by(&mut candidates, |(_, score)| score);
         candidates.sort_by(|(left, left_score), (right, right_score)| {
             scoring::by_score_desc(
                 (&resolved.items[*left].item_id, *left_score),
@@ -310,20 +319,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         chosen.sort_by_key(|(position, _)| *position);
 
-        let mut scores: Vec<f64> = chosen
-            .iter()
-            .map(|(position, _)| candidates[*position].1)
-            .collect();
-        scoring::normalize(&mut scores);
-
         let item_list: Vec<PredictedItem> = chosen
             .iter()
-            .zip(&scores)
-            .map(|((position, promoted), score)| {
-                let item = &resolved.items[candidates[*position].0];
+            .map(|(position, promoted)| {
+                let (index, score) = candidates[*position];
+                let item = &resolved.items[index];
                 PredictedItem {
                     item_id: Some(item.item_id.clone()),
-                    score: Some(*score),
+                    score: Some(score),
                     promotion_name: promoted
                         .then(|| promotion.as_ref().map(|promotion| promotion.name.clone()))
                         .flatten(),
