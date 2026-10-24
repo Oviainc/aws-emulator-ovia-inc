@@ -33,11 +33,12 @@ const TAGS: &str = "/prod/tags";
 /// exactly the set an ARN can name here; each is created by
 /// [`create_resource`]. The rule under test holds for a resource, so the rows of
 /// every table below span this list rather than one chosen type.
-const KINDS: [&str; 8] = [
+const KINDS: [&str; 9] = [
     "channel",
     "input",
     "inputSecurityGroup",
     "sdiSource",
+    "network",
     "signal-map",
     "multiplex",
     "cloudwatch-alarm-template-group",
@@ -172,6 +173,18 @@ async fn create_resource(
             with_tags(json!({ "name": name, "type": "SINGLE" })),
             201,
             vec!["sdiSource", "arn"],
+        ),
+        "network" => (
+            "/prod/networks".to_string(),
+            // A network's `Name` must be unique in the account, which the
+            // per-kind label already makes it, and its `IpPools` carry one CIDR
+            // block each.
+            with_tags(json!({
+                "name": name,
+                "ipPools": [{ "cidr": "192.0.2.0/24" }],
+            })),
+            201,
+            vec!["arn"],
         ),
         "signal-map" => {
             // A signal map discovers its graph from an existing resource, so its

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNetwork
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNetwork`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNetwork::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +170,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNetwork` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNetworkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNetwork"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
+
+        // The two CIDR lists are validated BEFORE anything is written, so a
+        // refused request mints no network and leaves no partial one behind. The
+        // rules themselves live in `state`, so `UpdateNetwork` can hold its
+        // pools and routes to the same ones when its own issue lands.
+        let ip_pools = crate::state::network_ip_pools(
+            input
+                .ip_pools
+                .unwrap_or_default()
+                .into_iter()
+                .map(|pool| pool.cidr),
+        )
+        .map_err(bad_request)?;
+        let routes = crate::state::network_routes(
+            input
+                .routes
+                .unwrap_or_default()
+                .into_iter()
+                .map(|route| (route.cidr, route.gateway)),
+        )
+        .map_err(bad_request)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // `settle` materialises the transitions the clock had already made due —
+        // including the `CREATING` -> `ACTIVE` step an earlier network owes —
+        // which were owed whether or not this create ran. It runs before the
+        // name-uniqueness check, so that check sees the store a reader would.
+        state.settle(now);
+
+        // A retried create (same `@idempotencyToken` `RequestId`) must return the
+        // network the first one created, not a second network.
+        if let Some(existing) = input
+            .request_id
+            .as_deref()
+            .and_then(|token| state.network_for_token(token))
+            .map(str::to_string)
+        {
+            let network = state
+                .network_description(&existing)
+                .ok_or_else(unavailable)?;
+            return Ok(crate::state::network_description_output!(
+                CreateNetworkOutput,
+                network
+            ));
+        }
+
+        // `Name` is documented "Specify a name that is unique in the AWS
+        // account… Names are case-sensitive", so a second network under a name
+        // the account already holds is the modelled conflict rather than another
+        // network. A request that names nothing takes no name, and so conflicts
+        // with nothing.
+        if let Some(name) = input.name.as_deref() {
+            if let Some(existing) = state.network_named(name).map(str::to_string) {
+                return Err(CreateNetworkErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "Network {existing} already uses the name {name}; a network \
+                             name must be unique in the AWS account"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The store is bounded, so a create loop cannot grow the emulator's heap
+        // without limit: once it is full the operation's own modelled throttle is
+        // the answer, not another network.
+        if state.networks_are_full() {
+            return Err(CreateNetworkErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "This emulator stores at most {} networks; delete one before creating another",
+                        crate::state::MAX_NETWORKS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `Id` is "the resource-id portion of the ARN", so the ARN is built from
+        // the region this request was signed for and the minted id, and the id is
+        // the tail of that ARN.
+        let id = state.mint_network_id();
+        let arn = ::engine::emulator_arn("medialive", &region, &format!("network:{id}"));
+        let mut network = crate::state::new_network(id.clone(), arn, now);
+
+        // Everything the request supplied is stored verbatim; the response is
+        // then read back out of the stored record, never from `input`. `State`
+        // and `AssociatedClusterIds` are not written from the request at all: the
+        // first is the lifecycle the clock owns and the second is derived from
+        // the rest of the store on every read.
+        network.name = input.name;
+        network.ip_pools = ip_pools;
+        network.routes = routes;
+        network.tags = input.tags.unwrap_or_default();
+
+        state.networks.insert(id.clone(), network);
+        if let Some(token) = input.request_id {
+            // Bounded, evicting write: a caller-chosen token can neither
+            // accumulate past the cap nor outlive the network it created.
+            state.record_network_token(token, &id);
+        }
+
+        let network = state.network_description(&id).ok_or_else(unavailable)?;
+        Ok(crate::state::network_description_output!(
+            CreateNetworkOutput,
+            network
+        ))
     }
+}
+
+/// Refuse a request whose `IpPools` or `Routes` are not valid, with the
+/// operation's own modelled client error (HTTP 400).
+fn bad_request(message: String) -> CreateNetworkError {
+    CreateNetworkErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to create the network in. A modelled server error, never
+/// a fresh engine (which would drop the write when this request returns).
+fn unavailable() -> CreateNetworkError {
+    CreateNetworkErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

@@ -16,6 +16,12 @@
 //! `MonitorDeployment` and its summary's `MonitorDeploymentStatus` are reported
 //! out of state.
 //!
+//! The MediaLive Anywhere network lives here too: one [`NetworkRecord`] per
+//! created network, its own id counter and its own token map. A network's
+//! `State` is the one lifecycle member it owes the clock (`CREATING` until the
+//! creation comes due, then `ACTIVE`) and its `AssociatedClusterIds` are derived
+//! from the rest of the state on every read, never recorded at create time.
+//!
 //! The INPUT DEVICES this account has claimed live here as well: one
 //! [`InputDeviceRecord`] per claimed device, keyed by the device id the claim
 //! named rather than by an id this service mints, because a Link unit's id is
@@ -105,14 +111,16 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AnywhereSettings, CdiInputSpecification, Channel, ChannelSummary,
     DescribeAnywhereSettings, DescribeFollowerChannelSettings, DescribeInferenceSettings,
-    DescribeLinkedChannelSettings, DescribePrimaryChannelSettings, EncoderSettings,
+    DescribeLinkedChannelSettings, DescribeNetworkSummary, DescribePrimaryChannelSettings,
+    EncoderSettings,
     InferenceSettings, Input, InputAttachment, InputDestination, InputDestinationRequest,
     InputDestinationRoute, InputDeviceSettings, InputSecurityGroup, InputSource,
     InputSourceRequest, InputSpecification, InputVpcRequest, InputWhitelistRule,
-    InputWhitelistRuleCidr,
+    InputWhitelistRuleCidr, IpPool,
     LinkedChannelSettings, MaintenanceStatus, MediaConnectFlow, MediaConnectFlowRequest,
     MediaResource, MediaResourceNeighbor, MonitorDeployment, MulticastSettings,
     MulticastSettingsCreateRequest, MulticastSource, OutputDestination, PipelineDetail,
+    Route,
     RouterDestination, RouterInputSettings, RouterSettings, SdiSource, SdiSourceSummary,
     Smpte2110ReceiverGroupSettings, SignalMapSummary, SpecialRouterSettings,
     SrtCallerDecryption, SrtCallerSource, SrtListenerDecryption, SrtListenerSettings,
@@ -257,6 +265,25 @@ pub mod sdi_source_state {
     pub const IDLE: &str = "IDLE";
     pub const IN_USE: &str = "IN_USE";
     pub const DELETED: &str = "DELETED";
+}
+
+/// The `NetworkState` enum values this slice uses, spelled exactly as the model
+/// declares them (`smithy_query(query="shape", shape="NetworkState")`: CREATING |
+/// CREATE_FAILED | ACTIVE | DELETING | IDLE | IN_USE | UPDATING | DELETE_FAILED |
+/// DELETED).
+///
+/// Only the two the create lifecycle reaches are named here. `CreateNetwork` is
+/// asynchronous — `State` is documented "The current state of the Network. Only
+/// MediaLive Anywhere can change the state" — so a network starts `CREATING` and
+/// the clock owes it `ACTIVE`, the one state the enum names for a network that
+/// exists, has not failed and nothing has deleted. The rest belong to operations
+/// no handler implements yet: `UPDATING` to `UpdateNetwork`, `DELETING` and
+/// `DELETED` to `DeleteNetwork`, `IDLE` and `IN_USE` to the cluster attachments
+/// this store has none of (`CreateCluster` is still a scaffold), and the two
+/// `*_FAILED` states to failures this emulator does not inject.
+pub mod network_state {
+    pub const CREATING: &str = "CREATING";
+    pub const ACTIVE: &str = "ACTIVE";
 }
 
 /// The `ChannelClass` enum values (`smithy_query(query="shape",
@@ -512,6 +539,34 @@ const FIRST_SDI_SOURCE_ID: u64 = 7_000_000;
 
 /// See [`FIRST_SDI_SOURCE_ID`].
 pub const MAX_SDI_SOURCES: usize = 100;
+
+/// The id the first Network of a process gets, and the most networks this
+/// emulator stores for one account.
+///
+/// The id is a numeric string, as MediaLive resource ids are, minted from a
+/// counter at a fixed seven-digit width so the `BTreeMap` key order equals the
+/// mint order and `ListNetworks` pagination is deterministic; `Id` is documented
+/// as "the resource-id portion of the ARN", so the ARN is built from it. A range
+/// of its own keeps the id spaces apart, for the same reason as
+/// [`FIRST_SDI_SOURCE_ID`]. The ceiling is not a guess at an AWS quota: it exists
+/// so a create loop cannot grow the emulator's heap without bound, and
+/// `CreateNetwork`'s own modelled `TooManyRequestsException` is the refusal once
+/// the store is full.
+const FIRST_NETWORK_ID: u64 = 8_000_000;
+
+/// See [`FIRST_NETWORK_ID`].
+pub const MAX_NETWORKS: usize = 100;
+
+/// The most `IpPools` (or `Routes`) entries this emulator accepts on one
+/// network.
+///
+/// A ceiling, not a guess at AWS's published quota: both lists are caller-chosen
+/// and the model targets them at plain lists with no length constraint, so
+/// nothing else bounds them, and every entry costs heap on a stored record and a
+/// member in every response that reports the network. `CreateNetwork` refuses a
+/// longer list with its own modelled `BadRequestException`, because the request
+/// is what is out of bounds — the same treatment [`MAX_INPUT_ATTACHMENTS`] gets.
+pub const MAX_NETWORK_CIDR_ENTRIES: usize = 32;
 
 /// The id the first input security group of a process gets. AWS input security
 /// group ids are numeric strings, the same shape as channel and input ids; a
@@ -1078,6 +1133,177 @@ impl SdiSourceRecord {
     }
 }
 
+/// One created Network, as `CreateNetwork` stored it plus the lifecycle state of
+/// that creation.
+///
+/// The members mirror the model's network response shapes (`CreateNetworkResponse`,
+/// `DescribeNetworkResponse` and the `DescribeNetworkSummary` a listing reports,
+/// which carry the same seven members), minus the one they derive:
+/// `AssociatedClusterIds` comes from what else is in the store
+/// ([`ComAmazonawsMedialiveMedialiveState::clusters_using_network`]), never from a
+/// field written at create time.
+#[derive(Debug, Clone)]
+pub struct NetworkRecord {
+    pub id: String,
+    pub arn: String,
+    /// The request's `Name`. `Option`, because the model declares the member
+    /// optional (`smithy_query(query="operation", operation="CreateNetwork")`: no
+    /// `@required`), so a network created without one has none rather than an
+    /// empty name.
+    pub name: Option<String>,
+    /// The CIDR blocks the request reserved, stored as the `IpPool` shape a
+    /// response reports, because `IpPoolCreateRequest` and `IpPool` carry the
+    /// same one member (`Cidr`).
+    pub ip_pools: Vec<IpPool>,
+    /// The routes the request named, stored as the `Route` shape a response
+    /// reports, for the same reason as [`Self::ip_pools`].
+    pub routes: Vec<Route>,
+    /// The request's `Tags`. No network response shape carries a `Tags` member
+    /// (`smithy_query(query="operation", operation="DescribeNetwork")`), so the
+    /// tag operations are what report them: `ListTagsForResource` reads this map
+    /// through [`ComAmazonawsMedialiveMedialiveState::resource_tags`].
+    pub tags: HashMap<String, String>,
+    /// The `NetworkState` this network is in.
+    state: String,
+    /// The instant the creation becomes due, so `CREATING` settles into
+    /// `ACTIVE`. Stored, never slept on.
+    active_due: SystemTime,
+}
+
+impl NetworkRecord {
+    /// Materialise the creation the clock has already made due. Owed at
+    /// `active_due` whether or not anybody called, so applying it in a reporting
+    /// operation changes nothing a later caller would have seen.
+    fn settle(&mut self, now: SystemTime) {
+        if self.state == network_state::CREATING && now >= self.active_due {
+            self.state = network_state::ACTIVE.to_string();
+        }
+    }
+}
+
+/// The message a request whose `IpPools` are not all valid IPv4 CIDR blocks is
+/// refused with \u2014 the fixed sentence of that rejection class, which states the
+/// rule the whole list must meet and interpolates nothing, exactly as
+/// [`INVALID_WHITELIST_CIDR_MESSAGE`] does for a security group's rules.
+pub const INVALID_IP_POOL_CIDR_MESSAGE: &str = "Every IP pool needs to have a valid IPv4 CIDR.";
+
+/// The message a request whose `Routes` are not all valid is refused with: a
+/// route's `Cidr` is "A CIDR block for one Route" and its optional `Gateway` is
+/// "The IP address of the Gateway for this route", so a route missing the former
+/// or carrying a gateway that is not an IP address fails this one rule.
+pub const INVALID_ROUTE_MESSAGE: &str =
+    "Every route needs to have a valid IPv4 CIDR and, if any, a valid IPv4 gateway address.";
+
+/// The message a request naming more `IpPools` or `Routes` than the emulator
+/// stores on one network is refused with.
+pub fn too_many_network_entries_message(member: &str) -> String {
+    format!("A network takes at most {MAX_NETWORK_CIDR_ENTRIES} {member} entries.")
+}
+
+/// The `IpPools` a request asks for, validated into the pools the store keeps,
+/// or the message a list that is not all valid IPv4 CIDR blocks is refused with.
+///
+/// Takes the CIDRs rather than the request shape, so the one rule serves every
+/// operation that writes a network's pools (`CreateNetwork` today,
+/// `UpdateNetwork` when its own issue lands) even though the model gives each of
+/// them its own request shape (`IpPoolCreateRequest`, `IpPoolUpdateRequest`)
+/// carrying the same single member. The whole list is checked before the caller
+/// writes anything, so a refused request leaves the store untouched rather than
+/// applying a prefix of its pools.
+pub fn network_ip_pools(
+    requested: impl IntoIterator<Item = Option<String>>,
+) -> Result<Vec<IpPool>, String> {
+    let mut pools: Vec<IpPool> = Vec::new();
+    for cidr in requested {
+        if pools.len() >= MAX_NETWORK_CIDR_ENTRIES {
+            return Err(too_many_network_entries_message("ipPools"));
+        }
+        let cidr = cidr.filter(|cidr| is_ipv4_cidr(cidr));
+        let Some(cidr) = cidr else {
+            return Err(INVALID_IP_POOL_CIDR_MESSAGE.to_string());
+        };
+        pools.push(IpPool { cidr: Some(cidr) });
+    }
+    Ok(pools)
+}
+
+/// The `Routes` a request asks for, validated into the routes the store keeps,
+/// or the message a list carrying an invalid route is refused with. Takes the
+/// `(Cidr, Gateway)` pairs for the same reason [`network_ip_pools`] takes the
+/// CIDRs.
+///
+/// `Gateway` is documented "The IP address of the Gateway for this route, if
+/// applicable", so a route may omit it; one that names it must name an IP
+/// address.
+pub fn network_routes(
+    requested: impl IntoIterator<Item = (Option<String>, Option<String>)>,
+) -> Result<Vec<Route>, String> {
+    let mut routes: Vec<Route> = Vec::new();
+    for (cidr, gateway) in requested {
+        if routes.len() >= MAX_NETWORK_CIDR_ENTRIES {
+            return Err(too_many_network_entries_message("routes"));
+        }
+        let cidr = cidr.filter(|cidr| is_ipv4_cidr(cidr));
+        let gateway_is_address = gateway
+            .as_deref()
+            .is_none_or(|gateway| gateway.parse::<::std::net::Ipv4Addr>().is_ok());
+        let Some(cidr) = cidr.filter(|_| gateway_is_address) else {
+            return Err(INVALID_ROUTE_MESSAGE.to_string());
+        };
+        routes.push(Route {
+            cidr: Some(cidr),
+            gateway,
+        });
+    }
+    Ok(routes)
+}
+
+/// Build a new network record from a `CreateNetwork` request's id and ARN.
+///
+/// The network starts `CREATING` and owes `ACTIVE` once [`TRANSIENT_STATE_SPAN`]
+/// has passed: `State` is documented "The current state of the Network. Only
+/// MediaLive Anywhere can change the state", so creation is asynchronous and a
+/// caller waits on that member. The caller then stores the request's `Name`,
+/// `IpPools`, `Routes` and `Tags` on the record.
+pub fn new_network(id: String, arn: String, now: SystemTime) -> NetworkRecord {
+    NetworkRecord {
+        id,
+        arn,
+        name: None,
+        ip_pools: Vec::new(),
+        routes: Vec::new(),
+        tags: HashMap::new(),
+        state: network_state::CREATING.to_string(),
+        active_due: now + TRANSIENT_STATE_SPAN,
+    }
+}
+
+/// Project a [`DescribeNetworkSummary`] onto one of the structurally identical
+/// per-operation network output shapes (`CreateNetworkOutput`,
+/// `DescribeNetworkOutput`; `UpdateNetworkOutput` and `DeleteNetworkOutput`
+/// carry the same seven members, for when their own issues land).
+///
+/// One macro rather than a hand-written copy of the same seven-member move per
+/// operation, so the operations that report a network cannot drift from each
+/// other. `DescribeNetworkSummary` is the shape a LISTING reports, which makes
+/// the listed summary and the described network one projection rather than two.
+macro_rules! network_description_output {
+    ($out:ident, $network:expr) => {{
+        let network: $crate::ops::types::DescribeNetworkSummary = $network;
+        $out {
+            arn: network.arn,
+            associated_cluster_ids: network.associated_cluster_ids,
+            id: network.id,
+            ip_pools: network.ip_pools,
+            name: network.name,
+            routes: network.routes,
+            state: network.state,
+        }
+    }};
+}
+
+pub(crate) use network_description_output;
+
 /// Why a monitor template GROUP's delete removed nothing. Each variant is one
 /// modelled refusal, and both of them leave the store exactly as it was.
 ///
@@ -1206,6 +1432,16 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// `CreateSdiSource`'s `RequestId` (`@idempotencyToken`) -> the SdiSource it
     /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
     sdi_source_tokens: IdempotencyTokens,
+    /// Every Network that exists, keyed by its minted `Id`, in a `BTreeMap` for
+    /// the same reason as [`Self::channels`]: `ListNetworks` walks it in id
+    /// order on every call and its `NextToken` means the same thing on the next
+    /// one.
+    pub networks: BTreeMap<String, NetworkRecord>,
+    /// Mint counter behind [`Self::mint_network_id`].
+    pub next_network_id: u64,
+    /// `CreateNetwork`'s `RequestId` (`@idempotencyToken`) -> the network it
+    /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
+    network_tokens: IdempotencyTokens,
     /// Every eventbridge rule template group that exists, keyed by its minted
     /// `Id`. A `BTreeMap` so a walk over the groups is in id order on every
     /// call.
@@ -1298,6 +1534,9 @@ impl ComAmazonawsMedialiveMedialiveState {
         }
         for signal_map in self.signal_maps.values_mut() {
             signal_map.settle(now);
+        }
+        for network in self.networks.values_mut() {
+            network.settle(now);
         }
         self.settle_multiplexes(now);
         self.settle_input_devices(now);
@@ -1556,6 +1795,80 @@ impl ComAmazonawsMedialiveMedialiveState {
             name: source.name.clone(),
             r#type: source.r#type.clone(),
         }
+    }
+
+    /// Whether the network store is full, so `CreateNetwork` must refuse rather
+    /// than mint another network.
+    pub fn networks_are_full(&self) -> bool {
+        self.networks.len() >= MAX_NETWORKS
+    }
+
+    /// The next network id, as AWS shapes MediaLive resource ids: a numeric
+    /// string, which `Id` documents as "the resource-id portion of the ARN".
+    pub fn mint_network_id(&mut self) -> String {
+        let id = FIRST_NETWORK_ID + self.next_network_id;
+        self.next_network_id += 1;
+        id.to_string()
+    }
+
+    /// Record `token` as having created `network_id`.
+    pub fn record_network_token(&mut self, token: String, network_id: &str) {
+        self.network_tokens.record(token, network_id, MAX_NETWORKS);
+    }
+
+    /// The network a stored `RequestId` created, if that network still exists.
+    pub fn network_for_token(&self, request_id: &str) -> Option<&str> {
+        let id = self.network_tokens.created(request_id)?;
+        self.networks.get(id).map(|network| network.id.as_str())
+    }
+
+    /// The id of the network whose `Name` is `name`, if the store holds one.
+    ///
+    /// `CreateNetwork`'s `Name` is documented "Specify a name that is unique in
+    /// the AWS account… Names are case-sensitive", so the lookup is exact and
+    /// account-wide (not per region), and it is what makes a second create under
+    /// a name already taken the modelled `ConflictException` rather than a second
+    /// network.
+    pub fn network_named(&self, name: &str) -> Option<&str> {
+        self.networks
+            .values()
+            .find(|network| network.name.as_deref() == Some(name))
+            .map(|network| network.id.as_str())
+    }
+
+    /// The ids of the clusters currently attached to the network `id` — what
+    /// `AssociatedClusterIds` reports. Derived from the store on every read, so
+    /// it tracks every later cluster create and delete rather than being recorded
+    /// at create time.
+    ///
+    /// Empty for every network today: a cluster names its networks through
+    /// `CreateCluster`, which is still a scaffold, so this store holds no cluster
+    /// that could be attached to one. The derivation lives here so the cluster
+    /// slice has one place to fill in when it lands.
+    pub fn clusters_using_network(&self, _network_id: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The `DescribeNetworkSummary` projection of one stored network, or `None`
+    /// when no network has that id.
+    ///
+    /// The ONE projection every operation that reports a network
+    /// (`CreateNetwork`, `DescribeNetwork`, `ListNetworks`) answers from, so none
+    /// of them can drift from the others: the summary shape a listing reports
+    /// carries exactly the members the flat describe output does
+    /// (`smithy_query(query="shape", shape="DescribeNetworkSummary")`), and
+    /// [`network_description_output`] projects it onto those outputs.
+    pub fn network_description(&self, id: &str) -> Option<DescribeNetworkSummary> {
+        let network = self.networks.get(id)?;
+        Some(DescribeNetworkSummary {
+            arn: Some(network.arn.clone()),
+            associated_cluster_ids: Some(self.clusters_using_network(id)),
+            id: Some(network.id.clone()),
+            ip_pools: Some(network.ip_pools.clone()),
+            name: network.name.clone(),
+            routes: Some(network.routes.clone()),
+            state: Some(network.state.clone()),
+        })
     }
 
     /// Whether the group store is full, so
@@ -2502,6 +2815,9 @@ impl ComAmazonawsMedialiveMedialiveState {
         if let Some(record) = self.sdi_sources.values().find(|record| record.arn == arn) {
             return Some(TaggedResource::SdiSource(record.id.clone()));
         }
+        if let Some(record) = self.networks.values().find(|record| record.arn == arn) {
+            return Some(TaggedResource::Network(record.id.clone()));
+        }
         if let Some(record) = self.signal_maps.values().find(|record| record.arn == arn) {
             return Some(TaggedResource::SignalMap(record.id.clone()));
         }
@@ -2544,6 +2860,7 @@ impl ComAmazonawsMedialiveMedialiveState {
                 .get(&id)
                 .map(|record| &record.tags),
             TaggedResource::SdiSource(id) => self.sdi_sources.get(&id).map(|record| &record.tags),
+            TaggedResource::Network(id) => self.networks.get(&id).map(|record| &record.tags),
             TaggedResource::SignalMap(id) => self.signal_maps.get(&id).map(|record| &record.tags),
             TaggedResource::Multiplex(id) => self.multiplexes.get(&id).map(|record| &record.tags),
             TaggedResource::InputDevice(id) => {
@@ -2601,6 +2918,11 @@ impl ComAmazonawsMedialiveMedialiveState {
                 .get_mut(&id)
                 .filter(|record| !record.is_deleted())
                 .map(|record| &mut record.tags),
+            // No delete filter: `DeleteNetwork` is still a scaffold, so no
+            // network in this store has had a delete accepted for it.
+            TaggedResource::Network(id) => {
+                self.networks.get_mut(&id).map(|record| &mut record.tags)
+            }
             TaggedResource::SignalMap(id) => self
                 .signal_maps
                 .get_mut(&id)
@@ -2728,6 +3050,7 @@ enum TaggedResource {
     Input(String),
     InputSecurityGroup(String),
     SdiSource(String),
+    Network(String),
     SignalMap(String),
     Multiplex(String),
     InputDevice(String),
