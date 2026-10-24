@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEventDataStores
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEventDataStores`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEventDataStores::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the event data stores in the caller's Region from the shared event data
+//! store registry (`crate::state`), one `MaxResults`-sized page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +151,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEventDataStores` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEventDataStoresErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEventDataStores"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `MaxResults` is "the maximum number of event data stores to display on a
+        // single page". Its modelled `@range 1..1000` is what keeps a request from
+        // asking outside those bounds (the framework enforces it before this handler
+        // runs); clamping to the same bounds here keeps the walk below terminating
+        // and bounded even if some future path reached it unvalidated. A request
+        // that sends no `MaxResults` gets the service's own page size, never a value
+        // derived from a request that sent one. It is read before the token because
+        // it is one of the parameters a token is issued for.
+        let page_size = match input.max_results {
+            Some(requested) => usize::try_from(requested)
+                .unwrap_or(crate::state::LIST_EVENT_DATA_STORES_MIN_PAGE_SIZE)
+                .clamp(
+                    crate::state::LIST_EVENT_DATA_STORES_MIN_PAGE_SIZE,
+                    crate::state::LIST_EVENT_DATA_STORES_MAX_PAGE_SIZE,
+                ),
+            None => crate::state::LIST_EVENT_DATA_STORES_PAGE_SIZE,
+        };
+
+        // A page token is a value this service issued for ONE walk and the caller
+        // handed back unread, so a token it never issued — or one issued for another
+        // walk — names no resume position in this one. The rule is
+        // `crate::state::page_token`, stated once for every listing of this service;
+        // what is this operation's own is the shape of a resume key it could have
+        // issued (a store id it minted) and the error it refuses with.
+        let resume_at = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::page_token::decode(
+                    token,
+                    page_size,
+                    &region,
+                    Self::NAME,
+                    crate::state::is_event_data_store_id,
+                )
+                .map_err(|message| {
+                    ListEventDataStoresErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: Some(message),
+                        },
+                    )
+                })?,
+            ),
+            None => None,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListEventDataStoresErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "ListEventDataStores needs the CloudTrail event data store registry, \
+                         which this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+        // This operation REPORTS the stores. The only write it makes is to
+        // materialise what the CLOCK already owed the registry — a provisioning span
+        // that has elapsed, or the seven-day wait a deleted store has served — which
+        // was due at this instant whether or not anybody called, so the page is what
+        // a caller would have seen even if nobody had listed.
+        store.settle_event_data_stores(now);
+
+        // "Returns information about all event data stores in the account, in the
+        // current Region" — an event data store is a regional resource, so another
+        // Region's stores are not this call's to report. The registry is keyed by
+        // store id, which is the stable order the pages walk and what lets a token
+        // carrying the next store's id resume exactly where a page stopped.
+        let resume_from = resume_at.unwrap_or_default();
+        let mut remaining = store
+            .event_data_stores
+            .range(resume_from..)
+            .map(|(_, record)| record)
+            .filter(|record| record.region == region);
+        let page: Vec<EventDataStore> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::EventDataStoreRecord::to_list_entry)
+            .collect();
+        // One store past a full page: report where to resume rather than carrying
+        // it, and report no token at all when the page emptied the Region.
+        let next_token = remaining
+            .next()
+            .map(|record| crate::state::page_token::encode(page_size, &region, &record.id));
+
+        Ok(ListEventDataStoresOutput {
+            event_data_stores: Some(page),
+            next_token,
+        })
     }
 }

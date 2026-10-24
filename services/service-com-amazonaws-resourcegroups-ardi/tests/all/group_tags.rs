@@ -36,7 +36,9 @@ use super::resource_group_lifecycle::{error_code, Emulator, ACCOUNT};
 /// Percent-encode one path segment: everything outside RFC 3986 §2.3's unreserved
 /// set is escaped, which is what an SDK client sends for an ARN bound to a
 /// NON-greedy `@httpLabel` (`/resources/{Arn}/tags`).
-fn pct(value: &str) -> String {
+///
+/// Shared with the sibling untagging suite, which addresses the same path.
+pub(crate) fn pct(value: &str) -> String {
     value
         .bytes()
         .map(|byte| match byte {
@@ -49,20 +51,20 @@ fn pct(value: &str) -> String {
 }
 
 /// The ARN every operation of this service reports for the group `name` in `region`.
-fn group_arn(region: &str, name: &str) -> String {
+pub(crate) fn group_arn(region: &str, name: &str) -> String {
     format!("arn:aws:resource-groups:{region}:{ACCOUNT}:group/{name}")
 }
 
 /// A deterministic string of `length` ASCII letters, for exercising a modelled
 /// length bound rather than one hand-picked spelling.
-fn filler(length: usize, seed: u8) -> String {
+pub(crate) fn filler(length: usize, seed: u8) -> String {
     (0..length)
         .map(|index| char::from(b'a' + ((index as u8).wrapping_add(seed) % 26)))
         .collect()
 }
 
 /// The wire form of a `Tags` map.
-fn tag_json(pairs: &[(String, String)]) -> Value {
+pub(crate) fn tag_json(pairs: &[(String, String)]) -> Value {
     Value::Object(
         pairs
             .iter()
@@ -72,7 +74,7 @@ fn tag_json(pairs: &[(String, String)]) -> Value {
 }
 
 /// A `Tags` map from a response, as an ordered map so two answers compare.
-fn tag_pairs(case: &str, tags: &Value) -> BTreeMap<String, String> {
+pub(crate) fn tag_pairs(case: &str, tags: &Value) -> BTreeMap<String, String> {
     tags.as_object()
         .unwrap_or_else(|| panic!("case {case:?}: expected a Tags object, got {tags}"))
         .iter()
@@ -87,7 +89,12 @@ fn tag_pairs(case: &str, tags: &Value) -> BTreeMap<String, String> {
 
 /// `PUT /resources/{Arn}/tags` with `tags` as the request's `Tags` map, signed (in
 /// scope only) for `region`.
-async fn tag(emulator: &Emulator, region: &str, arn: &str, tags: &Value) -> (u16, Value) {
+pub(crate) async fn tag(
+    emulator: &Emulator,
+    region: &str,
+    arn: &str,
+    tags: &Value,
+) -> (u16, Value) {
     emulator
         .request_in(
             region,
@@ -99,7 +106,7 @@ async fn tag(emulator: &Emulator, region: &str, arn: &str, tags: &Value) -> (u16
 }
 
 /// `GET /resources/{Arn}/tags`, which carries no payload at all.
-async fn get_tags(emulator: &Emulator, region: &str, arn: &str) -> (u16, Value) {
+pub(crate) async fn get_tags(emulator: &Emulator, region: &str, arn: &str) -> (u16, Value) {
     emulator
         .request_in(
             region,
@@ -111,7 +118,11 @@ async fn get_tags(emulator: &Emulator, region: &str, arn: &str) -> (u16, Value) 
 }
 
 /// The map `GetTags` reports for `arn`, which must be a 200 reporting that same ARN.
-async fn stored_tags(emulator: &Emulator, case: &str, arn: &str) -> BTreeMap<String, String> {
+pub(crate) async fn stored_tags(
+    emulator: &Emulator,
+    case: &str,
+    arn: &str,
+) -> BTreeMap<String, String> {
     let (status, body) = get_tags(emulator, "us-east-1", arn).await;
     assert_eq!(
         status, 200,

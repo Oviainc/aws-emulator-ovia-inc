@@ -19,14 +19,16 @@
 //! parameter group of such a family publishes (see
 //! [`ENGINE_DEFAULT_PARAMETERS`]), the documented identifier syntax, the
 //! documented `MaxRecords` window, the published maintenance-track catalog (see
-//! [`published_maintenance_tracks`]), every `Cluster` member this service DERIVES
+//! [`published_maintenance_tracks`]), the published account attributes (see
+//! [`published_account_attributes`]), every `Cluster` member this service DERIVES
 //! from a cluster's own configuration (one rule, [`populate_derived_members`],
 //! so the create, modify and read paths cannot report different member sets),
 //! and the clock-owed `creating` -> `available` transitions (see
 //! [`PROVISIONING_SPAN`]).
 
 use crate::ops::types::{
-    AccountWithRestoreAccess, AquaConfiguration, AvailabilityZone, Cluster, ClusterIamRole,
+    AccountAttribute, AccountWithRestoreAccess, AquaConfiguration, AttributeValueTarget,
+    AvailabilityZone, Cluster, ClusterIamRole,
     ClusterNode, ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus,
     ClusterSubnetGroup, ClusterVersion, CreateUsageLimitOutput, HsmConfiguration, MaintenanceTrack,
     NetworkInterface, Parameter, PendingModifiedValues, Qev2IdcApplication, Snapshot, Subnet,
@@ -786,6 +788,66 @@ pub fn check_maintenance_track(name: &str) -> Result<(), String> {
     ))
 }
 
+/// The most days a cluster's maintenance may be deferred for — the
+/// account-level allowance `DescribeAccountAttributes` publishes under
+/// [`ATTRIBUTE_MAX_DEFER_MAINTENANCE_DURATION`], and the bound a
+/// `ModifyClusterMaintenance` deferral is held to once that operation enforces
+/// one (it is still a scaffold).
+///
+/// Source: `smithy_query(query="doc", shape="ModifyClusterMaintenanceMessage",
+/// member="DeferMaintenanceDuration")` — "An integer indicating the duration of
+/// the maintenance window in days. … The duration must be 60 days or less."
+pub const MAX_DEFER_MAINTENANCE_DURATION: i32 = 60;
+
+/// `AccountAttribute$AttributeName` of the deferred-maintenance allowance.
+///
+/// Amazon Redshift names an account attribute in lower-case hyphenated form,
+/// after the member whose value it bounds
+/// (`ModifyClusterMaintenanceMessage$DeferMaintenanceDuration`).
+pub const ATTRIBUTE_MAX_DEFER_MAINTENANCE_DURATION: &str = "max-defer-maintenance-duration";
+
+/// One published account attribute: its name and the values it carries, each
+/// wrapped in the modelled `AttributeValueTarget` an `AttributeValueList` holds
+/// (`smithy_query(query="shape", shape="AttributeValueTarget")` — "Describes an
+/// attribute value").
+pub fn account_attribute<I>(name: &str, values: I) -> AccountAttribute
+where
+    I: IntoIterator<Item = String>,
+{
+    AccountAttribute {
+        attribute_name: Some(name.to_string()),
+        attribute_values: Some(
+            values
+                .into_iter()
+                .map(|value| AttributeValueTarget {
+                    attribute_value: Some(value),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// Every account attribute this service publishes, in the order
+/// `DescribeAccountAttributes` reports them.
+///
+/// An entry is "a name value pair that describes an aspect of an account"
+/// (`smithy_query(query="shape", shape="AccountAttribute")`) — a published
+/// allowance of the ACCOUNT, not a record a caller creates — so the catalog
+/// holds the allowances this service publishes for an account: the
+/// deferred-maintenance maximum ([`MAX_DEFER_MAINTENANCE_DURATION`]), the
+/// documented bound a `ModifyClusterMaintenance` deferral is held to once that
+/// operation enforces one. Seeded into
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::account_attributes`]
+/// when the store is created, exactly like the engine-version and
+/// maintenance-track catalogs, so the allowance a read reports and the bound
+/// that enforcement reads are one constant.
+pub fn published_account_attributes() -> Vec<AccountAttribute> {
+    vec![account_attribute(
+        ATTRIBUTE_MAX_DEFER_MAINTENANCE_DURATION,
+        [MAX_DEFER_MAINTENANCE_DURATION.to_string()],
+    )]
+}
+
 /// The default number of days automated snapshots are retained.
 ///
 /// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
@@ -1525,6 +1587,12 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// the tracks a cluster can be assigned to exist before any cluster does,
     /// and no operation adds to or removes from the list.
     pub maintenance_tracks: Vec<MaintenanceTrack>,
+    /// The account attributes this service publishes, in catalog order. SEEDED
+    /// when the store is created, exactly like
+    /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::maintenance_tracks`]:
+    /// an attribute is an allowance the account already has before it creates
+    /// anything, and no operation adds to or removes from the list.
+    pub account_attributes: Vec<AccountAttribute>,
 }
 
 /// Where in the store one resource an ARN names sits: its collection and its
@@ -1563,6 +1631,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             qev2_idc_applications: Vec::new(),
             cluster_versions: published_cluster_versions(),
             maintenance_tracks: published_maintenance_tracks(),
+            account_attributes: published_account_attributes(),
         }
     }
 }
@@ -1655,6 +1724,26 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         self.clusters
             .iter()
             .find(|c| c.cluster.cluster_identifier.as_deref() == Some(identifier))
+    }
+
+    /// The account attributes whose names `requested` asks for, in catalog
+    /// order — the WHOLE catalog when it asks for none.
+    ///
+    /// One rule for every caller: a request names the attributes it wants
+    /// reported, so an attribute the account carries no such name for
+    /// contributes nothing, and naming the same attribute twice still reports
+    /// it once.
+    pub fn account_attributes_named(&self, requested: &[String]) -> Vec<AccountAttribute> {
+        self.account_attributes
+            .iter()
+            .filter(|attribute| {
+                requested.is_empty()
+                    || requested
+                        .iter()
+                        .any(|name| Some(name.as_str()) == attribute.attribute_name.as_deref())
+            })
+            .cloned()
+            .collect()
     }
 
     /// The published maintenance track with this name, if the catalog has one.
