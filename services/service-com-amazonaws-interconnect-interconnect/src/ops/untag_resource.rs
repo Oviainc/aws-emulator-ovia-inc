@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -73,9 +64,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-interconnect-interconne
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.interconnect#UntagResource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.interconnect#UntagResource",
+    extra_errors = [
+        "ResourceNotFoundException",
+        "InterconnectValidationException",
+        "InterconnectServerException",
+    ]
+)]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
+    ResourceNotFoundException(ResourceNotFoundException),
+    InterconnectValidationException(InterconnectValidationException),
+    InterconnectServerException(InterconnectServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -124,23 +125,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// "Removes tags from the specified resource."
+    ///
+    /// The tag set of the resource the `arn` names loses exactly the keys the
+    /// request lists and keeps every other key with its value. A key the resource
+    /// does not carry is removed from nothing, so the call is idempotent: repeating
+    /// it, or naming a key that was never applied, succeeds and changes nothing.
+    /// An `arn` that names no resource of this service is a 404 — untagging never
+    /// brings a resource into existence.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InterconnectServerException(
+                InterconnectServerException {
+                    message: "the Interconnect connection store is not mounted on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // "Currently this supports Connection resources" (the tagging operations'
+        // own documentation), which is also what `AmazonResourceName`'s pattern
+        // allows: the ARN carries the `ConnectionId` of the connection whose tags
+        // these are. An ARN the boundary validator let through that still does not
+        // parse as one is refused as invalid INPUT, never with a 501.
+        let Some(connection_id) = crate::state::connection_id_from_arn(&input.arn) else {
+            return Err(UntagResourceErrorModeled::InterconnectValidationException(
+                InterconnectValidationException {
+                    message: crate::state::not_a_connection_arn_message(&input.arn),
+                },
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        // The one clock-driven write every connection operation makes first: it
+        // settles transitions that were already due at this instant, so a connection
+        // whose delete has completed is seen as `deleted` here.
+        guard.materialise_due_transitions(::std::time::Instant::now());
+        let store = &mut *guard;
+
+        // The ARN identifies the resource in full — partition, region and account
+        // included — so an ARN that differs from the stored one names a resource
+        // this store does not hold, exactly as an unknown id does. A connection that
+        // has reached the terminal `deleted` state is gone too: the store keeps it
+        // readable so a caller polling a delete sees the terminal state, but it no
+        // longer has a tag set to change.
+        let resolved = store.connections.get_mut(connection_id).filter(|stored| {
+            stored.connection.arn == input.arn && stored.connection.state != "deleted"
+        });
+        let Some(stored) = resolved else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::connection_not_retrievable_message(&input.arn)),
+                },
+            )
+            .into());
+        };
+
+        // Only the listed keys go; the rest of the map is untouched. A resource left
+        // with no tags holds `None`, which is how a connection created without tags
+        // is stored, so "no tags" has ONE representation in the store however it was
+        // reached.
+        if let Some(tags) = stored.connection.tags.as_mut() {
+            for key in &input.tag_keys {
+                tags.remove(key);
+            }
+            if tags.is_empty() {
+                stored.connection.tags = None;
+            }
+        }
+
+        Ok(UntagResourceOutput {})
     }
 }
