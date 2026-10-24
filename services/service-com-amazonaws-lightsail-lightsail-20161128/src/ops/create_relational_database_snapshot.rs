@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRelationalDatabaseSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRelationalDatabaseSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Takes a point-in-time copy of ONE stored managed relational database and
+//! persists it under the snapshot name the request names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRelationalDatabaseSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Everything the snapshot says about its source is copied out of the stored
+//! database record at this instant — engine, engine version, disk size, bundle id,
+//! blueprint id, location — so the snapshot keeps reporting them even after the
+//! database is changed or deleted; the caller's `tags` are kept verbatim and every
+//! server-assigned member (ARN, support code, creation time, resource type, state)
+//! is computed from them plus the store's own allocators. The snapshot is created
+//! `creating` and the CLOCK, not a reader, settles it into `available`.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +173,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRelationalDatabaseSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRelationalDatabaseSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRelationalDatabaseSnapshot"))
+        // Nothing about this request is regional: a snapshot is located where the
+        // database it was taken of is located (`RelationalDatabaseSnapshot$location`
+        // is "The Region name and Availability Zone where the database snapshot is
+        // located"), which the stored source record already names.
+        let _ = ctx;
+
+        // `relationalDatabaseName` and `relationalDatabaseSnapshotName` are modelled
+        // `@required` members carrying the modelled `ResourceName` pattern, so the
+        // centralized walk refused anything outside them before this body ran. What is
+        // left is what the model cannot express: the source must be a database this
+        // account holds, the snapshot name must not already be taken, and the
+        // caller-sized tag list must be within the store's bounds. Each is checked
+        // BEFORE the first write, so a refused request creates nothing.
+        let tags = input.tags.unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                tags.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+
+        let name = input.relational_database_snapshot_name;
+        let source_name = input.relational_database_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A snapshot name addresses one snapshot, so creating one this account
+            // already holds is refused rather than silently replacing a record a
+            // restore may already be using.
+            if store.relational_database_snapshot(&name).is_some() {
+                return Err(invalid(format!(
+                    "a relational database snapshot named '{name}' already exists"
+                )));
+            }
+            if store.relational_database_snapshots.len()
+                >= crate::state::MAX_RELATIONAL_DATABASE_SNAPSHOTS
+            {
+                return Err(invalid(format!(
+                    "creating a relational database snapshot would take this account past the {} \
+                     this emulator holds",
+                    crate::state::MAX_RELATIONAL_DATABASE_SNAPSHOTS
+                )));
+            }
+
+            // Everything about the source is read out of the SOURCE record as it
+            // stands now, so the snapshot keeps it even if the database later changes
+            // or is deleted.
+            let database = store.relational_database(&source_name).ok_or_else(|| {
+                // The source the request named is not a resource this account
+                // holds: Lightsail's `DoesNotExist` rejection — HTTP 400, wire
+                // error `NotFoundException`, body `code` `DoesNotExist` and a
+                // message naming the resource type and the requested name.
+                crate::scaffolded::Scaffolded::resource_does_not_exist(
+                    crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+                    &source_name,
+                )
+            })?;
+            let location = database.location.clone();
+            let engine = database.blueprint.engine.to_string();
+            let engine_version = database.blueprint.engine_version.to_string();
+            // The snapshotted disk is the database bundle's own storage — the size
+            // `GetRelationalDatabase` reports as its hardware disk size.
+            let size_in_gb = database.bundle.disk_size_in_gb;
+            let from_relational_database_name = database.name.clone();
+            let from_relational_database_arn = database.arn.clone();
+            let from_relational_database_bundle_id = database.bundle.bundle_id.to_string();
+            let from_relational_database_blueprint_id = database.blueprint.blueprint_id();
+
+            let id = store.mint_uuid();
+            // A snapshot is not restorable yet: the clock owes it `available`, which
+            // is why a read straight after this call still reports `creating`.
+            let due = crate::state::DueNamedState::after(
+                now,
+                crate::state::RELATIONAL_DATABASE_SNAPSHOT_STATE_AVAILABLE,
+            );
+            store.insert_relational_database_snapshot(
+                crate::state::StoredRelationalDatabaseSnapshot {
+                    name: name.clone(),
+                    arn: crate::state::relational_database_snapshot_arn(
+                        &location.region_name,
+                        &id,
+                    ),
+                    support_code: crate::state::support_code(&id),
+                    created_at_ms: now,
+                    location: location.clone(),
+                    tags,
+                    engine,
+                    engine_version,
+                    size_in_gb,
+                    state: crate::state::RELATIONAL_DATABASE_SNAPSHOT_STATE_CREATING,
+                    due: Some(due),
+                    from_relational_database_name,
+                    from_relational_database_arn,
+                    from_relational_database_bundle_id,
+                    from_relational_database_blueprint_id,
+                },
+            );
+            // `operations` is a list because other Lightsail creates act on several
+            // resources at once; `CreateRelationalDatabaseSnapshot` creates exactly
+            // one snapshot, so it answers exactly one entry, left non-terminal until
+            // the copy the clock owes the snapshot is due.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_RELATIONAL_DATABASE_SNAPSHOT,
+                crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE_SNAPSHOT,
+                &name,
+                &location,
+                Some(due.at_ms),
+            );
+            Ok(CreateRelationalDatabaseSnapshotOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateRelationalDatabaseSnapshotError {
+    CreateRelationalDatabaseSnapshotErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateRelationalDatabaseSnapshotError {
+    CreateRelationalDatabaseSnapshotErrorModeled::ServiceException(ServiceException {
+        message: Some(
+            "the Lightsail relational database snapshot store is unavailable".to_string(),
+        ),
+        ..Default::default()
+    })
+    .into()
 }
