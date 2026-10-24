@@ -19,6 +19,15 @@
 //! channels placed in this group) comes from the channel store — a channel names
 //! its group in `AnywhereSettings$ChannelPlacementGroupId` — and `State` comes
 //! from the group's own lifecycle, which the clock moves.
+//!
+//! The lifecycle has TWO clock-owed steps, because a group's node association
+//! can be both made and unmade: `UpdateChannelPlacementGroup` ("Change the
+//! settings for a ChannelPlacementGroup") can give a group a node, swap the one
+//! it has, or take its last one away, so a group that now names a node is
+//! `ASSIGNING` until `ASSIGNED` comes due and one whose nodes have just been
+//! emptied is `UNASSIGNING` until `UNASSIGNED` does
+//! ([`ChannelPlacementGroupRecord::begin_assignment`]). The instant is stored
+//! and never slept on.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -37,6 +46,9 @@ pub mod channel_placement_group_state {
     pub const ASSIGNING: &str = "ASSIGNING";
     /// A group that is associated with its node.
     pub const ASSIGNED: &str = "ASSIGNED";
+    /// A group whose last node is being taken away — the transient state the
+    /// clock owes [`UNASSIGNED`]. Reached by an update that empties `Nodes`.
+    pub const UNASSIGNING: &str = "UNASSIGNING";
     /// A group whose delete has been accepted; the clock owes [`DELETED`].
     /// Used by `DeleteChannelPlacementGroup` when its own issue lands; the
     /// read path already reports whatever state the record carries.
@@ -81,6 +93,16 @@ pub const MAX_CHANNEL_PLACEMENT_GROUP_TOKENS: usize = MAX_CHANNEL_PLACEMENT_GROU
 /// the documented maximum, not a ceiling this emulator chose.
 pub const MAX_CHANNEL_PLACEMENT_GROUP_NODES: usize = 1;
 
+/// The message a request that named more nodes than the member allows carries:
+/// the member, the documented bound and the count the request carried, so the
+/// caller can fix the request from that text alone.
+///
+/// One helper, so the create and the update cannot word the one refusal two
+/// ways.
+pub fn too_many_nodes_message(count: usize) -> String {
+    format!("Nodes accepts at most {MAX_CHANNEL_PLACEMENT_GROUP_NODES} node id, but {count} were supplied")
+}
+
 /// Why [`ComAmazonawsMedialiveMedialiveState::insert_channel_placement_group`]
 /// stored nothing. Each variant is one refusal, and each leaves the store
 /// exactly as it was.
@@ -100,15 +122,37 @@ pub enum ChannelPlacementGroupRefusal {
     StoreFull,
 }
 
+/// Why
+/// [`ComAmazonawsMedialiveMedialiveState::apply_channel_placement_group_changes`]
+/// changed nothing. Each variant is one refusal the update answers with, and
+/// each leaves the stored group exactly as it was.
+#[derive(Debug)]
+pub enum ChannelPlacementGroupUpdateRefusal {
+    /// The (`ClusterId`, `ChannelPlacementGroupId`) pair names no group in this
+    /// store — the same resolution a read performs, so a group of another
+    /// cluster is not found here either.
+    NoSuchGroup,
+    /// A delete has already been accepted for the group the pair names, so that
+    /// id names no resource a caller may still change (the rule every mutation
+    /// of this service follows).
+    AlreadyDeleted,
+    /// The request named more node ids than
+    /// [`MAX_CHANNEL_PLACEMENT_GROUP_NODES`]. Carries how many it named.
+    TooManyNodes { count: usize },
+    /// Another group of the same cluster already carries the new `Name`.
+    NameTaken,
+}
+
 /// One created channel placement group, as `CreateChannelPlacementGroup` stored
-/// it.
+/// it and `UpdateChannelPlacementGroup` has changed it since.
 ///
 /// `Channels` is NOT a member: it is derived from the channel store on every
 /// read (see
 /// [`ComAmazonawsMedialiveMedialiveState::channels_in_channel_placement_group`]),
 /// so a channel created or deleted after this group changes what the group
 /// reports. `State` is private, because the only ways into it are the create
-/// below and the clock (this record's own `settle`).
+/// below, the update's [`ChannelPlacementGroupRecord::begin_assignment`] and the
+/// clock (this record's own `settle`).
 #[derive(Debug, Clone)]
 pub struct ChannelPlacementGroupRecord {
     pub id: String,
@@ -116,10 +160,11 @@ pub struct ChannelPlacementGroupRecord {
     /// The cluster this group belongs to, from the creating request's
     /// `ClusterId` path label. A group is only reachable through this id.
     pub cluster_id: String,
-    /// The `Name` the request supplied, which "You can't change". A group
-    /// created without one has none, rather than an empty one.
+    /// The `Name` the group carries: the one the create supplied, or the one the
+    /// latest update changed it to. A group created without one has none,
+    /// rather than an empty one.
     pub name: Option<String>,
-    /// The node ids the request associated the group with — at most
+    /// The node ids the group is associated with — at most
     /// [`MAX_CHANNEL_PLACEMENT_GROUP_NODES`] of them.
     pub nodes: Vec<String>,
     /// The request's `Tags`. No response shape of this resource carries a
@@ -129,9 +174,10 @@ pub struct ChannelPlacementGroupRecord {
     /// The state the group is in NOW, one of
     /// [`channel_placement_group_state`]'s values.
     state: String,
-    /// When the clock makes this group's `ASSIGNING` -> `ASSIGNED` step due.
-    /// STORED, never slept on; `None` once nothing is owed.
-    assignment_due: Option<SystemTime>,
+    /// The transition the clock owes this group while its node association is
+    /// still going through. STORED, never slept on; `None` once nothing is
+    /// owed.
+    pending: Option<PendingAssignment>,
 }
 
 impl ChannelPlacementGroupRecord {
@@ -155,26 +201,87 @@ impl ChannelPlacementGroupRecord {
     /// A group created with a node is `ASSIGNING` and becomes `ASSIGNED` once
     /// [`TRANSIENT_STATE_SPAN`] has passed, whether or not anybody called, so
     /// running this on a read never changes what a later caller would otherwise
-    /// have seen.
+    /// have seen. An update that changed the node set owes the same kind of
+    /// step, into whichever state the new set implies.
     fn settle(&mut self, now: SystemTime) {
-        let Some(due) = self.assignment_due else {
+        let Some(pending) = self.pending else {
             return;
         };
-        if now < due {
+        if now < pending.due {
             return;
         }
-        self.state = channel_placement_group_state::ASSIGNED.to_string();
-        self.assignment_due = None;
+        self.state = pending.settled.to_string();
+        self.pending = None;
     }
+
+    /// Start the association the clock owes a group whose node set has just
+    /// become [`Self::nodes`]: the group reports the transient state now and
+    /// settles into the one that node set implies once
+    /// [`TRANSIENT_STATE_SPAN`] has passed.
+    ///
+    /// The one writer of [`Self::state`] after the insert, so the state a group
+    /// is in can never disagree with the node set it was computed from.
+    fn begin_assignment(&mut self, now: SystemTime) {
+        let (transient, settled) = assignment_states(&self.nodes);
+        self.state = transient.to_string();
+        self.pending = Some(PendingAssignment {
+            due: now + TRANSIENT_STATE_SPAN,
+            settled,
+        });
+    }
+}
+
+/// A transition the clock owes a group: the instant it comes due and the
+/// `ChannelPlacementGroupState` it settles into. Stored, never slept on — the
+/// same shape as the cluster and multiplex slices' own, for the same reason.
+#[derive(Debug, Clone, Copy)]
+struct PendingAssignment {
+    due: SystemTime,
+    settled: &'static str,
+}
+
+/// The state a group whose node set has just become `nodes` is in right now, and
+/// the one the clock then owes it.
+///
+/// Associating a node, and taking one away, is work the real service performs on
+/// the Nodes, so it is asynchronous and the caller waits on `State`: a group
+/// that now names a node is `ASSIGNING` until `ASSIGNED` comes due, and a group
+/// whose nodes have just been emptied is `UNASSIGNING` until `UNASSIGNED` does.
+fn assignment_states(nodes: &[String]) -> (&'static str, &'static str) {
+    if nodes.is_empty() {
+        (
+            channel_placement_group_state::UNASSIGNING,
+            channel_placement_group_state::UNASSIGNED,
+        )
+    } else {
+        (
+            channel_placement_group_state::ASSIGNING,
+            channel_placement_group_state::ASSIGNED,
+        )
+    }
+}
+
+/// What an `UpdateChannelPlacementGroup` request asks to change.
+///
+/// Each member is `Some` only when the request carried it — "Include this
+/// parameter only if you want to change the current ..." on both of them — so an
+/// omitted member leaves that setting exactly as it was. One struct rather than
+/// two positional `Option`s on
+/// [`ComAmazonawsMedialiveMedialiveState::apply_channel_placement_group_changes`],
+/// so a handler cannot pass the name where the nodes belong.
+#[derive(Debug, Clone, Default)]
+pub struct ChannelPlacementGroupChanges {
+    pub name: Option<String>,
+    pub nodes: Option<Vec<String>>,
 }
 
 /// One channel placement group as the response shapes carry it: the stored
 /// record plus the two members derived from the rest of the state.
 ///
 /// Every operation that reports a group (`CreateChannelPlacementGroup`,
-/// `DescribeChannelPlacementGroup`, and the update and delete when their own
-/// issues land) is modelled with its OWN flat output shape carrying the same
-/// seven members, so the projection is built once here and the
+/// `DescribeChannelPlacementGroup`, `UpdateChannelPlacementGroup`, and the
+/// delete when its own issue lands) is modelled with its OWN flat output shape
+/// carrying the same seven members, so the projection is built once here and the
 /// `channel_placement_group_output` macro below moves it onto whichever shape
 /// the operation declares.
 #[derive(Debug, Clone)]
@@ -266,12 +373,20 @@ impl ComAmazonawsMedialiveMedialiveState {
             region,
             &format!("channelPlacementGroup:{id}"),
         );
-        let (state, assignment_due) = if nodes.is_empty() {
+        // A group created with no node has nothing in flight, so it starts in
+        // the settled `UNASSIGNED` with nothing owed; one created with a node
+        // starts the association, whose two states come from the one mapping
+        // from node set to state ([`assignment_states`]).
+        let (state, pending) = if nodes.is_empty() {
             (channel_placement_group_state::UNASSIGNED, None)
         } else {
+            let (transient, settled) = assignment_states(&nodes);
             (
-                channel_placement_group_state::ASSIGNING,
-                Some(now + TRANSIENT_STATE_SPAN),
+                transient,
+                Some(PendingAssignment {
+                    due: now + TRANSIENT_STATE_SPAN,
+                    settled,
+                }),
             )
         };
         self.channel_placement_groups.insert(
@@ -284,7 +399,7 @@ impl ComAmazonawsMedialiveMedialiveState {
                 nodes,
                 tags,
                 state: state.to_string(),
-                assignment_due,
+                pending,
             },
         );
         Ok(id)
@@ -309,6 +424,13 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// documented "Specify a name that is unique in the Cluster. You can't
     /// change the name. Names are case-sensitive", so at most one group answers
     /// and the comparison is case-sensitive.
+    ///
+    /// The uniqueness is what both the create and the UPDATE resolve against:
+    /// `UpdateChannelPlacementGroup`'s own `Name` is documented "Include this
+    /// parameter only if you want to change the current name of the
+    /// ChannelPlacementGroup", so a rename IS possible and this lookup is what
+    /// tells it apart from a clash with another group of the same cluster (see
+    /// [`ComAmazonawsMedialiveMedialiveState::apply_channel_placement_group_changes`]).
     fn channel_placement_group_named(
         &self,
         cluster_id: &str,
@@ -317,6 +439,70 @@ impl ComAmazonawsMedialiveMedialiveState {
         self.channel_placement_groups.values().find(|group| {
             group.cluster_id == cluster_id && group.name.as_deref() == Some(name)
         })
+    }
+
+    /// Apply an `UpdateChannelPlacementGroup` request's changes to the group the
+    /// pair names, or refuse.
+    ///
+    /// Every refusal is checked BEFORE the first write, so a refused update
+    /// leaves the stored group exactly as it was. A member the request omitted
+    /// is not changed ("Include this parameter only if you want to change the
+    /// current ..."), and a node set it carried that the group already holds is
+    /// not a change either — so re-sending the stored nodes leaves the group in
+    /// the state it had reached instead of starting a fresh association.
+    ///
+    /// The documented in-cluster name uniqueness and node bound are the create's
+    /// own rules, checked here too so the two cannot disagree about what a
+    /// stored group may look like.
+    pub fn apply_channel_placement_group_changes(
+        &mut self,
+        cluster_id: &str,
+        id: &str,
+        changes: ChannelPlacementGroupChanges,
+        now: SystemTime,
+    ) -> Result<(), ChannelPlacementGroupUpdateRefusal> {
+        match self.channel_placement_group(cluster_id, id) {
+            None => return Err(ChannelPlacementGroupUpdateRefusal::NoSuchGroup),
+            Some(group) if group.is_delete_accepted() => {
+                return Err(ChannelPlacementGroupUpdateRefusal::AlreadyDeleted)
+            }
+            Some(_) => {}
+        }
+        if let Some(nodes) = changes.nodes.as_ref() {
+            if nodes.len() > MAX_CHANNEL_PLACEMENT_GROUP_NODES {
+                return Err(ChannelPlacementGroupUpdateRefusal::TooManyNodes {
+                    count: nodes.len(),
+                });
+            }
+        }
+        // A name another group of this cluster holds is refused, while
+        // re-sending the group's own name is not a collision with itself.
+        if let Some(name) = changes.name.as_deref() {
+            if self
+                .channel_placement_group_named(cluster_id, name)
+                .is_some_and(|holder| holder.id != id)
+            {
+                return Err(ChannelPlacementGroupUpdateRefusal::NameTaken);
+            }
+        }
+
+        let group = self
+            .channel_placement_groups
+            .get_mut(id)
+            .ok_or(ChannelPlacementGroupUpdateRefusal::NoSuchGroup)?;
+        if let Some(name) = changes.name {
+            group.name = Some(name);
+        }
+        if let Some(nodes) = changes.nodes {
+            if nodes != group.nodes {
+                group.nodes = nodes;
+                // The node set really changed, so the association the real
+                // service makes on the Nodes starts over: the group reports the
+                // transient state and settles into the one the new set implies.
+                group.begin_assignment(now);
+            }
+        }
+        Ok(())
     }
 
     /// The ids of the channels currently placed in the group `group_id` names in
@@ -432,12 +618,12 @@ fn channel_placement_group_token_key(cluster_id: &str, token: &str) -> String {
 /// Project a [`ChannelPlacementGroupDescription`] onto one of the structurally
 /// identical per-operation flat group output shapes
 /// (`CreateChannelPlacementGroupOutput`,
-/// `DescribeChannelPlacementGroupOutput`, and the update's and delete's when
-/// their own issues land).
+/// `DescribeChannelPlacementGroupOutput`, `UpdateChannelPlacementGroupOutput`,
+/// and the delete's when its own issue lands).
 ///
 /// One macro rather than a hand-written copy of the same seven-member move per
-/// operation, so a create and the read that follows it cannot report the same
-/// stored group differently.
+/// operation, so a create, an update and the read that follows either cannot
+/// report the same stored group differently.
 macro_rules! channel_placement_group_output {
     ($out:ident, $group:expr) => {{
         let group: $crate::state::ChannelPlacementGroupDescription = $group;

@@ -112,6 +112,16 @@
 //! is its `State` — out of the `CREATING` -> `ACTIVE` transition the clock owes
 //! it.
 //!
+//! The CHANNEL PLACEMENT GROUPS those clusters hold live here as well: one
+//! [`ChannelPlacementGroupRecord`] per created group, its own id counter and its
+//! own token map, each carrying the id of the cluster it was created in, so the
+//! (`ClusterId`, `ChannelPlacementGroupId`) pair every one of its operations
+//! names it by resolves out of state. A group's `Channels` is derived from the
+//! channels this store already holds — the ones whose
+//! `AnywhereSettings$ChannelPlacementGroupId` names the group — and its `State`
+//! from the node assignment the clock owes it
+//! (`ASSIGNING` -> `ASSIGNED`, `UNASSIGNING` -> `UNASSIGNED`).
+//!
 //! Tags are NOT a store of their own: every resource record above carries its
 //! own tag map, and the tag operations reach the map of the resource their
 //! `ResourceArn` names through
@@ -194,8 +204,9 @@ pub(crate) use alarm_template_groups::alarm_template_group_output;
 pub mod channel_placement_groups;
 
 pub use channel_placement_groups::{
-    channel_placement_group_state, ChannelPlacementGroupDescription,
-    ChannelPlacementGroupRecord, ChannelPlacementGroupRefusal,
+    channel_placement_group_state, too_many_nodes_message, ChannelPlacementGroupChanges,
+    ChannelPlacementGroupDescription, ChannelPlacementGroupRecord,
+    ChannelPlacementGroupRefusal, ChannelPlacementGroupUpdateRefusal,
     MAX_CHANNEL_PLACEMENT_GROUPS, MAX_CHANNEL_PLACEMENT_GROUP_NODES,
     MAX_CHANNEL_PLACEMENT_GROUP_TOKENS,
 };
