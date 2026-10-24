@@ -23,8 +23,8 @@ use crate::ops::types::{
     IngestConfiguration, InternalServerException, ParticipantRecordingHlsConfiguration,
     ParticipantReplica, ParticipantSummary, ParticipantThumbnailConfiguration, ParticipantToken,
     RedundantIngestCredential, ResourceNotFoundException, S3StorageConfiguration,
-    ServiceQuotaExceededException, Stage, StageEndpoints, StageSummary, StorageConfiguration,
-    StorageConfigurationSummary, ValidationException, Video,
+    ServiceQuotaExceededException, Stage, StageEndpoints, StageSessionSummary, StageSummary,
+    StorageConfiguration, StorageConfigurationSummary, ValidationException, Video,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -262,7 +262,8 @@ pub const NO_ACTIVE_SESSION_ID: &str = "";
 ///
 /// The model documents it on `ListStagesRequest$maxResults` ("Maximum number of
 /// results to return. Default: 50.") and states the same default on
-/// `ListParticipantReplicasRequest$maxResults`, so both listings page by it.
+/// `ListParticipantsRequest$maxResults`, `ListParticipantReplicasRequest$maxResults`
+/// and `ListStageSessionsRequest$maxResults`, so those listings page by it.
 pub const DEFAULT_LIST_PAGE_SIZE: usize = 50;
 
 /// Total size an `attributes` map may reach, on every shape of this service that
@@ -518,6 +519,10 @@ const REPLICA_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-replica-after:";
 /// above so a token issued by one listing names no position in another and is refused
 /// there.
 const STORAGE_CONFIGURATION_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-storage-configuration-after:";
+
+/// The same marker for a `ListStageSessions` page, kept distinct from the others so a
+/// token issued by one listing names no position in another and is refused there.
+const STAGE_SESSION_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-stage-session-after:";
 
 /// One stage, as `CreateStage` persisted it and `GetStage` / `ListStages` report it.
 #[derive(Debug, Clone)]
@@ -799,8 +804,8 @@ impl StorageConfigurationRecord {
 // [`join_stage_session`] / [`leave_stage_session`] — the one entry point a stage data
 // plane uses, and the one place the modelled defaults of a joining participant are
 // applied — over the session [`ensure_active_session`] opens, and the reporting
-// operations (`ListParticipants` today; `GetParticipant`, `GetStageSession` and
-// `ListStageSessions`, each its own gap issue) answer from exactly what those
+// operations (`ListParticipants` and `ListStageSessions` today; `GetParticipant` and
+// `GetStageSession`, each its own gap issue) answer from exactly what those
 // recorded, never from a value invented for a join that never happened.
 // ---------------------------------------------------------------------------
 
@@ -981,6 +986,20 @@ pub struct StageSessionRecord {
 }
 
 impl StageSessionRecord {
+    /// The modelled `StageSessionSummary` this record reports in a `ListStageSessions`
+    /// page.
+    ///
+    /// `endTime` is reported only once the session has ended — "This is null if the
+    /// stage is active", as `StageSessionSummary$endTime` states — which is exactly
+    /// what [`Self::end_time`] holds.
+    pub fn to_summary(&self) -> StageSessionSummary {
+        StageSessionSummary {
+            session_id: Some(self.session_id.clone()),
+            start_time: Some(::aws_smithy_types::DateTime::from(self.start_time)),
+            end_time: self.end_time.map(::aws_smithy_types::DateTime::from),
+        }
+    }
+
     /// This session's participants in join order — the order `ListParticipants` pages
     /// over, so a record added or left mid-pagination cannot shift a later page onto
     /// an already-returned one.
@@ -1229,6 +1248,21 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
             self.storage_configurations.values().collect();
         configurations.sort_by_key(|record| record.sequence);
         configurations
+    }
+
+    /// Every session the stage `stage_arn` has had, in start order — the order
+    /// `ListStageSessions` pages over, so a session opening or ending mid-pagination
+    /// cannot shift a later page onto an already-returned one. A stage this store
+    /// holds no session for (one that never had a participant, or one it does not hold
+    /// at all) has none.
+    pub fn stage_sessions_in_start_order(&self, stage_arn: &str) -> Vec<&StageSessionRecord> {
+        let mut sessions: Vec<&StageSessionRecord> = self
+            .stage_sessions
+            .get(stage_arn)
+            .map(|sessions| sessions.iter().collect())
+            .unwrap_or_default();
+        sessions.sort_by_key(|record| record.sequence);
+        sessions
     }
 
     /// The session `session_id` of the stage `stage_arn`, or `None` when this store
@@ -1746,6 +1780,19 @@ pub fn encode_participant_page_token(after_sequence: u64) -> String {
 /// another listing included.
 pub fn decode_participant_page_token(token: &str) -> Option<u64> {
     decode_after(PARTICIPANT_PAGE_TOKEN_PREFIX, token)
+}
+
+/// [`encode_page_token`] for a `ListStageSessions` page: the start sequence the next
+/// page of stage sessions resumes after, under that listing's own marker.
+pub fn encode_stage_session_page_token(after_sequence: u64) -> String {
+    encode_after(STAGE_SESSION_PAGE_TOKEN_PREFIX, after_sequence)
+}
+
+/// The start sequence a stage-session `nextToken` resumes after, or `None` when the
+/// token was not issued by [`encode_stage_session_page_token`] — a token from another
+/// listing included.
+pub fn decode_stage_session_page_token(token: &str) -> Option<u64> {
+    decode_after(STAGE_SESSION_PAGE_TOKEN_PREFIX, token)
 }
 
 /// [`encode_page_token`] for a `ListParticipantReplicas` page: the start sequence the

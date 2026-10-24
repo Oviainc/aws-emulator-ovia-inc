@@ -27,6 +27,8 @@ mod participant_replication;
 mod participants;
 #[path = "all/signing_name_routing.rs"]
 mod signing_name_routing;
+#[path = "all/stage_sessions.rs"]
+mod stage_sessions;
 #[path = "all/stages.rs"]
 mod stages;
 #[path = "all/state_roundtrip.rs"]
