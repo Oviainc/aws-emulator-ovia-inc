@@ -14,6 +14,12 @@
 //! response's `errors` list, which is what the model says that list is ("Returns of list of
 //! resources that doesn't have idle recommendations").
 //!
+//! It reports for exactly ONE account, the one this emulator presents: a request that asks
+//! about any other account — in `accountIds`, or through a `resourceArns` entry whose
+//! account field names one — is refused with `InvalidParameterValueException` (see
+//! [`foreign_account`]), as every other reader of this service refuses it, and no
+//! recommendation recorded against another account is reported.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -191,38 +197,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A malformed request is refused BEFORE the store is read, so
         // InvalidParameterValueException takes precedence over the opt-in gate below, as it
-        // does in the other read operations of this service.
-        let account_ids = input.account_ids.unwrap_or_default();
-        // `accountIds`: "You can only specify one account ID per request."
-        if account_ids.len() > 1 {
-            return Err(invalid_parameter(
-                "The value supplied for parameter accountIds is not valid: you can only specify \
-                 one account ID per request."
-                    .to_string(),
-            ));
-        }
-        if let Some(value) = account_ids
-            .iter()
-            .find(|value| !crate::state::is_account_id(value))
-        {
-            return Err(invalid_parameter(format!(
-                "The value supplied for parameter accountIds is not valid: {value} is not a \
-                 12-digit Amazon Web Services account ID."
-            )));
-        }
+        // does in the other read operations of this service; so is every request that asks
+        // about an account this service cannot answer for (see [`foreign_account`]).
+        let account_id = requested_account_id(input.account_ids.as_deref())?;
 
         // `resourceArns`: "The ARN that identifies the idle resource" — so each value is an
-        // ARN. Which resource an ARN names is NOT checked here: a well-formed ARN the
-        // service holds no recommendation for is reported in `errors` below, not refused.
+        // ARN, and one whose account field names another account asks about an account this
+        // service cannot report on. WHICH resource an ARN of the requested account names is
+        // NOT checked here: a well-formed ARN the service holds no recommendation for is
+        // reported in `errors` below, not refused.
         let resource_arns = input.resource_arns.unwrap_or_default();
-        if let Some(value) = resource_arns
-            .iter()
-            .find(|value| crate::state::parse_arn(value).is_none())
-        {
-            return Err(invalid_parameter(format!(
-                "The value supplied for parameter resourceArns is not valid: {value} is not an \
-                 Amazon Resource Name (ARN)."
-            )));
+        for value in &resource_arns {
+            let Some(parsed) = crate::state::parse_arn(value) else {
+                return Err(invalid_parameter(format!(
+                    "The value supplied for parameter resourceArns is not valid: {value} is not \
+                     an Amazon Resource Name (ARN)."
+                )));
+            };
+            // The account field of an ARN is empty for the resources of a service that does
+            // not scope them to an account, so such an ARN names no OTHER account: it is
+            // just a resource this service holds no idle recommendation for.
+            if !parsed.account_id.is_empty() && parsed.account_id != account_id {
+                return Err(foreign_account());
+            }
         }
 
         // The filter vocabulary is the model's own; a name or value outside it is refused
@@ -240,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let selection_fingerprint = crate::state::fingerprint(&(
             Self::NAME,
             &resource_arns,
-            &account_ids,
+            &account_id,
             &filters,
             &input.order_by,
         ));
@@ -286,8 +283,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The recommendations the request selects: those of the named resources, of the
-        // named account, that satisfy every filter. A member the request omits selects
-        // nothing away.
+        // account this request asks about, that satisfy every filter. A member the request
+        // omits selects nothing away — except the account, which is always the one account
+        // this service answers for.
         let mut selected: Vec<IdleRecommendation> = guard
             .idle_recommendations
             .iter_in_order()
@@ -298,12 +296,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .as_ref()
                         .is_some_and(|arn| resource_arns.contains(arn))
             })
+            // Only the requested account's analysis is reported. This service answers for
+            // ONE account (see [`foreign_account`]), so a recommendation recorded against
+            // another account is not part of what this caller can be told — scoping, not a
+            // selection the request can widen. A record naming no account belongs to the
+            // account whose analysis this is, the only analysis this service holds.
             .filter(|recommendation| {
-                account_ids.is_empty()
-                    || recommendation
-                        .account_id
-                        .as_ref()
-                        .is_some_and(|account_id| account_ids.contains(account_id))
+                recommendation
+                    .account_id
+                    .as_deref()
+                    .is_none_or(|recorded| recorded == account_id)
             })
             .filter(|recommendation| {
                 crate::state::idle_recommendation_matches_filters(recommendation, &filters)
@@ -391,4 +393,33 @@ fn invalid_parameter(message: String) -> GetIdleRecommendationsError {
         },
     )
     .into()
+}
+
+/// A 400 `InvalidParameterValueException` for a request that asks about an account other
+/// than the one this service answers for.
+///
+/// `accountIds` is how a MANAGEMENT account names a member account of its organization: "If
+/// your account is the management account or the delegated administrator of an organization,
+/// use this parameter to return the idle resource recommendations to specific member
+/// accounts." This emulator presents one standalone account (`::engine::emulator_account_id`)
+/// and records no organization, so no other account is a member account it can be asked
+/// about — in `accountIds`, or through a `resourceArns` entry that names one. The refusal is
+/// worded once for the whole crate ([`crate::state::CROSS_ACCOUNT_MESSAGE`]) so no two
+/// readers differ.
+fn foreign_account() -> GetIdleRecommendationsError {
+    invalid_parameter(crate::state::CROSS_ACCOUNT_MESSAGE.to_string())
+}
+
+/// The account whose recommendations this request asks for: the one id `accountIds` carries,
+/// or the caller's own account when it carries none.
+///
+/// The rule is the crate's ([`crate::state::requested_account_id`]): "You can only specify
+/// one account ID per request" (`GetIdleRecommendations$accountIds`), an `AccountId` is a
+/// 12-digit Amazon Web Services account id (`Scope$value`), and an id that is well-formed but
+/// names another account is refused by [`foreign_account`] rather than used as a filter key.
+/// This wrapper only lifts the reason into this operation's error channel.
+fn requested_account_id(
+    account_ids: Option<&[String]>,
+) -> Result<String, GetIdleRecommendationsError> {
+    crate::state::requested_account_id(account_ids).map_err(invalid_parameter)
 }

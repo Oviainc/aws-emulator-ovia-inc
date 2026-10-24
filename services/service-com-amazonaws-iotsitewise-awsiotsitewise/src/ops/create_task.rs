@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +172,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTask"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateTaskError::Modeled(CreateTaskErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let store_key = crate::state::task_key(&input.workspace_name, &input.task_name);
+        let mut store = state.lock();
+
+        if let Some(existing) = store.tasks.get(&store_key) {
+            // "If you retry a request that completed successfully using the same client
+            // token, the server returns the cached result from the original successful
+            // request without performing the operation again": the retry writes
+            // nothing and reports the version the ORIGINAL call minted — the first one
+            // — whatever version a later update has since written.
+            if input.client_token.is_some() && input.client_token == existing.client_token {
+                return Ok(CreateTaskOutput {
+                    task_name: existing.name.clone(),
+                    task_arn: existing.arn.clone(),
+                    version: crate::state::FIRST_TASK_VERSION.to_string(),
+                    status: existing.status(now),
+                });
+            }
+            // `taskName` "must be unique within the workspace", so a second create
+            // claiming a name a task already holds collides with that task.
+            return Err(CreateTaskError::Modeled(
+                CreateTaskErrorModeled::ConflictingOperationException(
+                    ConflictingOperationException {
+                        message: format!(
+                            "The task {} already exists in the workspace {}.",
+                            existing.name, existing.workspace_name
+                        ),
+                        resource_id: existing.name.clone(),
+                        resource_arn: existing.arn.clone(),
+                    },
+                ),
+            ));
+        }
+
+        // The store is bounded, for the reason `CreatePipeline` states: a create is the
+        // only thing that adds a task and nothing evicts one, so past either cap this is
+        // a quota refusal. The total is checked as well as the per-workspace count,
+        // because `workspaceName` is a caller-supplied string this service has no
+        // registry to resolve, so a caller naming a fresh workspace each time would
+        // otherwise open one more per-workspace bucket every time.
+        if store.tasks.len() >= crate::state::MAX_TASKS {
+            return Err(CreateTaskError::Modeled(
+                CreateTaskErrorModeled::LimitExceededException(LimitExceededException {
+                    message: format!(
+                        "This emulator holds at most {} tasks.",
+                        crate::state::MAX_TASKS
+                    ),
+                }),
+            ));
+        }
+        let held = store
+            .tasks
+            .keys()
+            .filter(|(workspace, _)| *workspace == input.workspace_name)
+            .count();
+        if held >= crate::state::MAX_TASKS_PER_WORKSPACE {
+            return Err(CreateTaskError::Modeled(
+                CreateTaskErrorModeled::LimitExceededException(LimitExceededException {
+                    message: format!(
+                        "This emulator holds at most {} tasks per workspace.",
+                        crate::state::MAX_TASKS_PER_WORKSPACE
+                    ),
+                }),
+            ));
+        }
+
+        // The boundary validator reaches a map's VALUES but not its KEYS, so
+        // `TagKey`'s own bound is enforced here, the way `TagResource` enforces it,
+        // and before anything is stored.
+        for tag_key in input.tags.iter().flatten().map(|(tag_key, _)| tag_key) {
+            crate::state::check_tag_key(tag_key).map_err(invalid_request)?;
+        }
+
+        let record = crate::state::TaskRecord {
+            workspace_name: input.workspace_name.clone(),
+            name: input.task_name.clone(),
+            arn: crate::state::task_arn(&region, &input.workspace_name, &input.task_name),
+            current: crate::state::TaskVersion {
+                version: crate::state::FIRST_TASK_VERSION,
+                description: input.description.clone(),
+                configuration: input.task_configuration.clone(),
+                recorded_at: now,
+            },
+            // A freshly created task has no superseded version: only `UpdateTask`
+            // writes another one.
+            superseded: Vec::new(),
+            created_at: now,
+            // The task reports CREATING until the transition this call owes falls due;
+            // the instant is stored, never slept on.
+            settling_state: crate::state::STATE_CREATING.to_string(),
+            active_at: now + crate::state::ACTIVATION_DELAY,
+            client_token: input.client_token.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+
+        let output = created(&record, now);
+        store.tasks.insert(store_key, record);
+
+        Ok(output)
     }
+}
+
+/// What this operation answers for a stored task, as of `now` — every member read
+/// off the record rather than off the request.
+fn created(record: &crate::state::TaskRecord, now: ::std::time::SystemTime) -> CreateTaskOutput {
+    CreateTaskOutput {
+        task_name: record.name.clone(),
+        task_arn: record.arn.clone(),
+        version: record.version_label(),
+        status: record.status(now),
+    }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> CreateTaskError {
+    CreateTaskError::Modeled(CreateTaskErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
 }

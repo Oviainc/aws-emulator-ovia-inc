@@ -9,10 +9,10 @@
 //! An idle resource recommendation is produced by Compute Optimizer's own analysis of an
 //! observed workload, and no operation of THIS API creates one, so the fixtures below
 //! record recommendations into the store the way that analysis would and then read them
-//! back only over the wire. What is asserted is the RULE the read follows — select by
-//! resource, account and filter, sort on the requested savings dimension, page at
-//! `maxResults`, and report a requested resource that has no recommendation in `errors` —
-//! over a table of inputs, never one recorded call.
+//! back only over the wire. What is asserted is the RULE the read follows — answer for the
+//! one account this emulator presents, select by resource, account and filter, sort on the
+//! requested savings dimension, page at `maxResults`, and report a requested resource that
+//! has no recommendation in `errors` — over a table of inputs, never one recorded call.
 
 use std::sync::Arc;
 
@@ -25,11 +25,24 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
     service_state, IDLE_MAX_PAGE_SIZE, NO_RECOMMENDATION_CODE,
 };
 
-use crate::harness::{call, emulator_with_engine, error_code, opt_in, ACCOUNT};
+use crate::harness::{call, emulator_with_engine, error_code, opt_in};
 
-/// The second account these fixtures use, so an `accountIds` selection has something to
-/// select away.
+/// The ONE account this emulator presents, and so the only account any reader of this
+/// service can report on. Taken from the runtime's single source of truth rather than
+/// written out, so the fixtures below cannot drift from the account the service answers for.
+fn own_account() -> &'static str {
+    ::engine::emulator_account_id()
+}
+
+/// A well-formed account id that is NOT the caller's: an account of an organization this
+/// emulator records none of, so every request naming it is refused.
 const MEMBER_ACCOUNT: &str = "210987654321";
+
+/// The refusal a request about another account is answered with, as this crate's readers
+/// word it once (`crate::state::CROSS_ACCOUNT_MESSAGE`): it states the permission that is
+/// missing and how an organization account gets it, naming neither member nor account.
+const CROSS_ACCOUNT_MESSAGE: &str = "Invalid permission to access another account. If this \
+     is an organization account, request the management account to enable service access.";
 
 /// The region every ARN below names.
 const REGION: &str = "us-east-1";
@@ -104,58 +117,83 @@ fn recorded(
 fn corpus() -> Vec<IdleRecommendation> {
     vec![
         recorded(
-            &arn("ec2", ACCOUNT, "instance/i-0123456789abcdef0"),
+            &arn("ec2", own_account(), "instance/i-0123456789abcdef0"),
             "i-0123456789abcdef0",
             "EC2Instance",
-            ACCOUNT,
+            own_account(),
             "Idle",
             10.0,
             8.0,
         ),
         recorded(
-            &arn("ec2", ACCOUNT, "volume/vol-0123456789abcdef0"),
+            &arn("ec2", own_account(), "volume/vol-0123456789abcdef0"),
             "vol-0123456789abcdef0",
             "EBSVolume",
-            ACCOUNT,
+            own_account(),
             "Unattached",
             5.0,
             4.5,
         ),
         recorded(
-            &arn("ec2", ACCOUNT, "natgateway/nat-0123456789abcdef0"),
+            &arn("ec2", own_account(), "natgateway/nat-0123456789abcdef0"),
             "nat-0123456789abcdef0",
             "NatGateway",
-            ACCOUNT,
+            own_account(),
             "Unused",
             30.0,
             2.0,
         ),
         recorded(
-            &arn("dynamodb", MEMBER_ACCOUNT, "table/orders"),
+            &arn("dynamodb", own_account(), "table/orders"),
             "orders",
             "DynamoDBTable",
-            MEMBER_ACCOUNT,
+            own_account(),
             "Idle",
             20.0,
             19.0,
         ),
         recorded(
-            &arn("ecs", ACCOUNT, "service/web/checkout"),
+            &arn("ecs", own_account(), "service/web/checkout"),
             "checkout",
             "ECSService",
-            ACCOUNT,
+            own_account(),
             "Idle",
             1.0,
             0.5,
         ),
         recorded(
-            &arn("sagemaker", MEMBER_ACCOUNT, "endpoint/scoring"),
+            &arn("sagemaker", own_account(), "endpoint/scoring"),
             "scoring",
             "SageMakerEndpoint",
-            MEMBER_ACCOUNT,
+            own_account(),
             "Unused",
             7.5,
             7.0,
+        ),
+    ]
+}
+
+/// Analysis output recorded against ANOTHER account — an organization member account this
+/// standalone emulator records none of. Nothing a caller of this service may be told about.
+fn foreign_corpus() -> Vec<IdleRecommendation> {
+    vec![
+        recorded(
+            &arn("dynamodb", MEMBER_ACCOUNT, "table/member-orders"),
+            "member-orders",
+            "DynamoDBTable",
+            MEMBER_ACCOUNT,
+            "Idle",
+            42.0,
+            40.0,
+        ),
+        recorded(
+            &arn("sagemaker", MEMBER_ACCOUNT, "endpoint/member-scoring"),
+            "member-scoring",
+            "SageMakerEndpoint",
+            MEMBER_ACCOUNT,
+            "Unused",
+            3.5,
+            3.0,
         ),
     ]
 }
@@ -244,7 +282,7 @@ async fn a_recorded_recommendation_is_reported_member_for_member() {
         "resourceArn": resource_arn,
         "resourceId": "i-0123456789abcdef0",
         "resourceType": "EC2Instance",
-        "accountId": ACCOUNT,
+        "accountId": own_account(),
         "finding": "Idle",
         "findingDescription": "The resource is Idle.",
         "savingsOpportunity": {
@@ -321,19 +359,14 @@ async fn the_read_selects_by_resource_account_and_filter() {
             vec![instance.clone(), table.clone(), endpoint.clone()],
         ),
         (
-            "one account",
-            json!({"accountIds": [MEMBER_ACCOUNT]}),
-            vec![table.clone(), endpoint.clone()],
+            "the caller's own account, named explicitly",
+            json!({"accountIds": [own_account()]}),
+            all.clone(),
         ),
         (
-            "the other account",
-            json!({"accountIds": [ACCOUNT]}),
-            vec![
-                instance.clone(),
-                volume.clone(),
-                nat_gateway.clone(),
-                ecs_service.clone(),
-            ],
+            "an empty accountIds list names no account",
+            json!({"accountIds": []}),
+            all.clone(),
         ),
         (
             "one finding",
@@ -378,13 +411,20 @@ async fn the_read_selects_by_resource_account_and_filter() {
         ),
         (
             "an account and a resource ARN are ANDed",
-            json!({"accountIds": [ACCOUNT], "resourceArns": [instance.clone(), table.clone()]}),
-            vec![instance.clone()],
+            json!({
+                "accountIds": [own_account()],
+                "resourceArns": [instance.clone(), table.clone()],
+            }),
+            vec![instance.clone(), table.clone()],
         ),
         (
-            "a resource of another account",
-            json!({"accountIds": [ACCOUNT], "resourceArns": [endpoint.clone()]}),
-            Vec::new(),
+            "an account, a resource ARN and a filter are ANDed",
+            json!({
+                "accountIds": [own_account()],
+                "resourceArns": [instance.clone(), table.clone()],
+                "filters": [{"name": "ResourceType", "values": ["DynamoDBTable"]}],
+            }),
+            vec![table.clone()],
         ),
     ];
 
@@ -396,6 +436,106 @@ async fn the_read_selects_by_resource_account_and_filter() {
             "case {case:?}: expected {wanted:?}, got {body}"
         );
     }
+}
+
+/// The account rule: this service answers for exactly ONE account, so a request that asks
+/// about any OTHER account — a well-formed `accountIds` value naming it, or a `resourceArns`
+/// entry whose account field names it — is refused with `InvalidParameterValueException`
+/// (HTTP 400) rather than used as a selection key, and a recommendation recorded against
+/// another account is never reported.
+///
+/// The rows span the class of foreign ids: the documentation's own example accounts, an id
+/// one digit from the caller's own, and both ends of the 12-digit range — each sent through
+/// both members that can name an account, alone and together with the caller's own id.
+#[tokio::test]
+async fn a_request_about_another_account_is_refused() {
+    let (router, engine, corpus) = emulator_with_corpus().await;
+    // Analysis recorded for another account, which no answer of this service may carry.
+    let foreign = foreign_corpus();
+    record(&engine, &foreign);
+    let own_arns: Vec<String> = corpus
+        .iter()
+        .map(|recommendation| recommendation.resource_arn.clone().expect("an ARN"))
+        .collect();
+
+    let foreign_accounts = [
+        MEMBER_ACCOUNT,
+        "111122223333",
+        "123456789012",
+        "000000000001",
+        "999999999999",
+    ];
+
+    for account_id in foreign_accounts {
+        let foreign_arn = arn("ec2", account_id, "instance/i-0123456789abcdef0");
+        let requests = [
+            ("accountIds alone", json!({"accountIds": [account_id]})),
+            (
+                "accountIds with a resource of the caller's own account",
+                json!({"accountIds": [account_id], "resourceArns": [own_arns[0].clone()]}),
+            ),
+            (
+                "a resource ARN of another account",
+                json!({"resourceArns": [foreign_arn.clone()]}),
+            ),
+            (
+                "the caller's own account with another account's resource ARN",
+                json!({
+                    "accountIds": [own_account()],
+                    "resourceArns": [own_arns[0].clone(), foreign_arn.clone()],
+                }),
+            ),
+        ];
+        for (member, request) in requests {
+            let case = format!("{account_id} via {member}");
+            let (status, body) =
+                call(&router, "GetIdleRecommendations", request.clone()).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected {request} to be refused, got {status}: {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "InvalidParameterValueException",
+                "case {case:?}: expected InvalidParameterValueException, got {body}"
+            );
+            assert_eq!(
+                body["message"].as_str(),
+                Some(CROSS_ACCOUNT_MESSAGE),
+                "case {case:?}: expected the cross-account refusal, got {body}"
+            );
+            assert!(
+                body["idleRecommendations"].is_null(),
+                "case {case:?}: a refused request reports nothing, got {body}"
+            );
+        }
+    }
+
+    // What the store holds for another account is reported to nobody: not to a request that
+    // names no account, not to one naming the caller's own, and not through its own ARN.
+    for (case, request) in [
+        ("no account named", json!({})),
+        ("the caller's own account", json!({"accountIds": [own_account()]})),
+        (
+            "every recorded resource named",
+            json!({"resourceArns": own_arns.clone()}),
+        ),
+    ] {
+        let body = get_idle(&router, case, request).await;
+        assert_eq!(
+            reported_arns(&body),
+            own_arns,
+            "case {case:?}: expected only the caller's own analysis, got {body}"
+        );
+    }
+
+    // The foreign records are still in the store — the read reported around them, it did not
+    // delete them.
+    assert_eq!(
+        stored_count(&engine),
+        corpus.len() + foreign.len(),
+        "a read must not add or drop a stored recommendation"
+    );
 }
 
 /// The ordering rule: `orderBy` sorts the selection on the estimated monthly savings of the
@@ -456,7 +596,7 @@ async fn order_by_sorts_the_selection_on_the_requested_savings_dimension() {
         (
             "ordering applies to the selection, not to the store",
             json!({
-                "accountIds": [ACCOUNT],
+                "resourceArns": [arn_of(0), arn_of(1), arn_of(2), arn_of(4)],
                 "orderBy": {"dimension": "SavingsValue", "order": "Desc"},
             }),
             [2, 0, 1, 4].map(arn_of).to_vec(),
@@ -574,7 +714,7 @@ async fn a_requested_resource_with_no_recommendation_is_reported_in_errors() {
             "an Auto Scaling group",
             arn(
                 "autoscaling",
-                ACCOUNT,
+                own_account(),
                 "autoScalingGroup:12345678-1234-1234-1234-123456789012:\
                  autoScalingGroupName/web-tier",
             ),
@@ -582,35 +722,38 @@ async fn a_requested_resource_with_no_recommendation_is_reported_in_errors() {
         ),
         (
             "an RDS DB instance",
-            arn("rds", ACCOUNT, "db:orders"),
+            arn("rds", own_account(), "db:orders"),
             json!("RDSDBInstance"),
         ),
         (
             "a DocumentDB cluster, which carries the rds namespace",
-            arn("rds", ACCOUNT, "cluster:docdb-analytics"),
+            arn("rds", own_account(), "cluster:docdb-analytics"),
             json!("DocumentDBCluster"),
         ),
         (
             "an ElastiCache cluster",
-            arn("elasticache", ACCOUNT, "cluster:sessions"),
+            arn("elasticache", own_account(), "cluster:sessions"),
             json!("ElastiCacheCluster"),
         ),
         (
             "a MemoryDB cluster",
-            arn("memorydb", ACCOUNT, "cluster/leaderboard"),
+            arn("memorydb", own_account(), "cluster/leaderboard"),
             json!("MemoryDBCluster"),
         ),
         (
             "a WorkSpace",
-            arn("workspaces", ACCOUNT, "workspace/ws-0123456789"),
+            arn("workspaces", own_account(), "workspace/ws-0123456789"),
             json!("WorkSpaces"),
         ),
         (
             "an EC2 instance the analysis never looked at",
-            arn("ec2", ACCOUNT, "instance/i-00000000000000000"),
+            arn("ec2", own_account(), "instance/i-00000000000000000"),
             json!("EC2Instance"),
         ),
         (
+            // The account field of this ARN is empty, as it is for every ARN of a service
+            // that does not scope its resources to an account, so it names no OTHER account
+            // and is not refused: it is simply a resource with no idle recommendation.
             "an ARN whose namespace names no idle-recommendable resource",
             "arn:aws:s3:::reports-bucket".to_string(),
             Value::Null,
@@ -680,7 +823,7 @@ async fn an_invalid_request_is_refused() {
     let other_selection = get_idle(
         &router,
         "a token over another selection",
-        json!({"accountIds": [ACCOUNT], "maxResults": 1}),
+        json!({"accountIds": [own_account()], "maxResults": 1}),
     )
     .await;
     let foreign_token = other_selection["nextToken"]
@@ -693,7 +836,7 @@ async fn an_invalid_request_is_refused() {
         (
             // "You can only specify one account ID per request."
             "two account ids",
-            json!({"accountIds": [ACCOUNT, MEMBER_ACCOUNT]}),
+            json!({"accountIds": [own_account(), MEMBER_ACCOUNT]}),
             "InvalidParameterValueException",
         ),
         (
@@ -708,7 +851,7 @@ async fn an_invalid_request_is_refused() {
         ),
         (
             "an ARN missing its resource field",
-            json!({"resourceArns": [format!("arn:aws:ec2:{REGION}:{ACCOUNT}:")]}),
+            json!({"resourceArns": [format!("arn:aws:ec2:{REGION}:{}:", own_account())]}),
             "InvalidParameterValueException",
         ),
         (
