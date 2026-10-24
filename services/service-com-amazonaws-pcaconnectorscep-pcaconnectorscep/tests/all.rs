@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/challenge_deletion.rs"]
 mod challenge_deletion;
+#[path = "all/connector_delete_not_found.rs"]
+mod connector_delete_not_found;
 #[path = "all/connector_deletion.rs"]
 mod connector_deletion;
 #[path = "all/connector_lifecycle.rs"]

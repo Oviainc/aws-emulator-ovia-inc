@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelRotateSecret
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelRotateSecret`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Turns automatic rotation off for a stored secret: rotation is disabled and the
+//! schedule stops making a rotation due, while the rotation function, rules and
+//! external-rotation metadata the secret holds stay stored, so a later
+//! `RotateSecret` can rotate with the values already there.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelRotateSecret::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A rotation that is still in progress is cancelled, and the version id it staked
+//! `AWSPENDING` on is reported back so the caller can clean that partially created
+//! version up with `UpdateSecretVersionStage`. The staging labels themselves are
+//! left exactly as the cancelled rotation left them — which is why a cancelled
+//! rotation that is not cleaned up still blocks the next one.
 //!
 //! ## Shape of an operation
 //!
@@ -165,20 +166,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelRotateSecret` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelRotateSecretErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelRotateSecret"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        store.expire_due(now);
+
+        let Some(secret) = store.get_mut(&input.secret_id) else {
+            return Err(CancelRotateSecretErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The documented causes of `InvalidRequestException` that a call
+        // carrying nothing but a `SecretId` can run into, in the order the model
+        // lists them: "The secret is scheduled for deletion. ... The secret is
+        // managed by another service, and you must use that service to update
+        // it."
+        if secret.scheduled_for_deletion() {
+            return Err(invalid_request(crate::state::MARKED_FOR_DELETION_MESSAGE));
+        }
+        if let Some(owner) = secret.owning_service.clone() {
+            return Err(invalid_request(format!(
+                "You can't perform this operation on the secret because it is managed by \
+                 {owner}, and you must use that service to update it."
+            )));
+        }
+
+        // "Turns off automatic rotation, and if a rotation is currently in
+        // progress, cancels the rotation." A secret that rotation was never
+        // configured for has no schedule to turn off and no rotation to cancel,
+        // so the call leaves it as it was and still reports the secret it named:
+        // nothing here is conditional on rotation having been on, which is what
+        // makes a second call answer like the first.
+        let cancelled_version_id = secret.cancel_rotation(now);
+
+        Ok(CancelRotateSecretOutput {
+            arn: Some(secret.arn.clone()),
+            name: Some(secret.name.clone()),
+            // "The unique identifier of the version of the secret created during
+            // the rotation": there is such a version only when this call
+            // cancelled a rotation that was still in progress.
+            version_id: cancelled_version_id,
+        })
     }
+}
+
+/// `InvalidRequestException` for a request this secret's current state does not
+/// allow: "A parameter value is not valid for the current state of the
+/// resource."
+fn invalid_request(message: impl Into<String>) -> CancelRotateSecretError {
+    CancelRotateSecretErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> CancelRotateSecretError {
+    CancelRotateSecretErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }

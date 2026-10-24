@@ -45,6 +45,32 @@ pub(crate) fn wait_for_the_clock() {
     std::thread::sleep(state::TRANSITION_SPAN + Duration::from_millis(250));
 }
 
+/// A `KubernetesNamespace` of this suite's container cluster for a fixture named `name`.
+///
+/// A virtual cluster maps 1:1 onto a namespace, so every fixture cluster needs its OWN:
+/// the characters the shape admits are `^[a-z0-9]([-a-z0-9]*[a-z0-9])?$` with length
+/// 1..63 (smithy_query: shape `EksInfo`), so anything else in the name maps to `-` and
+/// the value is framed so that it starts and ends on an accepted character.
+pub(crate) fn namespace_for(name: &str) -> String {
+    let mapped: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let core: String = mapped.trim_matches('-').chars().take(56).collect();
+    let core = core.trim_matches('-');
+    if core.is_empty() {
+        "ns".to_string()
+    } else {
+        format!("{core}-ns")
+    }
+}
+
 /// `POST /virtualclusters`, carrying `scheduler` as the cluster's
 /// `schedulerConfiguration` when the row has one.
 pub(crate) async fn create_cluster(
@@ -59,7 +85,7 @@ pub(crate) async fn create_cluster(
         "containerProvider": {
             "type": "EKS",
             "id": "eks-scheduler",
-            "info": {"eksInfo": {"namespace": "default"}},
+            "info": {"eksInfo": {"namespace": namespace_for(name)}},
         },
     });
     if let (Some(target), Some(scheduler)) = (body.as_object_mut(), scheduler) {

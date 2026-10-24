@@ -547,6 +547,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `PutRuntimeManagementConfig` stores one, so every version reports the
             // documented `Auto` default until then.
             runtime_management_configs: ::std::collections::BTreeMap::new(),
+            // ... and no provisioned concurrency on any of its qualifiers until
+            // `PutProvisionedConcurrencyConfig` adds a configuration to one.
+            provisioned_concurrency_configs: ::std::collections::BTreeMap::new(),
         };
 
         // "Use the Publish parameter to create version 1 of your function from its

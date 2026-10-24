@@ -39,6 +39,8 @@ mod start_job_run_required_members;
 mod state_roundtrip;
 #[path = "all/virtual_cluster_job_run_loop.rs"]
 mod virtual_cluster_job_run_loop;
+#[path = "all/virtual_cluster_references.rs"]
+mod virtual_cluster_references;
 #[path = "all/virtual_cluster_scheduler.rs"]
 mod virtual_cluster_scheduler;
 #[path = "all/virtual_cluster_scheduler_status.rs"]
