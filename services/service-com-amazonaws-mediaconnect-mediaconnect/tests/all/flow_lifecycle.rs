@@ -54,13 +54,8 @@ fn assert_minted_flow_arn(case: &str, arn: &str, name: &str) {
     );
 }
 
-/// A SigV4 `Authorization` header whose credential scope names this service and the
-/// Region every ARN below is minted in. It is the routing signal the front door reads.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDEXAMPLEEXAMPLE/20260101/us-east-1/mediaconnect/aws4_request, \
-     SignedHeaders=host, Signature=deadbeef";
-
-/// The Region of [`AUTHORIZATION`].
+/// The Region whose SigV4 credential scope [`Emulator::send`] signs every request for, and
+/// so the Region every ARN below is minted in.
 ///
 /// `pub(crate)` because the other suites assert the same Region in the ARNs they read
 /// back.
@@ -147,8 +142,29 @@ impl Emulator {
 
     /// Send one request and return `(status, error code, body)`. The error code is the
     /// restJson1 `x-amzn-errortype` header, absent on success.
+    ///
+    /// The request is signed for [`REGION`]; a suite that needs another signing Region
+    /// calls [`Self::send_signed_for`].
     pub(crate) async fn send(
         &self,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (u16, Option<String>, Value) {
+        self.send_signed_for(REGION, method, uri, body).await
+    }
+
+    /// The same request [`Self::send`] builds, but with its SigV4 credential scope naming
+    /// `region`.
+    ///
+    /// The credential scope is where
+    /// `service_com_amazonaws_mediaconnect_mediaconnect::state::request_region` reads "the
+    /// current region" from, so this is what lets a suite assert the Region a create derives
+    /// for a request that names none — distinguished from the fallback
+    /// `state::DEFAULT_REGION`, which [`REGION`] happens to equal.
+    pub(crate) async fn send_signed_for(
+        &self,
+        region: &str,
         method: &str,
         uri: &str,
         body: Option<Value>,
@@ -156,12 +172,17 @@ impl Emulator {
         let payload = body
             .map(|value| bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize body")))
             .unwrap_or_default();
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 \
+             Credential=AKIDEXAMPLEEXAMPLE/20260101/{region}/mediaconnect/aws4_request, \
+             SignedHeaders=host, Signature=deadbeef"
+        );
         let request = http::Request::builder()
             .method(method)
             .uri(uri)
             .header("content-type", "application/json")
             .header("host", "mediaconnect.us-east-1.amazonaws.com")
-            .header("authorization", AUTHORIZATION)
+            .header("authorization", authorization)
             .body(payload)
             .expect("build request");
         let response = self.router.dispatch(request).await;
