@@ -14,7 +14,8 @@
 //!   materialises the status transitions the clock has already made due (a directory
 //!   leaving `Requested`, a snapshot leaving `Creating`, an IP route leaving `Adding`, a
 //!   trust leaving `Creating` or `Verifying` (and a deleted one leaving the store), an
-//!   assessment leaving `IN_PROGRESS`, a directory's data access leaving `Enabling`).
+//!   assessment leaving `IN_PROGRESS`, a directory's data access leaving `Enabling`, a
+//!   registered certificate leaving `Registering`).
 //!   Every handler calls it before reading or writing, so a reporting operation reports
 //!   what the clock already owed and nothing more.
 //! * [`Directory::to_description`], the one place a stored directory is rendered as the
@@ -42,9 +43,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Assessment, AssessmentSummary, Attribute, ClientAuthenticationSettingInfo, Computer,
-    ConditionalForwarder, DirectoryDescription, DirectoryLimits, DirectoryVpcSettingsDescription,
-    EventTopic, IpRouteInfo, LDAPSSettingInfo, Snapshot, SnapshotLimits, Tag, Trust,
+    Assessment, AssessmentSummary, Attribute, Certificate, ClientAuthenticationSettingInfo,
+    ClientCertAuthSettings, Computer, ConditionalForwarder, DirectoryDescription, DirectoryLimits,
+    DirectoryVpcSettingsDescription, EventTopic, IpRouteInfo, LDAPSSettingInfo, Snapshot,
+    SnapshotLimits, Tag, Trust,
 };
 
 /// How long a status transition a create owes takes to fall due.
@@ -353,6 +355,38 @@ pub const DATA_ACCESS_ENABLING: &str = "Enabling";
 /// elapsed: the modelled enum's `Enabled` value.
 pub const DATA_ACCESS_ENABLED: &str = "Enabled";
 
+/// The `CertificateState` a certificate carries between `RegisterCertificate` and
+/// [`TRANSITION_SPAN`]: the first value of the modelled `CertificateState` enum
+/// (`smithy_query(query="shape", shape="CertificateState")` answers `["Registering",
+/// "Registered", "RegisterFailed", "Deregistering", "Deregistered",
+/// "DeregisterFailed"]`).
+///
+/// The register answers before the certificate is in service — the enum carries both
+/// the transient `Registering` and the settled `Registered` — so the move to
+/// [`CERTIFICATE_STATE_REGISTERED`] is owed by the clock, on the same span a create's
+/// stage transition uses.
+pub const CERTIFICATE_STATE_REGISTERING: &str = "Registering";
+
+/// The `CertificateState` a certificate reaches once the register's
+/// [`TRANSITION_SPAN`] has elapsed: the modelled enum's `Registered` value.
+pub const CERTIFICATE_STATE_REGISTERED: &str = "Registered";
+
+/// The `CertificateType` a registration that names none performs.
+///
+/// From the `Type` member's own documentation: "Valid values include `ClientLDAPS` or
+/// `ClientCertAuth`. The default value is `ClientLDAPS`."
+pub const DEFAULT_CERTIFICATE_TYPE: &str = "ClientLDAPS";
+
+/// The most certificates this emulator will register with one directory.
+///
+/// NOT an AWS quota: a resource guard, the same construction as
+/// [`MAX_EVENT_TOPICS_PER_DIRECTORY`]. `RegisterCertificate` is a write a caller can
+/// repeat with fresh certificate data forever, so the per-directory index carries its
+/// own bound, enforced at the single insert site in `register_certificate.rs` — which
+/// is what the modelled `CertificateLimitExceededException` ("the certificate limit has
+/// been reached") then refuses.
+pub const MAX_CERTIFICATES_PER_DIRECTORY: usize = 10;
+
 /// The `TrustState` a trust relationship carries between `CreateTrust` and
 /// [`TRANSITION_SPAN`]: the first value of the modelled `TrustState` enum
 /// (`smithy_query(query="shape",shape="TrustState")`).
@@ -618,6 +652,141 @@ impl ClientAuthenticationSetting {
     }
 }
 
+/// One registered certificate: what `RegisterCertificate` persisted and
+/// `DescribeCertificate` reports.
+///
+/// Named `CertificateRecord` rather than `Certificate` so it does not collide with the
+/// modelled `Certificate` shape [`Self::to_certificate`] renders it into — the same
+/// reason [`ComputerRecord`] is named the way it is.
+#[derive(Debug, Clone)]
+pub struct CertificateRecord {
+    /// The id this registration was minted, as the modelled `CertificateId` reports it.
+    pub certificate_id: String,
+    /// One of the modelled `CertificateState` values.
+    pub state: String,
+    /// When the state transition the register owes falls due; `None` once there is none
+    /// left to make. See [`TRANSITION_SPAN`].
+    pub state_due_at: Option<SystemTime>,
+    /// The modelled `CertificateStateReason`, "Describes a state change for the
+    /// certificate": absent while nothing has changed the state but the clock.
+    pub state_reason: Option<String>,
+    /// The certificate's own subject common name, as the modelled `CommonName` reports
+    /// it: read out of the registered certificate by [`parse_certificate`], and absent
+    /// when its subject carries no common-name attribute.
+    pub common_name: Option<String>,
+    /// "The date and time that the certificate was registered".
+    pub registered_at: SystemTime,
+    /// "The date and time when the certificate will expire": the registered
+    /// certificate's own `notAfter` validity bound, not a span this emulator chose.
+    pub expires_at: SystemTime,
+    /// One of the modelled `CertificateType` values; [`DEFAULT_CERTIFICATE_TYPE`] when
+    /// the register named none.
+    pub certificate_type: String,
+    /// The `ClientCertAuthSettings` the register was called with, reported back
+    /// unchanged; absent when it carried none.
+    pub client_cert_auth_settings: Option<ClientCertAuthSettings>,
+    /// The registered certificate itself, in DER form — [`parse_certificate`] is what
+    /// decodes it out of the PEM the caller sent. Held because it is the certificate,
+    /// rather than the text it arrived as, that a directory registers at most once: this
+    /// is what the duplicate check in `register_certificate.rs` compares, so two
+    /// certificates that differ only in the common name they state are two
+    /// registrations, and one certificate sent twice is one.
+    pub der: Vec<u8>,
+    /// Registration rank, from
+    /// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::next_seq`], shared
+    /// with the directories so every listing of this service pages over one ordering.
+    pub seq: u64,
+}
+
+impl CertificateRecord {
+    /// This registration as the modelled `Certificate` structure.
+    pub fn to_certificate(&self) -> Certificate {
+        Certificate {
+            certificate_id: Some(self.certificate_id.clone()),
+            state: Some(self.state.clone()),
+            state_reason: self.state_reason.clone(),
+            common_name: self.common_name.clone(),
+            registered_date_time: Some(as_timestamp(self.registered_at)),
+            expiry_date_time: Some(as_timestamp(self.expires_at)),
+            r#type: Some(self.certificate_type.clone()),
+            client_cert_auth_settings: self.client_cert_auth_settings.clone(),
+        }
+    }
+}
+
+/// What a registered certificate itself states: the values a handler must read out of
+/// the certificate rather than invent for it.
+#[derive(Debug, Clone)]
+pub struct ParsedCertificate {
+    /// The subject's common-name attribute, when it carries one.
+    pub common_name: Option<String>,
+    /// The certificate's `notAfter` validity bound.
+    pub expires_at: SystemTime,
+    /// The certificate in DER form, so two registrations of one certificate compare
+    /// equal whatever their PEM framing.
+    pub der: Vec<u8>,
+}
+
+/// The object identifier of the X.509 `commonName` attribute type, `2.5.4.3`
+/// (RFC 4519 section 2.3). Stated here rather than taken from an OID database so the
+/// lookup needs no optional feature of the parser.
+const COMMON_NAME_OID: ::x509_cert::der::asn1::ObjectIdentifier =
+    ::x509_cert::der::asn1::ObjectIdentifier::new_unwrap("2.5.4.3");
+
+/// One subject attribute as a string, whichever of the ASN.1 string types X.509 allows
+/// for it the certificate used; `None` when it is not a string at all.
+fn attribute_string(attribute: &::x509_cert::attr::AttributeTypeAndValue) -> Option<String> {
+    use ::x509_cert::der::asn1::{Ia5StringRef, PrintableStringRef, TeletexStringRef, Utf8StringRef};
+
+    if let Ok(value) = attribute.value.decode_as::<Utf8StringRef<'_>>() {
+        return Some(value.as_str().to_string());
+    }
+    if let Ok(value) = attribute.value.decode_as::<PrintableStringRef<'_>>() {
+        return Some(value.as_str().to_string());
+    }
+    if let Ok(value) = attribute.value.decode_as::<Ia5StringRef<'_>>() {
+        return Some(value.as_str().to_string());
+    }
+    attribute
+        .value
+        .decode_as::<TeletexStringRef<'_>>()
+        .ok()
+        .map(|value| value.as_str().to_string())
+}
+
+/// The certificate `pem` carries, or `None` when `pem` is not a PEM-encoded X.509
+/// certificate — which is what the modelled `InvalidCertificateException` ("The
+/// certificate PEM that was provided has incorrect encoding") refuses.
+///
+/// The PEM and the DER inside it are decoded by the `x509-cert` parser rather than by
+/// anything written here, so the reported `CommonName` and `ExpiryDateTime` are the
+/// certificate's own values and a certificate this emulator cannot parse is refused
+/// instead of accepted with invented ones.
+pub fn parse_certificate(pem: &str) -> Option<ParsedCertificate> {
+    use ::x509_cert::der::{DecodePem, Encode};
+
+    let certificate = ::x509_cert::Certificate::from_pem(pem.as_bytes()).ok()?;
+    let common_name = certificate
+        .tbs_certificate
+        .subject
+        .0
+        .iter()
+        .flat_map(|rdn| rdn.0.iter())
+        .find(|attribute| attribute.oid == COMMON_NAME_OID)
+        .and_then(attribute_string);
+    let expires_at = SystemTime::UNIX_EPOCH
+        + certificate
+            .tbs_certificate
+            .validity
+            .not_after
+            .to_unix_duration();
+    Some(ParsedCertificate {
+        common_name,
+        expires_at,
+        der: certificate.to_der().ok()?,
+    })
+}
+
 /// One stored computer account: the Active Directory computer object `CreateComputer`
 /// created in a directory.
 ///
@@ -815,6 +984,11 @@ pub struct Directory {
     /// The client authentication recorded for this directory, keyed by the modelled
     /// `ClientAuthenticationType`; `DescribeClientAuthenticationSettings` reports it.
     pub client_authentication_settings: BTreeMap<String, ClientAuthenticationSetting>,
+    /// The certificates `RegisterCertificate` registered with this directory, keyed by
+    /// `CertificateId`; `DescribeCertificate` reports one. A certificate is registered
+    /// FOR a directory, so the registrations live on the directory record and deleting
+    /// the directory takes them with it.
+    pub certificates: BTreeMap<String, CertificateRecord>,
     /// The Amazon SNS topics `RegisterEventTopic` associated with this directory, keyed
     /// by topic name — a directory publishes to a given topic at most once, and the
     /// associations live on the directory record, so deleting the directory takes its
@@ -1277,6 +1451,8 @@ pub struct ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// Drives [`Self::mint_snapshot_id`], kept apart from [`Self::id_seed`] so the two
     /// id spaces advance independently.
     snapshot_id_seed: u64,
+    /// Drives [`Self::mint_certificate_id`], its own id space for the same reason.
+    certificate_id_seed: u64,
     /// Drives [`Self::mint_trust_id`], kept apart from the other seeds so the id spaces
     /// advance independently.
     trust_id_seed: u64,
@@ -1346,6 +1522,13 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
         mint_id(&mut self.snapshot_id_seed, 's')
     }
 
+    /// Mint a fresh `CertificateId` of the shape the model declares,
+    /// `^c-[0-9a-f]{10}$`, through the same bijection as [`Self::mint_directory_id`]
+    /// over its own seed.
+    pub fn mint_certificate_id(&mut self) -> String {
+        mint_id(&mut self.certificate_id_seed, 'c')
+    }
+
     /// Mint a fresh `TrustId` of the shape the model declares, `^t-[0-9a-f]{10}$`,
     /// through the same bijection as [`Self::mint_directory_id`] over its own seed.
     pub fn mint_trust_id(&mut self) -> String {
@@ -1412,6 +1595,20 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                 if now >= due && directory.data_access_status == DATA_ACCESS_ENABLING {
                     directory.data_access_status = DATA_ACCESS_ENABLED.to_string();
                     directory.data_access_due_at = None;
+                }
+            }
+            // The state transition `RegisterCertificate` owes: the transient
+            // `Registering` settles on `Registered`. The mirrored transition out of
+            // `Deregistering` belongs to `DeregisterCertificate`, which is still
+            // scaffolded, so it lands with that handler rather than as a branch nothing
+            // can reach.
+            for certificate in directory.certificates.values_mut() {
+                let Some(due) = certificate.state_due_at else {
+                    continue;
+                };
+                if now >= due && certificate.state == CERTIFICATE_STATE_REGISTERING {
+                    certificate.state = CERTIFICATE_STATE_REGISTERED.to_string();
+                    certificate.state_due_at = None;
                 }
             }
         }
@@ -1739,7 +1936,9 @@ modeled_failures!(
     ADAssessmentLimitExceededException,
     AccessDeniedException,
     AuthenticationFailedException,
+    CertificateAlreadyExistsException,
     CertificateDoesNotExistException,
+    CertificateLimitExceededException,
     ClientException,
     DirectoryAlreadySharedException,
     DirectoryDoesNotExistException,
@@ -1749,6 +1948,7 @@ modeled_failures!(
     EntityAlreadyExistsException,
     EntityDoesNotExistException,
     InsufficientPermissionsException,
+    InvalidCertificateException,
     InvalidClientAuthStatusException,
     InvalidLDAPSStatusException,
     InvalidNextTokenException,

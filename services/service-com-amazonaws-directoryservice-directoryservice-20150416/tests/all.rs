@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/ad_assessment.rs"]
 mod ad_assessment;
+#[path = "all/certificates.rs"]
+mod certificates;
 #[path = "all/computers.rs"]
 mod computers;
 #[path = "all/conditional_forwarders.rs"]

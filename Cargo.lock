@@ -7718,10 +7718,12 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "rcgen",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
  "tracing",
+ "x509-cert",
 ]
 
 [[package]]

@@ -23,12 +23,18 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes/decodes the opaque NextToken cursor the paginated operations issue.
 hex = { workspace = true }
+# Decodes the PEM/DER X.509 certificate RegisterCertificate is called with, so the
+# CommonName and ExpiryDateTime reported back are the certificate's own values.
+x509-cert = { version = "0.2", features = ["pem"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# Builds the self-signed certificates the certificate suite registers, so each row's
+# common name and expiry come from a real certificate rather than a fixed blob.
+rcgen = "0.13"
 
 [lints]
 workspace = true

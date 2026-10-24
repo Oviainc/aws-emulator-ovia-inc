@@ -301,6 +301,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // what record a setting for a type; nothing is configured at create.
             ldaps_settings: ::std::collections::BTreeMap::new(),
             client_authentication_settings: ::std::collections::BTreeMap::new(),
+            // `RegisterCertificate` is what registers a certificate with the directory;
+            // a fresh directory has none.
+            certificates: ::std::collections::BTreeMap::new(),
             // No event topic until `RegisterEventTopic` associates one.
             event_topics: ::std::collections::BTreeMap::new(),
             // No conditional forwarder until `CreateConditionalForwarder` points the
