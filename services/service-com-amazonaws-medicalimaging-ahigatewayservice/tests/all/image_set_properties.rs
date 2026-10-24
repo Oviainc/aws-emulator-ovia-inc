@@ -7,9 +7,10 @@
 //! taking every reported member from state rather than from the request: the version's
 //! own `imageSetState`, `imageSetWorkflowStatus`, `updatedAt`, `message` and
 //! `Overrides.forced` (present only for a version created with the force flag), and the
-//! image SET's own `imageSetArn`, `isPrimary`, `createdAt` and `deletedAt`. Because it
-//! reports rather than mutates, the call writes nothing of its own: `lastAccessedAt`
-//! stays absent, no status it finds is moved, and two reads of the same version answer
+//! image SET's own `imageSetArn`, `isPrimary`, `createdAt`, `deletedAt` and
+//! `lastAccessedAt`. Because it reports rather than mutates, the call writes nothing of
+//! its own: no access is recorded (`lastAccessedAt` is the stored instant, not this
+//! call's), no status it finds is moved, and two reads of the same version answer
 //! identically. A resource or version the data store does not hold is 404
 //! `ResourceNotFoundException`, and an identifier outside its modelled pattern is 400
 //! `ValidationException`.
@@ -18,8 +19,9 @@
 //! the wire behaviour a `medical-imaging` SDK client sees. The rows differ along what the
 //! rule generalises over: how many versions the image set holds, which version is asked
 //! for, which `ImageSetState` / `ImageSetWorkflowStatus` each version carries, whether it
-//! was forced, whether it carries a `message`, whether the image set is primary, and
-//! whether it has been deleted.
+//! was forced, whether it carries a `message`, whether the image set is primary,
+//! whether its content has been accessed since it was created, and whether it has been
+//! deleted.
 //!
 //! ## Why a seeded image set
 //!
@@ -82,6 +84,9 @@ struct ReadCase {
     created_offset_secs: u64,
     /// Seconds past [`BASE_EPOCH_SECS`] the image set was deleted, for a tombstone.
     deleted_offset_secs: Option<u64>,
+    /// Seconds past [`BASE_EPOCH_SECS`] the content this image set holds was last
+    /// accessed — the creation instant for one nothing has accessed since.
+    last_accessed_offset_secs: u64,
     /// The versions, oldest first; version identifiers are 1..=len.
     versions: Vec<VersionSeed>,
 }
@@ -120,13 +125,15 @@ fn seed(emulator: &Emulator, datastore_id: &str, case: &ReadCase) -> String {
     }
     image_set.created_at = at(case.created_offset_secs);
     image_set.deleted_at = case.deleted_offset_secs.map(at);
+    image_set.last_accessed_at = at(case.last_accessed_offset_secs);
     datastore.image_sets.insert(image_set_id.clone(), image_set);
     image_set_id
 }
 
 /// The rows span: one, two and four versions; each version's own state, workflow status,
-/// force flag and message; a primary and a secondary image set; a locked image set; and
-/// a deleted tombstone.
+/// force flag and message; a primary and a secondary image set; a locked image set; a
+/// deleted tombstone; and an image set whose content was last accessed when it was
+/// created against ones accessed later than that.
 fn read_cases() -> Vec<ReadCase> {
     vec![
         ReadCase {
@@ -134,6 +141,8 @@ fn read_cases() -> Vec<ReadCase> {
             is_primary: false,
             created_offset_secs: 0,
             deleted_offset_secs: None,
+            // Nothing has accessed its content, so the last access is its creation.
+            last_accessed_offset_secs: 0,
             versions: vec![VersionSeed {
                 state: ImageSetState::Active,
                 workflow: ImageSetWorkflowStatus::Imported,
@@ -147,6 +156,8 @@ fn read_cases() -> Vec<ReadCase> {
             is_primary: true,
             created_offset_secs: 10,
             deleted_offset_secs: None,
+            // Accessed after its latest version was written.
+            last_accessed_offset_secs: 30,
             versions: vec![
                 VersionSeed {
                     state: ImageSetState::Active,
@@ -169,6 +180,7 @@ fn read_cases() -> Vec<ReadCase> {
             is_primary: false,
             created_offset_secs: 100,
             deleted_offset_secs: None,
+            last_accessed_offset_secs: 100,
             versions: vec![
                 VersionSeed {
                     state: ImageSetState::Active,
@@ -205,6 +217,9 @@ fn read_cases() -> Vec<ReadCase> {
             is_primary: true,
             created_offset_secs: 7,
             deleted_offset_secs: None,
+            // Accessed between the two versions, which no version reports: the last
+            // access belongs to the image set, not to a snapshot of it.
+            last_accessed_offset_secs: 12,
             versions: vec![
                 VersionSeed {
                     state: ImageSetState::Active,
@@ -228,6 +243,7 @@ fn read_cases() -> Vec<ReadCase> {
             is_primary: false,
             created_offset_secs: 3,
             deleted_offset_secs: None,
+            last_accessed_offset_secs: 3,
             versions: vec![
                 VersionSeed {
                     state: ImageSetState::Locked,
@@ -250,6 +266,8 @@ fn read_cases() -> Vec<ReadCase> {
             is_primary: true,
             created_offset_secs: 40,
             deleted_offset_secs: Some(90),
+            // Accessed while it was still readable; the tombstone keeps reporting it.
+            last_accessed_offset_secs: 45,
             versions: vec![
                 VersionSeed {
                     state: ImageSetState::Deleted,
@@ -399,9 +417,11 @@ async fn get_image_set_reports_the_persisted_properties_of_the_version_asked_for
                 "case {:?} version={version_id}: expected a modelled storageTier, got {read:?}",
                 case.case
             );
-            assert!(
-                read.field(&["lastAccessedAt"]).is_null(),
-                "case {:?} version={version_id}: a read must not record an access, got {read:?}",
+            assert_eq!(
+                read.field(&["lastAccessedAt"]).as_f64(),
+                Some(expected_instant(case.last_accessed_offset_secs)),
+                "case {:?} version={version_id}: expected the image set's stored last-access \
+                 instant, got {read:?}",
                 case.case
             );
         }
@@ -583,6 +603,7 @@ async fn get_image_set_refuses_what_it_cannot_report() {
         is_primary: false,
         created_offset_secs: 0,
         deleted_offset_secs: None,
+        last_accessed_offset_secs: 0,
         versions: vec![
             VersionSeed {
                 state: ImageSetState::Active,

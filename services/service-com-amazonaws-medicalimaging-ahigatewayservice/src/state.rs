@@ -25,6 +25,13 @@
 //! the same frames. A frame is readable only once something has DELIVERED it — the copy
 //! that completes carries its source's frames to its destination — so nothing is served
 //! that was never stored.
+//!
+//! Serving or delivering that content is an ACCESS of the image set, and an access is
+//! the only thing [`ImageSet::last_accessed_at`] reports: an image set carries the
+//! instant it came into existence until something reads the content it holds or writes
+//! content into it, and the instant of the latest such access from then on. Reporting an
+//! image set's properties is not an access of its content, so no reader of those moves
+//! it.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -931,6 +938,13 @@ pub struct ImageSet {
     pub dicom_tags: DICOMTags,
     pub created_at: SystemTime,
     pub deleted_at: Option<SystemTime>,
+    /// When the DICOM content this image set holds was last ACCESSED — what
+    /// `lastAccessedAt` reports. An image set nothing has accessed since it came into
+    /// existence carries the instant it was created; every access of its content —
+    /// pixel data served to a caller, content delivered into it — moves it forward
+    /// through [`ImageSet::record_access`]. Reporting an image set's PROPERTIES is not
+    /// an access of the content it holds, so no reader of those moves it.
+    pub last_accessed_at: SystemTime,
     /// What the clock owes the latest version, if anything.
     pub pending: Option<PendingImageSetTransition>,
 }
@@ -971,6 +985,9 @@ impl ImageSet {
             dicom_tags: DICOMTags::default(),
             created_at: now,
             deleted_at: None,
+            // Nothing has accessed the content of an image set that has only just come
+            // into existence, so the instant it appeared is the last access of it.
+            last_accessed_at: now,
             pending: None,
         }
     }
@@ -1005,6 +1022,16 @@ impl ImageSet {
         self.pending
             .as_ref()
             .is_some_and(|pending| pending.retires_image_set)
+    }
+
+    /// Record that the DICOM content this image set holds was accessed at `at` — pixel
+    /// data served from it, or content delivered into it.
+    ///
+    /// MONOTONIC: the reported instant never moves backwards, so an access recorded at
+    /// the instant it fell due is never overwritten by an earlier one, and what
+    /// `lastAccessedAt` reports is always the LAST access.
+    pub fn record_access(&mut self, at: SystemTime) {
+        self.last_accessed_at = self.last_accessed_at.max(at);
     }
 
     /// The image frame `image_frame_id` names, or `None` when this image set holds no
@@ -1068,6 +1095,14 @@ impl ImageSet {
         self.latest_version.workflow_status = pending.workflow_status;
         // The due instant, not `now`: `updatedAt` must not move between reads.
         self.latest_version.updated_at = pending.due_at;
+        // Content landing IN this image set is an access of it, recorded at the instant
+        // the transition that delivers it fell DUE rather than at `now`, so what
+        // `lastAccessedAt` reports does not move between reads.
+        let delivers_content =
+            pending.delivered_image_frames.is_some() || pending.delivered_dicom_tags.is_some();
+        if delivers_content {
+            self.record_access(pending.due_at);
+        }
         // The pixel data the transition owed lands with it, so a frame becomes readable
         // exactly when the copy that delivers it completes. A frame already held under
         // the same identifier is replaced by the delivered one: an image frame id names
