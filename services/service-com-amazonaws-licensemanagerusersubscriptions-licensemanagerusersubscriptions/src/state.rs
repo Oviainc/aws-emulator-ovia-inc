@@ -24,7 +24,8 @@ use crate::ops::types::{
 pub const STATUS_REGISTERING: &str = "REGISTERING";
 /// The status a registration carries once provisioning completed.
 pub const STATUS_REGISTERED: &str = "REGISTERED";
-/// The status returned by `DeregisterIdentityProvider` for the registration it removed.
+/// The status a registration carries from the moment `DeregisterIdentityProvider`
+/// accepted its deregistration until the teardown that status announces completes.
 pub const STATUS_DEREGISTERING: &str = "DEREGISTERING";
 /// The status a product user carries while its subscription is active.
 pub const STATUS_SUBSCRIBED: &str = "SUBSCRIBED";
@@ -56,6 +57,18 @@ pub const PROVISIONING_STATUS_DELETING: &str = "DELETING";
 /// The terminal `LicenseServerEndpointProvisioningStatus` an endpoint reaches once the
 /// deletion that put it in [`PROVISIONING_STATUS_DELETING`] has completed.
 pub const PROVISIONING_STATUS_DELETED: &str = "DELETED";
+
+/// Whether `status` is a registration status a record carries because its deregistration
+/// was accepted.
+///
+/// A registration in it is still REPORTED — that is what answering the non-terminal
+/// [`STATUS_DEREGISTERING`] means — but it is no longer a LIVE registration: it resolves
+/// for no operation that acts on a registration, it provides no product to an instance
+/// view, it is not taggable, and it keeps its `(identity provider, product)` pair taken so
+/// a register for that pair conflicts instead of succeeding while the teardown runs.
+pub fn deregistration_started(status: &str) -> bool {
+    status == STATUS_DEREGISTERING
+}
 
 /// Whether `status` is a `LicenseServerEndpointProvisioningStatus` an endpoint carries
 /// because its deletion was accepted — `DELETING` while the deletion runs, `DELETED` once
@@ -104,6 +117,16 @@ const ENDPOINT_PROVISIONING_SPAN: Duration = Duration::from_millis(500);
 /// still observes that transient status, and a later read materialises the terminal
 /// `DELETED` the clock already owed.
 const ENDPOINT_DELETION_SPAN: Duration = Duration::from_millis(500);
+
+/// How long after `DeregisterIdentityProvider` the registration stops being reported.
+///
+/// A chosen span (AWS documents no duration for it), kept inside the emulator's
+/// 250-750 ms window for a clock-owed transition: the deregister call answers with the
+/// non-terminal `DEREGISTERING` status — License Manager has to tear down the VPC
+/// endpoints the registration provisioned — so a caller that lists the registration
+/// straight away still observes that status, and a later read materialises the removal the
+/// clock already owed.
+const DEREGISTRATION_SPAN: Duration = Duration::from_millis(500);
 
 /// The most endpoints whose deletion has completed that the store keeps reporting.
 ///
@@ -341,7 +364,10 @@ pub struct IdentityProviderRecord {
     pub product: String,
     /// The product-related configuration settings (subnets + security group).
     pub settings: Settings,
-    /// `REGISTERING` until [`REGISTRATION_SPAN`] has elapsed, then `REGISTERED`.
+    /// `REGISTERING` until [`REGISTRATION_SPAN`] has elapsed, then `REGISTERED`;
+    /// `DEREGISTERING` from the moment a deregistration was accepted until
+    /// [`DEREGISTRATION_SPAN`] has elapsed, at which point the record stops being reported
+    /// altogether (the model gives the status no terminal counterpart).
     pub status: String,
     /// Set only when provisioning failed; never fabricated.
     pub failure_message: Option<String>,
@@ -351,6 +377,12 @@ pub struct IdentityProviderRecord {
     pub created_at: SystemTime,
     /// When the `REGISTERING` -> `REGISTERED` transition falls due.
     pub registered_due_at: SystemTime,
+    /// When the deregistration was accepted, or `None` while the registration is still
+    /// live.
+    pub deregistration_started_at: Option<SystemTime>,
+    /// When the deregistration completes and the record stops being reported, or `None`
+    /// while the registration is still live.
+    pub deregistered_due_at: Option<SystemTime>,
 }
 
 /// An EC2 instance that provides user-based subscriptions.
@@ -650,14 +682,27 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         let still_pending = |due_at: SystemTime, next: &mut Option<SystemTime>| {
             *next = Some(next.map_or(due_at, |earliest: SystemTime| earliest.min(due_at)));
         };
+        // A registration whose deregistration has completed is dropped from the store,
+        // which cannot happen while `identity_providers` is borrowed: the sweep collects
+        // them and the drops run below.
+        let mut deregistered: Vec<String> = Vec::new();
         for record in self.identity_providers.values_mut() {
-            if record.status != STATUS_REGISTERING {
-                continue;
-            }
-            if now >= record.registered_due_at {
-                record.status = STATUS_REGISTERED.to_string();
-            } else {
-                still_pending(record.registered_due_at, &mut next);
+            if record.status == STATUS_REGISTERING {
+                if now >= record.registered_due_at {
+                    record.status = STATUS_REGISTERED.to_string();
+                } else {
+                    still_pending(record.registered_due_at, &mut next);
+                }
+            } else if record.status == STATUS_DEREGISTERING {
+                // The teardown the clock owes: a `DEREGISTERING` registration stops being
+                // reported once its span has elapsed, whether or not anybody called.
+                if let Some(due_at) = record.deregistered_due_at {
+                    if now >= due_at {
+                        deregistered.push(record.arn.clone());
+                    } else {
+                        still_pending(due_at, &mut next);
+                    }
+                }
             }
         }
         for record in self.instance_users.values_mut() {
@@ -688,6 +733,15 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
                     }
                 }
             }
+        }
+        let mut dropped = false;
+        for arn in deregistered {
+            dropped |= self.drop_identity_provider(&arn).is_some();
+        }
+        // The views those drops changed are recomputed ONCE for the whole sweep, not once
+        // per dropped registration, and not at all when the sweep dropped nothing.
+        if dropped {
+            self.refresh_every_instance_view();
         }
         self.pending_transition_due_at = next;
     }
@@ -755,15 +809,28 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         self.account_instances.contains_key(instance_id)
     }
 
-    /// Whether any registration in state is for the directory `key` names.
+    /// Whether any LIVE registration in state is for the directory `key` names.
     ///
     /// `AssociateUser` carries no `Product`, so the registration it associates through is
     /// addressed by directory alone: a directory with a registration for ANY product is
-    /// registered for the purposes of a user association.
+    /// registered for the purposes of a user association. A registration whose
+    /// deregistration was accepted is not one: it is still reported so a client can watch
+    /// the teardown, not so new work can be built on it.
     pub fn provider_key_is_registered(&self, key: &str) -> bool {
-        self.identity_provider_index
-            .keys()
-            .any(|(indexed, _product)| indexed == key)
+        self.identity_provider_order
+            .iter()
+            .filter_map(|arn| self.identity_providers.get(arn))
+            .filter(|record| !deregistration_started(&record.status))
+            .any(|record| provider_key(&record.identity_provider).is_ok_and(|k| k == key))
+    }
+
+    /// The registration `arn` names, when it names one this account can still act on: a
+    /// registration whose deregistration was accepted resolves for nothing, exactly as one
+    /// that is gone.
+    pub fn live_identity_provider(&self, arn: &str) -> Option<&IdentityProviderRecord> {
+        self.identity_providers
+            .get(arn)
+            .filter(|record| !deregistration_started(&record.status))
     }
 
     /// The user associations in association order.
@@ -923,9 +990,10 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// A license server endpoint whose deletion was accepted is NOT one: it is still
     /// reported in its `DELETING`/`DELETED` status, but it is on its way out and carries
     /// no tags any more, so the tagging surface resolves it exactly as it resolves an
-    /// endpoint that is gone.
+    /// endpoint that is gone. A registration whose deregistration was accepted is on its
+    /// way out in exactly the same sense, so it is not one either.
     pub fn holds_resource(&self, arn: &str) -> bool {
-        self.identity_providers.contains_key(arn)
+        self.live_identity_provider(arn).is_some()
             || self.product_users.contains_key(arn)
             || self.instance_users.contains_key(arn)
             || self
@@ -1015,7 +1083,12 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// read from the registrations rather than taken from the request), so a product stops
     /// being reported as soon as the last association or registration behind it is gone.
     /// Nothing else is recorded: no status check has been performed, so none is reported.
+    ///
+    /// ONE pass over the associations and ONE over the registrations: this runs with the
+    /// service-state lock held, so the work it costs must not multiply with how much the
+    /// store holds beyond the lists it has to read.
     pub fn refresh_instance_view(&mut self, instance_id: &str) {
+        let products_by_key = self.products_by_provider_key();
         let naming: Vec<InstanceUserRecord> = self
             .instance_user_order
             .iter()
@@ -1023,16 +1096,82 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             .filter(|association| association.instance_id == instance_id)
             .cloned()
             .collect();
+        self.apply_instance_view(instance_id, &naming, &products_by_key);
+    }
+
+    /// Recompute the view of every instance an association names: what a registration's
+    /// removal changes is which PRODUCTS those instances provide.
+    ///
+    /// ONE pass over each of the three lists involved — the registrations, the
+    /// associations (grouped by the instance each names) and the instances — rather than
+    /// re-reading two of them per instance: this runs with the service-state lock held, so
+    /// one request must not be able to buy work that multiplies with the whole store.
+    pub fn refresh_every_instance_view(&mut self) {
+        let products_by_key = self.products_by_provider_key();
+        let mut naming: HashMap<String, Vec<InstanceUserRecord>> = HashMap::new();
+        for association in self
+            .instance_user_order
+            .iter()
+            .filter_map(|arn| self.instance_users.get(arn))
+        {
+            naming
+                .entry(association.instance_id.clone())
+                .or_default()
+                .push(association.clone());
+        }
+        for instance_id in self.instance_order.clone() {
+            let associations = naming.remove(&instance_id).unwrap_or_default();
+            self.apply_instance_view(&instance_id, &associations, &products_by_key);
+        }
+    }
+
+    /// The products each directory key has a LIVE registration for, in registration order.
+    ///
+    /// ONE pass over the registrations, so a refresh that needs the products of several
+    /// directories does not rescan them once per directory. Only live registrations: a
+    /// product stops being provided as soon as the registration behind it is being torn
+    /// down.
+    fn products_by_provider_key(&self) -> HashMap<String, Vec<String>> {
+        let mut products: HashMap<String, Vec<String>> = HashMap::new();
+        for record in self
+            .identity_provider_order
+            .iter()
+            .filter_map(|arn| self.identity_providers.get(arn))
+            .filter(|record| !deregistration_started(&record.status))
+        {
+            if let Ok(key) = provider_key(&record.identity_provider) {
+                products.entry(key).or_default().push(record.product.clone());
+            }
+        }
+        products
+    }
+
+    /// Write the view of ONE instance, computed from the associations that name it and the
+    /// products their directories are registered for — or drop it from the view when no
+    /// association names it.
+    ///
+    /// The one place an [`InstanceRecord`] is built, so the single-instance and the
+    /// whole-store refresh above cannot disagree about what the view says.
+    fn apply_instance_view(
+        &mut self,
+        instance_id: &str,
+        naming: &[InstanceUserRecord],
+        products_by_key: &HashMap<String, Vec<String>>,
+    ) {
         let Some(first) = naming.first() else {
             self.remove_instance(instance_id);
             return;
         };
 
         let mut products: Vec<String> = Vec::new();
-        for association in &naming {
-            for product in self.products_registered_for(&association.provider_key) {
-                if !products.contains(&product) {
-                    products.push(product);
+        for association in naming {
+            let registered = products_by_key
+                .get(&association.provider_key)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            for product in registered {
+                if !products.contains(product) {
+                    products.push(product.clone());
                 }
             }
         }
@@ -1049,25 +1188,6 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             identity_provider: Some(first.identity_provider.clone()),
             last_status_check_at,
         });
-    }
-
-    /// Recompute the view of every instance an association names: what a registration's
-    /// removal changes is which PRODUCTS those instances provide.
-    pub fn refresh_every_instance_view(&mut self) {
-        let instances: Vec<String> = self.instance_order.clone();
-        for instance_id in instances {
-            self.refresh_instance_view(&instance_id);
-        }
-    }
-
-    /// The products the directory `key` names is registered for, in registration order.
-    pub fn products_registered_for(&self, key: &str) -> Vec<String> {
-        self.identity_provider_order
-            .iter()
-            .filter_map(|arn| self.identity_providers.get(arn))
-            .filter(|record| provider_key(&record.identity_provider).is_ok_and(|k| k == key))
-            .map(|record| record.product.clone())
-            .collect()
     }
 
     /// The product users of one registration (optionally one product), in subscription order.
@@ -1090,6 +1210,11 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     ///
     /// `ValidationException` when neither addressing is complete, `ResourceNotFoundException`
     /// when the addressed registration is not registered.
+    ///
+    /// Only a LIVE registration resolves: one whose deregistration was accepted is still
+    /// REPORTED in its `DEREGISTERING` status, but it is on its way out, so an operation
+    /// that acts on a registration is told the identifier is not one of this account's
+    /// identity providers exactly as it is once the record is gone.
     pub fn resolve_identity_provider(
         &self,
         arn: Option<&str>,
@@ -1098,8 +1223,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     ) -> Result<&IdentityProviderRecord, StateError> {
         if let Some(arn) = arn {
             return self
-                .identity_providers
-                .get(arn)
+                .live_identity_provider(arn)
                 .ok_or(StateError::ProviderNotRegistered);
         }
         let (Some(identity_provider), Some(product)) = (identity_provider, product) else {
@@ -1113,8 +1237,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             .identity_provider_index
             .get(&(key, product.to_string()))
             .ok_or(StateError::ProviderNotRegistered)?;
-        self.identity_providers
-            .get(arn)
+        self.live_identity_provider(arn)
             .ok_or(StateError::ProviderNotRegistered)
     }
 
@@ -1177,36 +1300,50 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         Ok(record)
     }
 
-    /// Remove a registration, and with it the product users that were subscribed
-    /// through it and the license server endpoints created for it (both are only
-    /// reachable through their provider).
+    /// Accept the deregistration of one registration: it enters `DEREGISTERING` now and
+    /// stops being reported when the clock owes it, at [`DEREGISTRATION_SPAN`].
     ///
-    /// The endpoints are DELETED the same asynchronous way `DeleteLicenseServerEndpoint`
-    /// deletes one — they enter `DELETING` and reach `DELETED` when the clock owes it —
-    /// because how an endpoint's deletion becomes observable does not depend on what
-    /// asked for it.
+    /// Deregistration is ASYNCHRONOUS — License Manager has to tear down the VPC endpoints
+    /// the registration provisioned, which is why the operation answers the non-terminal
+    /// `DEREGISTERING` — so the record is NOT dropped here: a caller polling
+    /// `ListIdentityProviders` keeps seeing the registration in `DEREGISTERING` until the
+    /// teardown completes, instead of it vanishing between two reads. The
+    /// `(identity provider, product)` index entry is kept for the same reason, so a
+    /// register for that pair conflicts with the registration still being torn down rather
+    /// than succeeding beside it.
+    ///
+    /// What the deregistration does take away at once is everything that depended on the
+    /// registration being LIVE: the product users subscribed through it and the license
+    /// server endpoints created for it (both are only reachable through their provider),
+    /// its tags, and the products it contributed to the instance views. The endpoints are
+    /// DELETED the same asynchronous way `DeleteLicenseServerEndpoint` deletes one — they
+    /// enter `DELETING` and reach `DELETED` when the clock owes it — because how an
+    /// endpoint's deletion becomes observable does not depend on what asked for it.
     ///
     /// User ASSOCIATIONS are not removed: an association names a directory and no
     /// product (`AssociateUser` carries no `Product`), so it outlives the registration
     /// of any one product for that directory.
-    pub fn remove_identity_provider(
+    ///
+    /// Returns the record as the deregistration left it (`DEREGISTERING`), or `None` when
+    /// the ARN names no stored registration. A registration whose deregistration was
+    /// ALREADY accepted is returned unchanged, so a repeat neither restarts the teardown
+    /// nor pushes its completion further out.
+    pub fn begin_identity_provider_deregistration(
         &mut self,
         arn: &str,
         now: SystemTime,
     ) -> Option<IdentityProviderRecord> {
-        let record = self.identity_providers.remove(arn)?;
-        self.identity_provider_order.retain(|a| a != arn);
-        self.identity_provider_index
-            .retain(|_, indexed| indexed != arn);
-        let orphaned: Vec<String> = self
-            .product_users
-            .values()
-            .filter(|user| user.identity_provider_arn == arn)
-            .map(|user| user.arn.clone())
-            .collect();
-        for user_arn in orphaned {
-            self.remove_product_user(&user_arn);
+        let record = self.identity_providers.get_mut(arn)?;
+        if deregistration_started(&record.status) {
+            return Some(record.clone());
         }
+        record.status = STATUS_DEREGISTERING.to_string();
+        record.deregistration_started_at = Some(now);
+        let due_at = now + DEREGISTRATION_SPAN;
+        record.deregistered_due_at = Some(due_at);
+        let deregistering = record.clone();
+
+        self.remove_product_users_of(arn);
         let orphaned: Vec<String> = self
             .license_server_endpoints
             .values()
@@ -1216,11 +1353,71 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         for endpoint_arn in orphaned {
             self.begin_license_server_endpoint_deletion(&endpoint_arn, now);
         }
+        // Which products the instances in view provide is read from the LIVE
+        // registrations, so a registration leaving that set changes those views.
+        self.refresh_every_instance_view();
+        self.tags.remove(arn);
+        // The removal the clock now owes.
+        self.schedule_transition(due_at);
+        Some(deregistering)
+    }
+
+    /// Remove a registration from the store, the order it is listed in and the
+    /// `(identity provider, product)` index that reaches it.
+    ///
+    /// This is the FINAL drop, which stops reporting the registration altogether and frees
+    /// its `(identity provider, product)` pair; a deregistration the caller asked for goes
+    /// through
+    /// [`begin_identity_provider_deregistration`](Self::begin_identity_provider_deregistration)
+    /// instead, so the `DEREGISTERING` status the operation answers stays observable.
+    /// Anything still hanging off the registration goes with it, so no product user
+    /// outlives the provider it was subscribed through however the drop was reached.
+    pub fn remove_identity_provider(&mut self, arn: &str) -> Option<IdentityProviderRecord> {
+        let record = self.drop_identity_provider(arn)?;
         // Which products the instances in view provide is read from the registrations, so
         // removing one changes those views.
         self.refresh_every_instance_view();
+        Some(record)
+    }
+
+    /// Drop one registration and everything held against it, WITHOUT recomputing the
+    /// instance views.
+    ///
+    /// The one remover [`remove_identity_provider`](Self::remove_identity_provider) and the
+    /// clock-owed sweep in [`materialise_due`](Self::materialise_due) share, so a sweep
+    /// that drops several registrations recomputes those views ONCE instead of once per
+    /// record: the recomputation reads the whole store, and this runs with the
+    /// service-state lock held.
+    fn drop_identity_provider(&mut self, arn: &str) -> Option<IdentityProviderRecord> {
+        let record = self.identity_providers.remove(arn)?;
+        self.identity_provider_order.retain(|a| a != arn);
+        self.identity_provider_index
+            .retain(|_, indexed| indexed != arn);
+        self.remove_product_users_of(arn);
         self.tags.remove(arn);
         Some(record)
+    }
+
+    /// Remove every product user subscribed through the registration `provider_arn`
+    /// names, in ONE pass over each list that reaches them: a registration with many
+    /// subscribers must not cost a scan of the order list and of the index per subscriber.
+    fn remove_product_users_of(&mut self, provider_arn: &str) {
+        let orphaned: HashSet<String> = self
+            .product_users
+            .values()
+            .filter(|user| user.identity_provider_arn == provider_arn)
+            .map(|user| user.arn.clone())
+            .collect();
+        if orphaned.is_empty() {
+            return;
+        }
+        for arn in &orphaned {
+            self.product_users.remove(arn);
+            self.tags.remove(arn);
+        }
+        self.product_user_order.retain(|arn| !orphaned.contains(arn));
+        self.product_user_index
+            .retain(|_, indexed| !orphaned.contains(indexed));
     }
 
     /// Remove one product user from the store and from every index that reaches it.

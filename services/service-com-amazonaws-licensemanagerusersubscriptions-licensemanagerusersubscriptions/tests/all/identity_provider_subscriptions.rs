@@ -284,6 +284,14 @@ const REGISTRATIONS: &[Registration] = &[
     },
 ];
 
+/// How long a read waits before it must see a transition the clock owed.
+///
+/// A clock-owed transition in this emulator falls due inside 250-750 ms of the call that
+/// started it, so a read this far later must observe it whatever span the service chose
+/// inside that window.
+pub(crate) const PAST_THE_OWED_TRANSITION: std::time::Duration =
+    std::time::Duration::from_millis(900);
+
 pub(crate) fn provider_union(directory_id: &str) -> Value {
     json!({ "ActiveDirectoryIdentityProvider": { "DirectoryId": directory_id } })
 }
@@ -936,6 +944,10 @@ async fn an_unusable_page_size_or_token_is_refused() {
         .await
         .ok(row.case);
     }
+    // Deregistration is asynchronous: the registrations are still REPORTED in
+    // `DEREGISTERING`, so the list only shrinks past the cursor once the teardown the
+    // clock owes has completed (see `identity_provider_deregistration`).
+    tokio::time::sleep(PAST_THE_OWED_TRANSITION).await;
     let stale = list_providers(&h, &json!({ "MaxResults": 2, "NextToken": token })).await;
     assert_eq!(
         stale.status, 400,
@@ -1204,9 +1216,12 @@ async fn the_registering_status_settles_once_the_clock_owes_it() {
     );
 }
 
-/// RULE: a deregistration removes the stored registration (and the product users only
-/// reachable through it), so a later list does not report it and a second deregistration
-/// has nothing to remove.
+/// RULE: a deregistration ACCEPTS an asynchronous teardown — it answers the non-terminal
+/// `DEREGISTERING`, takes the product users that were only reachable through the
+/// registration at once, and stops reporting the registration once the teardown the clock
+/// owes has completed; a second deregistration names an identifier that is no longer one
+/// of this account's identity providers. The observability of `DEREGISTERING` itself is
+/// pinned by `identity_provider_deregistration`.
 #[tokio::test]
 async fn deregistration_removes_the_registration_and_its_product_users() {
     let h = harness();
@@ -1248,13 +1263,39 @@ async fn deregistration_removes_the_registration_and_its_product_users() {
         assert_eq!(
             as_str(&summary, "Status", row.case),
             "DEREGISTERING",
-            "case {:?}: a removed registration answers DEREGISTERING, got {summary:?}",
+            "case {:?}: a deregistered registration answers DEREGISTERING, got {summary:?}",
             row.case
         );
         assert_eq!(
             as_str(&summary, "IdentityProviderArn", row.case),
             arns[index].as_str(),
             "case {:?}: the final summary must be the stored one, got {summary:?}",
+            row.case
+        );
+        // A client reading straight after the call still sees the registration, in the
+        // transient status the call announced.
+        let listed = list_providers(&h, &json!({})).await;
+        let body = listed.ok(row.case);
+        let reported = body["IdentityProviderSummaries"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {:?}: no summaries in {body:?}", row.case))
+            .iter()
+            .find(|summary| {
+                summary.get("IdentityProviderArn").and_then(Value::as_str)
+                    == Some(arns[index].as_str())
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: the list must still report {} while it is deregistering, \
+                     got {body:?}",
+                    row.case, arns[index]
+                )
+            });
+        assert_eq!(
+            as_str(&reported, "Status", row.case),
+            "DEREGISTERING",
+            "case {:?}: the list reports the stored status, got {reported:?}",
             row.case
         );
 
@@ -1281,14 +1322,16 @@ async fn deregistration_removes_the_registration_and_its_product_users() {
     }
 
     let listed = list_providers(&h, &json!({})).await;
-    assert_eq!(
-        listed.ok("everything deregistered")["IdentityProviderSummaries"]
-            .as_array()
-            .map(Vec::len),
-        Some(0),
-        "a deregistered provider must be gone from the list"
+    let still_reported = listed.ok("everything deregistering")["IdentityProviderSummaries"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or_default();
+    assert!(
+        still_reported > 0,
+        "a deregistering provider is still reported until the teardown completes, got {:?}",
+        listed.body
     );
-    // Its product users went with it: the provider they hung off is no longer registered.
+    // Its product users went at once: the provider they hung off is no longer registered.
     let orphaned = list_subscriptions(
         &h,
         &json!({
@@ -1306,6 +1349,29 @@ async fn deregistration_removes_the_registration_and_its_product_users() {
         orphaned.error_type.as_deref(),
         Some("ValidationException"),
         "listing through a deregistered provider must be a ValidationException, got {orphaned:?}"
+    );
+    {
+        let state = h
+            .engine
+            .state::<ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState>();
+        let guard = state.lock();
+        assert!(
+            guard.product_users.is_empty() && guard.product_user_index.is_empty(),
+            "no product user may outlive its identity provider: {:?}",
+            guard.product_users
+        );
+    }
+
+    // Once the clock owes the teardown's completion, the registration stops being
+    // reported and every index drops it.
+    tokio::time::sleep(PAST_THE_OWED_TRANSITION).await;
+    let listed = list_providers(&h, &json!({})).await;
+    assert_eq!(
+        listed.ok("everything deregistered")["IdentityProviderSummaries"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "a deregistered provider must be gone from the list once the teardown completed"
     );
     let state = h
         .engine

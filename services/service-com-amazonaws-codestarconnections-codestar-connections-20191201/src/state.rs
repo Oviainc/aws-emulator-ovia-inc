@@ -471,6 +471,33 @@ pub fn mint_resource_uuid(sequence: u64) -> String {
     )
 }
 
+/// Whether `host_arn` names a host in the account this emulator serves.
+///
+/// A host ARN is a caller-supplied cross-reference to another resource, and its FIFTH
+/// field is the account that owns it (`service_common::arn`, this emulator's one ARN
+/// parse). An operation that associates a connection with a host, or filters by one,
+/// authorizes that field against the caller's own account before it resolves the ARN
+/// against any store: a host in another account is not the caller's to reach, whether or
+/// not it exists.
+///
+/// An ARN this cannot parse answers `false` too — the modeled `HostArn` pattern
+/// (`^arn:aws(-[\w]+)*:codestar-connections:.+:[0-9]{12}:host\/.+$`) is enforced by the
+/// boundary validator before a handler runs, so a value that reaches here and does not
+/// parse names no account at all.
+pub fn host_arn_is_in_caller_account(host_arn: &str) -> bool {
+    ::service_common::arn::parse(host_arn)
+        .is_some_and(|arn| arn.account == ::engine::emulator_account_id())
+}
+
+/// The refusal for a host ARN outside the caller's account: it names the caller's
+/// account and the ARN it was denied, so a client can tell which of the two is wrong.
+pub fn host_access_denied_message(host_arn: &str) -> String {
+    format!(
+        "Account {} does not have access to host {host_arn}",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// The ARN of a connection: `arn:aws:codestar-connections:<region>:<account>:connection/<id>`.
 pub fn connection_arn(region: &str, connection_id: &str) -> String {
     ::engine::emulator_arn(
@@ -500,10 +527,10 @@ pub fn host_arn(region: &str, host_id: &str) -> String {
 
 /// How this service reports a `HostArn` that resolves to no host it holds.
 ///
-/// Shared by every operation that resolves one (`DeleteHost`, `GetHost`), so an absent
-/// host reads the same whichever call found it absent. The message is built from the
-/// REQUEST — it names the ARN that was supplied — which is the part of it that is a
-/// contract.
+/// Shared by every operation that resolves one (`DeleteHost`, `GetHost`, and the
+/// `CreateConnection` / `ListConnections` host cross-references), so an absent host reads
+/// the same whichever call found it absent. The message is built from the REQUEST — it
+/// names the ARN that was supplied — which is the part of it that is a contract.
 pub fn host_not_found_message(host_arn: &str) -> String {
     format!("No host exists with the ARN: {host_arn}")
 }

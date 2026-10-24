@@ -143,6 +143,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut guard = state.lock();
+        // Judge the contact by the state in force NOW: a move the clock already owed — a
+        // reservation's SCHEDULING -> SCHEDULED, an earlier stop's CANCELLING ->
+        // CANCELLED, an update's UPDATING -> ACTIVE — was due whether or not anybody
+        // called, and it is what decides whether there is still a reservation to release.
+        guard.settle_due_contacts();
+
         let contact = guard.contacts.get_mut(&input.contact_id).ok_or_else(|| {
             CancelContactErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 // This service's `CancelContact` text quotes the requested id and
@@ -155,12 +161,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // Cancelling releases the reservation: the contact is CANCELLED from here on,
-        // and the scheduler no longer owes it anything. @idempotent — cancelling an
-        // already-cancelled contact lands on the same state and answers the same way.
-        contact.contact_status = "CANCELLED".to_string();
-        contact.scheduling_settles_at = None;
-        contact.last_updated = crate::state::now_timestamp();
+        // A release this contact is already carrying out is answered without starting a
+        // second one: @idempotent, so a retry that arrives inside the stop's window lands
+        // on the same state and answers the same way.
+        if contact.contact_status != crate::state::CONTACT_CANCELLING {
+            // Cancelling RELEASES a reservation, so it is only answered while there is
+            // one to release: a contact whose pass has yet to start is cancelled, one
+            // whose pass is under way is stopped, and a contact that was already released
+            // or whose pass is over or will never be flown has nothing left to cancel.
+            if !contact.is_cancellable() {
+                return Err(CancelContactErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "a contact in {} holds no reservation to release; only a \
+                             contact whose pass has not finished ({}) can be cancelled or \
+                             stopped",
+                            contact.contact_status,
+                            crate::state::cancellable_statuses(),
+                        )),
+                        parameter_name: Some("contactId".to_string()),
+                    },
+                )
+                .into());
+            }
+
+            // Accepted: the reservation is released. Before the pass that is CANCELLED
+            // outright; during it the contact is STOPPED — CANCELLING while the stop is
+            // carried out, and the antenna time the pass already used stays spent.
+            contact.begin_cancellation(crate::state::now_timestamp());
+        }
 
         Ok(CancelContactOutput {
             contact_id: Some(contact.contact_id.clone()),

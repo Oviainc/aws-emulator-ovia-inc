@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConnection
-//! IMPLEMENTED: mints a connection, persists it in [`crate::state`] and answers out of
-//! that record. This is the ONLY file to touch for this operation.
+//! IMPLEMENTED: refuses a request that names no provider (neither `ProviderType` nor
+//! `HostArn`) and a `HostArn` the caller may not reach, then mints a connection,
+//! persists it in [`crate::state`] and answers out of that record. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -93,12 +95,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codestarconnections-cod
 // (see `types::shared_types`) but this operation does not list it, and it is the only
 // honest answer for "this service is mounted on an engine that holds no state" — a 400
 // would blame the caller's request and a 501 would claim the operation is unwritten.
+// `AccessDeniedException` (403, "You do not have sufficient access to perform this
+// action.") is widened in for the same reason: the SERVICE models it (most of its
+// operations list it) and it is the answer the live service gives a `HostArn` naming a
+// host outside the caller's account — an authorization refusal, which neither of this
+// operation's absence/availability errors states.
 #[smithy_macros::operation_error(
     "com.amazonaws.codestarconnections#CreateConnection",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "AccessDeniedException"]
 )]
 #[derive(Debug)]
 pub enum CreateConnectionErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     LimitExceededException(LimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -168,7 +176,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolves against the endpoint the client addressed.
         let region = crate::state::request_region(ctx.parts());
 
+        // A connection names the third-party provider it reaches either DIRECTLY
+        // (`ProviderType`) or through the host that holds the provider's endpoint
+        // (`HostArn`). Both members are optional in the model, which cannot express "at
+        // least one of", so the service enforces it: a request carrying neither names no
+        // provider at all and is refused before anything is minted, rather than creating
+        // an addressable connection whose `GetConnection` reports no provider. The model
+        // declares no client-input error for this operation, so it is the scaffold
+        // channel's 400 `ValidationException`, naming both members the caller may fix.
+        if input.provider_type.is_none() && input.host_arn.is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "CreateConnection requires either ProviderType, naming the external \
+                 provider directly, or HostArn, naming the host that holds it; the request \
+                 supplied neither",
+            ));
+        }
+
         let mut store = state.lock();
+        // A `HostArn` is a cross-reference to another resource, so it is AUTHORIZED
+        // before it is resolved: a host in another account is not the caller's to attach
+        // a connection to, whatever the host store holds, and that refusal is an
+        // authorization answer (`AccessDeniedException`, 403) rather than an absence.
+        // Only an in-account ARN is then resolved against the host store, and one naming
+        // no host is the modelled absence (`ResourceNotFoundException`) — the operation's
+        // other refusal, `ResourceUnavailableException` (400), stays reserved for a host
+        // that IS there but is not usable. Both run before any state is written, so a
+        // refused request mints nothing and a stored connection never points at a host
+        // the caller cannot reach.
+        let mut provider_type = input.provider_type;
+        if let Some(host_arn) = input.host_arn.as_deref() {
+            if !crate::state::host_arn_is_in_caller_account(host_arn) {
+                // Audit record for an authorization decision: who presented which access
+                // key id, which host they were refused, and the outcome. No secret is
+                // logged — the access key id is the public half the request already
+                // carries in its SigV4 scope. The same shape `CreateHost` records a
+                // state change with.
+                ::tracing::info!(
+                    operation = "CreateConnection",
+                    access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+                    host_arn = %host_arn,
+                    outcome = "access_denied",
+                    "codestar connections authorization decision"
+                );
+                return Err(CreateConnectionErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(crate::state::host_access_denied_message(host_arn)),
+                    },
+                )
+                .into());
+            }
+            let Some(host) = store.hosts.get(host_arn) else {
+                return Err(CreateConnectionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::host_not_found_message(host_arn)),
+                    },
+                )
+                .into());
+            };
+            // A host-backed connection reaches its provider THROUGH the host, which is
+            // what makes `ProviderType` optional beside a `HostArn`: the host record
+            // already names the provider (`CreateHost` models `ProviderType` required),
+            // so the connection reports that one rather than no provider at all. A
+            // caller who named a provider keeps the value they supplied.
+            if provider_type.is_none() {
+                provider_type = Some(host.provider_type.clone());
+            }
+        }
         // The service caps how many connections it holds; the model declares
         // `LimitExceededException` ("Exceeded the maximum limit for connections.") for
         // exactly this, and the cap is what keeps state from growing without bound.
@@ -194,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 connection_id,
                 connection_name: input.connection_name,
                 connection_arn: connection_arn.clone(),
-                provider_type: input.provider_type,
+                provider_type,
                 owner_account_id: ::engine::emulator_account_id().to_string(),
                 // A connection created through the API is PENDING; see
                 // `crate::state::CONNECTION_STATUS_PENDING` for the modeled doc sentence.
@@ -211,6 +284,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // response reports what was stored.
         let tags = store.tag_list(&connection_arn);
         drop(store);
+
+        // Audit record for a state-changing operation: who presented which access key
+        // id, what was created, and the outcome — the record `CreateHost` beside it
+        // emits for the same reason.
+        ::tracing::info!(
+            operation = "CreateConnection",
+            access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+            connection_arn = %connection_arn,
+            outcome = "created",
+            "codestar connections state change"
+        );
 
         Ok(CreateConnectionOutput {
             connection_arn,

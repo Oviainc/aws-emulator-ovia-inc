@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetupInstanceHttps
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetupInstanceHttps`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Secures a stored instance's traffic: the request is resolved against the stored
+//! instance, recorded in that instance's HTTPS setup history (what
+//! `GetSetupHistory` reports) and in the operation log, and the certificate is in
+//! place once the clock settles the entry it answered.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetupInstanceHttps::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +161,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetupInstanceHttps` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetupInstanceHttpsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetupInstanceHttps"))
+        // `ctx` carries request metadata only, and nothing this operation stores
+        // comes from it: the certificate is installed on an instance that already
+        // exists, so the setup is recorded where that instance is rather than
+        // where the request signed for.
+        let _ = ctx;
+
+        // `instanceName`, `emailAddress`, `domainNames` and `certificateProvider`
+        // are modelled `@required` members; each domain name's length and charset,
+        // the list's own 1..10 length, the contact address's pattern and the
+        // `CertificateProvider` enum are modelled constraints — so the centralized
+        // walk refused anything outside them before this body ran. What is left is
+        // the one rule the model cannot express: "If you provide more than one
+        // domain name in the request, at least one name must be less than or equal
+        // to 63 characters in length." It is checked BEFORE the first write, so a
+        // refused request records nothing.
+        crate::state::validate_setup_domain_names(&input.domain_names).map_err(invalid)?;
+
+        let recorded = crate::state::with_state(&*self.engine, |store| {
+            // Read after the store is held, so the instant this call records is
+            // never earlier than the one the clock has already been advanced to:
+            // a record cannot be created already due.
+            let now = crate::state::now_ms();
+            // The certificate is installed ON the named instance, so an instance
+            // this account does not hold is refused rather than a setup being
+            // recorded against nothing.
+            let Some(instance) = store.instance(&input.instance_name) else {
+                return Err(not_found(&input.instance_name));
+            };
+            let resource_location = instance.location.clone();
+            let resource_arn = instance.arn.clone();
+            let resource_created_at_ms = instance.created_at_ms;
+
+            // The certificate is not in place as the call returns — it is issued
+            // by the certificate authority and installed afterwards — so the log
+            // entry is answered non-terminal and the clock owes it its `Succeeded`
+            // status at the same instant it owes the setup record its terminal
+            // `succeeded`: a caller reading the history straight after this call
+            // still sees the setup `inProgress`.
+            let settles_at_ms = now.saturating_add(crate::state::STATE_TRANSITION_MILLIS);
+            // `operations` is a list because other Lightsail calls act on several
+            // resources at once; this one acts on exactly one instance, so it
+            // answers exactly one entry, located where that instance is.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_SETUP_INSTANCE_HTTPS,
+                crate::state::RESOURCE_TYPE_INSTANCE,
+                &input.instance_name,
+                &resource_location,
+                Some(settles_at_ms),
+            );
+            // The request itself is what `GetSetupHistory` reports back, keyed by
+            // the id of the log entry this call wrote — `SetupHistory$operationId`
+            // is "A GUID that's used to identify the operation".
+            store.record_instance_https_setup(crate::state::StoredInstanceHttpsSetup {
+                operation_id: operation.id.clone(),
+                instance_name: input.instance_name.clone(),
+                domain_names: input.domain_names.clone(),
+                certificate_provider: input.certificate_provider.clone(),
+                email_address: input.email_address.clone(),
+                resource_arn,
+                resource_created_at_ms,
+                resource_location,
+                status: crate::state::SETUP_STATUS_IN_PROGRESS.to_string(),
+                settles_at_ms: Some(settles_at_ms),
+            });
+            Ok((
+                SetupInstanceHttpsOutput {
+                    operations: Some(vec![operation.view()]),
+                },
+                operation.id.clone(),
+            ))
+        })
+        .ok_or_else(unavailable)?;
+
+        let (output, operation_id) = recorded?;
+        // Audit record for a state-changing call: the operation, the resource it
+        // acted on and what it was asked to secure. The renewal contact the
+        // request carried is NOT logged — it is modelled `@sensitive`, and the
+        // service redacts it from its own answers — and neither is any
+        // credential.
+        ::tracing::info!(
+            audit = true,
+            operation = "SetupInstanceHttps",
+            outcome = "started",
+            instance_name = %input.instance_name,
+            certificate_provider = %input.certificate_provider,
+            domain_name_count = input.domain_names.len(),
+            operation_id = %operation_id,
+            "HTTPS certificate setup started for a Lightsail instance"
+        );
+        Ok(output)
     }
+}
+
+/// No instance of that name is stored: Lightsail's `DoesNotExist` rejection —
+/// HTTP 400, wire error `NotFoundException`, body `code` `DoesNotExist` and a
+/// message naming the resource type and the requested name.
+fn not_found(name: &str) -> SetupInstanceHttpsError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_INSTANCE,
+        name,
+    )
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> SetupInstanceHttpsError {
+    SetupInstanceHttpsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> SetupInstanceHttpsError {
+    SetupInstanceHttpsErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail instance store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

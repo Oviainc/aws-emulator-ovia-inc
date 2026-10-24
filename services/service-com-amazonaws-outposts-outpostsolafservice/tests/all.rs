@@ -17,6 +17,8 @@ mod capacity_task_lifecycle;
 mod error_classification;
 #[path = "all/error_message_rules.rs"]
 mod error_message_rules;
+#[path = "all/orderable_instance_types.rs"]
+mod orderable_instance_types;
 #[path = "all/outpost_assets.rs"]
 mod outpost_assets;
 #[path = "all/outpost_decommission.rs"]

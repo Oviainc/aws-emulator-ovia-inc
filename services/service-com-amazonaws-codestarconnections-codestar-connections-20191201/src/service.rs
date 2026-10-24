@@ -16,13 +16,15 @@
 //! Five opt-in seams are yours to change; every one defaults to the framework's
 //! own behaviour, so an unedited service still routes and answers correctly:
 //!
-//! - `can_handle` — which requests this service claims. The default matches the
-//!   request's resolved route key against this service's signing name. Edit it
-//!   for anything the model does not express: a signing name shared by several
-//!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//! - `can_handle` — which requests this service claims. EDITED HERE: the framework's
+//!   default (the request's resolved route key equals this service's signing name),
+//!   plus a request whose `X-Amz-Target` names this service, which the framework's
+//!   routing-key fallback misreads for this service's dotted target prefix.
+//! - `override_operation` — which operation serves a request. EDITED HERE: the
+//!   operation is resolved from the LAST segment of `x-amz-target`, so a client whose
+//!   target prefix carries dots of its own (the fully qualified Coral service name,
+//!   which is what the AWS SDK model publishes for this service) reaches the same
+//!   generated operation as one using the bare service shape name. See the method.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.

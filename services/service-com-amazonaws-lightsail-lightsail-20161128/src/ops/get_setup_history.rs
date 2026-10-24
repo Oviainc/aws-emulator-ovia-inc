@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSetupHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSetupHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the `SetupInstanceHttps` requests that ran against one stored
+//! instance, most recent first, from this service's HTTPS setup history. Reporting
+//! only: the history is written by `SetupInstanceHttps`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSetupHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +159,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSetupHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSetupHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSetupHistory"))
+        // `ctx` carries request metadata only, and this operation reports from the
+        // stored history alone: a setup record is located where the instance it
+        // ran against is, not where this request signed for.
+        let _ = ctx;
+
+        // `resourceName` is a modelled `@required` member and the page token's
+        // length and charset are modelled constraints, so the centralized walk
+        // refused anything outside them before this body ran. An EMPTY token is
+        // outside the modelled length too, so this only guards a token the walk
+        // cannot see (an absent member).
+        let name = input.resource_name;
+        let page_token = input.page_token.as_deref().filter(|token| !token.is_empty());
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A setup history belongs to the resource it ran on, so a name this
+            // account holds no instance under is refused rather than answered with
+            // an empty history — which would say "this instance has never had a
+            // certificate set up" about an instance that does not exist.
+            if store.instance(&name).is_none() {
+                return Err(not_found(&name));
+            }
+            let (setup_history, next_page_token) = store
+                .setup_history_page(&name, page_token)
+                .ok_or_else(|| invalid_page_token(page_token.unwrap_or_default(), &name))?;
+            Ok(GetSetupHistoryOutput {
+                // Reported EMPTY rather than left out for an instance nothing has
+                // been set up on: an absent member hands a typed caller a null
+                // where it iterates.
+                setup_history: Some(setup_history),
+                // "A next page token is not returned if there are no more results
+                // to display."
+                next_page_token,
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No instance of that name is stored: Lightsail's `DoesNotExist` rejection —
+/// HTTP 400, wire error `NotFoundException`, body `code` `DoesNotExist` and a
+/// message naming the resource type and the requested name.
+fn not_found(name: &str) -> GetSetupHistoryError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_INSTANCE,
+        name,
+    )
+}
+
+/// The token names no record of this resource's history: "To get a page token,
+/// perform an initial GetSetupHistory request", so the only tokens this operation
+/// accepts are the ones a previous page reported as `nextPageToken`.
+fn invalid_page_token(token: &str, resource_name: &str) -> GetSetupHistoryError {
+    invalid(format!(
+        "pageToken {token:?} names no setup record of resource '{resource_name}'; a page \
+         token is the one a previous GetSetupHistory page reported as nextPageToken"
+    ))
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> GetSetupHistoryError {
+    GetSetupHistoryErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetSetupHistoryError {
+    GetSetupHistoryErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail instance store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

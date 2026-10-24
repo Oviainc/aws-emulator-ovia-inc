@@ -37,7 +37,7 @@ use crate::scheduling_loop::{create_mission_profile, harness_with_engine, send, 
 
 /// Midnight-anchored epoch seconds for a UTC civil instant, so a test case reads as the
 /// calendar date it is about.
-fn epoch(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> i64 {
+pub(crate) fn epoch(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> i64 {
     chrono::NaiveDate::from_ymd_opt(year, month, day)
         .and_then(|date| date.and_hms_opt(hour, minute, 0))
         .unwrap_or_else(|| panic!("{year}-{month}-{day} {hour}:{minute} is a UTC instant"))
@@ -46,7 +46,7 @@ fn epoch(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> i64 {
 }
 
 /// The UTC calendar month `instant` (epoch seconds) falls in.
-fn month_of(instant: i64) -> (i32, i32) {
+pub(crate) fn month_of(instant: i64) -> (i32, i32) {
     let moment = chrono::DateTime::from_timestamp(instant, 0)
         .unwrap_or_else(|| panic!("{instant} is an epoch-seconds instant"));
     let month = chrono::Datelike::month(&moment);
@@ -57,7 +57,7 @@ fn month_of(instant: i64) -> (i32, i32) {
 }
 
 /// `GetMinuteUsage` for one month, asserting it answered.
-async fn minute_usage(router: &MultiServiceRouter, (year, month): (i32, i32)) -> Reply {
+pub(crate) async fn minute_usage(router: &MultiServiceRouter, (year, month): (i32, i32)) -> Reply {
     let reply = send(
         router,
         "POST",
@@ -75,14 +75,14 @@ async fn minute_usage(router: &MultiServiceRouter, (year, month): (i32, i32)) ->
 
 /// One integer member of a `GetMinuteUsage` answer. Absent is a failure, not a zero: the
 /// operation reports every member it models.
-fn minutes(reply: &Reply, member: &str, case: &str) -> i64 {
+pub(crate) fn minutes(reply: &Reply, member: &str, case: &str) -> i64 {
     reply.field(member).as_i64().unwrap_or_else(|| {
         panic!("case {case}: {member} is not an integer in {}", reply.body)
     })
 }
 
 /// `ReserveContact` for a window, answering the `contactId`.
-async fn reserve_pass(
+pub(crate) async fn reserve_pass(
     router: &MultiServiceRouter,
     profile_arn: &str,
     case: &str,

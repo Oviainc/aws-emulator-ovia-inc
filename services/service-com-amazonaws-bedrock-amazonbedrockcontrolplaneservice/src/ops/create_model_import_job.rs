@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateModelImportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateModelImportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateModelImportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! Mints one model import job in the store and answers its `jobArn`. The job is accepted
+//! and runs asynchronously, so it is stored `InProgress` with the instant it is owed its
+//! move to `Completed` ([`crate::state::IMPORT_JOB_COMPLETE_AFTER`] from now); the
+//! imported model's ARN is minted here too, because it is the job's target and every read
+//! of the job reports it. `GetModelImportJob` reads the job back and materialises that
+//! owed transition.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +180,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateModelImportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateModelImportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateModelImportJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateModelImportJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "model import job state is not available on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `TooManyTagsException` documents the bound itself ("50 tags per resource"), and
+        // this request carries tags for TWO resources — the job and the model it imports —
+        // so each list is held to it separately. The modelled `@length(0..200)` on
+        // `TagList` is enforced ahead of this handler, so this is the per-resource bound
+        // inside that span.
+        for (member, tags) in [
+            ("jobTags", input.job_tags.as_ref()),
+            ("importedModelTags", input.imported_model_tags.as_ref()),
+        ] {
+            let count = tags.map_or(0, Vec::len);
+            if count > crate::state::MAX_TAGS_PER_RESOURCE {
+                return Err(CreateModelImportJobErrorModeled::TooManyTagsException(
+                    TooManyTagsException {
+                        message: Some(format!(
+                            "a resource may carry at most {} tags, and {member} carries {count}",
+                            crate::state::MAX_TAGS_PER_RESOURCE
+                        )),
+                        resource_name: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken`: a replay answers with what the first request minted.
+        let replayed = input
+            .client_request_token
+            .as_ref()
+            .and_then(|token| {
+                store
+                    .model_import_job_create_tokens
+                    .get(&(region.clone(), token.clone()))
+            })
+            .cloned();
+        if let Some(minted) = replayed {
+            if let Some(job) = store.model_import_jobs.get(&minted) {
+                return Ok(CreateModelImportJobOutput {
+                    job_arn: job.arn.clone(),
+                });
+            }
+        }
+
+        // Both names address a resource on their own — a `ModelImportJobIdentifier` may be
+        // a bare `jobName` and an `ImportedModelIdentifier` a bare model name — so each
+        // names at most one resource in this account and region, and a create that reuses
+        // either conflicts with the job that holds it.
+        let name_key = (region.clone(), input.job_name.clone());
+        if store.model_import_job_names.contains_key(&name_key) {
+            return Err(CreateModelImportJobErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "a model import job named {} already exists in this account in {region}",
+                        input.job_name
+                    )),
+                },
+            )
+            .into());
+        }
+        if store.imports_model_named(&region, &input.imported_model_name) {
+            return Err(CreateModelImportJobErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "a model named {} has already been imported into this account in \
+                         {region}",
+                        input.imported_model_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The account's import job quota. Enforcing it here is also what bounds this part
+        // of the store: without a server-side cap a caller could grow it with nothing but
+        // fresh job names.
+        if store.model_import_jobs.len() >= crate::state::MAX_MODEL_IMPORT_JOBS_PER_ACCOUNT {
+            return Err(
+                CreateModelImportJobErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} model import jobs; \
+                             request a quota increase",
+                            crate::state::MAX_MODEL_IMPORT_JOBS_PER_ACCOUNT
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let job_id = store.mint_model_import_job_id(now);
+        let arn = crate::state::model_import_job_arn(&region, &job_id);
+        let model_id = store.mint_imported_model_id(now);
+        let job = crate::state::ModelImportJobRecord {
+            arn: arn.clone(),
+            name: input.job_name,
+            region: region.clone(),
+            imported_model_name: input.imported_model_name,
+            imported_model_arn: crate::state::imported_model_arn(&region, &model_id),
+            role_arn: input.role_arn,
+            model_data_source: input.model_data_source,
+            vpc_config: input.vpc_config,
+            // `importedModelKmsKeyId` admits a key ARN, a bare key id or an alias, while
+            // the `importedModelKmsKeyArn` a read reports admits only a key ARN; the
+            // shared conversion is what decides which of those can be reported back.
+            imported_model_kms_key_arn: crate::state::kms_key_arn(
+                input.imported_model_kms_key_id.as_deref(),
+                &region,
+            ),
+            job_tags: input.job_tags.unwrap_or_default(),
+            imported_model_tags: input.imported_model_tags.unwrap_or_default(),
+            // The import runs after this call returns, so the job is reported running now
+            // and is owed `Completed` once the span has passed.
+            status: crate::state::IMPORT_JOB_STATUS_IN_PROGRESS,
+            completed_due_at: Some(now + crate::state::IMPORT_JOB_COMPLETE_AFTER),
+            created_at: now,
+            last_modified_at: now,
+            ended_at: None,
+        };
+
+        store.model_import_job_names.insert(name_key, arn.clone());
+        if let Some(token) = input.client_request_token {
+            store
+                .model_import_job_create_tokens
+                .insert((region, token), arn.clone());
+        }
+        store.model_import_jobs.insert(arn.clone(), job);
+
+        // Read the response back out of the STORED record, so what the caller is told is
+        // exactly what a later GetModelImportJob will find.
+        let stored = store
+            .model_import_jobs
+            .get(&arn)
+            .expect("the model import job just inserted under this ARN");
+        Ok(CreateModelImportJobOutput {
+            job_arn: stored.arn.clone(),
+        })
     }
 }

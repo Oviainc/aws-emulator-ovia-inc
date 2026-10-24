@@ -17,7 +17,15 @@ pub struct GetModelImportJobInput {
     pub job_identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#GetModelImportJobResponse")]
+/// `GetModelImportJobResponse`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `creationTime`, `lastModifiedTime` and `endTime` carry
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation",operation="GetModelImportJob")`), which the derive does
+/// not put on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct GetModelImportJobOutput {
     pub job_arn: Option<String>,
@@ -34,4 +42,81 @@ pub struct GetModelImportJobOutput {
     pub vpc_config: Option<VpcConfig>,
     pub imported_model_kms_key_arn: Option<String>,
 }
+
+bedrock_schema_and_codec!(
+    GetModelImportJobOutput,
+    GET_MODEL_IMPORT_JOB_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#GetModelImportJobResponse",
+    "com.amazonaws.bedrock",
+    "GetModelImportJobResponse",
+    (M_JOB_ARN, job_arn, "jobArn", 0, opt, string),
+    (M_JOB_NAME, job_name, "jobName", 1, opt, string),
+    (
+        M_IMPORTED_MODEL_NAME,
+        imported_model_name,
+        "importedModelName",
+        2,
+        opt,
+        string
+    ),
+    (
+        M_IMPORTED_MODEL_ARN,
+        imported_model_arn,
+        "importedModelArn",
+        3,
+        opt,
+        string
+    ),
+    (M_ROLE_ARN, role_arn, "roleArn", 4, opt, string),
+    (
+        M_MODEL_DATA_SOURCE,
+        model_data_source,
+        "modelDataSource",
+        5,
+        opt,
+        union_of(ModelDataSource)
+    ),
+    (M_STATUS, status, "status", 6, opt, string),
+    (
+        M_FAILURE_MESSAGE,
+        failure_message,
+        "failureMessage",
+        7,
+        opt,
+        string
+    ),
+    (
+        M_CREATION_TIME,
+        creation_time,
+        "creationTime",
+        8,
+        opt,
+        date_time
+    ),
+    (
+        M_LAST_MODIFIED_TIME,
+        last_modified_time,
+        "lastModifiedTime",
+        9,
+        opt,
+        date_time
+    ),
+    (M_END_TIME, end_time, "endTime", 10, opt, date_time),
+    (
+        M_VPC_CONFIG,
+        vpc_config,
+        "vpcConfig",
+        11,
+        opt,
+        struct_of(VpcConfig)
+    ),
+    (
+        M_IMPORTED_MODEL_KMS_KEY_ARN,
+        imported_model_kms_key_arn,
+        "importedModelKmsKeyArn",
+        12,
+        opt,
+        string
+    ),
+);
 

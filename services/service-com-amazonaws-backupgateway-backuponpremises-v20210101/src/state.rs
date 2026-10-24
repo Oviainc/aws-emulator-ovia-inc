@@ -48,6 +48,13 @@
 //! they belong to: `GetHypervisorPropertyMappings` reports the mappings of the record its
 //! `ServerArn` resolves to, and a hypervisor that carries none has no mappings resource
 //! to report ([`MissingResource::PropertyMappings`]).
+//! `PutHypervisorPropertyMappings` is what writes them
+//! ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::set_property_mappings`]),
+//! and only for a hypervisor a GATEWAY is associated with
+//! ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::gateway_for_hypervisor`]):
+//! the appliance that serves the hypervisor is what applies the mappings to it, so with
+//! none associated the request is refused ([`GATEWAY_OUT_OF_DATE`]) and nothing is
+//! written.
 //!
 //! A hypervisor also carries the METADATA SYNC last started on it
 //! ([`StoredHypervisor::metadata_sync_started`]):
@@ -149,6 +156,29 @@ pub const MAPPINGS_NOT_CONFIGURED: &str = "MappingsNotConfigured";
 /// the refusal in the model's own words rather than in invented ones.
 pub const MAPPINGS_NOT_CONFIGURED_MESSAGE: &str =
     "The operation cannot proceed because you have insufficient permissions.";
+
+/// `ValidationException$ErrorCode` for a request that only the backup gateway serving a
+/// hypervisor can carry out, made for a hypervisor NO gateway is associated with.
+///
+/// Property mappings are applied to the hypervisor's entities BY the gateway appliance
+/// that serves it — `PutHypervisorPropertyMappings` "sets the property mappings for the
+/// specified hypervisor", the "relationship of entity properties available from the
+/// hypervisor to the properties available in Amazon Web Services"
+/// (`smithy_query(query="operation",operation="PutHypervisorPropertyMappings")`), and a
+/// gateway is associated with a hypervisor by `AssociateGatewayToServer` — so with no
+/// such gateway there is no appliance that can apply them, which is what AWS is recorded
+/// refusing with `ValidationException` and [`GATEWAY_OUT_OF_DATE_MESSAGE`].
+///
+/// `ValidationException$ErrorCode` is documented as "A description of what caused the
+/// validation error" (`smithy_query(query="shape",shape="ValidationException")`) and AWS
+/// publishes no vocabulary for that member, so this value names the condition the way
+/// [`ACTIVATION_KEY_NOT_FOUND`] names its own.
+pub const GATEWAY_OUT_OF_DATE: &str = "GatewayOutOfDate";
+
+/// See [`GATEWAY_OUT_OF_DATE`]: the sentence AWS is recorded stating for that refusal
+/// (`issues/.../backup-gateway-puthypervisorpropertymappings-stub.md`), kept in one place
+/// so every operation the gateway has to carry out refuses the same way.
+pub const GATEWAY_OUT_OF_DATE_MESSAGE: &str = "The specified gateway is out of date.";
 
 /// The region a minted ARN falls back to when the request carries no SigV4 credential
 /// scope to read one from (an unsigned request on an emulator with authentication off).
@@ -447,8 +477,8 @@ pub struct StoredHypervisor {
     /// The hypervisor's property mappings, absent until they have been SET for it.
     ///
     /// An import never mints mappings: `PutHypervisorPropertyMappings` is the operation
-    /// that writes them (still a scaffold answering 501 under its own stub issue), and
-    /// `GetHypervisorPropertyMappings` reports whatever this field holds. Absent is a
+    /// that writes them ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::set_property_mappings`]),
+    /// and `GetHypervisorPropertyMappings` reports whatever this field holds. Absent is a
     /// meaningful value and not an empty mapping set: a hypervisor with no mappings has
     /// no mappings resource to report ([`MissingResource::PropertyMappings`]), where one
     /// whose mappings are an empty list has.
@@ -913,6 +943,41 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     pub fn property_mappings_configured(&self, arn: &str) -> bool {
         self.hypervisor(arn)
             .is_some_and(|hypervisor| hypervisor.property_mappings.is_some())
+    }
+
+    /// The gateway ASSOCIATED with the hypervisor `hypervisor_arn` names, if any.
+    ///
+    /// A gateway records the hypervisor it serves in [`StoredGateway::hypervisor_arn`], so
+    /// the association is read off the gateway records rather than kept a second time on
+    /// the hypervisor record. `None` both for a hypervisor no gateway is associated with
+    /// and for an ARN this store holds no hypervisor under — nothing can be associated
+    /// with a hypervisor the service does not hold — which is the ONE question an
+    /// operation only the serving gateway can carry out is gated on
+    /// ([`GATEWAY_OUT_OF_DATE`]).
+    pub fn gateway_for_hypervisor(&self, hypervisor_arn: &str) -> Option<&StoredGateway> {
+        self.gateways
+            .values()
+            .find(|gateway| gateway.hypervisor_arn.as_deref() == Some(hypervisor_arn))
+    }
+
+    /// Set the property mappings of the hypervisor stored under `arn`, and hand back the
+    /// record as it is now STORED — read out of the map after the write, so what a caller
+    /// gets is what the store holds.
+    ///
+    /// `None` — nothing written — when this store holds no hypervisor under `arn`.
+    ///
+    /// The mappings REPLACE whatever that hypervisor carried: the request states the
+    /// mappings the hypervisor is to have, so setting the same ones again leaves the
+    /// record exactly as one call left it, and no mapping of an earlier call survives a
+    /// later one. Nothing else on the record is touched — a put of mappings is not a
+    /// metadata sync and does not move the hypervisor's state.
+    pub fn set_property_mappings(
+        &mut self,
+        arn: &str,
+        mappings: StoredPropertyMappings,
+    ) -> Option<StoredHypervisor> {
+        self.hypervisors.get_mut(arn)?.property_mappings = Some(mappings);
+        self.hypervisors.get(arn).cloned()
     }
 
     /// Start a metadata sync on the hypervisor stored under `arn` at `now`, and hand back

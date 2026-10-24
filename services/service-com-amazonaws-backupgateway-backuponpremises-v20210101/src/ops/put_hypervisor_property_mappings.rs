@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutHypervisorPropertyMappings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutHypervisorPropertyMappings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! SETS the property mappings of the hypervisor an ARN names: persists the IAM role and
+//! the VMware-to-Amazon tag mappings, in the order the request carried them, on that
+//! hypervisor's record in [`crate::state`], and answers with the ARN read back off the
+//! stored record. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutHypervisorPropertyMappings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The mappings are applied to the hypervisor's entities by the backup GATEWAY that
+//! serves it, so a put for a hypervisor no gateway is associated with
+//! ([`crate::state::ComAmazonawsBackupgatewayBackuponpremisesV20210101State::gateway_for_hypervisor`])
+//! is refused with HTTP 400 `ValidationException` carrying
+//! [`crate::state::GATEWAY_OUT_OF_DATE`] and nothing is written — the same answer however
+//! often it is repeated.
+//!
+//! `@idempotent`: the request states the mappings the hypervisor is to have, so repeating
+//! it leaves the record exactly as one call left it and no mapping of an earlier call
+//! survives a later one.
 //!
 //! ## Shape of an operation
 //!
@@ -77,7 +83,18 @@
 //! * `ConflictException` (HTTP 409) — The operation cannot proceed because it is not
 //!   supported.
 //! * `ResourceNotFoundException` (HTTP 404) — A resource that is required for the action
-//!   wasn't found.
+//!   wasn't found. Answered at HTTP 400 for a missing HYPERVISOR, with `ErrorCode`
+//!   `HypervisorNotFound` (`crate::state::MissingResource`) — reached when a gateway is
+//!   associated with a hypervisor record the store no longer holds. An ARN that names no
+//!   hypervisor at all takes the gateway refusal below instead: nothing is associated with
+//!   a record this service does not hold, so there is no appliance for the request either
+//!   way, and that is the answer AWS is recorded giving.
+//! * `ValidationException` (HTTP 400) — the refusal for a hypervisor no gateway is
+//!   associated with, `ErrorCode` [`crate::state::GATEWAY_OUT_OF_DATE`]. One of the errors
+//!   this SERVICE models for every operation, which
+//!   `smithy_query(query="operation",operation="PutHypervisorPropertyMappings")` therefore
+//!   lists for this one (beside `InternalServerException` and `ThrottlingException`) even
+//!   though the operation shape itself does not — hence `extra_errors` below.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -93,12 +110,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupgateway-backuponp
 // here — hence the `PutHypervisorPropertyMappingsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupgateway#PutHypervisorPropertyMappings")]
+// `extra_errors` widens the set with the two errors this SERVICE models for every
+// operation — the ones `smithy_query(query="operation")` reports for this operation by
+// merging the service-common errors in, and which the OPERATION shape in the model does
+// not list itself, so `#[operation_error]` does not generate them. The same widening
+// `create_gateway` and `start_virtual_machines_metadata_sync` do.
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupgateway#PutHypervisorPropertyMappings",
+    extra_errors = ["ValidationException", "InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum PutHypervisorPropertyMappingsErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
+    ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -152,18 +179,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutHypervisorPropertyMappings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutHypervisorPropertyMappingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Request metadata only; the store is reached through `self.engine`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutHypervisorPropertyMappingsErrorModeled::InternalServerException(
+                InternalServerException {
+                    error_code: None,
+                    message: Some(
+                        "Backup gateway state is unavailable on this engine.".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        // One guard spans the gate and the write, so the record the gate passed is the
+        // record the mappings are written to.
+        let mut store = state.lock();
+
+        // `HypervisorArn`'s and `IamRoleArn`'s lengths and patterns, and every member of
+        // every `VmwareToAwsTagMapping`, are refused by the boundary validator before
+        // `handle` runs, so reaching here means the input satisfies all of them. What is
+        // left is a fact of the STORE: which appliance would apply these mappings.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutHypervisorPropertyMappings"))
+        // The GATEWAY gate comes first. A property mapping is applied to the hypervisor's
+        // entities by the backup gateway appliance that serves it, so a put for a
+        // hypervisor no gateway is associated with reaches no appliance that could carry
+        // it out: the refusal is about the GATEWAY and not about the mappings or the
+        // hypervisor, which is why it is answered the same way for an ARN this store holds
+        // no hypervisor under — nothing is associated with a hypervisor the service does
+        // not hold either. Nothing is written before this gate passes, so the answer is
+        // the same however often the call is repeated.
+        if store.gateway_for_hypervisor(&input.hypervisor_arn).is_none() {
+            return Err(PutHypervisorPropertyMappingsErrorModeled::ValidationException(
+                ValidationException {
+                    error_code: Some(crate::state::GATEWAY_OUT_OF_DATE.to_string()),
+                    message: Some(crate::state::GATEWAY_OUT_OF_DATE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Past the gate a gateway names this hypervisor. The record it names can still be
+        // absent — a hypervisor the store once held and no longer does — and a put cannot
+        // set mappings on a record that is not there, so that is refused through the same
+        // `crate::state::MissingResource` choice of status and `ErrorCode` every other
+        // operation of this service refuses a missing hypervisor with.
+        let mappings = crate::state::StoredPropertyMappings {
+            iam_role_arn: input.iam_role_arn.clone(),
+            vmware_to_aws_tag_mappings: input.vmware_to_aws_tag_mappings.clone(),
+        };
+        let Some(updated) = store.set_property_mappings(&input.hypervisor_arn, mappings) else {
+            let missing = crate::state::MissingResource::Hypervisor;
+            let error = PutHypervisorPropertyMappingsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    error_code: missing.error_code().map(str::to_string),
+                    message: Some(missing.message(&input.hypervisor_arn)),
+                },
+            );
+            return Err(match missing.status_override() {
+                Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
+                None => error.into(),
+            });
+        };
+
+        // The ARN comes back off the record the store now holds, not off the request.
+        Ok(PutHypervisorPropertyMappingsOutput {
+            hypervisor_arn: Some(updated.arn),
+        })
     }
 }
