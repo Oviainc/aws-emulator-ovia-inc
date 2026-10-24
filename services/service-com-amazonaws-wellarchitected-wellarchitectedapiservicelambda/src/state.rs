@@ -10,7 +10,8 @@
 //! `ListLensReviews`), the answers of
 //! a workload's lens reviews (`ListAnswers`), the improvement plan of one of those lens
 //! reviews (`ListLensReviewImprovements`) and the answers of a review template's lens
-//! reviews (`ListReviewTemplateAnswers`) are backed entirely by the maps below, so a
+//! reviews (`ListReviewTemplateAnswers`, `GetReviewTemplateAnswer`,
+//! `UpdateReviewTemplateAnswer`) are backed entirely by the maps below, so a
 //! create is visible to the next request on the same engine. The custom lenses
 //! `ImportLens`
 //! imports, the versions `CreateLensVersion` publishes from them, the content
@@ -57,19 +58,21 @@ use sha2::{Digest, Sha256};
 pub mod official_lenses;
 
 pub use official_lenses::{
-    framework_lens_published_at, lens_metadata, lens_pillars, lens_question_count, lens_questions,
-    official_lens, LensMetadata, OfficialLens, OFFICIAL_LENS_CATALOG, SPECIALISED_LENS_VERSION,
-    WELL_ARCHITECTED_PILLARS,
+    framework_lens_published_at, lens_metadata, lens_pillars, lens_question, lens_question_count,
+    lens_questions, official_lens, LensMetadata, OfficialLens, OFFICIAL_LENS_CATALOG,
+    SPECIALISED_LENS_VERSION, WELL_ARCHITECTED_PILLARS,
 };
 
 use crate::ops::types::{
-    AgentProfileSummary, AggregationConfiguration, Choice, ConflictException, ContextContent,
+    AgentProfileSummary, AggregationConfiguration, Choice, ChoiceAnswer, ConflictException,
+    ContextContent,
     ContextSummary,
     GoalSummary, LensSummary, Milestone,
     MilestoneSummary,
     Profile, ProfileQuestion, Progress,
     ResourceNotFoundException,
-    ReviewTemplate, ReviewTemplateLensReview, ReviewTemplatePillarReviewSummary,
+    ReviewTemplate, ReviewTemplateAnswer, ReviewTemplateLensReview,
+    ReviewTemplatePillarReviewSummary,
     ReviewTemplateSummary, Scope,
     ShareInvitation, ShareInvitationSummary, Tag, Workload, WorkloadDiscoveryConfig,
     WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput, WorkloadShare,
@@ -103,6 +106,13 @@ pub const RISK_NOT_APPLICABLE: &str = "NOT_APPLICABLE";
 /// (`smithy_query(query="shape", shape="ChoiceStatus")`): what keeps a question's risk
 /// off `NONE`.
 pub const CHOICE_STATUS_UNSELECTED: &str = "UNSELECTED";
+
+/// The `ChoiceStatus` member that says a best practice IS in place
+/// (`smithy_query(query="shape", shape="ChoiceStatus")`): the status every `ChoiceId` a
+/// `SelectedChoices` names carries, and the only status a selected choice carries — which
+/// is what keeps an answer's `SelectedChoices` and its `ChoiceAnswers` in agreement
+/// ([`AnswerRecord::resolve_selected_choices`]).
+pub const CHOICE_STATUS_SELECTED: &str = "SELECTED";
 
 /// `TrustedAdvisorIntegrationStatus$DISABLED`: what a workload's discovery
 /// configuration reports while no Trusted Advisor integration has been configured for
@@ -279,6 +289,22 @@ impl FrameworkQuestion {
                 additional_resources: None,
             })
             .collect()
+    }
+
+    /// Whether `choice_id` names one of this question's choices. A choice belongs to the
+    /// question that offers it, so an answer can only speak about the choices named here.
+    pub fn defines_choice(&self, choice_id: &str) -> bool {
+        self.each_choice_id().any(|defined| defined == choice_id)
+    }
+
+    /// The `ChoiceId` of every best practice this question asks about, in the lens's own
+    /// order — the key space an answer's per-choice statuses live in, and what a
+    /// request's `SelectedChoices` values and `ChoiceUpdates` keys are judged against.
+    ///
+    /// Lazy, so a caller that only has to RECOGNISE an id, or that consumes the ids one at
+    /// a time, does not build the whole list to do it.
+    fn each_choice_id(&self) -> impl Iterator<Item = String> + '_ {
+        (0..self.best_practices.len()).map(|index| self.choice_id(index))
     }
 }
 
@@ -1029,8 +1055,9 @@ pub fn page_size_up_to(max_results: Option<i32>, ceiling: i32) -> usize {
 ///
 /// Only the members a projection reports are held: `AnswerSummary` carries the selected
 /// choices, the per-choice answers, whether the question applies and the reason it does
-/// not. The question's RISK is not stored — it is derived from these by
-/// [`AnswerRecord::risk`] on every read, so it moves when the answer does.
+/// not, and `Answer` / `ReviewTemplateAnswer` carry the answer's notes too. The
+/// question's RISK is not stored — it is derived from these by [`AnswerRecord::risk`] on
+/// every read, so it moves when the answer does.
 #[derive(Debug, Clone)]
 pub struct AnswerRecord {
     /// `SelectedChoices`: the `ChoiceId`s of the best practices that are in place.
@@ -1041,18 +1068,96 @@ pub struct AnswerRecord {
     pub is_applicable: bool,
     /// `Reason` (an `AnswerReason`): why the question does not apply, when it does not.
     pub reason: Option<String>,
+    /// `Notes`: the notes recorded against this answer, absent until one is written.
+    pub notes: Option<String>,
 }
 
-/// One stored per-choice answer: the choice's status and the reason for it.
+/// One stored per-choice answer: the choice's status, the reason for it and its notes.
 #[derive(Debug, Clone)]
 pub struct ChoiceAnswerRecord {
     /// A `ChoiceStatus` (`SELECTED` | `UNSELECTED` | `NOT_APPLICABLE`).
     pub status: String,
     /// A `ChoiceReason`, when one was given.
     pub reason: Option<String>,
+    /// `ChoiceAnswer$Notes` — "the notes associated with a choice", when any were given.
+    /// `ChoiceAnswerSummary` models no notes member, so only the full answer reports it.
+    pub notes: Option<String>,
 }
 
 impl AnswerRecord {
+    /// The answer a question carries the moment it is first answered: every choice the
+    /// question asks about recorded [`CHOICE_STATUS_UNSELECTED`] — a best practice is not
+    /// in place until an answer says it is — with nothing selected, the question applying
+    /// and no reason or notes.
+    ///
+    /// The whole choice set is recorded rather than only the choices a request speaks
+    /// about, so an answered question reports one `ChoiceAnswers` entry per choice of the
+    /// question however it was answered.
+    pub fn for_question(question: &FrameworkQuestion) -> Self {
+        Self {
+            selected_choices: Vec::new(),
+            choice_answers: question
+                .each_choice_id()
+                .map(|choice_id| {
+                    (
+                        choice_id,
+                        ChoiceAnswerRecord {
+                            status: CHOICE_STATUS_UNSELECTED.to_string(),
+                            reason: None,
+                            notes: None,
+                        },
+                    )
+                })
+                .collect(),
+            is_applicable: true,
+            reason: None,
+            notes: None,
+        }
+    }
+
+    /// Record `selected` as exactly the choices of `question` that are in place: each
+    /// `ChoiceId` it names becomes [`CHOICE_STATUS_SELECTED`] and every OTHER choice of
+    /// the question becomes [`CHOICE_STATUS_UNSELECTED`] — "the values entered replace the
+    /// previously selected choices" (`SelectedChoices` doc).
+    ///
+    /// Only each choice's STATUS is written: a choice's reason and notes are what a
+    /// `ChoiceUpdate` carries, so they are left as stored.
+    pub fn select_only(&mut self, question: &FrameworkQuestion, selected: &[String]) {
+        let selected: BTreeSet<&str> = selected.iter().map(String::as_str).collect();
+        for choice_id in question.each_choice_id() {
+            let status = if selected.contains(choice_id.as_str()) {
+                CHOICE_STATUS_SELECTED
+            } else {
+                CHOICE_STATUS_UNSELECTED
+            };
+            self.choice_answers
+                .entry(choice_id)
+                .and_modify(|choice| choice.status = status.to_string())
+                .or_insert_with(|| ChoiceAnswerRecord {
+                    status: status.to_string(),
+                    reason: None,
+                    notes: None,
+                });
+        }
+    }
+
+    /// Bring [`Self::selected_choices`] back into agreement with the per-choice statuses:
+    /// the selected choices of an answer ARE the choices of `question` it records
+    /// [`CHOICE_STATUS_SELECTED`] for, in the lens's own choice order.
+    ///
+    /// Run after every write to an answer, so the two members a client reads back cannot
+    /// contradict each other whichever of them the request wrote through.
+    pub fn resolve_selected_choices(&mut self, question: &FrameworkQuestion) {
+        self.selected_choices = question
+            .each_choice_id()
+            .filter(|choice_id| {
+                self.choice_answers
+                    .get(choice_id)
+                    .is_some_and(|choice| choice.status == CHOICE_STATUS_SELECTED)
+            })
+            .collect();
+    }
+
     /// The `Risk` this answer carries, derived from what it records.
     ///
     /// The Well-Architected Tool rates a question by how many of its best practices are
@@ -1767,6 +1872,21 @@ impl ReviewTemplateRecord {
         self.answers.get(lens_alias(lens))?.get(question_id)
     }
 
+    /// [`Self::answer`] for a caller about to WRITE it, created from the question's own
+    /// choice set on the first write ([`AnswerRecord::for_question`]).
+    ///
+    /// Recording an answer is what makes the question `ANSWERED`
+    /// ([`Self::question_counts`]), so this is the one place a template's answer comes
+    /// into existence. `lens` is a lens as a request names it, so an answer written by
+    /// either spelling is the same answer ([`lens_alias`]).
+    pub fn answer_mut(&mut self, lens: &str, question: &FrameworkQuestion) -> &mut AnswerRecord {
+        self.answers
+            .entry(lens_alias(lens).to_string())
+            .or_default()
+            .entry(question.question_id.to_string())
+            .or_insert_with(|| AnswerRecord::for_question(question))
+    }
+
     /// Whether this template applies the lens a `LensAlias` names, however the template
     /// and the request spell it: a lens review of a template exists only while that
     /// lens is applied to it.
@@ -2005,6 +2125,76 @@ impl ReviewTemplateRecord {
             // stub.
             share_invitation_id: None,
         }
+    }
+}
+
+/// The `ReviewTemplateAnswer` shape `UpdateReviewTemplateAnswer` and
+/// `GetReviewTemplateAnswer` report for ONE question of ONE lens review of a review
+/// template: "an answer of the question".
+///
+/// `question` is the question as the LENS defines it and `answer` the answer the template
+/// records for it, absent for a question nothing has answered — which is what makes the
+/// difference between the two states a `ReviewTemplateAnswerStatus` publishes. A question
+/// with no stored answer applies, has nothing selected and speaks about no choice, exactly
+/// as the template's question roll-up counts it ([`ReviewTemplateRecord::question_counts`])
+/// and as a `ReviewTemplateAnswerSummary` of the same question reports it.
+///
+/// `QuestionDescription`, `ImprovementPlanUrl`, `HelpfulResourceUrl` and
+/// `HelpfulResourceDisplayText` are lens CONTENT this emulator's official-lens catalog
+/// does not carry, and every one of them is optional, so they are omitted rather than
+/// guessed at.
+pub fn review_template_answer(
+    question: &FrameworkQuestion,
+    answer: Option<&AnswerRecord>,
+) -> ReviewTemplateAnswer {
+    ReviewTemplateAnswer {
+        question_id: Some(question.question_id.to_string()),
+        pillar_id: Some(question.pillar_id.to_string()),
+        question_title: Some(question.title.to_string()),
+        question_description: None,
+        improvement_plan_url: None,
+        helpful_resource_url: None,
+        helpful_resource_display_text: None,
+        // The per-question CHOICE CATALOG the lens defines: the best practices the
+        // question asks about, each with the `ChoiceId` a client passes back in
+        // `UpdateReviewTemplateAnswer$SelectedChoices` and `$ChoiceUpdates`. It describes
+        // the QUESTION, so it is reported whether or not the template has answered it.
+        choices: Some(question.choices()),
+        selected_choices: Some(
+            answer
+                .map(|answer| answer.selected_choices.clone())
+                .unwrap_or_default(),
+        ),
+        choice_answers: Some(
+            answer
+                .map(|answer| {
+                    answer
+                        .choice_answers
+                        .iter()
+                        .map(|(choice_id, choice)| ChoiceAnswer {
+                            choice_id: Some(choice_id.clone()),
+                            status: Some(choice.status.clone()),
+                            reason: choice.reason.clone(),
+                            notes: choice.notes.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        // A question applies unless an answer says it does not.
+        is_applicable: Some(answer.is_none_or(|answer| answer.is_applicable)),
+        // "The status of whether or not this question has been answered": the stored
+        // answer IS that status, so an answer and the template's roll-up cannot disagree.
+        answer_status: Some(
+            if answer.is_some() {
+                REVIEW_TEMPLATE_ANSWER_STATUS_ANSWERED
+            } else {
+                REVIEW_TEMPLATE_ANSWER_STATUS_UNANSWERED
+            }
+            .to_string(),
+        ),
+        notes: answer.and_then(|answer| answer.notes.clone()),
+        reason: answer.and_then(|answer| answer.reason.clone()),
     }
 }
 
@@ -5302,6 +5492,37 @@ pub fn review_template_lens_review_not_found(
         LENS_REVIEW_RESOURCE_TYPE,
         lens_review_resource_id(template_arn, lens),
         &format!("review of lens {lens} in a review template with ARN {template_arn}"),
+    )
+}
+
+/// `ResourceNotFoundException$ResourceType` for a question of a lens review: the answer
+/// to one question is reached through its `QuestionId`, so a `QuestionId` the lens under
+/// review does not ask names a missing question rather than a missing lens review. The
+/// modelled `ResourceType` is a free-form string (`smithy_query(query="shape",
+/// shape="ResourceNotFoundException")`), so this is the emulator's own type name for it,
+/// worded like the resource types the model does publish.
+pub const QUESTION_RESOURCE_TYPE: &str = "QUESTION";
+
+/// [`resource_not_found`] for a `QuestionId` the lens applied to a review template does
+/// not ask, so the template's lens review holds no answer to it to read or write.
+///
+/// An answer is identified by the review template, the lens and the question together, so
+/// — as for a lens review — the `ResourceId` is that composite and the message names all
+/// three. `lens` and `question_id` are AS SENT, which is how the caller named them. A lens
+/// this emulator holds no question set for asks nothing HERE ([`lens_questions`]), so
+/// every `QuestionId` of such a lens resolves here.
+pub fn review_template_answer_not_found(
+    template_arn: &str,
+    lens: &str,
+    question_id: &str,
+) -> ResourceNotFoundException {
+    resource_not_found(
+        QUESTION_RESOURCE_TYPE,
+        format!("{}.{question_id}", lens_review_resource_id(template_arn, lens)),
+        &format!(
+            "question with ID {question_id} in the review of lens {lens} \
+             in a review template with ARN {template_arn}"
+        ),
     )
 }
 

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetReviewTemplateAnswer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetReviewTemplateAnswer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetReviewTemplateAnswer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the answer a review template records for ONE question of ONE of its lens
+//! reviews — "get review template answer".
+//!
+//! A question of an applied lens always HAS an answer to report: the one
+//! `UpdateReviewTemplateAnswer` recorded, or the `UNANSWERED` state of a question nothing
+//! has answered, which applies, selects nothing and speaks about no choice. A
+//! `TemplateArn` nothing is stored under, a lens the template does not apply and a
+//! `QuestionId` that lens does not ask are each a modelled 404.
+//!
+//! Reporting only — nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +166,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetReviewTemplateAnswer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetReviewTemplateAnswerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetReviewTemplateAnswer"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetReviewTemplateAnswerErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Well-Architected Tool review template store is unavailable"
+                        .to_string(),
+                },
+            )
+        })?;
+
+        let store = state.lock();
+        let template = store
+            .review_templates
+            .get(&input.template_arn)
+            .ok_or_else(|| {
+                GetReviewTemplateAnswerErrorModeled::ResourceNotFoundException(
+                    crate::state::review_template_not_found(&input.template_arn),
+                )
+            })?;
+
+        // The answers of a lens review exist only while that lens is applied to the
+        // review template, so a lens the template does not carry has no review to report.
+        if !template.applies_lens(&input.lens_alias) {
+            return Err(GetReviewTemplateAnswerErrorModeled::ResourceNotFoundException(
+                crate::state::review_template_lens_review_not_found(
+                    &template.template_arn,
+                    &input.lens_alias,
+                ),
+            )
+            .into());
+        }
+
+        // A question belongs to the LENS under review, so a `QuestionId` that lens does
+        // not ask names no answer of this lens review.
+        let question = crate::state::lens_question(&input.lens_alias, &input.question_id)
+            .ok_or_else(|| {
+                GetReviewTemplateAnswerErrorModeled::ResourceNotFoundException(
+                    crate::state::review_template_answer_not_found(
+                        &template.template_arn,
+                        &input.lens_alias,
+                        &input.question_id,
+                    ),
+                )
+            })?;
+
+        Ok(GetReviewTemplateAnswerOutput {
+            // The template as STORED, which is the resource this answer belongs to, and
+            // the lens as the REQUEST named it: `LensAlias` is "either the lens alias …
+            // or the lens ARN" (`LensAlias` doc) and this output models no `LensArn` to
+            // resolve it into.
+            template_arn: Some(template.template_arn.clone()),
+            lens_alias: Some(input.lens_alias.clone()),
+            answer: Some(crate::state::review_template_answer(
+                question,
+                template.answer(&input.lens_alias, &input.question_id),
+            )),
+        })
     }
 }

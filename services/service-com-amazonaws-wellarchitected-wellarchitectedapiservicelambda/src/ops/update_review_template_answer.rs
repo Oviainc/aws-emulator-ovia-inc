@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateReviewTemplateAnswer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateReviewTemplateAnswer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateReviewTemplateAnswer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers ONE question of ONE lens review of ONE review template, and reports that
+//! answer back.
+//!
+//! The answer records one `ChoiceStatus` per choice the question asks about:
+//! `SelectedChoices` names exactly the choices that are in place — every other choice of
+//! the question becomes `UNSELECTED` — and a `ChoiceUpdates` entry replaces the whole
+//! stored answer of the choice it keys (its `Status` is `@required`, so it carries that
+//! choice's answer in full), applied after `SelectedChoices` so the more specific member
+//! wins. `SelectedChoices` as read back is always the set of choices recorded `SELECTED`.
+//! `IsApplicable`, `Reason` and `Notes` each replace the stored value when the request
+//! supplies them and are left as stored when it does not. An update is a WRITE whatever it
+//! carries, so a request that supplies none of them still records the answer — which is
+//! what makes a question that nothing had answered `ANSWERED`.
+//!
+//! Recording an answer is what makes the question `ANSWERED` in every roll-up the
+//! template reports. A `TemplateArn` nothing is stored under, a lens the template does
+//! not apply and a `QuestionId` that lens does not ask are each a modelled 404; a
+//! `ChoiceId` the question does not offer, and an enum value outside its modelled value
+//! set, are a modelled 400 and nothing is stored.
+//!
+//! The answer is read back by `GetReviewTemplateAnswer` and summarised by
+//! `ListReviewTemplateAnswers`.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +191,223 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateReviewTemplateAnswer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateReviewTemplateAnswerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateReviewTemplateAnswer"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateReviewTemplateAnswerErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Well-Architected Tool review template store is unavailable"
+                        .to_string(),
+                },
+            )
+        })?;
+
+        let now = std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The resource is resolved BEFORE the request's values are judged, so a request
+        // that names a template, a lens review or a question that does not exist is
+        // answered with that 404 whatever else it carries.
+        let template = store
+            .review_templates
+            .get_mut(&input.template_arn)
+            .ok_or_else(|| {
+                UpdateReviewTemplateAnswerErrorModeled::ResourceNotFoundException(
+                    crate::state::review_template_not_found(&input.template_arn),
+                )
+            })?;
+
+        // The answers of a lens review exist only while that lens is applied to the
+        // review template, so a lens the template does not carry has no review to answer.
+        if !template.applies_lens(&input.lens_alias) {
+            return Err(
+                UpdateReviewTemplateAnswerErrorModeled::ResourceNotFoundException(
+                    crate::state::review_template_lens_review_not_found(
+                        &template.template_arn,
+                        &input.lens_alias,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // A question belongs to the LENS under review: the answer this operation writes is
+        // the answer to one of the questions that lens asks, so a `QuestionId` it does not
+        // ask names no answer of this lens review.
+        let question = crate::state::lens_question(&input.lens_alias, &input.question_id)
+            .ok_or_else(|| {
+                UpdateReviewTemplateAnswerErrorModeled::ResourceNotFoundException(
+                    crate::state::review_template_answer_not_found(
+                        &template.template_arn,
+                        &input.lens_alias,
+                        &input.question_id,
+                    ),
+                )
+            })?;
+
+        // `AnswerReason` and `ChoiceStatus` / `ChoiceReason` are modelled enums, whose
+        // value sets the boundary does not enforce, so a value outside one is refused here
+        // rather than stored.
+        if let Some(exception) = enum_member_refusal(&input) {
+            return Err(
+                UpdateReviewTemplateAnswerErrorModeled::ValidationException(exception).into(),
+            );
+        }
+
+        // A `ChoiceId` is a choice of THIS question (`ReviewTemplateAnswer$Choices` is the
+        // only place a client discovers them), so one that names no choice of it belongs
+        // to no answer of this question and is refused rather than stored.
+        for (member, choice_ids) in [
+            (
+                SELECTED_CHOICES_MEMBER,
+                input.selected_choices.clone().unwrap_or_default(),
+            ),
+            (
+                CHOICE_UPDATES_MEMBER,
+                input
+                    .choice_updates
+                    .as_ref()
+                    .map(|updates| updates.keys().cloned().collect())
+                    .unwrap_or_default(),
+            ),
+        ] {
+            let mut undefined: Vec<String> = choice_ids
+                .into_iter()
+                .filter(|choice_id| !question.defines_choice(choice_id))
+                .collect();
+            if !undefined.is_empty() {
+                // Sorted and deduplicated so the refusal does not depend on the order the
+                // request listed the choices in.
+                undefined.sort_unstable();
+                undefined.dedup();
+                return Err(UpdateReviewTemplateAnswerErrorModeled::ValidationException(
+                    crate::state::member_constraint_exception(
+                        member,
+                        &format!(
+                            "every choice must be a choice of question {}, which {} is not",
+                            question.question_id,
+                            undefined.join(", ")
+                        ),
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let answer = template.answer_mut(&input.lens_alias, question);
+
+        // "The values entered replace the previously selected choices"
+        // (`SelectedChoices` doc): the choices named are the ones in place, so every other
+        // choice of the question is not.
+        if let Some(selected) = input.selected_choices.as_deref() {
+            answer.select_only(question, selected);
+        }
+
+        // Each `ChoiceUpdate` carries one choice's answer in full — `Status` is
+        // `@required` on the shape — so it REPLACES what was stored for that choice, down
+        // to a reason or notes it leaves out.
+        if let Some(updates) = input.choice_updates {
+            for (choice_id, update) in updates {
+                answer.choice_answers.insert(
+                    choice_id,
+                    crate::state::ChoiceAnswerRecord {
+                        status: update.status,
+                        reason: update.reason,
+                        notes: update.notes,
+                    },
+                );
+            }
+        }
+
+        // Each remaining member of the answer is replaced by the value the request
+        // supplies and left as stored when it supplies none, so they are written
+        // independently of each other.
+        if let Some(is_applicable) = input.is_applicable {
+            answer.is_applicable = is_applicable;
+        }
+        if let Some(reason) = input.reason {
+            answer.reason = Some(reason);
+        }
+        if let Some(notes) = input.notes {
+            answer.notes = Some(notes);
+        }
+
+        // The selected choices of an answer ARE the choices it records `SELECTED` for, so
+        // the two members a client reads back agree whichever of them the request wrote
+        // through.
+        answer.resolve_selected_choices(question);
+
+        // Answering a question changes the template and the lens review that asks it, so
+        // both report this write as the instant they were last updated.
+        template
+            .lens_review_notes_mut(&input.lens_alias, now)
+            .updated_at = now;
+        template.updated_at = now;
+
+        Ok(UpdateReviewTemplateAnswerOutput {
+            // The template as STORED, which is the resource this answer belongs to, and
+            // the lens as the REQUEST named it: `LensAlias` is "either the lens alias …
+            // or the lens ARN" (`LensAlias` doc) and this output models no `LensArn` to
+            // resolve it into.
+            template_arn: Some(template.template_arn.clone()),
+            lens_alias: Some(input.lens_alias.clone()),
+            answer: Some(crate::state::review_template_answer(
+                question,
+                template.answer(&input.lens_alias, &input.question_id),
+            )),
+        })
     }
+}
+
+/// The member a refused `SelectedChoices` value is reported under
+/// (`UpdateReviewTemplateAnswerInput$SelectedChoices`).
+const SELECTED_CHOICES_MEMBER: &str = "SelectedChoices";
+
+/// The member a refused `ChoiceUpdates` key is reported under
+/// (`UpdateReviewTemplateAnswerInput$ChoiceUpdates`).
+const CHOICE_UPDATES_MEMBER: &str = "ChoiceUpdates";
+
+/// The member a refused `Reason` is reported under
+/// (`UpdateReviewTemplateAnswerInput$Reason`).
+const REASON_MEMBER: &str = "Reason";
+
+/// The refusal for the first enum member of this request carrying a value outside its
+/// modelled value set, if any does: the answer's own `Reason` (an `AnswerReason`) and each
+/// `ChoiceUpdate`'s `Status` (a `ChoiceStatus`) and `Reason` (a `ChoiceReason`).
+///
+/// A `ChoiceUpdates` entry is reported under the path that reaches it, so a caller is told
+/// WHICH choice's update it has to fix. The entries are judged in `ChoiceId` order, so the
+/// member a refusal names does not depend on the request map's iteration order.
+fn enum_member_refusal(input: &UpdateReviewTemplateAnswerInput) -> Option<ValidationException> {
+    let mut members: Vec<(String, &str, &[&str])> = Vec::new();
+    if let Some(reason) = input.reason.as_deref() {
+        members.push((REASON_MEMBER.to_string(), reason, ANSWER_REASON_VALUES));
+    }
+    let mut updates: Vec<(&String, &ChoiceUpdate)> = input.choice_updates.iter().flatten().collect();
+    updates.sort_by_key(|(choice_id, _)| *choice_id);
+    for (choice_id, update) in updates {
+        members.push((
+            format!("{CHOICE_UPDATES_MEMBER}.{choice_id}.Status"),
+            update.status.as_str(),
+            CHOICE_STATUS_VALUES,
+        ));
+        if let Some(reason) = update.reason.as_deref() {
+            members.push((
+                format!("{CHOICE_UPDATES_MEMBER}.{choice_id}.Reason"),
+                reason,
+                CHOICE_REASON_VALUES,
+            ));
+        }
+    }
+    members
+        .into_iter()
+        .find(|(_, value, allowed)| !allowed.contains(value))
+        .map(|(member, _, allowed)| {
+            crate::state::member_constraint_exception(
+                &member,
+                &format!(
+                    "Member must satisfy enum value set: [{}]",
+                    allowed.join(", ")
+                ),
+            )
+        })
 }
