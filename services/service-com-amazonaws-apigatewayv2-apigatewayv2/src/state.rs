@@ -329,6 +329,13 @@ pub struct ComAmazonawsApigatewayv2Apigatewayv2State {
     /// Drives [`ComAmazonawsApigatewayv2Apigatewayv2State::mint_api_id`]; see
     /// [`ID_MULTIPLIER`] for how an id is derived from it.
     pub api_id_seed: u64,
+    /// Every persisted portal, keyed by `PortalId`. A portal is an account-level
+    /// resource, not a child of an api, so it lives beside [`Self::apis`] rather than
+    /// inside one; `BTreeMap` for the same stable key order `ListPortals` pages over.
+    pub portals: BTreeMap<String, Portal>,
+    /// Drives [`ComAmazonawsApigatewayv2Apigatewayv2State::mint_portal_id`]; see
+    /// [`ID_MULTIPLIER`] for how an id is derived from it.
+    pub portal_id_seed: u64,
     /// Every persisted portal product, keyed by `PortalProductId`. A portal product is
     /// an ACCOUNT-level resource, not a child of an api, so it is stored here beside
     /// the apis; `BTreeMap` for the same stable key order
@@ -360,6 +367,16 @@ impl ComAmazonawsApigatewayv2Apigatewayv2State {
     pub fn mint_api_id(&mut self) -> String {
         self.api_id_seed = self.api_id_seed.wrapping_add(1);
         mint_id(self.api_id_seed)
+    }
+
+    /// Mint a fresh `PortalId`: ten lowercase alphanumerics, never one already minted.
+    ///
+    /// `PortalId` is modelled as `__stringMin10Max30PatternAZ09` (len 10..30, pattern
+    /// `^[a-z0-9]+$`), and [`mint_id`] renders exactly ten characters of
+    /// [`ID_ALPHABET`], so every minted id satisfies that constraint by construction.
+    pub fn mint_portal_id(&mut self) -> String {
+        self.portal_id_seed = self.portal_id_seed.wrapping_add(1);
+        mint_id(self.portal_id_seed)
     }
 
     /// Mint a fresh `PortalProductId`: ten lowercase alphanumerics, never one already
@@ -1344,6 +1361,94 @@ impl Deployment {
     }
 }
 
+/// The most portals one account may hold, after which CreatePortal is refused.
+///
+/// An EMULATOR growth bound, not a figure AWS publishes: API Gateway publishes
+/// per-account quotas for its other top-level resources (600 HTTP/WebSocket APIs, see
+/// [`MAX_APIS`]) but none for portals, so this takes a smaller bound of its own. What
+/// it buys is that no loop of CreatePortal calls can grow this store without end.
+/// `TooManyRequestsException` ("A limit has been exceeded") is the modelled error the
+/// operation refuses with. Do not cite this as a published portals quota.
+pub const MAX_PORTALS: usize = 100;
+
+/// The `PublishStatus` a portal carries while it serves nothing: the value
+/// [`Portal`] is created with, since a portal that has never been published is not
+/// serving its content to anyone.
+///
+/// `PublishStatus` is exactly `PUBLISHED | PUBLISH_IN_PROGRESS | PUBLISH_FAILED |
+/// DISABLE_IN_PROGRESS | DISABLE_FAILED | DISABLED`
+/// (`smithy_query(query="shape", shape="PublishStatus")`) — it has no "never published"
+/// value, and `DISABLED` is its one terminal not-serving value, the status a portal also
+/// settles in once `DisablePortal` has run.
+pub const PUBLISH_STATUS_DISABLED: &str = "DISABLED";
+
+/// A persisted `Portal` resource.
+///
+/// An account-level resource: a portal is not owned by an api, and the resources it
+/// references (its portal products) are named by ARN rather than nested. The record
+/// keeps what the create RESOLVED — the id and ARN it minted, the endpoint configuration
+/// it derived from the request, the instant it was last modified — so every reader of
+/// the portal reports one value, and [`Portal::to_wire`] projects it onto the modelled
+/// `PortalSummary` shape every portal reader serializes from.
+#[derive(Debug, Clone)]
+pub struct Portal {
+    pub portal_id: String,
+    pub portal_arn: String,
+    /// The authorization the create accepted: exactly one of its alternatives, see
+    /// [`validate_exclusive_choice`].
+    pub authorization: wire::Authorization,
+    /// The endpoint configuration the create RESOLVED: the request names the domain
+    /// (its own, or API Gateway's default) and the response reports the default domain
+    /// name and hosted zone id the service generated for it.
+    pub endpoint_configuration: wire::EndpointConfigurationResponse,
+    pub included_portal_product_arns: Vec<String>,
+    /// The logo image URI the caller supplied, if any. Not a member of any modelled
+    /// portal RESPONSE shape — the logo is reported through
+    /// `PortalContent$Theme$LogoLastUploaded` — so the record keeps it for the readers
+    /// that serve the portal's content.
+    pub logo_uri: Option<String>,
+    pub portal_content: wire::PortalContent,
+    pub rum_app_monitor_name: Option<String>,
+    /// One of `PUBLISH_STATUS_VALUES`; [`PUBLISH_STATUS_DISABLED`] for a portal that has
+    /// never been published.
+    pub publish_status: String,
+    pub last_modified: SystemTime,
+    /// Set only once the portal has been published; `None` until then, so nothing is
+    /// reported for a portal that never was.
+    pub last_published: Option<SystemTime>,
+    pub last_published_description: Option<String>,
+    /// "Error information for failed portal operations" — `None` while nothing has
+    /// failed.
+    pub status_exception: Option<wire::StatusException>,
+    /// The preview this portal's last PreviewPortal produced; `None` until one runs.
+    pub preview: Option<wire::Preview>,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl Portal {
+    /// Project the record onto the modelled `PortalSummary` shape — the shape that
+    /// carries every member the portal readers report, so each of them projects from
+    /// this one value.
+    pub fn to_wire(&self) -> wire::PortalSummary {
+        wire::PortalSummary {
+            authorization: self.authorization.clone(),
+            endpoint_configuration: self.endpoint_configuration.clone(),
+            included_portal_product_arns: self.included_portal_product_arns.clone(),
+            last_modified: to_timestamp(self.last_modified),
+            last_published: self.last_published.map(to_timestamp),
+            last_published_description: self.last_published_description.clone(),
+            portal_arn: self.portal_arn.clone(),
+            portal_content: self.portal_content.clone(),
+            portal_id: self.portal_id.clone(),
+            preview: self.preview.clone(),
+            publish_status: Some(self.publish_status.clone()),
+            rum_app_monitor_name: self.rum_app_monitor_name.clone(),
+            status_exception: self.status_exception.clone(),
+            tags: Some(self.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+        }
+    }
+}
+
 /// The most portal products one account may hold, after which CreatePortalProduct is
 /// refused.
 ///
@@ -1572,6 +1677,91 @@ impl DomainName {
     }
 }
 
+/// Refuse a structure that does not name EXACTLY one of its alternatives.
+///
+/// Several of this service's input structures are tagged unions modelled as structures
+/// whose members are each one alternative — `Authorization` ("Supports Cognito-based
+/// user authentication or no authentication": `CognitoConfig | None`) and
+/// `EndpointConfigurationRequest` ("Use a default domain provided by API Gateway or
+/// provide a fully-qualified domain name that you own": `AcmManaged | None`). The
+/// structure's meaning is the ONE alternative it names, so a request naming none has
+/// said nothing and one naming several has said two contradictory things; both are
+/// incomplete-or-incorrect input, which is what `BadRequestException` reports.
+///
+/// `alternatives` pairs each alternative's wire name with whether the request carried
+/// it, in the order the message should list them. `Err` carries the message for the
+/// operation's `BadRequestException`.
+pub fn validate_exclusive_choice(
+    member: &str,
+    alternatives: &[(&str, bool)],
+) -> Result<(), String> {
+    let names: Vec<&str> = alternatives.iter().map(|(name, _)| *name).collect();
+    let named: Vec<&str> = alternatives
+        .iter()
+        .filter(|(_, present)| *present)
+        .map(|(name, _)| *name)
+        .collect();
+    match named.len() {
+        1 => Ok(()),
+        0 => Err(format!(
+            "{member} must specify exactly one of: {}.",
+            names.join(", ")
+        )),
+        _ => Err(format!(
+            "{member} must specify exactly one of: {}, but specifies {}.",
+            names.join(", "),
+            named.join(", ")
+        )),
+    }
+}
+
+/// The resource portion every portal-product ARN opens with: API Gateway names a
+/// resource by its own REST path, so a portal product's is `/portalproducts/{id}` (see
+/// [`portal_product_arn`]). Declared once, so the writer that BUILDS such an ARN and the
+/// validator that READS a caller-supplied one cannot drift.
+pub const PORTAL_PRODUCT_RESOURCE_PREFIX: &str = "/portalproducts/";
+
+/// Refuse a member that must hold ARNs of a given resource type but holds a value that
+/// is not one.
+///
+/// `IncludedPortalProductArns` names portal products — resources of THIS service's ARN
+/// namespace, under the `/portalproducts/` resource path — so a value that is not a
+/// well-formed resource ARN, that names another vendor, or that names another of this
+/// service's resource types (an `/apis/{id}`, say) addresses nothing the member could
+/// include. The parse is [`::service_common::arn::parse_of`], the tree's ONE
+/// caller-supplied-ARN parse (it is also what rejects an ARN with an empty partition,
+/// vendor or resource); `resource_prefix` is what narrows it to one resource type.
+/// `label` names the member in the message; `Err` carries the message for the
+/// operation's `BadRequestException`.
+pub fn validate_arns_of<'a, I>(
+    label: &str,
+    vendor: &str,
+    resource_prefix: &str,
+    arns: I,
+) -> Result<(), String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    for arn in arns {
+        // A prefix match alone would accept `…:/portalproducts/` — the resource type with
+        // no id, which names no resource — so the remainder after the prefix must be
+        // non-empty.
+        let names_the_resource = ::service_common::arn::parse_of(arn, vendor).is_some_and(|parsed| {
+            parsed
+                .resource
+                .strip_prefix(resource_prefix)
+                .is_some_and(|id| !id.is_empty())
+        });
+        if !names_the_resource {
+            return Err(format!(
+                "Invalid ARN specified for {label}: '{arn}'. Expected an ARN of the form \
+                 arn:<partition>:{vendor}:<region>:<account>:{resource_prefix}<id>."
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The ARN of a stored portal product.
 ///
 /// API Gateway's own ARNs carry the resource portion as the URI path of the resource
@@ -1587,7 +1777,7 @@ pub fn portal_product_arn(region: &str, portal_product_id: &str) -> String {
     ::engine::emulator_arn(
         ARN_SERVICE,
         region,
-        &format!("/portalproducts/{portal_product_id}"),
+        &format!("{PORTAL_PRODUCT_RESOURCE_PREFIX}{portal_product_id}"),
     )
 }
 
@@ -1640,6 +1830,79 @@ pub fn validate_ec2_resource_ids(
         }
     }
     Ok(())
+}
+
+/// The ARN of a portal: API Gateway's ARNs name the resource by its own REST path
+/// (`/apis/{apiId}` for an api, `/domainnames/{name}` for a domain name), so a portal's
+/// is `/portals/{portalId}`. Built through `engine::emulator_arn`, so the account
+/// segment is the emulator's canonical one.
+pub fn portal_arn(region: &str, portal_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("/portals/{portal_id}"))
+}
+
+/// The default domain name API Gateway generates for a portal: the host a consumer
+/// reaches the portal on when the account brought no domain of its own
+/// (`EndpointConfigurationResponse$PortalDefaultDomainName`: "This domain name is
+/// generated and managed by API Gateway").
+///
+/// AWS publishes no format for it, so the host follows this service's own convention
+/// for a generated endpoint host — `{resource-id}.{subdomain}.{region}.amazonaws.com`,
+/// as [`execute_api_endpoint`] builds for an api. What the member has to hold is a
+/// name that is unique to the portal, stable across reads and within the modelled
+/// 3..256 bound; the subdomain label is CHOSEN.
+pub fn portal_default_domain_name(portal_id: &str, region: &str) -> String {
+    format!("{portal_id}.portal.{region}.amazonaws.com")
+}
+
+/// How many characters follow the leading `Z` of a hosted zone id, matching the
+/// fourteen-character ids AWS publishes for its endpoint hosted zones.
+const HOSTED_ZONE_ID_LEN: usize = 13;
+
+/// The hosted zone id of the portal domain
+/// (`EndpointConfigurationResponse$PortalDomainHostedZoneId`), the zone an alias record
+/// for the portal's domain points at.
+///
+/// The member is REQUIRED on the modelled response, so a portal always reports one. AWS
+/// assigns ONE opaque hosted zone id per service endpoint per Region and publishes no
+/// formula for it, so this DERIVES a stable id per region rather than carrying a table of
+/// real ones it could not keep true. The mixing is
+/// [`::service_common::stable_hex_id`] — the tree's one derived-id mixer, reproducible
+/// across builds — uppercased and cut to the published LENGTH: a leading `Z` and
+/// [`HOSTED_ZONE_ID_LEN`] characters, which the mixer renders as uppercase hexadecimal
+/// (a subset of the uppercase alphanumerics AWS's own ids use, e.g. `Z1UJRXOUMOOFQ8`). A
+/// region therefore always answers the same id, and two regions answer different ones.
+pub fn portal_domain_hosted_zone_id(region: &str) -> String {
+    let mixed: String = ::service_common::stable_hex_id(&[region])
+        .to_uppercase()
+        .chars()
+        .take(HOSTED_ZONE_ID_LEN)
+        .collect();
+    format!("Z{mixed}")
+}
+
+/// Resolve a portal's requested domain configuration into the one the readers report.
+///
+/// The request names either a domain the account owns together with its ACM certificate
+/// (`AcmManaged`) or API Gateway's default domain (`None`); either way the response
+/// carries the generated default domain name and its hosted zone id, and reports
+/// `DomainName`/`CertificateArn` only for the domain the account brought.
+pub fn resolve_portal_endpoint_configuration(
+    portal_id: &str,
+    region: &str,
+    requested: &wire::EndpointConfigurationRequest,
+) -> wire::EndpointConfigurationResponse {
+    wire::EndpointConfigurationResponse {
+        certificate_arn: requested
+            .acm_managed
+            .as_ref()
+            .map(|managed| managed.certificate_arn.clone()),
+        domain_name: requested
+            .acm_managed
+            .as_ref()
+            .map(|managed| managed.domain_name.clone()),
+        portal_default_domain_name: portal_default_domain_name(portal_id, region),
+        portal_domain_hosted_zone_id: portal_domain_hosted_zone_id(region),
+    }
 }
 
 /// Refuse a `SubnetIds` list that no VPC link could be built from: one naming no subnet
@@ -1826,7 +2089,7 @@ fn checked_enum(
 ///
 /// Truncated to whole seconds: `createdDate` is rendered as an ISO-8601
 /// `date-time` and the service reports it at second granularity.
-fn to_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
+pub fn to_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let secs = at
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());

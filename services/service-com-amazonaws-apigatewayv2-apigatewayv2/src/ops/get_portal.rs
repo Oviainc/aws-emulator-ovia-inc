@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPortal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPortal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPortal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the persisted [`crate::state::Portal`] under the requested
+//! `PortalId`, or 404 `NotFoundException` when no portal carries that id.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +158,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPortal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPortalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPortal"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("GetPortal"));
+        };
+        // A reporting operation: it reads the store and writes nothing, so a later
+        // caller sees exactly what this one saw.
+        let store = state.lock();
+        let Some(record) = store.portals.get(&input.portal_id) else {
+            return Err(GetPortalErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "Invalid portal identifier specified {}:{}",
+                    ::engine::emulator_account_id(),
+                    input.portal_id
+                )),
+                resource_type: ::std::option::Option::None,
+            })
+            .into());
+        };
+
+        let stored = record.to_wire();
+        Ok(GetPortalOutput {
+            authorization: Some(stored.authorization),
+            endpoint_configuration: Some(stored.endpoint_configuration),
+            included_portal_product_arns: Some(stored.included_portal_product_arns),
+            last_modified: Some(stored.last_modified),
+            last_published: stored.last_published,
+            last_published_description: stored.last_published_description,
+            portal_arn: Some(stored.portal_arn),
+            portal_content: Some(stored.portal_content),
+            portal_id: Some(stored.portal_id),
+            preview: stored.preview,
+            publish_status: stored.publish_status,
+            rum_app_monitor_name: stored.rum_app_monitor_name,
+            status_exception: stored.status_exception,
+            tags: stored.tags,
+        })
     }
 }

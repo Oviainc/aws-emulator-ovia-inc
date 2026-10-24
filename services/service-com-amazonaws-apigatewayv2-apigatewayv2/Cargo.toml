@@ -8,6 +8,9 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The tree's shared service helpers: the ONE caller-supplied-ARN parse
+# (`arn::parse_of`) and the ONE derived-id mixer (`stable_hex_id`).
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

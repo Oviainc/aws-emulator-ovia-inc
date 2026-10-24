@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePortal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePortal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a `PortalId` and its ARN, resolves the endpoint configuration the
+//! request asked for, persists a [`crate::state::Portal`] record under that id, and
+//! answers with that STORED record. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePortal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A portal is created unpublished — [`crate::state::PUBLISH_STATUS_DISABLED`] — so it
+//! reports no `LastPublished` until `PublishPortal` has run.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +172,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePortal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePortalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePortal"))
+        let bad_request = |message: String| -> Self::Error {
+            CreatePortalErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // `Authorization` and `EndpointConfiguration` are tagged unions modelled as
+        // structures, so the ONE alternative each names is its meaning; naming none or
+        // several is incomplete-or-incorrect input. See
+        // `crate::state::validate_exclusive_choice`.
+        if let Err(message) = crate::state::validate_exclusive_choice(
+            "Authorization",
+            &[
+                ("CognitoConfig", input.authorization.cognito_config.is_some()),
+                ("None", input.authorization.none.is_some()),
+            ],
+        ) {
+            return Err(bad_request(message));
+        }
+        if let Err(message) = crate::state::validate_exclusive_choice(
+            "EndpointConfiguration",
+            &[
+                (
+                    "AcmManaged",
+                    input.endpoint_configuration.acm_managed.is_some(),
+                ),
+                ("None", input.endpoint_configuration.none.is_some()),
+            ],
+        ) {
+            return Err(bad_request(message));
+        }
+
+        // `IncludedPortalProductArns` holds "The ARNs of the portal products included in
+        // the portal", so a value that is not an ARN of this service's namespace names no
+        // product at all. Whether each ARN names a product in THIS account's store is
+        // deliberately not checked: a portal product is a shareable resource
+        // (`PutPortalProductSharingPolicy`, and `GetPortalProduct$ResourceOwnerAccountId`
+        // reports the owner), so an ARN naming a product another account shared is a
+        // legitimate inclusion this store holds no record of.
+        let included_portal_product_arns = input.included_portal_product_arns.unwrap_or_default();
+        if let Err(message) = crate::state::validate_arns_of(
+            "IncludedPortalProductArns",
+            crate::state::ARN_SERVICE,
+            crate::state::PORTAL_PRODUCT_RESOURCE_PREFIX,
+            included_portal_product_arns.iter().map(String::as_str),
+        ) {
+            return Err(bad_request(message));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreatePortal"));
+        };
+        let mut store = state.lock();
+
+        // Bound the growth a caller drives: `TooManyRequestsException` is the modelled
+        // error for "a limit has been exceeded", and it names the limit in `LimitType`.
+        if store.portals.len() >= crate::state::MAX_PORTALS {
+            return Err(CreatePortalErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("Portal".to_string()),
+                    message: Some(format!(
+                        "The maximum number of portals ({}) for this account has been reached.",
+                        crate::state::MAX_PORTALS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let portal_id = store.mint_portal_id();
+        let region = crate::state::request_region(ctx.parts());
+        let created_at = ::std::time::SystemTime::now();
+
+        // `PortalTheme$LogoLastUploaded` ("The timestamp when the logo was last
+        // uploaded") is a fact about an upload the SERVICE performed, not a value a
+        // caller owns: a request carrying a `LogoUri` uploaded a logo in THIS call, so
+        // the theme reports this call's instant, and a request carrying none uploaded
+        // nothing, so the member is cleared however the request filled it in.
+        let mut portal_content = input.portal_content;
+        portal_content.theme.logo_last_uploaded = input
+            .logo_uri
+            .as_ref()
+            .map(|_| crate::state::to_timestamp(created_at));
+
+        let record = crate::state::Portal {
+            portal_arn: crate::state::portal_arn(&region, &portal_id),
+            authorization: input.authorization,
+            endpoint_configuration: crate::state::resolve_portal_endpoint_configuration(
+                &portal_id,
+                &region,
+                &input.endpoint_configuration,
+            ),
+            included_portal_product_arns,
+            logo_uri: input.logo_uri,
+            portal_content,
+            rum_app_monitor_name: input.rum_app_monitor_name,
+            // Created unpublished: nothing has published this portal, so it serves
+            // nothing and has no `LastPublished` to report.
+            publish_status: crate::state::PUBLISH_STATUS_DISABLED.to_string(),
+            last_modified: created_at,
+            last_published: ::std::option::Option::None,
+            last_published_description: ::std::option::Option::None,
+            status_exception: ::std::option::Option::None,
+            preview: ::std::option::Option::None,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            portal_id: portal_id.clone(),
+        };
+
+        // `portal_id` comes from the store's own id bijection, so it names no existing
+        // portal: `insert` ANSWERS the value it displaced, and that it displaced NOTHING
+        // is the invariant this create depends on. The projection is taken from the very
+        // value the store now holds, which is what makes this answer the one a later
+        // GetPortal reports.
+        let stored = record.to_wire();
+        let displaced = store.portals.insert(portal_id.clone(), record);
+        debug_assert!(
+            displaced.is_none(),
+            "mint_portal_id answered an id the store already held: {portal_id}"
+        );
+        Ok(CreatePortalOutput {
+            authorization: Some(stored.authorization),
+            endpoint_configuration: Some(stored.endpoint_configuration),
+            included_portal_product_arns: Some(stored.included_portal_product_arns),
+            last_modified: Some(stored.last_modified),
+            last_published: stored.last_published,
+            last_published_description: stored.last_published_description,
+            portal_arn: Some(stored.portal_arn),
+            portal_content: Some(stored.portal_content),
+            portal_id: Some(stored.portal_id),
+            publish_status: stored.publish_status,
+            rum_app_monitor_name: stored.rum_app_monitor_name,
+            status_exception: stored.status_exception,
+            tags: stored.tags,
+        })
     }
 }
