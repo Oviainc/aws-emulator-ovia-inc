@@ -24,7 +24,7 @@ fn emulator_account() -> String {
 /// The emulator the tests drive: one shared engine, the STS service mounted on it,
 /// request authentication off (these tests sign nothing — they only carry the
 /// `Credential=` scope the service reads the caller from).
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -33,9 +33,10 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// Percent-encode the characters that are significant in an
-/// `application/x-www-form-urlencoded` body, leaving everything else as a client's
-/// own encoder would (`:` and `/` in an ARN, `{`/`"` in a policy document).
-fn form_value(value: &str) -> String {
+/// `application/x-www-form-urlencoded` body — the delimiters, and the CR/LF a value
+/// may carry — leaving everything else as a client's own encoder would (`:` and `/`
+/// in an ARN, `{`/`"` in a policy document).
+pub(crate) fn form_value(value: &str) -> String {
     value
         .chars()
         .map(|c| match c {
@@ -44,13 +45,15 @@ fn form_value(value: &str) -> String {
             '+' => "%2B".to_string(),
             '%' => "%25".to_string(),
             ' ' => "%20".to_string(),
+            '\n' => "%0A".to_string(),
+            '\r' => "%0D".to_string(),
             other => other.to_string(),
         })
         .collect()
 }
 
 /// One awsQuery call, signed (in the routing sense) with `access_key_id`.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     access_key_id: &str,
     action: &str,
@@ -82,7 +85,7 @@ async fn call(
 /// The text of the one `<name>…</name>` element in an awsQuery response. Every
 /// element these responses carry is uniquely named, so this reads the member
 /// without a document model.
-fn element(body: &str, name: &str) -> Option<String> {
+pub(crate) fn element(body: &str, name: &str) -> Option<String> {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
     let start = body.find(&open)? + open.len();
@@ -91,7 +94,7 @@ fn element(body: &str, name: &str) -> Option<String> {
 }
 
 /// The member, or a panic naming the case and the whole body.
-fn member(case: &str, body: &str, name: &str) -> String {
+pub(crate) fn member(case: &str, body: &str, name: &str) -> String {
     element(body, name).unwrap_or_else(|| panic!("case {case:?}: no <{name}> in {body}"))
 }
 
@@ -115,7 +118,7 @@ fn now_secs() -> i64 {
 
 /// A caller with no session of its own: a long-term key id (20 characters, the shape
 /// the emulator's own keys take).
-const LONG_TERM_KEY: &str = "EMULATORAKTESTKEY001";
+pub(crate) const LONG_TERM_KEY: &str = "EMULATORAKTESTKEY001";
 
 // ---------------------------------------------------------------------------
 // GetCallerIdentity
