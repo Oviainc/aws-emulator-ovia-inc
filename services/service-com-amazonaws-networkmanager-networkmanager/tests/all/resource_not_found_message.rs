@@ -33,6 +33,8 @@ const GLOBAL_NETWORK: &str = "global-network";
 const SITE: &str = "site";
 /// See [`GLOBAL_NETWORK`].
 const LINK: &str = "link";
+/// See [`GLOBAL_NETWORK`].
+const DEVICE: &str = "device";
 
 /// One row: a request that must be refused as not found, and the resource the refusal
 /// has to identify.
@@ -114,6 +116,7 @@ async fn every_not_found_refusal_carries_the_constant_message_and_identifies_the
     let unknown_network = "global-network-00000000000000099".to_string();
     let unknown_site = "site-00000000000000099".to_string();
     let unknown_link = "link-00000000000000099".to_string();
+    let unknown_device = "device-00000000000000099".to_string();
 
     let rows = vec![
         NotFoundCase {
@@ -147,6 +150,22 @@ async fn every_not_found_refusal_carries_the_constant_message_and_identifies_the
             body: None,
             resource_id: unknown_network.clone(),
             resource_type: GLOBAL_NETWORK,
+        },
+        NotFoundCase {
+            case: "GetDevices on a global network that never existed",
+            method: "GET",
+            uri: format!("/global-networks/{unknown_network}/devices"),
+            body: None,
+            resource_id: unknown_network.clone(),
+            resource_type: GLOBAL_NETWORK,
+        },
+        NotFoundCase {
+            case: "ListTagsForResource on the ARN of a device that never existed",
+            method: "GET",
+            uri: tags_uri(&expected_arn(DEVICE, &unknown_device)),
+            body: None,
+            resource_id: unknown_device.clone(),
+            resource_type: DEVICE,
         },
         NotFoundCase {
             case: "DeleteSite on a deleted site",

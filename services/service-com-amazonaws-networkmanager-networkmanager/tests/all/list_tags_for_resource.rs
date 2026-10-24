@@ -17,12 +17,12 @@ use serde_json::{json, Value};
 use crate::global_network_lifecycle::{error_code, Emulator};
 use crate::resource_tagging::{
     create_taggable, list_tags, tag, tags_through_resource_reader, tags_uri, untag_uri, Taggable,
-    GLOBAL_NETWORK, LINK, MAX_KEY_CHARS, MAX_VALUE_CHARS, SITE,
+    DEVICE, GLOBAL_NETWORK, LINK, MAX_KEY_CHARS, MAX_VALUE_CHARS, SITE,
 };
 
 /// The whole resource record its own reader (`DescribeGlobalNetworks` / `GetSites` /
-/// `GetLinks`) answers with, so a test can assert that a read left every member — not
-/// just `Tags` — exactly as it was.
+/// `GetLinks` / `GetDevices`) answers with, so a test can assert that a read left every
+/// member — not just `Tags` — exactly as it was.
 async fn resource_record(emulator: &Emulator, resource: &Taggable) -> Value {
     let (status, body) = emulator.get(&resource.read_uri).await;
     assert_eq!(
@@ -107,6 +107,14 @@ fn read_cases() -> Vec<ReadCase> {
             then_tagged: Value::Null,
             then_untagged: &[],
             expected: json!([tag("env", "test")]),
+        },
+        ReadCase {
+            name: "a device tagged on the create and again afterwards",
+            kind: DEVICE,
+            created_with: json!([tag("env", "dev")]),
+            then_tagged: json!([tag("owner", "ops")]),
+            then_untagged: &["env"],
+            expected: json!([tag("owner", "ops")]),
         },
         ReadCase {
             name: "a global network whose tags came only from TagResource",
@@ -224,7 +232,7 @@ async fn listing_tags_changes_nothing_a_later_caller_sees() {
     // A read may not move any state: repeated calls answer identically, and every other
     // view of the resource — its own reader, and the lists of its neighbours — is the
     // same afterwards as before.
-    for kind in [GLOBAL_NETWORK, SITE, LINK] {
+    for kind in [GLOBAL_NETWORK, SITE, LINK, DEVICE] {
         let emulator = Emulator::new();
         let resource =
             create_taggable(&emulator, kind, &json!([tag("env", "test"), tag("tier", "a")])).await;
