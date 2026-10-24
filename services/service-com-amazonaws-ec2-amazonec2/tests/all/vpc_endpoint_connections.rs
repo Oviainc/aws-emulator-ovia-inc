@@ -927,6 +927,74 @@ fn the_connection_store_refuses_to_grow_past_its_count_ceiling() {
     );
 }
 
+/// Rewriting the connection stored under ONE `VpcEndpointId` gives the displaced record's
+/// bytes back before the new record is charged, so the store's byte budget tracks what it
+/// HOLDS rather than how often it was written: after any number of rewrites the budget has
+/// advanced by exactly the bytes of the one connection the store holds.
+///
+/// Without that refund, repeatedly rewriting one endpoint's connection would advance the
+/// budget towards [`ec2::state::MAX_STORED_BYTES`] for records the store does not hold, and
+/// writers would start being refused for bytes nothing is using.
+#[test]
+fn rewriting_one_endpoints_connection_charges_only_what_the_store_holds() {
+    let engine = engine::InMemoryEngine::new();
+    let store = engine.state::<Ec2State>();
+    let mut guard = store.lock();
+    let service_id = guard.next_id("vpce-svc");
+    let endpoint_id = guard.next_id("vpce");
+    // What the store already holds for everything else — the default network a fresh store
+    // comes with — which this measures the connection's own charge against.
+    let baseline = guard.stored_bytes();
+    let spec = |tags: Vec<Tag>, arns: Vec<String>| VpcEndpointConnectionSpec {
+        service_id: service_id.clone(),
+        vpc_endpoint_id: endpoint_id.clone(),
+        vpc_endpoint_owner: OTHER_ACCOUNT.to_string(),
+        vpc_endpoint_state: "PendingAcceptance".to_string(),
+        creation_timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_400),
+        vpc_endpoint_region: REGION.to_string(),
+        ip_address_type: Some("ipv4".to_string()),
+        dns_entries: Vec::new(),
+        network_load_balancer_arns: arns,
+        gateway_load_balancer_arns: Vec::new(),
+        payer_responsibilities: Vec::new(),
+        tags,
+    };
+
+    // Rows: the tag-free record, then records whose caller-chosen bytes grow, shrink and
+    // return to nothing, so the charge given back is never the same number as the charge
+    // taken twice in a row.
+    let rows: [(usize, usize); 5] = [(0, 0), (1, 1), (4, 2), (2, 0), (0, 0)];
+    for (case, (tag_count, arn_count)) in rows.into_iter().enumerate() {
+        let tags: Vec<Tag> = (0..tag_count)
+            .map(|ordinal| tag(&format!("Key{ordinal}"), &"v".repeat(16 * (ordinal + 1))))
+            .collect();
+        let arns: Vec<String> = (0..arn_count)
+            .map(|ordinal| load_balancer_arn("net", 0, ordinal))
+            .collect();
+        assert!(
+            guard.insert_vpc_endpoint_connection(spec(tags, arns)).is_some(),
+            "case {case}: rewriting the connection under {endpoint_id:?} must be stored"
+        );
+        assert_eq!(
+            guard.vpc_endpoint_connections.len(),
+            1,
+            "case {case}: a rewrite must leave exactly the one connection stored"
+        );
+        let held = guard
+            .vpc_endpoint_connections
+            .get(&endpoint_id)
+            .cloned()
+            .expect("the connection just written must be stored");
+        let expected = baseline + ec2::state::vpc_endpoint_connection_payload_bytes(&held);
+        assert_eq!(
+            guard.stored_bytes(),
+            expected,
+            "case {case}: the budget must hold the stored record's {expected} bytes, got {}",
+            guard.stored_bytes()
+        );
+    }
+}
+
 /// A `NextToken` this service did not issue is refused with `InvalidPaginationToken`,
 /// rather than read as a cursor.
 #[tokio::test]

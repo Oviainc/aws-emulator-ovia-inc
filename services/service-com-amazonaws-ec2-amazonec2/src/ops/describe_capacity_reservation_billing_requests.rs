@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCapacityReservationBillingRequests
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCapacityReservationBillingRequests`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCapacityReservationBillingRequests::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the Capacity Reservation billing requests [`crate::state`] holds,
+//! narrowed to the side of the assignment the request's `Role` asks about, to the
+//! `CapacityReservationIds` it names and to the documented filters, and paged by
+//! `MaxResults`/`NextToken`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +151,358 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCapacityReservationBillingRequests` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCapacityReservationBillingRequestsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget, decode_page_token,
+            encode_page_token, invalid_pagination_token, require_service_state,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — a billing
+        // assignment is between two ACCOUNTS, so the Region a request was signed for does not
+        // narrow the requests the store holds. The store is reached through the engine held
+        // on `self`.
+        let _ = ctx;
+
+        // "Specify one of the following: odcr-owner … unused-reservation-billing-owner"
+        // (`Role`). The modelled `CallerRole` enum is what refuses every other word, at the
+        // boundary before this handler runs — `crate::service`'s refusal override states that
+        // one with EC2's `InvalidParameterValue` and the sentence EC2 words for that
+        // parameter type ([`crate::state::caller_role_refusal_message`]); the empty string IS
+        // a value, and a value outside the catalog. Resolving the word here rather than
+        // matching on it later is what makes every decision below total: this arm answers a
+        // word outside the catalog in those same words, through the one place that sentence is
+        // written, so the operation cannot fall through to a third behaviour if that boundary
+        // ever stops refusing it.
+        let role = CallerRole::resolve(input.role.as_str()).ok_or_else(|| {
+            Scaffolded::invalid_parameter_value(crate::state::caller_role_refusal_message(
+                input.role.as_str(),
+            ))
+        })?;
+
+        let named_ids = input.capacity_reservation_ids.clone().unwrap_or_default();
+        if named_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "CapacityReservationIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                named_ids.len()
+            )));
+        }
+        // The ids are held as a SET, so narrowing costs one lookup per stored request rather
+        // than ids x requests string comparisons: the cap above bounds the number of ids, but
+        // not the product of that number with however many requests the store holds, and that
+        // product would be paid under the state lock.
+        let requested_ids: ::std::collections::BTreeSet<&str> =
+            named_ids.iter().map(String::as_str).collect();
+
+        // Matching cost is filters x values x held values x stored requests and the model
+        // bounds none of them, so the request-controlled factors are capped here, before any
+        // work proportional to them is done — and their PRODUCT is charged to one
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any request
+        // would have matched it, so an unsupported filter can never read as "no results".
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                Scaffolded::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            // The `Role` already pins one side of the assignment to the caller's own account,
+            // so the filter that selects on THAT side is not supported with it. The model's
+            // own words, from `DescribeCapacityReservationBillingRequestsRequest$Role`
+            // (`smithy_query(query="doc",shape="DescribeCapacityReservationBillingRequestsRequest",member="Role")`):
+            // "odcr-owner - If you are the Capacity Reservation owner, specify this value to
+            // view requests that you have initiated. Not supported with the requested-by
+            // filter." and "unused-reservation-billing-owner - If you are the consumer
+            // account, specify this value to view requests that have been sent to you. Not
+            // supported with the unused-reservation-billing-owner filter." `Filters` states
+            // the same pairing from the filter's side ("Not supported if you specify
+            // requested-by for Role", "Not supported if you specify
+            // unused-reservation-billing-owner for Role"). Each member is valid on its own and
+            // only the COMBINATION is not, which is what EC2's `InvalidParameterCombination`
+            // says.
+            if canonical == role.bound_filter() {
+                return Err(Scaffolded::invalid_parameter_combination(format!(
+                    "The filter '{canonical}' is not supported with the Role '{}'",
+                    role.as_str()
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(canonical.to_string(), values.to_vec()));
+        }
+
+        // "The token to use to retrieve the next page of results" — anything else is refused
+        // rather than read as an id, and it is refused before any state is read, so whether a
+        // bogus token is caught never depends on what the store holds.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+        };
+
+        // DryRun sits AFTER every parameter has been validated: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused is refused with
+        // that reason instead. Nothing is resolved against the store beyond this point, so
+        // there is nothing else that could have refused it.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // Which requests the caller may see is decided by the `Role`: as the Capacity
+        // Reservation owner the caller sees the requests IT initiated, as the consumer account
+        // the ones sent TO it. Every call of this emulator is made by the emulator's own
+        // account, so that is the account each side is compared against — a request between
+        // two other accounts is neither of the caller's and is reported under neither role.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCapacityReservationBillingRequests"))
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored requests,
+        // filters, values, held values and value length is bounded however the caller combines
+        // them — which is also what bounds how long this holds the state lock.
+        let account = ::engine::emulator_account_id();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<CapacityReservationBillingRequest> = Vec::new();
+        for request in store.capacity_reservation_billing_requests.values() {
+            if budget.exhausted() {
+                break;
+            }
+            // "The ID of the Capacity Reservation" narrows the answer to the reservations the
+            // request names. No operation of this emulator creates a Capacity Reservation yet,
+            // so there is no set of known reservation ids to call an id unknown against: an id
+            // this store holds no billing request for selects nothing, which is also the answer
+            // AWS gives for a reservation whose billing nobody has asked to assign.
+            if !requested_ids.is_empty()
+                && !request
+                    .capacity_reservation_id
+                    .as_deref()
+                    .is_some_and(|held| requested_ids.contains(held))
+            {
+                continue;
+            }
+            if !role.selects(request, account) {
+                continue;
+            }
+            if matches_every_filter(request, &selectors, &mut budget) {
+                selected.push(request.clone());
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as a
+        // result: the request asked for more filtering than one call will do, and is told so
+        // rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `CapacityReservationId` order, which the cursor below names a position in.
+        // The store is an ordered map keyed by that id, so its iteration order already
+        // satisfies this sort; doing it here establishes the invariant the cursor depends on at
+        // the point of use.
+        selected.sort_by(|left, right| {
+            left.capacity_reservation_id
+                .cmp(&right.capacity_reservation_id)
+        });
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|request| {
+                request.capacity_reservation_id.as_deref().unwrap_or_default() < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // `MaxResults` carries the modelled `range 1..1000`
+        // (`smithy_query(query="shape",shape="DescribeCapacityReservationBillingRequestsRequestMaxResults")`),
+        // so the boundary validator has already refused anything outside it, and a request that
+        // names no page size gets the largest page this service serves — the `NextToken` path
+        // then behaves the same whether or not a page size was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // A token only when a request follows this page: "This value is null when there are no
+        // more results to return" (`DescribeCapacityReservationBillingRequestsResult$NextToken`).
+        let next_token = page
+            .get(limit)
+            .and_then(|request| request.capacity_reservation_id.as_deref())
+            .map(encode_page_token);
+
+        Ok(DescribeCapacityReservationBillingRequestsOutput {
+            capacity_reservation_billing_requests: Some(
+                page.iter().take(limit).cloned().collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The filter names this operation documents, from
+/// `DescribeCapacityReservationBillingRequestsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeCapacityReservationBillingRequestsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// That list is the whole set: `status`, `requested-by` and
+/// `unused-reservation-billing-owner`. A billing request carries no tags — the modelled
+/// `CapacityReservationBillingRequest` has no `Tags` member — so this operation documents
+/// none of the `tag:<key>` / `tag-key` filters the describes of a taggable resource do.
+/// Every entry must be answered by [`filter_values`].
+const CAPACITY_RESERVATION_BILLING_REQUEST_FILTERS: [&str; 3] = [
+    "requested-by",
+    "status",
+    "unused-reservation-billing-owner",
+];
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None`
+/// when this operation documents no such filter.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact.
+fn canonical_filter_name(name: &str) -> Option<&str> {
+    CAPACITY_RESERVATION_BILLING_REQUEST_FILTERS
+        .contains(&name)
+        .then_some(name)
+}
+
+/// Which side of a billing assignment the caller is asking about: the `Role` the request
+/// named, resolved ONCE out of the modelled `CallerRole` catalog.
+///
+/// Resolving the word into a value with exactly the catalog's members is what makes every
+/// decision that depends on the role total — there is no third role for a match arm to
+/// answer for, so no behaviour can hide behind an unreachable fallthrough.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallerRole {
+    /// `odcr-owner` — "If you are the Capacity Reservation owner, specify this value to view
+    /// requests that you have initiated" (`Role`).
+    OdcrOwner,
+    /// `unused-reservation-billing-owner` — "If you are the consumer account, specify this
+    /// value to view requests that have been sent to you" (that same member's doc).
+    UnusedReservationBillingOwner,
+}
+
+impl CallerRole {
+    /// The role `value` names, or `None` when the `CallerRole` catalog does not hold it.
+    ///
+    /// The catalog members come from [`crate::state`], the one place this service spells
+    /// them, so this cannot drift from what the store and the refusal wording use.
+    fn resolve(value: &str) -> Option<Self> {
+        match value {
+            crate::state::CALLER_ROLE_ODCR_OWNER => Some(Self::OdcrOwner),
+            crate::state::CALLER_ROLE_UNUSED_RESERVATION_BILLING_OWNER => {
+                Some(Self::UnusedReservationBillingOwner)
+            }
+            _ => None,
+        }
+    }
+
+    /// The catalog member this role is, which is the word a refusal quotes back.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OdcrOwner => crate::state::CALLER_ROLE_ODCR_OWNER,
+            Self::UnusedReservationBillingOwner => {
+                crate::state::CALLER_ROLE_UNUSED_RESERVATION_BILLING_OWNER
+            }
+        }
+    }
+
+    /// The filter whose attribute this role has already pinned to the caller's own account,
+    /// and which is therefore "not supported" with it.
+    ///
+    /// `odcr-owner` views the requests the caller initiated, so `requested-by` is already the
+    /// caller; `unused-reservation-billing-owner` views the requests sent to the caller, so
+    /// `unused-reservation-billing-owner` is. Both pairings come from the `Role` member's own
+    /// documentation.
+    fn bound_filter(self) -> &'static str {
+        match self {
+            Self::OdcrOwner => "requested-by",
+            Self::UnusedReservationBillingOwner => "unused-reservation-billing-owner",
+        }
+    }
+
+    /// Is `request` one of the requests the caller, in this role, is asking to see?
+    ///
+    /// `odcr-owner` sees the requests `account` initiated — the ones it is the Capacity
+    /// Reservation owner of — and `unused-reservation-billing-owner` the ones sent to it as
+    /// the consumer account. A request between two OTHER accounts belongs to neither side of
+    /// the caller, so neither role reports it.
+    fn selects(self, request: &CapacityReservationBillingRequest, account: &str) -> bool {
+        match self {
+            Self::OdcrOwner => request.requested_by.as_deref() == Some(account),
+            Self::UnusedReservationBillingOwner => {
+                request.unused_reservation_billing_owner_id.as_deref() == Some(account)
+            }
+        }
+    }
+}
+
+/// The values the EC2 filter `name` compares against this billing request.
+///
+/// A filter naming an attribute this request does not carry compares against NO values, so
+/// it selects nothing — the same answer every other describe of this service gives for an
+/// absent attribute. `name` is a name [`canonical_filter_name`] resolved.
+fn filter_values<'a>(
+    request: &'a CapacityReservationBillingRequest,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "requested-by" => text(request.requested_by.as_deref()),
+        "status" => text(request.status.as_deref()),
+        "unused-reservation-billing-owner" => {
+            text(request.unused_reservation_billing_owner_id.as_deref())
+        }
+        // Unreachable: `canonical_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// Does `request` satisfy every filter?
+///
+/// The AND/OR evaluation, the wildcard matching and the budget charging all live in
+/// [`crate::state::matches_every_filter`], so this operation only says WHERE a filter's
+/// values come from.
+fn matches_every_filter(
+    request: &CapacityReservationBillingRequest,
+    selectors: &[crate::state::CompiledFilter],
+    budget: &mut crate::state::MatchBudget,
+) -> bool {
+    crate::state::matches_every_filter(selectors, budget, &|name| filter_values(request, name))
 }
