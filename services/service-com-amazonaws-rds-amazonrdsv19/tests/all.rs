@@ -51,6 +51,8 @@ mod engine_version_families;
 mod event_subscriptions;
 #[path = "all/existence_and_parameter_guards.rs"]
 mod existence_and_parameter_guards;
+#[path = "all/export_tasks.rs"]
+mod export_tasks;
 #[path = "all/global_clusters.rs"]
 mod global_clusters;
 #[path = "all/not_found_paths.rs"]

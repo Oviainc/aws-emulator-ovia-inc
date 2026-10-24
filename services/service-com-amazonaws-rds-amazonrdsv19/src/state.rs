@@ -85,6 +85,7 @@ pub mod option_catalog;
 pub mod blue_green;
 pub mod db_proxies;
 pub mod engine_log;
+pub mod export_tasks;
 pub mod integrations;
 pub mod tenant_databases;
 
@@ -101,6 +102,11 @@ pub use db_proxies::{
     DB_PROXY_TARGET_QUOTA_PER_PROXY, NETWORK_TYPE_IPV4,
 };
 pub use engine_log::InstanceLog;
+pub use export_tasks::{
+    ExportTaskRecord, EXPORT_TASK_STATUS_CANCELED, EXPORT_TASK_STATUS_CANCELING,
+    EXPORT_TASK_STATUS_COMPLETE, EXPORT_TASK_STATUS_FAILED, EXPORT_TASK_STATUS_IN_PROGRESS,
+    EXPORT_TASK_STATUS_STARTING, EXPORT_TASK_STATUS_VALUES,
+};
 pub use integrations::{
     check_integration_target_arn, check_kms_key_id, mint_integration_id, IntegrationRecord,
     INTEGRATION_QUOTA_PER_REGION, INTEGRATION_STATUS_ACTIVE, INTEGRATION_STATUS_CREATING,
@@ -961,6 +967,14 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// [`DB_PROXY_TARGET_QUOTA_PER_PROXY`] target registrations, which
     /// `RegisterDBProxyTargets` adds and `DeregisterDBProxyTargets` removes.
     pub db_proxies: BTreeMap<RegionalKey, DbProxyRecord>,
+    /// Snapshot and cluster export tasks by `(region, ExportTaskIdentifier)`. Ordered, so
+    /// `DescribeExportTasks` pages deterministically within a region.
+    ///
+    /// `StartExportTask` — the operation that inserts here — is still scaffolded in this
+    /// crate (its own stub issue), so nothing creates a task yet; `DescribeExportTasks`
+    /// reports what is here and `CancelExportTask` moves a task that is here, both against
+    /// the stored record rather than a canned answer.
+    pub export_tasks: BTreeMap<RegionalKey, ExportTaskRecord>,
     /// The account's CA certificate OVERRIDE, by region: the `CertificateIdentifier`
     /// `ModifyCertificates` pinned as the certificate new DB instances are created with,
     /// for the regions where one is set.
@@ -1148,9 +1162,41 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                 gone.push(key.clone());
             }
         }
-        for key in gone {
+        for key in gone.drain(..) {
             self.db_proxies.remove(&key);
         }
+        for (key, export_task) in self
+            .export_tasks
+            .range_mut((region.to_string(), String::new())..)
+        {
+            if key.0 != region {
+                break;
+            }
+            if export_task.settle(now) {
+                gone.push(key.clone());
+            }
+        }
+        for key in gone {
+            self.export_tasks.remove(&key);
+        }
+    }
+
+    /// The export tasks stored in `region`, in identifier order.
+    ///
+    /// An ordered range rather than a scan of the whole map, so the work is bounded by
+    /// what one region holds however many regions the store holds.
+    pub fn export_tasks_in(&self, region: &str) -> Vec<&ExportTaskRecord> {
+        range_in(&self.export_tasks, region)
+    }
+
+    /// The export task `identifier` names in `region`, or `None` when nothing of that
+    /// identifier exists — what a request that NAMES an export task is resolved against.
+    ///
+    /// `ExportTaskIdentifier` is "a unique identifier for the export task" and the model
+    /// documents no case folding for it, so the lookup is exact, as the store is keyed.
+    pub fn resolve_export_task(&self, region: &str, identifier: &str) -> Option<&ExportTaskRecord> {
+        self.export_tasks
+            .get(&(region.to_string(), identifier.to_string()))
     }
 
     /// The DB shard groups stored in `region`, in folded-identifier order.
@@ -1521,6 +1567,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .chain(self.integrations.keys())
             .chain(self.tenant_databases.keys())
             .chain(self.db_proxies.keys())
+            .chain(self.export_tasks.keys())
             .map(|(stored, _)| stored.as_str())
             .chain(self.certificate_overrides.keys().map(String::as_str))
             .collect();
