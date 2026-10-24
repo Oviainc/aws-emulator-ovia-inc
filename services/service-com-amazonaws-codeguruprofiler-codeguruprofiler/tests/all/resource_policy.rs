@@ -5,18 +5,19 @@
 //!
 //! The rule every case here asserts: `GetPolicy` reports the resource-based policy
 //! STORED on the named profiling group — one `Allow` statement per stored action group,
-//! carrying that action group's principals, the actions the action group grants and the
-//! group's own stored ARN, beside the stored revision id — and, because its output
-//! models `policy` and `revisionId` as required, refuses with 404
-//! `ResourceNotFoundException` whenever no policy is stored (the group has none, or the
-//! group does not exist). Being a read, it leaves what a later caller sees untouched.
+//! carrying that action group's statement id, that action group's principals, the
+//! actions the action group grants and the group's own stored ARN, beside the stored
+//! revision id — and, when the group resolves but has NO policy stored, answers 200
+//! with `policy` and `revisionId` both absent, reserving 404
+//! `ResourceNotFoundException` for a profiling group that does not exist. Being a read,
+//! it leaves what a later caller sees untouched.
 //!
 //! Rows differ along what the rule generalises over: how many principals a grant names,
 //! what kind of principal ARN they are, how many action groups the policy carries, and
 //! the group they are stored on — every row sits on a row of the shared
 //! [`group_cases`] table, so the modelled `ProfilingGroupName` length bounds (1 and 255)
 //! and the varying compute platforms come from there. No row is privileged; the
-//! recorded cases this suite closes (a group with no policy at all) are the refusal
+//! recorded cases this suite closes (a group with no policy at all) are the empty-200
 //! rows.
 //!
 //! The harness is the one `profiling_group_lifecycle` exports for this test target, so
@@ -31,6 +32,7 @@ use std::collections::BTreeMap;
 use service_com_amazonaws_codeguruprofiler_codeguruprofiler::ComAmazonawsCodeguruprofilerCodeguruprofilerState;
 use service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::{
     ACTION_GROUP_AGENT_PERMISSIONS, POLICY_VERSION, ResourcePolicy, action_group_actions,
+    action_group_statement_id,
 };
 
 use crate::profiling_group_lifecycle::{Answer, GroupCase, Harness, group_cases};
@@ -67,7 +69,7 @@ async fn delete_group(harness: &Harness, name: &str) -> Answer {
 /// Attach `grants` to the stored group as its resource-based policy at `revision_id`,
 /// through the same state writers a permission handler uses: rewrite the grants, then
 /// rotate the revision ONCE for the change.
-fn attach_policy(
+pub(crate) fn attach_policy(
     harness: &Harness,
     name: &str,
     grants: &[(String, Vec<String>)],
@@ -231,22 +233,28 @@ fn assert_matches_case(case: &PolicyCase, label: &str, answer: &Answer) {
     );
 
     for (action_group, principals) in &case.grants {
+        let sid = action_group_statement_id(action_group);
         let statement = statements
             .iter()
             .find(|statement| {
-                statement.get("Sid").and_then(serde_json::Value::as_str) == Some(action_group)
+                statement.get("Sid").and_then(serde_json::Value::as_str) == Some(sid.as_str())
             })
             .unwrap_or_else(|| {
-                panic!("case {case:?} ({label}): no statement for {action_group} in {document}")
+                panic!("case {case:?} ({label}): no statement for {sid} in {document}")
             });
         assert_eq!(
             statement.get("Effect").and_then(serde_json::Value::as_str),
             Some("Allow"),
             "case {case:?} ({label}): wrong Effect in {statement}"
         );
+        // One principal is the ARN itself; several are a list.
+        let expected_principal = match principals.as_slice() {
+            [only] => serde_json::Value::from(only.clone()),
+            several => serde_json::Value::from(several.to_vec()),
+        };
         assert_eq!(
             statement.pointer("/Principal/AWS"),
-            Some(&serde_json::Value::from(principals.clone())),
+            Some(&expected_principal),
             "case {case:?} ({label}): wrong Principal.AWS in {statement}"
         );
         assert_eq!(
@@ -342,13 +350,13 @@ async fn a_policy_carrying_several_action_groups_renders_one_statement_each() {
 }
 
 #[tokio::test]
-async fn no_stored_policy_answers_resource_not_found_and_stores_nothing() {
+async fn no_stored_policy_answers_an_empty_200_and_stores_nothing() {
     let harness = Harness::new();
 
     // Rows: every group of the shared table, created and never granted anything (the
     // recorded "absent before any permission" case, across both name-length bounds);
     // the first of them then has a policy holding NO grants attached, because no grants
-    // is no policy; and a name that was never created at all.
+    // is no policy.
     let groups = group_cases();
     for (index, case) in groups.iter().enumerate() {
         assert_eq!(
@@ -359,30 +367,47 @@ async fn no_stored_policy_answers_resource_not_found_and_stores_nothing() {
     }
     attach_policy(&harness, &groups[0].name, &[], PLACEHOLDER_REVISION);
 
-    let mut names: Vec<String> = groups.iter().map(|case| case.name.clone()).collect();
-    names.push("never-created-group".to_string());
-
-    for name in &names {
+    for case in &groups {
         for label in ["first read", "second read"] {
-            let answer = get_policy(&harness, name).await;
+            let answer = get_policy(&harness, &case.name).await;
             assert_eq!(
                 answer.status,
-                404,
-                "case {name} ({label}): a group with no policy must answer 404, got {} {}",
+                200,
+                "case {case:?} ({label}): a group with no policy must answer 200, got {} {}",
                 answer.status,
                 String::from_utf8_lossy(&answer.body)
             );
             assert_eq!(
-                answer.error_code(),
-                "ResourceNotFoundException",
-                "case {name} ({label}): wrong error code in {}",
+                answer.json(),
+                serde_json::json!({}),
+                "case {case:?} ({label}): a group with no policy must carry neither \
+                 policy nor revisionId, got {}",
                 String::from_utf8_lossy(&answer.body)
             );
         }
     }
 
-    // The refusal is a read too: it must not have attached a policy to anything. For
-    // every group that was never granted, the raw policy FIELD must still be empty —
+    // A group that was never created is the other class: it is the resource that does
+    // not exist, so it is the one answered 404.
+    for label in ["first read", "second read"] {
+        let answer = get_policy(&harness, "never-created-group").await;
+        assert_eq!(
+            answer.status,
+            404,
+            "case never-created-group ({label}): expected 404, got {} {}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            answer.error_code(),
+            "ResourceNotFoundException",
+            "case never-created-group ({label}): wrong error code in {}",
+            String::from_utf8_lossy(&answer.body)
+        );
+    }
+
+    // The empty answer is a read too: it must not have attached a policy to anything.
+    // For every group that was never granted, the raw policy FIELD must still be empty —
     // evidence of no write that is independent of the empty-grants filter; the seeded
     // empty-grants row keeps its (grant-less) record, and must still read as absent.
     for (index, case) in groups.iter().enumerate() {
@@ -440,15 +465,15 @@ async fn deleting_a_group_takes_its_policy_with_it() {
     let recreated = get_policy(&harness, &name).await;
     assert_eq!(
         recreated.status,
-        404,
-        "a re-created group must start with no policy, got {} {}",
+        200,
+        "a re-created group exists, so its policy-less state is a 200, got {} {}",
         recreated.status,
         String::from_utf8_lossy(&recreated.body)
     );
     assert_eq!(
-        recreated.error_code(),
-        "ResourceNotFoundException",
-        "a re-created group's GetPolicy must answer ResourceNotFoundException, got {}",
+        recreated.json(),
+        serde_json::json!({}),
+        "a re-created group must start with no policy, got {}",
         String::from_utf8_lossy(&recreated.body)
     );
 }
