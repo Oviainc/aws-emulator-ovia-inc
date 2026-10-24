@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
-    AttachedPermissionsBoundary, InstanceProfile, Policy, PolicyVersion, Role,
+    AttachedPermissionsBoundary, InstanceProfile, LoginProfile, Policy, PolicyVersion, Role,
     ServiceSpecificCredentialMetadata, Tag, User,
 };
 
@@ -473,6 +473,29 @@ pub struct AccessKeyRecord {
     pub create_date: ::aws_smithy_types::DateTime,
 }
 
+/// One IAM user's login profile: the console password `CreateLoginProfile`
+/// created, as the account holds it.
+///
+/// The PASSWORD itself is deliberately not among its members. `LoginProfile` (the
+/// only shape any operation reports a login profile through) carries just
+/// `UserName`, `CreateDate` and `PasswordResetRequired`
+/// (`smithy_query(query="shape", shape="LoginProfile")`), the model marks
+/// `CreateLoginProfile$Password` sensitive, and this emulator serves no console
+/// sign-in, so nothing can ever read the password back: holding it would be
+/// keeping a secret no caller may be given. The owning user's NAME is not copied
+/// in either, for the same reason [`AccessKeyRecord`] does not copy it — it is
+/// read from the user the record's key names, so the name lives in one place.
+#[derive(Debug, Clone)]
+pub struct LoginProfileRecord {
+    /// The instant the password was created, reported unchanged by every later
+    /// read: "the CreateDate reflects the initial password creation date"
+    /// (`GetLoginProfile`).
+    pub create_date: ::aws_smithy_types::DateTime,
+    /// Whether "the user is required to set a new password on next sign-in"
+    /// (`CreateLoginProfile$PasswordResetRequired`), as the create asked.
+    pub password_reset_required: bool,
+}
+
 /// Per-service state for com-amazonaws-iam-awsidentitymanagementv20100508. A handler reaches it through [`service_state`].
 ///
 /// Every map is a `BTreeMap` so enumeration order is total and stable, which is
@@ -506,6 +529,12 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// owns it. `GetUser` with no `UserName` resolves the caller through this map,
     /// and `CreateAccessKey` is what populates it.
     pub access_keys: BTreeMap<String, AccessKeyRecord>,
+    /// The persisted login profiles, keyed by [`name_key`] of the user name — the
+    /// same key [`Self::users`] uses, because a user has AT MOST ONE login profile
+    /// ("a login profile is created when you create a password for the user",
+    /// `GetLoginProfile`) and that profile is reached only through its user.
+    /// `CreateLoginProfile` is what fills this map and `GetLoginProfile` reads it.
+    pub login_profiles: BTreeMap<String, LoginProfileRecord>,
     /// The persisted service-specific credentials, keyed by their
     /// `ServiceSpecificCredentialId` — the handle every other operation on one takes
     /// (`ListServiceSpecificCredentials` reports it,
@@ -717,6 +746,25 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             .filter(|record| record.role_keys.iter().any(|held| held == role_key))
             .map(|record| record.profile.instance_profile_name.clone())
             .collect()
+    }
+
+    /// The modelled `LoginProfile` of the user keyed by `user_key`, or `None` when
+    /// that user has no password — or no longer exists.
+    ///
+    /// `LoginProfile$UserName` reports the name as the ACCOUNT holds it, not the
+    /// case a request happened to spell, because IAM names "are not distinguished
+    /// by case"; the name is therefore read from the user rather than copied into
+    /// the login profile record. One definition, shared by the create that returns
+    /// the new profile and the read that reports it, so both answer with the same
+    /// values from the same state.
+    pub fn login_profile_report(&self, user_key: &str) -> Option<LoginProfile> {
+        let user = self.users.get(user_key)?;
+        let held = self.login_profiles.get(user_key)?;
+        Some(LoginProfile {
+            user_name: user.user_name.clone(),
+            create_date: held.create_date,
+            password_reset_required: held.password_reset_required,
+        })
     }
 }
 
