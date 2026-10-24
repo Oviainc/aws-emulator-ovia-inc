@@ -39,6 +39,8 @@ mod list_deployment_strategies;
 mod list_environments;
 #[path = "all/list_extensions.rs"]
 mod list_extensions;
+#[path = "all/refusal_message_templates.rs"]
+mod refusal_message_templates;
 #[path = "all/resource_deletes.rs"]
 mod resource_deletes;
 #[path = "all/resource_tags.rs"]

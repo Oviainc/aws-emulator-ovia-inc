@@ -170,7 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let not_found = || -> Self::Error {
             CreateSubscriptionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("Domain {} was not found", input.domain_id)),
+                message: Some(crate::service::error_detail::domain_not_found_message(
+                    &input.domain_id,
+                )),
             })
             .into()
         };
@@ -215,6 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the initial status is not one of those transitions.
             activated_at: None,
             deactivated_at: None,
+            // A freshly created subscription has had no Medical Scribe listening session
+            // started on it.
+            scribe_sessions: ::std::collections::BTreeMap::new(),
         };
         // `or_insert` hands back the record it STORED, so every field rendered below is
         // read out of the store rather than echoed from the request.

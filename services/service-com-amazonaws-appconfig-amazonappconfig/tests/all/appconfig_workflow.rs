@@ -48,6 +48,13 @@ pub(crate) fn router() -> MultiServiceRouter {
     router_on(&Arc::new(engine::InMemoryEngine::new()))
 }
 
+/// The one account id a generated emulator presents, which every refusal whose template
+/// carries an account clause must name. `pub(crate)` because more than one suite asserts
+/// against it.
+pub(crate) fn account() -> &'static str {
+    engine::emulator_account_id()
+}
+
 /// What a dispatched request answered.
 pub(crate) struct Answer {
     pub(crate) status: u16,

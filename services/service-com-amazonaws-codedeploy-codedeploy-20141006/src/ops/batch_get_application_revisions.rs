@@ -82,15 +82,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// How many revisions one batch may carry, as the model documents for the member
-/// (`smithy_query(query="doc",shape="BatchGetApplicationRevisionsInput",member="revisions")`:
-/// "The maximum number of `RevisionLocation` objects you can specify is 25").
-///
-/// `RevisionLocationList` itself carries no modelled length, so the bound is this
-/// handler's to enforce, and `BatchLimitExceededException` is the refusal the
-/// model declares for it.
-const MAX_BATCH_REVISIONS: usize = 25;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -172,18 +163,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = input.application_name;
         let requested = input.revisions;
 
-        // The batch precondition comes FIRST: a batch past the documented maximum
-        // is refused whatever it carries, and nothing about the store is read for
-        // it.
-        if requested.len() > MAX_BATCH_REVISIONS {
+        // The batch precondition comes FIRST: a batch past the request-size
+        // quota is refused whatever it carries, and nothing about the store is
+        // read for it. That quota is the one `BatchLimitExceededException` states
+        // for every batch reader of this service (`crate::state::MAX_BATCH_SIZE`).
+        if requested.len() > crate::state::MAX_BATCH_SIZE {
             return Err(
                 BatchGetApplicationRevisionsErrorModeled::BatchLimitExceededException(
                     BatchLimitExceededException {
-                        message: Some(format!(
-                            "The maximum number of RevisionLocation objects you can specify for \
-                             revisions is {MAX_BATCH_REVISIONS}, but {} were specified",
-                            requested.len()
-                        )),
+                        message: Some(crate::state::batch_limit_exceeded_message()),
                     },
                 )
                 .into(),

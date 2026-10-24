@@ -48,17 +48,28 @@ const PAST_THE_DELETION_SPAN: Duration = Duration::from_millis(900);
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
     region: String,
+    /// The ONE shared engine this service was mounted on, kept so a suite can reach the
+    /// service's own store directly — the way to seed a record no operation this
+    /// emulator serves writes yet.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
     pub(crate) fn new(region: &str) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
         Self {
             router,
             region: region.to_string(),
+            engine,
         }
+    }
+
+    /// The shared engine, for a suite that has to write a record directly into this
+    /// service's store.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     /// Dispatch one request and return its status and parsed JSON body.
@@ -836,10 +847,28 @@ async fn unknown_resources_are_404_and_ids_outside_the_model_are_400() {
     // A well-formed id (len 21, `^dom-[a-z0-9]+$`) that names nothing.
     let absent_domain = "dom-doesnotexist00000";
     let absent_subscription = "sub-000000000000000000000";
+    // A domain this service DID allocate and has since deleted: its id names a domain
+    // that is gone, which is the modelled not-found. An id with no allocation history at
+    // all is `DeleteDomain`'s own separate case — see
+    // `domain_account_cap_and_lookup_semantics`.
+    let deleted_domain = string_at(
+        &emulator
+            .create_domain(&json!({ "name": "clinic-deleted" }))
+            .await,
+        "domainId",
+    );
+    let (status, body) = emulator
+        .send("DELETE", &format!("/domain/{deleted_domain}"), None)
+        .await;
+    assert_eq!(status, 200, "the first DeleteDomain got {status} {body:?}");
 
     let not_found: [(&str, &str, &str); 7] = [
         ("GetDomain", "GET", &format!("/domain/{absent_domain}")),
-        ("DeleteDomain", "DELETE", &format!("/domain/{absent_domain}")),
+        (
+            "DeleteDomain of a domain that is gone",
+            "DELETE",
+            &format!("/domain/{deleted_domain}"),
+        ),
         (
             "CreateSubscription under an absent domain",
             "POST",
@@ -904,37 +933,12 @@ async fn unknown_resources_are_404_and_ids_outside_the_model_are_400() {
 #[tokio::test]
 async fn store_growth_is_bounded_and_refused_with_the_modelled_errors() {
     use service_com_amazonaws_connecthealth_connecthealth::state::{
-        MAX_DOMAINS, MAX_SUBSCRIPTIONS_PER_DOMAIN, MAX_TAGS_PER_RESOURCE, MAX_TAG_KEY_LEN,
-        MAX_TAG_VALUE_LEN,
+        MAX_SUBSCRIPTIONS_PER_DOMAIN, MAX_TAGS_PER_RESOURCE, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN,
     };
 
-    // A domain store that is full refuses the next create with the operation's own
-    // quota error, and holds exactly the cap.
-    let emulator = Emulator::new("us-east-1");
-    for index in 0..MAX_DOMAINS {
-        let (status, body) = emulator
-            .send(
-                "POST",
-                "/domain",
-                Some(&json!({ "name": format!("clinic-{index}") })),
-            )
-            .await;
-        assert_eq!(status, 201, "domain {index} of the cap: got {status} {body:?}");
-    }
-    let (status, body) = emulator
-        .send("POST", "/domain", Some(&json!({ "name": "one-too-many" })))
-        .await;
-    assert_eq!(
-        status, 402,
-        "the domain past the cap of {MAX_DOMAINS}: got {status} {body:?}"
-    );
-    assert_eq!(
-        error_code(&body),
-        "ServiceQuotaExceededException",
-        "the domain past the cap: got {body:?}"
-    );
-
-    // And so does a domain whose subscriptions are at the per-domain cap.
+    // A domain whose subscriptions are at the per-domain cap refuses the next one with
+    // the operation's own quota error. (The account-wide Domain cap is its own rule,
+    // asserted in `domain_account_cap_and_not_found_semantics`.)
     let emulator = Emulator::new("us-east-1");
     let domain_id = string_at(
         &emulator.create_domain(&json!({ "name": "clinic" })).await,

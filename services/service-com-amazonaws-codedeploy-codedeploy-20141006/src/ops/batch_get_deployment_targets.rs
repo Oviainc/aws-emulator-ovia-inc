@@ -290,18 +290,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 );
             };
-            // A deployment that has not started has deployed to nothing, so it
-            // has no target state to report: that is this operation's
-            // `DeploymentNotStartedException`.
-            if !deployment.is_started() {
-                return Err(
-                    BatchGetDeploymentTargetsErrorModeled::DeploymentNotStartedException(
-                        DeploymentNotStartedException {
-                            message: Some(crate::state::deployment_not_started(&deployment_id)),
-                        },
-                    ),
-                );
-            }
             // How many targets a call may name depends on the deployment it is
             // against, so this bound is answered once the deployment is
             // resolved, after the request-wide one above.
@@ -326,7 +314,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // other batch readers of this service, this one MODELS a
             // does-not-exist error for its ids, so an id the deployment does
             // not hold is refused rather than left out of the answer.
-            let mut targets = Vec::with_capacity(target_ids.len());
+            //
+            // MEMBERSHIP is resolved before the deployment's own progress, the
+            // same order the single-target reader takes: the targets a
+            // deployment has are the snapshot its group resolved when it was
+            // created, so an id that names none of them belongs to no target of
+            // this deployment however far the deployment has got.
+            let mut resolved = Vec::with_capacity(target_ids.len());
             for target_id in &target_ids {
                 if crate::state::check_deployment_target_id(
                     &deployment.compute_platform,
@@ -357,12 +351,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ),
                     );
                 };
-                targets.push(crate::state::deployment_target_view(
-                    state,
-                    deployment,
-                    target,
-                ));
+                resolved.push(target);
             }
+            // Every id names a target of this deployment; a deployment that has
+            // not started has deployed to none of them yet, so it has no target
+            // state to report: that is this operation's
+            // `DeploymentNotStartedException`.
+            if !deployment.is_started() {
+                return Err(
+                    BatchGetDeploymentTargetsErrorModeled::DeploymentNotStartedException(
+                        DeploymentNotStartedException {
+                            message: Some(crate::state::deployment_not_started(&deployment_id)),
+                        },
+                    ),
+                );
+            }
+            let targets = resolved
+                .into_iter()
+                .map(|target| crate::state::deployment_target_view(state, deployment, target))
+                .collect::<Vec<_>>();
             Ok(targets)
         })
         .ok_or_else(|| {

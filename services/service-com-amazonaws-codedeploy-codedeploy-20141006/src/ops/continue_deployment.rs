@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ContinueDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ContinueDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts a blue/green deployment's traffic shift without waiting out the wait
+//! its deployment group configured.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ContinueDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +78,19 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The `DeploymentWaitType` of the wait a blue/green deployment holds in BEFORE
+/// its traffic shift, as the member documents it
+/// (`smithy_query(query="doc",shape="ContinueDeploymentInput",member="deploymentWaitType")`:
+/// "READY_WAIT indicates that the deployment is ready to start shifting
+/// traffic").
+const READY_WAIT: &str = "READY_WAIT";
+
+/// The `DeploymentWaitType` of the wait a blue/green deployment holds in AFTER
+/// its traffic shift: "TERMINATION_WAIT indicates that the traffic is shifted,
+/// but the original target is not terminated" — the wait the deployment group's
+/// `terminationWaitTimeInMinutes` configured.
+const TERMINATION_WAIT: &str = "TERMINATION_WAIT";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -178,18 +186,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ContinueDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ContinueDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ContinueDeployment"))
+        let _ = ctx;
+        // `deploymentId` is modelled OPTIONAL, but there is no deployment to
+        // continue without one, and CodeDeploy models its own code for that. The
+        // FORMAT is gated before the lookup, so "that is not an id" and "no
+        // deployment has that id" stay the two different answers every other
+        // operation taking a deployment id gives.
+        let deployment_id = input.deployment_id.unwrap_or_default();
+        if deployment_id.trim().is_empty() {
+            return Err(ContinueDeploymentErrorModeled::DeploymentIdRequiredException(
+                DeploymentIdRequiredException {
+                    message: Some(crate::state::DEPLOYMENT_ID_MISSING.to_string()),
+                },
+            )
+            .into());
+        }
+        if !crate::state::deployment_id_is_well_formed(&deployment_id) {
+            return Err(ContinueDeploymentErrorModeled::InvalidDeploymentIdException(
+                InvalidDeploymentIdException {
+                    message: Some(crate::state::malformed_deployment_id_message(
+                        &deployment_id,
+                    )),
+                },
+            )
+            .into());
+        }
+        // `deploymentWaitType` is a modelled value set, so the boundary already
+        // refused anything outside it in this service's own words; what is left
+        // here is a request that named NO wait to continue past, which is what
+        // `InvalidDeploymentWaitTypeException` ("The wait type is invalid")
+        // answers — a blue/green deployment has two waits, so which of them to
+        // continue past is not something this service can choose for the caller.
+        let wait_type = input.deployment_wait_type.unwrap_or_default();
+        if wait_type.trim().is_empty() {
+            return Err(
+                ContinueDeploymentErrorModeled::InvalidDeploymentWaitTypeException(
+                    InvalidDeploymentWaitTypeException {
+                        message: Some(format!(
+                            "The deployment wait type was not specified: it must be \
+                             {READY_WAIT} or {TERMINATION_WAIT}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let outcome = crate::state::with_state(&*self.engine, |state| {
+            let Some(deployment) = state.deployments.get_mut(&deployment_id) else {
+                return Err(ContinueDeploymentErrorModeled::DeploymentDoesNotExistException(
+                    DeploymentDoesNotExistException {
+                        message: Some(crate::state::deployment_not_found(&deployment_id)),
+                    },
+                ));
+            };
+            // The deployment's TYPE comes first, before anything about how far it
+            // has got: only a blue/green deployment reroutes traffic between two
+            // environments, so this call never applied to a deployment of any
+            // other type — and a deployment's type is fixed when it is created,
+            // so that is as true of a finished deployment as of a running one.
+            if !deployment.is_blue_green() {
+                return Err(
+                    ContinueDeploymentErrorModeled::UnsupportedActionForDeploymentTypeException(
+                        UnsupportedActionForDeploymentTypeException {
+                            message: Some(format!(
+                                "Operation is not supported for the deployment {deployment_id} \
+                                 of type {}.",
+                                deployment.deployment_type()
+                            )),
+                        },
+                    ),
+                );
+            }
+            // A deployment that already reached a terminal status has no wait
+            // left to continue past.
+            if deployment.is_complete() {
+                return Err(
+                    ContinueDeploymentErrorModeled::DeploymentAlreadyCompletedException(
+                        DeploymentAlreadyCompletedException {
+                            message: Some(format!(
+                                "The deployment {deployment_id} is already complete with status {}",
+                                deployment.status
+                            )),
+                        },
+                    ),
+                );
+            }
+            if wait_type == READY_WAIT {
+                // The wait BEFORE the traffic shift. This emulator starts a
+                // blue/green deployment's traffic shift as soon as the clock
+                // starts the deployment — the behaviour of a deployment group
+                // whose `deploymentReadyOption` continues on timeout — so no
+                // deployment it holds ever waits in the `Ready` status this wait
+                // type continues past, which is exactly what
+                // `DeploymentIsNotInReadyStateException` ("The deployment does
+                // not have a status of Ready and can't continue yet") states.
+                return Err(
+                    ContinueDeploymentErrorModeled::DeploymentIsNotInReadyStateException(
+                        DeploymentIsNotInReadyStateException {
+                            message: Some(format!(
+                                "The deployment {deployment_id} does not have a status of Ready \
+                                 and can't continue yet: it holds the status {}",
+                                deployment.status
+                            )),
+                        },
+                    ),
+                );
+            }
+            // The wait AFTER the traffic shift, which only a deployment whose
+            // group terminates the original environment's instances has.
+            if !deployment.terminates_original_instances {
+                return Err(
+                    ContinueDeploymentErrorModeled::InvalidDeploymentWaitTypeException(
+                        InvalidDeploymentWaitTypeException {
+                            message: Some(format!(
+                                "The deployment {deployment_id} does not terminate the instances \
+                                 of its original environment, so it has no {TERMINATION_WAIT} \
+                                 to continue past"
+                            )),
+                        },
+                    ),
+                );
+            }
+            if !deployment.is_started() {
+                return Err(
+                    ContinueDeploymentErrorModeled::InvalidDeploymentStatusException(
+                        InvalidDeploymentStatusException {
+                            message: Some(format!(
+                                "The deployment {deployment_id} has not started yet, so its \
+                                 traffic has not been shifted and there is no \
+                                 {TERMINATION_WAIT} to continue past"
+                            )),
+                        },
+                    ),
+                );
+            }
+            // Continuing past the termination wait drops what is left of it, so
+            // the completion the clock owes moves back to the instant traffic
+            // routing is complete. Nothing is terminated by this call itself —
+            // the clock still owes that transition — so a caller reading the
+            // deployment afterwards sees the same record every later caller
+            // does.
+            deployment.completes_at_ms = deployment.traffic_routing_complete_at_ms();
+            deployment.termination_wait_millis = 0;
+            Ok(())
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+        outcome?;
+
+        Ok(ContinueDeploymentOutput)
     }
 }
