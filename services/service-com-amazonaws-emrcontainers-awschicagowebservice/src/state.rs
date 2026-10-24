@@ -49,6 +49,10 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// EMR on EKS documents no duration for any of them, so this span is the emulator's own
 /// choice. It is deliberately non-zero: a caller that reads straight after the call that
 /// started the transition observes the transient state, exactly as it would against AWS.
+///
+/// The span is when a transition becomes DUE, not when it is materialised: an admission
+/// to `RUNNING` also waits for the cluster's scheduler to have a free concurrency slot
+/// (see [`ComAmazonawsEmrcontainersAwschicagowebserviceState::settle`]).
 pub const TRANSITION_SPAN: Duration = Duration::from_millis(400);
 
 /// `VirtualClusterState` members this slice uses. Each is a value of the generated
@@ -61,10 +65,10 @@ pub const CLUSTER_TERMINATED: &str = "TERMINATED";
 /// `JOB_RUN_STATE_VALUES` catalog in `ops::types::shared_types`.
 ///
 /// `JOB_SUBMITTED` is the one state no handler here writes: EMR on EKS reports it for a
-/// run handed to the scheduler, and this slice runs no scheduler (it accepts a run
-/// PENDING and the clock moves it straight to RUNNING). It is named because
-/// `job_state_is_terminal` and the queue-side members below are written against the whole
-/// catalog, so a later slice that does schedule has one place to add it.
+/// run handed to the scheduler, and this slice accepts a run `PENDING` and admits it to
+/// `RUNNING` from there. It is named because `job_state_is_terminal` and
+/// [`job_state_is_in_queue`] are written against the whole catalog, so a run in either
+/// waiting state is counted as queued.
 pub const JOB_PENDING: &str = "PENDING";
 pub const JOB_SUBMITTED: &str = "SUBMITTED";
 pub const JOB_RUNNING: &str = "RUNNING";
@@ -758,6 +762,11 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
     ///
     /// Called first by every handler — including the reporting ones, which may write
     /// only this: the change was owed at the same instant whether or not anybody called.
+    ///
+    /// A due start is the one transition that also needs scheduler capacity, so the job
+    /// runs are walked oldest submission first and a start waits while the cluster's
+    /// `maxConcurrentJobRuns` is fully taken; every other transition answers to the clock
+    /// alone.
     ///
     /// It walks only the records that actually owe a transition, so one call costs the
     /// number of transitions in flight, not the size of the store.
