@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRelationalDatabases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRelationalDatabases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Enumerates the managed relational databases this service has stored, one page
+//! at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRelationalDatabases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! A page carries at most [`crate::state::RELATIONAL_DATABASE_PAGE_SIZE`]
+//! databases out of the store's own total order (by database name), and
+//! `nextPageToken` NAMES the first database of the page after it, present only
+//! while databases remain. Every member of every entry comes from the one stored
+//! record `CreateRelationalDatabase` wrote, so this listing and
+//! `GetRelationalDatabase` can never disagree.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +168,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRelationalDatabases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRelationalDatabasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRelationalDatabases"))
+        // This operation reports what the account holds; it takes no region, so
+        // nothing here reads the request's credential scope.
+        let _ = ctx;
+
+        // `pageToken` is the name the previous page stopped before, so a page is the
+        // stored databases from that name onward in the store's own total order.
+        // Using the name rather than an index means a database deleted between two
+        // pages cannot make the walk skip or repeat another one.
+        let page_token = input.page_token.unwrap_or_default();
+
+        crate::state::with_state(&*self.engine, |store| {
+            let mut databases = Vec::new();
+            let mut next_page_token = None;
+            for (name, database) in store.relational_databases.range(page_token..) {
+                if databases.len() == crate::state::RELATIONAL_DATABASE_PAGE_SIZE {
+                    next_page_token = Some(name.clone());
+                    break;
+                }
+                databases.push(database.view());
+            }
+            GetRelationalDatabasesOutput {
+                // An account with no databases reports an empty list, not an absent
+                // one: the caller asked what it has, and the answer is "nothing".
+                relational_databases: Some(databases),
+                next_page_token,
+            }
+        })
+        .ok_or_else(unavailable)
     }
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetRelationalDatabasesError {
+    GetRelationalDatabasesErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail relational database store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
