@@ -8,6 +8,11 @@
 //! exactly what was stored — including the name and the ARN this operation mints and
 //! the service-linked role it records with.
 //!
+//! Only a service Config links a configuration recorder of this account's own
+//! resources to can own one ([`crate::state::SERVICE_LINKED_PRINCIPALS`]): a
+//! `ServicePrincipal` outside that set is refused with the modelled
+//! `ValidationException` before anything is stored.
+//!
 //! One recorder per linked service, and at most
 //! [`crate::state::SERVICE_LINKED_RECORDERS_QUOTA`] of them per account and Region:
 //! past either bound the create is refused with the modelled `ConflictException` or
@@ -198,20 +203,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let service_principal = input.service_principal;
 
-        // Config assigns the recorder's name itself, from the service the recorder is
-        // linked to; a value that names no service principal names no service to link
-        // to either.
-        let Some(name) = crate::state::service_linked_recorder_name(&service_principal) else {
-            return Err(
-                PutServiceLinkedConfigurationRecorderErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(crate::state::invalid_service_principal_message(
-                            &service_principal,
-                        )),
-                    },
-                )
-                .into(),
-            );
+        // This operation is "linked to a specific Amazon Web Services service based on
+        // the ServicePrincipal you specify", from the published list of supported
+        // services: a value that names no service principal names no service to link to,
+        // and a WELL-FORMED one naming a service Config links no configuration recorder
+        // of this account's own resources to names no recorder this operation can
+        // create. Both are refused before anything is stored, with the refusal the
+        // model states for the case (`ValidationException`: "You have provided a service
+        // principal for service-linked configuration recorder that is not valid") —
+        // exactly as `PutThirdPartyServiceLinkedConfigurationRecorder` refuses a service
+        // outside its own set.
+        let name = match crate::state::service_linked_recorder_name(&service_principal) {
+            Some(name) if crate::state::supports_service_linked_recording(&service_principal) => {
+                name
+            }
+            _ => {
+                return Err(
+                    PutServiceLinkedConfigurationRecorderErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(crate::state::invalid_service_principal_message(
+                                &service_principal,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
         };
 
         let region = crate::state::request_region(ctx);
@@ -230,9 +247,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 PutServiceLinkedConfigurationRecorderErrorModeled::ConflictException(
                     ConflictException {
-                        message: Some(crate::state::service_linked_recorder_conflict_message(
-                            &service_principal,
-                        )),
+                        message: Some(
+                            crate::state::SERVICE_LINKED_RECORDER_CONFLICT_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

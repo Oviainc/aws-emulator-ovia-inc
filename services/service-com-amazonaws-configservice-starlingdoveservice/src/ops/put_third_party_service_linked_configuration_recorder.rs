@@ -275,9 +275,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if existing.connector_arn.as_deref() != Some(connector_arn.as_str()) {
                 return Err(PutThirdPartyServiceLinkedConfigurationRecorderErrorModeled::ConflictException(
                     ConflictException {
-                        message: Some(crate::state::service_linked_recorder_conflict_message(
-                            &service_principal,
-                        )),
+                        message: Some(
+                            crate::state::SERVICE_LINKED_RECORDER_CONFLICT_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());

@@ -176,44 +176,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        // Stopping is a no-op on a service-linked configuration recorder: the service
-        // it is linked to owns its recording, so this operation does not affect it
-        // (`UnmodifiableEntityException`: "For StartConfigurationRecorder and
-        // StopConfigurationRecorder, you will see this exception because these
-        // operations do not affect service-linked configuration recorders").
-        if recorder.service_principal.is_some() {
+        // This operation does not affect a service-linked configuration recorder, and
+        // the model states why, and with it the message: "these operations do not
+        // affect service-linked configuration recorders. Service-linked configuration
+        // recorders are always recording. To stop recording, you must delete the
+        // service-linked configuration recorder." So the refusal reports the PROPERTY
+        // the recorder has — it always records, and is therefore not stoppable — rather
+        // than telling the caller the call had no effect.
+        if recorder.is_service_linked() {
             return Err(
                 StopConfigurationRecorderErrorModeled::UnmodifiableEntityException(
                     UnmodifiableEntityException {
-                        message: Some(format!(
-                            "'{name}' is a service-linked configuration recorder; \
-                             StopConfigurationRecorder does not affect service-linked \
-                             configuration recorders"
-                        )),
+                        message: Some(
+                            crate::state::SERVICE_LINKED_RECORDER_ALWAYS_RECORDING.to_string(),
+                        ),
                     },
                 )
                 .into(),
             );
         }
         let arn = recorder.arn.clone();
-
-        // This operation does not affect a service-linked configuration recorder:
-        // "Service-linked configuration recorders are always recording. To stop
-        // recording, you must delete the service-linked configuration recorder."
-        if recorder.is_service_linked() {
-            return Err(
-                StopConfigurationRecorderErrorModeled::UnmodifiableEntityException(
-                    UnmodifiableEntityException {
-                        message: Some(format!(
-                            "'{name}' is a service-linked configuration recorder, which is \
-                             always recording; use DeleteServiceLinkedConfigurationRecorder to \
-                             stop it"
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
 
         let now = ::std::time::SystemTime::now();
         let status = store

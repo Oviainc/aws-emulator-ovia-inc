@@ -28,7 +28,9 @@
 //!    through in place, and that connector can carry the service's recorder again.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_configservice_starlingdoveservice::state::RECORDING_SCOPE_INTERNAL;
+use service_com_amazonaws_configservice_starlingdoveservice::state::{
+    SERVICE_LINKED_PRINCIPALS, RECORDING_SCOPE_INTERNAL,
+};
 
 use crate::config_setup_and_rule_loop::{recorder_request, Emulator, ROLE_ARN};
 
@@ -39,9 +41,24 @@ const PUT: &str = "PutServiceLinkedConfigurationRecorder";
 /// The operation that creates a THIRD-PARTY service-linked recorder.
 const PUT_THIRD_PARTY: &str = "PutThirdPartyServiceLinkedConfigurationRecorder";
 
-/// A service whose recorder every case leaves alone, so each delete is shown to remove
-/// the ONE recorder it names and no other.
-const BYSTANDER: &str = "bystander.amazonaws.com";
+/// A service `PutServiceLinkedConfigurationRecorder` creates a recorder for
+/// (`state::SERVICE_LINKED_PRINCIPALS`): only a service Config links a configuration
+/// recorder to has one to delete.
+const LINKED: &str = SERVICE_LINKED_PRINCIPALS[0];
+
+/// Another such service, whose recorder every case leaves alone, so each delete is
+/// shown to remove the ONE recorder it names and no other.
+const BYSTANDER: &str = SERVICE_LINKED_PRINCIPALS[1];
+
+/// The supported service principal that is NOT `service_principal`, so a case can hold
+/// a second recorder the delete must leave alone whichever row it is running.
+fn bystander_of(service_principal: &str) -> &'static str {
+    if service_principal == BYSTANDER {
+        LINKED
+    } else {
+        BYSTANDER
+    }
+}
 
 /// Which of the two selectors a request names the recorder with. A request carries
 /// exactly one of them (`DeleteServiceLinkedConfigurationRecorderRequest$Arn`: "You
@@ -213,41 +230,25 @@ async fn put_customer_managed(emulator: &Emulator) -> String {
 #[tokio::test]
 async fn a_delete_removes_the_one_service_linked_recorder_it_names() {
     // Rows differ along which selector names the recorder and along the service it is
-    // linked to — how many labels the principal carries and whether the service's own
-    // label is hyphenated, digit-bearing or sub-labelled — because the rule is about
-    // naming one recorder, not about one service.
-    let cases: [(&str, &str, By); 6] = [
-        ("a single-label service, by ARN", "ssm.amazonaws.com", By::Arn),
-        (
-            "a single-label service, by service principal",
-            "ssm.amazonaws.com",
-            By::ServicePrincipal,
-        ),
-        ("a digit-bearing service, by ARN", "s3.amazonaws.com", By::Arn),
-        (
-            "a hyphenated service, by service principal",
-            "config-multiaccountsetup.amazonaws.com",
-            By::ServicePrincipal,
-        ),
-        (
-            "a sub-labelled principal, by ARN",
-            "azure.partner.amazonaws.com",
-            By::Arn,
-        ),
-        (
-            "a regional principal, by service principal",
-            "logs.us-east-1.amazonaws.com",
-            By::ServicePrincipal,
-        ),
-    ];
+    // linked to — every service Config links a recorder to, each named both ways —
+    // because the rule is about naming one recorder, not about one service.
+    let mut cases: Vec<(String, &str, By)> = Vec::new();
+    for service_principal in SERVICE_LINKED_PRINCIPALS {
+        for (label, selector) in [("by ARN", By::Arn), ("by service principal", By::ServicePrincipal)]
+        {
+            cases.push((format!("{service_principal}, {label}"), service_principal, selector));
+        }
+    }
 
     for (case, service_principal, selector) in cases {
+        let case = case.as_str();
+        let bystander = bystander_of(service_principal);
         let emulator = Emulator::new();
         let (arn, name) = put_service_linked(&emulator, service_principal, &[("owner", "team")])
             .await;
-        let (bystander_arn, bystander_name) = put_service_linked(&emulator, BYSTANDER, &[]).await;
+        let (bystander_arn, bystander_name) = put_service_linked(&emulator, bystander, &[]).await;
         let customer_managed = put_customer_managed(&emulator).await;
-        let bystander_before = described_for(&emulator, BYSTANDER).await;
+        let bystander_before = described_for(&emulator, bystander).await;
 
         // The recorder is in state before the delete, recording for its service.
         assert_eq!(
@@ -304,7 +305,7 @@ async fn a_delete_removes_the_one_service_linked_recorder_it_names() {
         // Every other recorder the account holds is untouched: the one linked to
         // another service, ARN and all, and the customer managed one.
         assert_eq!(
-            described_for(&emulator, BYSTANDER).await,
+            described_for(&emulator, bystander).await,
             bystander_before,
             "case {case:?}: the recorder of another service must be left alone"
         );
@@ -345,18 +346,9 @@ async fn a_delete_removes_the_one_service_linked_recorder_it_names() {
 async fn a_service_can_be_linked_again_after_its_recorder_is_deleted() {
     // Rows differ along the selector the delete used and the service, so the release of
     // the assigned name is shown for both ways of naming the recorder.
-    let cases: [(&str, &str, By); 3] = [
-        ("by ARN", "ssm.amazonaws.com", By::Arn),
-        (
-            "by service principal",
-            "backup.amazonaws.com",
-            By::ServicePrincipal,
-        ),
-        (
-            "a sub-labelled principal, by ARN",
-            "azure.partner.amazonaws.com",
-            By::Arn,
-        ),
+    let cases: [(&str, &str, By); 2] = [
+        ("by ARN", LINKED, By::Arn),
+        ("by service principal", BYSTANDER, By::ServicePrincipal),
     ];
 
     for (case, service_principal, selector) in cases {
@@ -419,8 +411,7 @@ async fn a_service_can_be_linked_again_after_its_recorder_is_deleted() {
 #[tokio::test]
 async fn a_selector_that_names_no_service_linked_recorder_is_refused() {
     let emulator = Emulator::new();
-    let linked = "ssm.amazonaws.com";
-    let (arn, name) = put_service_linked(&emulator, linked, &[]).await;
+    let (arn, name) = put_service_linked(&emulator, LINKED, &[]).await;
     let customer_managed = put_customer_managed(&emulator).await;
     let before = described_recorders(&emulator).await;
 
@@ -433,9 +424,13 @@ async fn a_selector_that_names_no_service_linked_recorder_is_refused() {
         &emulator.region,
         "configuration-recorder/AWSConfigurationRecorderForGhost/cr-ghost",
     );
-    let cases: [(&str, Value); 5] = [
+    let cases: [(&str, Value); 6] = [
         (
             "a service nothing is linked to",
+            json!({ "ServicePrincipal": BYSTANDER }),
+        ),
+        (
+            "a service Config links no recorder to",
             json!({ "ServicePrincipal": "backup.amazonaws.com" }),
         ),
         ("an ARN no recorder carries", json!({ "Arn": ghost_arn })),
@@ -477,7 +472,7 @@ async fn a_selector_that_names_no_service_linked_recorder_is_refused() {
 #[tokio::test]
 async fn a_request_that_does_not_name_exactly_one_selector_is_refused() {
     let emulator = Emulator::new();
-    let linked = "ssm.amazonaws.com";
+    let linked = LINKED;
     let (arn, name) = put_service_linked(&emulator, linked, &[]).await;
     let before = described_recorders(&emulator).await;
 
@@ -526,7 +521,7 @@ async fn a_service_principal_that_names_no_service_is_refused() {
     // operation="DeleteServiceLinkedConfigurationRecorder")) admits all of them, and
     // none names an Amazon Web Services service, so none names a recorder either.
     let cases: [(&str, &str); 6] = [
-        ("no DNS suffix at all", "backup"),
+        ("no DNS suffix at all", "observabilityadmin"),
         ("another suffix", "backup.amazon.com"),
         ("the suffix on its own", "amazonaws.com"),
         ("an empty service label", ".amazonaws.com"),
@@ -535,7 +530,7 @@ async fn a_service_principal_that_names_no_service_is_refused() {
     ];
 
     let emulator = Emulator::new();
-    let (_, name) = put_service_linked(&emulator, "ssm.amazonaws.com", &[]).await;
+    let (_, name) = put_service_linked(&emulator, LINKED, &[]).await;
     let before = described_recorders(&emulator).await;
 
     for (case, service_principal) in cases {

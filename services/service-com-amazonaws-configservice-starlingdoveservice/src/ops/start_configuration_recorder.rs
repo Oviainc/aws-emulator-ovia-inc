@@ -181,43 +181,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        // Starting is a no-op on a service-linked configuration recorder: the service
-        // it is linked to turns it on, so this operation does not affect it
-        // (`UnmodifiableEntityException`: "For StartConfigurationRecorder and
-        // StopConfigurationRecorder, you will see this exception because these
-        // operations do not affect service-linked configuration recorders").
-        if recorder.service_principal.is_some() {
+        // This operation does not affect a service-linked configuration recorder, and
+        // the model states the message for exactly these two operations: "these
+        // operations do not affect service-linked configuration recorders.
+        // Service-linked configuration recorders are always recording." A recorder that
+        // always records has nothing for a caller to start.
+        if recorder.is_service_linked() {
             return Err(
                 StartConfigurationRecorderErrorModeled::UnmodifiableEntityException(
                     UnmodifiableEntityException {
-                        message: Some(format!(
-                            "'{name}' is a service-linked configuration recorder; \
-                             StartConfigurationRecorder does not affect service-linked \
-                             configuration recorders"
-                        )),
+                        message: Some(
+                            crate::state::SERVICE_LINKED_RECORDER_ALWAYS_RECORDING.to_string(),
+                        ),
                     },
                 )
                 .into(),
             );
         }
         let arn = recorder.arn.clone();
-
-        // This operation does not affect a service-linked configuration recorder:
-        // "Service-linked configuration recorders are always recording", so there is
-        // nothing for a caller to start.
-        if recorder.is_service_linked() {
-            return Err(
-                StartConfigurationRecorderErrorModeled::UnmodifiableEntityException(
-                    UnmodifiableEntityException {
-                        message: Some(format!(
-                            "'{name}' is a service-linked configuration recorder, which is \
-                             always recording"
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
 
         // Config needs somewhere to deliver what it records before it can record.
         if store.delivery_channels.is_empty() {
