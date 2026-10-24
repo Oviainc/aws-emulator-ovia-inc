@@ -40,6 +40,7 @@ use service_com_amazonaws_wafregional_awswaf_regional_20161128::state::{
     MAX_TAGS_PER_RESOURCE, MESSAGE_LIMITS_EXCEEDED, MESSAGE_NONEXISTENT_ITEM,
 };
 
+use crate::harness::{expected_arn, store_web_acl};
 use crate::wire::{call, change_token, error_message, expect_error, ok_call, router, router_on};
 
 /// The account id every ARN in this suite carries. This emulator serves a single
@@ -783,33 +784,32 @@ async fn untag_resource_removes_the_keys_it_names_and_leaves_the_rest() {
 /// Each of the kinds AWS WAF Classic documents as taggable — "web ACLs, rule groups,
 /// and rules", a rate-based rule being a rule — carries its OWN tag set, reached through
 /// its own ARN: tagging one leaves the others as they were, and a web ACL is reached
-/// through the very `WebACLArn` the service minted for it.
+/// through the very `WebACLArn` the service holds for it.
 #[tokio::test]
 async fn every_taggable_kind_carries_its_own_tag_set() {
-    let router = router();
+    // The engine is held here as well as by the router: the web ACL this suite tags is
+    // one that already EXISTS, since `CreateWebACL` admits no new one (AWS WAF Classic
+    // is past its end of support — see `web_acl_end_of_support.rs`).
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(Arc::clone(&engine));
 
     let rule_arn_value = {
         let rule_id = create_rule(&router, "kinds-rule", None).await;
         rule_arn(&rule_id)
     };
 
-    let web_acl_token = change_token(&router).await;
-    let web_acl = ok_call(
-        &router,
-        "CreateWebACL",
-        &json!({
-            "Name": "kinds-web-acl",
-            "MetricName": "kindsWebAcl",
-            "DefaultAction": {"Type": "ALLOW"},
-            "ChangeToken": web_acl_token
-        }),
-    )
-    .await;
-    // The ARN the service minted for the web ACL, used verbatim as a client would.
-    let web_acl_arn = web_acl["WebACL"]["WebACLArn"]
-        .as_str()
-        .unwrap_or_else(|| panic!("CreateWebACL returned no WebACLArn: {web_acl}"))
-        .to_string();
+    // The ARN the service holds for that web ACL, used verbatim as a client would.
+    let web_acl_arn = {
+        let web_acl_id = store_web_acl(
+            &engine,
+            REGION,
+            "kinds-web-acl",
+            "kindsWebAcl",
+            "ALLOW",
+            &[],
+        );
+        expected_arn(REGION, &web_acl_id)
+    };
 
     let rule_group_token = change_token(&router).await;
     let rule_group = ok_call(

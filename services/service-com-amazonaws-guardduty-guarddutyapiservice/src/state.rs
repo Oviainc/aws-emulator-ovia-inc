@@ -453,6 +453,20 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
             .find(|plan| plan.bucket_name == bucket_name)
     }
 
+    /// [`Self::malware_protection_plan_for_bucket`], for a caller that writes to the
+    /// plan it resolves — `SendObjectMalwareScan` recording the object scan it
+    /// accepted against the plan protecting the object's bucket.
+    pub fn malware_protection_plan_for_bucket_mut(
+        &mut self,
+        region: &str,
+        bucket_name: &str,
+    ) -> Option<&mut MalwareProtectionPlan> {
+        self.malware_protection_plans
+            .values_mut()
+            .filter(|plan| plan.region == region)
+            .find(|plan| plan.bucket_name == bucket_name)
+    }
+
     /// How many Malware Protection plans `region`'s endpoint holds — the count the
     /// per-account-per-Region quota
     /// ([`MAX_MALWARE_PROTECTION_PLANS_PER_ACCOUNT_PER_REGION`]) is measured
@@ -1458,6 +1472,32 @@ pub const ROLE_MEMBER: &str = "role";
 
 /// The wire name of the `ProtectedResource` member, for the same reason.
 pub const PROTECTED_RESOURCE_MEMBER: &str = "protectedResource";
+
+/// The wire name of `SendObjectMalwareScan`'s `S3Object` member
+/// (`smithy_query(operation="SendObjectMalwareScan")` renders it `s3Object`), for a
+/// rejection to name.
+pub const S3_OBJECT_MEMBER: &str = "s3Object";
+
+/// The wire name of that member's `Bucket`: "The name of the S3 bucket containing
+/// the object to scan" (`smithy_query(shape="S3ObjectForSendObjectMalwareScan")`).
+/// Dotted the way this service names a nested member in a rejection, as
+/// [`DESTINATION_ARN_MEMBER`] is.
+pub const S3_OBJECT_BUCKET_MEMBER: &str = "s3Object.bucket";
+
+/// The wire name of that member's `Key`: "The key (name) of the S3 object to scan
+/// for malware" (`smithy_query(shape="S3ObjectForSendObjectMalwareScan")`).
+pub const S3_OBJECT_KEY_MEMBER: &str = "s3Object.key";
+
+/// The message an object scan is refused with when the Region's endpoint holds no
+/// Malware Protection plan for the bucket the request names.
+///
+/// "The bucket must have a Malware Protection plan configured to use this API"
+/// (`smithy_query(query="doc",shape="SendObjectMalwareScanRequest",member="S3Object")`),
+/// so a bucket with no plan has nothing to scan the object with. Built from the
+/// REQUEST — the condition the caller broke — and naming neither the bucket nor the
+/// Region, like every other rejection this service answers.
+pub const OBJECT_MALWARE_SCAN_WITHOUT_PLAN_MESSAGE: &str =
+    "The request is rejected because the S3 bucket does not have a Malware Protection plan configured.";
 
 /// The `MalwareProtectionPlanStatus` a plan GuardDuty accepted reports: the plan
 /// is in force and nothing is wrong with it. The enum's other two members
@@ -3329,7 +3369,76 @@ pub struct MalwareProtectionPlan {
     pub created_at_millis: i64,
     /// `MalwareProtectionPlanStatus`.
     pub status: String,
+    /// The on-demand object scans `SendObjectMalwareScan` asked this plan for,
+    /// oldest first — see [`ObjectMalwareScanRequest`]. They hang off the PLAN
+    /// because the plan is what the API requires ("The bucket must have a Malware
+    /// Protection plan configured to use this API",
+    /// `smithy_query(query="doc",shape="SendObjectMalwareScanRequest",member="S3Object")`),
+    /// so a plan a delete removes takes the scans it accepted with it.
+    ///
+    /// BOUNDED at [`MAX_OBJECT_MALWARE_SCANS_PER_PLAN`] entries, oldest first:
+    /// write it through [`MalwareProtectionPlan::record_object_scan`], never by
+    /// pushing directly.
+    pub object_scans: Vec<ObjectMalwareScanRequest>,
 }
+
+impl MalwareProtectionPlan {
+    /// Record one accepted object scan against this plan, dropping the oldest
+    /// entries past [`MAX_OBJECT_MALWARE_SCANS_PER_PLAN`].
+    ///
+    /// Eviction rather than refusal: the caller is handed no identifier for the
+    /// scan it asked for (`SendObjectMalwareScan`'s response has no members —
+    /// `smithy_query(shape="SendObjectMalwareScanResponse")`) and no operation
+    /// reports one, so no caller can hold a reference to an entry this drops. A
+    /// send the real service accepts is therefore never refused for the sake of a
+    /// store guard.
+    pub fn record_object_scan(&mut self, request: ObjectMalwareScanRequest) {
+        self.object_scans.push(request);
+        let overflow = self
+            .object_scans
+            .len()
+            .saturating_sub(MAX_OBJECT_MALWARE_SCANS_PER_PLAN);
+        if overflow > 0 {
+            self.object_scans.drain(..overflow);
+        }
+    }
+}
+
+/// One on-demand S3 object scan `SendObjectMalwareScan` accepted, held on the
+/// [`MalwareProtectionPlan`] that protects the object's bucket.
+///
+/// It records WHAT was asked for and WHEN, and nothing else: GuardDuty Malware
+/// Protection would read the object's bytes and scan them, which this emulator has
+/// no scanner and no S3 object content for. So no verdict, status, tag or file count
+/// is synthesised for a scan nothing ran — the same line
+/// [`MALWARE_SCAN_FAILED`] draws for an EC2 scan, except that this operation models
+/// no result for a caller to read at all: its response carries no members
+/// (`smithy_query(shape="SendObjectMalwareScanResponse")`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectMalwareScanRequest {
+    /// `S3Object.Key`, stored verbatim: "the full key path of the object within the
+    /// bucket" (`smithy_query(shape="S3ObjectForSendObjectMalwareScan")`). The
+    /// bucket is not repeated here — the plan this record hangs off names it.
+    pub object_key: String,
+    /// `S3Object.VersionId`, when the request named one. "If not specified, the
+    /// latest version of the object is scanned"
+    /// (`smithy_query(shape="S3ObjectForSendObjectMalwareScan")`), so an absent
+    /// version id is stored as absent rather than as a value.
+    pub version_id: Option<String>,
+    /// When the send was accepted, in epoch milliseconds.
+    pub requested_at_millis: i64,
+}
+
+/// The most accepted object scans one Malware Protection plan retains.
+///
+/// A STORE GUARD, not a modelled quota, like [`MAX_CLIENT_TOKENS`]: AWS publishes no
+/// ceiling on how many objects may be sent for scanning, the object key is
+/// request-chosen, and an accepted scan has no expiry of its own, so without this a
+/// caller could make one plan retain records without limit. Per PLAN, so the whole
+/// log is bounded by this times the plan ceilings
+/// ([`MAX_MALWARE_PROTECTION_PLANS_PER_ACCOUNT_PER_REGION`] across
+/// [`MAX_MALWARE_PROTECTION_PLAN_REGIONS`] Regions).
+pub const MAX_OBJECT_MALWARE_SCANS_PER_PLAN: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Malware scans

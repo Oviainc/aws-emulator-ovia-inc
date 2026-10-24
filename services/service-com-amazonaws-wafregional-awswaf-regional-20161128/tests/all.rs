@@ -57,6 +57,8 @@ mod sql_injection_match_set_updates;
 mod state_roundtrip;
 #[path = "all/web_acl_default_action.rs"]
 mod web_acl_default_action;
+#[path = "all/web_acl_end_of_support.rs"]
+mod web_acl_end_of_support;
 #[path = "all/web_acl_lifecycle.rs"]
 mod web_acl_lifecycle;
 #[path = "all/wire.rs"]
