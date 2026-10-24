@@ -157,7 +157,7 @@ fn seed(engine: &engine::InMemoryEngine) -> Vec<(VpcAttributes, String)> {
     let mut seeded = Vec::new();
     for (index, attributes) in attribute_combinations().into_iter().enumerate() {
         let cidr_block = format!("10.{index}.0.0/16");
-        let vpc_id = guard.insert_vpc(&cidr_block, false, "default", "available", Vec::new());
+        let vpc_id = guard.insert_vpc(&cidr_block, false, "default", "available", REGION, Vec::new());
         guard.vpc_attributes.insert(vpc_id.clone(), attributes);
         seeded.push((attributes, vpc_id));
     }
@@ -291,7 +291,8 @@ async fn a_vpc_with_no_stored_attribute_row_reads_as_an_unmodified_vpc() {
     let vpc_id = {
         let store = engine.state::<Ec2State>();
         let mut guard = store.lock();
-        let vpc_id = guard.insert_vpc("10.7.0.0/16", false, "default", "available", Vec::new());
+        let vpc_id =
+            guard.insert_vpc("10.7.0.0/16", false, "default", "available", REGION, Vec::new());
         guard.vpc_attributes.remove(&vpc_id);
         vpc_id
     };

@@ -67,7 +67,7 @@ fn insert_vpc(engine: &engine::InMemoryEngine, cidr_block: &str) -> String {
     engine
         .state::<Ec2State>()
         .lock()
-        .insert_vpc(cidr_block, false, "default", "available", Vec::new())
+        .insert_vpc(cidr_block, false, "default", "available", REGION, Vec::new())
 }
 
 /// One `CreateSecurityGroup` request, with the members the row exercises.

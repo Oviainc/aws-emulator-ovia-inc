@@ -329,6 +329,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.has_vpc_capacity() {
             return Err(state::vpc_limit_exceeded());
         }
+        // The first VPC of a Region mints that Region's default DHCP option set, and the
+        // Region comes from the caller's credential scope, so the option set store has a
+        // ceiling of its own that this asks about before anything is written.
+        if !store.has_dhcp_option_set_capacity(&region) {
+            return Err(state::dhcp_options_limit_exceeded());
+        }
+        // Those option set bytes are part of what this request would store, so they are
+        // checked against the budget here rather than added behind its back.
+        let payload_bytes =
+            payload_bytes.saturating_add(store.unheld_default_dhcp_options_bytes(&region));
         if store.would_exceed_stored_bytes(payload_bytes) {
             return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
                 "This emulator holds {held} of at most {max} bytes of caller-supplied \
@@ -350,12 +360,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `pending`. Only `CreateDefaultVpc` creates the Region's default VPC, so this one
         // is not the default.
         // `insert_vpc` charges the tag bytes against the store's budget itself, so no
-        // writer can store them uncharged.
+        // writer can store them uncharged, and it associates the Region's default DHCP
+        // option set with the VPC — "we automatically associate it with a default set of
+        // DHCP options" (Amazon VPC User Guide, "DHCP option sets"), the one set every VPC
+        // of the Region inherits rather than one minted per VPC.
         let vpc_id = store.insert_vpc(
             &cidr_block,
             false,
             tenancy,
             state::VPC_STATE_PENDING,
+            &region,
             tags,
         );
         // "When you create a VPC, it comes with a default security group" (Amazon VPC User

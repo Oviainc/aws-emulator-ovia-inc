@@ -68,8 +68,18 @@ struct VpcSpec {
     cidr_block: &'static str,
     instance_tenancy: &'static str,
     state: &'static str,
+    /// The Region the VPC is created in, which decides the default DHCP option set it
+    /// inherits — the `dhcp-options-id` filter's subject.
+    region: &'static str,
     tags: Vec<Tag>,
 }
+
+/// The Region all but one seeded VPC is created in: the one every call here is signed for.
+const SEEDED_REGION: &str = REGION;
+
+/// The Region the one seeded VPC that is not in [`SEEDED_REGION`] is created in, so the
+/// store holds two default DHCP option sets and `dhcp-options-id` selects a proper subset.
+const OTHER_REGION: &str = "eu-west-1";
 
 /// The VPCs the filter and paging tables are written against, beyond the default VPC a
 /// fresh account already has. They differ along every attribute the documented filters
@@ -80,36 +90,44 @@ fn seeded_specs() -> Vec<VpcSpec> {
             cidr_block: "10.0.0.0/16",
             instance_tenancy: "default",
             state: "available",
+            region: SEEDED_REGION,
             tags: vec![tag("Name", "web"), tag("Owner", "TeamA")],
         },
         VpcSpec {
             cidr_block: "10.1.0.0/16",
             instance_tenancy: "dedicated",
             state: "available",
+            region: SEEDED_REGION,
             tags: vec![tag("Name", "batch"), tag("Owner", "TeamB")],
         },
         VpcSpec {
             cidr_block: "10.2.0.0/16",
             instance_tenancy: "default",
             state: "pending",
+            region: SEEDED_REGION,
             tags: vec![tag("Name", "web")],
         },
         VpcSpec {
             cidr_block: "192.168.0.0/24",
             instance_tenancy: "host",
             state: "available",
+            region: SEEDED_REGION,
             tags: Vec::new(),
         },
+        // The one VPC of another Region, so it inherits that Region's default DHCP option
+        // set rather than the one every row above carries.
         VpcSpec {
             cidr_block: "172.20.0.0/16",
             instance_tenancy: "default",
             state: "available",
+            region: OTHER_REGION,
             tags: vec![tag("Owner", "TeamA")],
         },
         VpcSpec {
             cidr_block: "10.3.0.0/16",
             instance_tenancy: "default",
             state: "available",
+            region: SEEDED_REGION,
             tags: vec![tag("Project", "atlas")],
         },
     ]
@@ -139,6 +157,7 @@ fn seed(engine: &engine::InMemoryEngine) -> Seeded {
             false,
             spec.instance_tenancy,
             spec.state,
+            spec.region,
             spec.tags,
         );
     }
@@ -263,6 +282,7 @@ async fn every_stored_vpc_is_reported_and_a_later_write_is_visible() {
         false,
         "default",
         "available",
+        SEEDED_REGION,
         vec![tag("Name", "late")],
     );
     let after = described_ids(&router, "after a later write", &[]).await;
@@ -314,10 +334,18 @@ async fn each_documented_filter_selects_the_vpcs_whose_attribute_equals_a_value(
             vec!["associated".into()],
             all.clone(),
         ),
+        // The Region's default DHCP option set is what a VPC inherits, so this selects
+        // every VPC of the signed-for Region — all but the one seeded in another.
         (
             "dhcp-options-id",
-            vec![seeded.dhcp_options_ids[2].clone()],
-            vec![2],
+            vec![seeded.dhcp_options_ids[0].clone()],
+            vec![0, 1, 2, 3, 4, 6],
+        ),
+        // The other Region's set selects exactly the one VPC created there.
+        (
+            "dhcp-options-id",
+            vec![seeded.dhcp_options_ids[5].clone()],
+            vec![5],
         ),
         (
             "ipv6-cidr-block-association.ipv6-cidr-block",
