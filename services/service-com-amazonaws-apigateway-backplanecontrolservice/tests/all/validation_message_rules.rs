@@ -9,14 +9,14 @@
 //! crate's existing harness, reused from `rest_api_lifecycle`.
 //!
 //! The RULE under test, which is this service's and not one operation's: a refused
-//! request is answered HTTP 400 `ValidationException` whose message names the offending
+//! request is answered HTTP 400 `BadRequestException` whose message names the offending
 //! value, the member's path ROOTED AT THE OPERATION'S INPUT SHAPE (`<operation>Input` in
 //! lowerCamel), and the constraint it failed — with a `@pattern` emitted without the
 //! whole-value anchors the public model adds, and an enum value set listed in the order
 //! the service declares the enum in.
 //!
 //! The rows span what the rule generalises over rather than repeating one recorded call:
-//! six different operations (so the root is shown to be derived per operation, not a
+//! seven different operations (so the root is shown to be derived per operation, not a
 //! constant), four constraint classes (an enum value set, a `@pattern`, an absent
 //! required member, several violations at once), both HTTP bindings a violated member
 //! can have (a body member and a URI label), and a nested member at two different list
@@ -26,9 +26,23 @@ use serde_json::{json, Value};
 
 use crate::rest_api_lifecycle::{Answer, Gateway};
 
-/// The error code the framework's refusal channel names a constraint failure by for this
-/// `restJson1` service, and which this service's wording keeps.
+/// The error code a constraint failure carries on this surface: API Gateway classifies a
+/// request that breaks a modelled input constraint as a BAD REQUEST, which is the code a
+/// client branches on. Source: the recorded refusal of an out-of-enum
+/// `CreateAuthorizer$type`, which AWS answers `BadRequestException` (HTTP 400), and
+/// `BadRequestException` is the client-input error this service's model declares.
+const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
+
+/// The code this surface must NOT answer a constraint failure with: the framework's
+/// generic default for a `restJson1` service, which a client of API Gateway does not
+/// branch on.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The code a HANDLER answers for identifiers that name no stored record, as every
+/// operation of this service models it: `NotFoundException` (HTTP 404). A row that
+/// satisfies every modelled constraint and still names an API that was never created is
+/// answered by this, which is what says the request got PAST the boundary validator.
+const NOT_FOUND_EXCEPTION: &str = "NotFoundException";
 
 /// The `Op` enum's value set as API Gateway lists it. Source: the recorded refusals of an
 /// invalid patch `op` on `UpdateDocumentationVersion`, `UpdateRestApi` and `UpdateApiKey`
@@ -65,6 +79,10 @@ const GATEWAY_RESPONSE_TYPE_VALUES: [&str; 21] = [
     "QUOTA_EXCEEDED",
     "WAF_FILTERED",
 ];
+
+/// The `AuthorizerType` value set, in the order the model declares it. Source:
+/// `smithy_query(query="shape", shape="com.amazonaws.apigateway#AuthorizerType")`.
+const AUTHORIZER_TYPE_VALUES: [&str; 3] = ["TOKEN", "REQUEST", "COGNITO_USER_POOLS"];
 
 /// The `StatusCode` shape's regular expression as the service emits it: the modelled
 /// `^[1-5]\d\d$` without the whole-value anchors. Source:
@@ -104,7 +122,7 @@ fn patch_operations(count: usize, position: usize, bad: &str) -> Value {
     )
 }
 
-/// Assert `answer` is the 400 `ValidationException` stating exactly `message`.
+/// Assert `answer` is the 400 `BadRequestException` stating exactly `message`.
 fn assert_stated(answer: &Answer, case: &str, message: &str) {
     assert_eq!(
         answer.status, 400,
@@ -113,8 +131,8 @@ fn assert_stated(answer: &Answer, case: &str, message: &str) {
     );
     assert_eq!(
         answer.error.as_deref(),
-        Some(VALIDATION_EXCEPTION),
-        "case {case}: expected {VALIDATION_EXCEPTION}, got {:?}",
+        Some(BAD_REQUEST_EXCEPTION),
+        "case {case}: expected {BAD_REQUEST_EXCEPTION}, got {:?}",
         answer.error
     );
     assert_eq!(
@@ -238,6 +256,23 @@ async fn a_refused_request_names_the_member_by_its_path_from_the_operations_inpu
             )),
         ),
         (
+            // The recorded case of this refusal's CODE: an authorizer type outside the
+            // modelled enum, which AWS answers `BadRequestException` for.
+            "CreateAuthorizer, a type outside its enum".to_string(),
+            "POST",
+            "/restapis/abcde12345/authorizers".to_string(),
+            Some(json!({
+                "name": "auth",
+                "type": "NOT_A_REAL_TYPE",
+                "identitySource": "method.request.header.Auth",
+            })),
+            one(&clause(
+                "NOT_A_REAL_TYPE",
+                "createAuthorizerInput.type",
+                &enum_value_set(&AUTHORIZER_TYPE_VALUES),
+            )),
+        ),
+        (
             // An absent required member is found while READING the request rather than
             // while walking it, and is stated with the same rooted path.
             "CreateRestApi, no name at all".to_string(),
@@ -306,13 +341,21 @@ async fn every_violation_of_one_request_is_stated_with_the_same_rooted_path() {
     }
 }
 
+/// One row of the accepted-request table below: the case name, the HTTP method, the URI,
+/// the request body, and the answer the OPERATION itself makes — `None` for its own
+/// success, or the modelled error code it answers identifiers that name no record with.
+type AcceptedRow<'a> = (&'a str, &'a str, &'a str, Option<Value>, Option<&'a str>);
+
 #[tokio::test]
 async fn a_request_within_every_modelled_constraint_is_not_refused_as_a_validation_error() {
     // The wording seam must not refuse what the model accepts: each row satisfies every
     // constraint its operation declares, so none of them may answer the validation
-    // error above. What they DO answer is their own operation's business (a 201, or the
-    // modelled 404 for an API that does not exist, or the scaffold's 501).
-    let rows: [(&str, &str, &str, Option<Value>); 5] = [
+    // error above. What they DO answer is their own operation's business, which the row
+    // states: a success for a request naming records that exist, and the modelled
+    // `NotFoundException` for one whose identifiers name an API that was never created —
+    // a refusal the HANDLER makes, which is what says the request got past the boundary
+    // validator rather than being refused by it.
+    let rows: [AcceptedRow; 5] = [
         (
             "CreateRestApi with every modelled member",
             "POST",
@@ -322,31 +365,38 @@ async fn a_request_within_every_modelled_constraint_is_not_refused_as_a_validati
                 "apiKeySource": "HEADER",
                 "endpointConfiguration": { "types": ["REGIONAL"] },
             })),
+            None,
         ),
         (
             "UpdateRestApi with a legal op at each position",
             "PATCH",
             "/restapis/abcde12345",
             Some(json!({ "patchOperations": patch_operations(3, 0, "unused") })),
+            Some(NOT_FOUND_EXCEPTION),
         ),
         (
             "PutGatewayResponse within the status-code pattern",
             "PUT",
             "/restapis/abcde12345/gatewayresponses/DEFAULT_4XX",
             Some(json!({ "statusCode": "404" })),
+            Some(NOT_FOUND_EXCEPTION),
         ),
         (
             "PutIntegrationResponse within the status-code pattern",
             "PUT",
             "/restapis/abcde12345/resources/fghij67890/methods/GET/integration/responses/200",
             Some(json!({})),
+            Some(NOT_FOUND_EXCEPTION),
         ),
-        ("GetRestApis, which constrains nothing", "GET", "/restapis", None),
+        ("GetRestApis, which constrains nothing", "GET", "/restapis", None, None),
     ];
 
     let gateway = Gateway::new();
-    for (case, method, uri, body) in rows {
+    for (case, method, uri, body, expected) in rows {
         let answer = gateway.call(method, uri, body).await;
+        // Not the framework's generic code, which this surface never answers at all,
+        // and not the constraint envelope either — which is what says the request was
+        // not refused as a constraint violation, whatever code the answer carries.
         assert_ne!(
             answer.error.as_deref(),
             Some(VALIDATION_EXCEPTION),
@@ -354,5 +404,38 @@ async fn a_request_within_every_modelled_constraint_is_not_refused_as_a_validati
             answer.status,
             answer.body
         );
+        let message = answer.body["message"].as_str().unwrap_or_default();
+        assert!(
+            !message.contains("validation error"),
+            "case {case}: expected no validation refusal, got {} with {:?}",
+            answer.status,
+            answer.body
+        );
+        // The POSITIVE expectation, so the row cannot go vacuous: the answer is the one
+        // the operation itself makes.
+        match expected {
+            None => assert!(
+                (200..300).contains(&answer.status),
+                "case {case}: expected the operation's own success, got {} {:?} with {:?}",
+                answer.status,
+                answer.error,
+                answer.body
+            ),
+            Some(code) => {
+                assert_eq!(
+                    answer.error.as_deref(),
+                    Some(code),
+                    "case {case}: expected the handler's own {code}, got {} {:?} with {:?}",
+                    answer.status,
+                    answer.error,
+                    answer.body
+                );
+                assert_eq!(
+                    answer.status, 404,
+                    "case {case}: expected HTTP 404 with {code}, got {}",
+                    answer.status
+                );
+            }
+        }
     }
 }

@@ -63,6 +63,8 @@ mod on_premises_revisions_and_blue_green;
 mod on_premises_tag_removal;
 #[path = "all/on_premises_tagging.rs"]
 mod on_premises_tagging;
+#[path = "all/predefined_traffic_shift_configs.rs"]
+mod predefined_traffic_shift_configs;
 #[path = "all/quotas_waits_and_host_names.rs"]
 mod quotas_waits_and_host_names;
 #[path = "all/read_response_collections.rs"]

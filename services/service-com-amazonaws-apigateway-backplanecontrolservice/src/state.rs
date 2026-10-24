@@ -6,8 +6,9 @@
 //! `Resource`s under it (including the implicit root resource every API is created
 //! with), the `Method`s put on those resources, the API's `Stage`s and the gateway
 //! responses a developer has customized on it — beside the
-//! account's `ApiKey`, `UsagePlan` and custom `DomainName` records. Every handler in `src/ops/`
-//! computes its response from these records; nothing is synthesised per request.
+//! account's `ApiKey`, `VpcLink`, `UsagePlan` and custom `DomainName` records. Every
+//! handler in `src/ops/` computes its response from these records; nothing is synthesised
+//! per request.
 //!
 //! A few leaf values are stored as the modelled shapes from [`crate::ops::types`]
 //! (`EndpointConfiguration`, `Method`'s responses and integration) rather than as a
@@ -38,6 +39,11 @@ pub struct ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// Every created `ApiKey`, keyed by its API key id — the identifier `GetApiKey`
     /// and `DeleteApiKey` take in their `apiKey` path label, NOT the key's value.
     pub api_keys: BTreeMap<String, ApiKeyEntry>,
+    /// Every created `VpcLink`, keyed by its VPC link id — the identifier `GetVpcLink`
+    /// takes in its `vpcLinkId` path label and an `Integration`'s `connectionId` names.
+    /// A VPC link belongs to the ACCOUNT rather than to one API, so it sits beside the
+    /// APIs here rather than under one of them.
+    pub vpc_links: BTreeMap<String, VpcLinkEntry>,
     /// Every created `UsagePlan`, keyed by its usage plan id — the identifier
     /// `GetUsagePlan` takes in its `usagePlanId` path label.
     pub usage_plans: BTreeMap<String, UsagePlanEntry>,
@@ -362,6 +368,48 @@ impl StageEntry {
                     CACHE_CLUSTER_AVAILABLE
                 }
             }
+        }
+    }
+}
+
+/// One stored `VpcLink`: a named set of target ARNs a private integration reaches a VPC
+/// through, with the provisioning status the clock moves.
+#[derive(Debug, Clone, Default)]
+pub struct VpcLinkEntry {
+    /// The VPC link id, which is also this record's key in
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::vpc_links`].
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// The target ARNs the request supplied, in the order it listed them: "The ARN of
+    /// the network load balancer of the VPC targeted by the VPC link"
+    /// (`VpcLink$targetArns`).
+    pub target_arns: Vec<String>,
+    /// When this link finishes being provisioned. It is reported [`VPC_LINK_PENDING`]
+    /// until this instant and [`VPC_LINK_AVAILABLE`] from it on; see
+    /// [`VPC_LINK_PROVISION_SPAN`] and [`Self::status`].
+    pub available_at: Option<::std::time::Instant>,
+    pub tags: BTreeMap<String, String>,
+    /// This link's creation rank, from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
+    /// listing can report creation order rather than id order. Nothing reads it yet:
+    /// `GetVpcLinks`, the listing it is stamped for, is still a stub.
+    pub sequence: u64,
+}
+
+impl VpcLinkEntry {
+    /// The `status` this link reports now.
+    ///
+    /// `CreateVpcLink` is "an asynchronous operation that typically takes 2-4 minutes to
+    /// complete and become operational" (the operation's own documentation), so a link
+    /// is created [`VPC_LINK_PENDING`] and becomes [`VPC_LINK_AVAILABLE`] once
+    /// [`VPC_LINK_PROVISION_SPAN`] has passed — a transition the CLOCK owes, materialised
+    /// from the stored due instant rather than by sleeping or by being read, the way
+    /// [`StageEntry::cache_cluster_status`] materialises its own.
+    pub fn status(&self) -> &'static str {
+        match self.available_at {
+            Some(available_at) if ::std::time::Instant::now() < available_at => VPC_LINK_PENDING,
+            _ => VPC_LINK_AVAILABLE,
         }
     }
 }
@@ -1249,6 +1297,25 @@ pub const CACHE_CLUSTER_DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
 pub const CACHE_CLUSTER_DELETE_SPAN: ::std::time::Duration =
     ::std::time::Duration::from_millis(500);
 
+/// API Gateway's default quota "VPC links per account per Region: 20".
+pub const MAX_VPC_LINKS: usize = 20;
+
+/// The `status` of a VPC link that is still being provisioned, from the modelled
+/// `VpcLinkStatus` enum (`smithy_query(query="shape",
+/// shape="com.amazonaws.apigateway#VpcLinkStatus")`: `AVAILABLE`, `PENDING`,
+/// `DELETING`, `FAILED`).
+pub const VPC_LINK_PENDING: &str = "PENDING";
+
+/// The `status` of a VPC link that is provisioned; see [`VPC_LINK_PENDING`].
+pub const VPC_LINK_AVAILABLE: &str = "AVAILABLE";
+
+/// How long a VPC link stays [`VPC_LINK_PENDING`] after `CreateVpcLink`, after which it
+/// reports [`VPC_LINK_AVAILABLE`]. API Gateway documents no duration for it
+/// ("typically takes 2-4 minutes to complete and become operational" is guidance, not a
+/// contract), so this span is the emulator's own, chosen so a caller reading straight
+/// after the create still observes `PENDING`.
+pub const VPC_LINK_PROVISION_SPAN: ::std::time::Duration = ::std::time::Duration::from_millis(500);
+
 /// How long an edge-optimized custom domain name takes to become
 /// [`DOMAIN_NAME_AVAILABLE`]: the CloudFront distribution API Gateway creates for it is
 /// not in place when the create call answers. API Gateway documents no duration for it
@@ -1310,16 +1377,15 @@ pub const MAX_TAG_VALUE_CHARS: usize = 256;
 const ARN_SERVICE: &str = "apigateway";
 
 /// The leading resource-portion segment of each taggable resource kind whose records
-/// this emulator does not keep: the operations that create a client certificate, a VPC
-/// link or a domain name access association are still scaffolds, so nothing can answer to
-/// one of these ARNs — while the ARN itself is a well-formed ARN of a taggable API
-/// Gateway resource and so is not a malformed request.
+/// this emulator does not keep: the operations that create a client certificate or a
+/// domain name access association are still scaffolds, so nothing can answer to one of
+/// these ARNs — while the ARN itself is a well-formed ARN of a taggable API Gateway
+/// resource and so is not a malformed request.
 ///
 /// The segments are the first path segment of each kind's read URI; see the section
 /// comment above for the `smithy_query` calls they come from.
 const UNSTORED_TAGGABLE_KINDS: &[&str] = &[
     "clientcertificates",
-    "vpclinks",
     "domainnameaccessassociations",
 ];
 
@@ -1336,6 +1402,8 @@ pub enum TaggedResource {
     },
     /// `/apikeys/{apiKey}` — an [`ApiKeyEntry`]'s tags.
     ApiKey { api_key_id: String },
+    /// `/vpclinks/{vpcLinkId}` — a [`VpcLinkEntry`]'s tags.
+    VpcLink { vpc_link_id: String },
     /// `/usageplans/{usagePlanId}` — a [`UsagePlanEntry`]'s tags.
     UsagePlan { usage_plan_id: String },
     /// `/domainnames/{domainName}` — a [`DomainNameEntry`]'s tags, where the path
@@ -1345,6 +1413,32 @@ pub enum TaggedResource {
     /// [`UNSTORED_TAGGABLE_KINDS`]. `kind` is that list's entry and `id` the identifier
     /// the ARN carried, so the refusal can name what it could not resolve.
     Unstored { kind: &'static str, id: String },
+}
+
+impl TaggedResource {
+    /// The kind of resource this names, as the leading segment of its ARN's resource
+    /// portion — which is also the first path segment of the operation that reads it
+    /// (`restapis`, `apikeys`, `vpclinks`, `domainnames`, …).
+    ///
+    /// For an operation that takes an ARN of ONE kind rather than any taggable one
+    /// (`RejectDomainNameAccessAssociation`, whose two ARNs name an access association
+    /// and a domain name): it reads the ARN through [`parse_tagged_resource`] like every
+    /// other ARN of this service and then checks the kind, instead of parsing the value a
+    /// second way.
+    ///
+    /// It is the ARN's FIRST segment only, so it does not distinguish an API from one of
+    /// its stages — both answer `restapis`, the segment their ARNs share. A caller that
+    /// needs that distinction matches the variant rather than the kind.
+    pub fn kind(&self) -> &str {
+        match self {
+            TaggedResource::RestApi { .. } | TaggedResource::Stage { .. } => "restapis",
+            TaggedResource::ApiKey { .. } => "apikeys",
+            TaggedResource::VpcLink { .. } => "vpclinks",
+            TaggedResource::UsagePlan { .. } => "usageplans",
+            TaggedResource::DomainName { .. } => "domainnames",
+            TaggedResource::Unstored { kind, .. } => kind,
+        }
+    }
 }
 
 /// Read `resource_arn` as the ARN of a taggable resource of this service.
@@ -1379,6 +1473,9 @@ pub fn parse_tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
         }),
         ["apikeys", api_key_id] => Some(TaggedResource::ApiKey {
             api_key_id: (*api_key_id).to_string(),
+        }),
+        ["vpclinks", vpc_link_id] => Some(TaggedResource::VpcLink {
+            vpc_link_id: (*vpc_link_id).to_string(),
         }),
         ["usageplans", usage_plan_id] => Some(TaggedResource::UsagePlan {
             usage_plan_id: (*usage_plan_id).to_string(),
@@ -2225,6 +2322,11 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
                 .get(api_key_id)
                 .map(|key| &key.tags)
                 .ok_or_else(|| NO_SUCH_API_KEY.to_string()),
+            TaggedResource::VpcLink { vpc_link_id } => self
+                .vpc_links
+                .get(vpc_link_id)
+                .map(|link| &link.tags)
+                .ok_or_else(|| NO_SUCH_VPC_LINK.to_string()),
             TaggedResource::UsagePlan { usage_plan_id } => self
                 .usage_plans
                 .get(usage_plan_id)
@@ -2237,6 +2339,17 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
                 .ok_or_else(|| NO_SUCH_DOMAIN_NAME.to_string()),
             TaggedResource::Unstored { kind, id } => Err(no_such_tagged_resource(kind, id)),
         }
+    }
+
+    /// Whether this emulator HOLDS the record `resource` names, for an operation that
+    /// resolves an ARN without reading its tags (`RejectDomainNameAccessAssociation`).
+    ///
+    /// Reached through [`Self::tags_of`], the one lookup that resolves an ARN to a stored
+    /// record, so an operation that resolves an ARN can never disagree with the tag
+    /// operations about whether that ARN names anything. `Err` carries the same
+    /// `NotFoundException` message those operations answer with.
+    pub fn holds(&self, resource: &TaggedResource) -> Result<(), String> {
+        self.tags_of(resource).map(|_| ())
     }
 
     /// The same collection for WRITING, so `TagResource` and `UntagResource` edit the
@@ -2267,6 +2380,11 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
                 .get_mut(api_key_id)
                 .map(|key| &mut key.tags)
                 .ok_or_else(|| NO_SUCH_API_KEY.to_string()),
+            TaggedResource::VpcLink { vpc_link_id } => self
+                .vpc_links
+                .get_mut(vpc_link_id)
+                .map(|link| &mut link.tags)
+                .ok_or_else(|| NO_SUCH_VPC_LINK.to_string()),
             TaggedResource::UsagePlan { usage_plan_id } => self
                 .usage_plans
                 .get_mut(usage_plan_id)
@@ -2437,12 +2555,15 @@ pub fn no_such_tagged_resource(kind: &str, id: &str) -> String {
     )
 }
 
-/// The `BadRequestException` message for a `resourceArn` that is not the ARN of a
-/// taggable resource of this service — the refusal [`parse_tagged_resource`]'s `None`
-/// earns. BUILT FROM THE REQUEST: it names the value that could not be read as such an
-/// ARN, so the caller can see which argument to fix.
-pub fn invalid_tagged_resource_arn(resource_arn: &str) -> String {
-    format!("Invalid ARN specified in the request {resource_arn}")
+/// The `BadRequestException` message for ANY caller-supplied value this service could
+/// not read as an ARN — a `resourceArn` the tag operations take (the refusal
+/// [`parse_tagged_resource`]'s `None` earns), a `targetArns` entry, a domain name or
+/// access-association ARN. ONE sentence and one spelling of it, BUILT FROM THE REQUEST:
+/// it names the value that could not be read, so the caller can see which argument to
+/// fix, and the same malformed value is refused the same way whichever member carried
+/// it.
+pub fn invalid_arn(value: &str) -> String {
+    format!("Invalid ARN specified in the request {value}")
 }
 
 /// The `NotFoundException` message for a `documentationPartId` that names no stored
@@ -2457,9 +2578,23 @@ pub const NO_SUCH_DOCUMENTATION_VERSION: &str = "Invalid Documentation version s
 /// of the API.
 pub const NO_SUCH_AUTHORIZER: &str = "Invalid Authorizer identifier specified";
 
+/// The `NotFoundException` message for a `vpcLinkId` that names no stored VPC link, in
+/// the shape of the sibling identifier messages above.
+pub const NO_SUCH_VPC_LINK: &str = "Invalid VPC link identifier specified";
+
 /// The `NotFoundException` message for a `requestValidatorId` that names no stored
 /// request validator of the API, in the shape of the sibling identifier messages above.
 pub const NO_SUCH_REQUEST_VALIDATOR: &str = "Invalid Request Validator identifier specified";
+
+/// The `NotFoundException` message for a `responseType` the API carries no CUSTOMIZED
+/// gateway response for — the record `DeleteGatewayResponse` clears and
+/// `PutGatewayResponse` writes. Every modelled type always has the response API Gateway
+/// generates itself, so what is missing is the customization and not the type; the
+/// message is BUILT FROM THE REQUEST and names the type it looked for, the way this
+/// service's other identifier refusals do (see [`no_such_rest_api`]).
+pub fn no_such_gateway_response(response_type: &str) -> String {
+    format!("No customized gateway response specified for response type {response_type}")
+}
 
 /// The `target` every audit record this service emits carries, so a consumer can select
 /// the access trail without reading the rest of the emulator's traces.

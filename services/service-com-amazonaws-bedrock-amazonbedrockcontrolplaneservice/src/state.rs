@@ -21,6 +21,9 @@
 //! `ops/get_model_import_job.rs` reads back, together with the instant each job's
 //! non-terminal `status` is owed its move to `Completed`.
 //!
+//! And it holds the evaluation jobs `ops/create_evaluation_job.rs` mints and
+//! `ops/get_evaluation_job.rs` reads back.
+//!
 //! And it holds the Bedrock Marketplace model endpoints
 //! `ops/create_marketplace_model_endpoint.rs` mints,
 //! `ops/update_marketplace_model_endpoint.rs` reconfigures and
@@ -37,7 +40,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    EndpointConfig, GuardrailAutomatedReasoningPolicy, GuardrailAutomatedReasoningPolicyConfig,
+    EndpointConfig, EvaluationConfig, EvaluationInferenceConfig, EvaluationOutputDataConfig,
+    GuardrailAutomatedReasoningPolicy, GuardrailAutomatedReasoningPolicyConfig,
     GuardrailContentFilter, GuardrailContentFilterConfig, GuardrailContentFiltersTier,
     GuardrailContentFiltersTierConfig, GuardrailContentPolicy, GuardrailContentPolicyConfig,
     GuardrailContextualGroundingFilter, GuardrailContextualGroundingFilterConfig,
@@ -221,6 +225,41 @@ pub const IMPORT_JOB_COMPLETE_AFTER: Duration = Duration::from_millis(500);
 /// server-side cap a caller could grow this part of the store with nothing but fresh job
 /// names.
 pub const MAX_MODEL_IMPORT_JOBS_PER_ACCOUNT: usize = 100;
+
+/// `EvaluationJobStatus` — the job Amazon Bedrock accepted is running.
+///
+/// The enum is `[InProgress, Completed, Failed, Stopping, Stopped, Deleting]`
+/// (`smithy_query(query="shape",shape="EvaluationJobStatus")`). An accepted evaluation job
+/// runs asynchronously, so this is the status it carries from the call that starts it.
+///
+/// It is also the only status `CreateEvaluationJob` mints, and no clock transition moves
+/// it: the other five report an outcome of work this emulator does not perform. Reaching
+/// `Completed` or `Failed` means the inference and the metric computation over the
+/// caller's dataset ran and the results were written to the request's
+/// `outputDataConfig`, and `Stopping`/`Stopped`/`Deleting` are reached only by a caller's
+/// own `StopEvaluationJob` or `BatchDeleteEvaluationJob` — so none of them is owed by the
+/// clock here.
+pub const EVALUATION_JOB_STATUS_IN_PROGRESS: &str = "InProgress";
+
+/// `EvaluationJobType` — the job computes metrics itself.
+///
+/// The enum is `[Human, Automated]` (`smithy_query(query="shape",
+/// shape="EvaluationJobType")`), and the `EvaluationConfig` union a create carries names
+/// which one the job is: see [`evaluation_job_type_of`].
+pub const EVALUATION_JOB_TYPE_AUTOMATED: &str = "Automated";
+
+/// `EvaluationJobType` — the job's responses are rated by human workers. The other value
+/// of the enum; see [`EVALUATION_JOB_TYPE_AUTOMATED`].
+pub const EVALUATION_JOB_TYPE_HUMAN: &str = "Human";
+
+/// The most evaluation jobs this account may hold at once, past which a create is refused
+/// with `ServiceQuotaExceededException`.
+///
+/// The emulator's own bound rather than a published quota (AWS publishes quotas for
+/// CONCURRENT evaluation jobs per job type, not for the jobs an account's history holds):
+/// without a server-side cap a caller could grow this part of the store with nothing but
+/// fresh job names.
+pub const MAX_EVALUATION_JOBS_PER_ACCOUNT: usize = 100;
 
 /// The number of base-36 digits each half of a minted resource id carries.
 ///
@@ -550,6 +589,55 @@ impl ModelImportJobRecord {
     }
 }
 
+/// One stored evaluation job: the identity `CreateEvaluationJob` minted, the
+/// configuration that request carried, and the instants a read reports.
+///
+/// `status` and `job_type` are `&'static str` for the same reason
+/// [`ModelImportJobRecord::status`] is: both are values this emulator derives
+/// ([`EVALUATION_JOB_STATUS_IN_PROGRESS`], [`evaluation_job_type_of`]) rather than
+/// anything a request names directly.
+#[derive(Debug, Clone)]
+pub struct EvaluationJobRecord {
+    /// The `EvaluationJobArn` this job is addressed by, minted by [`evaluation_job_arn`].
+    pub arn: String,
+    /// `jobName`, as the create request spelled it.
+    pub name: String,
+    /// The region the create addressed, which [`Self::arn`] also carries. Kept beside it
+    /// so the name index is per region without re-parsing an ARN.
+    pub region: String,
+    /// `jobDescription`, as the create request carried it (absent when it carried none).
+    pub description: Option<String>,
+    /// `roleArn` — the service role Amazon Bedrock assumes to run the evaluation.
+    pub role_arn: String,
+    /// `customerEncryptionKeyId`, as the create request carried it. Stored and reported
+    /// VERBATIM: the read's `customerEncryptionKeyId` carries the same `KmsKeyId` shape
+    /// the request's does, so a key ARN, a bare key id and an alias all come back as they
+    /// were given (unlike a member a read reports as a `KmsKeyArn`, which must be
+    /// completed by [`kms_key_arn`]).
+    pub customer_encryption_key_id: Option<String>,
+    /// `applicationType`, as the create request carried it (absent when it carried none —
+    /// the member is optional in both the request and the response, and the model declares
+    /// no default for it).
+    pub application_type: Option<String>,
+    /// `evaluationConfig` — the automated or human evaluation the job runs.
+    pub evaluation_config: EvaluationConfig,
+    /// `inferenceConfig` — the models or knowledge bases the job evaluates.
+    pub inference_config: EvaluationInferenceConfig,
+    /// `outputDataConfig` — where the job's results are saved.
+    pub output_data_config: EvaluationOutputDataConfig,
+    /// `jobTags` — the tags attached to the evaluation job.
+    pub tags: Vec<Tag>,
+    /// `EvaluationJobType`, as [`evaluation_job_type_of`] reads it off
+    /// [`Self::evaluation_config`].
+    pub job_type: &'static str,
+    /// `EvaluationJobStatus`.
+    pub status: &'static str,
+    pub created_at: SystemTime,
+    /// When the job last changed, which is the creation instant until something changes
+    /// it.
+    pub last_modified_at: SystemTime,
+}
+
 /// Per-service state for com-amazonaws-bedrock-amazonbedrockcontrolplaneservice. A handler reaches it through [`service_state`].
 ///
 /// Every map here is bounded, and each bound holds by construction rather than by
@@ -579,6 +667,11 @@ impl ModelImportJobRecord {
 ///   import job, capped at [`MAX_MODEL_IMPORT_JOBS_PER_ACCOUNT`] by the quota
 ///   `CreateModelImportJob` enforces, and `model_import_job_create_tokens` holds at most
 ///   one entry per stored job for the same reason `create_tokens` does.
+///
+/// * `evaluation_jobs` and `evaluation_job_names` hold one entry per stored evaluation
+///   job, capped at [`MAX_EVALUATION_JOBS_PER_ACCOUNT`] by the quota
+///   `CreateEvaluationJob` enforces, and `evaluation_job_create_tokens` holds at most one
+///   entry per stored job for the same reason `create_tokens` does.
 ///
 /// * `marketplace_model_endpoints` holds one entry per live marketplace model endpoint,
 ///   capped at [`MAX_MARKETPLACE_MODEL_ENDPOINTS_PER_ACCOUNT`] by the quota
@@ -663,6 +756,26 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many imported model ids this store has minted; the uniqueness half of a minted
     /// id.
     pub minted_imported_models: u64,
+    /// Every stored evaluation job, keyed by its `EvaluationJobArn` — the one spelling an
+    /// `EvaluationJobIdentifier` carries
+    /// (`smithy_query(query="operation",operation="GetEvaluationJob")`: its pattern is the
+    /// job ARN alone).
+    pub evaluation_jobs: HashMap<String, EvaluationJobRecord>,
+    /// `(region, jobName)` -> `EvaluationJobArn`, so a duplicate job name is a
+    /// `ConflictException`.
+    ///
+    /// Keyed by the region too because the model documents the name as unique "with your
+    /// Amazon Web Services account, and your account's Amazon Web Services region"
+    /// (`smithy_query(query="doc",shape="CreateEvaluationJobRequest",member="jobName")`),
+    /// so the same name in another region names another job.
+    pub evaluation_job_names: HashMap<(String, String), String>,
+    /// `CreateEvaluationJob` idempotency: `(region, clientRequestToken)` -> the `jobArn`
+    /// that token minted. Scoped to that one operation, and to the region the request
+    /// addressed, the way the model import job index is.
+    pub evaluation_job_create_tokens: HashMap<(String, String), String>,
+    /// How many evaluation job ids this store has minted; the uniqueness half of a minted
+    /// id.
+    pub minted_evaluation_jobs: u64,
 }
 
 impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
@@ -778,6 +891,26 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     pub fn mint_imported_model_id(&mut self, now: SystemTime) -> String {
         self.minted_imported_models += 1;
         minted_id(self.minted_imported_models, now)
+    }
+
+    /// The evaluation job an `EvaluationJobIdentifier` names.
+    ///
+    /// A borrow rather than a mutable one: an evaluation job has no transition the clock
+    /// owes (see [`EVALUATION_JOB_STATUS_IN_PROGRESS`]), so a read of one writes nothing.
+    #[must_use]
+    pub fn evaluation_job(&self, identifier: &str) -> Option<&EvaluationJobRecord> {
+        self.evaluation_jobs.get(identifier)
+    }
+
+    /// Mint a fresh evaluation job id: the resource half of an `evaluation-job/<id>` ARN,
+    /// unique within this store.
+    ///
+    /// Built like a guardrail id, and for the same two reasons; `EvaluationJobArn` admits
+    /// exactly `[a-z0-9]{12}` there, which is what two [`ID_HALF_WIDTH`] base-36 halves
+    /// spell.
+    pub fn mint_evaluation_job_id(&mut self, now: SystemTime) -> String {
+        self.minted_evaluation_jobs += 1;
+        minted_id(self.minted_evaluation_jobs, now)
     }
 }
 
@@ -900,6 +1033,32 @@ pub fn model_import_job_arn(region: &str, id: &str) -> String {
 /// spells it.
 pub fn imported_model_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn("bedrock", region, &format!("imported-model/{id}"))
+}
+
+/// The ARN of an evaluation job in `region`:
+/// `arn:aws:bedrock:<region>:<account>:evaluation-job/<id>`, as `EvaluationJobArn`
+/// (`^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:evaluation-job/[a-z0-9]{12}$`)
+/// spells it.
+pub fn evaluation_job_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn("bedrock", region, &format!("evaluation-job/{id}"))
+}
+
+/// The `EvaluationJobType` of a job configured by `config`.
+///
+/// `EvaluationConfig` is a union of `automated` ("an automated evaluation job that
+/// computes metrics") and `human` ("an evaluation job that uses human workers")
+/// (`smithy_query(query="shape",shape="EvaluationConfig")`), and `EvaluationJobType` is
+/// `[Human, Automated]` — so the variant the request carried IS the job's type, and the
+/// type is never read off the request's own wording.
+///
+/// Lives here rather than in one operation's file because `CreateEvaluationJob` derives it
+/// and `GetEvaluationJob` reports it, so both must agree about it.
+#[must_use]
+pub fn evaluation_job_type_of(config: &EvaluationConfig) -> &'static str {
+    match config {
+        EvaluationConfig::Automated(_) => EVALUATION_JOB_TYPE_AUTOMATED,
+        EvaluationConfig::Human(_) => EVALUATION_JOB_TYPE_HUMAN,
+    }
 }
 
 /// Lives here rather than in one operation's file because
