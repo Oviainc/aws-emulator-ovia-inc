@@ -245,11 +245,11 @@ fn cases() -> Vec<Case> {
             terminal_message: COMPLETED,
         },
         Case {
-            label: "a query, FULL_SUPPORT, three tags",
+            label: "a query, AI_ONLY, three tags",
             body: body(
                 "Subprocessors",
                 json!({ "query": "Which subprocessors handle customer content?" }),
-                Some("FULL_SUPPORT"),
+                Some("AI_ONLY"),
                 &[("team", "legal"), ("env", "prod"), ("owner", "a.b@c")],
             ),
             input_source: "TEXT",

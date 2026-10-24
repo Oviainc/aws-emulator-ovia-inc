@@ -383,20 +383,45 @@ pub fn reportable_query_text(label: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// The `ReviewType` the queries of one submission carry.
+/// The `ReviewType` the queries of one submission carry, from the support mode the
+/// inquiry is processed under.
 ///
-/// `FULL_SUPPORT` "includes human expert review" and is "[o]nly supported for file upload
-/// mode" (`CreateComplianceInquiryRequest$supportMode`), so it selects human review for an
-/// uploaded document and for nothing else: a submission the mode does not cover is
-/// reviewed by the service's own model, whatever the request asked for.
-pub fn review_type_for(support_mode: &str, content: &InquiryContentRecord) -> &'static str {
-    if support_mode == SUPPORT_MODE_FULL_SUPPORT
-        && content.input_source() == INPUT_SOURCE_FILE
-    {
+/// `FULL_SUPPORT` "includes human expert review", `AI_ONLY` "provides AI-generated
+/// responses" (`InquiryDetail$supportMode`), so the stored mode decides the review and
+/// the two can never disagree: a mode a submission cannot be processed under never
+/// reaches the record ([`support_mode_available_for`]).
+pub fn review_type_for(support_mode: &str) -> &'static str {
+    if support_mode == SUPPORT_MODE_FULL_SUPPORT {
         REVIEW_TYPE_HUMAN
     } else {
         REVIEW_TYPE_AI
     }
+}
+
+/// Whether `support_mode` is available for a submission made of `content`.
+///
+/// `FULL_SUPPORT` is "[o]nly supported for file upload mode"
+/// (`CreateComplianceInquiryRequest$supportMode`), so it can only be asked for of an
+/// uploaded document; `AI_ONLY` is the mode the same sentence makes every submission's
+/// default, so it asks for nothing no submission can be given.
+pub fn support_mode_available_for(support_mode: &str, content: &InquiryContentRecord) -> bool {
+    support_mode != SUPPORT_MODE_FULL_SUPPORT || content.input_source() == INPUT_SOURCE_FILE
+}
+
+/// The requirement a `supportMode` the submitted content cannot be processed under failed
+/// — the restriction the member's own documentation states
+/// ([`support_mode_available_for`]).
+pub const SUPPORT_MODE_REQUIREMENT: &str =
+    "FULL_SUPPORT is only supported for file upload mode";
+
+/// The modelled `ValidationException` for a `supportMode` the submitted content cannot be
+/// processed under ([`support_mode_available_for`]).
+///
+/// `ValidationExceptionReason`'s `fieldValidationFailed`, naming `supportMode` in the
+/// field list: the refused value came in on that member, and the clause states the
+/// requirement rather than echoing the value back.
+pub fn unsupported_support_mode() -> ValidationException {
+    field_validation_failed("supportMode", SUPPORT_MODE_REQUIREMENT)
 }
 
 /// How many tags one resource carries at most.
@@ -900,7 +925,11 @@ pub struct ComplianceInquiry {
     /// One of `InquiryStatusMessage`'s values.
     pub status_message: String,
     /// One of `InquirySupportMode`'s values, defaulted to [`SUPPORT_MODE_AI_ONLY`] when
-    /// the request named none.
+    /// the request named none — and always one this submission IS processed under: a mode
+    /// the content cannot be processed under is refused at the create
+    /// ([`support_mode_available_for`]) rather than stored, so no read advertises a
+    /// support mode the inquiry's queries were not reviewed in
+    /// ([`review_type_for`]).
     pub support_mode: String,
     pub content: InquiryContentRecord,
     /// The queries this inquiry owns, by ascending `queryIdentifier`.
@@ -2165,7 +2194,19 @@ pub fn too_many_tags(total: usize) -> ValidationException {
 /// [`constraint_violation_message`] renders for a modelled constraint, and without
 /// echoing the refused identifiers back: the request already carried them.
 pub fn unknown_query_identifiers(member: &str) -> ValidationException {
-    let clause = unknown_query_identifier_clause(member);
+    field_validation_failed(member, UNKNOWN_QUERY_IDENTIFIER_REQUIREMENT)
+}
+
+/// The modelled `ValidationException` for a value the SERVICE itself refused on `member`,
+/// against `requirement`.
+///
+/// The one envelope every such refusal is stated in: `ValidationExceptionReason`'s
+/// `fieldValidationFailed`, the member named in `fieldList`, and the same clause in both
+/// the message and the field entry ([`field_constraint_clause`]) — the AWS validation
+/// envelope [`constraint_violation_message`] renders for a modelled constraint, without
+/// echoing the refused value, which the request already carried.
+pub fn field_validation_failed(member: &str, requirement: &str) -> ValidationException {
+    let clause = field_constraint_clause(member, requirement);
     ValidationException {
         message: format!("1 validation error detected: {clause}"),
         reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
@@ -2176,12 +2217,16 @@ pub fn unknown_query_identifiers(member: &str) -> ValidationException {
     }
 }
 
+/// One clause of a validation refusal: the member path and the requirement its value
+/// failed.
+pub fn field_constraint_clause(member: &str, requirement: &str) -> String {
+    format!("Value at '{member}' failed to satisfy constraint: {requirement}")
+}
+
 /// The clause [`unknown_query_identifiers`] states, in both the message and the
-/// `fieldList` entry: the member path and the requirement its value failed.
+/// `fieldList` entry.
 pub fn unknown_query_identifier_clause(member: &str) -> String {
-    format!(
-        "Value at '{member}' failed to satisfy constraint: {UNKNOWN_QUERY_IDENTIFIER_REQUIREMENT}"
-    )
+    field_constraint_clause(member, UNKNOWN_QUERY_IDENTIFIER_REQUIREMENT)
 }
 
 /// The requirement half of [`unknown_query_identifier_clause`].
