@@ -137,8 +137,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+        // An environment lives in the Region it was created in, so an ARN is resolved in
+        // the Region this request was signed for and nowhere else.
+        let region = crate::state::request_region(ctx);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UntagResourceErrorModeled::InternalServerException(InternalServerException {
@@ -151,9 +153,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource_arn = input.resource_arn.clone();
         // The same refusal `TagResource` answers, for the same lookup: HTTP 404 with the
         // wire error code the tagging operations publish, `NotFoundException`.
-        let stored = store.environment_by_arn_mut(&resource_arn).ok_or_else(|| {
-            crate::scaffolded::Scaffolded::not_found(crate::state::RESOURCE_NOT_FOUND_MESSAGE)
-        })?;
+        let stored = store
+            .environment_by_arn_mut(&region, &resource_arn)
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::not_found(crate::state::RESOURCE_NOT_FOUND_MESSAGE)
+            })?;
 
         // `@idempotent`: a key the environment does not carry is simply not there to
         // remove, which is the state the caller asked for.

@@ -134,8 +134,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+        // An environment lives in the Region it was created in, so a name is resolved in
+        // the Region this request was signed for and nowhere else.
+        let region = crate::state::request_region(ctx);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteEnvironmentErrorModeled::InternalServerException(InternalServerException {
@@ -147,7 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A second delete of the same name lands here, because the first one removed the
         // record.
-        store.remove(&input.name).ok_or_else(|| {
+        store.remove(&region, &input.name).ok_or_else(|| {
             DeleteEnvironmentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: Some(crate::state::environment_not_found_message(&input.name)),
             })

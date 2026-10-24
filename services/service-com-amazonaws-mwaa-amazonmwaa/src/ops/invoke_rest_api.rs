@@ -171,8 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+        // An environment lives in the Region it was created in, so a name is resolved in
+        // the Region this request was signed for and nowhere else.
+        let region = crate::state::request_region(ctx);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             InvokeRestApiErrorModeled::InternalServerException(InternalServerException {
@@ -182,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // The transition the clock already owes, materialised before anything is read.
         store.settle(now);
-        let known = store.environments.contains_key(&input.name);
+        let known = store.contains(&region, &input.name);
         drop(store);
 
         if !known {
