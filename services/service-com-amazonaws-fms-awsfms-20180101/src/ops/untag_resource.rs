@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes tags from one Firewall Manager resource, named by a generic
+//! `ResourceArn`.
+//!
+//! Administrator-gated, like every organisation-scoped Firewall Manager
+//! operation: with no Firewall Manager default administrator association for the
+//! organisation the call is refused by [`crate::state::require_administrator`]
+//! BEFORE the ARN's form is checked and before anything is looked up or written
+//! — so an unauthorised caller learns nothing about what the organisation holds
+//! and leaves the stored tag sets untouched. The association is
+//! organisation-wide (one default administrator, whose `AdminScope` is the whole
+//! organisation), so the gate answers the same in every Region and the request's
+//! Region only composes the refusal's message.
+//! With an administrator associated, a malformed ARN is a `ValidationException`,
+//! an ARN naming no stored resource is `ResourceNotFoundException`, and the
+//! named keys are dropped from the resource's persisted tag set while every
+//! other key it carries is left alone.
 //!
 //! ## Shape of an operation
 //!
@@ -148,17 +156,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // request metadata.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The authorization gate FIRST, on the ordering
+        // [`crate::state::require_administrator`]'s own documentation states, and
+        // the same ordering this operation's sibling tag writer follows: this is
+        // an organisation-scoped call, so it is answered only while the
+        // organisation has a Firewall Manager administrator, and the decision is
+        // taken before the ARN's form, the `TagKeys` and any lookup — hence the
+        // lock is held across the request-local checks below rather than taken
+        // after them.
+        crate::state::require_administrator(&store, &region)?;
+
+        // The ARN's FORM next: a string that is not an ARN at all is a caller
+        // programming error, refused before anything is looked up or written.
+        // The modelled `ResourceArn` pattern cannot express this, so the service
+        // check does — as a 400 `ValidationException`, never a 501.
+        if let Some(reason) = crate::state::arn_format_error(&input.resource_arn) {
+            return Err(crate::scaffolded::Scaffolded::validation(reason));
+        }
+
+        // A well-formed ARN that names no stored resource is not-found, and the
+        // call must leave NO tag state behind — so the resource is resolved
+        // before any write, and nothing is written on this path.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // `ResourceArn` is GENERIC: the request does not say which kind of
+        // Firewall Manager resource it names, so the resolution covers every
+        // taggable kind this service stores (policies, resource sets,
+        // applications lists, protocols lists) rather than one of them, and it
+        // hands back the tags the resource carries along with it.
+        let resolved = store
+            .tagged_resource_for_arn(&input.resource_arn)
+            .map(|(resource, held)| (resource, held.to_vec()));
+        let Some((resource, held)) = resolved else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+            .into());
+        };
+
+        // "Removes one or more tags": the keys the request names stop being
+        // carried and every other key the resource holds is left alone, with the
+        // values of the surviving keys unchanged. A tag is identified by its key
+        // alone, and keys are case-SENSITIVE (`com.amazonaws.fms#Tag$Key`: "Tag
+        // keys are case-sensitive"), so `env` and `Env` are two keys, not one.
+        //
+        // A key the resource does not carry is not an error, and a key the
+        // request names twice is not ambiguous: either way the resource ends up
+        // not carrying it, so the call is idempotent — unlike a tag WRITE, where
+        // one key appearing twice would have to hold two values at once.
+        let mut tags = held;
+        tags.retain(|tag| !input.tag_keys.iter().any(|key| key == &tag.key));
+
+        // The tags on the resource's own record are authoritative and
+        // `tags_by_arn` is the index maintained from them, so the write goes
+        // through the one helper that writes both from the same value: the two
+        // can never disagree, whatever kind of resource this is.
+        //
+        // `set_tags` answers whether the resource was still there to write to.
+        // It cannot be false here: the resource was resolved under the SAME lock
+        // this write holds, so nothing could have deleted it in between — hence
+        // the debug assertion rather than an error path no request can take.
+        let written = store.set_tags(&resource, tags);
+        debug_assert!(
+            written,
+            "the resource resolved under this lock must still be there to untag"
+        );
+        Ok(UntagResourceOutput {})
     }
 }

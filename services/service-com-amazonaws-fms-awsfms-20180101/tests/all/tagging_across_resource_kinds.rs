@@ -43,8 +43,12 @@ use crate::tagging_and_managing_admins::{list_tags, minimal_policy, owned, tag_l
 
 /// The kinds of Firewall Manager resource that carry tags and that this service
 /// persists.
+///
+/// `pub(crate)` so a sibling suite in this test target asserts its own rule over
+/// the SAME set of taggable kinds, rather than growing a second copy of the list
+/// and of the seeding each kind needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     Policy,
     ResourceSet,
     ProtocolsList,
@@ -52,7 +56,7 @@ enum Kind {
 }
 
 /// Every taggable kind, so a row of the table is a (kind, tag set) pair.
-const KINDS: [Kind; 4] = [
+pub(crate) const KINDS: [Kind; 4] = [
     Kind::Policy,
     Kind::ResourceSet,
     Kind::ProtocolsList,
@@ -62,7 +66,7 @@ const KINDS: [Kind; 4] = [
 impl Kind {
     /// A well-formed ARN of this kind naming the resource id `id`, built by the
     /// service's own ARN helpers so the test writes no ARN literal.
-    fn arn_of(self, id: &str) -> String {
+    pub(crate) fn arn_of(self, id: &str) -> String {
         match self {
             Kind::Policy => state::policy_arn(REGION, id),
             Kind::ResourceSet => state::resource_set_arn(REGION, id),
@@ -113,7 +117,10 @@ async fn create_through_the_api(
 
 /// Create one resource of `kind` carrying `tags` (or no `TagList` at all when
 /// `tags` is `None`) and return its ARN.
-async fn create_resource(
+///
+/// `pub(crate)` for the same reason [`Kind`] is: one seam per taggable kind,
+/// shared by every suite that needs a resource of each kind to exist.
+pub(crate) async fn create_resource(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     kind: Kind,

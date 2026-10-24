@@ -53,6 +53,8 @@ mod resource_set_deletion;
 mod resource_set_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_removal.rs"]
+mod tag_removal;
 #[path = "all/tagging_across_resource_kinds.rs"]
 mod tagging_across_resource_kinds;
 #[path = "all/tagging_administrator_gate.rs"]
