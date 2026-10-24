@@ -29,11 +29,21 @@
 //!   document, whose queries are written inside the file). The one projection
 //!   ([`crate::state::ComplianceInquiry::display_name`]) serves this create, the listing,
 //!   `GetComplianceInquiryMetadata` and the exported document.
+//! * The queries an inquiry owns are the UNITS OF WORK its submitted content carries, one
+//!   each: the query a text submission carries, and one per section of an uploaded
+//!   document — "[l]ist of file sections/sheets to process"
+//!   (`InquiryFileContent$fileSections`) — with the document as a whole when the request
+//!   names no section. The one enumeration
+//!   ([`crate::state::InquiryContentRecord::work_units`]) serves every content form, so
+//!   `ListComplianceInquiryQueries` reports what was submitted for processing whatever
+//!   form it took, and `supportMode` selects the review each of them carries
+//!   ([`crate::state::review_type_for`]).
 //! * The inquiry's RESPONSES are model-generated compliance answers, and no such engine
 //!   runs in this emulator. Nothing is synthesised to look generated: no query ever
-//!   carries a `response`, and that absence is the signal — a query read off the request's
-//!   own text still completes, and only an inquiry whose queries could not be enumerated
-//!   at all ends in the modelled failure state (see `materialise`).
+//!   carries a `response`, and that absence is the signal — a query is reported under the
+//!   handle its submission gave it, never under question text nothing read — and only a
+//!   submission carrying nothing to process at all ends in the modelled failure state
+//!   (see `materialise`).
 //!
 //! ## Shape of an operation
 //!
@@ -199,6 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags: ::std::collections::BTreeMap<String, String> =
             input.tags.unwrap_or_default().into_iter().collect();
         let fingerprint = request_fingerprint(&input.name, &support_mode, &content, &tags);
+        let queries = enumerate_queries(&input.name, &support_mode, &content, now);
 
         let mut store = state.lock();
 
@@ -251,7 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::INQUIRY_STATUS_PROCESSING.to_string(),
             status_message: crate::state::INQUIRY_MESSAGE_IN_PROGRESS.to_string(),
             support_mode,
-            queries: enumerate_queries(&content, now),
+            queries,
             content,
             created_at: now,
             updated_at: now,
@@ -306,37 +317,43 @@ fn content_record(content: InquiryContent) -> crate::state::InquiryContentRecord
     }
 }
 
-/// The queries the inquiry owns at creation.
+/// The queries the inquiry owns at creation: one per UNIT OF WORK the submitted content
+/// carries ([`crate::state::InquiryContentRecord::work_units`]), numbered from 1 in the
+/// order they are processed ("[s]equential identifier of the query within the inquiry").
 ///
-/// A TEXT inquiry carries exactly one: the submitted query itself, so its text is known
-/// without parsing anything. A FILE inquiry's queries are the ones written in the
-/// uploaded document — reading them out means parsing that document, which this emulator
-/// does not do, so it owns none and `materialise` reports its processing as failed rather
-/// than inventing queries nothing read.
+/// Every query starts non-terminal, like the inquiry itself, and carries the review
+/// `supportMode` asks for ([`crate::state::review_type_for`]); the clock moves them on
+/// (see [`crate::state::ComplianceInquiry::materialise`]).
+///
+/// A unit whose handle cannot be reported inside the modelled bounds of
+/// `QuerySummary$query` ([`crate::state::reportable_query_text`]) yields no query, rather
+/// than one reported outside the shape the model declares for it.
 ///
 /// No query carries a `response`: see [`crate::state::InquiryQuery::response`].
 fn enumerate_queries(
+    title: &str,
+    support_mode: &str,
     content: &crate::state::InquiryContentRecord,
     now: ::std::time::SystemTime,
 ) -> Vec<crate::state::InquiryQuery> {
-    match content {
-        crate::state::InquiryContentRecord::Text(query) => {
-            vec![crate::state::InquiryQuery {
-                // "Sequential identifier of the query within the inquiry" — the first.
-                identifier: 1,
-                query: query.clone(),
-                response: None,
-                // `supportMode`'s `FULL_SUPPORT` is "only supported for file upload
-                // mode", so a query read off submitted text is AI-reviewed whatever the
-                // request asked for.
-                review_type: Some(crate::state::REVIEW_TYPE_AI.to_string()),
-                status: crate::state::QUERY_STATUS_PROCESSING.to_string(),
-                status_message: crate::state::QUERY_MESSAGE_IN_PROGRESS.to_string(),
-                created_at: now,
-            }]
-        }
-        crate::state::InquiryContentRecord::File { .. } => Vec::new(),
-    }
+    let review_type = crate::state::review_type_for(support_mode, content);
+    let texts: Vec<String> = content
+        .work_units(title)
+        .iter()
+        .filter_map(|unit| crate::state::reportable_query_text(unit))
+        .collect();
+    (1i32..)
+        .zip(texts)
+        .map(|(identifier, query)| crate::state::InquiryQuery {
+            identifier,
+            query,
+            response: None,
+            review_type: Some(review_type.to_string()),
+            status: crate::state::QUERY_STATUS_PROCESSING.to_string(),
+            status_message: crate::state::QUERY_MESSAGE_IN_PROGRESS.to_string(),
+            created_at: now,
+        })
+        .collect()
 }
 
 /// A fingerprint of the request this create was made from, so a replayed `clientToken`

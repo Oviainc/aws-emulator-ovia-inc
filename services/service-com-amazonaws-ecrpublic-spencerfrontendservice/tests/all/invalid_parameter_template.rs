@@ -52,9 +52,9 @@ async fn refusal_message(operation: &str, body: Value, case: &str) -> String {
 
 #[tokio::test]
 async fn a_refused_member_is_stated_as_the_member_and_the_rule_it_failed() {
-    // The modelled `RepositoryName` pattern, as the message states it: the expression a
-    // value must satisfy, without the anchors the model spells it with.
-    let repository_pattern = "(?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*[a-z0-9]+(?:[._-][a-z0-9]+)*";
+    // The expression a `RepositoryName` pattern failure states: the registry naming
+    // grammar in the form the SERVICE publishes, not the model's `@pattern` source.
+    let repository_pattern = r"[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*";
 
     // (case, operation, request, the ONE clause the message must be)
     let rows: Vec<(&str, &str, Value, String)> = vec![
@@ -118,6 +118,15 @@ async fn a_refused_member_is_stated_as_the_member_and_the_rule_it_failed() {
             "a repository name outside the pattern on a read",
             "DescribeImages",
             json!({"repositoryName": "UPPER"}),
+            clause(
+                "repositoryName",
+                &format!("must satisfy regular expression '{repository_pattern}'"),
+            ),
+        ),
+        (
+            "a repository name outside the pattern inside a reader's name list",
+            "DescribeRepositories",
+            json!({"repositoryNames": ["UPPER_AND!"]}),
             clause(
                 "repositoryName",
                 &format!("must satisfy regular expression '{repository_pattern}'"),
@@ -340,8 +349,11 @@ async fn a_request_refusing_two_members_states_one_clause_for_each() {
         ),
         clause(
             "repositoryName",
-            "must satisfy regular expression \
-             '(?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*[a-z0-9]+(?:[._-][a-z0-9]+)*'",
+            &format!(
+                "must satisfy regular expression \
+                 '{}'",
+                r"[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*"
+            ),
         ),
         clause(
             "maxResults",

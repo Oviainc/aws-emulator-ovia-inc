@@ -255,13 +255,18 @@ fn text_body(name: &str, query: &str, tags: &[(&str, &str)]) -> Value {
     create_body(name, json!({ "query": query }), tags)
 }
 
-/// A `CreateComplianceInquiry` body for an uploaded document.
-fn file_body(name: &str, sections: &[&str], tags: &[(&str, &str)]) -> Value {
-    let mut file = json!({ "content": FILE_CONTENT });
+/// A `CreateComplianceInquiry` body for an uploaded document of `content` bytes.
+fn file_body_of(name: &str, content: &str, sections: &[&str], tags: &[(&str, &str)]) -> Value {
+    let mut file = json!({ "content": content });
     if !sections.is_empty() {
         file["fileSections"] = json!(sections);
     }
     create_body(name, json!({ "fileContent": file }), tags)
+}
+
+/// A `CreateComplianceInquiry` body for an uploaded document.
+fn file_body(name: &str, sections: &[&str], tags: &[(&str, &str)]) -> Value {
+    file_body_of(name, FILE_CONTENT, sections, tags)
 }
 
 fn create_body(name: &str, inquiry_content: Value, tags: &[(&str, &str)]) -> Value {
@@ -297,8 +302,9 @@ struct Case {
     body: Value,
     tags: &'static [(&'static str, &'static str)],
     /// The `queryIdentifiers` the export names, or `None` to name none. A TEXT inquiry
-    /// owns exactly the one query its content carried (identifier 1); a FILE inquiry owns
-    /// none, because nothing reads queries out of an uploaded document.
+    /// owns exactly the one query its content carried (identifier 1); an upload owns one
+    /// per unit of work it was submitted in — the sections it named, or the document as a
+    /// whole — and an upload carrying no bytes owns none.
     query_identifiers: Option<&'static [i32]>,
     /// The `includeCitations` the export names, or `None` to name none.
     include_citations: Option<bool>,
@@ -374,7 +380,7 @@ fn cases() -> Vec<Case> {
             tags: &[],
             query_identifiers: None,
             include_citations: None,
-            covered: &[],
+            covered: &[1],
             region: REGION,
             after_terminal: true,
         },
@@ -388,8 +394,34 @@ fn cases() -> Vec<Case> {
             tags: &[("env", "staging")],
             query_identifiers: Some(&[]),
             include_citations: Some(false),
-            covered: &[],
+            // An empty list names no identifier, so the export covers every query the
+            // inquiry owns — one per submitted section.
+            covered: &[1, 2],
             region: "us-west-2",
+            after_terminal: true,
+        },
+        Case {
+            label: "an uploaded document, three sections, the second of them",
+            body: file_body(
+                "Customer DDQ",
+                &["Sheet 1", "Sheet 2", "Sheet 3"],
+                &[],
+            ),
+            tags: &[],
+            query_identifiers: Some(&[2]),
+            include_citations: Some(true),
+            covered: &[2],
+            region: REGION,
+            after_terminal: true,
+        },
+        Case {
+            label: "an upload carrying no bytes, so no query to cover",
+            body: file_body_of("Empty workbook", "", &[], &[]),
+            tags: &[],
+            query_identifiers: None,
+            include_citations: None,
+            covered: &[],
+            region: REGION,
             after_terminal: true,
         },
     ]
@@ -734,8 +766,10 @@ async fn query_identifiers_the_inquiry_does_not_own_are_refused() {
     )
     .await;
     let text_id = created_id(&text);
-    let file = create(&router, &file_body("Questionnaire", &["Sheet 1"], &[])).await;
+    let file = create(&router, &file_body_of("Empty questionnaire", "", &[], &[])).await;
     let file_id = created_id(&file);
+    let upload = create(&router, &file_body("Questionnaire", &["Sheet 1"], &[])).await;
+    let upload_id = created_id(&upload);
     std::thread::sleep(PAST_THE_PROCESSING_SPAN);
 
     // `queryIdentifiers` is a list of `Integer`, which the model bounds in no other way
@@ -749,6 +783,11 @@ async fn query_identifiers_the_inquiry_does_not_own_are_refused() {
         ("the type's floor", &text_id, vec![i32::MIN]),
         ("the type's ceiling", &text_id, vec![i32::MAX]),
         ("one owned and one not", &text_id, vec![1, 2]),
+        (
+            "one past the sections an upload was submitted in",
+            &upload_id,
+            vec![2],
+        ),
         ("an inquiry that owns no query", &file_id, vec![1]),
     ];
     for (label, id, identifiers) in refused {

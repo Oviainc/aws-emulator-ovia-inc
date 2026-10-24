@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrust
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrust`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrust::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Establishes the Amazon Web Services side of a trust relationship between a Managed
+//! Microsoft AD directory and an external domain, and persists it so `DescribeTrusts`
+//! reports it. Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +162,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrust` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTrustErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrust"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The trust password is the secret the two sides of the relationship share. It is
+        // modelled `@sensitive`, no operation reports it back, and the external domain it
+        // would be presented to is not something this emulator can reach — so it is bound
+        // here only to be dropped, and never reaches the store.
+        let _ = input.trust_password;
+
+        let forwarder_ip_addrs = input.conditional_forwarder_ip_addrs.unwrap_or_default();
+        let forwarder_ipv6_addrs = input.conditional_forwarder_ipv6_addrs.unwrap_or_default();
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // The trust is the Amazon Web Services side of the relationship, so it hangs off
+        // the directory the request names: an id naming no stored directory is refused
+        // with the modelled "specified entity could not be found" and stores nothing.
+        let Some(directory) = store.directories.get(&input.directory_id) else {
+            return Err(CreateTrustErrorModeled::EntityDoesNotExistException(
+                crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
+            )
+            .into());
+        };
+        let directory_type = directory.directory_type.clone();
+        // Whether this call has to create the directory's conditional forwarder for the
+        // remote domain, and whether there is room for it, both read from the directory
+        // HERE so the decision is taken before anything is stored. A directory that
+        // ALREADY points at that domain keeps the forwarder it has, addresses included,
+        // and this call's address lists change nothing: a forwarder in place is changed by
+        // `UpdateConditionalForwarder` and by nothing else, so the trust is created beside
+        // it rather than refused or allowed to overwrite it.
+        let forwarder_key =
+            crate::state::Directory::conditional_forwarder_key(&input.remote_domain_name);
+        let forwarder_wanted = (!forwarder_ip_addrs.is_empty()
+            || !forwarder_ipv6_addrs.is_empty())
+            && !directory.conditional_forwarders.contains_key(&forwarder_key);
+        let forwarder_index_full = directory.conditional_forwarders.len()
+            >= crate::state::MAX_CONDITIONAL_FORWARDERS_PER_DIRECTORY;
+
+        // This operation's own documentation: "Directory Service for Microsoft Active
+        // Directory allows you to configure trust relationships … This action initiates
+        // the creation of the Amazon Web Services side of a trust relationship between an
+        // Managed Microsoft AD directory and an external domain." A trust is a feature of
+        // the Managed Microsoft AD directory type alone, so a request naming a directory
+        // of another type asks for something that type does not support — which is the
+        // modelled refusal for exactly that. NOT dead code: `CreateDirectory` persists a
+        // Simple AD directory today, so this branch is reachable from the wire.
+        if directory_type != crate::state::TYPE_MICROSOFT_AD {
+            return Err(CreateTrustErrorModeled::UnsupportedOperationException(
+                crate::state::refusal(format!(
+                    "DirectoryId {id} names a {directory_type} directory; a trust \
+                     relationship is supported for {supported} directories only",
+                    id = input.directory_id,
+                    supported = crate::state::TYPE_MICROSOFT_AD
+                )),
+            )
+            .into());
+        }
+
+        // A directory is one side of at most one trust with a given external domain, so a
+        // second create for that domain is the entity that already exists rather than a
+        // second trust or a silent overwrite: `UpdateTrust` is what changes one that is
+        // already there. The domain is matched case-insensitively and without the trailing
+        // root dot the modelled `RemoteDomainName` pattern admits, because those spellings
+        // name one DNS domain.
+        if let Some(existing) = store.trust_of(&input.directory_id, &input.remote_domain_name) {
+            return Err(CreateTrustErrorModeled::EntityAlreadyExistsException(
+                crate::state::refusal(format!(
+                    "Directory {id} already has a trust relationship with the remote \
+                     domain '{domain}'",
+                    id = input.directory_id,
+                    domain = existing.remote_domain_name
+                )),
+            )
+            .into());
+        }
+
+        // The trust store is one a caller can grow with a fresh remote domain forever, so
+        // it carries its own documented per-directory maximum and the call is refused once
+        // that is reached. Checked BEFORE anything is minted or inserted, so a refused
+        // call stores nothing.
+        if store.trust_count(&input.directory_id) >= crate::state::MAX_TRUSTS_PER_DIRECTORY {
+            return Err(CreateTrustErrorModeled::ClientException(crate::state::refusal(
+                format!(
+                    "This emulator stores at most {max} trust relationships on one directory",
+                    max = crate::state::MAX_TRUSTS_PER_DIRECTORY
+                ),
+            ))
+            .into());
+        }
+
+        // The forwarder this call has to create is part of what the request asked for, so
+        // a directory whose forwarder index is already full means the call cannot be served
+        // as asked: it is refused here rather than answered with a trust whose DNS
+        // forwarding was silently dropped. Checked BEFORE anything is minted or inserted.
+        if forwarder_wanted && forwarder_index_full {
+            return Err(CreateTrustErrorModeled::ClientException(crate::state::refusal(
+                format!(
+                    "Directory {id} already holds the {max} conditional forwarders this \
+                     emulator stores on one directory, so the conditional forwarder this \
+                     trust's remote DNS server addresses ask for cannot be created",
+                    id = input.directory_id,
+                    max = crate::state::MAX_CONDITIONAL_FORWARDERS_PER_DIRECTORY
+                ),
+            ))
+            .into());
+        }
+
+        let trust_id = store.mint_trust_id();
+        let seq = store.next_seq();
+        store.trusts.insert(
+            trust_id.clone(),
+            crate::state::TrustRecord {
+                trust_id: trust_id.clone(),
+                directory_id: input.directory_id.clone(),
+                remote_domain_name: input.remote_domain_name.clone(),
+                // "The trust relationship type. `Forest` is the default."
+                trust_type: input
+                    .trust_type
+                    .unwrap_or_else(|| crate::state::TRUST_TYPE_FOREST.to_string()),
+                trust_direction: input.trust_direction,
+                // Selective authentication is what the optional member ENABLES, so a
+                // request that named none leaves the trust at the modelled enum's
+                // not-enabled value.
+                selective_auth: input
+                    .selective_auth
+                    .unwrap_or_else(|| crate::state::SELECTIVE_AUTH_DISABLED.to_string()),
+                // The create "initiates the creation" of the relationship, so it answers
+                // while the trust is still being established and the move to `Created` is
+                // owed by the clock.
+                trust_state: crate::state::TRUST_STATE_CREATING.to_string(),
+                trust_state_due_at: Some(now + crate::state::TRANSITION_SPAN),
+                created_at: now,
+                last_updated: now,
+                state_last_updated: now,
+                seq,
+            },
+        );
+
+        // `ConditionalForwarderIpAddrs` / `ConditionalForwarderIpv6Addrs` are "the IP
+        // addresses of the remote DNS server associated with RemoteDomainName": a trust
+        // needs the directory's DNS to forward that domain's lookups, so naming them with
+        // the trust creates the conditional forwarder for it, exactly as
+        // `CreateConditionalForwarder` would have — which is why `DeleteTrust` carries a
+        // `DeleteAssociatedConditionalForwarder` to take it away again.
+        if forwarder_wanted {
+            if let Some(directory) = store.directories.get_mut(&input.directory_id) {
+                directory.conditional_forwarders.insert(
+                    forwarder_key,
+                    crate::state::ConditionalForwarderRecord {
+                        remote_domain_name: input.remote_domain_name,
+                        dns_ip_addrs: forwarder_ip_addrs,
+                        dns_ipv6_addrs: forwarder_ipv6_addrs,
+                        // The scope is not a request member: the only value the modelled
+                        // enum declares is the replication to every domain controller of
+                        // the directory.
+                        replication_scope: crate::state::REPLICATION_SCOPE_DOMAIN.to_string(),
+                    },
+                );
+            }
+        }
+
+        // The operation reports the id alone: `DescribeTrusts` is what reports the
+        // relationship back.
+        Ok(CreateTrustOutput {
+            trust_id: Some(trust_id),
+        })
     }
 }
+

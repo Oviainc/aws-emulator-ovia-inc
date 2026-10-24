@@ -21,6 +21,8 @@ mod call_analytics_category_updates;
 mod call_analytics_jobs;
 #[path = "all/client_error_wire_status.rs"]
 mod client_error_wire_status;
+#[path = "all/describe_language_model.rs"]
+mod describe_language_model;
 #[path = "all/language_models.rs"]
 mod language_models;
 #[path = "all/medical_scribe_jobs.rs"]

@@ -5,24 +5,27 @@
 //! This module owns the records the handlers in `src/ops/` share — the directories
 //! `CreateDirectory` persists, the snapshots `CreateSnapshot` takes of them, the aliases
 //! `CreateAlias` assigns, the computer accounts `CreateComputer` creates in them, the
-//! Amazon SNS topics `RegisterEventTopic` associates, the assessments
+//! Amazon SNS topics `RegisterEventTopic` associates, the trust relationships
+//! `CreateTrust` establishes, the assessments
 //! `StartADAssessment` starts and the tags `AddTagsToResource` merges — plus
 //! the pieces of behaviour that cannot live in any single operation file:
 //!
 //! * [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`], which
 //!   materialises the status transitions the clock has already made due (a directory
-//!   leaving `Requested`, a snapshot leaving `Creating`, an IP route leaving `Adding`, an
+//!   leaving `Requested`, a snapshot leaving `Creating`, an IP route leaving `Adding`, a
+//!   trust leaving `Creating` or `Verifying` (and a deleted one leaving the store), an
 //!   assessment leaving `IN_PROGRESS`, a directory's data access leaving `Enabling`).
 //!   Every handler calls it before reading or writing, so a reporting operation reports
 //!   what the clock already owed and nothing more.
 //! * [`Directory::to_description`], the one place a stored directory is rendered as the
 //!   modelled `DirectoryDescription`, so every operation that reports a directory
 //!   reports the same derived values (`Alias`, `AccessUrl`), and
-//!   [`SnapshotRecord::to_snapshot`] / [`EventTopicRegistration::to_event_topic`], the
-//!   same for a stored snapshot and a stored topic association.
+//!   [`SnapshotRecord::to_snapshot`] / [`EventTopicRegistration::to_event_topic`] /
+//!   [`TrustRecord::to_trust`], the
+//!   same for a stored snapshot, a stored topic association and a stored trust.
 //! * [`encode_cursor`] / [`decode_cursor`], the opaque `NextToken` the paginated
 //!   operations of this slice (`DescribeDirectories`, `DescribeSnapshots`,
-//!   `ListTagsForResource`) issue and resolve.
+//!   `DescribeTrusts`, `ListTagsForResource`) issue and resolve.
 //! * [`refusal`], the one place a modelled refusal of this service is built: every error
 //!   shape the model declares carries a `Message` and a UUID-shaped `RequestId`, and this
 //!   is what mints the call's id, reports it in that member and appends it to the message
@@ -41,7 +44,7 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Assessment, AssessmentSummary, Attribute, ClientAuthenticationSettingInfo, Computer,
     ConditionalForwarder, DirectoryDescription, DirectoryLimits, DirectoryVpcSettingsDescription,
-    EventTopic, IpRouteInfo, LDAPSSettingInfo, Snapshot, SnapshotLimits, Tag,
+    EventTopic, IpRouteInfo, LDAPSSettingInfo, Snapshot, SnapshotLimits, Tag, Trust,
 };
 
 /// How long a status transition a create owes takes to fall due.
@@ -350,6 +353,57 @@ pub const DATA_ACCESS_ENABLING: &str = "Enabling";
 /// elapsed: the modelled enum's `Enabled` value.
 pub const DATA_ACCESS_ENABLED: &str = "Enabled";
 
+/// The `TrustState` a trust relationship carries between `CreateTrust` and
+/// [`TRANSITION_SPAN`]: the first value of the modelled `TrustState` enum
+/// (`smithy_query(query="shape",shape="TrustState")`).
+///
+/// `CreateTrust` "initiates the creation of the Amazon Web Services side of a trust
+/// relationship", so it answers while the relationship is still being established and the
+/// move to [`TRUST_STATE_CREATED`] is owed by the clock rather than by any later call, on
+/// the same span a directory's stage transition uses.
+pub const TRUST_STATE_CREATING: &str = "Creating";
+
+/// The `TrustState` a trust relationship reaches once its [`TRANSITION_SPAN`] has
+/// elapsed: the `Created` value of the modelled `TrustState` enum.
+pub const TRUST_STATE_CREATED: &str = "Created";
+
+/// The `TrustState` a trust relationship carries between `VerifyTrust` and
+/// [`TRANSITION_SPAN`]: the `Verifying` value of the modelled `TrustState` enum.
+///
+/// `VerifyTrust` starts the verification rather than reporting its outcome — the enum
+/// carries both the transient `Verifying` and the settled `Verified` — so the move to
+/// [`TRUST_STATE_VERIFIED`] is owed by the clock, on the same span a create's transition
+/// uses.
+pub const TRUST_STATE_VERIFYING: &str = "Verifying";
+
+/// The `TrustState` a trust relationship reaches once its verification's
+/// [`TRANSITION_SPAN`] has elapsed: the `Verified` value of the modelled `TrustState`
+/// enum.
+pub const TRUST_STATE_VERIFIED: &str = "Verified";
+
+/// The `TrustState` a trust relationship carries between `DeleteTrust` and
+/// [`TRANSITION_SPAN`], after which the relationship is gone: the `Deleting` value of the
+/// modelled `TrustState` enum.
+///
+/// `DeleteTrust` answers while the Amazon Web Services side is still being torn down, so a
+/// caller acting straight after it still sees the trust in this state, and the removal is
+/// owed by the clock rather than by any later call.
+pub const TRUST_STATE_DELETING: &str = "Deleting";
+
+/// The `TrustType` a request that names none gets: the `Forest` value of the modelled
+/// `TrustType` enum, from `CreateTrustRequest$TrustType`'s own documentation — "The trust
+/// relationship type. `Forest` is the default."
+pub const TRUST_TYPE_FOREST: &str = "Forest";
+
+/// The `SelectiveAuth` a trust relationship whose request asked for none carries: the
+/// `Disabled` value of the modelled `SelectiveAuth` enum.
+///
+/// `CreateTrustRequest$SelectiveAuth` is the "optional parameter to enable selective
+/// authentication for the trust", and `Trust$SelectiveAuth` reports the "current state of
+/// selective authentication" — a state every stored trust has, so a request that enabled
+/// nothing leaves it at the enum's not-enabled value.
+pub const SELECTIVE_AUTH_DISABLED: &str = "Disabled";
+
 /// The ARN service segment of an Amazon SNS topic, so a reported `TopicArn` is built
 /// through [`::engine::emulator_arn`] rather than written as a literal.
 const SNS_ARN_SERVICE: &str = "sns";
@@ -425,6 +479,21 @@ pub const MAX_DIRECTORY_IDS_PER_REQUEST: usize = 100;
 /// list can only repeat ids — and it is what keeps the caller-chosen list from being
 /// allocated and scanned unbounded.
 pub const MAX_SNAPSHOT_IDS_PER_REQUEST: usize = 100;
+
+/// The most trust relationships this emulator will store on one directory.
+///
+/// NOT an AWS quota: a resource guard. `CreateTrust` is a write a caller can repeat with
+/// a fresh remote domain name forever, so the trust store carries its own per-directory
+/// bound, enforced at the single insert site in `create_trust.rs`.
+pub const MAX_TRUSTS_PER_DIRECTORY: usize = 50;
+
+/// The most `TrustIds` entries a single `DescribeTrusts` will resolve.
+///
+/// NOT an AWS quota: a resource guard, deliberately well above any list a caller has
+/// reason to send — a directory holds at most [`MAX_TRUSTS_PER_DIRECTORY`] trusts, so a
+/// longer list can only repeat ids — and it is what keeps the caller-chosen filter from
+/// being allocated and scanned unbounded.
+pub const MAX_TRUST_IDS_PER_REQUEST: usize = 100;
 
 /// The page size a paginated operation uses when the request declares none.
 ///
@@ -818,14 +887,10 @@ impl Directory {
             .collect()
     }
 
-    /// The key [`Self::conditional_forwarders`] holds `remote_domain_name` under: the
-    /// name folded to lower case with the trailing root label dropped, so a lookup agrees
-    /// with DNS, where a domain name is compared case-insensitively and the fully
-    /// qualified `example.com.` names the same domain as `example.com` (the modelled
-    /// `RemoteDomainName` pattern `^([a-zA-Z0-9]+[\.-])+([a-zA-Z0-9])+[.]?$` admits both
-    /// forms and either case).
+    /// The key [`Self::conditional_forwarders`] holds `remote_domain_name` under:
+    /// [`domain_key`] of that name, so a lookup agrees with DNS.
     pub fn conditional_forwarder_key(remote_domain_name: &str) -> String {
-        remote_domain_name.trim_end_matches('.').to_lowercase()
+        domain_key(remote_domain_name)
     }
 
     /// This directory's conditional forwarders as the modelled `ConditionalForwarders`
@@ -1090,6 +1155,89 @@ impl SnapshotRecord {
     }
 }
 
+/// One stored trust relationship: what `CreateTrust` persisted and `DescribeTrusts`
+/// reports.
+///
+/// A trust is a relationship between ONE Managed Microsoft AD directory and ONE external
+/// domain, so a directory points at a given remote domain at most once — which is what
+/// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::trust_of`] resolves. The
+/// `TrustPassword` the create was called with is deliberately not a field: the model marks
+/// it `@sensitive`, no operation reports it back, and state this emulator does not need is
+/// state it must not hold.
+#[derive(Debug, Clone)]
+pub struct TrustRecord {
+    pub trust_id: String,
+    /// The Managed Microsoft AD directory this is the Amazon Web Services side of. A
+    /// trust does not outlive that directory: `DeleteDirectory` drops the trusts naming
+    /// the id it deletes.
+    pub directory_id: String,
+    /// The FQDN of the external domain, as the request spelled it, so the report gives the
+    /// caller back its own spelling even though the lookup folds it.
+    pub remote_domain_name: String,
+    /// One of the modelled `TrustType` values; [`TRUST_TYPE_FOREST`] when the request
+    /// named none.
+    pub trust_type: String,
+    /// One of the modelled `TrustDirection` values, as the request required.
+    pub trust_direction: String,
+    /// One of the modelled `SelectiveAuth` values; [`SELECTIVE_AUTH_DISABLED`] when the
+    /// request named none.
+    pub selective_auth: String,
+    /// One of the modelled `TrustState` values.
+    pub trust_state: String,
+    /// When the state transition the create owes falls due; `None` once there is no
+    /// transition left to make. See [`TRANSITION_SPAN`].
+    pub trust_state_due_at: Option<SystemTime>,
+    /// "The date and time that the trust relationship was created", the `CreatedDateTime`
+    /// member reports.
+    pub created_at: SystemTime,
+    /// "The date and time that the trust relationship was last updated", the
+    /// `LastUpdatedDateTime` member reports.
+    pub last_updated: SystemTime,
+    /// "The date and time that the TrustState was last updated", the
+    /// `StateLastUpdatedDateTime` member reports.
+    pub state_last_updated: SystemTime,
+    /// Creation rank, from
+    /// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::next_seq`], shared
+    /// with the directories so every listing of this service pages over one ordering.
+    pub seq: u64,
+}
+
+impl TrustRecord {
+    /// This trust as the modelled `Trust` structure.
+    ///
+    /// The one place a stored trust is rendered, so every operation that reports one
+    /// reports exactly what was persisted. `TrustStateReason` ("the reason for the
+    /// TrustState") stays absent: it explains a state this emulator never records, and a
+    /// trust that is being created or is created has no reason to give.
+    pub fn to_trust(&self) -> Trust {
+        Trust {
+            directory_id: Some(self.directory_id.clone()),
+            trust_id: Some(self.trust_id.clone()),
+            remote_domain_name: Some(self.remote_domain_name.clone()),
+            trust_type: Some(self.trust_type.clone()),
+            trust_direction: Some(self.trust_direction.clone()),
+            trust_state: Some(self.trust_state.clone()),
+            created_date_time: Some(as_timestamp(self.created_at)),
+            last_updated_date_time: Some(as_timestamp(self.last_updated)),
+            state_last_updated_date_time: Some(as_timestamp(self.state_last_updated)),
+            trust_state_reason: None,
+            selective_auth: Some(self.selective_auth.clone()),
+        }
+    }
+}
+
+/// How this service compares two spellings of ONE remote domain name: the name folded to
+/// lower case with the trailing root label dropped, so a lookup agrees with DNS, where a
+/// domain name is compared case-insensitively and the fully qualified `example.com.` names
+/// the same domain as `example.com` (the modelled `RemoteDomainName` pattern
+/// `^([a-zA-Z0-9]+[\.-])+([a-zA-Z0-9])+[.]?$` admits both forms and either case).
+///
+/// One function, so the conditional forwarder index and the trust store cannot disagree
+/// about which requests name the same external domain.
+pub fn domain_key(remote_domain_name: &str) -> String {
+    remote_domain_name.trim_end_matches('.').to_lowercase()
+}
+
 /// A stored list as an optional modelled list: absent when this emulator holds no
 /// entries for it, so an empty list is never reported as though one had been recorded.
 fn optional_list(values: &[String]) -> Option<Vec<String>> {
@@ -1110,6 +1258,10 @@ pub struct ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// Every stored snapshot, keyed by its `SnapshotId`. A snapshot names the directory
     /// it was taken of, so this is one store rather than one per directory.
     pub snapshots: BTreeMap<String, SnapshotRecord>,
+    /// Every stored trust relationship, keyed by its `TrustId`. A trust names the
+    /// directory it belongs to, and `DescribeTrusts`/`VerifyTrust`/`DeleteTrust` all
+    /// resolve one by trust id alone, so this is one store rather than one per directory.
+    pub trusts: BTreeMap<String, TrustRecord>,
     /// Which directory owns which alias. An alias is unique across the account, so
     /// this is what `CreateAlias` checks before assigning one. An entry OUTLIVES the
     /// directory it was created for: `CreateAlias`' documentation says an alias
@@ -1125,6 +1277,9 @@ pub struct ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// Drives [`Self::mint_snapshot_id`], kept apart from [`Self::id_seed`] so the two
     /// id spaces advance independently.
     snapshot_id_seed: u64,
+    /// Drives [`Self::mint_trust_id`], kept apart from the other seeds so the id spaces
+    /// advance independently.
+    trust_id_seed: u64,
     /// Drives [`Self::next_seq`]: the creation rank stamped on each directory.
     seq_counter: u64,
 }
@@ -1189,6 +1344,12 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// [`Self::mint_directory_id`] over its own seed.
     pub fn mint_snapshot_id(&mut self) -> String {
         mint_id(&mut self.snapshot_id_seed, 's')
+    }
+
+    /// Mint a fresh `TrustId` of the shape the model declares, `^t-[0-9a-f]{10}$`,
+    /// through the same bijection as [`Self::mint_directory_id`] over its own seed.
+    pub fn mint_trust_id(&mut self) -> String {
+        mint_id(&mut self.trust_id_seed, 't')
     }
 
     /// The next creation rank. Stamped on a directory or an assessment when it is
@@ -1263,6 +1424,35 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                 snapshot.status_due_at = None;
             }
         }
+        // The state transitions the trust writes owe: the transient `Creating` a create
+        // answers in settles on `Created`, the `Verifying` a verify answers in settles on
+        // `Verified`, and a trust whose delete has fallen due is gone — a deleted
+        // relationship is not one `DescribeTrusts` reports. The transition `UpdateTrust`
+        // owes belongs to that handler, which is still scaffolded, so it lands with it
+        // rather than as a branch nothing can reach.
+        for trust in self.trusts.values_mut() {
+            let Some(due) = trust.trust_state_due_at else {
+                continue;
+            };
+            if now < due {
+                continue;
+            }
+            let settled = match trust.trust_state.as_str() {
+                TRUST_STATE_CREATING => TRUST_STATE_CREATED,
+                TRUST_STATE_VERIFYING => TRUST_STATE_VERIFIED,
+                // A trust being deleted has no settled state to move to: it is removed
+                // below, so its due instant is left in place for that pass to find.
+                _ => continue,
+            };
+            trust.trust_state = settled.to_string();
+            trust.state_last_updated = due;
+            trust.last_updated = due;
+            trust.trust_state_due_at = None;
+        }
+        self.trusts.retain(|_, trust| {
+            trust.trust_state != TRUST_STATE_DELETING
+                || trust.trust_state_due_at.is_some_and(|due| now < due)
+        });
         for assessment in self.assessments.values_mut() {
             let Some(due) = assessment.status_due_at else {
                 continue;
@@ -1315,6 +1505,32 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
         let mut ordered: Vec<&SnapshotRecord> = self.snapshots.values().collect();
         ordered.sort_by_key(|snapshot| snapshot.seq);
         ordered
+    }
+
+    /// Trust relationships in creation order — the order `DescribeTrusts` pages over.
+    pub fn trusts_in_creation_order(&self) -> Vec<&TrustRecord> {
+        let mut ordered: Vec<&TrustRecord> = self.trusts.values().collect();
+        ordered.sort_by_key(|trust| trust.seq);
+        ordered
+    }
+
+    /// The trust `directory_id` already holds with `remote_domain_name`, if any: a
+    /// directory is one side of at most one trust with a given external domain, so this is
+    /// what a second `CreateTrust` for it resolves as the entity that already exists.
+    pub fn trust_of(&self, directory_id: &str, remote_domain_name: &str) -> Option<&TrustRecord> {
+        let key = domain_key(remote_domain_name);
+        self.trusts.values().find(|trust| {
+            trust.directory_id == directory_id && domain_key(&trust.remote_domain_name) == key
+        })
+    }
+
+    /// How many trust relationships `directory_id` currently holds — the count
+    /// [`MAX_TRUSTS_PER_DIRECTORY`] bounds.
+    pub fn trust_count(&self, directory_id: &str) -> usize {
+        self.trusts
+            .values()
+            .filter(|trust| trust.directory_id == directory_id)
+            .count()
     }
 
     /// How many manual snapshots `directory_id` currently holds — the count
@@ -1664,6 +1880,18 @@ pub fn region_from_request(parts: &::http::request::Parts) -> String {
 /// same failure.
 pub fn no_such_snapshot(snapshot_id: &str) -> String {
     format!("Snapshot {snapshot_id} does not exist")
+}
+
+/// The `EntityDoesNotExistException` message for an id that names no stored trust
+/// relationship. Shared so every operation that resolves a trust says the same thing
+/// about the same failure.
+///
+/// It quotes the id the request asked for and says it does not exist, the way the
+/// directory-lookup family's wording does ([`no_such_directory`]), so the message is built
+/// from the request and names what the caller has to fix. [`refusal`] appends the request
+/// id.
+pub fn no_such_trust(trust_id: &str) -> String {
+    format!("Trust: '{trust_id}' does not exist.")
 }
 
 /// The `EntityDoesNotExistException` message for an id that names no stored assessment.

@@ -37,7 +37,12 @@ use crate::transcription_jobs::{Reply, Transcribe};
 /// Waited out with `std::thread::sleep`: the workspace enables tokio's `macros`,
 /// `rt` and `rt-multi-thread` features only, so `tokio::time::sleep` is not
 /// available here.
-const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
+///
+/// `pub(crate)`, like [`ROLE_ARN`], [`create`] and [`described`] below: the
+/// `DescribeLanguageModel` read suite in this same test crate
+/// (`crate::describe_language_model`) drives the same family through these rather
+/// than keeping a second copy that could drift from them.
+pub(crate) const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
 
 /// The region every row of this suite is served in (the rows are unsigned, and this
 /// is the region this emulator serves a request carrying no SigV4 credential scope
@@ -47,7 +52,7 @@ const REGION: &str = "us-east-1";
 /// An IAM role ARN inside `DataAccessRoleArn`'s own `@pattern`
 /// (`^arn:(aws|aws-cn|aws-us-gov|aws-iso-{0,1}[a-z]{0,1}):iam::[0-9]{0,63}:role/...$`,
 /// `smithy_query(query="shape", shape="InputDataConfig")`).
-const ROLE_ARN: &str = "arn:aws:iam::111122223333:role/Admin";
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::111122223333:role/Admin";
 
 /// The class of `CreateLanguageModel` request, one row per axis the rules generalise
 /// over: the model's language, its base model, the form of its name, which URI scheme
@@ -60,7 +65,11 @@ const ROLE_ARN: &str = "arn:aws:iam::111122223333:role/Admin";
 /// `smithy_query(query="shape", shape="CLMLanguageCode,BaseModelName")` — so the rows
 /// cover entries no recorded request used. The URI schemes are the ones `Uri`'s own
 /// `@pattern` admits (`^(s3://|http(s*)://).+$`).
-fn language_model_rows() -> Vec<(&'static str, Value)> {
+///
+/// `pub(crate)`, like the helpers below it: `crate::describe_language_model` builds its
+/// read rows from this one table so the request shape has a single definition for this
+/// family.
+pub(crate) fn language_model_rows() -> Vec<(&'static str, Value)> {
     vec![
         (
             "en-US on WideBand, training data only",
@@ -155,6 +164,25 @@ fn language_model_rows() -> Vec<(&'static str, Value)> {
     ]
 }
 
+/// One `CreateLanguageModel` request for `name` in `language` on `base_model`, with
+/// its training data in a location of this family's usual form.
+///
+/// The one-row counterpart of [`language_model_rows`], which `crate::language_models`
+/// keeps beside the table so this family's request shape has a single home: a suite
+/// that needs a row of its own (`crate::describe_language_model`, whose rows differ
+/// along the FORM OF THE NAME) builds it here rather than restating the request.
+pub(crate) fn language_model_request(name: &str, language: &str, base_model: &str) -> Value {
+    json!({
+        "ModelName": name,
+        "LanguageCode": language,
+        "BaseModelName": base_model,
+        "InputDataConfig": {
+            "S3Uri": format!("s3://DOC-EXAMPLE-BUCKET/{language}-training/"),
+            "DataAccessRoleArn": ROLE_ARN
+        }
+    })
+}
+
 /// The `ModelName` member of a request row.
 fn name_of(request: &Value) -> String {
     request["ModelName"]
@@ -178,13 +206,13 @@ fn is_absent(object: &Value, member: &str) -> bool {
 }
 
 /// The `LanguageModel` a `DescribeLanguageModel` answer carries.
-fn described(reply: &Reply, case: &str) -> Value {
+pub(crate) fn described(reply: &Reply, case: &str) -> Value {
     reply.ok(case)["LanguageModel"].clone()
 }
 
 /// Create the model `request` describes, asserting the answer is the record just
 /// stored.
-async fn create(transcribe: &Transcribe, case: &str, request: &Value) -> Reply {
+pub(crate) async fn create(transcribe: &Transcribe, case: &str, request: &Value) -> Reply {
     let created = transcribe.call("CreateLanguageModel", request.clone()).await;
     created.ok(case);
     assert_eq!(

@@ -389,18 +389,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
-                if let Some(visibility) = crate::state::invalid_visibility(value) {
-                    return Err(StartChangeSetErrorModeled::ValidationException(
-                        crate::state::validation(
-                            "ChangeSet.Details.Visibility",
-                            format!(
-                                "Visibility must be one of {:?}, not {visibility:?}",
-                                crate::state::ENTITY_VISIBILITY_VALUES
-                            ),
-                        ),
-                    )
-                    .into());
-                }
+                // Nothing here judges the MEMBERS of the details: they belong
+                // to the change type, which the model declares no shape for, so
+                // a value the catalog cannot read is found by APPLYING the
+                // change set — which fails it — and not by refusing the start.
             }
 
             // A change naming an entity acts on that entity; a change naming
@@ -461,6 +453,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 change_name: change.change_name.clone(),
                 entity_tags: change.entity_tags.clone().unwrap_or_default(),
                 entity_id,
+                // What applying the change finds wrong with it, which nothing
+                // has looked for yet: the change set has not run.
+                errors: Vec::new(),
             });
         }
 
@@ -475,8 +470,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::STATUS_PREPARING.to_string(),
             start_time: crate::state::iso8601(now),
             end_time: None,
-            // Nothing this emulator applies fails, so no change set reaches
-            // `FAILED` and none reports a failure.
+            // A change set reports a failure only once it HAS one: the end of
+            // its run is where its changes are applied, and that is where a
+            // change set that cannot apply them takes `FAILED` and the failure
+            // that explains it.
             failure_code: None,
             failure_description: None,
             changes,

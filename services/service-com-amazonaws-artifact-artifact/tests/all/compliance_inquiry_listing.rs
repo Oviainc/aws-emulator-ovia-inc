@@ -215,10 +215,10 @@ struct Case {
     /// `InputSource`: `TEXT` for a submitted query, `FILE` for an uploaded document.
     input_source: &'static str,
     /// The `InquiryStatus` the clock owes this inquiry, and the message that goes with
-    /// it. A TEXT submission's one query is enumerated from the request itself and its
-    /// processing is over at the due instant, so the inquiry completes cleanly; a FILE
-    /// submission's queries are never read out of the document at all, so its processing
-    /// failed.
+    /// it. A submission's units of work become its queries, so a submission that carries
+    /// any reaches a non-failure state: `COMPLETED` once the service's own model has
+    /// processed them, or `HUMAN_REVIEW` while the human expert review `FULL_SUPPORT`
+    /// asked for is pending.
     terminal_status: &'static str,
     /// See [`Case::terminal_status`].
     terminal_message: &'static str,
@@ -230,8 +230,7 @@ struct Case {
 /// many tags come with it — none of which may change whether the inquiry is reported.
 fn cases() -> Vec<Case> {
     const COMPLETED: &str = "Compliance inquiry processing is complete.";
-    const INQUIRY_INTERNAL_ERROR: &str =
-        "An internal error occurred while processing the inquiry. Try again at a later time.";
+    const HUMAN_REVIEW: &str = "Human review is in progress.";
     vec![
         Case {
             label: "a query, no supportMode, no tags",
@@ -266,8 +265,8 @@ fn cases() -> Vec<Case> {
                 &[],
             ),
             input_source: "FILE",
-            terminal_status: "FAILED",
-            terminal_message: INQUIRY_INTERNAL_ERROR,
+            terminal_status: "COMPLETED",
+            terminal_message: COMPLETED,
         },
         Case {
             label: "an uploaded document, two sections, AI_ONLY, one tag",
@@ -283,8 +282,25 @@ fn cases() -> Vec<Case> {
                 &[("team", "security")],
             ),
             input_source: "FILE",
-            terminal_status: "FAILED",
-            terminal_message: INQUIRY_INTERNAL_ERROR,
+            terminal_status: "COMPLETED",
+            terminal_message: COMPLETED,
+        },
+        Case {
+            label: "an uploaded document, one section, FULL_SUPPORT",
+            body: body(
+                "Annual audit workbook",
+                json!({
+                    "fileContent": {
+                        "content": FILE_CONTENT,
+                        "fileSections": ["Section A"],
+                    }
+                }),
+                Some("FULL_SUPPORT"),
+                &[],
+            ),
+            input_source: "FILE",
+            terminal_status: "HUMAN_REVIEW",
+            terminal_message: HUMAN_REVIEW,
         },
     ]
 }

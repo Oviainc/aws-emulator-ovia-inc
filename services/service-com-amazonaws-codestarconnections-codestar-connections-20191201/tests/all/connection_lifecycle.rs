@@ -41,9 +41,12 @@ const PROVIDER_TYPES: &[&str] = codestar::ops::types::shared_types::PROVIDER_TYP
 pub(crate) const HOST_PROVIDER_TYPE: &str = "GitHubEnterpriseServer";
 
 /// One emulator: the router the production front door builds, with this service mounted
-/// on a single shared engine.
+/// on a single shared engine, plus a handle on that engine so a suite can put a record
+/// no modeled operation creates (a sync blocker the Git-sync side raises) in the SAME
+/// store the handlers read.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -52,8 +55,14 @@ impl Emulator {
         let mut router = MultiServiceRouter::new();
         // The tests sign nothing, so no authenticator may be registered.
         router.set_request_authentication(false);
-        router.register_service(codestar::EmulatedService::new(engine));
-        Self { router }
+        router.register_service(codestar::EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// The one engine the mounted service reads and writes, for a suite that has to seed
+    /// or inspect state the API itself cannot reach.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     /// Dispatch one awsJson1_0 call under this service's short target prefix and return

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetProfile
-//! Returns a stored agent profile for a group: the bytes exactly as
-//! `PostAgentProfile` uploaded them, under the `Content-Type` they were posted with.
-//! Reporting only: it writes nothing.
+//! Returns the AGGREGATED profile of a group over a requested window: the bytes
+//! exactly as `PostAgentProfile` uploaded them, under the `Content-Type` they were
+//! posted with. A profile the group has received but that the service has not yet
+//! collected into an aggregated profile is not servable, so a window covered by no
+//! aggregated profile is the operation's 404. Reporting only: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -278,15 +280,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: crate::state::group_not_found_message(&input.profiling_group_name),
             })
         })?;
-        // The group IS there; what is missing is profile data covering the requested
-        // range. That is a different refusal from a missing group, and the service
-        // states it with its own fixed text — the only thing distinguishing the two,
-        // since both are 404 `ResourceNotFoundException`.
-        let profile = group.latest_profile_in(start, end).ok_or_else(|| {
-            GetProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: crate::state::NO_PROFILES_IN_TIME_RANGE.to_string(),
-            })
-        })?;
+        // The group IS there; what is missing is an AGGREGATED profile covering the
+        // requested range. Collecting posted agent profiles into aggregated profiles is
+        // work the service does after the fact, so a profile this group received is
+        // servable only once the aggregation it belongs to is due — before that, and for
+        // a window the group holds nothing in, this operation reports the same absence.
+        // That is a different refusal from a missing group, and the service states it
+        // with its own fixed text — the only thing distinguishing the two, since both
+        // are 404 `ResourceNotFoundException`.
+        let profile = group
+            .latest_profile_in(start, end, crate::state::now())
+            .ok_or_else(|| {
+                GetProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::NO_PROFILES_IN_TIME_RANGE.to_string(),
+                })
+            })?;
 
         if let Some(accept) = input.accept.as_deref() {
             let acceptable = accept

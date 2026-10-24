@@ -17,6 +17,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::RESOURCE_TYPE_VALUES;
+use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
+    RESOURCE_TYPE_AUTO_SCALING_GROUP, SCOPE_ACCOUNT_ID, SCOPE_RESOURCE_ARN,
+};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -203,6 +207,29 @@ pub(crate) async fn put_preference(router: &MultiServiceRouter, request: &Value)
         json!({}),
         "put {request}: PutRecommendationPreferences has an empty output, got {body}"
     );
+}
+
+/// Every value of the model's `ResourceType` enum — the type a preference request's
+/// `resourceType` member carries — taken from the crate's generated value set rather than
+/// copied, so a resource type the model adds is covered the day it appears
+/// (`RESOURCE_TYPE_VALUES`: AuroraDBClusterStorage | AutoScalingGroup | EbsVolume |
+/// Ec2Instance | EcsService | Idle | LambdaFunction | License | NotApplicable |
+/// RdsDBInstance).
+pub(crate) const RESOURCE_TYPES: &[&str] = RESOURCE_TYPE_VALUES;
+
+/// The scope a preference for `resource_type` may be written at.
+///
+/// An Auto Scaling group preference "can only be set at the resource level by specifying a
+/// scope name of `ResourceArn`" (`PutRecommendationPreferences$scope`); every other
+/// resource type takes the account-level scope, whose "value must be a 12-digit Amazon Web
+/// Services account ID" (`Scope$value`). Stated once here so no suite that walks the whole
+/// enum can drift from another on it.
+pub(crate) fn scope_for(resource_type: &str) -> Value {
+    if resource_type == RESOURCE_TYPE_AUTO_SCALING_GROUP {
+        json!({"name": SCOPE_RESOURCE_ARN, "value": auto_scaling_group_arn("batch-tier")})
+    } else {
+        json!({"name": SCOPE_ACCOUNT_ID, "value": ACCOUNT})
+    }
 }
 
 /// Read the preference records stored for `resource_type`, optionally at one scope.

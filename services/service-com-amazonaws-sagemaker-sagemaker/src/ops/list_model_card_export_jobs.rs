@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListModelCardExportJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListModelCardExportJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListModelCardExportJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: filters, sorts and pages the export jobs `CreateModelCardExportJob`
+//! stored in `crate::state` against the one model card `ModelCardName` names, after
+//! materialising every terminal status the clock already owes
+//! (`crate::state::ModelCardExportJob::settle_status`), so the listing reports the status
+//! `DescribeModelCardExportJob` reports at the same instant. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +151,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListModelCardExportJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListModelCardExportJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListModelCardExportJobs"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `SortBy` "sorts by creation time by default" (its model doc), which is this
+        // service's shared default; `SortOrder` documents none for this operation, so it
+        // takes the one the service's other listings apply. Both accepted value sets are
+        // the generated `*_VALUES` slices, so a refusal stays in step with the model
+        // rather than with a transcription of it.
+        let sort_by = input
+            .sort_by
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_BY);
+        if !MODEL_CARD_EXPORT_JOB_SORT_BY_VALUES.contains(&sort_by) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {}; got \"{sort_by}\".",
+                MODEL_CARD_EXPORT_JOB_SORT_BY_VALUES.join(", ")
+            )));
+        }
+        let sort_order = input
+            .sort_order
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_ORDER);
+        if !MODEL_CARD_EXPORT_JOB_SORT_ORDER_VALUES.contains(&sort_order) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortOrder must be one of {}; got \"{sort_order}\".",
+                MODEL_CARD_EXPORT_JOB_SORT_ORDER_VALUES.join(", ")
+            )));
+        }
+        let descending = sort_order == crate::state::ORDER_DESCENDING;
+        if let Some(status) = input.status_equals.as_deref() {
+            // `StatusEquals` selects on exactly one member of the modelled enum; anything
+            // else is refused rather than quietly matching nothing.
+            if !MODEL_CARD_EXPORT_JOB_STATUS_VALUES.contains(&status) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "StatusEquals must be one of {}; got \"{status}\".",
+                    MODEL_CARD_EXPORT_JOB_STATUS_VALUES.join(", ")
+                )));
+            }
+        }
+
+        let created_after = input.creation_time_after.map(crate::state::timestamp_key);
+        let created_before = input.creation_time_before.map(crate::state::timestamp_key);
+
+        let mut store = state.lock();
+
+        // The one write a reporting call makes: every terminal status the clock already
+        // owed. Each was due at its stored instant whether or not anybody listed the jobs,
+        // so this listing reports the status a `DescribeModelCardExportJob` at this same
+        // instant reports — which is what makes `StatusEquals` and a `Status` sort agree
+        // with the reader instead of selecting on a status the job has already left.
+        let now = ::std::time::SystemTime::now();
+        let mut settled: Vec<String> = Vec::new();
+        for job in store.model_card_export_jobs.values_mut() {
+            if job.settle_status(now) {
+                settled.push(job.arn.clone());
+            }
+        }
+
+        // The result set is the export jobs of the ONE card `ModelCardName` names: a job's
+        // name is unique within its card rather than within the account, and this listing
+        // is scoped to that card. A card the store does not hold simply has no export
+        // jobs, and this operation models no error at all (smithy_query
+        // operation=ListModelCardExportJobs lists none), so that is an empty page rather
+        // than a refusal.
+        let mut matching: Vec<&crate::state::ModelCardExportJob> = store
+            .model_card_export_jobs
+            .values()
+            .filter(|job| job.card_name == input.model_card_name)
+            .filter(|job| {
+                // `ModelCardVersion` lists "export jobs for the model card with the
+                // specified version" — the version each job's create RESOLVED.
+                input
+                    .model_card_version
+                    .is_none_or(|version| job.card_version == version)
+            })
+            .filter(|job| {
+                input
+                    .model_card_export_job_name_contains
+                    .as_deref()
+                    .is_none_or(|needle| job.name.contains(needle))
+            })
+            .filter(|job| {
+                input
+                    .status_equals
+                    .as_deref()
+                    .is_none_or(|status| job.status == status)
+            })
+            .filter(|job| {
+                // Both bounds are inclusive, as the service's other listings apply them,
+                // so a bound copied straight out of a prior response's `CreatedAt` still
+                // selects the job carrying it.
+                let created = crate::state::timestamp_key(crate::state::timestamp(job.created_at));
+                created_after.is_none_or(|bound| created >= bound)
+                    && created_before.is_none_or(|bound| created <= bound)
+            })
+            .collect();
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays the job's name
+        // ascending in both directions, so two jobs sharing a sort key keep one order
+        // whichever way the page is sorted — and a `NextToken` resolved against a freshly
+        // computed result set lands on the same boundary.
+        matching.sort_by(|left, right| {
+            let by_key = match sort_by {
+                "Name" => left.name.cmp(&right.name),
+                "Status" => left.status.cmp(&right.status),
+                _ => crate::state::timestamp_key(crate::state::timestamp(left.created_at))
+                    .cmp(&crate::state::timestamp_key(crate::state::timestamp(
+                        right.created_at,
+                    ))),
+            };
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.name.cmp(&right.name))
+        });
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|name| matching.iter().position(|job| job.name == name))
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(crate::state::STALE_PAGE_TOKEN)
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // `MaxResults` documents no default for this operation, so an absent one takes the
+        // service's own page ceiling and an explicit one is capped by it: no single call
+        // can serialise the whole store. The token below is emitted whenever anything is
+        // left, so a paginating client walks the full result set exactly once either way.
+        let start = start.min(matching.len());
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_PAGE_SIZE, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end < matching.len() => Some(crate::state::encode_page_token(&last.name)),
+            _ => None,
+        };
+
+        let output = ListModelCardExportJobsOutput {
+            model_card_export_job_summaries: page
+                .iter()
+                .map(|job| ModelCardExportJobSummary {
+                    model_card_export_job_name: job.name.clone(),
+                    model_card_export_job_arn: job.arn.clone(),
+                    status: job.status.clone(),
+                    model_card_name: job.card_name.clone(),
+                    // The version the create RESOLVED, replayed rather than recomputed, so
+                    // a card that has gained versions since does not change what this job
+                    // reports exporting.
+                    model_card_version: job.card_version,
+                    created_at: crate::state::timestamp(job.created_at),
+                    last_modified_at: crate::state::timestamp(job.last_modified_at),
+                })
+                .collect(),
+            next_token,
+        };
+        drop(store);
+
+        for arn in &settled {
+            // A transition is a state change, so it leaves the same record a create does
+            // rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, arn, ctx);
+        }
+        Ok(output)
     }
 }

@@ -21,6 +21,8 @@ mod environment_business_rules;
 mod environment_lifecycle;
 #[path = "all/environment_service_defaults.rs"]
 mod environment_service_defaults;
+#[path = "all/environment_unit_count_ranges.rs"]
+mod environment_unit_count_ranges;
 #[path = "all/environment_update_status_sequence.rs"]
 mod environment_update_status_sequence;
 #[path = "all/rejection_contract.rs"]

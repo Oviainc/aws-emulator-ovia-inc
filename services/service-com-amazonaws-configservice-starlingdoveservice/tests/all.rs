@@ -93,3 +93,5 @@ mod list_stored_queries;
 mod delete_stored_query;
 #[path = "all/delete_pending_aggregation_request.rs"]
 mod delete_pending_aggregation_request;
+#[path = "all/aggregate_config_rule_compliance_summary.rs"]
+mod aggregate_config_rule_compliance_summary;

@@ -1176,7 +1176,10 @@ pub fn too_many_tags_message(resulting: usize) -> String {
 ///
 /// AWS's tag restrictions reserve this prefix on every taggable resource: the keys under
 /// it name AWS-generated tags, so a user request may not supply one and a request that
-/// does is refused rather than stored. The model constrains a `TagKey`'s length and
+/// does is refused rather than stored. The restriction covers editing and DELETING such
+/// a tag as well as creating one, so a key in this namespace is refused wherever a
+/// request names it — in a supplied tag map ([`invalid_tags_message`]) and in the keys an
+/// untag request asks the service to remove alike. The model constrains a `TagKey`'s length and
 /// nothing else, so the reserved namespace is the service's own rule to enforce, with
 /// the `ValidationException` (HTTP 400) a request that "fails to satisfy the constraints
 /// specified by the service" earns.

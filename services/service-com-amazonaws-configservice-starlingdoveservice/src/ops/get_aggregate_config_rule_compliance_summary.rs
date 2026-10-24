@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAggregateConfigRuleComplianceSummary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAggregateConfigRuleComplianceSummary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAggregateConfigRuleComplianceSummary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports how many Config rules are compliant and how many are noncompliant in each
+//! source group a configuration aggregator takes in, computed from the rules this
+//! service's store holds (`config_rules` in
+//! [`crate::state::ComAmazonawsConfigserviceStarlingdoveserviceState`]) and the
+//! evaluation results recorded against each of them.
+//!
+//! A group is a source account or a source Region, whichever `GroupByKey` names
+//! (`AggregateComplianceCount$GroupName`: "The 12-digit account ID or region based on
+//! the GroupByKey value"); a request that names no key is grouped by account, the
+//! identity an aggregator names its sources by, and the key the summary was grouped by
+//! is reported back. Each group's `ComplianceSummary` is the roll-up
+//! [`crate::state::summarise_rule_compliance`] computes for every compliance summary
+//! this service reports, so this read and the account's own
+//! `GetComplianceSummaryByConfigRule` cannot disagree about how many of the same rules
+//! are compliant.
+//!
+//! This store stands for ONE account in ONE Region, so it contributes at most one
+//! group: this account, in the Region the request is scoped to, and only while one of
+//! the aggregator's sources names that account and Region
+//! ([`crate::state::ConfigurationAggregatorEntry::aggregates_source`]) and the
+//! request's own `Filters` do not exclude it. A group is reported only where there are
+//! Config rules to summarise, which is one way a caller is served the empty result
+//! page this operation documents.
+//!
+//! It is a REPORT: it writes nothing, so the rules and results a later caller sees are
+//! the ones this call saw.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +186,177 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAggregateConfigRuleComplianceSummary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAggregateConfigRuleComplianceSummaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAggregateConfigRuleComplianceSummary"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // `Limit` is the page size, and 0 asks for the default (`Limit`: "The default
+        // is 1000. You cannot specify a number greater than 1000. If you specify 0,
+        // Config uses the default"). The modelled 0..1000 range is refused before this
+        // handler runs; a value outside it reaching here is still the limit error this
+        // operation models, never a page.
+        let max = crate::state::GROUP_BY_API_MAX_LIMIT;
+        let page_size = match usize::try_from(input.limit)
+            .ok()
+            .filter(|limit| *limit <= max)
+        {
+            Some(0) => max,
+            Some(limit) => limit,
+            None => {
+                // Defensive, and unreachable in the assembled emulator: the shared
+                // request validation refuses the modelled 0..1000 range before this
+                // handler runs, so nothing reaches this arm.
+                return Err(
+                    GetAggregateConfigRuleComplianceSummaryErrorModeled::InvalidLimitException(
+                        InvalidLimitException {
+                            message: Some(format!(
+                                "The specified Limit {} is outside the allowable range of \
+                                 0 to {max}.",
+                                input.limit
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        GetAggregateConfigRuleComplianceSummaryErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "the specified NextToken is not valid; use the NextToken \
+                                     a previous GetAggregateConfigRuleComplianceSummary \
+                                     response returned"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // Which key the groups are named by. The modelled enum is refused before this
+        // handler runs, so the only other case is a request that names no key at all,
+        // which is grouped by the account an aggregation source is named by.
+        let group_by_key = input
+            .group_by_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .unwrap_or(crate::state::COMPLIANCE_SUMMARY_GROUP_BY_ACCOUNT_ID)
+            .to_string();
+
+        // This store stands for ONE account in ONE Region, so the Config data it holds
+        // is this account's, in the Region the request is signed for.
+        let account_id = ::emulator_server::emulator_account_id();
+        let region = crate::state::request_region(ctx);
+        let store = state.lock();
+
+        let Some(aggregator) = store
+            .configuration_aggregators
+            .get(&input.configuration_aggregator_name)
+        else {
+            return Err(
+                GetAggregateConfigRuleComplianceSummaryErrorModeled::NoSuchConfigurationAggregatorException(
+                    NoSuchConfigurationAggregatorException {
+                        message: Some(crate::state::no_such_configuration_aggregator_message(
+                            &input.configuration_aggregator_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `Filters` narrows the summary to one source account and/or one source Region
+        // ("Filters the results based on the account IDs and regions"), so a filter
+        // naming any other source leaves this store contributing nothing.
+        let excluded_by_filters = input.filters.as_ref().is_some_and(|filters| {
+            filters
+                .account_id
+                .as_deref()
+                .filter(|named| !named.is_empty())
+                .is_some_and(|named| named != account_id)
+                || filters
+                    .aws_region
+                    .as_deref()
+                    .filter(|named| !named.is_empty())
+                    .is_some_and(|named| named != region)
+        });
+
+        // The group key names the source identity each group is named by. The modelled
+        // enum is refused before this handler runs; a value outside it reaching here is
+        // a key this operation cannot group by — a bad request, not a group.
+        let group_name = match group_by_key.as_str() {
+            crate::state::COMPLIANCE_SUMMARY_GROUP_BY_ACCOUNT_ID => account_id,
+            crate::state::COMPLIANCE_SUMMARY_GROUP_BY_AWS_REGION => region.as_str(),
+            unknown => {
+                return Err(
+                    GetAggregateConfigRuleComplianceSummaryErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "'{unknown}' is not a valid value for GroupByKey; the valid \
+                                 values are {}, {}.",
+                                crate::state::COMPLIANCE_SUMMARY_GROUP_BY_ACCOUNT_ID,
+                                crate::state::COMPLIANCE_SUMMARY_GROUP_BY_AWS_REGION,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // The groups this store contributes: its own source, named by the group key,
+        // while the aggregator takes that source in, the filters admit it and there are
+        // Config rules to summarise. Collected as a list so the page walk below is the
+        // one every group takes, however many a group key resolves to — this store's
+        // one account in one Region is why at most one group reaches it.
+        let contributes = !excluded_by_filters
+            && aggregator.aggregates_source(account_id, &region)
+            && !store.config_rules.is_empty();
+        let mut groups: Vec<&str> = Vec::new();
+        if contributes {
+            groups.push(group_name);
+        }
+        // One total ordering over the group names, so a page token names exactly one
+        // group and resuming at it can neither skip nor repeat another.
+        groups.sort_unstable();
+
+        // `ComplianceSummaryTimestamp` is the instant Config created the summary, which
+        // is now, and is the same instant for every group of one response.
+        let created_at = ::std::time::SystemTime::now();
+        let mut page = Vec::new();
+        let mut next_token = None;
+        for name in groups
+            .into_iter()
+            .filter(|name| resume_at.as_deref().is_none_or(|from| *name >= from))
+        {
+            if page.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(name));
+                break;
+            }
+            page.push(AggregateComplianceCount {
+                group_name: Some(name.to_string()),
+                compliance_summary: Some(crate::state::summarise_rule_compliance(
+                    store.config_rules.values(),
+                    created_at,
+                )),
+            });
+        }
+
+        Ok(GetAggregateConfigRuleComplianceSummaryOutput {
+            group_by_key: Some(group_by_key),
+            aggregate_compliance_counts: Some(page),
+            next_token,
+        })
     }
 }

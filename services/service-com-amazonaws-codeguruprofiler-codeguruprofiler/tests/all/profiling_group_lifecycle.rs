@@ -37,6 +37,37 @@ pub(crate) fn group_arn(name: &str) -> String {
     format!("arn:aws:codeguru-profiler:{REGION}:{ACCOUNT}:profilingGroup/{name}")
 }
 
+/// Let the aggregation every profile a group holds is owed fall due, by moving each
+/// stored receipt time back past the span the service's aggregation takes.
+///
+/// A posted agent profile is not part of an aggregated profile at the instant it is
+/// received — the window it belongs to is still open, and the aggregation pass runs
+/// after that window closes — so a case about what an AGGREGATED profile reads back as
+/// places the receipt in a window that has closed, the way `place_receipts` does for a
+/// case about several windows. This writes the same stored field `PostAgentProfile`
+/// wrote, through the one shared engine, and nothing else. `pub(crate)` so every suite
+/// in this target ages a stored profile one way.
+pub(crate) fn complete_aggregation_in(engine: &Arc<engine::InMemoryEngine>, name: &str) {
+    use service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::{
+        AGGREGATION_PASS_MILLIS, finest_aggregation_period_seconds,
+    };
+
+    let back = finest_aggregation_period_seconds() + AGGREGATION_PASS_MILLIS / 1_000 + 1;
+    let state = engine
+        .state::<service_com_amazonaws_codeguruprofiler_codeguruprofiler::ComAmazonawsCodeguruprofilerCodeguruprofilerState>();
+    let mut guard = state.lock();
+    let group = guard
+        .groups
+        .get_mut(name)
+        .unwrap_or_else(|| panic!("no stored group named {name}"));
+    for profile in group.profiles.iter_mut() {
+        profile.received_at = aws_smithy_types::DateTime::from_secs_and_nanos(
+            profile.received_at.secs() - back,
+            profile.received_at.subsec_nanos(),
+        );
+    }
+}
+
 /// One HTTP answer, reduced to what these tests assert on. `pub(crate)` so the other
 /// suites in this test target drive the same harness instead of forking it.
 pub(crate) struct Answer {
@@ -144,6 +175,11 @@ impl Harness {
             .policy
             .as_ref()
             .map(|policy| policy.revision_id.clone())
+    }
+
+    /// [`complete_aggregation_in`] on this harness's engine.
+    pub(crate) fn complete_aggregation(&self, name: &str) {
+        complete_aggregation_in(&self.engine, name);
     }
 
     /// Profile bytes retained across every group — what the store-wide budget bounds.
@@ -750,6 +786,9 @@ async fn a_posted_agent_profile_comes_back_byte_identical() {
             String::from_utf8_lossy(&posted.body)
         );
 
+        // Aggregation is what `GetProfile` serves, and it is not instant: the posted
+        // profile is readable once the aggregation its window owes has fallen due.
+        harness.complete_aggregation(&case.name);
         let fetched = harness.get_profile(&case.name, "").await;
         assert_eq!(
             fetched.status, 200,
@@ -799,6 +838,7 @@ async fn a_posted_agent_profile_comes_back_byte_identical() {
             "{}: replaying a profileToken must still answer 204",
             profile.label
         );
+        harness.complete_aggregation(&case.name);
         let after_replay = harness.get_profile(&case.name, "").await;
         assert_eq!(
             after_replay.body, profile.bytes,
@@ -1102,6 +1142,7 @@ async fn posting_profiles_stays_inside_the_per_group_retention_bound() {
             );
         }
 
+        harness.complete_aggregation(&case.name);
         let fetched = harness.get_profile(&case.name, "").await;
         assert_eq!(
             fetched.status, 200,
@@ -1190,6 +1231,9 @@ async fn get_profile_selects_by_the_requested_time_range() {
             .status,
         204
     );
+    // Every row below is about which WINDOW selects the stored profile, so the profile's
+    // own aggregation is settled first.
+    harness.complete_aggregation(&case.name);
 
     let reported_at = harness
         .describe(&case.name)

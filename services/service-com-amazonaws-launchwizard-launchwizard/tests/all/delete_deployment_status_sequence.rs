@@ -9,7 +9,7 @@
 //! so every one of those three statuses is observable by a polling reader.
 //!
 //! It is asserted over a TABLE rather than over one call: the delete arrives while the
-//! deployment is in each status a live deployment can be in (`CREATING`,
+//! deployment is in each status a live deployment can be in (`CREATING`, `VALIDATING`,
 //! `IN_PROGRESS`, `COMPLETED`, `UPDATE_IN_PROGRESS`), on a different workload and
 //! deployment pattern of the seeded catalogue each time. No status value is written by
 //! hand without being checked against the model's own `DeploymentStatus` enum.
@@ -156,12 +156,13 @@ async fn a_delete_reports_delete_initiating_and_then_advances_on_the_clock() {
     // One row per status a live deployment can be in when the delete arrives: the rule
     // is about the delete, not about what the deployment was doing, so each row must
     // report the same first status and walk the same sequence afterwards.
-    let rows: [(&str, Option<Duration>, bool); 4] = [
+    let rows: [(&str, Option<Duration>, bool); 5] = [
         // label, how long to wait after the create, whether to update first
         ("delete while CREATING", None, false),
-        ("delete while IN_PROGRESS", Some(ONE_STEP), false),
-        ("delete when COMPLETED", Some(ONE_STEP * 2), false),
-        ("delete while UPDATE_IN_PROGRESS", Some(ONE_STEP * 2), true),
+        ("delete while VALIDATING", Some(ONE_STEP), false),
+        ("delete while IN_PROGRESS", Some(ONE_STEP * 2), false),
+        ("delete when COMPLETED", Some(ONE_STEP * 3), false),
+        ("delete while UPDATE_IN_PROGRESS", Some(ONE_STEP * 3), true),
     ];
 
     for (row, (label, wait, update_first)) in rows.into_iter().enumerate() {

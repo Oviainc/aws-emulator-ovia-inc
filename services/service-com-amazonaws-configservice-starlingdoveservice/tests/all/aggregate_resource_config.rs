@@ -99,6 +99,14 @@ const MIN_IDENTIFIERS: usize = 1;
 /// See [`MIN_IDENTIFIERS`].
 const MAX_IDENTIFIERS: usize = 100;
 
+/// The published length bounds of the aggregator name both reads carry
+/// (`ConfigurationAggregatorName`, `@length(min: 1, max: 256)` with pattern
+/// `^[\w\-]+$`, from `smithy_query(query="shape",
+/// shape="ConfigurationAggregatorName")`).
+const AGGREGATOR_NAME_MIN_LENGTH: usize = 1;
+/// See [`AGGREGATOR_NAME_MIN_LENGTH`].
+const AGGREGATOR_NAME_MAX_LENGTH: usize = 256;
+
 /// The instant a seeded resource's configuration item was captured: a fixed point in
 /// the past, so the reported capture time and configuration state id can be checked
 /// against it.
@@ -1362,4 +1370,84 @@ async fn a_single_read_naming_an_aggregator_that_does_not_exist_is_refused() {
              NoSuchConfigurationAggregatorException, got {status} {code}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_single_read_whose_aggregator_name_misses_the_published_bounds_is_refused() {
+    let emulator = emulator_holding(&inventory()).await;
+    put_whole_account_aggregator(&emulator).await;
+    // The same identifier throughout, so each row is about the NAME it carries and
+    // nothing else: the inventory holds a current configuration item for it, which the
+    // aggregator created above answers.
+    let sent = home(EC2_VOLUME, "vol-0001");
+
+    // A name INSIDE what the member accepts reaches the lookup, so it is answered
+    // about the aggregator it names — none of these named one — rather than refused as
+    // malformed. Rows sit at each published length bound and on the character classes
+    // the pattern admits.
+    let accepted: [(&str, String); 4] = [
+        (
+            "the shortest name the member accepts",
+            "x".repeat(AGGREGATOR_NAME_MIN_LENGTH),
+        ),
+        (
+            "the longest name the member accepts",
+            "y".repeat(AGGREGATOR_NAME_MAX_LENGTH),
+        ),
+        ("a word character and a hyphen", "org_wide-2".to_string()),
+        ("digits alone", "90210".to_string()),
+    ];
+    for (case, name) in accepted {
+        let (status, code) = emulator
+            .refused("GetAggregateResourceConfig", &single(&name, &sent))
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "NoSuchConfigurationAggregatorException"),
+            "case {case:?}: the name is inside what the member accepts, so the read is \
+             refused for the aggregator it names with 400 \
+             NoSuchConfigurationAggregatorException, got {status} {code}"
+        );
+    }
+
+    // A name OUTSIDE it names no aggregator at all, so the request is refused at the
+    // boundary before the lookup: one past each published length bound, and names the
+    // pattern does not admit.
+    let malformed: [(&str, String); 4] = [
+        (
+            "one character short of the minimum",
+            "z".repeat(AGGREGATOR_NAME_MIN_LENGTH - 1),
+        ),
+        (
+            "one character past the maximum",
+            "z".repeat(AGGREGATOR_NAME_MAX_LENGTH + 1),
+        ),
+        ("a name with a space", "org wide".to_string()),
+        ("a name with a slash", "org/wide".to_string()),
+    ];
+    for (case, name) in malformed {
+        let (status, code) = emulator
+            .refused("GetAggregateResourceConfig", &single(&name, &sent))
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: the name is outside what the member accepts, so the read is \
+             refused 400 ValidationException, got {status} {code}"
+        );
+    }
+
+    // Every refusal left the inventory alone: the aggregator still answers the
+    // identifier with its configuration item.
+    let body = emulator
+        .ok("GetAggregateResourceConfig", &single(AGGREGATOR, &sent))
+        .await;
+    assert_eq!(
+        (
+            body["ConfigurationItem"]["resourceType"].as_str(),
+            body["ConfigurationItem"]["resourceId"].as_str(),
+        ),
+        (Some(EC2_VOLUME), Some("vol-0001")),
+        "expected the refusals to change nothing the read reports, got {body}"
+    );
 }

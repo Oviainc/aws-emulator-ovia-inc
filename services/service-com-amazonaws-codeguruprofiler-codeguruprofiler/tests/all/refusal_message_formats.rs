@@ -551,7 +551,9 @@ async fn every_other_group_scoped_operation_states_its_own_not_found_text() {
     // ("Profiling group for <accountId>/<name> does not exist!"), which
     // `refusal_message_rules.rs` pins over both of them. `GetPolicy` is not here for the
     // same reason — a recorded refusal states the LOOKUP it performed, naming the account
-    // it was scoped to — and is pinned on its own below.
+    // it was scoped to — and is pinned on its own below. Nor is `UpdateProfilingGroup`,
+    // which states the lookup AND the operation, or the ARN-addressed tagging surface,
+    // which answers its own error code: `not_found_surfaces.rs` pins both.
     let names = ["never-created", "Absent_1", "a-b-c"];
     for name in names {
         let cases: Vec<(&str, &str, String, &str, Vec<u8>)> = vec![            (
@@ -560,16 +562,6 @@ async fn every_other_group_scoped_operation_states_its_own_not_found_text() {
                 format!("/profilingGroups/{name}"),
                 "application/json",
                 Vec::new(),
-            ),
-            (
-                "UpdateProfilingGroup",
-                "PUT",
-                format!("/profilingGroups/{name}"),
-                "application/json",
-                serde_json::to_vec(&serde_json::json!({
-                    "agentOrchestrationConfig": {"profilingEnabled": true}
-                }))
-                .expect("a serializable body"),
             ),
             (
                 "GetProfile",
@@ -596,16 +588,6 @@ async fn every_other_group_scoped_operation_states_its_own_not_found_text() {
                 "ListProfileTimes",
                 "GET",
                 format!("/profilingGroups/{name}/profileTimes?{window}&period=PT5M"),
-                "application/json",
-                Vec::new(),
-            ),
-            (
-                "UntagResource",
-                "DELETE",
-                format!(
-                    "/tags/arn%3Aaws%3Acodeguru-profiler%3Aus-east-1%3A{}%3AprofilingGroup%2F{name}?tagKeys=env",
-                    account_id()
-                ),
                 "application/json",
                 Vec::new(),
             ),

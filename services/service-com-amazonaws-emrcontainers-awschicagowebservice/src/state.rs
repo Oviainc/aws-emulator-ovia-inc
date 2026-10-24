@@ -178,6 +178,16 @@ pub const MAX_JOB_TEMPLATES: usize = 500;
 /// further. Sized well above any plausible test or demo workload.
 pub const MAX_SECURITY_CONFIGURATIONS: usize = 200;
 
+/// The most tags one resource holds.
+///
+/// `TagMap` is `len 0..50`, and it is the shape of BOTH the tag set a request carries and
+/// the tag set a read answers with (`VirtualCluster$tags`, `JobRun$tags`,
+/// `ListTagsForResource$tags`), so a resource that held more than this could not be
+/// reported inside its own modelled shape. The boundary already refuses a single request
+/// carrying more; what has to hold it is a MERGE, which is why `TagResource` checks the
+/// size the merged set would reach before writing any of it.
+pub const MAX_RESOURCE_TAGS: usize = 50;
+
 /// The most managed endpoints this emulator keeps at once.
 ///
 /// Not an AWS quota: the emulator's own retention cap, on the same terms as

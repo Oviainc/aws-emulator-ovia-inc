@@ -339,14 +339,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `TRANSITION_SPAN` after the previous one and is materialised by the first
         // request at or after that instant.
         //
+        // The steps are every non-failure `DeploymentStatus` member the model declares
+        // for a CREATE, in the order they happen: a deployment's settings are checked
+        // (`VALIDATING`) before its resources are created (`IN_PROGRESS`), so each of
+        // those phases is a step of its own that a poller — and a `DEPLOYMENT_STATUS`
+        // filter — can observe, rather than a phase collapsed into the next one.
+        //
         // COMPLETED is the honest terminal status here: what this service's control
         // plane owns IS the deployment record, and by then the record is complete and
         // readable. Nothing in it claims infrastructure the emulator did not build —
         // `resourceGroup` stays absent because no resource group was created, and the
         // events describe the record's own lifecycle rather than provisioned resources.
-        let in_progress_at = now + crate::state::TRANSITION_SPAN;
+        let validating_at = now + crate::state::TRANSITION_SPAN;
+        let in_progress_at = validating_at + crate::state::TRANSITION_SPAN;
         let completed_at = in_progress_at + crate::state::TRANSITION_SPAN;
         let pending = ::std::collections::VecDeque::from(vec![
+            crate::state::PendingTransition {
+                due_at: validating_at,
+                status: crate::state::STATUS_VALIDATING.to_string(),
+                event: crate::state::DeploymentEvent::new(
+                    "DeploymentValidating",
+                    format!(
+                        "Deployment '{}' is validating the settings submitted for deployment \
+                         pattern '{}'.",
+                        input.name, input.deployment_pattern_name
+                    ),
+                    crate::state::EVENT_IN_PROGRESS,
+                    validating_at,
+                ),
+            },
             crate::state::PendingTransition {
                 due_at: in_progress_at,
                 status: crate::state::STATUS_IN_PROGRESS.to_string(),

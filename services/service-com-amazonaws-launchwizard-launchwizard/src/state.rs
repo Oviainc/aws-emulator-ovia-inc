@@ -36,6 +36,12 @@ pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
 /// one of `DEPLOYMENT_STATUS_VALUES` (the model's `DeploymentStatus` enum).
 pub const STATUS_CREATING: &str = "CREATING";
 /// See [`STATUS_CREATING`].
+///
+/// The phase in which an accepted deployment's settings are checked before anything is
+/// provisioned: the model declares it as a `DeploymentStatus` member of its own, so it
+/// is a step a created deployment walks rather than a phase folded into the next one.
+pub const STATUS_VALIDATING: &str = "VALIDATING";
+/// See [`STATUS_CREATING`].
 pub const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 /// See [`STATUS_CREATING`].
 pub const STATUS_COMPLETED: &str = "COMPLETED";

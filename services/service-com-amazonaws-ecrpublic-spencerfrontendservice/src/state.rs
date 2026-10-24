@@ -41,21 +41,32 @@ use crate::ops::types::{
 /// (`OPERATIONS.md`, "Wire protocol": ARN namespace `ecr-public`).
 pub const ARN_NAMESPACE: &str = "ecr-public";
 
-/// The one Region this API is served from.
+/// The one Region the registry-catalog WRITE is served from.
 ///
 /// `UnsupportedCommandException` ("The action isn't supported in this Region", client,
 /// HTTP 400) is a SERVICE-level error in this model: it is bound to every one of the 23
 /// operations rather than declared per operation (`smithy_query(query="digest")` reports
-/// it under `common_errors`), so any ECR Public call can be refused for the Region it was
-/// signed for. ECR Public publishes endpoints in more than one Region but serves its API
-/// from this one, which is also the Region AWS documents a caller of a public registry
-/// must name.
+/// it under `common_errors`), and `endpointResolution` is an endpoint rule set — so the
+/// model says any ECR Public call CAN be refused for the Region it was signed for, and
+/// says nothing about which Region serves which operation.
+///
+/// What the service does is narrower than that: ECR Public publishes endpoints in more
+/// than one Region and serves the registry and repository surface — repositories, images,
+/// layer uploads, tags, policies, catalog reads — from any of them. The one call that is
+/// Region-scoped is the write of the account-global registry catalog data
+/// (`PutRegistryCatalogData`), which is accepted only in this Region; the matching read
+/// (`GetRegistryCatalogData`) is served everywhere, so a caller outside this Region can
+/// still see what the record holds.
 pub const API_REGION: &str = "us-east-1";
 
-/// The `UnsupportedCommandException` an ECR Public call signed for any Region other than
-/// [`API_REGION`] is refused with, or `None` when the request addressed the Region this
-/// API is served from: the Region gate every implemented handler runs before it reads or
-/// writes anything.
+/// The `UnsupportedCommandException` a Region-scoped ECR Public call signed for any Region
+/// other than [`API_REGION`] is refused with, or `None` when the request addressed the
+/// Region that call is served from.
+///
+/// This is the gate of the ONE Region-scoped operation (see [`API_REGION`]): it is called
+/// by `PutRegistryCatalogData` before it touches the account-global record, and by nothing
+/// else — an operation AWS serves from every published endpoint must not consult it, or a
+/// caller that reached ECR Public from another Region is refused everything.
 ///
 /// The Region a request carries is the one in its SigV4 credential scope, parsed by
 /// `emulator_server::sigv4_credential_scope` (the single source of SigV4-scope parsing),
@@ -912,12 +923,173 @@ pub fn is_layer_digest_form(candidate: &str) -> bool {
 /// failed, and never the rejected body itself (a manifest is modelled up to 4 MiB).
 /// `member` is the member as the service names it in that message.
 pub fn json_document(member: &str, text: &str) -> Result<::serde_json::Value, String> {
-    ::serde_json::from_str(text).map_err(|_| {
-        format!(
-            "Invalid parameter at '{member}' failed to satisfy constraint: \
-             'Invalid JSON syntax'"
-        )
-    })
+    ::serde_json::from_str(text).map_err(|_| invalid_json_message(member))
+}
+
+/// The `InvalidParameterException` message ECR Public fills from the request for a member
+/// whose content is not the JSON document that member has to carry — a body that does not
+/// parse, and a manifest that does not satisfy the schema it declares itself to be.
+///
+/// This service states every refusal OF A DOCUMENT with this one clause: it names the
+/// member at fault and that the content is not the document that member takes, so the two
+/// manifest-level refusals (a body that is not JSON, and a document whose content is not
+/// the schema it declares) read alike on the wire, as the recorded refusal does.
+///
+/// `member` is the member as the service names it in that message. The rejected content is
+/// never part of it.
+pub fn invalid_json_message(member: &str) -> String {
+    format!("Invalid parameter at '{member}' failed to satisfy constraint: 'Invalid JSON syntax'")
+}
+
+/// The content member the schema a manifest media type names requires a document to carry.
+///
+/// A registry manifest declares its own schema in its `mediaType`, and each schema is
+/// defined by where it lists its content: a manifest list / OCI image index lists other
+/// manifests under `manifests`, an image manifest lists layer descriptors under `layers`,
+/// and the Docker V2 Schema 1 form lists them under `fsLayers`. A media type this table
+/// does not name declares no schema this registry knows, so nothing is required of the
+/// document that carries it.
+const MANIFEST_SCHEMA_MEMBERS: &[(&str, &str)] = &[
+    (
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "manifests",
+    ),
+    ("application/vnd.oci.image.index.v1+json", "manifests"),
+    (
+        "application/vnd.docker.distribution.manifest.v2+json",
+        "layers",
+    ),
+    ("application/vnd.oci.image.manifest.v1+json", "layers"),
+    (
+        "application/vnd.docker.distribution.manifest.v1+json",
+        "fsLayers",
+    ),
+    (
+        "application/vnd.docker.distribution.manifest.v1+prettyjws",
+        "fsLayers",
+    ),
+];
+
+/// The media type under the spelling [`MANIFEST_SCHEMA_MEMBERS`] is keyed by: without the
+/// parameters a media type may carry after a `;`, trimmed, and case-folded, because a
+/// media type's type and subtype are case-insensitive.
+fn media_type_key(media_type: &str) -> String {
+    media_type
+        .split(';')
+        .next()
+        .unwrap_or(media_type)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// The `InvalidParameterException` message for a manifest that does not satisfy the schema
+/// its own declared media type names, or `None` when the document and the schema agree.
+///
+/// A manifest is only a manifest of the kind it says it is: the registry is the only place
+/// that consistency can be enforced, so a document declaring a schema while carrying no
+/// content of that schema (an index media type over a document with no `manifests` array,
+/// an image-manifest media type over a document with no layer array) is refused rather
+/// than stored, and nothing is created for it. `media_type` is the type declared for the
+/// document, which is the one the request declared and otherwise the document's own ("if
+/// you push an image manifest that doesn't contain the mediaType field, you must specify
+/// the imageManifestMediaType in the request", `PutImage$imageManifestMediaType`). A
+/// document that declares no schema at all, or one this registry does not know, is left to
+/// the content it carries.
+///
+/// `member` is the member the message names (`ImageManifest` for a pushed manifest).
+pub fn manifest_schema_violation(
+    member: &str,
+    media_type: Option<&str>,
+    document: &serde_json::Value,
+) -> Option<String> {
+    let declared = media_type_key(media_type?);
+    let (_, required) = MANIFEST_SCHEMA_MEMBERS
+        .iter()
+        .find(|(media_type, _)| *media_type == declared)?;
+    let carried = document
+        .get(required)
+        .is_some_and(::serde_json::Value::is_array);
+    if carried {
+        return None;
+    }
+    Some(invalid_json_message(member))
+}
+
+/// The blob digests an image manifest names: its config descriptor's, then each layer
+/// descriptor's, as the document spelled them, each named once and in document order.
+///
+/// These are the blobs that have to be in the repository before the manifest that
+/// references them can be stored ("when an image is pushed and all new image layers have
+/// been uploaded, the PutImage API is called", `PutImage`), so this is what the push
+/// resolves against the repository's completed layers. A descriptor that names no digest
+/// points at no blob and so states nothing to resolve.
+///
+/// A manifest list names other MANIFESTS rather than blobs, and a list document carries
+/// neither `config` nor `layers`, so it names no blob here: what it references is read by
+/// [`manifest_content_of`] instead. A document that carries BOTH — a `layers` array beside
+/// a `manifests` one — still names the blobs of its layer descriptors, so they are read:
+/// what a document names is read from the members it actually carries, never skipped
+/// because another member is present.
+///
+/// `None` for a document naming more layer descriptors than
+/// [`MAX_MANIFEST_LAYER_ENTRIES`]: the count is the caller's, so the walk is bounded
+/// before any per-entry work rather than after it, and a document past the bound is not
+/// read in part — the push that carries it is refused instead.
+pub fn manifest_blob_digests(document: &serde_json::Value) -> Option<Vec<String>> {
+    let digest_of = |descriptor: &serde_json::Value| -> Option<String> {
+        descriptor
+            .get("digest")
+            .and_then(serde_json::Value::as_str)
+            .filter(|digest| !digest.is_empty())
+            .map(ToString::to_string)
+    };
+    let layers = match document.get("layers").and_then(|l| l.as_array()) {
+        Some(layers) if layers.len() > MAX_MANIFEST_LAYER_ENTRIES => return None,
+        Some(layers) => layers.as_slice(),
+        None => &[],
+    };
+    // Each blob is named once and in document order, so the order is kept in the `Vec`
+    // while membership is decided by the set beside it: one descriptor costs one set
+    // lookup, whatever the document's length.
+    let mut named: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut push = |digest: Option<String>| {
+        if let Some(digest) = digest {
+            if seen.insert(digest.clone()) {
+                named.push(digest);
+            }
+        }
+    };
+    push(document.get("config").and_then(digest_of));
+    for layer in layers {
+        push(digest_of(layer));
+    }
+    Some(named)
+}
+
+/// The most `layers[*]` descriptors this service reads from one image manifest.
+///
+/// A push commits a manifest over the blobs the repository holds, and a repository records
+/// at most [`MAX_LAYERS_PER_REPOSITORY`] layers, so a document naming more layer
+/// descriptors than that names blobs no repository of this registry could hold. The count
+/// is caller-supplied and `imageManifest` is modelled `@length(1..4194304)`, so one
+/// document could otherwise name hundreds of thousands of descriptors; this is the bound
+/// that caps the work of reading one, the way [`MAX_MANIFEST_LIST_ENTRIES`] caps a
+/// manifest list's.
+pub const MAX_MANIFEST_LAYER_ENTRIES: usize = MAX_LAYERS_PER_REPOSITORY;
+
+/// The `InvalidParameterException` message for a manifest naming more layer descriptors
+/// than [`MAX_MANIFEST_LAYER_ENTRIES`].
+///
+/// The service's parameter template over the member at fault and the rule it failed, as
+/// every refused parameter of this API is stated: here the rule is this registry's own
+/// ceiling on how many layer descriptors it reads from one document, so the clause states
+/// that count rather than the document's syntax.
+pub fn manifest_layer_count_message(member: &str) -> String {
+    format!(
+        "Invalid parameter at '{member}' failed to satisfy constraint: 'Member must have \
+         no more than {MAX_MANIFEST_LAYER_ENTRIES} layers'"
+    )
 }
 
 /// What content a stored manifest document references.

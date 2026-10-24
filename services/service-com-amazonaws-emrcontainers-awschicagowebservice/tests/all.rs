@@ -21,6 +21,8 @@ mod job_template_lifecycle;
 mod managed_endpoint_listing;
 #[path = "all/resource_tag_removal.rs"]
 mod resource_tag_removal;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/security_configuration.rs"]
 mod security_configuration;
 #[path = "all/security_configuration_delete.rs"]

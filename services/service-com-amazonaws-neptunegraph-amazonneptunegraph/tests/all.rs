@@ -25,6 +25,8 @@ mod graph_lifecycle;
 mod graph_run_state;
 #[path = "all/graph_snapshot_lifecycle.rs"]
 mod graph_snapshot_lifecycle;
+#[path = "all/graph_summary.rs"]
+mod graph_summary;
 #[path = "all/import_task_lifecycle.rs"]
 mod import_task_lifecycle;
 #[path = "all/import_task_minting.rs"]

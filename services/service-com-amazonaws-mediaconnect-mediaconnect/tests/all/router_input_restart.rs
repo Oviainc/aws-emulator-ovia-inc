@@ -34,7 +34,10 @@ const NETWORK_INTERFACE_ARN: &str =
 
 /// Long enough for a transition the clock owes to be due: twice
 /// [`mc::TRANSITION_SPAN`], so a settled state is never read early.
-fn past_transition_span() -> Duration {
+///
+/// `pub(crate)` because the router input START suite waits the same span out (see
+/// `tests/all/router_input_start.rs`).
+pub(crate) fn past_transition_span() -> Duration {
     mc::TRANSITION_SPAN * 2
 }
 
@@ -119,7 +122,11 @@ pub(crate) fn union_member<'a>(payload: &'a Value, member_name: &str, json_name:
 /// Every row is a DIFFERENT kind of input, which is what the input's `InputType` and
 /// `StreamDetails` follow from, so the restart rule is asserted over the whole class rather
 /// than over one configuration.
-fn configuration_rows() -> Vec<(
+///
+/// `pub(crate)` because the router input START suite spans the same class (see
+/// `tests/all/router_input_start.rs`), so there is one configuration table rather than one
+/// per suite.
+pub(crate) fn configuration_rows() -> Vec<(
     &'static str,
     &'static str,
     &'static str,
@@ -247,7 +254,10 @@ fn configuration_rows() -> Vec<(
 }
 
 /// A minimal valid CreateRouterInput body for `configuration`.
-fn create_body(name: &str, configuration: Value) -> Value {
+///
+/// `pub(crate)` because the router input start suite creates its inputs the same way (see
+/// `tests/all/router_input_start.rs`).
+pub(crate) fn create_body(name: &str, configuration: Value) -> Value {
     json!({
         "name": name,
         "configuration": configuration,
@@ -303,11 +313,14 @@ fn assert_minted_router_input_arn(case: &str, arn: &str, id: &str) {
 /// Put the stored router input `arn` into the settled state `state`, the way the state a
 /// router input is in when a restart arrives is reached.
 ///
-/// StartRouterInput and StopRouterInput are still scaffolded, so the states an input other
+/// StopRouterInput and UpdateRouterInput are still scaffolded, so the states an input other
 /// than a freshly created one is in are reached through the store rather than through
 /// thousands of round trips. The record is left SETTLED (no transition owed), exactly as a
 /// created input is once the clock has settled it.
-fn settle_router_input_in(emulator: &Emulator, arn: &str, state: &str) {
+///
+/// `pub(crate)` because the router input start suite reaches the state a start arrives in
+/// the same way (see `tests/all/router_input_start.rs`).
+pub(crate) fn settle_router_input_in(emulator: &Emulator, arn: &str, state: &str) {
     let store = emulator
         .engine
         .state::<mc::ComAmazonawsMediaconnectMediaconnectState>();
@@ -321,7 +334,10 @@ fn settle_router_input_in(emulator: &Emulator, arn: &str, state: &str) {
 }
 
 /// The state a stored router input is in, read straight from the store.
-fn stored_state(emulator: &Emulator, arn: &str) -> String {
+///
+/// `pub(crate)` because the router input start suite asserts on the stored state too (see
+/// `tests/all/router_input_start.rs`).
+pub(crate) fn stored_state(emulator: &Emulator, arn: &str) -> String {
     let store = emulator
         .engine
         .state::<mc::ComAmazonawsMediaconnectMediaconnectState>();

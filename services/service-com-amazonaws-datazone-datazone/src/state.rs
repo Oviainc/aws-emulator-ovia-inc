@@ -266,6 +266,10 @@ pub struct Domain {
     /// identifier `GetListing`/`DeleteListing` address one by — so they go with the
     /// domain when it is deleted. Bounded by [`MAX_LISTINGS_PER_DOMAIN`].
     pub listings: BTreeMap<String, Listing>,
+    /// The account pools stored in this domain, keyed by their `AccountPoolId` — the
+    /// identifier `GetAccountPool` addresses one by — so they go with the domain when
+    /// it is deleted. Bounded by [`MAX_ACCOUNT_POOLS_PER_DOMAIN`].
+    pub account_pools: BTreeMap<String, AccountPool>,
 }
 
 impl Domain {
@@ -1856,6 +1860,11 @@ pub const MAX_LISTINGS_PER_DOMAIN: usize = 500;
 /// `ServiceQuotaExceededException`.
 pub const MAX_LISTING_REVISIONS: usize = 100;
 
+/// The most account pools this emulator stores in one domain, for the same reason and
+/// with the same refusal (`CreateAccountPool` models `ServiceQuotaExceededException`
+/// too): a CHOSEN ceiling, not a published quota.
+pub const MAX_ACCOUNT_POOLS_PER_DOMAIN: usize = 500;
+
 /// The most tags this emulator keeps on one resource.
 ///
 /// A CHOSEN ceiling, not a published quota: `TagResource` is a caller-driven growth
@@ -2391,6 +2400,257 @@ fn domain_unit_name_from(domain_name: &str, domain_id: &str) -> String {
     }
 }
 
+/// One account pool created in a domain.
+///
+/// `accountSource` is kept as the modelled union itself (the trade
+/// [`AssetFilter::configuration`] makes): either a static list of accounts or a custom
+/// handler, reported back by the pool's reader exactly as it was stored. The model
+/// gives an account pool no status member (smithy_query operation="GetAccountPool"), so
+/// a pool is reported in full from the moment it is stored and owes the clock no
+/// transition.
+#[derive(Debug, Clone)]
+pub struct AccountPool {
+    /// The pool's own `AccountPoolId`, minted by
+    /// [`ComAmazonawsDatazoneDatazoneState::mint_id`].
+    pub id: String,
+    pub domain_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// A `ResolutionStrategy` member — see [`RESOLUTION_STRATEGY_MANUAL`].
+    pub resolution_strategy: String,
+    pub account_source: crate::ops::types::AccountSource,
+    /// The domain unit the pool belongs to. `CreateAccountPool` takes none, so a new
+    /// pool belongs to the domain's ROOT unit ([`Domain::root_domain_unit_id`]) — the
+    /// unit a resource created without an explicit one hangs under.
+    pub domain_unit_id: String,
+    pub created_by: String,
+    pub created_at_ms: i64,
+    /// Moves with every update of the pool; equal to [`Self::created_at_ms`] until
+    /// something updates it.
+    pub last_updated_at_ms: i64,
+    /// The principal of the last update, absent until something updates the pool.
+    pub updated_by: Option<String>,
+}
+
+/// The one `ResolutionStrategy` member (model enum
+/// `com.amazonaws.datazone#ResolutionStrategy`: MANUAL) — the mechanism that resolves
+/// an account selection from a pool.
+pub const RESOLUTION_STRATEGY_MANUAL: &str = "MANUAL";
+
+/// `AccountInfoList`'s modelled length, 1..25 (smithy_query shape="AccountInfoList").
+pub const ACCOUNTS_PER_SOURCE: std::ops::RangeInclusive<usize> = 1..=25;
+
+/// `AwsRegionList`'s modelled length, 1..3 (smithy_query shape="AwsRegionList").
+pub const REGIONS_PER_ACCOUNT: std::ops::RangeInclusive<usize> = 1..=3;
+
+/// `AwsAccountName`'s modelled length, 1..256 (smithy_query shape="AccountInfo").
+pub const AWS_ACCOUNT_NAME_LEN: std::ops::RangeInclusive<usize> = 1..=256;
+
+/// Whether `account_source` satisfies the constraints the model declares INSIDE the
+/// `AccountSource` union, answering the member and the constraint it fails otherwise.
+///
+/// Every handler that takes an `accountSource` checks it through this, so the two forms
+/// of the union are judged by one rule.
+///
+/// The reason it is checked here at all: the vendored boundary validator walks a
+/// structure's members (`vendor/smithy-schema-server/src/constraints.rs`) but not the
+/// active member of a UNION, so the `@length` and `@pattern` traits the model declares
+/// under `AccountSource` would otherwise reach the store unchecked. The refusal is the
+/// `ValidationException` these operations model, and its message names the offending
+/// member and the constraint only — never the value the caller sent (`AccountPoolName`
+/// and `AwsAccountName` are `@sensitive`).
+pub fn validate_account_source(
+    account_source: &crate::ops::types::AccountSource,
+) -> Result<(), String> {
+    match account_source {
+        crate::ops::types::AccountSource::Accounts(accounts) => {
+            if !ACCOUNTS_PER_SOURCE.contains(&accounts.len()) {
+                return Err(format!(
+                    "accountSource.accounts must hold between {} and {} accounts",
+                    ACCOUNTS_PER_SOURCE.start(),
+                    ACCOUNTS_PER_SOURCE.end()
+                ));
+            }
+            for (index, account) in accounts.iter().enumerate() {
+                // `AwsAccountId` is `^\d{12}$` (smithy_query shape="AwsAccountId").
+                if !is_aws_account_id(&account.aws_account_id) {
+                    return Err(format!(
+                        "accountSource.accounts[{index}].awsAccountId must be twelve digits"
+                    ));
+                }
+                if !REGIONS_PER_ACCOUNT.contains(&account.supported_regions.len()) {
+                    return Err(format!(
+                        "accountSource.accounts[{index}].supportedRegions must hold between {} and {} regions",
+                        REGIONS_PER_ACCOUNT.start(),
+                        REGIONS_PER_ACCOUNT.end()
+                    ));
+                }
+                for (slot, region) in account.supported_regions.iter().enumerate() {
+                    if !is_aws_region(region) {
+                        return Err(format!(
+                            "accountSource.accounts[{index}].supportedRegions[{slot}] must be an Amazon Web Services Region identifier"
+                        ));
+                    }
+                }
+                if account
+                    .aws_account_name
+                    .as_deref()
+                    .is_some_and(|name| !AWS_ACCOUNT_NAME_LEN.contains(&name.chars().count()))
+                {
+                    return Err(format!(
+                        "accountSource.accounts[{index}].awsAccountName must be between {} and {} characters",
+                        AWS_ACCOUNT_NAME_LEN.start(),
+                        AWS_ACCOUNT_NAME_LEN.end()
+                    ));
+                }
+            }
+            Ok(())
+        }
+        crate::ops::types::AccountSource::customAccountPoolHandler(handler) => {
+            if !is_lambda_function_arn(&handler.lambda_function_arn) {
+                return Err(
+                    "accountSource.customAccountPoolHandler.lambdaFunctionArn must be the ARN of a Lambda function"
+                        .to_string(),
+                );
+            }
+            if handler
+                .lambda_execution_role_arn
+                .as_deref()
+                .is_some_and(|arn| !is_iam_role_arn(arn))
+            {
+                return Err(
+                    "accountSource.customAccountPoolHandler.lambdaExecutionRoleArn must be the ARN of an IAM role"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Whether `candidate` is an account id: `AwsAccountId`'s modelled `^\d{12}$`
+/// (smithy_query shape="AwsAccountId"). A Smithy `@pattern` is ECMA-262, where `\d` is
+/// the ASCII digit class.
+fn is_aws_account_id(candidate: &str) -> bool {
+    candidate.len() == 12 && candidate.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Whether `candidate` is a Region identifier: `AwsRegion`'s modelled
+/// `^[a-z]{2}-[a-z]{4,10}-\d$` (smithy_query shape="AwsRegion"), read off the pattern
+/// field by field — two lowercase letters, 4..10 lowercase letters, one digit.
+fn is_aws_region(candidate: &str) -> bool {
+    let lowercase = |field: &str, len: std::ops::RangeInclusive<usize>| {
+        len.contains(&field.len()) && field.bytes().all(|byte| byte.is_ascii_lowercase())
+    };
+    let mut fields = candidate.split('-');
+    let (Some(area), Some(direction), Some(ordinal), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    lowercase(area, 2..=2)
+        && lowercase(direction, 4..=10)
+        && ordinal.len() == 1
+        && ordinal.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Whether `candidate` is the ARN of a Lambda function, as `LambdaFunctionArn`'s
+/// modelled pattern describes one (smithy_query shape="CustomAccountPoolHandler"):
+/// `arn`, one of the three partitions the pattern names, the `lambda` service, a Region
+/// (the pattern admits a `-gov-` one here), a 12-digit account, then `function` and the
+/// function's name, optionally followed by one qualifier and/or a `$`-prefixed version.
+fn is_lambda_function_arn(candidate: &str) -> bool {
+    let mut fields = candidate.split(':');
+    if fields.next() != Some("arn")
+        || !matches!(fields.next(), Some("aws" | "aws-cn" | "aws-us-gov"))
+        || fields.next() != Some("lambda")
+        || !fields.next().is_some_and(is_lambda_arn_region)
+        || !fields.next().is_some_and(is_aws_account_id)
+        || fields.next() != Some("function")
+    {
+        return false;
+    }
+    let name_and_qualifier: Vec<&str> = fields.collect();
+    if !(1..=2).contains(&name_and_qualifier.len()) {
+        return false;
+    }
+    // `[a-zA-Z0-9-_]+` per field, and the LAST field may carry the pattern's trailing
+    // `(?:\$[\w-]+)?` version suffix.
+    let last = name_and_qualifier.len() - 1;
+    name_and_qualifier
+        .iter()
+        .enumerate()
+        .all(|(index, field)| {
+            let (field, version) = match field.split_once('$') {
+                Some((field, version)) if index == last => (field, Some(version)),
+                Some(_) => return false,
+                None => (*field, None),
+            };
+            !field.is_empty()
+                && field
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+                && version.is_none_or(|version| {
+                    !version.is_empty()
+                        && version
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+                })
+        })
+}
+
+/// Whether `candidate` is the Region field of a Lambda function ARN:
+/// `[a-z]{2}(?:-gov)?-[a-z]+-\d{1,}`, the sub-expression `LambdaFunctionArn`'s pattern
+/// admits there — WIDER than [`is_aws_region`], which is `AwsRegion`'s own pattern.
+fn is_lambda_arn_region(candidate: &str) -> bool {
+    let mut fields: Vec<&str> = candidate.split('-').collect();
+    if fields.len() == 4 {
+        // The optional `-gov` infix, which the pattern allows only there.
+        if fields[1] != "gov" {
+            return false;
+        }
+        fields.remove(1);
+    }
+    let [area, direction, ordinal] = fields[..] else {
+        return false;
+    };
+    area.len() == 2
+        && area.bytes().all(|byte| byte.is_ascii_lowercase())
+        && !direction.is_empty()
+        && direction.bytes().all(|byte| byte.is_ascii_lowercase())
+        && !ordinal.is_empty()
+        && ordinal.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Whether `candidate` is the ARN of an IAM role, as `LambdaExecutionRoleArn`'s
+/// modelled pattern describes one (smithy_query shape="CustomAccountPoolHandler"):
+/// `^arn:aws[^:]*:iam::\d{12}:(role|role/service-role)/[\w+=,.@-]*$`.
+fn is_iam_role_arn(candidate: &str) -> bool {
+    let mut fields = candidate.splitn(6, ':');
+    if fields.next() != Some("arn")
+        || !fields.next().is_some_and(|partition| partition.starts_with("aws"))
+        || fields.next() != Some("iam")
+        || fields.next() != Some("")
+        || !fields.next().is_some_and(is_aws_account_id)
+    {
+        return false;
+    }
+    let Some(resource) = fields.next() else {
+        return false;
+    };
+    // The longer prefix first: the path of a service role carries the only `/` the
+    // pattern's trailing class does not admit.
+    let Some(name) = resource
+        .strip_prefix("role/service-role/")
+        .or_else(|| resource.strip_prefix("role/"))
+    else {
+        return false;
+    };
+    name.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || b"_+=,.@-".contains(&byte)
+    })
+}
+
 /// A stored owner as the modelled `DomainUnitOwnerProperties` union
 /// (smithy_query shape="DomainUnitOwnerProperties"), shared by every operation that
 /// reports a domain unit's owners so the two forms cannot drift apart.
@@ -2449,6 +2709,7 @@ pub enum ResourceKind {
     Domain,
     DomainUnit,
     Project,
+    AccountPool,
     AssetType,
     FormType,
     Glossary,
@@ -2466,6 +2727,7 @@ impl ResourceKind {
             Self::Domain => "Domain",
             Self::DomainUnit => "Domain unit",
             Self::Project => "Project",
+            Self::AccountPool => "Account Pool",
             Self::AssetType => "Asset type",
             Self::FormType => "Form type",
             Self::Glossary => "Glossary",

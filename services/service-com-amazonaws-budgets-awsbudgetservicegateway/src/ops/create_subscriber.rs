@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSubscriber
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSubscriber`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSubscriber::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches ONE subscriber to a notification that a budget already holds: "you must
+//! create the associated budget and notification before you create the subscriber", so a
+//! budget this account does not hold, or a notification that budget does not alert on,
+//! is a `NotFoundException`. A subscriber carries no id — its subscription type and its
+//! address are its identity ([`crate::state::same_subscriber`]) — so a repeat of one the
+//! notification already holds is a `DuplicateRecordException`, and the documented
+//! per-type subscriber limits are answered with `CreationLimitExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +156,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSubscriber` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSubscriberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSubscriber"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateSubscriberErrorModeled::InternalErrorException(InternalErrorException {
+                message: Some(
+                    "budgets is mounted on an engine that holds no state for it".to_string(),
+                ),
+            })
+        })?;
+
+        // The modelled `BudgetName` `@pattern` the boundary validator cannot compile —
+        // refused as the request-validation failure it is (HTTP 400
+        // `ValidationException`), naming the member path and the constraint.
+        if let Some(message) =
+            crate::state::budget_name_violation(&["BudgetName"], &input.budget_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        let mut store = state.lock();
+        // A subscriber is held inside the notification, which is held inside the budget,
+        // so the budget is resolved by the same `(AccountId, BudgetName)` identity every
+        // other operation uses: "you must create the associated budget and notification
+        // before you create the subscriber".
+        let stored = store
+            .budgets
+            .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
+            .ok_or_else(|| {
+                CreateSubscriberErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!(
+                        "Unable to create subscriber: {} - the budget doesn't exist.",
+                        input.budget_name
+                    )),
+                })
+            })?;
+        // A notification carries no id: the caller names the one to subscribe to by
+        // value, and `crate::state::same_notification` holds which members that identity
+        // is made of (the service-owned alarm state is not one of them).
+        let held = crate::state::find_notification_mut(stored, &input.notification)
+            .ok_or_else(|| {
+                // The refusal names the notification the caller asked for by the members
+                // that identify it, so it reads as the notification being missing rather
+                // than the budget that was found.
+                CreateSubscriberErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!(
+                        "Unable to create subscriber: {} - the notification doesn't exist \
+                         (NotificationType {}, ComparisonOperator {}, Threshold {}, \
+                         ThresholdType {}).",
+                        input.budget_name,
+                        input.notification.notification_type,
+                        input.notification.comparison_operator,
+                        input.notification.threshold,
+                        input
+                            .notification
+                            .threshold_type
+                            .as_deref()
+                            .unwrap_or(crate::state::THRESHOLD_TYPE_PERCENTAGE)
+                    )),
+                })
+            })?;
+
+        // The subscription type and the address are what identify a subscriber, so a
+        // notification cannot hold two of the same one: a repeat of one it already has is
+        // the duplicate record, not a second copy in the set a read reports.
+        if held
+            .subscribers
+            .iter()
+            .any(|subscriber| crate::state::same_subscriber(subscriber, &input.subscriber))
+        {
+            return Err(CreateSubscriberErrorModeled::DuplicateRecordException(
+                DuplicateRecordException {
+                    message: Some(format!(
+                        "Unable to create subscriber: {} - the subscriber already exists.",
+                        input.budget_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "A notification can have one SNS subscriber and up to 10 email subscribers, for
+        // a total of 11 subscribers" — checked over the set this call would leave behind,
+        // because this operation grows a notification's subscribers ONE at a time and so
+        // never carries the modelled `@length(1, 11)` list that the create paths have
+        // refused at the boundary. The two per-type halves add up to that total.
+        crate::state::subscriber_limit_violation(
+            held.subscribers
+                .iter()
+                .chain(::std::iter::once(&input.subscriber)),
+        )
+        .map_err(|message| {
+            CreateSubscriberErrorModeled::CreationLimitExceededException(
+                CreationLimitExceededException {
+                    message: Some(message),
+                },
+            )
+        })?;
+
+        // Appended, so the subscribers keep the order they were created in — the order a
+        // paginated `DescribeSubscribersForNotification` indexes into.
+        held.subscribers.push(input.subscriber);
+
+        Ok(CreateSubscriberOutput {})
     }
 }

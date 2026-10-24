@@ -23,10 +23,9 @@
 //!   resource's absence.
 //!
 //! The rows differ along what those rules generalise over: the FORM of the submitted
-//! content (a single query versus an uploaded document, which carries no query this
-//! emulator ever read), the query text, whether `supportMode` is given and which value,
-//! the requested page size at each published bound and past it, and the shape of the
-//! refused token.
+//! content (a single query versus an uploaded document, processed section by section), the
+//! query text, whether `supportMode` is given and which value, the requested page size at
+//! each published bound and past it, and the shape of the refused token.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,6 +64,10 @@ const QUERY_IN_PROGRESS: &str = "Query processing is in-progress.";
 /// model-generated text and no such engine runs in this emulator — and its absence, not a
 /// query-level error that never happened, is what says so.
 const QUERY_TERMINAL: (&str, &str) = ("COMPLETED", "Query processing is complete.");
+
+/// The pair a query submitted for HUMAN review rests in: a human expert's review is not
+/// the clock's to finish, so the query stays non-terminal and reports what it waits for.
+const QUERY_PENDING_HUMAN_REVIEW: (&str, &str) = ("PROCESSING", "Query is pending human review.");
 
 /// The span after which an inquiry's processing is due to be over, plus slack. The handler
 /// stores the due instant rather than sleeping, so only the test waits.
@@ -187,9 +190,14 @@ fn text_body(name: &str, query: &str, support_mode: Option<&str>) -> Value {
     body(name, json!({ "query": query }), support_mode)
 }
 
-/// A `CreateComplianceInquiry` body for an uploaded document.
-fn file_body(name: &str, sections: &[&str], support_mode: Option<&str>) -> Value {
-    let mut file = json!({ "content": FILE_CONTENT });
+/// A `CreateComplianceInquiry` body for an uploaded document of `content` bytes.
+fn file_body(
+    name: &str,
+    content: &str,
+    sections: &[&str],
+    support_mode: Option<&str>,
+) -> Value {
+    let mut file = json!({ "content": content });
     if !sections.is_empty() {
         file["fileSections"] = json!(sections);
     }
@@ -208,17 +216,21 @@ fn body(name: &str, inquiry_content: Value, support_mode: Option<&str>) -> Value
 struct Case {
     label: &'static str,
     body: Value,
-    /// The query texts the content carries, in `queryIdentifier` order. EMPTY for an
-    /// uploaded document: its queries are written inside the document, which this emulator
-    /// does not parse, so it carries no query anything read.
+    /// The query texts the content carries, in `queryIdentifier` order: the submitted
+    /// query for a text submission, and one per unit of work an upload is processed in —
+    /// the sections it names, or the document as a whole under the submitted title.
+    /// EMPTY for an upload carrying no bytes, which submits nothing to process.
     queries: Vec<&'static str>,
     /// The `reviewType` each reported query must carry, if any.
     review_type: Option<&'static str>,
+    /// The `status`/`statusMessage` pair each of this case's queries rests in once the
+    /// inquiry's processing span is over.
+    terminal_pair: (&'static str, &'static str),
 }
 
 /// The submissions this suite covers. The rows differ along the form of the content, the
-/// query text, how many sections a document names, and whether `supportMode` is given and
-/// which of its values.
+/// query text, how many sections a document names, whether the upload carries any bytes
+/// at all, and whether `supportMode` is given and which of its values.
 fn cases() -> Vec<Case> {
     vec![
         Case {
@@ -228,6 +240,7 @@ fn cases() -> Vec<Case> {
             // `supportMode`'s `FULL_SUPPORT` is "only supported for file upload mode", so
             // a query read off submitted text is AI-reviewed whatever was asked for.
             review_type: Some("AI"),
+            terminal_pair: QUERY_TERMINAL,
         },
         Case {
             label: "a query, AI_ONLY",
@@ -238,6 +251,7 @@ fn cases() -> Vec<Case> {
             ),
             queries: vec!["Is customer data encrypted at rest?"],
             review_type: Some("AI"),
+            terminal_pair: QUERY_TERMINAL,
         },
         Case {
             label: "a query, FULL_SUPPORT",
@@ -248,6 +262,7 @@ fn cases() -> Vec<Case> {
             ),
             queries: vec!["Which subprocessors handle customer content?"],
             review_type: Some("AI"),
+            terminal_pair: QUERY_TERMINAL,
         },
         Case {
             label: "a long query with punctuation",
@@ -258,28 +273,57 @@ fn cases() -> Vec<Case> {
             ),
             queries: vec!["How long is audit log data retained, and where (region / account)?"],
             review_type: Some("AI"),
+            terminal_pair: QUERY_TERMINAL,
         },
         Case {
             label: "an uploaded document, no sections",
-            body: file_body("Vendor questionnaire", &[], None),
-            queries: vec![],
-            review_type: None,
+            body: file_body("Vendor questionnaire", FILE_CONTENT, &[], None),
+            queries: vec!["Vendor questionnaire"],
+            review_type: Some("AI"),
+            terminal_pair: QUERY_TERMINAL,
         },
         Case {
             label: "an uploaded document, two sections, FULL_SUPPORT",
             body: file_body(
                 "Annual audit workbook",
+                FILE_CONTENT,
                 &["Section A", "Section B"],
                 Some("FULL_SUPPORT"),
             ),
+            queries: vec!["Section A", "Section B"],
+            review_type: Some("HUMAN"),
+            terminal_pair: QUERY_PENDING_HUMAN_REVIEW,
+        },
+        Case {
+            label: "an uploaded document, three sections, AI_ONLY",
+            body: file_body(
+                "Customer DDQ",
+                FILE_CONTENT,
+                &["Sheet 1", "Sheet 2", "Sheet 3"],
+                Some("AI_ONLY"),
+            ),
+            queries: vec!["Sheet 1", "Sheet 2", "Sheet 3"],
+            review_type: Some("AI"),
+            terminal_pair: QUERY_TERMINAL,
+        },
+        Case {
+            label: "an upload carrying no bytes, so nothing to process",
+            body: file_body("Empty workbook", "", &["Section A"], None),
             queries: vec![],
             review_type: None,
+            terminal_pair: QUERY_TERMINAL,
         },
     ]
 }
 
 /// Assert one reported `QuerySummary` against the submission it came from.
-fn assert_summary(case: &str, position: usize, summary: &Value, query_text: &str) {
+fn assert_summary(
+    case: &str,
+    position: usize,
+    summary: &Value,
+    query_text: &str,
+    terminal_pair: (&str, &str),
+) {
     let expected_identifier = i64::try_from(position).expect("a test row index fits in i64") + 1;
     assert_eq!(
         summary["queryIdentifier"].as_i64(),
@@ -307,7 +351,7 @@ fn assert_summary(case: &str, position: usize, summary: &Value, query_text: &str
     );
     // Read inside the inquiry's processing span or after it, the pair is one of exactly
     // two — and no `response` is ever reported, because nothing generated one.
-    let legal = [("PROCESSING", QUERY_IN_PROGRESS), QUERY_TERMINAL];
+    let legal = [("PROCESSING", QUERY_IN_PROGRESS), terminal_pair];
     assert!(
         legal.contains(&(status, message)),
         "case {case:?}: expected one of {legal:?}, got {:?}",
@@ -368,7 +412,7 @@ async fn a_listing_reports_the_queries_the_submitted_content_created() {
             listed.body["nextToken"]
         );
         for (position, (summary, text)) in listed.queries().iter().zip(&case.queries).enumerate() {
-            assert_summary(label, position, summary, text);
+            assert_summary(label, position, summary, text, case.terminal_pair);
             let review = summary["reviewType"].as_str();
             assert_eq!(
                 review,

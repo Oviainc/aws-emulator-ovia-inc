@@ -27,5 +27,7 @@ mod lifecycle_policy_crud;
 mod policy_configuration_validation;
 #[path = "all/policy_read_projection.rs"]
 mod policy_read_projection;
+#[path = "all/policy_type.rs"]
+mod policy_type;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

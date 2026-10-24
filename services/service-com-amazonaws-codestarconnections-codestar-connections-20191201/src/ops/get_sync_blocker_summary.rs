@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSyncBlockerSummary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSyncBlockerSummary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the sync blockers [`crate::state`] holds for the requested
+//! `(SyncType, ResourceName)` pair, most recent first, and an empty `LatestBlockers`
+//! list when it holds none. A pure read — nothing is written. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSyncBlockerSummary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A resource with no recorded blockers is NOT a 404: the recorded AWS response for a
+//! `CFN_STACK_SYNC` summary of a resource this account never synced is HTTP 200 with
+//! `LatestBlockers: []` and the requested `ResourceName`, so the operation reports the
+//! absence of blockers rather than refusing the resource. The modeled
+//! `ResourceNotFoundException` is therefore never the answer to "no blockers".
+//!
+//! Blockers themselves are raised by the sync process (a failed sync attempt), which
+//! this emulator does not run, and resolved by `UpdateSyncBlocker`. This reader reports
+//! whatever is recorded, however it got there, out of the SAME per-blocker records that
+//! writer reads and updates.
+//!
+//! The modeled `AccessDeniedException` is deliberately never returned: the emulator
+//! verifies every request signature up front and models no per-principal policy for a
+//! blocker summary, so there is no authorization decision this handler could make. The
+//! unreturned variant is an omission by design rather than an oversight.
 //!
 //! ## Shape of an operation
 //!
@@ -149,20 +160,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // Unused: the summary is addressed entirely by the request body's
+        // `(SyncType, ResourceName)` pair, so no request metadata enters the answer.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSyncBlockerSummary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSyncBlockerSummaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetSyncBlockerSummaryErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "CodeStar connections state is unavailable on this engine".to_string(),
+                ),
+            })
+        })?;
+
+        // `SyncType` is a modeled enum, so a value outside `SYNC_CONFIGURATION_TYPE_VALUES`
+        // is refused before this handler runs; the pair below therefore addresses a sync
+        // type this service knows.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSyncBlockerSummary"))
+        // A pure read: the summary is the state's one projection of the blockers it holds
+        // for the addressed pair (`crate::state::blocker_summary`), so this reader and
+        // `UpdateSyncBlocker`, which resolves one of those same records, cannot render
+        // them differently.
+        let summary = state
+            .lock()
+            .blocker_summary(&input.sync_type, &input.resource_name);
+
+        Ok(GetSyncBlockerSummaryOutput {
+            sync_blocker_summary: summary,
+        })
     }
 }

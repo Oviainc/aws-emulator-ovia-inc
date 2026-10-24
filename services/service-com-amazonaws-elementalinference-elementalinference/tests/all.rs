@@ -45,6 +45,8 @@ mod refusals_from_state;
 mod region_isolation;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/resource_untagging.rs"]
+mod resource_untagging;
 #[path = "all/response_members.rs"]
 mod response_members;
 #[path = "all/state_roundtrip.rs"]

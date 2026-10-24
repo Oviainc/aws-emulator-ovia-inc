@@ -156,9 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) else {
             return Err(ListDeploymentStrategiesErrorModeled::BadRequestException(
                 BadRequestException {
-                    message: Some(
-                        "NextToken is not a pagination token this operation issued.".to_string(),
-                    ),
+                    message: Some(crate::state::next_token_not_issued()),
                     reason: None,
                     details: None,
                 },

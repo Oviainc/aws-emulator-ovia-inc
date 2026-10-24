@@ -32,7 +32,7 @@ use crate::virtual_cluster_job_run_loop::{field, text, Answer, Emr, REGION};
 /// `String128`, the `TagMap` key and `TagKeyList` member shape, is `len 1..128` with
 /// pattern `\S` (the model, via `OPERATIONS.md`), so 128 characters is the longest key a
 /// request may carry and the longest one a resource can hold.
-const MAX_TAG_KEY_CHARS: usize = 128;
+pub(crate) const MAX_TAG_KEY_CHARS: usize = 128;
 
 /// `TagKeyList` is `len 0..50`, so 50 keys is the most one `UntagResource` call removes.
 const MAX_TAG_KEYS_PER_CALL: usize = 50;
@@ -45,7 +45,10 @@ const MAX_TAG_KEYS_PER_CALL: usize = 50;
 /// Written here rather than taken from a crate: it is one `match` over the UTF-8 bytes of
 /// a test URI, and a dependency edge would be a `Cargo.lock` edit this operation's
 /// behaviour has nothing to do with.
-fn encoded(value: &str) -> String {
+///
+/// `pub(crate)` because the tagging suites in this one test binary share it rather than
+/// keeping a copy each.
+pub(crate) fn encoded(value: &str) -> String {
     value
         .bytes()
         .map(|byte| match byte {
@@ -59,7 +62,7 @@ fn encoded(value: &str) -> String {
 
 /// A tag set as the JSON object the wire carries, for comparison against a response
 /// member.
-fn tag_object(tags: &BTreeMap<String, String>) -> Value {
+pub(crate) fn tag_object(tags: &BTreeMap<String, String>) -> Value {
     Value::Object(
         tags.iter()
             .map(|(key, value)| (key.clone(), Value::String(value.clone())))
@@ -68,7 +71,7 @@ fn tag_object(tags: &BTreeMap<String, String>) -> Value {
 }
 
 /// A tag set from borrowed literals, for the tables.
-fn tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+pub(crate) fn tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -76,7 +79,7 @@ fn tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 }
 
 /// A key of exactly `chars` characters, so a published length bound can be tested AT it.
-fn key_of(chars: usize) -> String {
+pub(crate) fn key_of(chars: usize) -> String {
     "k".repeat(chars)
 }
 
@@ -97,7 +100,11 @@ async fn untag(emr: &Emr, resource_arn: &str, keys: &[&str]) -> Answer {
 }
 
 /// Create a virtual cluster carrying `initial` and answer its `(id, arn)`.
-async fn tagged_cluster(emr: &Emr, name: &str, initial: &BTreeMap<String, String>) -> (String, String) {
+pub(crate) async fn tagged_cluster(
+    emr: &Emr,
+    name: &str,
+    initial: &BTreeMap<String, String>,
+) -> (String, String) {
     let answer = emr
         .send(
             "POST",
@@ -124,7 +131,7 @@ async fn tagged_cluster(emr: &Emr, name: &str, initial: &BTreeMap<String, String
 }
 
 /// Start a job run carrying `initial` and answer its `(id, arn)`.
-async fn tagged_job_run(
+pub(crate) async fn tagged_job_run(
     emr: &Emr,
     cluster: &str,
     token: &str,
@@ -149,7 +156,7 @@ async fn tagged_job_run(
 }
 
 /// The tag set `DescribeVirtualCluster` reports for this cluster.
-async fn cluster_tags(emr: &Emr, id: &str, case: &str) -> Value {
+pub(crate) async fn cluster_tags(emr: &Emr, id: &str, case: &str) -> Value {
     let answer = emr
         .send("GET", &format!("/virtualclusters/{id}"), None)
         .await;
@@ -157,7 +164,7 @@ async fn cluster_tags(emr: &Emr, id: &str, case: &str) -> Value {
 }
 
 /// The tag set `DescribeJobRun` reports for this job run.
-async fn job_run_tags(emr: &Emr, cluster: &str, id: &str, case: &str) -> Value {
+pub(crate) async fn job_run_tags(emr: &Emr, cluster: &str, id: &str, case: &str) -> Value {
     let answer = emr
         .send("GET", &format!("/virtualclusters/{cluster}/jobruns/{id}"), None)
         .await;

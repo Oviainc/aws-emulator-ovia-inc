@@ -17,6 +17,11 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `DescribeClientVpnTargetNetworks` reports for the target networks associated with one
+// Client VPN endpoint, and how the ids, the filters and the page size narrow it. Declared
+// here rather than in sorted position, for the reason the note above gives.
+#[path = "all/client_vpn_target_networks.rs"]
+mod client_vpn_target_networks;
 // What `ResetInstanceAttribute` resets, to what, from which instance states, and what it
 // refuses. Declared beside `prefix_lists` for the same reason: the sorted region is where
 // every new ec2 suite inserts its lines.

@@ -31,3 +31,5 @@ mod sdk_target_dispatch;
 mod state_roundtrip;
 #[path = "all/sync_blocker_resolution.rs"]
 mod sync_blocker_resolution;
+#[path = "all/sync_blocker_summary.rs"]
+mod sync_blocker_summary;

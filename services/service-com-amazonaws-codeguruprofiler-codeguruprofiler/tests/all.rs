@@ -17,10 +17,14 @@ mod findings_report_account_summary;
 mod findings_reports_listing;
 #[path = "all/interval_validation.rs"]
 mod interval_validation;
+#[path = "all/not_found_surfaces.rs"]
+mod not_found_surfaces;
 #[path = "all/notification_channels.rs"]
 mod notification_channels;
 #[path = "all/notification_configuration.rs"]
 mod notification_configuration;
+#[path = "all/pending_aggregation.rs"]
+mod pending_aggregation;
 #[path = "all/permission_writes.rs"]
 mod permission_writes;
 #[path = "all/policy_surface.rs"]
