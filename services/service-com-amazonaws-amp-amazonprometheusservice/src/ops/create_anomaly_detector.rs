@@ -90,6 +90,12 @@
 //! * `ConflictException` (HTTP 409) — The request would cause an inconsistent state.
 //! * `InternalServerException` (HTTP 500) — An unexpected error occurred during the
 //!   processing of the request.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see
+//!   below): `workspaceId` is an `@httpLabel` naming the PARENT the detector is created
+//!   inside, and a request this service cannot place in a workspace this account holds is
+//!   a not-found rather than a member-validation failure. The shape is one this SERVICE
+//!   models (every other workspace-scoped operation lists it); only this operation's
+//!   `errors` list omits it.
 //! * `ServiceQuotaExceededException` (HTTP 402) — Completing the request would cause a
 //!   service quota to be exceeded.
 //! * `ThrottlingException` (HTTP 429) — The request was denied due to request throttling.
@@ -110,12 +116,24 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-amp-amazonprometheusser
 // here — hence the `CreateAnomalyDetectorError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.amp#CreateAnomalyDetector")]
+//
+// `ResourceNotFoundException` is widened in through `extra_errors`: the model's own
+// `errors` list for this operation omits it, but the shape is one this SERVICE models
+// (`com.amazonaws.amp#ResourceNotFoundException`, @httpError 404, with @required
+// `resourceId` and `resourceType`) and every other operation addressed by
+// `/workspaces/{workspaceId}` lists it. RECORDED BEHAVIOUR: the live service answers an
+// unresolvable parent 404 with that code and the identity of the resource that did not
+// resolve — see the handler's parent-resolution branch.
+#[smithy_macros::operation_error(
+    "com.amazonaws.amp#CreateAnomalyDetector",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum CreateAnomalyDetectorErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
@@ -185,6 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
 
+        // The rules this service enforces on the request's own members are checked BEFORE
+        // the parent is resolved: the recorded live service answers a `randomCutForest`
+        // query no supported aggregation operator wraps with the 400 `ValidationException`
+        // even when the `{workspaceId}` it names resolves to nothing, so a member the
+        // caller got wrong is reported whatever the parent.
+        //
         // "Keys must not begin with aws:" (`TagResource$tags`) — the service's rule for
         // its own tag keys, so it holds for the tags a detector is created with too.
         if crate::state::reserved_tag_key(input.tags.iter().flat_map(|tags| tags.keys())).is_some()
@@ -200,16 +224,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due(now);
 
-        // A detector is created INSIDE a workspace, so an unknown `workspaceId` is a
-        // request this service cannot satisfy. `CreateAnomalyDetector` models no
-        // `ResourceNotFoundException`, so the refusal is the modelled
-        // `ValidationException`, naming the member that does not resolve.
+        // A detector is created INSIDE a workspace: `workspaceId` is an `@httpLabel`
+        // naming the PARENT resource, and a request this service cannot place in a
+        // workspace this account holds is a NOT-FOUND rather than a constraint failure —
+        // which is what the recording shows the live service answering for an
+        // unresolvable parent, even though this operation's modelled `errors` list omits
+        // the shape. Answered exactly as every other operation addressed by
+        // `/workspaces/{workspaceId}` answers it: the modelled 404
+        // `ResourceNotFoundException` carrying the unresolved id in `resourceId` and the
+        // parent's AWS type in `resourceType`, with the one constant sentence
+        // [`crate::state::WORKSPACE_NOT_FOUND_MESSAGE`] as the message.
         let detector_quota = crate::state::ANOMALY_DETECTORS_PER_WORKSPACE_QUOTA;
         let Some(workspace) = store.workspaces.get(&input.workspace_id) else {
-            return Err(field_validation(
-                "workspaceId",
-                "Member must name a workspace this account holds",
-            ));
+            return Err(workspace_not_found(&input.workspace_id));
         };
 
         // Adding a child to a workspace whose deletion has already started would leave
@@ -320,6 +347,22 @@ fn field_validation(field: &str, requirement: &str) -> CreateAnomalyDetectorErro
     CreateAnomalyDetectorErrorModeled::ValidationException(
         crate::state::member_validation_failed(field, requirement),
     )
+    .into()
+}
+
+/// The modelled `ResourceNotFoundException` for a `workspaceId` that resolves to no
+/// workspace this account holds — the parent of the detector this call would create.
+///
+/// One composition shared with every other workspace-scoped operation: the constant
+/// sentence in `message`, the unresolved id in `resourceId` (which is what that
+/// `@required` member is for, so the message echoes nothing from the request) and the
+/// parent's AWS type name in `resourceType`.
+fn workspace_not_found(workspace_id: &str) -> CreateAnomalyDetectorError {
+    CreateAnomalyDetectorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
+        resource_id: workspace_id.to_string(),
+        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+    })
     .into()
 }
 

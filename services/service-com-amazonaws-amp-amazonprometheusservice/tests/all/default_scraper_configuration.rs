@@ -18,12 +18,13 @@
 //!
 //! One known divergence from the AWS published document, stated here as well as on
 //! `DEFAULT_SCRAPER_CONFIGURATION` so it is visible from either side: the served blob
-//! omits the three members that name the kubelet's in-cluster secret files
+//! omits the two members that name the kubelet's in-cluster secret file
 //! (`authorization.credentials_file` and `bearer_token_file`, both the service-account
-//! token, and `tls_config.ca_file`), because emulator source may not reference a host
-//! secret path. A consumer that feeds this blob to a real in-cluster Prometheus supplies
-//! those three itself. [`exactly_the_documented_members_are_absent_from_the_served_document`]
-//! pins exactly that gap, and goes away with the omission if the constraint is lifted.
+//! token), because emulator source may not reference a host secret path. A consumer that
+//! feeds this blob to a real in-cluster Prometheus supplies those itself.
+//! [`exactly_the_documented_members_are_absent_from_the_served_document`] pins exactly
+//! that gap — and, in its own table, the stanzas the published document does not carry at
+//! all — and goes away with the omission if the constraint is lifted.
 
 use std::collections::BTreeSet;
 
@@ -276,29 +277,78 @@ async fn every_scrape_job_satisfies_the_prometheus_vocabularies() {
     }
 }
 
-/// The three members of the published document this emulator deliberately does not serve,
+/// The `global` block ships its `external_labels` INERT: the document carries the block
+/// and its `clusterArn` commented out behind a `<REPLACE_ME>` placeholder for the caller
+/// to fill in, so a scraper fed this blob unedited stamps no label of the service's
+/// choosing onto every series it collects. Asserted from both sides, since a comment is
+/// invisible to the parser alone: the parsed document carries no such key, and every line
+/// naming one is a comment.
+#[tokio::test]
+async fn the_external_labels_block_is_served_inert() {
+    let amp = Amp::new();
+    let text = configuration_text(&default_scraper_configuration(&amp).await);
+    let document = configuration_document(&text);
+
+    assert!(
+        document["global"]["external_labels"].is_badvalue(),
+        "`global.external_labels` must not be an active setting, got {document:?}"
+    );
+
+    // (case, the key the document mentions only in a comment, the placeholder it carries)
+    let commented: &[(&str, &str, Option<&str>)] = &[
+        ("the block itself", "external_labels:", None),
+        ("the cluster label", "clusterArn:", Some("<REPLACE_ME>")),
+    ];
+    for (case, needle, placeholder) in commented {
+        let lines: Vec<&str> = text.lines().filter(|line| line.contains(needle)).collect();
+        assert!(
+            !lines.is_empty(),
+            "case {case:?}: the document must still mention {needle:?}, got {text}"
+        );
+        for line in &lines {
+            assert!(
+                line.trim_start().starts_with('#'),
+                "case {case:?}: {needle:?} must appear only in a comment, got {line:?}"
+            );
+            if let Some(placeholder) = placeholder {
+                assert!(
+                    line.contains(placeholder),
+                    "case {case:?}: the commented line must carry the {placeholder:?} \
+                     placeholder, got {line:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The members of the published document this emulator deliberately does not serve,
 /// pinned per job and per nested path so the divergence cannot widen unnoticed: a later
 /// edit either restores them — and deletes this test with the omission — or leaves them
-/// out, but cannot drop a fourth member by accident. The reason is on
-/// `DEFAULT_SCRAPER_CONFIGURATION` and in this file's header.
+/// out, but cannot drop a third member by accident. The reason is on
+/// `DEFAULT_SCRAPER_CONFIGURATION` and in this file's header. Two further tables keep the
+/// census honest: what the published document carries and this emulator keeps, and what
+/// the published document does not carry at all (a correct absence, not an omission).
 #[tokio::test]
 async fn exactly_the_documented_members_are_absent_from_the_served_document() {
-    // (job_name, the member's path within that job) — absent by design.
+    // (job_name, the member's path within that job) — omitted by design: both are the
+    // in-cluster service-account token path.
     let omitted: &[(&str, &[&str])] = &[
         ("cadvisor", &["authorization", "credentials_file"]),
         ("kubernetes-apiservers", &["bearer_token_file"]),
-        ("kubernetes-apiservers", &["tls_config", "ca_file"]),
     ];
     // What the published document carries on those same jobs and this emulator keeps, so
-    // the test fails if the gap grows past the three members above.
+    // the test fails if the gap grows past the members above.
     let kept: &[(&str, &[&str])] = &[
         ("cadvisor", &["scheme"]),
         ("cadvisor", &["relabel_configs"]),
         ("kubernetes-apiservers", &["scheme"]),
-        ("kubernetes-apiservers", &["tls_config"]),
-        ("kubernetes-apiservers", &["tls_config", "insecure_skip_verify"]),
         ("kubernetes-apiservers", &["relabel_configs"]),
     ];
+    // Stanzas the published document does not have, so neither does this one — these are
+    // not omissions. The API-server job declares `scheme: https` and no TLS stanza, and
+    // an `insecure_skip_verify` the service does not ship would change that job's TLS
+    // behaviour for every consumer.
+    let not_in_the_document: &[(&str, &[&str])] = &[("kubernetes-apiservers", &["tls_config"])];
 
     let amp = Amp::new();
     let text = configuration_text(&default_scraper_configuration(&amp).await);
@@ -310,6 +360,15 @@ async fn exactly_the_documented_members_are_absent_from_the_served_document() {
             member_at(&job, path).is_badvalue(),
             "case {job_name:?} {path:?}: this member is absent from the served document \
              by design, got {:?}",
+            member_at(&job, path)
+        );
+    }
+    for (job_name, path) in not_in_the_document {
+        let job = job_named(&jobs, job_name);
+        assert!(
+            member_at(&job, path).is_badvalue(),
+            "case {job_name:?} {path:?}: the published document carries no such stanza, \
+             got {:?}",
             member_at(&job, path)
         );
     }

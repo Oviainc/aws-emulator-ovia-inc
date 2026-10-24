@@ -32,7 +32,7 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, create_domain, emulator, Answer, ACCOUNT, REGION};
+use crate::harness::{call, create_domain, emulator, package_group_arn, Answer};
 use crate::package_group_hierarchy::{create_package_group, describe_package_group, ROOT};
 
 /// `GetAssociatedPackageGroup`: every input is `httpQuery`-bound, and `namespace` is sent
@@ -53,9 +53,12 @@ async fn get_associated_package_group(
     call(router, "GET", &uri, None).await
 }
 
-/// The ARN the emulator mints for a package group, as every answer must report it.
+/// The ARN the emulator mints for a package group, as every answer must report it: the
+/// pattern as a path, each segment percent-encoded
+/// (`crate::harness::package_group_arn`, pinned by
+/// `tests/all/package_group_arn_encoding.rs`).
 fn group_arn(domain: &str, pattern: &str) -> String {
-    format!("arn:aws:codeartifact:{REGION}:{ACCOUNT}:package-group/{domain}{pattern}")
+    package_group_arn(domain, pattern)
 }
 
 /// One package to resolve, and the group it must resolve to.

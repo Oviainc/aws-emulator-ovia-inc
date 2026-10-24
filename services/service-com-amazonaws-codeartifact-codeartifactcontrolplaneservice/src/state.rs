@@ -461,7 +461,9 @@ pub enum ResourceRef {
     /// `arn:<partition>:codeartifact:<region>:<owner>:package-group/<domain><pattern>`,
     /// the form [`package_group_arn`] mints: the pattern is a path from the domain root,
     /// so it carries its own `/` separators and its leading `/` is the one between the
-    /// domain segment and the path.
+    /// domain segment and the path. The segments of that path are percent-encoded in the
+    /// ARN and decoded back here ([`decode_arn_resource_path`]), so `pattern` is the
+    /// identifier itself.
     PackageGroup {
         owner: Option<String>,
         domain: String,
@@ -507,12 +509,15 @@ pub fn taggable_resource(arn: &::service_common::arn::Arn<'_>) -> Option<Resourc
         }
         // A package group's identifier is a PATH, so everything after the domain segment
         // belongs to it, `/` separators included — the leading one is what makes `/*` the
-        // ancestor of `/npm/*`.
+        // ancestor of `/npm/*`. The path is percent-encoded in the ARN this service mints
+        // (`package_group_arn`), so it is decoded back into the pattern the store is keyed
+        // by; an ARN written out by hand with literal characters decodes to itself.
         ("package-group", Some(domain), Some(path)) if !domain.is_empty() && !path.is_empty() => {
+            let pattern = decode_arn_resource_path(path)?;
             Some(ResourceRef::PackageGroup {
                 owner,
                 domain: domain.to_string(),
-                pattern: format!("/{path}"),
+                pattern: format!("/{pattern}"),
             })
         }
         _ => None,
@@ -2092,6 +2097,78 @@ pub fn package_group_pattern_refusal(pattern: &str) -> Option<ValidationExceptio
     })
 }
 
+/// The characters an ARN resource path carries LITERALLY: RFC 3986's unreserved set
+/// (`ALPHA / DIGIT / "-" / "." / "_" / "~"`), which is also the set AWS's own URI
+/// encoder leaves alone. Every other byte of an identifier placed in a resource path is
+/// percent-encoded, so nothing a caller chose can be read as an ARN delimiter, a URI
+/// delimiter or an IAM wildcard.
+///
+/// `/` is NOT in the set because it is handled a level up, in
+/// [`encode_arn_resource_path`]: it is the path's own separator, not a character of a
+/// segment.
+const ARN_PATH_SEGMENT: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// One segment of an ARN resource path, percent-encoded.
+///
+/// The escapes are written with LOWER-case hex digits (`%2a`, `%24`), the form AWS's
+/// CodeArtifact ARNs carry; `percent-encoding` writes them upper-case, so the two digits
+/// of each escape — and only those — are lowered on the way out. Nothing else in the
+/// encoder's output can follow a `%`: every `%` in it begins an escape, because a literal
+/// `%` of the input is itself encoded (`%25`).
+fn encode_arn_path_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    let mut hex_digits_left = 0_u8;
+    for character in ::percent_encoding::utf8_percent_encode(segment, ARN_PATH_SEGMENT)
+        .flat_map(str::chars)
+    {
+        if character == '%' {
+            hex_digits_left = 2;
+            encoded.push(character);
+        } else if hex_digits_left > 0 {
+            hex_digits_left -= 1;
+            encoded.push(character.to_ascii_lowercase());
+        } else {
+            encoded.push(character);
+        }
+    }
+    encoded
+}
+
+/// A `/`-separated ARN resource path with every SEGMENT percent-encoded
+/// ([`encode_arn_path_segment`]) and the separators kept literal.
+///
+/// An ARN's resource field is a path, so `/` has to stay readable as the separator it is
+/// — an ARN parser and an IAM resource element both split on it. Everything inside a
+/// segment is an identifier the caller chose, and is encoded.
+#[must_use]
+pub fn encode_arn_resource_path(path: &str) -> String {
+    path.split('/')
+        .map(encode_arn_path_segment)
+        .collect::<Vec<String>>()
+        .join("/")
+}
+
+/// The identifiers an ARN resource path carries, with the percent-encoding
+/// [`encode_arn_resource_path`] applied removed again, or `None` when the escapes do not
+/// decode to UTF-8.
+///
+/// The inverse of minting: a client carries an ARN this service minted back into the API
+/// (`TagResource`, `ListTagsForResource`), so the resource path has to resolve to the
+/// identifier it was built from. Decoding is the identity on a path that carries no
+/// escape, so an ARN written out by hand with literal characters resolves to the same
+/// resource.
+#[must_use]
+pub fn decode_arn_resource_path(path: &str) -> Option<String> {
+    ::percent_encoding::percent_decode_str(path)
+        .decode_utf8()
+        .ok()
+        .map(|decoded| decoded.into_owned())
+}
+
 /// The ARN of a package group:
 /// `arn:aws:codeartifact:<region>:<owner>:package-group/<domain><pattern>`.
 ///
@@ -2099,12 +2176,22 @@ pub fn package_group_pattern_refusal(pattern: &str) -> Option<ValidationExceptio
 /// directly — the form CodeArtifact's `package-group` resource ARN takes. A pattern
 /// handed in without the leading `/` gets one here, so the ARN always has exactly one
 /// separator between the domain and the pattern.
+///
+/// The pattern is the one identifier of this service that is not restricted to characters
+/// an ARN carries literally — `PackageGroupPattern` admits every non-control,
+/// non-whitespace character, wildcards and sigils included — so it goes through
+/// [`encode_arn_resource_path`]. (The domain name is passed through the same encoder for
+/// uniformity; `DomainName` is `^[a-z][a-z0-9\-]{0,48}[a-z0-9]$`, which the encoder leaves
+/// untouched.)
 pub fn package_group_arn(region: &str, domain: &str, pattern: &str) -> String {
     let path = pattern.strip_prefix('/').unwrap_or(pattern);
     ::engine::emulator_arn(
         SERVICE_SIGNING_NAME,
         region,
-        &format!("package-group/{domain}/{path}"),
+        &format!(
+            "package-group/{}",
+            encode_arn_resource_path(&format!("{domain}/{path}"))
+        ),
     )
 }
 

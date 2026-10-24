@@ -29,7 +29,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, create_domain, emulator, Answer, ACCOUNT, REGION};
+use crate::harness::{call, create_domain, emulator, package_group_arn, Answer, ACCOUNT};
 
 /// The pattern of the root package group, which every domain holds from creation.
 pub(crate) const ROOT: &str = "/*";
@@ -99,9 +99,11 @@ fn restriction<'a>(label: &str, group: &'a Value, restriction_type: &str) -> &'a
 }
 
 /// The ARN a pattern gets: `package-group/<domain>` with the pattern — itself a path from
-/// the domain root — appended.
+/// the domain root — appended, each segment percent-encoded
+/// (`crate::harness::package_group_arn`, pinned by
+/// `tests/all/package_group_arn_encoding.rs`).
 fn expected_arn(domain: &str, pattern: &str) -> String {
-    format!("arn:aws:codeartifact:{REGION}:{ACCOUNT}:package-group/{domain}{pattern}")
+    package_group_arn(domain, pattern)
 }
 
 /// Assert that every origin restriction of `group` inherits, and resolves to the root
