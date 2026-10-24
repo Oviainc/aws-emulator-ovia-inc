@@ -24,8 +24,9 @@ use crate::ops::types::{
     AdvancedSecurityOptionsStatus, AutoTuneOptions, AutoTuneOptionsInput, AutoTuneOptionsOutput,
     AutoTuneOptionsStatus, AutoTuneStatus, AutomatedSnapshotPauseOptions,
     AutomatedSnapshotPauseOptionsStatus, AutomatedSnapshotPauseRequestOptions,
-    ChangeProgressDetails, ChangeProgressStatusDetails, ClusterConfig,
-    ClusterConfigStatus, CognitoOptions, CognitoOptionsStatus, DeploymentStrategyOptions,
+    ChangeProgressDetails, ChangeProgressStatusDetails, ClusterConfig, ClusterConfigStatus,
+    CognitoOptions, CognitoOptionsStatus, DataSourceDetails, DataSourceType,
+    DeploymentStrategyOptions,
     DeploymentStrategyOptionsStatus, DomainConfig, DomainEndpointOptions,
     DomainEndpointOptionsStatus, DomainInfo, DomainStatus, EBSOptions, EBSOptionsStatus,
     EncryptionAtRestOptions, EncryptionAtRestOptionsStatus, EngineModeStatus,
@@ -35,7 +36,8 @@ use crate::ops::types::{
     NodeToNodeEncryptionOptions, NodeToNodeEncryptionOptionsStatus, OffPeakWindowOptions,
     OffPeakWindowOptionsStatus, OptionStatus, ResourceNotFoundException, SAMLOptionsOutput,
     SnapshotOptions, SnapshotOptionsStatus, SoftwareUpdateOptions, SoftwareUpdateOptionsStatus,
-    Tag, UseCaseStatus, VPCDerivedInfo, VPCDerivedInfoStatus, VPCOptions, VersionStatus,
+    Tag, UseCaseStatus, VPCDerivedInfo, VPCDerivedInfoStatus, VPCOptions, ValidationException,
+    VersionStatus,
 };
 
 /// The engine version a domain runs when `CreateDomain` names none.
@@ -75,6 +77,17 @@ pub const ARN_NAMESPACE: &str = "es";
 /// its default domain-per-Region quota. It is what stops the state growing without
 /// end: every record it holds is released by `DeleteDomain`.
 pub const DOMAIN_QUOTA: usize = 100;
+
+/// How many data sources ONE domain holds before `AddDataSource` refuses with the
+/// modelled `LimitExceededException`.
+///
+/// Like [`DOMAIN_QUOTA`] this is the emulator's OWN bound on the store — it models
+/// neither Service Quotas nor an account's adjustments — and it is what stops a
+/// caller looping with fresh names from growing the state without end: every record
+/// it counts is released by `DeleteDataSource`. Because the per-domain set IS what
+/// `ListDataSources` answers with, it also bounds the size of that answer, and with
+/// [`DOMAIN_QUOTA`] it bounds the whole data-source store.
+pub const DATA_SOURCE_QUOTA: usize = 20;
 
 /// How long a domain stays `Processing` after the call that started the work
 /// (`CreateDomain`, or an `UpdateDomainConfig` that changed something) before the
@@ -209,6 +222,52 @@ pub struct OptionRevision {
     pub version: i32,
     /// `OptionStatus$UpdateDate`: the instant of the call that last set it.
     pub updated_at: SystemTime,
+}
+
+/// `DataSourceStatus`'s `ACTIVE` value — the status a direct-query data source has
+/// while queries may run against it. `DataSourceStatus` declares exactly
+/// `["ACTIVE", "DISABLED"]`.
+pub const DATA_SOURCE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `DataSourceStatus`'s `DISABLED` value — the other member of that same two-value
+/// enum: the data source exists but queries may not run against it.
+pub const DATA_SOURCE_STATUS_DISABLED: &str = "DISABLED";
+
+/// Every value `DataSourceStatus` declares, in the model's own order. This is the
+/// whole catalog a request may name and a report may carry.
+pub const DATA_SOURCE_STATUSES: [&str; 2] =
+    [DATA_SOURCE_STATUS_ACTIVE, DATA_SOURCE_STATUS_DISABLED];
+
+/// One direct-query data source of a domain, as this emulator persists it.
+///
+/// `AddDataSource` mints one, `GetDataSource` reports it and `ListDataSources`
+/// reports every one of its domain's — all from THIS record, so no two of them can
+/// report the same data source differently.
+#[derive(Debug, Clone)]
+pub struct DataSource {
+    /// `DataSourceDetails$Name`. Unique within the domain, so the name IS the key
+    /// the domain's map holds it under.
+    pub name: String,
+    /// `DataSourceDetails$DataSourceType`: the `DataSourceType` union the create
+    /// call carried, stored as the modelled shape rather than a second mirror of it.
+    pub data_source_type: DataSourceType,
+    /// `DataSourceDetails$Description`, absent when the create named none.
+    pub description: Option<String>,
+    /// `DataSourceDetails$Status`: one of [`DATA_SOURCE_STATUSES`].
+    pub status: String,
+}
+
+impl DataSource {
+    /// This record as `DataSourceDetails` — the element shape `ListDataSources`
+    /// reports, and member-for-member the projection `GetDataSource` answers with.
+    pub fn to_details(&self) -> DataSourceDetails {
+        DataSourceDetails {
+            data_source_type: Some(self.data_source_type.clone()),
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            status: Some(self.status.clone()),
+        }
+    }
 }
 
 /// One configuration change on a domain: what `DescribeDomainChangeProgress`
@@ -396,6 +455,10 @@ pub struct Domain {
     /// no entry has no persisted value, and `DomainConfig` reports no container for
     /// it.
     pub option_versions: BTreeMap<String, OptionRevision>,
+    /// This domain's direct-query data sources, keyed by their `Name` — unique per
+    /// domain, so the name IS the key. Iterating a `BTreeMap` is order-stable, which
+    /// is what lets `ListDataSources` report the same order twice.
+    pub data_sources: BTreeMap<String, DataSource>,
     /// This domain's configuration changes, oldest first, bounded by
     /// [`CHANGE_HISTORY`]: a FIFO, because the cap drops the oldest change and the
     /// newest is the one `DescribeDomainChangeProgress` reports when the request
@@ -1031,6 +1094,27 @@ pub fn datetime(at: SystemTime) -> ::aws_smithy_types::DateTime {
 pub fn domain_not_found(domain_name: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("Domain not found: {domain_name}")),
+    }
+}
+
+/// The `ValidationException` payload for a name that names no data source of a
+/// domain the store DOES hold.
+///
+/// Resolving a data source name against an existing domain is input validation, not
+/// a missing-resource lookup: the refusal names the value that could not be
+/// resolved, so a caller tells it apart from [`domain_not_found`].
+pub fn data_source_absent(name: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!("DataSource with name {name} doesn't exist.")),
+    }
+}
+
+/// The `ValidationException` payload for a create naming a data source the domain
+/// already holds — the mirror of [`data_source_absent`], so one refusal reads like
+/// the other.
+pub fn data_source_exists(name: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!("DataSource with name {name} already exists.")),
     }
 }
 
