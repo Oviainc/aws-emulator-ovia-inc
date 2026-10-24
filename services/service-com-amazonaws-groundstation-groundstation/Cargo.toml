@@ -25,12 +25,22 @@ tracing = { workspace = true }
 # `Uuid`-shaped id (see `state::new_uuid`); `hex` renders them.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Amazon S3 client an `s3RecordingConfig`'s `bucketArn` is resolved through: Ground
+# Station reads the recording bucket before it will store the config, and S3 is called
+# over the in-process callback into this same emulator (no network client feature is
+# enabled: the transport is the emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # Calendar arithmetic for `GetMinuteUsage`: the first instant of a requested month, and of
 # the next one, in the proleptic Gregorian calendar (month lengths and the leap rule).
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The s3-recording suite mounts the S3 service beside Ground Station on one engine,
+# because CreateConfig resolves an `s3RecordingConfig`'s bucket by calling S3 in process.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

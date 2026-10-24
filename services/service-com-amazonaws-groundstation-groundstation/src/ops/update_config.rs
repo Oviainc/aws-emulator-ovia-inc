@@ -142,7 +142,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateConfigErrorModeled::DependencyException(DependencyException {
@@ -170,68 +170,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut guard = state.lock();
-
         // A config is addressed by BOTH labels, so an id whose stored type is not the
         // `{configType}` label names no config to update — just as an unknown id does
-        // not. Checked before the body's references, so what the caller hears first is
-        // that the config it addressed is not there.
+        // not. Asked FIRST, before the body is judged at all, so what the caller hears
+        // first is that the config it addressed is not there. The text is this MUTATION
+        // path's own: the pair the request addressed plus the account the write was
+        // scoped to, where a read of the same dead pair answers the read path's text.
         let key = (input.config_type.clone(), input.config_id.clone());
-        if !guard.configs.contains_key(&key) {
-            return Err(UpdateConfigErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::config_not_found_message(
-                        &input.config_type,
-                        &input.config_id,
-                    )),
-                },
-            )
-            .into());
+        let not_found = || {
+            UpdateConfigErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::config_mutation_not_found_message(
+                    &input.config_type,
+                    &input.config_id,
+                )),
+            })
+        };
+        // Both are judged from this service's OWN store, under one short lock, before the
+        // cross-service bucket resolution below: the config the URI addresses has to be
+        // there, and what the service and this account may use in a `configData` — the
+        // ranges the model documents for its numeric members and the uplink frequencies
+        // this account is authorised to transmit on — holds of the parameters an update
+        // stores exactly as of the ones a create stores. So a local fault is never
+        // reported behind a cross-service call, and a refused update leaves the stored
+        // config as it was.
+        {
+            let guard = state.lock();
+            if !guard.configs.contains_key(&key) {
+                return Err(not_found().into());
+            }
+            guard
+                .validate_config_data(&input.config_data)
+                .map_err(UpdateConfigErrorModeled::InvalidParameterException)?;
         }
 
-        // What the service and this account may use in a `configData` — the ranges the
-        // model documents for its numeric members, the uplink frequencies this account is
-        // authorised to transmit on, and a recording bucket whose location the service can
-        // read — holds of the parameters an update stores exactly as of the ones a create
-        // stores, so an update outside them is refused and the stored config is left as it
-        // was.
-        guard
-            .validate_config_data(&input.config_data)
-            .map_err(UpdateConfigErrorModeled::InvalidParameterException)?;
+        // An `s3RecordingConfig` an update stores has to name a bucket this account
+        // holds exactly as one a create stores does, and the bucket lives in another
+        // service: it is resolved against S3 with this service's store UNLOCKED, since
+        // the call crosses an await.
+        if let Some(refusal) = crate::state::unresolvable_recording_bucket(
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            &input.config_data,
+        )
+        .await
+        {
+            return Err(UpdateConfigErrorModeled::InvalidParameterException(refusal).into());
+        }
+
+        let mut guard = state.lock();
 
         // An `uplinkEchoConfig` echoes a specific ANTENNA UPLINK config, named by ARN:
-        // the update is held to the same reference rule, and answers the same text, as
-        // the create, so an echo config cannot be pointed at a config that does not
-        // exist or is of another type.
+        // the update is held to the same reference rule, and answers the same two texts,
+        // as the create, so an echo config cannot be pointed at a config that does not
+        // exist (a missing resource) or at one of another type (a bad parameter).
         if let ConfigTypeData::uplinkEchoConfig(echo) = &input.config_data {
             // The one capability type an `uplinkEchoConfig`'s reference may name — the
             // member's own name and the `antenna-uplink` segment of a `ConfigArn` are
             // what say so.
             const ECHOED_TYPE: &str = "antenna-uplink";
 
-            if !guard.resolves_config(&echo.antenna_uplink_config_arn, Some(ECHOED_TYPE)) {
-                return Err(UpdateConfigErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Unable to find {} Config with ARN: {}",
-                            crate::state::capability_display_name(ECHOED_TYPE),
-                            echo.antenna_uplink_config_arn
-                        )),
-                    },
-                )
-                .into());
+            match guard.typed_reference_fault(&echo.antenna_uplink_config_arn, ECHOED_TYPE) {
+                None => {}
+                Some(crate::state::TypedReferenceFault::Absent) => {
+                    return Err(UpdateConfigErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::typed_reference_absent_message(
+                                ECHOED_TYPE,
+                                &echo.antenna_uplink_config_arn,
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                Some(crate::state::TypedReferenceFault::WrongType) => {
+                    return Err(UpdateConfigErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(crate::state::typed_reference_wrong_type_message(
+                                ECHOED_TYPE,
+                            )),
+                            parameter_name: Some(
+                                "configData.uplinkEchoConfig.antennaUplinkConfigArn".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
             }
         }
 
-        let stored = guard
-            .configs
-            .get_mut(&key)
-            .expect("the config whose presence was just checked under this lock");
+        // The modelled member defaults are materialised on the way in here too, so a
+        // config updated with the member omitted carries the default rather than losing
+        // it — the same value a create would have stored.
+        let mut config_data = input.config_data;
+        crate::state::apply_modelled_defaults(&mut config_data);
+
+        // Still addressed under this lock: the bucket resolution above released it, so
+        // a delete could have landed in between, and that is the same answer as an id
+        // that was never there.
+        let stored = guard.configs.get_mut(&key).ok_or_else(not_found)?;
 
         // Both members are required, so an update REPLACES the config's name and its
         // parameters; its id, type and ARN are its address and do not move.
         stored.name = input.name;
-        stored.config_data = input.config_data;
+        stored.config_data = config_data;
 
         Ok(UpdateConfigOutput {
             config_id: Some(stored.config_id.clone()),
