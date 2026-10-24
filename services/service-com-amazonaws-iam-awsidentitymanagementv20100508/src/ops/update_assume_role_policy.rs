@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAssumeRolePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAssumeRolePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAssumeRolePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the trust policy held on the account's own record of a role, so a later
+//! `GetRole` (and every other reader of that record) reports the document this call
+//! stored, verbatim.
+//!
+//! The modelled `LimitExceededException` is not answered here: this crate records no
+//! trust-policy size quota, and `CreateRole` — the other writer of this same member —
+//! enforces none, so a document the create accepts the update accepts too rather than
+//! a role's trust policy being refusable only on the way in through this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -179,20 +179,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // `ctx` carries request metadata only; this operation is driven entirely by
+        // its input and the store.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAssumeRolePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAssumeRolePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAssumeRolePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateAssumeRolePolicyErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The role is named (friendly name, not ARN) and IAM entity names "are not
+        // distinguished by case", so the case-folded name is the identity. This
+        // operation CHANGES the account's own record of a role, so it answers from
+        // the store alone: a name only `crate::state::service_provisioned_role`
+        // resolves is still "a resource entity that does not exist" here, as that
+        // function's own documentation records.
+        let key = crate::state::name_key(&input.role_name);
+        let Some(role) = store.roles.get(&key) else {
+            return Err(UpdateAssumeRolePolicyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The role with name {} cannot be found.",
+                        input.role_name
+                    )),
+                },
+            )
+            .into());
+        };
+        let role_name = role.role_name.clone();
+        // Which service a role is linked to is carried by its path, read through the
+        // one definition of that rule in `crate::state`.
+        let linked_service =
+            crate::state::service_linked_role_principal(&role.path).map(str::to_string);
+
+        // "Service-linked roles are protected Amazon Web Services resources. Only the
+        // service that depends on the service-linked role can modify or delete the role
+        // on your behalf" — so a caller's trust-policy update is refused with the
+        // modelled `UnmodifiableEntityException`, whose documentation says the message
+        // "includes the name of the service that depends on this service-linked role".
+        if let Some(linked_service) = linked_service {
+            return Err(
+                UpdateAssumeRolePolicyErrorModeled::UnmodifiableEntityException(
+                    UnmodifiableEntityException {
+                        message: Some(format!(
+                            "Service role {role_name} cannot be modified: its trust policy is \
+                             that of a service-linked role, so the change must be requested \
+                             through {linked_service}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A trust policy is "the policy that grants an entity permission to assume the
+        // role", and it must be an IAM JSON policy document, not merely the non-empty
+        // string `policyDocumentType`'s pattern asks for. The rule, and the note on how
+        // far it checks, live on `crate::state::is_policy_document` — the one definition
+        // every operation in this crate that takes a policy document shares, including
+        // `CreateRole`, the other writer of this very member.
+        if !crate::state::is_policy_document(&input.policy_document) {
+            return Err(
+                UpdateAssumeRolePolicyErrorModeled::MalformedPolicyDocumentException(
+                    MalformedPolicyDocumentException {
+                        message: Some(
+                            "Syntax errors in policy: PolicyDocument must be a JSON object \
+                             carrying a Statement element"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Updates the policy that grants an IAM entity permission to assume a role":
+        // the document REPLACES the one the role held, and is stored as the plain JSON
+        // text the request carried — the one form this crate holds every policy
+        // document in, so a later read hands it back exactly as it was sent whether
+        // `CreateRole` or this operation wrote it.
+        let Some(role) = store.roles.get_mut(&key) else {
+            return Err(UpdateAssumeRolePolicyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The role with name {} cannot be found.",
+                        input.role_name
+                    )),
+                },
+            )
+            .into());
+        };
+        role.assume_role_policy_document = Some(input.policy_document);
+
+        Ok(UpdateAssumeRolePolicyOutput)
     }
 }

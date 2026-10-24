@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    Address, CapacityTaskFailure, InstanceTypeCapacity, InstancesToExclude, Outpost,
+    Address, AssetInfo, CapacityTaskFailure, InstanceTypeCapacity, InstancesToExclude, Outpost,
     PricingOption, PrivateConnectivityConfig, Quote, Site,
 };
 
@@ -226,6 +226,27 @@ pub struct OutpostRecord {
     /// stubs with issues of their own. So a `CreateOutpost` leaves this empty, and
     /// an Outpost with no recorded option cannot be priced.
     pub renewal_pricing: Vec<PricingOption>,
+    /// The hardware assets INSTALLED on this Outpost — what `ListAssets` reports
+    /// for it — in the order they were installed, which is the order a page of
+    /// them is cut in ([`ASSET_PAGE`]).
+    ///
+    /// Kept on the Outpost's own record for the reason
+    /// [`OutpostRecord::private_connectivity`] and [`OutpostRecord::renewal_pricing`]
+    /// are: an asset belongs to exactly ONE Outpost (the modelled route is
+    /// `/outposts/{OutpostIdentifier}/assets`), so deleting the Outpost takes its
+    /// assets with it.
+    ///
+    /// An asset is a PHYSICAL unit — a rack, a compute or storage server, a
+    /// powershelf, a switch — that Amazon Web Services installs on the site after an
+    /// order is fulfilled, so no call in this API creates one and `CreateOutpost`
+    /// leaves this empty: the operations an Outpost's installed hardware would
+    /// arrive with (`CreateOrder`, `GetOrder`, `StartConnection`) are still scaffold
+    /// stubs with issues of their own. This therefore holds only the assets that
+    /// were actually recorded for the Outpost, exactly as
+    /// [`OutpostRecord::renewal_pricing`] holds only recorded prices, and an Outpost
+    /// with no installed hardware is reported as having none rather than as having
+    /// hardware the emulator made up.
+    pub assets: Vec<AssetInfo>,
 }
 
 /// The `CapacityTaskStatus` a capacity task carries the moment `StartCapacityTask`
@@ -1302,6 +1323,15 @@ pub const OUTPOST_PAGE: &str = "outposts";
 
 /// The stamp a `ListSites` page token carries. See [`OUTPOST_PAGE`].
 pub const SITE_PAGE: &str = "sites";
+
+/// The stamp a `ListAssets` page token carries.
+///
+/// An asset is not a top-level resource with a creation sequence of its own: it is
+/// a unit of hardware installed on ONE Outpost, held in that Outpost's own
+/// installation order ([`OutpostRecord::assets`]), so the boundary such a token
+/// names is a position in THAT list and the route the token is replayed on names
+/// the Outpost it belongs to. See [`OUTPOST_PAGE`].
+pub const ASSET_PAGE: &str = "assets";
 
 /// The page size a list uses when the caller named no `MaxResults`, which is also
 /// the ceiling the model declares for it (`MaxResults1000`, `range(1..1000)`).

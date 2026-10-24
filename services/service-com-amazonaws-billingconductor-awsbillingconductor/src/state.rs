@@ -488,7 +488,8 @@ impl CustomLineItemRecord {
 /// * `pricing_rules` / `pricing_rule_names` hold one entry per rule, at most
 ///   [`MAX_PRICING_RULES`], and `DeletePricingRule` reclaims both entries;
 ///   `pricing_plans` / `pricing_plan_names` hold one entry per plan, at most
-///   [`MAX_PRICING_PLANS`]; `billing_groups` / `billing_group_names` one per group,
+///   [`MAX_PRICING_PLANS`]; a plan's own association set at most
+///   [`MAX_PRICING_RULES_PER_PRICING_PLAN`]; `billing_groups` / `billing_group_names` one per group,
 ///   at most [`MAX_BILLING_GROUPS`]; a group's membership and its share of
 ///   `account_associations` at most [`MAX_ACCOUNTS_PER_BILLING_GROUP`]. A create or
 ///   an association past its cap is REFUSED with the modelled
@@ -1068,6 +1069,21 @@ pub const MAX_RESOURCES_PER_CUSTOM_LINE_ITEM: usize = 5;
 /// deletable (`DeletePricingRule`), so a caller that reaches the cap can make room
 /// by deleting one rather than being stuck.
 pub const MAX_PRICING_RULES: usize = 1000;
+
+/// How many pricing rules ONE pricing plan may associate.
+///
+/// A CHOSEN bound, informed by the model rather than read off it:
+/// `CreatePricingPlanInput.PricingRuleArns` (`PricingRuleArnsInput`, len 0..30) is
+/// the largest association set a create can express, and
+/// `AssociatePricingRules`/`DisassociatePricingRules` move at most 30 rules per call
+/// (`PricingRuleArnsNonEmptyInput`, len 1..30) — so holding a stored plan within
+/// what a create can express keeps that plan representable. (A documented AWS quota
+/// for rules per plan is not in the model; the `@length` maxima above bound a
+/// request rather than the membership it accumulates.) An association that would
+/// take a plan past the bound is refused with `AssociatePricingRules`'s modelled
+/// `ServiceLimitExceededException` — the one operation of the associate/disassociate
+/// pair that declares it — rather than displacing a stored association.
+pub const MAX_PRICING_RULES_PER_PRICING_PLAN: usize = 30;
 
 /// `ModifierPercentage` as the service stores it: "Your entry will be rounded to
 /// the nearest 2 decimal places." (the member's own documentation), so the value

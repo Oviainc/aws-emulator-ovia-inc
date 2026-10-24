@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBaseline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBaseline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBaseline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves a `baselineIdentifier` against this service's baseline catalog
+//! ([`crate::state::BASELINE_CATALOG`]) and reports that baseline's name and
+//! description. REPORTING only, and nothing in the per-account store takes part: a
+//! baseline is AWS-managed, so no call creates, changes or deletes one and the catalog is
+//! the same for every caller — which is why this handler neither locks nor writes the
+//! store (see [`crate::state::resolve_baseline`]).
+//!
+//! A baseline's identity is the 16-character resource id its ARN ends in; the partition,
+//! region and account segments before it select nothing, because the catalog is published
+//! in all of them. The ARN reported back is the one THIS endpoint serves that baseline
+//! under — the request's region and the emulator's canonical account id — so it is built
+//! through [`crate::state::baseline_arn`] rather than echoed from the request. An id the
+//! catalog does not hold is `ResourceNotFoundException` (404).
+//!
+//! AUTHORIZATION and THROTTLING are NOT emulated here, so the modelled
+//! `AccessDeniedException` (403) and `ThrottlingException` (429) are deliberately
+//! unreachable from this handler: the emulator verifies the request signature at its
+//! front door and models no per-principal policy or request budget. Read the silence as
+//! "not emulated", never as "checked and allowed".
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +164,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBaseline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBaselineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBaseline"))
+        // The per-account store takes no part: a baseline is AWS-managed, so the answer
+        // is the catalog's entry for the id the identifier names, the same for every
+        // caller. Binding the engine keeps the constructor seam honest without locking a
+        // store this read has no reason to touch.
+        let _ = &self.engine;
+
+        // The modelled `BaselineArn` pattern is enforced before this handler runs, so the
+        // identifier is well formed here and the only open question is whether the
+        // catalog holds the baseline it names.
+        let Some(baseline) = crate::state::resolve_baseline(&input.baseline_identifier) else {
+            return Err(GetBaselineErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no baseline matches baselineIdentifier {}",
+                        input.baseline_identifier
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetBaselineOutput {
+            // The ARN this endpoint serves the baseline under, in the request's region:
+            // the identifier's own partition, region and account segments are not the
+            // resource's identity, so the answer is built rather than echoed.
+            arn: crate::state::baseline_arn(
+                &crate::state::request_region(ctx.parts()),
+                baseline.id,
+            ),
+            name: baseline.name.to_string(),
+            description: Some(baseline.description.to_string()),
+        })
     }
 }

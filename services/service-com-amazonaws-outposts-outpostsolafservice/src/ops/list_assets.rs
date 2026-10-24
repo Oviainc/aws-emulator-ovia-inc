@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the hardware assets recorded for the Outpost the
+//! `OutpostIdentifier` names — resolved from either the bare id or the full ARN the
+//! modelled label pattern accepts — narrowed to those satisfying EVERY `*Filter` the
+//! caller sent, in the Outpost's own installation order, cut into pages of at most
+//! `MaxResults` with the modelled `NextToken` the next page resumes from.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A read, and one that writes NOTHING: it answers from
+//! [`crate::state::OutpostRecord::assets`], so a caller that lists an Outpost's assets
+//! sees exactly what the next caller does. An asset is a physical unit of hardware
+//! Amazon Web Services installs once an order is fulfilled, so no call in this API
+//! creates one and this operation invents none: an Outpost with no installed hardware
+//! is answered with no asset, exactly as `GetRenewalPricing` answers an Outpost with no
+//! recorded price. See [`crate::state::OutpostRecord::assets`] for the operations an
+//! Outpost's hardware would arrive with — all still scaffold stubs with issues of
+//! their own.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +161,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssets"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAssetsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
+        // the same stored Outpost.
+        let outpost_id =
+            crate::state::resolve_outpost_id(&input.outpost_identifier).ok_or_else(|| {
+                ListAssetsErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::outpost_identifier_pattern_report()),
+                })
+            })?;
+        // The resume point the caller's token names. A token this service did not
+        // issue for THIS list is a bad request, not an empty page.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::ASSET_PAGE, token).ok_or_else(
+                    || {
+                        ListAssetsErrorModeled::ValidationException(ValidationException {
+                            message: Some(crate::state::page_token_report("ListAssets")),
+                        })
+                    },
+                )?,
+            ),
+            None => None,
+        };
+        let size = crate::state::page_size(input.max_results);
+
+        // A read, so the guard is taken immutably: an asset's state is a fact about
+        // installed hardware rather than a transition the clock owes, so there is
+        // nothing here for this call to materialise and nothing for it to write.
+        let store = state.lock();
+        // An Outpost's assets are listed OFF that Outpost, so one the store does not
+        // hold is the not-found error this operation models, worded as the identifier
+        // echo of the value AS SUPPLIED — not of the bare id an ARN resolved to.
+        let record = store.outposts.get(&outpost_id).ok_or_else(|| {
+            ListAssetsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                    &input.outpost_identifier,
+                )),
+            })
+        })?;
+        // The boundary this list pages on is an asset's POSITION in the Outpost's
+        // installation order: an asset carries no creation sequence of its own, and
+        // that order is the one stable order the whole list is reported in.
+        let (assets, next_token) = crate::state::page(
+            crate::state::ASSET_PAGE,
+            record
+                .assets
+                .iter()
+                .enumerate()
+                .filter(|(_, asset)| matches_filters(asset, &input))
+                .map(|(position, asset)| (position as u64, asset.clone())),
+            after,
+            size,
+        );
+
+        Ok(ListAssetsOutput {
+            // "Information about the hardware assets": the ones recorded for this
+            // Outpost that match every filter, which may be none at all.
+            assets: Some(assets),
+            next_token,
+        })
     }
+}
+
+/// Whether an asset satisfies every `*Filter` member the caller sent.
+///
+/// Each filter is a LIST of accepted values for ONE member of the asset, so an asset
+/// matches when its value for that member is one of them, and — as this operation's
+/// documentation states — "if you specify multiple filters, the results include only
+/// the resources that match all of the specified filters": several filters together
+/// narrow rather than widen, while an absent (or empty) filter matches everything. An
+/// asset whose value for a filtered member was never recorded matches no value, so it
+/// is narrowed out, exactly as `ListOutposts` narrows out an Outpost with no value for
+/// a filtered member.
+///
+/// The members the model binds the three filters to: `AssetTypeFilter` selects on the
+/// asset's own `AssetType`, while `HostIdFilter` ("the host ID of a Dedicated Host")
+/// and `StatusFilter` ("by state") select on the `ComputeAttributes` that carry a
+/// compute asset's `HostId` and `State` — the only members of this output those two
+/// values appear in — so an asset with no compute attributes matches neither.
+fn matches_filters(asset: &AssetInfo, input: &ListAssetsInput) -> bool {
+    let matches = |filter: Option<&Vec<String>>, value: Option<&String>| match filter {
+        Some(accepted) if !accepted.is_empty() => {
+            value.is_some_and(|value| accepted.contains(value))
+        }
+        _ => true,
+    };
+    let compute = asset.compute_attributes.as_ref();
+    matches(input.asset_type_filter.as_ref(), asset.asset_type.as_ref())
+        && matches(
+            input.host_id_filter.as_ref(),
+            compute.and_then(|compute| compute.host_id.as_ref()),
+        )
+        && matches(
+            input.status_filter.as_ref(),
+            compute.and_then(|compute| compute.state.as_ref()),
+        )
 }

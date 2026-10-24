@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSecurityRequirementPack
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSecurityRequirementPack`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSecurityRequirementPack::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one stored security requirement pack: resolves the record
+//! `CreateSecurityRequirementPack` persisted and drops it from the pack store, so every
+//! later read of that id answers `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +143,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSecurityRequirementPack` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSecurityRequirementPackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSecurityRequirementPack"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteSecurityRequirementPackErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the security requirement pack store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // `packId` is `@required` but carries no `@length`, so an empty one reaches the
+        // handler. It names no pack and never could, so it is a bad request rather than
+        // a missing resource: refused with the modelled `ValidationException` (HTTP 400).
+        if input.pack_id.is_empty() {
+            return Err(
+                DeleteSecurityRequirementPackErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "packId must not be empty".to_string(),
+                        field_list: Some(vec![ValidationExceptionField {
+                            path: "packId".to_string(),
+                            message: "must not be empty".to_string(),
+                        }]),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut state = state.lock();
+
+        // The id has to name a pack the account holds: a delete of an id it does not
+        // hold is refused rather than reported as a success, so a client cannot read a
+        // delete of a typo as a delete of the pack it meant.
+        let pack = state
+            .security_requirement_packs
+            .get(&input.pack_id)
+            .ok_or_else(|| {
+                DeleteSecurityRequirementPackErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "No security requirement pack found for ID: {}",
+                            input.pack_id
+                        ),
+                    },
+                )
+            })?;
+
+        // "Deletes a CUSTOMER MANAGED security requirement pack and all its associated
+        // security requirements": an AWS managed pack is part of the catalog AWS ships
+        // with the account, so dropping it is not a change the account's own state
+        // admits. Refused with the modelled `ConflictException` (HTTP 409) — "a conflict
+        // with the current state of the resource".
+        if pack.management_type == crate::state::MANAGEMENT_TYPE_AWS_MANAGED {
+            return Err(DeleteSecurityRequirementPackErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Security requirement pack {} is {} and cannot be deleted; only \
+                         customer managed packs can be deleted",
+                        input.pack_id,
+                        crate::state::MANAGEMENT_TYPE_AWS_MANAGED
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The record is dropped, so every later read of this id — the single read, the
+        // listing, a second delete — sees it gone.
+        state.security_requirement_packs.remove(&input.pack_id);
+
+        Ok(DeleteSecurityRequirementPackOutput {})
     }
 }
