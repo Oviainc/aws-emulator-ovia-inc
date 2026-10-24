@@ -14,6 +14,10 @@
 //! one value past it, and the option-merge rule over a table of eight different
 //! option containers (a structure, a string, two maps, an enum) — each row both
 //! applied and dry-run.
+//!
+//! The wire harness below ([`Emulator`], [`Answer`] and the helpers around them) is
+//! this crate's ONE test harness: a sibling suite reaches it as
+//! `super::domain_lifecycle::…` rather than growing a second copy.
 
 use std::time::Duration;
 
@@ -23,27 +27,27 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The API version every path of this service is prefixed with.
-const PREFIX: &str = "/2021-01-01";
+pub(crate) const PREFIX: &str = "/2021-01-01";
 
 /// Long enough for the emulator's provisioning span (500 ms) to have fallen due, so
 /// the next read materialises the settled configuration.
-const SETTLE_WAIT: Duration = Duration::from_millis(700);
+pub(crate) const SETTLE_WAIT: Duration = Duration::from_millis(700);
 
 /// One emulator with this service mounted on a fresh shared engine.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 /// One answered request: the HTTP status, the `x-amzn-errortype` error code when the
 /// answer is a failure, and the parsed JSON body (`Value::Null` for an empty body).
-struct Answer {
-    status: u16,
-    error: Option<String>,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) error: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: std::sync::Arc<engine::InMemoryEngine> =
             std::sync::Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
@@ -54,7 +58,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
+    pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
         let payload = body.map(|value| value.to_string()).unwrap_or_default();
         let request = http::Request::builder()
             .method(method)
@@ -89,12 +93,12 @@ impl Emulator {
         }
     }
 
-    async fn create(&self, body: Value) -> Answer {
+    pub(crate) async fn create(&self, body: Value) -> Answer {
         self.call("POST", &format!("{PREFIX}/opensearch/domain"), Some(body))
             .await
     }
 
-    async fn describe(&self, name: &str) -> Answer {
+    pub(crate) async fn describe(&self, name: &str) -> Answer {
         self.call(
             "GET",
             &format!("{PREFIX}/opensearch/domain/{name}"),
@@ -103,7 +107,7 @@ impl Emulator {
         .await
     }
 
-    async fn describe_config(&self, name: &str) -> Answer {
+    pub(crate) async fn describe_config(&self, name: &str) -> Answer {
         self.call(
             "GET",
             &format!("{PREFIX}/opensearch/domain/{name}/config"),
@@ -112,7 +116,7 @@ impl Emulator {
         .await
     }
 
-    async fn update_config(&self, name: &str, body: Value) -> Answer {
+    pub(crate) async fn update_config(&self, name: &str, body: Value) -> Answer {
         self.call(
             "POST",
             &format!("{PREFIX}/opensearch/domain/{name}/config"),
@@ -141,7 +145,7 @@ impl Emulator {
 
 /// The wire error code of a failed answer: the `x-amzn-errortype` header when the
 /// path that answered sets one, else the `__type` of the error body.
-fn error_code(answer: &Answer) -> String {
+pub(crate) fn error_code(answer: &Answer) -> String {
     if let Some(code) = answer.error.as_deref() {
         return code.to_string();
     }
@@ -150,7 +154,7 @@ fn error_code(answer: &Answer) -> String {
 }
 
 /// A required string member of a response body, with the case named on failure.
-fn string_member(body: &Value, member: &str, case: &str) -> String {
+pub(crate) fn string_member(body: &Value, member: &str, case: &str) -> String {
     body[member]
         .as_str()
         .unwrap_or_else(|| panic!("case {case}: expected a string {member}, got {body:?}"))
@@ -222,7 +226,7 @@ fn baseline_options() -> Vec<(&'static str, Value)> {
 /// `DryRunResults$DeploymentType` applying it is — `Blue/Green` where it changes the
 /// shape of the provisioned cluster, `DynamicUpdate` where it is a setting on the
 /// running one.
-fn change_rows() -> Vec<(&'static str, Value, &'static str)> {
+pub(crate) fn change_rows() -> Vec<(&'static str, Value, &'static str)> {
     vec![
         (
             "ClusterConfig",
@@ -276,7 +280,7 @@ fn change_rows() -> Vec<(&'static str, Value, &'static str)> {
 }
 
 /// A `CreateDomain` body for `name` carrying every [`baseline_options`] container.
-fn baseline_create(name: &str) -> Value {
+pub(crate) fn baseline_create(name: &str) -> Value {
     let mut body = json!({ "DomainName": name, "EngineVersion": "OpenSearch_2.11" });
     for (option, value) in baseline_options() {
         body[option] = value;
@@ -285,7 +289,7 @@ fn baseline_create(name: &str) -> Value {
 }
 
 /// `CreateDomain` with [`baseline_create`], asserting it was accepted.
-async fn create_baseline(emulator: &Emulator, name: &str) -> Value {
+pub(crate) async fn create_baseline(emulator: &Emulator, name: &str) -> Value {
     let answer = emulator.create(baseline_create(name)).await;
     assert_eq!(
         answer.status, 200,

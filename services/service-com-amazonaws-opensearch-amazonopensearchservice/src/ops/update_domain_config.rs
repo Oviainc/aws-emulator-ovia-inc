@@ -451,8 +451,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The change is not live the instant the update returns: the clock owes
             // the domain a settled configuration once the provisioning span has
             // passed, and until then the options this call set report
-            // `OptionState::Processing`.
-            merged.begin_processing(PROCESSING_STATUS_MODIFYING, now);
+            // `OptionState::Processing` and are the pending properties of the change
+            // `DescribeDomainChangeProgress` reports. An update that changed nothing
+            // starts no change, so none is recorded for it.
+            merged.begin_change(PROCESSING_STATUS_MODIFYING, &touched, now);
         }
 
         let domain_config = merged.to_config();

@@ -140,7 +140,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::state::{
     domain_arn, domain_endpoint, domain_id, stored_advanced_security_options, stored_aiml_options,
@@ -328,6 +328,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             updated_at: now,
             option_versions: BTreeMap::new(),
+            // The change this create starts is recorded by `begin_change` below,
+            // once every option it set has a revision.
+            changes: VecDeque::new(),
         };
 
         // Every option the new domain holds a value for starts at revision 1, so
@@ -339,15 +342,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // case and the engine mode default when omitted, the cluster configuration is
         // `DomainStatus`'s required container, and the advanced options are a map that
         // is empty rather than absent.
-        for option in [
+        let mut touched: Vec<&str> = vec![
             OPT_ENGINE_VERSION,
             OPT_CLUSTER_CONFIG,
             OPT_ADVANCED_OPTIONS,
             OPT_USE_CASE,
             OPT_ENGINE_MODE,
-        ] {
-            domain.touch(option, now);
-        }
+        ];
         for (option, supplied) in [
             (OPT_EBS_OPTIONS, domain.ebs_options.is_some()),
             (OPT_ACCESS_POLICIES, domain.access_policies.is_some()),
@@ -399,16 +400,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         ] {
             if supplied {
-                domain.touch(option, now);
+                touched.push(option);
             }
+        }
+        for option in &touched {
+            domain.touch(option, now);
         }
 
         // A domain is not settled the instant the create returns: the clock owes it an
-        // `Active` configuration once the provisioning span has passed. Set AFTER the
-        // revisions, because `touch` moves `updated_at` — the options a create sets are
-        // exactly the ones the provisioning in flight is applying, so each reports
-        // `OptionState::Processing` until it settles.
-        domain.begin_processing(PROCESSING_STATUS_CREATING, now);
+        // `Active` configuration once the provisioning span has passed, and the change
+        // it is applying — every option this create set — is recorded so
+        // `DescribeDomainChangeProgress` can report on it. Set AFTER the revisions,
+        // because `touch` moves `updated_at`: the options a create sets are exactly
+        // the ones the provisioning in flight is applying, so each reports
+        // `OptionState::Processing` until it settles and each is a pending property of
+        // the change.
+        domain.begin_change(PROCESSING_STATUS_CREATING, &touched, now);
 
         store.domains.insert(name.clone(), domain);
         let stored = store
