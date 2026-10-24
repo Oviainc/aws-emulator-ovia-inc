@@ -32,7 +32,8 @@ use crate::ops::types::{
     AWSLocation, AccountStatus, Attachment, Bandwidth, ConnectAttachment, ConnectAttachmentOptions,
     Connection, ConnectionHealth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
     CoreNetworkPolicy, CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment,
-    Device, GlobalNetwork, Link, LinkAssociation, Location, NetworkTelemetry, OrganizationStatus,
+    Device, GlobalNetwork, Link, LinkAssociation, Location, NetworkResource, NetworkTelemetry,
+    OrganizationStatus,
     ResourceNotFoundException, Site, SiteToSiteVpnAttachment, Tag, ValidationException,
     ValidationExceptionField, VpcAttachment, VpcOptions,
 };
@@ -1860,6 +1861,125 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
         i32::try_from(held).unwrap_or(i32::MAX)
     }
 
+    /// Every network resource the global network `global_network_id` holds, as of `now`,
+    /// keyed by [`network_resource_key`] so the listing is ordered and a page token can
+    /// name an offset into it.
+    ///
+    /// The inventory is the same one [`Self::network_resource_count`] counts, branch for
+    /// branch — attachments, connections, core networks, devices, links and sites — so the
+    /// count of a type and the resources listed for it can never disagree. A kind whose
+    /// creating operation is still a scaffold stub is held nowhere and therefore
+    /// contributes nothing, not a placeholder. A connection registered with a global
+    /// network only for its telemetry lives in a different store
+    /// ([`Self::telemetry_resources`]) that [`Self::network_resource_count`] does not count
+    /// either, and every operation that registers one is still a scaffold stub, so the two
+    /// agree on that zero as well.
+    pub fn network_resources_of(
+        &self,
+        global_network_id: &str,
+        now: SystemTime,
+    ) -> Vec<(String, NetworkResource)> {
+        let mut resources: BTreeMap<String, NetworkResource> = BTreeMap::new();
+        for record in self.attachments.values().filter(|attachment| {
+            self.core_networks
+                .get(&attachment.core_network_id)
+                .is_some_and(|core_network| core_network.global_network_id == global_network_id)
+        }) {
+            // An attachment's Describe reader is the one for its OWN kind, so the
+            // definition is rendered from that kind's shape — the same shape
+            // `GetVpcAttachment` / `GetConnectAttachment` / `GetSiteToSiteVpnAttachment`
+            // answer. Each conversion answers `None` for a record of another kind, so
+            // exactly one of them builds a shape here.
+            let definition = if let Some(vpc) = record.to_vpc_attachment(now) {
+                resource_definition(&VpcAttachment::SCHEMA, &vpc)
+            } else if let Some(connect) = record.to_connect_attachment(now) {
+                resource_definition(&ConnectAttachment::SCHEMA, &connect)
+            } else if let Some(vpn) = record.to_site_to_site_vpn_attachment(now) {
+                resource_definition(&SiteToSiteVpnAttachment::SCHEMA, &vpn)
+            } else {
+                None
+            };
+            resources.insert(
+                network_resource_key(ATTACHMENT_KIND, &record.id),
+                NetworkResource {
+                    // An attachment belongs to the core network it joins a resource to.
+                    core_network_id: Some(record.core_network_id.clone()),
+                    definition,
+                    ..network_resource(ATTACHMENT_KIND, &record.id, &record.arn, &record.tags, now)
+                },
+            );
+        }
+        for record in self
+            .connections
+            .values()
+            .filter(|record| record.global_network_id == global_network_id)
+        {
+            resources.insert(
+                network_resource_key(CONNECTION_KIND, &record.id),
+                NetworkResource {
+                    definition: resource_definition(&Connection::SCHEMA, &record.to_shape(now)),
+                    ..network_resource(CONNECTION_KIND, &record.id, &record.arn, &record.tags, now)
+                },
+            );
+        }
+        for record in self
+            .core_networks
+            .values()
+            .filter(|record| record.global_network_id == global_network_id)
+        {
+            resources.insert(
+                network_resource_key(CORE_NETWORK_KIND, &record.id),
+                NetworkResource {
+                    // A core network IS a core network's resource, so this is the one
+                    // kind of this service whose `CoreNetworkId` is its own id.
+                    core_network_id: Some(record.id.clone()),
+                    definition: resource_definition(&CoreNetwork::SCHEMA, &record.to_shape(now)),
+                    ..network_resource(CORE_NETWORK_KIND, &record.id, &record.arn, &record.tags, now)
+                },
+            );
+        }
+        for record in self
+            .devices
+            .values()
+            .filter(|record| record.global_network_id == global_network_id)
+        {
+            resources.insert(
+                network_resource_key(DEVICE_KIND, &record.id),
+                NetworkResource {
+                    definition: resource_definition(&Device::SCHEMA, &record.to_shape(now)),
+                    ..network_resource(DEVICE_KIND, &record.id, &record.arn, &record.tags, now)
+                },
+            );
+        }
+        for record in self
+            .links
+            .values()
+            .filter(|record| record.global_network_id == global_network_id)
+        {
+            resources.insert(
+                network_resource_key(LINK_KIND, &record.id),
+                NetworkResource {
+                    definition: resource_definition(&Link::SCHEMA, &record.to_shape(now)),
+                    ..network_resource(LINK_KIND, &record.id, &record.arn, &record.tags, now)
+                },
+            );
+        }
+        for record in self
+            .sites
+            .values()
+            .filter(|record| record.global_network_id == global_network_id)
+        {
+            resources.insert(
+                network_resource_key(SITE_KIND, &record.id),
+                NetworkResource {
+                    definition: resource_definition(&Site::SCHEMA, &record.to_shape(now)),
+                    ..network_resource(SITE_KIND, &record.id, &record.arn, &record.tags, now)
+                },
+            );
+        }
+        resources.into_iter().collect()
+    }
+
     /// Register `record` as a telemetry-bearing connection of its global network,
     /// replacing any registration that global network already holds for the same resource
     /// ARN (see [`telemetry_key`]).
@@ -1977,6 +2097,101 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             _ => None,
         }
     }
+}
+
+/// The key one network resource is listed under: its resource TYPE, then its id.
+///
+/// A network-resource listing spans several kinds at once, and the ids of two kinds are
+/// drawn from different prefixes, so the type leads the key: the listing is then ordered
+/// by type and then by id, every key is unique, and a page token (which names a key
+/// offset, see [`paginate`]) can resume inside it.
+pub fn network_resource_key(resource_type: &str, resource_id: &str) -> String {
+    format!("{resource_type}/{resource_id}")
+}
+
+/// The members every network resource of this service carries, whatever its kind: the
+/// account that holds it, its type, id and ARN, its tags, and the instant the answer read
+/// its definition. The caller fills `Definition` (and, for a core network, `CoreNetworkId`)
+/// from the record itself.
+///
+/// Three members are deliberately left absent, because nothing in the store holds them:
+///
+/// * `AwsRegion` — every resource this service stores is partition-scoped: its ARN carries
+///   an empty region segment (see
+///   [`ComAmazonawsNetworkmanagerNetworkmanagerState::resource_arn`]), so none of these
+///   kinds sits in one Region and an `awsRegion` filter selects none of them. The
+///   Region-scoped kinds a global network can also hold (a registered transit gateway, a
+///   VPN connection) are minted by operations that are still scaffold stubs. A kind that
+///   DOES live in one Region must report it here when it starts being stored — a resource
+///   whose Region is known but unreported would be silently under-selected by that filter
+///   (an attachment, for one, knows the edge location it sits at).
+/// * `RegisteredGatewayArn` — only a resource reached through a registered gateway carries
+///   one, and the registering operations (`RegisterTransitGateway`,
+///   `AssociateCustomerGateway`) are still scaffold stubs.
+/// * `Metadata` — "The resource metadata" (`smithy_query shape=NetworkResource`) is what
+///   `UpdateNetworkResourceMetadata` stores, which is still a scaffold stub, so no resource
+///   has any.
+fn network_resource(
+    resource_type: &str,
+    resource_id: &str,
+    resource_arn: &str,
+    tags: &[Tag],
+    now: SystemTime,
+) -> NetworkResource {
+    NetworkResource {
+        registered_gateway_arn: None,
+        core_network_id: None,
+        aws_region: None,
+        account_id: Some(::engine::emulator_account_id().to_string()),
+        resource_type: Some(resource_type.to_string()),
+        resource_id: Some(resource_id.to_string()),
+        resource_arn: Some(resource_arn.to_string()),
+        definition: None,
+        // "The time that the resource definition was retrieved"
+        // (`smithy_query shape=NetworkResource`): the definition below is computed from
+        // the record as this call reads it, so the instant is this call's.
+        definition_timestamp: Some(epoch_seconds(now)),
+        tags: Some(tags.to_vec()),
+        metadata: None,
+    }
+}
+
+/// The JSON a `NetworkResource$Definition` carries for one stored resource: the resource's
+/// own Describe output, rendered by THIS SERVICE'S OWN restJson1 codec from the very shape
+/// that resource's reader answers.
+///
+/// "Information about the resource, in JSON format. Network Manager gets this information
+/// by describing the resource using its Describe API call"
+/// (`smithy_query shape=NetworkResource`), so a definition is exactly what `GetSites` /
+/// `GetLinks` / `GetDevices` / `GetCoreNetwork` / `GetVpcAttachment` /
+/// `GetConnectAttachment` put on the wire for that resource. Rendering through the codec
+/// (`JsonCodec::rest_json`, the one the protocol itself serialises responses with) rather
+/// than mapping member by member is what keeps the two readers of one resource in step:
+/// the member spelling, the `@jsonName` overrides and the wire form of every timestamp are
+/// the protocol's, so a model change cannot drift the definition away from the reader.
+///
+/// The resource's tags appear here as well as in the enclosing `NetworkResource$Tags`,
+/// because the definition is the Describe output as it stands and both come from the one
+/// stored tag list.
+///
+/// A value the codec cannot render answers `None`, so the member is absent rather than
+/// carrying a definition this service made up.
+fn resource_definition(
+    schema: &::aws_smithy_schema::Schema,
+    value: &dyn ::aws_smithy_schema::serde::SerializableStruct,
+) -> Option<String> {
+    use ::aws_smithy_schema::codec::Codec;
+    use ::aws_smithy_schema::serde::ShapeSerializer;
+
+    let mut serializer = ::aws_smithy_schema_server::json::JsonCodec::rest_json().create_serializer();
+    if let Err(error) = serializer.write_struct(schema, value) {
+        ::tracing::warn!(
+            %error,
+            "the JSON codec could not render a stored resource, so its network-resource definition is absent"
+        );
+        return None;
+    }
+    Some(serializer.into_string())
 }
 
 /// The resource an ARN of this service names: the ARN resource type (which is also the
