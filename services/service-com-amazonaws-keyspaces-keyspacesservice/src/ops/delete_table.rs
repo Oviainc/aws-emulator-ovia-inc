@@ -240,6 +240,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // tables again.
             store.note_transition_due(settles_at);
         }
+        drop(store);
+
+        // The table's capacities go with the table, so the scalable targets they were
+        // scaled on — and the target-tracking policies and CloudWatch alarms those own —
+        // are retired in Application Auto Scaling: deleting the table is what deregisters
+        // them. Done with this service's store lock released, so no request holds two
+        // service stores at once.
+        crate::state::retire_auto_scaling(
+            &*self.engine,
+            &region,
+            &input.keyspace_name,
+            &input.table_name,
+        );
 
         Ok(DeleteTableOutput {})
     }

@@ -23,9 +23,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AutoScalingSettings, AutoScalingSpecification, CapacitySpecification, ClientSideTimestamps,
-    Comment, EncryptionSpecification, FieldDefinition, PointInTimeRecovery, ReplicaSpecification,
-    ResourceNotFoundException, SchemaDefinition, Tag, TimeToLive, WarmThroughputSpecification,
+    AutoScalingPolicy, AutoScalingSettings, AutoScalingSpecification, CapacitySpecification,
+    ClientSideTimestamps, Comment, EncryptionSpecification, FieldDefinition, PointInTimeRecovery,
+    ReplicaSpecification, ResourceNotFoundException, SchemaDefinition, Tag,
+    TargetTrackingScalingPolicyConfiguration, TimeToLive, WarmThroughputSpecification,
 };
 
 /// The `cassandra` ARN namespace / SigV4 signing name of Amazon Keyspaces
@@ -733,7 +734,7 @@ pub struct Table {
     /// `CreateTable`/`UpdateTable` entry for a Region it already has replaces that
     /// Region's setting rather than adding a second one. A Region this map does not hold
     /// provisions the table's own read capacity and auto scaling
-    /// ([`Self::read_capacity_units_in`], [`Self::auto_scaling_in`]), and so does one
+    /// ([`Self::read_capacity_units_in`], [`Self::replica_auto_scaling`]), and so does one
     /// whose entry carries neither override.
     pub replica_specifications: BTreeMap<String, ReplicaSpecification>,
     /// The warm throughput this table was pre-warmed for, if any was ever configured.
@@ -938,11 +939,17 @@ impl Table {
             })
     }
 
-    /// The auto scaling settings this table reports in `region`: the table's, with the
-    /// Region's own `replicaSpecifications.readCapacityAutoScaling` override applied when
-    /// one is stored, or `None` when neither exists.
-    pub fn auto_scaling_in(&self, region: &str) -> Option<AutoScalingSpecification> {
-        let mut specification = self.auto_scaling_specification.clone();
+    /// The auto scaling settings this table reports in `region`: `base` — the settings
+    /// the table is scaled by, which live in Application Auto Scaling
+    /// ([`reported_auto_scaling`]) — with the Region's own
+    /// `replicaSpecifications.readCapacityAutoScaling` override applied ON TOP when one is
+    /// stored, or `None` when neither exists.
+    pub fn replica_auto_scaling(
+        &self,
+        region: &str,
+        base: Option<&AutoScalingSpecification>,
+    ) -> Option<AutoScalingSpecification> {
+        let mut specification = base.cloned();
         if let Some(read) = self
             .replica_specifications
             .get(region)
@@ -955,16 +962,17 @@ impl Table {
         specification
     }
 
-    /// Whether this table has a scalable target at all — the table's own auto scaling
-    /// settings, or a per-Region read capacity auto scaling override. `GetTableAutoScalingSettings`
-    /// reports the settings of a table that has one and answers the modelled not-found
-    /// for a table that has none.
-    pub fn has_auto_scaling(&self) -> bool {
-        self.auto_scaling_specification.is_some()
-            || self
-                .replica_specifications
-                .values()
-                .any(|replica| replica.read_capacity_auto_scaling.is_some())
+    /// Whether any Region this table is replicated in overrides its read capacity auto
+    /// scaling.
+    ///
+    /// Those overrides are the one part of a table's auto scaling settings that does not
+    /// live in this Region's Application Auto Scaling — they belong to another Region's —
+    /// so they are what makes a table with no scalable target here still have settings
+    /// for `GetTableAutoScalingSettings` to report.
+    pub fn has_replica_auto_scaling(&self) -> bool {
+        self.replica_specifications
+            .values()
+            .any(|replica| replica.read_capacity_auto_scaling.is_some())
     }
 }
 
@@ -1828,7 +1836,7 @@ pub fn resolve_auto_scaling(
 ///
 /// An entry carrying neither override states that its Region uses the table's own read
 /// capacity and auto scaling, which is what a Region with no entry does
-/// ([`Table::read_capacity_units_in`], [`Table::auto_scaling_in`]) — so it is accepted
+/// ([`Table::read_capacity_units_in`], [`Table::replica_auto_scaling`]) — so it is accepted
 /// and resets that Region.
 pub fn resolve_replica_specifications(
     supplied: Vec<ReplicaSpecification>,
@@ -2000,4 +2008,280 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsKeyspacesKeyspacesserviceState>)
+}
+
+// ---------------------------------------------------------------------------
+// A table's auto scaling settings, as the Application Auto Scaling resources they are
+// ---------------------------------------------------------------------------
+
+// Amazon Keyspaces auto scaling is implemented ON TOP of Application Auto Scaling: the
+// settings a caller configures through `autoScalingSpecification` are a scalable target
+// per capacity dimension, plus the target-tracking policy that steers it, in THAT
+// service — which is why `GetTableAutoScalingSettings` documents
+// `application-autoscaling:DescribeScalableTargets` and
+// `application-autoscaling:DescribeScalingPolicies` as the two permissions needed to read
+// them. So this service writes them there rather than keeping a disconnected copy, and
+// reports back what that service holds.
+use ::service_com_amazonaws_applicationautoscaling_anyscalefrontendservice as application_auto_scaling;
+
+/// The Application Auto Scaling `ServiceNamespace` Amazon Keyspaces' scalable targets are
+/// registered in (`cassandra`, the same namespace as this service's ARNs).
+pub const AUTO_SCALING_NAMESPACE: &str = ARN_NAMESPACE;
+
+/// Which capacity of a table a scalable target scales.
+///
+/// A table in provisioned capacity mode has two capacities, provisioned and scaled
+/// independently of each other: `AutoScalingSpecification` carries one
+/// `AutoScalingSettings` per capacity, and Application Auto Scaling declares one
+/// `ScalableDimension` per capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableCapacity {
+    /// `readCapacityUnits`.
+    Read,
+    /// `writeCapacityUnits`.
+    Write,
+}
+
+impl TableCapacity {
+    /// Both capacities, so a caller walks them rather than spelling each out twice.
+    pub const ALL: [Self; 2] = [Self::Read, Self::Write];
+
+    /// The `ScalableDimension` this capacity is scaled on.
+    pub fn scalable_dimension(self) -> &'static str {
+        match self {
+            Self::Read => "cassandra:table:ReadCapacityUnits",
+            Self::Write => "cassandra:table:WriteCapacityUnits",
+        }
+    }
+
+    /// The `PredefinedMetricType` a target-tracking policy of this capacity steers on:
+    /// the Amazon Keyspaces utilisation metric Application Auto Scaling publishes FOR
+    /// this dimension.
+    pub fn predefined_metric(self) -> &'static str {
+        match self {
+            Self::Read => "CassandraReadCapacityUtilization",
+            Self::Write => "CassandraWriteCapacityUtilization",
+        }
+    }
+
+    /// This capacity's settings inside a specification.
+    pub fn settings_of(self, specification: &AutoScalingSpecification) -> Option<&AutoScalingSettings> {
+        match self {
+            Self::Read => specification.read_capacity_auto_scaling.as_ref(),
+            Self::Write => specification.write_capacity_auto_scaling.as_ref(),
+        }
+    }
+
+    /// Put this capacity's settings into a specification being built for a report.
+    fn set_in(self, specification: &mut AutoScalingSpecification, settings: Option<AutoScalingSettings>) {
+        match self {
+            Self::Read => specification.read_capacity_auto_scaling = settings,
+            Self::Write => specification.write_capacity_auto_scaling = settings,
+        }
+    }
+}
+
+/// The `ResourceId` a table's scalable targets are registered under:
+/// `keyspace/<keyspaceName>/table/<tableName>`, the form Application Auto Scaling
+/// documents for the `cassandra` namespace's table resource type.
+pub fn auto_scaling_resource_id(keyspace_name: &str, table_name: &str) -> String {
+    format!("keyspace/{keyspace_name}/table/{table_name}")
+}
+
+/// The identity of one capacity's scalable target: the `cassandra` namespace, the table's
+/// resource id and that capacity's dimension.
+fn scalable_target_key(
+    keyspace_name: &str,
+    table_name: &str,
+    capacity: TableCapacity,
+) -> application_auto_scaling::state::TargetKey {
+    application_auto_scaling::state::TargetKey {
+        service_namespace: AUTO_SCALING_NAMESPACE.to_string(),
+        resource_id: auto_scaling_resource_id(keyspace_name, table_name),
+        scalable_dimension: capacity.scalable_dimension().to_string(),
+    }
+}
+
+/// The `PolicyName` of the target-tracking policy this service manages for one capacity.
+///
+/// A policy's name is its identity under its target, so a service-managed policy needs a
+/// name that is derived from what it steers rather than chosen per call: the metric it
+/// tracks and the resource it tracks it for. That is what makes a second configuration of
+/// the same capacity an UPDATE of the one policy instead of a second policy on one
+/// metric, which Application Auto Scaling refuses.
+fn managed_policy_name(
+    keyspace_name: &str,
+    table_name: &str,
+    capacity: TableCapacity,
+) -> String {
+    format!(
+        "{}:{}",
+        capacity.predefined_metric(),
+        auto_scaling_resource_id(keyspace_name, table_name)
+    )
+}
+
+/// What one capacity's settings are to be materialised as in Application Auto Scaling, or
+/// `None` when they turn auto scaling OFF for that capacity — "this optional parameter
+/// enables auto scaling for the table if set to `false`" — which is a capacity with no
+/// scalable target at all.
+fn managed_target(
+    keyspace_name: &str,
+    table_name: &str,
+    capacity: TableCapacity,
+    settings: &AutoScalingSettings,
+) -> Option<application_auto_scaling::state::ManagedTarget> {
+    if settings.auto_scaling_disabled {
+        return None;
+    }
+    let target_value = settings
+        .scaling_policy
+        .as_ref()
+        .and_then(|policy| policy.target_tracking_scaling_policy_configuration.as_ref());
+    // Settings that turn auto scaling on carry all three ([`validate_auto_scaling_settings`]),
+    // so this is the same rule read from the other side rather than a second check.
+    let (Some(minimum), Some(maximum), Some(configuration)) =
+        (settings.minimum_units, settings.maximum_units, target_value)
+    else {
+        return None;
+    };
+    Some(application_auto_scaling::state::ManagedTarget {
+        // A capacity window in Application Auto Scaling is an `int`, so a unit count
+        // beyond its range is registered at the largest capacity that service can hold.
+        min_capacity: i32::try_from(minimum).unwrap_or(i32::MAX),
+        max_capacity: i32::try_from(maximum).unwrap_or(i32::MAX),
+        policy_name: managed_policy_name(keyspace_name, table_name, capacity),
+        target_tracking:
+            application_auto_scaling::ops::types::TargetTrackingScalingPolicyConfiguration {
+                target_value: configuration.target_value,
+                predefined_metric_specification: Some(
+                    application_auto_scaling::ops::types::PredefinedMetricSpecification {
+                        predefined_metric_type: capacity.predefined_metric().to_string(),
+                        resource_label: None,
+                    },
+                ),
+                customized_metric_specification: None,
+                scale_out_cooldown: Some(configuration.scale_out_cooldown),
+                scale_in_cooldown: Some(configuration.scale_in_cooldown),
+                disable_scale_in: Some(configuration.disable_scale_in),
+            },
+    })
+}
+
+/// Materialise in Application Auto Scaling the auto scaling settings a request just
+/// configured for a table: for each capacity the request named, that capacity's scalable
+/// target and target-tracking policy when auto scaling is on for it, and neither when it
+/// is off.
+///
+/// A capacity the request did NOT name keeps whatever Application Auto Scaling holds for
+/// it — the two capacities are configured independently of each other, and a request that
+/// says nothing about one changes nothing about it.
+///
+/// Call it with NO store lock held. Only the table's OWN settings travel: a per-Region
+/// `replicaSpecifications.readCapacityAutoScaling` override belongs to another Region's
+/// Application Auto Scaling, which this emulator holds no store for, so it stays with the
+/// table record that reports it.
+pub fn publish_auto_scaling<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    keyspace_name: &str,
+    table_name: &str,
+    configured: &AutoScalingSpecification,
+) {
+    for capacity in TableCapacity::ALL {
+        let Some(settings) = capacity.settings_of(configured) else {
+            continue;
+        };
+        let wanted = managed_target(keyspace_name, table_name, capacity, settings);
+        application_auto_scaling::state::apply_managed_target(
+            engine,
+            region,
+            &scalable_target_key(keyspace_name, table_name, capacity),
+            wanted.as_ref(),
+        );
+    }
+}
+
+/// Retire both of a table's scalable targets, with their policies and the alarms those
+/// minted: the table is going away, so the capacities it was scaled on no longer exist.
+///
+/// Call it with NO store lock held.
+pub fn retire_auto_scaling<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    keyspace_name: &str,
+    table_name: &str,
+) {
+    for capacity in TableCapacity::ALL {
+        application_auto_scaling::state::apply_managed_target(
+            engine,
+            region,
+            &scalable_target_key(keyspace_name, table_name, capacity),
+            None,
+        );
+    }
+}
+
+/// The auto scaling settings of a table as they stand NOW: what Application Auto Scaling
+/// holds for each of the table's two capacities, which is where the settings live.
+///
+/// Per capacity, the settings are the registered scalable target's capacity window and
+/// the target-tracking policy that steers it — including one a caller registered through
+/// Application Auto Scaling itself, since that is the same resource this service's own
+/// writes produce. A capacity with NO scalable target is a capacity auto scaling is off
+/// for, which is what a stored `autoScalingDisabled: true` states; one that was never
+/// configured, or whose target has since been deregistered, has no settings at all.
+///
+/// `None` means the table has no auto scaling settings to report, which is what
+/// `GetTableAutoScalingSettings` answers the modelled not-found for. `stored` is the
+/// specification this service last wrote, which is also all that is known when the
+/// Application Auto Scaling store is not reachable from `engine`.
+///
+/// Call it with NO store lock held.
+pub fn reported_auto_scaling<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    keyspace_name: &str,
+    table_name: &str,
+    stored: Option<&AutoScalingSpecification>,
+) -> Option<AutoScalingSpecification> {
+    let Some(store) = application_auto_scaling::state::service_state(engine) else {
+        return stored.cloned();
+    };
+    let store = store.lock();
+    let mut reported = AutoScalingSpecification::default();
+    let mut configured = false;
+    for capacity in TableCapacity::ALL {
+        let key = scalable_target_key(keyspace_name, table_name, capacity);
+        let policy_name = managed_policy_name(keyspace_name, table_name, capacity);
+        let settings = match application_auto_scaling::state::managed_target_settings(
+            &store,
+            &key,
+            &policy_name,
+        ) {
+            Some((minimum, maximum, tracking)) => Some(AutoScalingSettings {
+                auto_scaling_disabled: false,
+                minimum_units: Some(i64::from(minimum)),
+                maximum_units: Some(i64::from(maximum)),
+                scaling_policy: tracking.map(|configuration| AutoScalingPolicy {
+                    target_tracking_scaling_policy_configuration: Some(
+                        TargetTrackingScalingPolicyConfiguration {
+                            disable_scale_in: configuration.disable_scale_in.unwrap_or_default(),
+                            scale_in_cooldown: configuration.scale_in_cooldown.unwrap_or_default(),
+                            scale_out_cooldown: configuration
+                                .scale_out_cooldown
+                                .unwrap_or_default(),
+                            target_value: configuration.target_value,
+                        },
+                    ),
+                }),
+            }),
+            None => stored
+                .and_then(|specification| capacity.settings_of(specification))
+                .filter(|settings| settings.auto_scaling_disabled)
+                .cloned(),
+        };
+        configured |= settings.is_some();
+        capacity.set_in(&mut reported, settings);
+    }
+    configured.then_some(reported)
 }

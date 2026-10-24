@@ -214,11 +214,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        // The settings this operation reads are the table's scalable target, which exists
+        // Everything this report is built from, taken under this service's lock and read
+        // after it is released — the settings themselves live in Application Auto Scaling,
+        // and no request holds two service stores at once.
+        let table = table.clone();
+        let replica_regions: Option<Vec<String>> = keyspace
+            .table_replica_regions()
+            .map(<[String]>::to_vec);
+        drop(store);
+
+        // The settings of the table's two capacities as they stand now: the scalable
+        // targets and target-tracking policies Application Auto Scaling holds for them,
+        // which is what this operation needs `DescribeScalableTargets` and
+        // `DescribeScalingPolicies` permission to read.
+        let auto_scaling_specification = crate::state::reported_auto_scaling(
+            &*self.engine,
+            &table.keyspace_name,
+            &table.table_name,
+            table.auto_scaling_specification.as_ref(),
+        );
+        // The settings this operation reads are the table's scalable targets, which exist
         // only for a table auto scaling was configured for — for the table itself, or for
         // one of the Regions it is replicated in. For any other table the operation "tried
         // to access a ... resource that doesn't exist".
-        if !table.has_auto_scaling() {
+        let replica_auto_scaling = table.has_replica_auto_scaling();
+        if auto_scaling_specification.is_none() && !replica_auto_scaling {
             return Err(
                 GetTableAutoScalingSettingsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -237,20 +257,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             keyspace_name: table.keyspace_name.clone(),
             table_name: table.table_name.clone(),
             resource_arn: table.resource_arn.clone(),
-            auto_scaling_specification: table.auto_scaling_specification.clone(),
+            auto_scaling_specification: auto_scaling_specification.clone(),
             // "The Amazon Web Services Region specific settings of a multi-Region table.
             // Returns the settings for all Regions the table is replicated in": one entry
             // per Region the OWNING keyspace replicates this table to, each carrying the
-            // table's auto scaling settings in that Region — the table's own, with the
-            // Region's `replicaSpecifications.readCapacityAutoScaling` override applied when
-            // one is stored. A table of a single-Region keyspace is replicated in one Region
-            // and reports none.
-            replica_specifications: keyspace.table_replica_regions().map(|regions| {
+            // table's auto scaling settings in that Region — the settings reported above,
+            // with the Region's `replicaSpecifications.readCapacityAutoScaling` override
+            // applied when one is stored. A table of a single-Region keyspace is
+            // replicated in one Region and reports none.
+            replica_specifications: replica_regions.map(|regions| {
                 regions
                     .iter()
                     .map(|replication_region| ReplicaAutoScalingSpecification {
                         region: Some(replication_region.clone()),
-                        auto_scaling_specification: table.auto_scaling_in(replication_region),
+                        auto_scaling_specification: table.replica_auto_scaling(
+                            replication_region,
+                            auto_scaling_specification.as_ref(),
+                        ),
                     })
                     .collect()
             }),
