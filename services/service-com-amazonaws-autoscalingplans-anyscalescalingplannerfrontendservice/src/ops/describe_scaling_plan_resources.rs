@@ -4,8 +4,11 @@
 //! Derives one `ScalingPlanResource` per stored `ScalingInstruction` of the named
 //! plan, read back from [`crate::state`] and paged by `MaxResults`/`NextToken`.
 //!
-//! This operation models no not-found error, so a plan this service does not hold is
-//! reported as an empty `ScalingPlanResources` page rather than refused.
+//! Both input members are required and together name ONE plan, so a request whose
+//! (`ScalingPlanName`, `ScalingPlanVersion`) names no stored plan is refused with the
+//! service's not-found sentence ([`crate::state::plan_not_found_message`]) — carried by
+//! the modelled `ValidationException` (HTTP 400), this operation's generic client error,
+//! because it binds no not-found shape of its own.
 //!
 //! A read, except for the transitions the clock already owes: `settle_due` applies
 //! only what was due at this instant whether or not anybody called.
@@ -168,17 +171,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(|| invalid_next_token("The NextToken provided is not valid"))?,
         };
 
-        // This operation models NO not-found error: `ObjectNotFoundException` is
-        // modelled on `DeleteScalingPlan` and `UpdateScalingPlan` and deliberately not
-        // here, and `ScalingPlanResources` is not a required output member. A plan this
-        // service does not hold therefore has no scalable resources to report, which is
-        // an empty page — not a client error.
-        let Some(plan) = state.plan(&input.scaling_plan_name, input.scaling_plan_version) else {
-            return Ok(DescribeScalingPlanResourcesOutput {
-                scaling_plan_resources: Some(Vec::new()),
-                next_token: None,
-            });
-        };
+        // A lookup by (name, version) that finds no plan is a client error, not an empty
+        // page: both members are required and identify one plan, so there is nothing to
+        // report the resources OF. The refusal carries the service's one not-found
+        // sentence; the shape is this operation's generic `ValidationException`, since it
+        // binds no not-found error of its own (`ObjectNotFoundException` is modelled only
+        // on `DeleteScalingPlan` and `UpdateScalingPlan`).
+        let plan = state
+            .plan(&input.scaling_plan_name, input.scaling_plan_version)
+            .ok_or_else(|| {
+                validation(crate::state::plan_not_found_message(
+                    &input.scaling_plan_name,
+                    input.scaling_plan_version,
+                ))
+            })?;
 
         let scaling_status_code = plan.scaling_status_code();
         let total = plan.scaling_instructions.len();

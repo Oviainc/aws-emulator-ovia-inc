@@ -7,9 +7,10 @@
 //!    refused with the modelled `ValidationException` (HTTP 400) and stores nothing.
 //!    The rows below each name a different documented relation; a maximum capacity
 //!    below its minimum is one of them, not the rule.
-//! 2. `DescribeScalingPlanResources` models no not-found error and its
-//!    `ScalingPlanResources` output member is not required, so a miss on
-//!    (`ScalingPlanName`, `ScalingPlanVersion`) is a 200 carrying an empty list.
+//! 2. `DescribeScalingPlanResources` identifies ONE plan by its two required members, so
+//!    a lookup on (`ScalingPlanName`, `ScalingPlanVersion`) that finds no stored plan is
+//!    refused with the modelled `ValidationException` (HTTP 400) carrying the service's
+//!    not-found sentence, rather than answered with an empty page.
 //!
 //! The harness (`Emulator`, `instruction`, `stack_source`) is the sibling suite's: every
 //! call goes over the same `awsJson1_1` wire path the router serves in production.
@@ -22,7 +23,9 @@ use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice
     MIN_RESOURCE_CAPACITY, TARGET_VALUE_MAX, TARGET_VALUE_MIN,
 };
 
-use crate::scaling_plan_lifecycle::{instruction, simple_instructions, stack_source, Emulator};
+use crate::scaling_plan_lifecycle::{
+    error_code, error_message, instruction, simple_instructions, stack_source, Emulator,
+};
 
 /// The instruction every row starts from: valid, and the one the sibling suite uses.
 fn valid_instruction() -> Value {
@@ -732,7 +735,7 @@ async fn create_refuses_an_application_source_that_names_no_stack() {
 }
 
 #[tokio::test]
-async fn describe_scaling_plan_resources_answers_a_miss_with_an_empty_page() {
+async fn describe_scaling_plan_resources_refuses_a_lookup_that_finds_no_plan() {
     let emulator = Emulator::new();
     emulator
         .ok(
@@ -748,7 +751,8 @@ async fn describe_scaling_plan_resources_answers_a_miss_with_an_empty_page() {
 
     // Rows: the ways a (name, version) lookup can miss — a name nothing ever created,
     // a name whose case differs, a name that was created and then deleted, and a
-    // version this service does not hold — plus a bounded page size on the miss.
+    // version this service does not hold — plus a bounded page size on the miss, which
+    // changes nothing: there is no page to size.
     emulator
         .ok(
             "CreateScalingPlan",
@@ -768,43 +772,56 @@ async fn describe_scaling_plan_resources_answers_a_miss_with_an_empty_page() {
         .await;
     emulator.make_all_due();
 
-    for (label, request) in [
+    for (label, name, version, request) in [
         (
             "a name nothing created",
+            "missing",
+            1,
             json!({ "ScalingPlanName": "missing", "ScalingPlanVersion": 1 }),
         ),
         (
             "a name differing only in case",
+            "KNOWN",
+            1,
             json!({ "ScalingPlanName": "KNOWN", "ScalingPlanVersion": 1 }),
         ),
         (
             "a deleted plan",
+            "gone",
+            1,
             json!({ "ScalingPlanName": "gone", "ScalingPlanVersion": 1 }),
         ),
         (
             "a version this service does not hold",
+            "known",
+            2,
             json!({ "ScalingPlanName": "known", "ScalingPlanVersion": 2 }),
         ),
         (
             "a miss with an explicit page size",
+            "missing",
+            1,
             json!({ "ScalingPlanName": "missing", "ScalingPlanVersion": 1, "MaxResults": 1 }),
         ),
     ] {
-        let described = emulator.ok("DescribeScalingPlanResources", request).await;
+        let (status, body) = emulator
+            .call("DescribeScalingPlanResources", &request)
+            .await;
         assert_eq!(
-            described.get("ScalingPlanResources"),
-            Some(&json!([])),
-            "case {label:?}: expected an empty ScalingPlanResources list, got {described}"
+            (status, error_code(&body)),
+            (400, "ValidationException"),
+            "case {label:?}: expected a 400 ValidationException, got {status} with {body}"
         );
+        let expected = format!("No scaling plan found for scaling plan name: {name}, version: {version}");
+        let actual = error_message(&body);
         assert_eq!(
-            described.get("NextToken"),
-            None,
-            "case {label:?}: an empty page has no next page, got {described}"
+            actual, expected,
+            "case {label:?}: expected {expected:?}, got {actual:?}"
         );
     }
 
-    // The plan that IS held still reports its own resources, so the empty page is a
-    // miss and not a blanket empty answer.
+    // The plan that IS held still reports its own resources, so the refusal is about the
+    // lookup and not about the operation.
     let described = emulator
         .ok(
             "DescribeScalingPlanResources",

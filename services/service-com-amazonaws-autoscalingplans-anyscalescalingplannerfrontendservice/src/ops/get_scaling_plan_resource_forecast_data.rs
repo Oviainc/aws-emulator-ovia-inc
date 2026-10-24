@@ -20,11 +20,13 @@
 //! takes the scaling instruction that names the requested resource: that instruction's
 //! capacity band, its target tracking configurations and its predictive-scaling settings
 //! decide every value, and each `ForecastDataType` reports the quantity the model defines
-//! for it (see [`ResourceForecast`]). A plan this service does not hold, a stored plan
-//! holding no instruction for the requested resource, and an instruction that configures
-//! no predictive scaling alike have no forecast, and report the empty `Datapoints` list —
-//! which is how this service reports every such miss, since the operation models no
-//! not-found error at all.
+//! for it (see [`ResourceForecast`]). The plan name and version are required and name ONE
+//! plan, so a lookup that finds none is refused with the service's not-found sentence
+//! ([`crate::state::plan_not_found_message`]) in the modelled `ValidationException`
+//! (HTTP 400), this operation's generic client error. A plan that IS held but holds no
+//! instruction for the requested resource, and an instruction that configures no
+//! predictive scaling, have no forecast: that is the empty `Datapoints` list, a resource
+//! with nothing to forecast rather than a plan that does not exist.
 //!
 //! AWS predicts each hour's load from the CloudWatch history of the instruction's load
 //! metric. This emulator ingests no metric data, so it has no history to predict FROM and
@@ -217,17 +219,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // due (a plan whose creation or deletion came due) rather than a stale one.
         state.settle_due(now);
 
+        // A lookup by (name, version) that finds no plan is refused, like every other
+        // operation here that looks a plan up by those two members: there is no resource
+        // to forecast for under a plan the service does not hold. The shape is this
+        // operation's generic `ValidationException`
+        // (`smithy_query(query="operation",operation="GetScalingPlanResourceForecastData")`
+        // binds only `InternalServiceException` and `ValidationException`), carrying the
+        // service's one not-found sentence.
+        let plan = state
+            .plan(&input.scaling_plan_name, input.scaling_plan_version)
+            .ok_or_else(|| {
+                validation(crate::state::plan_not_found_message(
+                    &input.scaling_plan_name,
+                    input.scaling_plan_version,
+                ))
+            })?;
+
         // The forecast is computed from the stored plan: the scaling instruction that
         // names the requested resource is what a forecast for it is issued from.
         //
-        // Where there is no such instruction there is no forecast, and the empty
-        // `Datapoints` list reports it: this operation models NO not-found error
-        // (`smithy_query(query="operation",operation="GetScalingPlanResourceForecastData")`
-        // binds only `InternalServiceException` and `ValidationException`), exactly as
-        // `DescribeScalingPlanResources` reports a miss as an empty page.
-        let datapoints = state
-            .plan(&input.scaling_plan_name, input.scaling_plan_version)
-            .and_then(|plan| instruction_for(plan, &input))
+        // Where the held plan instructs no such resource there is no forecast, and the
+        // empty `Datapoints` list reports it — a scalable resource this plan does not
+        // cover, not a missing plan.
+        let datapoints = instruction_for(plan, &input)
             .map(|instruction| {
                 forecast(
                     instruction,

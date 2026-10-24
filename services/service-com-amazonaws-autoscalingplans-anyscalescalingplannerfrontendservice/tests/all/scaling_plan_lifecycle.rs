@@ -753,24 +753,24 @@ async fn an_unknown_plan_or_version_answers_each_operations_own_envelope() {
         .await;
     emulator.make_all_due();
 
-    // `DescribeScalingPlanResources` models no not-found error and its
-    // `ScalingPlanResources` output member is not required, so a miss on
-    // (name, version) is an empty page — see
-    // `tests/all/scaling_instruction_validation.rs` for the full table.
+    // `DescribeScalingPlanResources` identifies one plan by its two required members and
+    // models no not-found shape, so a miss on (name, version) is refused in its generic
+    // `ValidationException` — see `tests/all/scaling_instruction_validation.rs` and
+    // `tests/all/error_message_wording.rs` for the full tables.
     for (label, name, version) in [
         ("unknown name", "missing", 1),
         ("known name, unmodelled version", "known", 2),
     ] {
-        let described = emulator
-            .ok(
+        let (status, code) = emulator
+            .err(
                 "DescribeScalingPlanResources",
                 json!({ "ScalingPlanName": name, "ScalingPlanVersion": version }),
             )
             .await;
         assert_eq!(
-            described.get("ScalingPlanResources"),
-            Some(&json!([])),
-            "case {label}: expected an empty ScalingPlanResources page, got {described}"
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {label}: expected a 400 ValidationException for a plan that is not held"
         );
     }
 

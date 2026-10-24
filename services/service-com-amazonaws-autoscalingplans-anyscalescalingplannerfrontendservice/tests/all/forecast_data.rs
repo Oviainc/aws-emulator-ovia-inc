@@ -6,11 +6,14 @@
 //! exposed them:
 //!
 //! * the forecast WINDOW is checked against its documented limits before any plan is
-//!   looked up, so the same window earns the same verdict whether or not the named plan
+//!   looked up, so the same window earns the same REFUSAL whether or not the named plan
 //!   exists — `EndTime` has to be later than `StartTime`, the window may span at most
 //!   `MAX_FORECAST_WINDOW_DAYS` days measured on the two instants the request carries
 //!   (and nothing coarser), and `StartTime` may be at most `MAX_FORECAST_HISTORY_DAYS`
 //!   days before the current date and time. Nothing bounds how far AHEAD a window reaches;
+//! * a request that passes those checks is looked up by (`ScalingPlanName`,
+//!   `ScalingPlanVersion`), and a lookup that finds no stored plan is refused with the
+//!   modelled `ValidationException` (HTTP 400) carrying the service's not-found sentence;
 //! * `ScalingPlanVersion` has exactly one documented valid value, so every other version
 //!   is refused with the modelled `ValidationException` (HTTP 400) rather than served;
 //! * forecast data is issued for ONE kind of scalable resource — an Auto Scaling group's
@@ -169,6 +172,25 @@ enum Verdict {
     RefusedAsTooOld,
     /// HTTP 400 `ValidationException`, because the end is not after the start.
     RefusedAsOutOfOrder,
+    /// HTTP 400 `ValidationException` carrying the not-found sentence, because the
+    /// request passed every member check and then named a plan this service does not
+    /// hold. What an otherwise ACCEPTED row earns against an absent plan.
+    RefusedAsNoSuchPlan,
+}
+
+/// The verdict one row earns against a plan the service does not hold: the member checks
+/// run first, so a row they refuse keeps its own refusal and only an otherwise accepted
+/// row falls through to the lookup.
+fn against_an_absent_plan(verdict: Verdict) -> Verdict {
+    match verdict {
+        Verdict::Accepted => Verdict::RefusedAsNoSuchPlan,
+        other => other,
+    }
+}
+
+/// The service's not-found sentence for one requested name and version.
+fn expected_not_found(name: &str, version: i64) -> String {
+    format!("No scaling plan found for scaling plan name: {name}, version: {version}")
 }
 
 /// The start of the clock hour containing now.
@@ -210,9 +232,18 @@ async fn assert_window_verdict(
         "case {label:?} on {held} ({window:?}): expected HTTP 400 ValidationException, \
          got {status} with {parsed}"
     );
+    let message = error_message(&parsed);
+    if verdict == Verdict::RefusedAsNoSuchPlan {
+        let expected = expected_not_found(plan, ONLY_VERSION);
+        assert_eq!(
+            message, expected,
+            "case {label:?} on {held} ({window:?}): expected {expected:?}, got {message:?}"
+        );
+        return;
+    }
+
     // The sentence is read only to tell WHICH relation refused the row — the width, the
     // history span or the endpoint order — not because a message text is the rule.
-    let message = error_message(&parsed);
     let named = (
         message.contains(&format!("{MAX_FORECAST_WINDOW_DAYS} days")),
         message.contains(&format!("{MAX_FORECAST_HISTORY_DAYS} days")),
@@ -220,7 +251,9 @@ async fn assert_window_verdict(
     let expected = match verdict {
         Verdict::RefusedAsTooWide => (true, false),
         Verdict::RefusedAsTooOld => (false, true),
-        Verdict::Accepted | Verdict::RefusedAsOutOfOrder => (false, false),
+        Verdict::Accepted | Verdict::RefusedAsOutOfOrder | Verdict::RefusedAsNoSuchPlan => {
+            (false, false)
+        }
     };
     assert_eq!(
         named, expected,
@@ -342,11 +375,17 @@ async fn the_forecast_window_width_is_measured_on_the_requested_instants() {
 
     let emulator = with_stored_plan().await;
     // Every row is checked twice: against the plan the emulator holds and against a name
-    // it does not hold. The window verdict is the same either way, which is what "the
-    // window is checked before the plan lookup" means.
+    // it does not hold. A row the window rules refuse earns the SAME refusal either way,
+    // which is what "the window is checked before the plan lookup" means; a row they
+    // accept reaches the lookup, which refuses the absent name.
     for (plan, held) in [(STORED_PLAN, "a stored plan"), (ABSENT_PLAN, "an absent plan")] {
         for (label, start_offset, width, verdict) in cases {
             let start = current_hour_start() + start_offset;
+            let verdict = if plan == ABSENT_PLAN {
+                against_an_absent_plan(verdict)
+            } else {
+                verdict
+            };
             assert_window_verdict(&emulator, label, held, plan, (start, start + width), verdict)
                 .await;
         }
@@ -417,6 +456,11 @@ async fn a_start_further_back_than_the_documented_span_is_refused() {
     for (plan, held) in [(STORED_PLAN, "a stored plan"), (ABSENT_PLAN, "an absent plan")] {
         for (label, start_offset, verdict) in cases {
             let start = now_secs() + start_offset;
+            let verdict = if plan == ABSENT_PLAN {
+                against_an_absent_plan(verdict)
+            } else {
+                verdict
+            };
             assert_window_verdict(&emulator, label, held, plan, (start, start + DAY), verdict)
                 .await;
         }
@@ -471,12 +515,25 @@ async fn only_the_documented_scaling_plan_version_is_accepted() {
 
     let emulator = with_stored_plan().await;
     // Checked against a plan the emulator holds and a name it does not: the version is a
-    // request member, so its verdict does not depend on what is stored.
+    // request member, so an unmodelled version is refused on the MEMBER either way. Only
+    // the documented version reaches the lookup, where the absent name is refused on the
+    // lookup instead.
     for (plan, held) in [(STORED_PLAN, "a stored plan"), (ABSENT_PLAN, "an absent plan")] {
         for (label, version, accepted) in cases {
             let base = now_secs();
             let body = asg_request(plan, version, "CapacityForecast", (base, base + HOUR));
             let (status, parsed) = emulator.call(OPERATION, &body).await;
+            if accepted && plan == ABSENT_PLAN {
+                let expected = expected_not_found(plan, version);
+                let message = error_message(&parsed);
+                assert_eq!(
+                    (status, error_code(&parsed), message),
+                    (400, "ValidationException", expected.as_str()),
+                    "case {label:?} ({version}) on {held}: expected a 400 ValidationException \
+                     saying {expected:?}, got {status} with {parsed}"
+                );
+                continue;
+            }
             if accepted {
                 assert_eq!(
                     status, 200,
@@ -643,13 +700,12 @@ async fn a_plan_configuring_no_predictive_scaling_reports_an_empty_forecast() {
         .await;
     emulator.make_all_due();
 
-    // Rows differ along what the lookup generalises over: whether the plan is held and
-    // whether the plan that is held covers the named resource. Neither plan's instruction
-    // carries a load metric specification, so neither configures predictive scaling and
-    // neither has a forecast — the covered resource included.
-    let lookups: [(&str, &str); 3] = [
+    // Rows differ along what the rule generalises over: whether the plan that is held
+    // covers the named resource. Neither plan's instruction carries a load metric
+    // specification, so neither configures predictive scaling and neither has a forecast
+    // — the covered resource included.
+    let lookups: [(&str, &str); 2] = [
         ("a plan that covers the resource", STORED_PLAN),
-        ("a plan this service does not hold", ABSENT_PLAN),
         ("a plan that covers another resource", "other plan"),
     ];
 
@@ -670,6 +726,25 @@ async fn a_plan_configuring_no_predictive_scaling_reports_an_empty_forecast() {
                 "case {label:?} / {data_type}: expected no data points, got {parsed}"
             );
         }
+
+        // A plan the service does not hold is a different answer altogether: there is no
+        // plan to report a forecast FOR, so the lookup is refused rather than answered
+        // with an empty list.
+        let base = now_secs();
+        let (status, parsed) = emulator
+            .call(
+                OPERATION,
+                &asg_request(ABSENT_PLAN, ONLY_VERSION, data_type, (base, base + DAY)),
+            )
+            .await;
+        let expected = expected_not_found(ABSENT_PLAN, ONLY_VERSION);
+        let message = error_message(&parsed);
+        assert_eq!(
+            (status, error_code(&parsed), message),
+            (400, "ValidationException", expected.as_str()),
+            "case a plan this service does not hold / {data_type}: expected a 400 \
+             ValidationException saying {expected:?}, got {status} with {parsed}"
+        );
     }
 }
 

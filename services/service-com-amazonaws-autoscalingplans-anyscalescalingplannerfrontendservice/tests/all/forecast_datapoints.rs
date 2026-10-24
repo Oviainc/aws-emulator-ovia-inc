@@ -15,9 +15,9 @@
 //! * `ScheduledActionMaxCapacity` follows the instruction's
 //!   `PredictiveScalingMaxCapacityBehavior` and `PredictiveScalingMaxCapacityBuffer`;
 //!
-//! and an instruction that configures no predictive scaling, a stored plan holding no
-//! instruction for the requested resource, and a plan this service does not hold have no
-//! forecast at all.
+//! and an instruction that configures no predictive scaling, and a stored plan holding no
+//! instruction for the requested resource, have no forecast at all — while a plan this
+//! service does not hold is refused, there being no plan to forecast for.
 //!
 //! The RELATIONS are asserted between the four answers rather than against numbers
 //! written down here: each row reads the load forecast the service computed and derives
@@ -40,7 +40,7 @@ use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice
 };
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::ops::types::FORECAST_DATA_TYPE_VALUES;
 
-use crate::scaling_plan_lifecycle::{instruction, stack_source, Emulator};
+use crate::scaling_plan_lifecycle::{error_code, error_message, instruction, stack_source, Emulator};
 
 /// The operation under test.
 const OPERATION: &str = "GetScalingPlanResourceForecastData";
@@ -54,6 +54,9 @@ const RESOURCE: &str = "autoScalingGroup/my-asg";
 
 /// An Auto Scaling group no plan here holds an instruction for.
 const OTHER_RESOURCE: &str = "autoScalingGroup/other-asg";
+
+/// A plan name this service does not hold.
+const ABSENT_PLAN: &str = "no such plan";
 
 /// The only scaling-plan version the model documents as valid.
 const ONLY_VERSION: i64 = 1;
@@ -622,30 +625,15 @@ async fn a_forecast_is_reported_only_for_a_resource_a_stored_plan_instructs() {
     let plan = "held plan";
     let emulator = emulator_with(plan, vec![case.instruction()]).await;
 
-    // Rows differ along what the lookup generalises over: whether the named plan is held,
-    // and whether the plan that is held instructs the named resource.
-    let misses: [(&str, &str, &str); 3] = [
-        ("a plan this service does not hold", "no such plan", RESOURCE),
-        (
-            "a plan that instructs another resource",
-            plan,
-            OTHER_RESOURCE,
-        ),
-        (
-            "neither the plan nor the resource",
-            "no such plan",
-            OTHER_RESOURCE,
-        ),
-    ];
+    // The resource half of the lookup: the held plan instructs the named resource, or it
+    // does not.
     for data_type in FORECAST_DATA_TYPE_VALUES {
-        for (label, named_plan, resource) in misses {
-            let got = points(&emulator, named_plan, resource, data_type, window).await;
-            assert!(
-                got.is_empty(),
-                "case {label:?} / {data_type}: nothing instructs this resource, so there \
-                 is no forecast, got {got:?}"
-            );
-        }
+        let got = points(&emulator, plan, OTHER_RESOURCE, data_type, window).await;
+        assert!(
+            got.is_empty(),
+            "case a plan that instructs another resource / {data_type}: nothing instructs \
+             this resource, so there is no forecast, got {got:?}"
+        );
         // …while the resource the stored plan does instruct has one.
         let got = points(&emulator, plan, RESOURCE, data_type, window).await;
         assert!(
@@ -653,6 +641,30 @@ async fn a_forecast_is_reported_only_for_a_resource_a_stored_plan_instructs() {
             "case the stored plan / {data_type}: the stored instruction covers this \
              resource, so its forecast is not empty"
         );
+
+        // A plan this service does not hold is refused instead: a resource a held plan
+        // does not instruct has no forecast, but a plan that is not held has no resources
+        // at all. Both resource ids are tried, so the refusal follows the plan lookup and
+        // not the resource.
+        for resource in [RESOURCE, OTHER_RESOURCE] {
+            let (status, body) = emulator
+                .call(
+                    OPERATION,
+                    &forecast_request(ABSENT_PLAN, resource, data_type, window),
+                )
+                .await;
+            let expected = format!(
+                "No scaling plan found for scaling plan name: {ABSENT_PLAN}, \
+                 version: {ONLY_VERSION}"
+            );
+            let message = error_message(&body);
+            assert_eq!(
+                (status, error_code(&body), message),
+                (400, "ValidationException", expected.as_str()),
+                "case an absent plan / {resource} / {data_type}: expected a 400 \
+                 ValidationException saying {expected:?}, got {status} with {body}"
+            );
+        }
     }
 }
 

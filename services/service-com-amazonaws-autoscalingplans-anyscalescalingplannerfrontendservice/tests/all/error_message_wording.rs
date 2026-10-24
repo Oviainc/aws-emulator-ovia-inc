@@ -8,9 +8,9 @@
 //! * a lookup by `ScalingPlanName` + `ScalingPlanVersion` that finds no stored plan is
 //!   refused with the request-derived sentence
 //!   `No scaling plan found for scaling plan name: <name>, version: <version>`, on every
-//!   operation that MODELS such a refusal — `DescribeScalingPlanResources` models none
-//!   and answers a miss with an empty page instead, which the same rows check here and
-//!   `crate::scaling_instruction_validation` covers in full;
+//!   operation that identifies ONE plan by those two members — in the not-found shape the
+//!   operation models where it models one, and in its generic `ValidationException` where
+//!   it does not;
 //! * a `DescribeScalingPlans` request that combines `ApplicationSources` with the
 //!   name-based selector (`ScalingPlanNames` and/or `ScalingPlanVersion`) is refused
 //!   with the fixed sentence
@@ -21,6 +21,10 @@
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::ops::get_scaling_plan_resource_forecast_data::{
+    FORECAST_SCALABLE_DIMENSION, FORECAST_SERVICE_NAMESPACE,
+};
+
 use crate::scaling_plan_lifecycle::{
     error_code, error_message, simple_instructions, stack_source, Emulator,
 };
@@ -30,14 +34,24 @@ use crate::scaling_plan_lifecycle::{
 ///
 /// Source: `smithy_query(query="operation",
 /// operation="DeleteScalingPlan,UpdateScalingPlan,DescribeScalingPlanResources")` — the
-/// two write paths bind `ObjectNotFoundException` (client, httpError 400).
-/// `DescribeScalingPlanResources` binds no not-found error at all and its
-/// `ScalingPlanResources` output member is not required, so a miss there is a 200
-/// carrying an empty list, not a refusal: it is checked that way below.
-const LOOKUP_OPERATIONS: [(&str, &str); 2] = [
+/// two write paths bind `ObjectNotFoundException` (client, httpError 400), while
+/// `DescribeScalingPlanResources` binds no not-found shape at all, so its refusal travels
+/// in its generic client error `ValidationException` (client, httpError 400). Both halves
+/// of the lookup — the name and the version — are probed by the rows below.
+const LOOKUP_OPERATIONS: [(&str, &str); 3] = [
     ("DeleteScalingPlan", "ObjectNotFoundException"),
     ("UpdateScalingPlan", "ObjectNotFoundException"),
+    ("DescribeScalingPlanResources", "ValidationException"),
 ];
+
+/// The fourth operation that looks one plan up by name and version. It is driven apart
+/// from [`LOOKUP_OPERATIONS`] because its request carries five more required members, and
+/// because it checks `ScalingPlanVersion` against the single documented valid value
+/// BEFORE any lookup — so only rows at that version reach its lookup.
+const FORECAST_OPERATION: &str = "GetScalingPlanResourceForecastData";
+
+/// The only scaling-plan version the model documents as valid.
+const ONLY_VERSION: i64 = 1;
 
 /// AWS's fixed text for the application-source / name-selector conflict.
 const APPLICATION_SOURCES_CONFLICT: &str =
@@ -47,6 +61,32 @@ const APPLICATION_SOURCES_CONFLICT: &str =
 fn expected_not_found(name: &str, version: i64) -> String {
     format!("No scaling plan found for scaling plan name: {name}, version: {version}")
 }
+
+/// A `GetScalingPlanResourceForecastData` request for the one resource kind that
+/// operation forecasts, with every member the model marks required.
+///
+/// The window is a valid one (an hour starting now, well inside the documented limits
+/// `crate::forecast_data` pins), so nothing but the plan lookup can refuse it.
+fn forecast_request(name: &str, version: i64) -> Value {
+    let start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a host clock at or after the epoch")
+        .as_secs() as i64;
+    json!({
+        "ScalingPlanName": name,
+        "ScalingPlanVersion": version,
+        "ServiceNamespace": FORECAST_SERVICE_NAMESPACE,
+        "ResourceId": FORECAST_RESOURCE_ID,
+        "ScalableDimension": FORECAST_SCALABLE_DIMENSION,
+        "ForecastDataType": "CapacityForecast",
+        "StartTime": start,
+        "EndTime": start + 3_600,
+    })
+}
+
+/// The Auto Scaling group [`simple_instructions`] instructs, which is also the resource
+/// the forecast rows below name.
+const FORECAST_RESOURCE_ID: &str = "autoScalingGroup/my-asg";
 
 /// A plan the emulator really holds, so a row that names it probes the VERSION half of
 /// the lookup rather than the name half.
@@ -123,25 +163,41 @@ async fn a_lookup_that_finds_no_plan_names_the_requested_name_and_version() {
             );
         }
 
-        // The same miss on the operation that models no not-found error: an empty page,
-        // which is what AWS answers there.
+        // The same miss on the operation whose request also names a scalable resource.
+        if version != ONLY_VERSION {
+            continue;
+        }
         let (status, body) = emulator
-            .call("DescribeScalingPlanResources", &request)
+            .call(FORECAST_OPERATION, &forecast_request(&name, version))
             .await;
         assert_eq!(
-            (status, body.get("ScalingPlanResources")),
-            (200, Some(&json!([]))),
-            "case DescribeScalingPlanResources/{label}: expected HTTP 200 with an empty \
-             ScalingPlanResources list, got {status} with {body}"
+            (status, error_code(&body)),
+            (400, "ValidationException"),
+            "case {FORECAST_OPERATION}/{label}: expected a 400 ValidationException, \
+             got {status} with {body}"
+        );
+        let actual = error_message(&body);
+        assert_eq!(
+            actual,
+            expected_not_found(&name, version),
+            "case {FORECAST_OPERATION}/{label}: expected {:?}, got {actual:?}",
+            expected_not_found(&name, version)
         );
     }
 
-    // The control: the plan that IS stored, at the version it has, is not refused — the
-    // sentence above is reported for a missing plan, not for every lookup.
+    // The control: the plan that IS stored, at the version it has, is not refused on any
+    // of these paths — the sentence above is reported for a missing plan, not for every
+    // lookup.
     emulator
         .ok(
             "DescribeScalingPlanResources",
-            json!({ "ScalingPlanName": STORED_PLAN, "ScalingPlanVersion": 1 }),
+            json!({ "ScalingPlanName": STORED_PLAN, "ScalingPlanVersion": ONLY_VERSION }),
+        )
+        .await;
+    emulator
+        .ok(
+            FORECAST_OPERATION,
+            forecast_request(STORED_PLAN, ONLY_VERSION),
         )
         .await;
 }
