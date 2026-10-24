@@ -69,6 +69,8 @@ mod member_accounts;
 mod member_association;
 #[path = "all/member_creation.rs"]
 mod member_creation;
+#[path = "all/member_detector_configuration.rs"]
+mod member_detector_configuration;
 #[path = "all/member_invitation.rs"]
 mod member_invitation;
 #[path = "all/member_monitoring.rs"]
