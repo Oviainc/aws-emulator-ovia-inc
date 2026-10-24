@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetQueryResults
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetQueryResults`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetQueryResults::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does
+//!
+//! "Gets event data results of a query. You must specify the QueryID value returned by
+//! the StartQuery operation." It REPORTS the query the `QueryId` addresses: the status
+//! the query is in, the rows it produced (one page of them) and the scan statistics of
+//! the run that produced them. It starts nothing — a query's rows are written by the
+//! operation that RUNS it — and its only write is the transition the CLOCK already made
+//! due: a run whose settle instant has passed had ended before this call was made, so
+//! [`crate::state::ComAmazonawsCloudtrailCloudtrail20131101State::settle_queries`]
+//! materialises it here the way `DescribeQuery` does, and nothing a later caller sees
+//! changes because of this read.
+//!
+//! A query is addressed by `QueryId`, which this request REQUIRES, and is reachable
+//! only from the Region it ran in — the rule the modelled `QueryIdNotFoundException`
+//! states as "does not exist or is not in the same region". `EventDataStore` is
+//! deprecated here ("EventDataStore is no longer required by GetQueryResultsRequest")
+//! and, with `EventDataStoreOwnerAccountId`, only NARROWS that addressing: an id that
+//! ran on another store, or under another owner account, is not the query the request
+//! names. Unlike `ListQueries`, which requires the member and so reports
+//! `EventDataStoreNotFoundException` for a store it cannot find, a query-id-addressed
+//! read answers for the query: a store that holds no such query and a store that does
+//! not exist are the same answer, `QueryIdNotFoundException`.
+//!
+//! `MaxQueryResults` is `@range`-bounded by the model, so the boundary validator — not
+//! this handler — refuses a page size outside `1..1000`; the handler only applies it,
+//! falling back to [`crate::state::GET_QUERY_RESULTS_MAX_PAGE_SIZE`] when the caller
+//! names none.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +209,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetQueryResults` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetQueryResultsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetQueryResults"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetQueryResultsErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "GetQueryResults needs the CloudTrail Lake query registry, which \
+                         this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+        // The transition the clock already owed each run is applied before any of them
+        // is reported, exactly as `DescribeQuery` applies it: a run due to end before
+        // this call was made had ended whether or not anybody asked, so the status and
+        // statistics this read answers with are the ones the run was already in. It is
+        // the ONLY write this reporting operation makes.
+        store.settle_queries(now);
+
+        // The deprecated `EventDataStore` is "The ARN (or ID suffix of the ARN) of the
+        // event data store against which the query was run": a value that cannot be
+        // read as either is refused as an ARN, and one that can only narrows which
+        // store's query this request addresses.
+        let named_store = input
+            .event_data_store
+            .as_deref()
+            .map(crate::state::parse_event_data_store_identifier)
+            .transpose()
+            .map_err(|rejection| {
+                GetQueryResultsErrorModeled::EventDataStoreARNInvalidException(
+                    EventDataStoreARNInvalidException {
+                        message: Some(rejection.message(&region)),
+                    },
+                )
+            })?;
+        let owner = input.event_data_store_owner_account_id.as_deref();
+
+        let query = store
+            .query(
+                &input.query_id,
+                &region,
+                named_store.as_ref().map(|identifier| identifier.id.as_str()),
+            )
+            // `EventDataStoreOwnerAccountId` "The account ID of the event data store
+            // owner": a query whose store belongs to another account is not the one
+            // this request addresses.
+            .filter(|query| owner.is_none_or(|owner| query.owner() == owner))
+            .ok_or_else(|| query_not_found(&input.query_id))?;
+
+        // Where this page starts: the offset the caller's token carries. Only a token
+        // THIS query handed out is accepted — "a token that is not valid, or a token
+        // that was previously used in a request with different parameters" is refused.
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => page_offset(token, &query.query_id, query.result_rows.len())
+                .ok_or_else(|| {
+                    GetQueryResultsErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: Some(format!(
+                                "The NextToken value {token} is not valid, or was used in a \
+                                 request with different parameters."
+                            )),
+                        },
+                    )
+                })?,
+        };
+        let page_size = input
+            .max_query_results
+            .map_or(crate::state::GET_QUERY_RESULTS_MAX_PAGE_SIZE, |requested| {
+                // The model's `@range 1..1000` is refused at the boundary; the clamp is
+                // what makes the cast to `usize` total.
+                requested.clamp(1, crate::state::GET_QUERY_RESULTS_MAX_PAGE_SIZE as i32) as usize
+            });
+
+        let page = query.result_rows_page(offset, page_size);
+        let next_offset = offset + page.len();
+        let next_token = (next_offset < query.result_rows.len())
+            .then(|| page_token(&query.query_id, next_offset));
+
+        Ok(GetQueryResultsOutput {
+            query_status: Some(query.status.as_wire().to_string()),
+            query_statistics: Some(QueryStatistics {
+                // "The number of results returned" is this page's count; "the total
+                // number of results returned by a query" is every row the run produced.
+                results_count: Some(page.len() as i32),
+                total_results_count: Some(query.result_rows.len() as i32),
+                bytes_scanned: Some(query.statistics.bytes_scanned),
+            }),
+            query_result_rows: Some(page),
+            next_token,
+            // "The error message returned if a query failed" — carried by a run that
+            // failed, and by nothing else.
+            error_message: query.error_message.clone(),
+        })
     }
+}
+
+/// The HTTP status this service answers a not-found refusal with.
+///
+/// The model annotates `QueryIdNotFoundException` `@httpError(404)`, but CloudTrail
+/// answers 400 for it on the wire: the recorded response to this very operation for an
+/// unknown `QueryId` is `HTTP 400` with that `__type`. The error CODE is the model's;
+/// only the status is stated here, as `DescribeQuery` states it for the same refusal.
+const NOT_FOUND_STATUS: u16 = 400;
+
+/// Refuse the request because no query of that id is addressed by it.
+///
+/// The text names the member the caller supplied and its value, the way the service
+/// words it: "The QueryId value <id> does not exist or is not in the same region."
+fn query_not_found(query_id: &str) -> GetQueryResultsError {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        GetQueryResultsErrorModeled::QueryIdNotFoundException(QueryIdNotFoundException {
+            message: Some(crate::state::query_not_found_message("QueryId", query_id)),
+        }),
+        NOT_FOUND_STATUS,
+    )
+}
+
+/// The separator between the two halves of this operation's page token,
+/// `<query id>:<offset>`.
+///
+/// A `QueryId` is a `UUID` (`^[a-f0-9\-]+$`) and so holds no colon, which is what keeps
+/// the halves apart. The token is opaque to a client, which only ever passes it back.
+const PAGE_TOKEN_SEPARATOR: char = ':';
+
+/// The page token this operation hands out: the query it belongs to and the row the
+/// next page resumes at, in the shared encoding every paged read of this service uses
+/// ([`crate::state::encode_page_token`]).
+fn page_token(query_id: &str, offset: usize) -> String {
+    crate::state::encode_page_token(query_id, offset, PAGE_TOKEN_SEPARATOR)
+}
+
+/// Read a page token back: the row offset it resumes at, or `None` when the token is
+/// not one THIS query handed out — a token for another query or one that is not a token
+/// at all, which [`crate::state::decode_page_token`] decides, or one pointing at or
+/// past the last row, which only this operation can decide (a page is continued only
+/// while rows remain, so no such token is ever minted).
+fn page_offset(token: &str, query_id: &str, rows: usize) -> Option<usize> {
+    let offset = crate::state::decode_page_token(token, query_id, PAGE_TOKEN_SEPARATOR)?;
+    (offset < rows).then_some(offset)
 }
