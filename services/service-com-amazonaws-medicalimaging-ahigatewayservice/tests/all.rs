@@ -33,6 +33,8 @@ mod image_set_search;
 mod image_set_version_listing;
 #[path = "all/import_job_listing.rs"]
 mod import_job_listing;
+#[path = "all/regional_isolation.rs"]
+mod regional_isolation;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]

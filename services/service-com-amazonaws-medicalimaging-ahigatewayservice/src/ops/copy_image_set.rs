@@ -227,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
         let information = &input.copy_image_set_information;
 
@@ -272,7 +272,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.advance_clock(now);
 
-        let datastore = store.datastores.get(&input.datastore_id).ok_or_else(|| {
+        // Reached in the region this request was addressed to: a data store exists in
+        // ONE region, so one held in another is not found here at all.
+        let datastore = store.datastore_in(&region, &input.datastore_id).ok_or_else(|| {
             CopyImageSetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 // Constant, and stated by resource KIND: the requested id is not
                 // reflected back (`crate::state::DATASTORE_NOT_FOUND_MESSAGE`).
@@ -406,12 +408,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             retires_image_set: false,
         };
 
-        let datastore = store.datastores.get_mut(&input.datastore_id).ok_or_else(|| {
-            CopyImageSetErrorModeled::InternalServerException(InternalServerException {
-                message: "the data store could not be reached while copying the image set"
-                    .to_string(),
-            })
-        })?;
+        let datastore = store
+            .datastore_in_mut(&region, &input.datastore_id)
+            .ok_or_else(|| {
+                CopyImageSetErrorModeled::InternalServerException(InternalServerException {
+                    message: "the data store could not be reached while copying the image set"
+                        .to_string(),
+                })
+            })?;
         let destination_image_set_id = match plan {
             DestinationPlan::Mint(image_set_id) => {
                 let mut image_set = ImageSet::new(
@@ -483,7 +487,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
 
         // Report from the records just written, not from local copies of them.
-        let datastore = store.datastores.get(&input.datastore_id).ok_or_else(|| {
+        let datastore = store.datastore_in(&region, &input.datastore_id).ok_or_else(|| {
             CopyImageSetErrorModeled::InternalServerException(InternalServerException {
                 message: "the data store could not be reached while reporting the copy".to_string(),
             })

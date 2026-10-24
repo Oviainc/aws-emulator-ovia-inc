@@ -153,7 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
         // Same classification as `TagResource`: a label that is not an ARN is a
@@ -175,7 +175,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // are too) and writes nothing else.
         store.advance_clock(now);
 
-        let tags = store.resource_tags(&arn).ok_or_else(|| {
+        // Reached in the region this request was addressed to, as every id-keyed read
+        // is: an ARN naming a data store of another region names a resource this
+        // request cannot see.
+        let tags = store.resource_tags(&region, &arn).ok_or_else(|| {
             ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: format!("Resource {} was not found", input.resource_arn),
             })

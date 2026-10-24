@@ -10,6 +10,12 @@
 //! configuration-manager and configuration records, so whatever a create or an update
 //! stored is what a later Get or List reports — including the ids the service assigned
 //! — and anything never stored (or since deleted) is the modelled 404.
+//!
+//! This file no longer carries a stub census: every operation it used to assert a 501
+//! for is implemented and covered by its own suite — `ListTagsForResource` in
+//! `tests/all/list_tags_for_resource.rs`, `TagResource` and `UntagResource` in
+//! `tests/all/resource_tags.rs`, and the service settings and type catalog in
+//! `tests/all/service_settings_and_types.rs`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

@@ -137,7 +137,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -148,13 +148,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.advance_clock(now);
 
-        let datastore = store.datastores.get_mut(&input.datastore_id).ok_or_else(|| {
-            DeleteDatastoreErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                // Constant, and stated by resource KIND: the requested id is not
-                // reflected back (`crate::state::DATASTORE_NOT_FOUND_MESSAGE`).
-                message: crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string(),
-            })
-        })?;
+        // Reached in the region this request was addressed to: a data store exists in
+        // ONE region, so one held in another is not found here at all.
+        let datastore = store
+            .datastore_in_mut(&region, &input.datastore_id)
+            .ok_or_else(|| {
+                DeleteDatastoreErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    // Constant, and stated by resource KIND: the requested id is not
+                    // reflected back (`crate::state::DATASTORE_NOT_FOUND_MESSAGE`).
+                    message: crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string(),
+                })
+            })?;
 
         // A creation the clock still owes is not something a delete may cancel: the
         // service has already answered `CREATING` and promised the store, so deleting it

@@ -18,6 +18,17 @@
 //! writes a change the clock already owed at that instant — so a read never moves a
 //! status that was not already due.
 //!
+//! # A data store belongs to ONE region
+//!
+//! AWS HealthImaging is a regional service: a data store exists in the region the
+//! `CreateDatastore` request was addressed to, and in no other. Each record carries
+//! that region ([`Datastore::region`]), every id-keyed handler reaches a store through
+//! [`ComAmazonawsMedicalimagingAhigatewayserviceState::datastore_in`] with the region
+//! of the request being served ([`request_region`]), and `ListDatastores` enumerates
+//! [`ComAmazonawsMedicalimagingAhigatewayserviceState::datastores_in`] — so a request
+//! addressed to another region reaches nothing and is answered exactly as it would be
+//! for an id nothing ever minted.
+//!
 //! # Pixel data belongs to the image set
 //!
 //! An image set owns the image frames it holds ([`ImageFrame`]), keyed by image frame
@@ -90,13 +101,27 @@ pub const MIN_LIST_PAGE_SIZE: usize = 1;
 /// response.
 pub const MAX_LIST_PAGE_SIZE: usize = 50;
 
-/// How many data stores this emulator will hold at once.
+/// How many data stores this emulator will hold at once IN ONE REGION.
 ///
 /// A memory bound, not an AWS quota: `CreateDatastore` persists caller-supplied data
 /// (name, ARNs, the whole tag map) in process memory, so without a cap a caller could
 /// grow it without limit. Past the cap the call is refused with the operation's own
-/// `ServiceQuotaExceededException` (HTTP 402).
+/// `ServiceQuotaExceededException` (HTTP 402). Counted per region, because a data store
+/// is a REGIONAL resource: the stores of one region are the only ones a request
+/// addressed to it can reach, so they are the only ones its quota can count.
 pub const MAX_DATASTORES: usize = 128;
+
+/// How many data stores this emulator will hold at once across EVERY region.
+///
+/// The process-wide companion to the per-region [`MAX_DATASTORES`]: a per-region cap
+/// alone bounds no memory, because a caller is free to address as many regions as it
+/// likes. Past this cap `CreateDatastore` is refused with the same
+/// `ServiceQuotaExceededException`.
+///
+/// No test drives this refusal: reaching it costs this many successful creates, which
+/// is minutes of wall clock in a suite. The per-region cap, which shares the one code
+/// path and the one error, is exercised instead.
+pub const MAX_DATASTORES_ALL_REGIONS: usize = 1024;
 
 /// How many import jobs one data store will hold at once — the same memory bound as
 /// [`MAX_DATASTORES`], applied per data store so the product of the two is bounded too.
@@ -1137,6 +1162,13 @@ impl ImageSet {
 #[derive(Debug, Clone)]
 pub struct Datastore {
     pub datastore_id: String,
+    /// The region this data store EXISTS in: the one the creating request was addressed
+    /// to ([`request_region`]), and the one its [`Datastore::datastore_arn`] names.
+    ///
+    /// A data store is a regional resource, so this is what makes it reachable from
+    /// that region and from no other — see
+    /// [`ComAmazonawsMedicalimagingAhigatewayserviceState::datastore_in`].
+    pub region: String,
     /// `CreateDatastore` leaves `datastoreName` optional; `DatastoreProperties` and
     /// `DatastoreSummary` make it required, so [`Datastore::reported_name`] supplies
     /// the fallback.
@@ -1234,6 +1266,11 @@ impl Datastore {
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMedicalimagingAhigatewayserviceState {
     /// Every live data store, keyed by its 32-character lowercase-alphanumeric id.
+    ///
+    /// One map holds every region's stores — an id is minted from one process-wide
+    /// counter ([`Self::mint_id`]), so no two regions can name the same one — and a
+    /// store is REACHED through [`Self::datastore_in`], which admits only the stores of
+    /// the region the request addressed.
     pub datastores: HashMap<String, Datastore>,
     /// `@idempotencyToken` ledger: a scoped client token (see [`client_token_key`])
     /// mapped to the id it minted, so a repeat call returns the SAME resource. Bounded
@@ -1277,15 +1314,51 @@ impl ComAmazonawsMedicalimagingAhigatewayserviceState {
         }
     }
 
+    /// The data store `datastore_id` names, as seen from `region` — `None` when this
+    /// emulator holds no such data store THERE.
+    ///
+    /// A data store is a regional resource: it exists only in the region its creating
+    /// request was addressed to, so a request addressed to any other region reaches
+    /// nothing by its id and is answered as if the resource did not exist. Every
+    /// id-keyed read and write goes through here (or through [`Self::datastore_in_mut`]),
+    /// so one rule decides reachability for all of them rather than each handler
+    /// deciding for itself.
+    pub fn datastore_in(&self, region: &str, datastore_id: &str) -> Option<&Datastore> {
+        self.datastores
+            .get(datastore_id)
+            .filter(|datastore| datastore.region == region)
+    }
+
+    /// [`Self::datastore_in`], for a writer.
+    pub fn datastore_in_mut(&mut self, region: &str, datastore_id: &str) -> Option<&mut Datastore> {
+        self.datastores
+            .get_mut(datastore_id)
+            .filter(|datastore| datastore.region == region)
+    }
+
+    /// Every data store `region` holds, in no particular order — what a listing in that
+    /// region enumerates, and what its quota counts.
+    pub fn datastores_in<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a Datastore> {
+        self.datastores
+            .values()
+            .filter(move |datastore| datastore.region == region)
+    }
+
     /// The tag map of the resource `arn` names — a data store, or one image set it
-    /// owns — or `None` when this emulator holds no such resource.
+    /// owns — as seen from `region`, or `None` when this emulator holds no such
+    /// resource there.
     ///
     /// One lookup for both resource kinds, so the three tagging operations agree on
     /// what exists: tags live ON the resource record rather than in a map beside it.
-    /// The ARN must be the resource's OWN: a data store is reached by its id, and
-    /// then only when the ARN it was named by is the one the data store reports.
-    pub fn resource_tags(&self, arn: &ResourceArn) -> Option<&HashMap<String, String>> {
-        let datastore = self.datastores.get(&arn.datastore_id)?;
+    /// The ARN must be the resource's OWN: a data store is reached by its id in the
+    /// region the request addressed, and then only when the ARN it was named by is the
+    /// one the data store reports.
+    pub fn resource_tags(
+        &self,
+        region: &str,
+        arn: &ResourceArn,
+    ) -> Option<&HashMap<String, String>> {
+        let datastore = self.datastore_in(region, &arn.datastore_id)?;
         if datastore.datastore_arn != arn.datastore_arn {
             return None;
         }
@@ -1296,8 +1369,12 @@ impl ComAmazonawsMedicalimagingAhigatewayserviceState {
     }
 
     /// [`Self::resource_tags`], for a writer.
-    pub fn resource_tags_mut(&mut self, arn: &ResourceArn) -> Option<&mut HashMap<String, String>> {
-        let datastore = self.datastores.get_mut(&arn.datastore_id)?;
+    pub fn resource_tags_mut(
+        &mut self,
+        region: &str,
+        arn: &ResourceArn,
+    ) -> Option<&mut HashMap<String, String>> {
+        let datastore = self.datastore_in_mut(region, &arn.datastore_id)?;
         if datastore.datastore_arn != arn.datastore_arn {
             return None;
         }
@@ -1334,11 +1411,12 @@ impl ComAmazonawsMedicalimagingAhigatewayserviceState {
 
 /// The ledger key for one `@idempotencyToken`.
 ///
-/// Scoped by operation (and, for an import job, by the data store it runs against), so
-/// the same token reused on a different operation mints a different resource rather
-/// than returning the first one.
-pub fn client_token_key(scope: &str, client_token: &str) -> String {
-    format!("{scope}\u{0}{client_token}")
+/// Scoped by REGION, and by operation (and, for an import job, by the data store it runs
+/// against), so the same token reused on a different operation — or against a different
+/// region, where the resource the first call minted does not exist — mints a different
+/// resource rather than returning the first one.
+pub fn client_token_key(region: &str, scope: &str, client_token: &str) -> String {
+    format!("{region}\u{0}{scope}\u{0}{client_token}")
 }
 
 /// SplitMix64's finalizer — a bijection on `u64`, which is what makes
