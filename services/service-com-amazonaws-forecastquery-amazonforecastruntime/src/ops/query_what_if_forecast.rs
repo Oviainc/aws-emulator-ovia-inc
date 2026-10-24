@@ -253,8 +253,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             };
 
-            // The what-if forecast the request names RESOLVED, so a continuation token can
-            // now be judged against it. The order matters and is not an accident: a token
+            // A what-if forecast the control plane has minted but whose creation run has
+            // not reached `ACTIVE` yet is not readable ("The Status of the forecast must be
+            // ACTIVE before you can query or export the forecast"), which is the modelled
+            // `ResourceInUseException` (409): the resource exists, so it is not a 404, and
+            // the request is well formed, so it is not a 400. Checked from the stored due
+            // instant, so no read has to write anything to move the forecast on.
+            if !forecast.is_active_at(::std::time::SystemTime::now()) {
+                return Err(QueryWhatIfForecastErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(
+                            crate::state::WHAT_IF_FORECAST
+                                .not_active_message(&input.what_if_forecast_arn),
+                        ),
+                    },
+                )
+                .into());
+            }
+
+            // The what-if forecast is readable, so a continuation token can now be judged
+            // against it. The order matters and is not an accident: a token
             // only means anything as a position inside one resource's results, so the
             // resource is resolved first and an ARN that names nothing is answered
             // `ResourceNotFoundException` even when the request also carries a token this

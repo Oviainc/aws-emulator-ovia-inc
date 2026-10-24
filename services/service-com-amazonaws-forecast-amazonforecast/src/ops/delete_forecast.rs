@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteForecast
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteForecast`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the forecast from the control plane AND withdraws it from the
+//! Amazon Forecast RUNTIME store ([`crate::state::withdraw_forecast`]), so the ARN
+//! `QueryForecast` answered a moment ago answers `ResourceNotFoundException`
+//! afterwards — one delete, both planes.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteForecast::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "You can delete only forecasts that have a status of ACTIVE or CREATE_FAILED"
+//! (this operation's documentation), so a forecast whose creation run the clock has
+//! not settled yet is refused with the modelled `ResourceInUseException` (409).
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +158,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteForecast` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteForecastErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteForecast"))
+        // A write keyed entirely by the request's ARN; no request metadata is needed.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented("DeleteForecast"));
+        };
+        let now = ::std::time::SystemTime::now();
+
+        {
+            let mut store = state.lock();
+            let Some(forecast) = store.forecasts.get(&input.forecast_arn) else {
+                return Err(DeleteForecastErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("No resource found {}", input.forecast_arn)),
+                    },
+                )
+                .into());
+            };
+            // "You can delete only forecasts that have a status of ACTIVE or
+            // CREATE_FAILED": a creation run the clock has not settled is still
+            // producing the forecast.
+            if !forecast.lifecycle.is_settled(now) {
+                return Err(DeleteForecastErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(format!(
+                            "The status of forecast {} is {}. You can delete only \
+                             forecasts whose status is ACTIVE or CREATE_FAILED.",
+                            forecast.arn,
+                            forecast.lifecycle.status(now)
+                        )),
+                    },
+                )
+                .into());
+            }
+            store.forecasts.remove(&input.forecast_arn);
+        }
+
+        // The predictions live in the runtime store, so the delete is not finished
+        // until they are gone from it too: a withdrawn forecast stops being queryable.
+        crate::state::withdraw_forecast(&*self.engine, &input.forecast_arn);
+
+        Ok(DeleteForecastOutput)
     }
 }

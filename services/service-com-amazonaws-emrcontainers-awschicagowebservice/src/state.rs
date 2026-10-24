@@ -276,6 +276,80 @@ pub fn security_configuration_arn(region: &str, id: &str) -> String {
     )
 }
 
+/// `arn:aws:emr-containers:{region}:{account}:/virtualclusters/{vc}/endpoints/{id}` — the
+/// `EndpointArn` shape's pattern.
+pub fn managed_endpoint_arn(region: &str, virtual_cluster_id: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("/virtualclusters/{virtual_cluster_id}/endpoints/{id}"),
+    )
+}
+
+/// The resource a tagging call's `resourceArn` (an `RsiArn`) names.
+///
+/// `RsiArn`'s pattern (`^arn:(aws[a-zA-Z0-9-]*):emr-containers:.+:(\d{12}):/virtualclusters/.+$`)
+/// admits the virtual cluster itself and the resources that live UNDER one, which is
+/// exactly the set of ARN shapes the model spells with a `/virtualclusters/` path:
+/// `VirtualClusterArn`, `JobArn` and `EndpointArn`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    VirtualCluster {
+        id: String,
+    },
+    JobRun {
+        virtual_cluster_id: String,
+        id: String,
+    },
+    ManagedEndpoint {
+        virtual_cluster_id: String,
+        id: String,
+    },
+}
+
+/// Whether an ARN path segment is an id segment this service's resource ARNs admit:
+/// `VirtualClusterArn`, `JobArn` and `EndpointArn` all spell theirs `[0-9a-zA-Z]+`.
+fn is_arn_id_segment(segment: &str) -> bool {
+    !segment.is_empty() && segment.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// The resource an `RsiArn` names, read out of the ARN's resource path.
+///
+/// `RsiArn`'s own pattern — refused at the boundary before any handler runs — already
+/// fixes the ARN's envelope (the `arn:` prefix, an `aws*` partition, the
+/// `emr-containers` service, a 12-digit account and a `/virtualclusters/` resource
+/// path), so what is left to read is which resource that path names.
+///
+/// `None` when the path is none of the three forms the model declares: an ARN that could
+/// not be ANY resource this service models is an invalid `resourceArn`, which is a
+/// different answer from a well-formed ARN whose resource is simply not there.
+pub fn parse_tagged_resource_arn(arn: &str) -> Option<TaggedResource> {
+    // `arn:{partition}:{service}:{region}:{account}:{resource}`: the resource is
+    // everything after the fifth `:`, so it is read with a bounded split rather than by
+    // taking the last field — a region or a resource path may itself contain a `:`.
+    let resource = arn.splitn(6, ':').nth(5)?;
+    let path = resource.strip_prefix("/virtualclusters/")?;
+    let mut segments = path.split('/');
+    let virtual_cluster_id = segments.next().filter(|segment| is_arn_id_segment(segment))?;
+    match (segments.next(), segments.next(), segments.next()) {
+        // `/virtualclusters/{id}` — the cluster itself.
+        (None, _, _) => Some(TaggedResource::VirtualCluster {
+            id: virtual_cluster_id.to_string(),
+        }),
+        (Some("jobruns"), Some(id), None) if is_arn_id_segment(id) => Some(TaggedResource::JobRun {
+            virtual_cluster_id: virtual_cluster_id.to_string(),
+            id: id.to_string(),
+        }),
+        (Some("endpoints"), Some(id), None) if is_arn_id_segment(id) => {
+            Some(TaggedResource::ManagedEndpoint {
+                virtual_cluster_id: virtual_cluster_id.to_string(),
+                id: id.to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// The region to build an ARN in for this request: the region of its SigV4 credential
 /// scope, so an ARN names the region the caller signed for.
 pub fn request_region(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String {
@@ -1165,6 +1239,61 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
     pub fn virtual_cluster_view(&self, id: &str) -> Option<VirtualCluster> {
         let record = self.virtual_clusters.get(id)?;
         Some(record.to_virtual_cluster(self.cluster_scheduler_status(id)))
+    }
+
+    /// Whether this store holds the resource `arn` names.
+    ///
+    /// The ARN is matched in FULL against the stored record's OWN `arn`, so one that
+    /// names another partition, region or account — a resource some other endpoint
+    /// holds — resolves to nothing rather than to this endpoint's resource of the same
+    /// id.
+    fn holds_tagged_resource(&self, resource: &TaggedResource, arn: &str) -> bool {
+        let stored = match resource {
+            TaggedResource::VirtualCluster { id } => {
+                self.virtual_clusters.get(id).map(|record| record.arn.as_str())
+            }
+            TaggedResource::JobRun {
+                virtual_cluster_id,
+                id,
+            } => self
+                .job_run(virtual_cluster_id, id)
+                .map(|record| record.arn.as_str()),
+            // No managed endpoint is ever stored: `CreateManagedEndpoint` is still a
+            // scaffold, so an `EndpointArn` is well formed and names nothing.
+            TaggedResource::ManagedEndpoint { .. } => None,
+        };
+        stored == Some(arn)
+    }
+
+    /// The tag set of the resource `arn` names, for editing — the ONE copy that
+    /// resource's record holds, so a tag written here is the tag every reader of the
+    /// resource reports.
+    ///
+    /// `None` when this store holds no such resource, on the terms
+    /// [`Self::holds_tagged_resource`] states.
+    pub fn resource_tags_mut(
+        &mut self,
+        resource: &TaggedResource,
+        arn: &str,
+    ) -> Option<&mut HashMap<String, String>> {
+        if !self.holds_tagged_resource(resource, arn) {
+            return None;
+        }
+        match resource {
+            TaggedResource::VirtualCluster { id } => self
+                .virtual_clusters
+                .get_mut(id)
+                .map(|record| &mut record.tags),
+            TaggedResource::JobRun {
+                virtual_cluster_id,
+                id,
+            } => self
+                .job_runs
+                .get_mut(id)
+                .filter(|record| &record.virtual_cluster_id == virtual_cluster_id)
+                .map(|record| &mut record.tags),
+            TaggedResource::ManagedEndpoint { .. } => None,
+        }
     }
 
     /// This cluster's stored job runs, in creation order.

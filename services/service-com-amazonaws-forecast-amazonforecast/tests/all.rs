@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/dataset_lifecycle.rs"]
 mod dataset_lifecycle;
+#[path = "all/forecast_propagation.rs"]
+mod forecast_propagation;
 #[path = "all/request_claiming.rs"]
 mod request_claiming;
 #[path = "all/state_roundtrip.rs"]

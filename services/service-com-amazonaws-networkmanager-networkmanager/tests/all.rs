@@ -15,6 +15,8 @@
 mod attachment_acceptance;
 #[path = "all/attachment_lifecycle.rs"]
 mod attachment_lifecycle;
+#[path = "all/connection_lifecycle.rs"]
+mod connection_lifecycle;
 #[path = "all/core_network_lifecycle.rs"]
 mod core_network_lifecycle;
 #[path = "all/delete_dependency_refusal.rs"]

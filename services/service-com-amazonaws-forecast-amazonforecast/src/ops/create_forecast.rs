@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateForecast
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateForecast`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints `arn:aws:forecast:<region>:<account>:forecast/<ForecastName>`,
+//! RUNS the predictor's fitted model forward over its `ForecastHorizon` for every time
+//! series it was trained on, and PUBLISHES the result into the Amazon Forecast RUNTIME
+//! store on the same shared engine — which is what makes the forecast answerable by
+//! `QueryForecast` (`crate::state::publish_forecast`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateForecast::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The predictions are computed from the history the predictor was fitted to; see
+//! [`crate::state::series`] for the estimator and for what Amazon Forecast's own
+//! learned models do instead. Nothing is published for a predictor that was not
+//! trained, and no value is invented for a time series with no data.
+//!
+//! "The Status of the forecast must be ACTIVE before you can query or export the
+//! forecast": the record is persisted and the published forecast carries the instant
+//! that status becomes due ([`crate::state::PENDING_SPAN`] /
+//! [`crate::state::RUN_SPAN`]), so a query made immediately after this call is
+//! answered with the runtime service's `ResourceInUseException` rather than with
+//! predictions the clock has not made available yet.
+//!
+//! `TimeSeriesSelector` narrows the forecast: the identifiers it names are read from
+//! object storage the same way an import file is, and "forecast creation is skipped for
+//! any time series that you specify that are not in the input dataset".
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +197,228 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateForecast` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateForecastErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateForecast"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateForecast"));
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let arn = crate::state::forecast_arn(&region, &input.forecast_name);
+
+        // Everything this forecast is computed FROM, read under one lock: the predictor
+        // carries the fitted model, and the ARN is what a repeated create collides on.
+        let predictor = {
+            let store = state.lock();
+            if store.forecasts.contains_key(&arn) {
+                return Err(CreateForecastErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!(
+                            "A forecast already exists with the name {}.",
+                            input.forecast_name
+                        )),
+                    },
+                )
+                .into());
+            }
+            if store.forecasts.len() >= crate::state::MAX_FORECASTS {
+                return Err(CreateForecastErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "You have reached the limit of {} forecasts for this account.",
+                            crate::state::MAX_FORECASTS
+                        )),
+                    },
+                )
+                .into());
+            }
+            let Some(predictor) = store.predictors.get(&input.predictor_arn) else {
+                return Err(CreateForecastErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("No resource found {}", input.predictor_arn)),
+                    },
+                )
+                .into());
+            };
+            // "The Status of the predictor must be ACTIVE, signifying that training has
+            // completed, before you can use the predictor to create a forecast"
+            // (`CreateForecast`'s `PredictorArn`): a predictor still training is a
+            // resource in use, not an absent one.
+            if !predictor.lifecycle.is_active(now) {
+                return Err(CreateForecastErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(format!(
+                            "The status of predictor {} is {}. The status must be ACTIVE \
+                             before you can use it to create a forecast.",
+                            predictor.arn,
+                            predictor.lifecycle.status(now)
+                        )),
+                    },
+                )
+                .into());
+            }
+            predictor.clone()
+        };
+
+        // "The default quantiles are the quantiles you specified during predictor
+        // creation" (`ForecastTypes`).
+        let forecast_types = match input.forecast_types.clone() {
+            Some(types) => types,
+            None => predictor.forecast_types.clone(),
+        };
+        if forecast_types.len() > crate::state::MAX_FORECAST_TYPES {
+            return Err(invalid(format!(
+                "A forecast may name at most {} forecast types.",
+                crate::state::MAX_FORECAST_TYPES
+            )));
+        }
+        if let Some(unknown) = forecast_types
+            .iter()
+            .find(|value| !crate::state::series::is_forecast_type(value))
+        {
+            return Err(invalid(format!(
+                "The forecast type {unknown} is not a quantile between 0.01 and 0.99 or \
+                 mean."
+            )));
+        }
+
+        // The time series this forecast covers: every one the predictor was trained on,
+        // or the subset a `TimeSeriesSelector` names. The identifiers are read without
+        // the store lock held.
+        let selected = match input
+            .time_series_selector
+            .as_ref()
+            .and_then(|selector| selector.time_series_identifiers.clone())
+        {
+            Some(identifiers) => {
+                match crate::state::series::read_identifiers(ctx, &region, &identifiers).await {
+                    Ok(selected) => Some(selected),
+                    Err(reason) => return Err(invalid(reason)),
+                }
+            }
+            None => None,
+        };
+        let fitted: Vec<crate::state::series::FittedSeries> = match &selected {
+            // "Forecast creation is skipped for any time series that you specify that
+            // are not in the input dataset", so a selector narrows the forecast and
+            // never adds a series the predictor has no model for.
+            Some(identifiers) => predictor
+                .fitted
+                .iter()
+                .filter(|model| {
+                    crate::state::series::is_selected(&model.dimensions, identifiers)
+                })
+                .cloned()
+                .collect(),
+            None => predictor.fitted.clone(),
+        };
+        if fitted.is_empty() {
+            return Err(invalid(format!(
+                "None of the time series the predictor {} was trained on were selected, \
+                 so there is nothing to forecast.",
+                predictor.arn
+            )));
+        }
+
+        // The POINTS this forecast would materialise: every factor of the product is
+        // bounded on its own, but it is the product one request allocates and the
+        // runtime store keeps. Checked HERE, before a single point is built, so a
+        // forecast past the bound costs no allocation — and checked again under the
+        // lock that inserts it, so two concurrent creates cannot both land past the
+        // store-wide total. A per-account resource limit is what
+        // `LimitExceededException` answers.
+        let points = crate::state::forecast_point_count(
+            fitted.len(),
+            &forecast_types,
+            predictor.forecast_horizon,
+        );
+        let rejection = crate::state::forecast_points_rejection(&state.lock(), points);
+        if let Some(reason) = rejection {
+            return Err(limit_exceeded(reason));
+        }
+
+        let record = crate::state::Forecast {
+            arn: arn.clone(),
+            name: input.forecast_name,
+            predictor_arn: predictor.arn.clone(),
+            dataset_group_arn: predictor.dataset_group_arn.clone(),
+            forecast_types,
+            time_series_selector: input.time_series_selector,
+            fitted: fitted.clone(),
+            points,
+            lifecycle: crate::state::Lifecycle::succeeded(now),
+            tags: input.tags.unwrap_or_default(),
+        };
+        // The predictions, computed from the fitted history alone.
+        let stored = match crate::state::stored_predictions(
+            &record.arn,
+            &record.name,
+            &record.forecast_types,
+            &predictor,
+            &fitted,
+            record.lifecycle.settled_at,
+        ) {
+            Ok(stored) => stored,
+            Err(reason) => return Err(invalid(reason)),
+        };
+
+        // Every limit this create is judged against, and the insert itself, under ONE
+        // lock acquisition: the selector's object-storage read was awaited without the
+        // lock, so the name, the forecast count and the store-wide point total are all
+        // re-checked here rather than against a store this request saw earlier. Two
+        // concurrent creates therefore cannot both land past a ceiling.
+        {
+            let mut store = state.lock();
+            if store.forecasts.contains_key(&arn) {
+                return Err(CreateForecastErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!(
+                            "A forecast already exists with the name {}.",
+                            record.name
+                        )),
+                    },
+                )
+                .into());
+            }
+            if store.forecasts.len() >= crate::state::MAX_FORECASTS {
+                return Err(limit_exceeded(format!(
+                    "You have reached the limit of {} forecasts for this account.",
+                    crate::state::MAX_FORECASTS
+                )));
+            }
+            if let Some(reason) = crate::state::forecast_points_rejection(&store, points) {
+                return Err(limit_exceeded(reason));
+            }
+            store.forecasts.insert(arn.clone(), record);
+        }
+
+        // The runtime store is where `QueryForecast` reads: a forecast this control
+        // plane cannot publish is a forecast no client could ever query, so the create
+        // is not answered as accepted and the record it would have described is
+        // withdrawn again.
+        if !crate::state::publish_forecast(&*self.engine, stored) {
+            state.lock().forecasts.remove(&arn);
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateForecast"));
+        }
+
+        Ok(CreateForecastOutput {
+            forecast_arn: Some(arn),
+        })
     }
+}
+
+/// The modelled `InvalidInputException` (HTTP 400) a request this service cannot
+/// create a forecast from is refused with.
+fn invalid(message: impl Into<String>) -> CreateForecastError {
+    CreateForecastErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled `LimitExceededException` (HTTP 409) a create past one of this store's
+/// ceilings is refused with.
+fn limit_exceeded(message: impl Into<String>) -> CreateForecastError {
+    CreateForecastErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message.into()),
+    })
+    .into()
 }

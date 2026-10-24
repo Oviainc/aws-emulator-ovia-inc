@@ -202,7 +202,7 @@ pub(crate) async fn register(h: &Harness, body: &Value) -> Reply {
     call(h, "/identity-provider/RegisterIdentityProvider", body).await
 }
 
-async fn deregister(h: &Harness, body: &Value) -> Reply {
+pub(crate) async fn deregister(h: &Harness, body: &Value) -> Reply {
     call(h, "/identity-provider/DeregisterIdentityProvider", body).await
 }
 

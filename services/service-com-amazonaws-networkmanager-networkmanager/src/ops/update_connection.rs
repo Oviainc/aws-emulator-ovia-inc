@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates the mutable information of an existing connection in place and returns the
+//! stored record; this is the only file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A connection is addressed through its owning global network, so an unknown
+//! `GlobalNetworkId`, or a `ConnectionId` that global network does not hold, is a 404
+//! `ResourceNotFoundException`. Only the members the request carries are written: an
+//! absent member leaves the stored value alone, and a member the request supplies
+//! REPLACES it — including with an empty string, which is how the service documents
+//! removing information ("To remove information for any of the parameters, specify an
+//! empty string"). A link reference the request supplies is resolved within the same
+//! global network first, so no update can leave the record pointing at a link that is not
+//! there. The record's identity (ids, ARN, the two devices, `CreatedAt`, tags and the
+//! clock-derived lifecycle state) is never rewritten here.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +160,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConnection"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateConnectionErrorModeled::InternalServerException(InternalServerException {
+                message: "the networkmanager store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let mut store = state.lock();
+
+        // The update acts on an EXISTING resource addressed by its path, so a parent the
+        // store does not hold is the missing-resource answer (404), not a field failure.
+        if !store.global_networks.contains_key(&input.global_network_id) {
+            return Err(UpdateConnectionErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::GLOBAL_NETWORK_KIND,
+                    &input.global_network_id,
+                ),
+            )
+            .into());
+        }
+
+        // A connection is addressed through its global network, so one stored under a
+        // different parent is not found here either. The resource the path names is
+        // resolved BEFORE the request's own members are judged, so a call that addresses
+        // nothing is answered as not found whatever body it carries.
+        let addressed = store
+            .connections
+            .get(&input.connection_id)
+            .is_some_and(|record| record.global_network_id == input.global_network_id);
+        if !addressed {
+            return Err(UpdateConnectionErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::CONNECTION_KIND,
+                    &input.connection_id,
+                ),
+            )
+            .into());
+        }
+
+        // A link member the request supplies is a reference, resolved WITHIN the global
+        // network that owns the connection exactly as `CreateConnection` resolves the one
+        // its input carries, so no update can leave the stored record pointing at a link
+        // this global network does not hold. The empty string is the documented REMOVAL of
+        // the information the member held ("To remove information for any of the
+        // parameters, specify an empty string", `smithy_query query="doc"
+        // shape="UpdateConnection"`), so it names no link and resolves nothing.
+        for (member, link_id) in [
+            (crate::state::FIELD_LINK_ID, input.link_id.as_deref()),
+            (
+                crate::state::FIELD_CONNECTED_LINK_ID,
+                input.connected_link_id.as_deref(),
+            ),
+        ] {
+            let Some(link_id) = link_id.filter(|supplied| !supplied.is_empty()) else {
+                continue;
+            };
+            let resolves = store
+                .links
+                .get(link_id)
+                .is_some_and(|link| link.global_network_id == input.global_network_id);
+            if !resolves {
+                return Err(UpdateConnectionErrorModeled::ValidationException(
+                    crate::state::unknown_reference(member, crate::state::LINK_KIND),
+                )
+                .into());
+            }
+        }
+
+        // Every refusal above happens before anything is written, so a refused update
+        // leaves the stored record exactly as it was.
+        let record = store
+            .connections
+            .get_mut(&input.connection_id)
+            .filter(|record| record.global_network_id == input.global_network_id)
+            .ok_or_else(|| {
+                UpdateConnectionErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::CONNECTION_KIND,
+                        &input.connection_id,
+                    ),
+                )
+            })?;
+
+        // Only the members the request supplied are changed; an absent member leaves the
+        // stored value alone, and a supplied one replaces it — an empty string is how the
+        // caller removes the information it holds. The two devices, the ids, the ARN,
+        // `CreatedAt`, tags and the clock-derived lifecycle state are never rewritten.
+        if input.description.is_some() {
+            record.description = input.description;
+        }
+        if input.link_id.is_some() {
+            record.link_id = input.link_id;
+        }
+        if input.connected_link_id.is_some() {
+            record.connected_link_id = input.connected_link_id;
+        }
+        let connection = record.to_shape(::std::time::SystemTime::now());
+
+        Ok(UpdateConnectionOutput {
+            connection: Some(connection),
+        })
     }
 }

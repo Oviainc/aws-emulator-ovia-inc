@@ -49,9 +49,14 @@
 //! A constrained member added to the model later has to be added here as well — one call
 //! per member below, each naming the shape the constraint lives on.
 //!
-//! The one refusal that cannot come through here is an ABSENT `@required` member: it is
-//! found while READING the request, so no input value ever exists for a handler to
-//! check, and the framework answers it directly.
+//! The one refusal no HANDLER can make is an ABSENT `@required` member: it is found while
+//! READING the request, so no input value ever exists for a handler to check — the model
+//! makes such a member non-`Option` on the generated input struct, so a request missing it
+//! never becomes one. It is still answered in this service's own modelled shape, through
+//! [`boundary_exception`]: `crate::service`'s per-operation wrapper collects the
+//! framework's own violation for it before the handler would have run, and words it with
+//! the renderer below, so the two refusal paths cannot disagree about the exception's
+//! shape.
 
 use std::sync::LazyLock;
 
@@ -746,13 +751,50 @@ fn report(violations: Violations) -> Result<(), ValidationException> {
 /// another way there. `reason` is the model's `fieldValidationFailed`, which the hook
 /// cannot carry and this shape can.
 pub fn constraint_exception(violations: &Violations) -> ValidationException {
-    ValidationException {
-        message: crate::service::constraint_envelope(violations.found())
+    let violations = violations.found();
+    violations_exception(
+        violations,
+        crate::service::constraint_envelope(violations)
             .unwrap_or_else(|| crate::state::INVALID_PARAMETER_VALUES_MESSAGE.to_string()),
+    )
+}
+
+/// The modelled `ValidationException` for a refusal the framework made BEFORE any handler
+/// ran, worded from the violations its own boundary walk produced.
+///
+/// This is the one refusal path no handler can serve — an ABSENT `@required` member, found
+/// while the request is being READ (see this module's header) — and it is answered with
+/// the SAME renderer [`constraint_exception`] uses, so a request refused for an absent
+/// member and one refused for a bad value carry one envelope: the AWS validation report as
+/// `message`, the model-required `reason`, and one `fieldList` entry per violation naming
+/// the member. Nothing here is keyed to an operation or a member: whatever violations the
+/// framework's walk produces are stated, so it holds for every `@required` member of every
+/// operation, top-level or nested in a filter, an identifier or a batch item.
+///
+/// `None` when nothing was refused, and when the set holds a violation class
+/// [`crate::service::constraint_clause`] has no wording for — which leaves that request to
+/// the framework's own envelope rather than inventing a sentence for it.
+pub fn boundary_exception(found: &[Violation]) -> Option<ValidationException> {
+    // The same ceiling every refusal of this service is bounded by: the body renders each
+    // violation twice, so the count a request can cause is capped here too.
+    let capped = &found[..found.len().min(MAX_VIOLATIONS)];
+    // The report is rendered ONCE: the same string decides whether this path states the
+    // refusal at all (an unworded violation class declines the whole refusal, leaving it to
+    // the framework's own envelope) and is the `message` it states.
+    let message = crate::service::constraint_envelope(capped)?;
+    Some(violations_exception(capped, message))
+}
+
+/// The one rendering of a violation set into this service's modelled exception, shared by
+/// both refusal paths: [`constraint_exception`] for the constraints a handler checks and
+/// [`boundary_exception`] for the absence the framework finds. `message` is the report its
+/// caller rendered from the same violations.
+fn violations_exception(violations: &[Violation], message: String) -> ValidationException {
+    ValidationException {
+        message,
         reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
         field_list: Some(
             violations
-                .found()
                 .iter()
                 .map(|violation| {
                     crate::state::validation_field(

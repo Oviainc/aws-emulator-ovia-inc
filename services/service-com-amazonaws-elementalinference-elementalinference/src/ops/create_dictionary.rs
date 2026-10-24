@@ -6,6 +6,11 @@
 //! 202), so it is stored in the transient `CREATING` status with the instant its move
 //! to `AVAILABLE` falls due; the dictionary readers materialise that move.
 //!
+//! Tags supplied here are judged by the same rules as tags supplied to `TagResource`
+//! (`crate::state::invalid_tags_message`): a key outside the modelled `TagKey` bounds,
+//! a key in the reserved `aws:` namespace, or more tags than a resource may carry earn
+//! the modelled `ValidationException` and no dictionary is minted.
+//!
 //! The scaffold's own notes on the operation shape and on reaching state are kept
 //! below, minus the line that recorded this operation as a stub.
 //!
@@ -189,6 +194,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // language; the refusal itself lives in `crate::state` so this handler and
         // `UpdateDictionary` answer it identically.
         if let Some(message) = crate::state::invalid_language_message(&input.language) {
+            return Err(CreateDictionaryErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
+        // A supplied tag map has to be one this service stores before anything is
+        // minted: the rules live in `crate::state` so a tag map earns the same answer
+        // here, in `CreateFeed` and in `TagResource`.
+        if let Some(message) = input
+            .tags
+            .as_ref()
+            .and_then(crate::state::invalid_tags_message)
+        {
             return Err(CreateDictionaryErrorModeled::ValidationException(
                 ValidationException { message },
             )

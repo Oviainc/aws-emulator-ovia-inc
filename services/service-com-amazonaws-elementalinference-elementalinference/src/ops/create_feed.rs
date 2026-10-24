@@ -10,6 +10,11 @@
 //! role this service is asked to PASS, so it is evaluated first: a role that names
 //! another account is denied (`AccessDeniedException`, HTTP 403).
 //!
+//! Tags supplied here are judged by the same rules as tags supplied to `TagResource`
+//! (`crate::state::invalid_tags_message`): a key outside the modelled `TagKey` bounds,
+//! a key in the reserved `aws:` namespace, or more tags than a resource may carry earn
+//! the modelled `ValidationException` and no feed is minted.
+//!
 //! The scaffold's own notes on the operation shape and on reaching state are kept
 //! below, minus the line that recorded this operation as a stub.
 //!
@@ -220,6 +225,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 AccessDeniedException {
                     message: crate::state::CROSS_ACCOUNT_PASS_ROLE_MESSAGE.to_string(),
                 },
+            )
+            .into());
+        }
+
+        // A supplied tag map has to be one this service stores before anything is
+        // minted: the rules live in `crate::state` so a tag map earns the same answer
+        // here, in `CreateDictionary` and in `TagResource`.
+        if let Some(message) = input
+            .tags
+            .as_ref()
+            .and_then(crate::state::invalid_tags_message)
+        {
+            return Err(CreateFeedErrorModeled::ValidationException(
+                ValidationException { message },
             )
             .into());
         }

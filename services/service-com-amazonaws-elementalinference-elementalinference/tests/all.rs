@@ -43,3 +43,5 @@ mod resource_tagging;
 mod response_members;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/supplied_tag_validation.rs"]
+mod supplied_tag_validation;

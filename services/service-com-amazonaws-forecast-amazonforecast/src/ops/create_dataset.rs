@@ -257,6 +257,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 creation_time: now,
                 last_modification_time: now,
                 tags: input.tags.unwrap_or_default(),
+                // No data until an import job runs: this emulator never invents a
+                // history for a dataset nothing was imported into.
+                series: Vec::new(),
+                import_job_arns: Vec::new(),
             },
         );
 

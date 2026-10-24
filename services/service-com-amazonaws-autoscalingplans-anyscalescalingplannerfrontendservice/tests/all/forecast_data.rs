@@ -2,17 +2,17 @@
 
 //! `GetScalingPlanResourceForecastData` over the real wire path.
 //!
-//! Three rules are pinned here, each over a TABLE of requests rather than the one that
+//! Four rules are pinned here, each over a TABLE of requests rather than the one that
 //! exposed them:
 //!
 //! * the forecast WINDOW is checked against its documented limits before any plan is
 //!   looked up, so the same window earns the same verdict whether or not the named plan
-//!   exists — `EndTime` has to be later than `StartTime`, and the window may be at most
-//!   `MAX_FORECAST_WINDOW_DAYS` days wide measured at the granularity the forecast has,
-//!   the `FORECAST_PERIOD_SECONDS` periods containing its two endpoints. WHERE the window
-//!   sits relative to the serving clock decides nothing: a window further back than the
-//!   `MAX_FORECAST_HISTORY_DAYS` availability horizon is a forecast with no data point in
-//!   it, which is the same empty answer every accepted window gets here;
+//!   exists — `EndTime` has to be later than `StartTime`, the window may span at most
+//!   `MAX_FORECAST_WINDOW_DAYS` days measured on the two instants the request carries
+//!   (and nothing coarser), and `StartTime` may be at most `MAX_FORECAST_HISTORY_DAYS`
+//!   days before the current date and time. Nothing bounds how far AHEAD a window reaches;
+//! * `ScalingPlanVersion` has exactly one documented valid value, so every other version
+//!   is refused with the modelled `ValidationException` (HTTP 400) rather than served;
 //! * forecast data is issued for ONE kind of scalable resource — an Auto Scaling group's
 //!   desired capacity — so any other `(ServiceNamespace, ScalableDimension)` pair, and a
 //!   resource id that does not identify a resource of that kind, is refused with the
@@ -30,8 +30,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::ops::get_scaling_plan_resource_forecast_data::{
-    FORECAST_PERIOD_SECONDS, FORECAST_SCALABLE_DIMENSION, FORECAST_SERVICE_NAMESPACE,
-    MAX_FORECAST_HISTORY_DAYS, MAX_FORECAST_WINDOW_DAYS,
+    FORECAST_SCALABLE_DIMENSION, FORECAST_SERVICE_NAMESPACE, MAX_FORECAST_HISTORY_DAYS,
+    MAX_FORECAST_WINDOW_DAYS,
 };
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::ops::types::FORECAST_DATA_TYPE_VALUES;
 
@@ -44,6 +44,11 @@ const OPERATION: &str = "GetScalingPlanResourceForecastData";
 
 /// Seconds in a day, for building windows out of the two documented day counts.
 const DAY: i64 = 86_400;
+
+/// Seconds in an hour, used only to place a window's endpoints at a KNOWN offset inside
+/// one clock hour: the documented widths are measured on the instants themselves, so an
+/// hour is a convenient probe size here and not a granularity any rule rounds to.
+const HOUR: i64 = 3_600;
 
 /// The Auto Scaling group the stored plan of these tests scales. Its id carries the
 /// documented prefix: `ResourceId` "consists of a prefix (autoScalingGroup) followed by
@@ -59,8 +64,14 @@ const STORED_PLAN: &str = "forecast plan";
 /// A plan name this service does not hold.
 const ABSENT_PLAN: &str = "no such plan";
 
-/// The only scaling-plan version this service holds.
+/// The only scaling-plan version the model documents as valid.
 const ONLY_VERSION: i64 = 1;
+
+/// How far from a documented bound a row is placed when the verdict depends on the
+/// SERVING clock: the service reads its own `now` a few milliseconds after this test
+/// builds the request, so a row sits a whole minute inside or past the bound and the
+/// elapsed time cannot flip it.
+const CLOCK_MARGIN_SECONDS: i64 = 60;
 
 /// Now, as the epoch seconds an `awsJson1_1` timestamp is carried as.
 fn now_secs() -> i64 {
@@ -141,24 +152,28 @@ fn datapoints(body: &Value) -> &Vec<Value> {
         .unwrap_or_else(|| panic!("expected Datapoints to be a list, got {body}"))
 }
 
-/// What the window rule answers for one row.
+/// What the window rules answer for one row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
     /// HTTP 200 carrying the required — and empty — `Datapoints` list.
     Accepted,
-    /// HTTP 400 `ValidationException`, because the window is wider than the documented
-    /// maximum.
+    /// HTTP 400 `ValidationException`, because the window spans more than the documented
+    /// maximum duration.
     RefusedAsTooWide,
+    /// HTTP 400 `ValidationException`, because the start is further than the documented
+    /// span before the current date and time.
+    RefusedAsTooOld,
     /// HTTP 400 `ValidationException`, because the end is not after the start.
     RefusedAsOutOfOrder,
 }
 
-/// The start of the forecast period containing now.
+/// The start of the clock hour containing now.
 ///
-/// Every width row below places its two endpoints at a KNOWN offset inside a period, so
-/// the verdict of a row never depends on where in the hour the test happens to run.
-fn current_period_start() -> i64 {
-    now_secs().div_euclid(FORECAST_PERIOD_SECONDS) * FORECAST_PERIOD_SECONDS
+/// Every width row below places its two endpoints at a KNOWN offset inside an hour, so a
+/// row that used to be accepted only because both endpoints fell in hour-aligned periods
+/// seven days apart is exercised whatever time the test happens to run at.
+fn current_hour_start() -> i64 {
+    now_secs().div_euclid(HOUR) * HOUR
 }
 
 /// Assert the verdict of one window on one plan name.
@@ -172,63 +187,73 @@ async fn assert_window_verdict(
 ) {
     let body = asg_request(plan, ONLY_VERSION, "CapacityForecast", window);
     let (status, parsed) = emulator.call(OPERATION, &body).await;
-    match verdict {
-        Verdict::Accepted => {
-            assert_eq!(
-                status, 200,
-                "case {label:?} on {held} ({window:?}): expected HTTP 200, got {status} \
-                 with {parsed}"
-            );
-            assert!(
-                datapoints(&parsed).is_empty(),
-                "case {label:?} on {held} ({window:?}): expected no data points, got {parsed}"
-            );
-        }
-        Verdict::RefusedAsTooWide | Verdict::RefusedAsOutOfOrder => {
-            assert_eq!(
-                (status, error_code(&parsed)),
-                (400, "ValidationException"),
-                "case {label:?} on {held} ({window:?}): expected HTTP 400 \
-                 ValidationException, got {status} with {parsed}"
-            );
-            // The sentence is read only to tell WHICH relation refused the row — the
-            // width rule or the endpoint order — not because a message text is the rule.
-            let message = error_message(&parsed);
-            let names_the_width = message.contains(&format!("{MAX_FORECAST_WINDOW_DAYS} days"));
-            assert_eq!(
-                names_the_width,
-                verdict == Verdict::RefusedAsTooWide,
-                "case {label:?} on {held} ({window:?}): expected the refusal for \
-                 {verdict:?}, got {message:?}"
-            );
-        }
+    if verdict == Verdict::Accepted {
+        assert_eq!(
+            status, 200,
+            "case {label:?} on {held} ({window:?}): expected HTTP 200, got {status} \
+             with {parsed}"
+        );
+        assert!(
+            datapoints(&parsed).is_empty(),
+            "case {label:?} on {held} ({window:?}): expected no data points, got {parsed}"
+        );
+        return;
     }
+
+    assert_eq!(
+        (status, error_code(&parsed)),
+        (400, "ValidationException"),
+        "case {label:?} on {held} ({window:?}): expected HTTP 400 ValidationException, \
+         got {status} with {parsed}"
+    );
+    // The sentence is read only to tell WHICH relation refused the row — the width, the
+    // history span or the endpoint order — not because a message text is the rule.
+    let message = error_message(&parsed);
+    let named = (
+        message.contains(&format!("{MAX_FORECAST_WINDOW_DAYS} days")),
+        message.contains(&format!("{MAX_FORECAST_HISTORY_DAYS} days")),
+    );
+    let expected = match verdict {
+        Verdict::RefusedAsTooWide => (true, false),
+        Verdict::RefusedAsTooOld => (false, true),
+        Verdict::Accepted | Verdict::RefusedAsOutOfOrder => (false, false),
+    };
+    assert_eq!(
+        named, expected,
+        "case {label:?} on {held} ({window:?}): expected the refusal for {verdict:?}, \
+         got {message:?}"
+    );
 }
 
 #[tokio::test]
-async fn the_forecast_window_is_measured_at_the_forecasts_own_granularity() {
+async fn the_forecast_window_width_is_measured_on_the_requested_instants() {
     let week = MAX_FORECAST_WINDOW_DAYS * DAY;
-    let period = FORECAST_PERIOD_SECONDS;
     // Rows differ along what the rule generalises over: the WIDTH of the window, the
-    // ORDER of its two endpoints, and — the dimension the documented day count alone does
-    // not fix — WHERE inside its forecast period each endpoint sits. The documented
-    // maximum is checked at the bound, inside it, and past it; and because the width is
-    // measured between the periods the endpoints fall in, two rows with almost the same
-    // wall-clock width earn opposite verdicts purely by crossing a period boundary.
+    // ORDER of its two endpoints, where inside its clock hour each endpoint sits, and
+    // whether the window lies ahead of or behind now. The documented maximum duration is
+    // probed inside, exactly at, one second past, and far past the bound — including the
+    // overshoots that stay inside one hour, which the duration between the instants
+    // refuses just the same.
     //
-    // `(label, offset of the start inside its period, width in seconds, verdict)`.
-    let cases: [(&str, i64, i64, Verdict); 15] = [
+    // `(label, offset of the start inside the current hour, width in seconds, verdict)`.
+    let cases: [(&str, i64, i64, Verdict); 17] = [
         ("a one-second window", 600, 1, Verdict::Accepted),
         (
-            "a ten-minute window inside a single period",
+            "a ten-minute window inside a single hour",
             600,
             600,
             Verdict::Accepted,
         ),
         (
-            "an hour-long window starting on the period boundary",
+            "an hour-long window starting on the hour",
             0,
-            period,
+            HOUR,
+            Verdict::Accepted,
+        ),
+        (
+            "a window one second inside the documented maximum width",
+            0,
+            week - 1,
             Verdict::Accepted,
         ),
         (
@@ -238,31 +263,43 @@ async fn the_forecast_window_is_measured_at_the_forecasts_own_granularity() {
             Verdict::Accepted,
         ),
         (
-            "a maximum-width window overshooting by a minute inside one period",
+            "a maximum-width window starting mid-hour",
+            1_777,
+            week,
+            Verdict::Accepted,
+        ),
+        (
+            "a window one second past the documented maximum width",
+            0,
+            week + 1,
+            Verdict::RefusedAsTooWide,
+        ),
+        (
+            "a minute past the maximum width, both endpoints inside one hour",
             800,
             week + 60,
-            Verdict::Accepted,
-        ),
-        (
-            "a maximum-width window overshooting to the last second of the period",
-            0,
-            week + period - 1,
-            Verdict::Accepted,
-        ),
-        (
-            "a maximum-width window overshooting into the next period",
-            0,
-            week + period,
             Verdict::RefusedAsTooWide,
         ),
         (
-            "a two-minute overshoot that crosses a period boundary",
-            period - 61,
-            week + 120,
+            "half an hour past the maximum width, both endpoints inside one hour",
+            1_000,
+            week + 1_800,
             Verdict::RefusedAsTooWide,
         ),
         (
-            "a window a day past the documented maximum width",
+            "the last second of the hour past the maximum width",
+            0,
+            week + HOUR - 1,
+            Verdict::RefusedAsTooWide,
+        ),
+        (
+            "an hour past the maximum width",
+            0,
+            week + HOUR,
+            Verdict::RefusedAsTooWide,
+        ),
+        (
+            "a day past the maximum width",
             0,
             week + DAY,
             Verdict::RefusedAsTooWide,
@@ -271,12 +308,6 @@ async fn the_forecast_window_is_measured_at_the_forecasts_own_granularity() {
             "a window ten days wide",
             800,
             10 * DAY,
-            Verdict::RefusedAsTooWide,
-        ),
-        (
-            "a window thirty days wide",
-            0,
-            30 * DAY,
             Verdict::RefusedAsTooWide,
         ),
         (
@@ -311,61 +342,161 @@ async fn the_forecast_window_is_measured_at_the_forecasts_own_granularity() {
     // window is checked before the plan lookup" means.
     for (plan, held) in [(STORED_PLAN, "a stored plan"), (ABSENT_PLAN, "an absent plan")] {
         for (label, start_offset, width, verdict) in cases {
-            let start = current_period_start() + start_offset;
-            assert_window_verdict(
-                &emulator,
-                label,
-                held,
-                plan,
-                (start, start + width),
-                verdict,
-            )
-            .await;
+            let start = current_hour_start() + start_offset;
+            assert_window_verdict(&emulator, label, held, plan, (start, start + width), verdict)
+                .await;
         }
     }
 }
 
 #[tokio::test]
-async fn where_the_window_sits_relative_to_the_clock_does_not_decide_the_verdict() {
+async fn a_start_further_back_than_the_documented_span_is_refused() {
     // One width — a day, well inside the documented maximum — at every position the
-    // request can put it: in the future, around now, inside the documented availability
-    // horizon and far beyond it on both sides. A forecast window carrying no data is the
-    // empty `Datapoints` list, not a refusal, so the service's own clock must not change
-    // any of these verdicts; that is also what makes one fixed request earn one verdict
-    // however long the process has been running.
+    // request can put it: ahead of now, around now, just inside the documented span
+    // before now, just past it, and far past it on both sides. `StartTime` "can be at
+    // most MAX_FORECAST_HISTORY_DAYS days before the current date and time", while
+    // `EndTime` "can accept a date and time that is more than two days in the future",
+    // so only the backward direction is bounded.
     //
-    // `MAX_FORECAST_HISTORY_DAYS` is the documented horizon ("Data points are available
-    // for up to 56 days"), probed one hour inside it, one hour past it, and far past it.
-    let cases: [(&str, i64); 8] = [
-        ("a window starting now", 0),
-        ("a window two days ahead, the documented forecast horizon", 2 * DAY),
-        ("a window a week ahead", 7 * DAY),
-        ("a window a year ahead", 365 * DAY),
-        ("a window a week in the past", -7 * DAY),
+    // `(label, offset of the start from now in seconds, verdict)`.
+    let history = MAX_FORECAST_HISTORY_DAYS * DAY;
+    let cases: [(&str, i64, Verdict); 14] = [
+        ("a window starting now", 0, Verdict::Accepted),
         (
-            "a window one hour inside the availability horizon",
-            -(MAX_FORECAST_HISTORY_DAYS * DAY) + FORECAST_PERIOD_SECONDS,
+            "a window two days ahead, the documented forecast horizon",
+            2 * DAY,
+            Verdict::Accepted,
+        ),
+        ("a window a week ahead", 7 * DAY, Verdict::Accepted),
+        ("a window a year ahead", 365 * DAY, Verdict::Accepted),
+        ("a window an hour in the past", -HOUR, Verdict::Accepted),
+        ("a window a week in the past", -7 * DAY, Verdict::Accepted),
+        ("a window thirty days in the past", -30 * DAY, Verdict::Accepted),
+        (
+            "a window an hour inside the documented span",
+            -history + HOUR,
+            Verdict::Accepted,
         ),
         (
-            "a window one hour past the availability horizon",
-            -(MAX_FORECAST_HISTORY_DAYS * DAY) - FORECAST_PERIOD_SECONDS,
+            "a window a minute inside the documented span",
+            -history + CLOCK_MARGIN_SECONDS,
+            Verdict::Accepted,
         ),
-        ("a window a year in the past", -365 * DAY),
+        (
+            "a window a minute past the documented span",
+            -history - CLOCK_MARGIN_SECONDS,
+            Verdict::RefusedAsTooOld,
+        ),
+        (
+            "a window an hour past the documented span",
+            -history - HOUR,
+            Verdict::RefusedAsTooOld,
+        ),
+        (
+            "a window a hundred days in the past",
+            -100 * DAY,
+            Verdict::RefusedAsTooOld,
+        ),
+        (
+            "a window two hundred days in the past",
+            -200 * DAY,
+            Verdict::RefusedAsTooOld,
+        ),
+        (
+            "a window a year in the past",
+            -365 * DAY,
+            Verdict::RefusedAsTooOld,
+        ),
     ];
 
     let emulator = with_stored_plan().await;
     for (plan, held) in [(STORED_PLAN, "a stored plan"), (ABSENT_PLAN, "an absent plan")] {
-        for (label, start_offset) in cases {
-            let start = current_period_start() + start_offset;
-            assert_window_verdict(
-                &emulator,
-                label,
-                held,
-                plan,
-                (start, start + DAY),
-                Verdict::Accepted,
-            )
-            .await;
+        for (label, start_offset, verdict) in cases {
+            let start = now_secs() + start_offset;
+            assert_window_verdict(&emulator, label, held, plan, (start, start + DAY), verdict)
+                .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_too_wide_window_is_refused_on_its_width_wherever_it_sits() {
+    // The two window rules are independent: a window that breaks the width rule is
+    // refused on the width whether it lies ahead of now, around now, or further back than
+    // the documented span — so neither rule hides the other.
+    let week = MAX_FORECAST_WINDOW_DAYS * DAY;
+    let history = MAX_FORECAST_HISTORY_DAYS * DAY;
+    let cases: [(&str, i64); 4] = [
+        ("a too-wide window starting a year ahead", 365 * DAY),
+        ("a too-wide window starting now", 0),
+        ("a too-wide window inside the documented span", -history / 2),
+        ("a too-wide window past the documented span", -300 * DAY),
+    ];
+
+    let emulator = with_stored_plan().await;
+    for (label, start_offset) in cases {
+        let start = now_secs() + start_offset;
+        assert_window_verdict(
+            &emulator,
+            label,
+            "a stored plan",
+            STORED_PLAN,
+            (start, start + week + 1),
+            Verdict::RefusedAsTooWide,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn only_the_documented_scaling_plan_version_is_accepted() {
+    // `ScalingPlanVersion` is a long (`smithy_query(query="shape",
+    // shape="ScalingPlanVersion")`) documented as "Currently, the only valid value is 1",
+    // so the rows differ in version MAGNITUDE and SIGN across that type's whole range:
+    // zero, the next version up, a negative version, a version past 32 bits and both
+    // extremes of the type.
+    let cases: [(&str, i64, bool); 7] = [
+        ("the only documented version", ONLY_VERSION, true),
+        ("version zero", 0, false),
+        ("the next version up", ONLY_VERSION + 1, false),
+        ("a negative version", -7, false),
+        ("a version past 32 bits", 4_294_967_296, false),
+        ("the largest long", i64::MAX, false),
+        ("the smallest long", i64::MIN, false),
+    ];
+
+    let emulator = with_stored_plan().await;
+    // Checked against a plan the emulator holds and a name it does not: the version is a
+    // request member, so its verdict does not depend on what is stored.
+    for (plan, held) in [(STORED_PLAN, "a stored plan"), (ABSENT_PLAN, "an absent plan")] {
+        for (label, version, accepted) in cases {
+            let base = now_secs();
+            let body = asg_request(plan, version, "CapacityForecast", (base, base + HOUR));
+            let (status, parsed) = emulator.call(OPERATION, &body).await;
+            if accepted {
+                assert_eq!(
+                    status, 200,
+                    "case {label:?} ({version}) on {held}: expected HTTP 200, got {status} \
+                     with {parsed}"
+                );
+                assert!(
+                    datapoints(&parsed).is_empty(),
+                    "case {label:?} ({version}) on {held}: expected no data points, got {parsed}"
+                );
+                continue;
+            }
+            assert_eq!(
+                (status, error_code(&parsed)),
+                (400, "ValidationException"),
+                "case {label:?} ({version}) on {held}: expected HTTP 400 \
+                 ValidationException, got {status} with {parsed}"
+            );
+            let message = error_message(&parsed);
+            assert!(
+                message.contains("ScalingPlanVersion"),
+                "case {label:?} ({version}) on {held}: the refusal must name the member it \
+                 is about, got {message:?}"
+            );
         }
     }
 }
@@ -450,7 +581,7 @@ async fn only_an_auto_scaling_group_desired_capacity_is_forecast() {
             ONLY_VERSION,
             (namespace, resource_id, dimension),
             "CapacityForecast",
-            (base, base + 3_600),
+            (base, base + HOUR),
         );
         let (status, parsed) = emulator.call(OPERATION, &body).await;
         assert_eq!(
@@ -473,7 +604,7 @@ async fn a_forecast_data_type_outside_the_modelled_enum_is_refused() {
         "CapacityForecasts",
     ] {
         let base = now_secs();
-        let body = asg_request(STORED_PLAN, ONLY_VERSION, label, (base, base + 3_600));
+        let body = asg_request(STORED_PLAN, ONLY_VERSION, label, (base, base + HOUR));
         let (status, parsed) = emulator.call(OPERATION, &body).await;
         assert_eq!(
             (status, error_code(&parsed)),
@@ -508,29 +639,24 @@ async fn every_modelled_forecast_data_type_reports_an_empty_forecast() {
         .await;
     emulator.make_all_due();
 
-    // Rows differ along what the lookup generalises over: whether the plan is held, the
-    // version asked for, and whether the plan that is held covers the named resource.
-    let lookups: [(&str, &str, i64); 4] = [
-        ("a plan that covers the resource", STORED_PLAN, ONLY_VERSION),
-        ("a plan this service does not hold", ABSENT_PLAN, ONLY_VERSION),
-        (
-            "a version this service does not hold",
-            STORED_PLAN,
-            ONLY_VERSION + 1,
-        ),
-        ("a plan that covers another resource", "other plan", ONLY_VERSION),
+    // Rows differ along what the lookup generalises over: whether the plan is held and
+    // whether the plan that is held covers the named resource.
+    let lookups: [(&str, &str); 3] = [
+        ("a plan that covers the resource", STORED_PLAN),
+        ("a plan this service does not hold", ABSENT_PLAN),
+        ("a plan that covers another resource", "other plan"),
     ];
 
     // Source: `smithy_query(query="shape",shape="ForecastDataType")`, mirrored in
     // `src/ops/types/shared_types.rs` as `FORECAST_DATA_TYPE_VALUES` — every value,
     // including the two scheduled-action ones the issue did not cite.
     for data_type in FORECAST_DATA_TYPE_VALUES {
-        for (label, plan, version) in lookups {
+        for (label, plan) in lookups {
             let base = now_secs();
             let parsed = emulator
                 .ok(
                     OPERATION,
-                    asg_request(plan, version, data_type, (base, base + DAY)),
+                    asg_request(plan, ONLY_VERSION, data_type, (base, base + DAY)),
                 )
                 .await;
             assert!(

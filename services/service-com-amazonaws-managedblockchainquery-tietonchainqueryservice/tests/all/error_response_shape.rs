@@ -1217,7 +1217,11 @@ async fn a_listed_asset_contract_is_the_one_get_asset_contract_returns() {
 /// The two networks a table row needs: one Ethereum network (which has contracts) and
 /// one Bitcoin network (which has none, and is the only one that accepts a
 /// `transactionId`). Both are read out of the ledger the emulator serves.
-fn networks(emulator: &Emulator) -> (NetworkFixture, NetworkFixture) {
+///
+/// `pub(crate)` because the sibling suite that tables this service's OTHER refusal class
+/// (`absent_required_member`) needs the same two rows, rather than finding them its own
+/// way.
+pub(crate) fn networks(emulator: &Emulator) -> (NetworkFixture, NetworkFixture) {
     let mut ethereum = None;
     let mut bitcoin = None;
     for network in emulator.fixture() {

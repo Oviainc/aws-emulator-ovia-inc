@@ -17,10 +17,11 @@
 //! Three things it refuses, each with one of the operation's own modelled errors: an
 //! ARN that is not the ARN a stored resource carries (`ResourceNotFoundException`), a
 //! resource whose deletion has already been accepted (`ConflictException`, as every
-//! other mutation of a record on its way out is refused), and a request whose tags
-//! would take the resource past the tag cap or whose key is outside the modelled
-//! `TagKey` bounds (`ValidationException`; see `crate::state::MAX_TAGS_PER_RESOURCE`
-//! and `crate::state::TAG_KEY_MIN_LENGTH` for why each is decided here).
+//! other mutation of a record on its way out is refused), and a tag map this service
+//! does not store — a key outside the modelled `TagKey` bounds, a key in the reserved
+//! `aws:` namespace, or tags that would take the resource past the tag cap
+//! (`ValidationException`; the shared rules live in
+//! `crate::state::invalid_tags_message`).
 //!
 //! ## Shape of an operation
 //!
@@ -203,23 +204,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The request's own validity is decided before any resource is looked up, so a
-        // malformed tag is refused whatever the ARN names. A `TagMap`'s KEY is the one
-        // constrained value the boundary walk does not reach, so its modelled `@length`
-        // is enforced here (`crate::state::TAG_KEY_MIN_LENGTH`); `@length` counts
-        // characters, not bytes, exactly as the boundary does.
-        if let Some(length) = input
-            .tags
-            .keys()
-            .map(|key| key.chars().count())
-            .find(|length| {
-                !(crate::state::TAG_KEY_MIN_LENGTH..=crate::state::TAG_KEY_MAX_LENGTH)
-                    .contains(length)
-            })
-        {
+        // tag map this service does not store is refused whatever the ARN names. The
+        // rules are shared with the operations that take tags at create time, so one
+        // supplied tag map is judged the same way wherever it arrives.
+        if let Some(message) = crate::state::invalid_tags_message(&input.tags) {
             return Err(TagResourceErrorModeled::ValidationException(
-                ValidationException {
-                    message: crate::state::invalid_tag_key_message(length),
-                },
+                ValidationException { message },
             )
             .into());
         }
