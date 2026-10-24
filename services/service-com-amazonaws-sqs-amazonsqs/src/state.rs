@@ -21,6 +21,16 @@
 //! by [`Queue::materialise_due`], so the three `ApproximateNumberOfMessages*`
 //! attributes are counts over real state rather than made-up values.
 //!
+//! # Message movement tasks
+//!
+//! `StartMessageMoveTask` takes the messages a dead-letter queue can hand out and puts
+//! them in the destination queue, each one deliverable at the instant the task's rate
+//! schedules it, and records a [`MessageMoveTask`] in
+//! [`ComAmazonawsSqsAmazonsqsState::message_move_tasks`]. The task's progress is a
+//! function of that record and the clock — [`MessageMoveTask::messages_moved`] and
+//! [`MessageMoveTask::status`] — so no handler stores a status it then has to keep up
+//! to date.
+//!
 //! Everything a caller can make this in-memory store hold is bounded — see the
 //! "Store bounds" section — and a bound is REFUSED rather than enforced by eviction,
 //! because dropping a message a client was told had been accepted would lose it.
@@ -31,8 +41,9 @@ use std::time::{Duration, SystemTime};
 use md5::{Digest, Md5};
 
 use crate::ops::types::{
-    InvalidAttributeName, InvalidAttributeValue, MessageAttributeValue, QueueDoesNotExist,
-    ReceiptHandleIsInvalid, UnsupportedOperation, QUEUE_ATTRIBUTE_NAME_VALUES,
+    InvalidAddress, InvalidAttributeName, InvalidAttributeValue, MessageAttributeValue,
+    QueueDoesNotExist, ReceiptHandleIsInvalid, ResourceNotFoundException, UnsupportedOperation,
+    QUEUE_ATTRIBUTE_NAME_VALUES,
 };
 
 /// The region an ARN carries when the request names none (an unsigned call, which
@@ -267,7 +278,7 @@ pub const SETTABLE_ATTRIBUTES: &[AttributeSpec] = &[
     AttributeSpec {
         // "The string that includes the parameters for the dead-letter queue
         // functionality of the source queue as a JSON object."
-        name: "RedrivePolicy",
+        name: REDRIVE_POLICY,
         kind: AttributeKind::Json,
         create_only: false,
         fifo_only: false,
@@ -304,6 +315,9 @@ pub const MAXIMUM_MESSAGE_SIZE: &str = "MaximumMessageSize";
 pub const MESSAGE_RETENTION_PERIOD: &str = "MessageRetentionPeriod";
 pub const RECEIVE_MESSAGE_WAIT_TIME_SECONDS: &str = "ReceiveMessageWaitTimeSeconds";
 pub const VISIBILITY_TIMEOUT: &str = "VisibilityTimeout";
+/// The attribute that makes a queue a dead-letter SOURCE queue: it names the queue its
+/// messages are driven to.
+pub const REDRIVE_POLICY: &str = "RedrivePolicy";
 
 /// The inclusive `(min, max)` the documentation gives integer attribute `name`, from
 /// [`SETTABLE_ATTRIBUTES`] — the one place those bounds are written.
@@ -438,6 +452,9 @@ impl StoredMessage {
 pub struct ComAmazonawsSqsAmazonsqsState {
     /// Every queue that exists, keyed by `QueueName`.
     pub queues: BTreeMap<String, Queue>,
+    /// The message movement tasks `StartMessageMoveTask` has started, oldest first.
+    /// Bounded per source queue by [`MAX_MESSAGE_MOVE_TASKS_PER_QUEUE`].
+    pub message_move_tasks: Vec<MessageMoveTask>,
 }
 
 /// A stored queue: the state the reported `Attributes` map is rebuilt from, plus the
@@ -605,10 +622,25 @@ impl Queue {
     /// The bounds are refused rather than enforced by eviction: silently dropping the
     /// oldest message would lose a message a client was told had been accepted.
     pub fn message_rejection(&self, message_bytes: usize, store_bytes: usize) -> Option<String> {
-        if self.messages.len() >= MAX_MESSAGES_PER_QUEUE {
+        self.batch_rejection(1, message_bytes, store_bytes)
+    }
+
+    /// Why this queue cannot take `count` more messages retaining `message_bytes`
+    /// together, given the store already holds `store_bytes` — or `None` when it can.
+    ///
+    /// The whole batch is judged at once, so a call that adds several messages (a
+    /// batch send, or the messages a message movement task hands over) is either
+    /// accepted entirely or refused entirely, never half-applied.
+    pub fn batch_rejection(
+        &self,
+        count: usize,
+        message_bytes: usize,
+        store_bytes: usize,
+    ) -> Option<String> {
+        if self.messages.len().saturating_add(count) > MAX_MESSAGES_PER_QUEUE {
             return Some(format!(
                 "This emulator holds at most {MAX_MESSAGES_PER_QUEUE} messages per queue; \
-                 queue {} is full. Delete messages from it first.",
+                 queue {} cannot take {count} more. Delete messages from it first.",
                 self.name
             ));
         }
@@ -661,6 +693,225 @@ impl ComAmazonawsSqsAmazonsqsState {
         let name = queue_name_from_url(queue_url)?.to_string();
         self.queues.remove(&name)
     }
+
+    /// The names of the queues whose `RedrivePolicy` names the queue called
+    /// `dead_letter_queue_name` as their dead-letter target, in queue-name order.
+    ///
+    /// These are that queue's dead-letter SOURCE queues, and having at least one is
+    /// what makes it "configured as a dead-letter queue (DLQ) of other Amazon SQS
+    /// queues" — the only kind of source `StartMessageMoveTask` supports.
+    pub fn dead_letter_source_queue_names(&self, dead_letter_queue_name: &str) -> Vec<String> {
+        self.queues
+            .values()
+            .filter(|queue| {
+                queue
+                    .attributes
+                    .get(REDRIVE_POLICY)
+                    .and_then(|policy| dead_letter_target_arn(policy))
+                    .and_then(|arn| queue_name_from_arn(&arn).map(str::to_string))
+                    .is_some_and(|target| target == dead_letter_queue_name)
+            })
+            .map(|queue| queue.name.clone())
+            .collect()
+    }
+
+    /// The message movement task that is still running for the queue called
+    /// `source_queue_name` at `now`, if any: "Only one active message movement task is
+    /// supported per queue at any given time" (`StartMessageMoveTask`).
+    pub fn active_message_move_task(
+        &self,
+        source_queue_name: &str,
+        now: SystemTime,
+    ) -> Option<&MessageMoveTask> {
+        self.message_move_tasks.iter().find(|task| {
+            task.source_queue_name == source_queue_name && task.status(now) == MESSAGE_MOVE_RUNNING
+        })
+    }
+
+    /// Record a started message movement task, keeping at most
+    /// [`MAX_MESSAGE_MOVE_TASKS_PER_QUEUE`] records per source queue and
+    /// [`MAX_MESSAGE_MOVE_TASKS`] in all.
+    ///
+    /// Beyond either bound the OLDEST record is dropped, not refused:
+    /// `ListMessageMoveTasks` reports "the most recent message movement tasks (up to 10)
+    /// under a specific source queue", so nothing a caller can still list is lost, and a
+    /// caller looping on `StartMessageMoveTask` cannot grow this store without end.
+    ///
+    /// The per-queue bound is counted on [`MessageMoveTask::source_queue_name`] — the
+    /// queue the start call RESOLVED, never a string the request supplied — so every
+    /// request naming one queue shares one allowance. The store-wide bound is the
+    /// backstop for the names of queues that no longer exist, which no per-queue count
+    /// can limit.
+    pub fn record_message_move_task(&mut self, task: MessageMoveTask) {
+        let source_queue_name = task.source_queue_name.clone();
+        self.message_move_tasks.push(task);
+        while self
+            .message_move_tasks
+            .iter()
+            .filter(|recorded| recorded.source_queue_name == source_queue_name)
+            .count()
+            > MAX_MESSAGE_MOVE_TASKS_PER_QUEUE
+        {
+            let Some(oldest) = self
+                .message_move_tasks
+                .iter()
+                .position(|recorded| recorded.source_queue_name == source_queue_name)
+            else {
+                break;
+            };
+            self.message_move_tasks.remove(oldest);
+        }
+        while self.message_move_tasks.len() > MAX_MESSAGE_MOVE_TASKS {
+            self.message_move_tasks.remove(0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Message movement tasks
+// ---------------------------------------------------------------------------
+
+/// The largest message movement rate `StartMessageMoveTask` accepts: "The maximum value
+/// for messages per second is 500"
+/// (`StartMessageMoveTaskRequest$MaxNumberOfMessagesPerSecond`).
+pub const MAX_MESSAGES_PER_SECOND: i32 = 500;
+
+/// How long after the start call the first moved message becomes deliverable in the
+/// destination queue.
+///
+/// `StartMessageMoveTask` "starts an asynchronous task": it answers with a task handle
+/// before the task has delivered anything, so this emulator owes the first delivery a
+/// short span after the call rather than at it — a consumer polling the destination
+/// queue straight away still sees the task running and none of its messages yet.
+pub const MESSAGE_MOVE_TASK_START_DELAY: Duration = Duration::from_millis(500);
+
+/// How many message movement task records one source queue keeps: "Gets the most recent
+/// message movement tasks (up to 10) under a specific source queue"
+/// (`ListMessageMoveTasks`).
+pub const MAX_MESSAGE_MOVE_TASKS_PER_QUEUE: usize = 10;
+
+/// How many message movement task records the whole store holds. The per-queue bound
+/// alone would still scale with the number of queue NAMES that have ever existed, which
+/// a caller creating and deleting queues can grow; this bounds them all together.
+pub const MAX_MESSAGE_MOVE_TASKS: usize = MAX_QUEUES * MAX_MESSAGE_MOVE_TASKS_PER_QUEUE;
+
+/// Nanoseconds in one second, so a rate in messages per second becomes a span per
+/// message without a floating-point division.
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
+
+/// A message movement task's status while it still has messages to deliver. The status
+/// set is the member's own: "Possible values are: RUNNING, COMPLETED, CANCELLING,
+/// CANCELLED, and FAILED" (`ListMessageMoveTasksResultEntry$Status`).
+pub const MESSAGE_MOVE_RUNNING: &str = "RUNNING";
+
+/// A message movement task's status once every message it took has been delivered.
+pub const MESSAGE_MOVE_COMPLETED: &str = "COMPLETED";
+
+/// One message movement task `StartMessageMoveTask` started.
+///
+/// The record holds only what the start call RESOLVED — the queues it found, the rate and
+/// how many messages the task took — and nothing a request supplied verbatim: each queue
+/// is held as the `QueueName` its ARN resolved to, which is the identity every reader and
+/// every bound keys on, and the ARNs a reader reports are projected from those queue
+/// records rather than stored a second time. How far the task has got is computed from
+/// this record and the clock by [`messages_moved`](Self::messages_moved) and
+/// [`status`](Self::status), so no two readers can disagree about a task's progress.
+#[derive(Debug, Clone)]
+pub struct MessageMoveTask {
+    /// The opaque handle the start call returned, which `CancelMessageMoveTask` names.
+    pub task_handle: String,
+    /// The name of the dead-letter queue the messages were taken from.
+    pub source_queue_name: String,
+    /// The name of the queue they are being delivered to.
+    pub destination_queue_name: String,
+    /// The message movement rate the caller fixed, or `None` when it left the rate to
+    /// the service ("the system will optimize the rate based on the queue message
+    /// backlog size").
+    pub max_number_of_messages_per_second: Option<i32>,
+    /// When the start call accepted the task.
+    pub started_at: SystemTime,
+    /// How many messages the task took from the source queue.
+    pub message_count: u64,
+}
+
+impl MessageMoveTask {
+    /// When the `index`-th message of this task becomes deliverable: the start delay,
+    /// then one message per rate slot. With no rate fixed, every message is deliverable
+    /// at the end of the start delay.
+    pub fn delivery_instant(&self, index: u64) -> SystemTime {
+        let first = self
+            .started_at
+            .checked_add(MESSAGE_MOVE_TASK_START_DELAY)
+            .unwrap_or(self.started_at);
+        let Some(rate) = self
+            .max_number_of_messages_per_second
+            .and_then(|rate| u64::try_from(rate).ok())
+            .filter(|rate| *rate > 0)
+        else {
+            return first;
+        };
+        let nanos =
+            u64::try_from(u128::from(index) * NANOS_PER_SECOND / u128::from(rate))
+                .unwrap_or(u64::MAX);
+        first
+            .checked_add(Duration::from_nanos(nanos))
+            .unwrap_or(first)
+    }
+
+    /// When the last message this task took becomes deliverable, which is when the task
+    /// is done.
+    pub fn completes_at(&self) -> SystemTime {
+        self.delivery_instant(self.message_count.saturating_sub(1))
+    }
+
+    /// How many of this task's messages have been delivered by `now`.
+    pub fn messages_moved(&self, now: SystemTime) -> u64 {
+        let Ok(elapsed) = now.duration_since(self.delivery_instant(0)) else {
+            return 0;
+        };
+        let Some(rate) = self
+            .max_number_of_messages_per_second
+            .and_then(|rate| u64::try_from(rate).ok())
+            .filter(|rate| *rate > 0)
+        else {
+            return self.message_count;
+        };
+        let delivered = u64::try_from(elapsed.as_nanos() * u128::from(rate) / NANOS_PER_SECOND)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        delivered.min(self.message_count)
+    }
+
+    /// How many of this task's messages are still to be delivered at `now`.
+    pub fn messages_to_move(&self, now: SystemTime) -> u64 {
+        self.message_count.saturating_sub(self.messages_moved(now))
+    }
+
+    /// This task's status at `now`: it runs until the last message it took is
+    /// deliverable, and is completed from that instant on.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now >= self.completes_at() {
+            MESSAGE_MOVE_COMPLETED
+        } else {
+            MESSAGE_MOVE_RUNNING
+        }
+    }
+}
+
+/// The `deadLetterTargetArn` a `RedrivePolicy` attribute value names, or `None` when
+/// the value is not a JSON object carrying one.
+///
+/// "The string that includes the parameters for the dead-letter queue functionality of
+/// the source queue as a JSON object", whose `deadLetterTargetArn` is "the Amazon
+/// Resource Name (ARN) of the dead-letter queue to which Amazon SQS moves messages
+/// after the value of maxReceiveCount is exceeded" (the `RedrivePolicy` attribute's own
+/// documentation).
+pub fn dead_letter_target_arn(policy: &str) -> Option<String> {
+    ::serde_json::from_str::<::serde_json::Value>(policy)
+        .ok()?
+        .get("deadLetterTargetArn")?
+        .as_str()
+        .map(ToString::to_string)
 }
 
 /// A `SystemTime` as the whole seconds since the Unix epoch, which is how SQS reports
@@ -735,6 +986,81 @@ pub fn queue_name_from_url(queue_url: &str) -> Option<&str> {
         return None;
     }
     Some(name)
+}
+
+/// The modelled refusal for a `SourceArn` or `DestinationArn` that is not an ARN naming
+/// a queue at all (`InvalidAddress`: "The specified ID is invalid.").
+///
+/// Only the member NAME reaches the payload, never the value it carried.
+pub fn invalid_address(member: &str) -> InvalidAddress {
+    InvalidAddress {
+        message: Some(format!(
+            "The address supplied for the {member} parameter is not a valid Amazon SQS queue ARN."
+        )),
+    }
+}
+
+/// The modelled refusal for a `SourceArn` or `DestinationArn` no queue of this account
+/// answers to, naming the member the caller has to fix.
+///
+/// Only the member NAME reaches the payload, never the value it carried, so a caller
+/// probing for a queue it may not address is never handed its own input back.
+pub fn resource_not_found(member: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "The resource that you specified for the {member} parameter doesn't exist."
+        )),
+    }
+}
+
+/// What a `SourceArn` or `DestinationArn` value names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueArn<'a> {
+    /// An Amazon SQS queue ARN of this account, naming the queue called this.
+    OfThisAccount(&'a str),
+    /// A well-formed ARN, but not one of this account's Amazon SQS queues: no resource
+    /// this emulator holds can answer to it.
+    Elsewhere,
+    /// Not an ARN that names a queue at all.
+    Malformed,
+}
+
+/// Classify the ARN a request supplied.
+///
+/// A queue ARN is `arn:<partition>:sqs:<region>:<accountId>:<QueueName>`, and a queue
+/// name "can have up to 80 characters" (`CreateQueueRequest$QueueName`), so a value with
+/// another segment count, an empty segment or a longer last segment names no queue in any
+/// account. The service and account segments are what single out this account's queues;
+/// the region segment is deliberately NOT matched, exactly as [`queue_name_from_url`]
+/// does not match the endpoint, so a client whose SigV4 scope names one region still
+/// reaches the queue it created under another.
+pub fn parse_queue_arn(arn: &str) -> QueueArn<'_> {
+    let segments: Vec<&str> = arn.split(':').collect();
+    let [prefix, partition, service, region, account, name] = segments[..] else {
+        return QueueArn::Malformed;
+    };
+    if prefix != "arn"
+        || partition.is_empty()
+        || service.is_empty()
+        || region.is_empty()
+        || account.is_empty()
+        || name.is_empty()
+        || name.chars().count() > MAX_QUEUE_NAME_LENGTH
+    {
+        return QueueArn::Malformed;
+    }
+    if service != ARN_SERVICE || account != ::engine::emulator_account_id() {
+        return QueueArn::Elsewhere;
+    }
+    QueueArn::OfThisAccount(name)
+}
+
+/// The `QueueName` a queue ARN of this account addresses, or `None` for any other value.
+pub fn queue_name_from_arn(arn: &str) -> Option<&str> {
+    match parse_queue_arn(arn) {
+        QueueArn::OfThisAccount(name) => Some(name),
+        QueueArn::Elsewhere | QueueArn::Malformed => None,
+    }
 }
 
 /// The message every `QueueDoesNotExist` refusal carries, whatever the request named.

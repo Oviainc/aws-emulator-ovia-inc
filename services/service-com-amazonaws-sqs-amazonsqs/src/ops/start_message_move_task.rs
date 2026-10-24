@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartMessageMoveTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartMessageMoveTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation takes the messages the source dead-letter queue can hand
+//! out, puts them in the destination queue each deliverable at the instant this task's
+//! rate schedules it, and records the task in [`crate::state`] under the handle it
+//! returns. It is the ONLY file to touch for `StartMessageMoveTask`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartMessageMoveTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## How the asynchronous task is modelled here
+//!
+//! The task takes its messages from the source queue when it starts and schedules each
+//! one's delivery in the destination queue at `start + 500 ms + index/rate`, so nothing
+//! sleeps and no background work is owed to a later call: a consumer of the destination
+//! sees the messages arrive over the task's duration, and one polling the instant the
+//! start call answers sees none of them yet. What this does NOT model is a source queue
+//! that drains gradually — the messages leave it when the task starts, so a future
+//! `CancelMessageMoveTask` can return the ones not yet delivered but cannot leave them
+//! where they were.
+//!
+//! Two documented shapes this store cannot answer faithfully are refused rather than
+//! guessed: a blank `DestinationArn` for a dead-letter queue with several source queues
+//! (nothing here records which queue each message came from), and a `SourceArn` that is
+//! not a queue ARN at all.
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +106,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state as sqs;
+use std::collections::VecDeque;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -168,18 +182,263 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartMessageMoveTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartMessageMoveTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartMessageMoveTask"))
+        // Request metadata this call records: the access key id identifies the caller in
+        // the audit record below, the way the real service's trail does.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+
+        // "The maximum value for messages per second is 500"
+        // (StartMessageMoveTaskRequest$MaxNumberOfMessagesPerSecond). A rate of zero or
+        // less would move nothing, so a fixed rate is an integer from 1 to that
+        // maximum; a request that names none leaves the rate to the service.
+        if let Some(rate) = input
+            .max_number_of_messages_per_second
+            .filter(|rate| !(1..=sqs::MAX_MESSAGES_PER_SECOND).contains(rate))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "MaxNumberOfMessagesPerSecond must be an integer from 1 to {}; got {rate}.",
+                sqs::MAX_MESSAGES_PER_SECOND
+            )));
+        }
+
+        // Both ARNs are classified BEFORE the store is reached: a value that names no
+        // queue in any account is not an address this service can resolve, which is what
+        // the modelled `InvalidAddress` ("The specified ID is invalid.") refuses, while a
+        // well-formed ARN of another account or another service names a resource that
+        // simply does not exist here.
+        let source_name = match sqs::parse_queue_arn(&input.source_arn) {
+            sqs::QueueArn::OfThisAccount(name) => name.to_string(),
+            sqs::QueueArn::Elsewhere => {
+                return Err(StartMessageMoveTaskErrorModeled::ResourceNotFoundException(
+                    sqs::resource_not_found("SourceArn"),
+                )
+                .into())
+            }
+            sqs::QueueArn::Malformed => {
+                return Err(StartMessageMoveTaskErrorModeled::InvalidAddress(
+                    sqs::invalid_address("SourceArn"),
+                )
+                .into())
+            }
+        };
+        // "The ARN of the queue that receives the moved messages. ... If this field is
+        // left blank, the messages will be redriven back to their respective original
+        // source queues."
+        let named_destination = match input
+            .destination_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|arn| !arn.is_empty())
+            .map(sqs::parse_queue_arn)
+        {
+            Some(sqs::QueueArn::OfThisAccount(name)) => Some(name.to_string()),
+            Some(sqs::QueueArn::Elsewhere) => {
+                return Err(StartMessageMoveTaskErrorModeled::ResourceNotFoundException(
+                    sqs::resource_not_found("DestinationArn"),
+                )
+                .into())
+            }
+            Some(sqs::QueueArn::Malformed) => {
+                return Err(StartMessageMoveTaskErrorModeled::InvalidAddress(
+                    sqs::invalid_address("DestinationArn"),
+                )
+                .into())
+            }
+            None => None,
+        };
+
+        let store = sqs::service_state(&*self.engine).ok_or_else(|| {
+            StartMessageMoveTaskErrorModeled::UnsupportedOperation(sqs::store_unavailable())
+        })?;
+        let mut state = store.lock();
+
+        let now = SystemTime::now();
+        // Retention lapses and visibility timeouts are owed by the clock, not by this
+        // call: what the task may take is what the source queue can hand out once
+        // everything already due has been applied.
+        state.materialise_due(now);
+
+        if !state.queues.contains_key(&source_name) {
+            return Err(StartMessageMoveTaskErrorModeled::ResourceNotFoundException(
+                sqs::resource_not_found("SourceArn"),
+            )
+            .into());
+        }
+
+        // "This action is currently limited to supporting message redrive from queues
+        // that are configured as dead-letter queues (DLQs) of other Amazon SQS queues
+        // only": the source queue is a DLQ exactly when another queue's RedrivePolicy
+        // names it as its dead-letter target.
+        let dead_letter_sources = state.dead_letter_source_queue_names(&source_name);
+        if dead_letter_sources.is_empty() {
+            return Err(StartMessageMoveTaskErrorModeled::UnsupportedOperation(
+                UnsupportedOperation {
+                    message: Some(
+                        "The source queue must be configured as a dead-letter queue of another \
+                         Amazon SQS queue before a message movement task can move its messages."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // With no destination named, the messages go back to the queue that drives its
+        // messages here. This store records no per-message origin, so the respective
+        // original source queue is determined exactly when the dead-letter queue has a
+        // single source queue; with several of them the task cannot say which queue a
+        // given message came from, so the call is refused rather than guessing one.
+        let destination_name = match named_destination {
+            Some(name) if state.queues.contains_key(&name) => name,
+            Some(_) => {
+                return Err(StartMessageMoveTaskErrorModeled::ResourceNotFoundException(
+                    sqs::resource_not_found("DestinationArn"),
+                )
+                .into())
+            }
+            None if dead_letter_sources.len() == 1 => dead_letter_sources[0].clone(),
+            None => {
+                return Err(StartMessageMoveTaskErrorModeled::UnsupportedOperation(
+                    UnsupportedOperation {
+                        message: Some(format!(
+                            "The source queue is the dead-letter queue of {} queues, so the \
+                             original source queue of each message is not determined: name the \
+                             queue to move the messages to in DestinationArn.",
+                            dead_letter_sources.len()
+                        )),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // "Only one active message movement task is supported per queue at any given
+        // time."
+        if let Some(running) = state.active_message_move_task(&source_name, now) {
+            let task_handle = running.task_handle.clone();
+            let outstanding = running.messages_to_move(now);
+            let message_count = running.message_count;
+            return Err(StartMessageMoveTaskErrorModeled::UnsupportedOperation(
+                UnsupportedOperation {
+                    message: Some(format!(
+                        "A message movement task is already running for this source queue \
+                         ({task_handle}), with {outstanding} of its {message_count} messages \
+                         still to deliver; only one active message movement task is supported \
+                         per queue at any given time."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The task takes the messages the source queue can hand out at the instant it
+        // starts. A message still delayed, or in flight with a consumer, is not the
+        // queue's to give away, so it stays where it is.
+        let source = state.queues.get(&source_name).ok_or_else(|| {
+            StartMessageMoveTaskErrorModeled::ResourceNotFoundException(sqs::resource_not_found(
+                "SourceArn",
+            ))
+        })?;
+        let moving_count = source
+            .messages
+            .iter()
+            .filter(|message| message.visibility(now) == sqs::Visibility::Visible)
+            .count();
+        let moving_bytes = source
+            .messages
+            .iter()
+            .filter(|message| message.visibility(now) == sqs::Visibility::Visible)
+            .map(sqs::StoredMessage::retained_bytes)
+            .fold(0usize, usize::saturating_add);
+
+        // A move does not change what the store holds in total, so the store-wide budget
+        // is measured without the bytes already accounted for in the source queue; the
+        // destination queue's own bounds still apply to what it is handed.
+        let store_bytes = state.retained_message_bytes().saturating_sub(moving_bytes);
+        let destination = state.queues.get(&destination_name).ok_or_else(|| {
+            StartMessageMoveTaskErrorModeled::ResourceNotFoundException(sqs::resource_not_found(
+                "DestinationArn",
+            ))
+        })?;
+        if destination_name != source_name {
+            if let Some(reason) = destination.batch_rejection(moving_count, moving_bytes, store_bytes)
+            {
+                return Err(StartMessageMoveTaskErrorModeled::UnsupportedOperation(
+                    UnsupportedOperation {
+                        message: Some(reason),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let task = sqs::MessageMoveTask {
+            task_handle: sqs::new_identifier(),
+            source_queue_name: source_name.clone(),
+            destination_queue_name: destination_name.clone(),
+            max_number_of_messages_per_second: input.max_number_of_messages_per_second,
+            started_at: now,
+            message_count: u64::try_from(moving_count).unwrap_or(u64::MAX),
+        };
+
+        // Take the messages out of the source queue, with the receipt handles it minted
+        // for them: a receipt handle is only ever valid for the queue that minted it.
+        let mut taken: Vec<sqs::StoredMessage> = Vec::with_capacity(moving_count);
+        {
+            let source = state.queues.get_mut(&source_name).ok_or_else(|| {
+                StartMessageMoveTaskErrorModeled::ResourceNotFoundException(
+                    sqs::resource_not_found("SourceArn"),
+                )
+            })?;
+            let mut staying: VecDeque<sqs::StoredMessage> = VecDeque::new();
+            for message in std::mem::take(&mut source.messages) {
+                if message.visibility(now) == sqs::Visibility::Visible {
+                    source.handles.retain(|_, id| *id != message.message_id);
+                    taken.push(message);
+                } else {
+                    staying.push_back(message);
+                }
+            }
+            source.messages = staying;
+        }
+
+        // Hand them to the destination queue in the order the source held them, each one
+        // deliverable at the instant this task's rate schedules it. The message keeps its
+        // id, body and attributes — it is the same message in another queue — and its
+        // receive count, which counts receives "across all queues"; retention in the
+        // destination runs from the move, which is when that queue took it.
+        let destination = state.queues.get_mut(&destination_name).ok_or_else(|| {
+            StartMessageMoveTaskErrorModeled::ResourceNotFoundException(sqs::resource_not_found(
+                "DestinationArn",
+            ))
+        })?;
+        for (index, message) in taken.into_iter().enumerate() {
+            destination.messages.push_back(sqs::StoredMessage {
+                sent_at: now,
+                available_at: task.delivery_instant(u64::try_from(index).unwrap_or(u64::MAX)),
+                invisible_until: None,
+                ..message
+            });
+        }
+
+        let task_handle = task.task_handle.clone();
+        state.record_message_move_task(task);
+
+        // The audit record for a state change: who, what, where, outcome. No secret and
+        // no credential material — only the access key id and the queues this call
+        // resolved.
+        ::tracing::info!(
+            operation = "StartMessageMoveTask",
+            akid = %akid,
+            source_queue = %source_name,
+            destination_queue = %destination_name,
+            task_handle = %task_handle,
+            message_count = moving_count,
+            outcome = "started",
+            "message movement task started"
+        );
+
+        Ok(StartMessageMoveTaskOutput {
+            task_handle: Some(task_handle),
+        })
     }
 }

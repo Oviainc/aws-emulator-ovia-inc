@@ -21,17 +21,7 @@ use std::time::SystemTime;
 
 use serde_json::{json, Value};
 
-use super::support::{as_map, call, create_ok, emulator, error_code, ok};
-
-/// The `Messages` of a receive reply, as a list — empty when the member is absent,
-/// which is how an empty queue answers.
-fn messages(reply: &Value) -> Vec<Value> {
-    reply
-        .get("Messages")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-}
+use super::support::{as_map, call, create_ok, emulator, error_code, messages, ok};
 
 /// One message's system `Attributes` map.
 fn attributes(message: &Value) -> BTreeMap<String, String> {
