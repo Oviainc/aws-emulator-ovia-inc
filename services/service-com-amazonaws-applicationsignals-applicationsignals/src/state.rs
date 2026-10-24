@@ -27,7 +27,7 @@ use crate::ops::types::{
 // The shapes the time-ranged topology reads project, on their own `use` so this set and the
 // SLO lifecycle's above are edited on separate lines.
 use crate::ops::types::{
-    MetricReference, Service, ServiceDependency, ServiceDependent, ServiceOperation,
+    MetricReference, Service, ServiceDependency, ServiceDependent, ServiceOperation, ServiceSummary,
 };
 
 /// This service's SigV4 signing name, which is also its ARN namespace
@@ -116,6 +116,8 @@ pub const SERVICE_DEPENDENCIES_TOKEN_TAG: &str = "service-dependencies/1/";
 pub const SERVICE_DEPENDENTS_TOKEN_TAG: &str = "service-dependents/1/";
 /// [`SERVICE_OPERATIONS_TOKEN_TAG`], for `ListAuditFindings`.
 pub const AUDIT_FINDINGS_TOKEN_TAG: &str = "audit-findings/1/";
+/// [`SERVICE_OPERATIONS_TOKEN_TAG`], for `ListServices`.
+pub const SERVICES_TOKEN_TAG: &str = "services/1/";
 
 /// Per-service state for com-amazonaws-applicationsignals-applicationsignals. A handler reaches it through [`service_state`].
 ///
@@ -972,6 +974,67 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             metric_references: no_metric_references(),
             log_group_references: None,
         }
+    }
+
+    /// Every service entity this emulator has observed over the window, as `ListServices`
+    /// reports it: one summary per distinct discovered service, in a deterministic order.
+    ///
+    /// The stored SLOs are this emulator's only evidence of a discovered service — it
+    /// receives no instrumentation telemetry — so the discovered set is the set of entities
+    /// the stored SLOs monitor, each over the window it is evidence for
+    /// ([`monitored_in_window`], the same window rule the other topology reads apply). A
+    /// dependency an SLO names is NOT in that set: the edge is evidence that the monitored
+    /// entity calls it, not that Application Signals discovered and instrumented the callee,
+    /// and `ListServiceDependencies` is where the edge is reported.
+    ///
+    /// An identity that is a STRICT SUBSET of another observed identity is not reported
+    /// separately: as few as one of an entity's up to four `Attributes` entries identifies
+    /// it ([`attributes_contain`]), so the subset names the same entity as the fuller set,
+    /// and `GetService` answers for it with exactly that fuller set
+    /// ([`Self::observed_service`]). Reporting both would list one service twice and hand
+    /// the caller a summary whose `KeyAttributes` no `GetService` echoes back.
+    ///
+    /// `MetricReferences` is empty for the reason stated on [`no_metric_references`], and
+    /// `AttributeMaps`/`ServiceGroups` stay absent, exactly as [`Self::observed_service`]
+    /// leaves them: they are platform, grouping and telemetry facts the real service learns
+    /// from an instrumented application, which this emulator never receives.
+    pub fn observed_services(
+        &self,
+        window_start: &DateTime,
+        window_end: &DateTime,
+    ) -> Vec<ServiceSummary> {
+        let mut by_identity: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
+        for slo in self
+            .slos
+            .values()
+            .filter(|slo| monitored_in_window(slo, window_start, window_end))
+        {
+            let Some(attributes) = entity_of(slo).key_attributes else {
+                continue;
+            };
+            // `ServiceSummary.KeyAttributes` is `@required` with `length 1..4`: an SLO whose
+            // indicator names no entity at all is evidence of no service.
+            if attributes.is_empty() {
+                continue;
+            }
+            by_identity.insert(attribute_key(&attributes), attributes);
+        }
+
+        let identities: Vec<HashMap<String, String>> = by_identity.into_values().collect();
+        identities
+            .iter()
+            .filter(|candidate| {
+                !identities.iter().any(|other| {
+                    other.len() > candidate.len() && attributes_contain(Some(other), candidate)
+                })
+            })
+            .map(|key_attributes| ServiceSummary {
+                key_attributes: key_attributes.clone(),
+                attribute_maps: None,
+                service_groups: None,
+                metric_references: no_metric_references(),
+            })
+            .collect()
     }
 
     /// The operations of the entity `key_attributes` identifies, in name order: one entry

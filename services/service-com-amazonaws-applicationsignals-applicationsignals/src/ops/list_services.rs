@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServices
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServices`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServices::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,23 +154,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_SERVICES_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the services this emulator has discovered over the requested period, a page
+    /// at a time.
+    ///
+    /// A read: it projects what the store holds and persists nothing. The range is refused
+    /// when it does not run forwards — a rule about the PAIR of members, so it is enforced
+    /// here rather than by a per-member constraint — and the reported range is the requested
+    /// one, as `GetService` reports it.
+    ///
+    /// The projection is derived in `crate::state`
+    /// ([`crate::state::ComAmazonawsApplicationsignalsApplicationsignalsState::observed_services`]),
+    /// so this read cannot disagree with `GetService` or the other topology reads about the
+    /// same entity: `GetService` on a reported summary's `KeyAttributes` answers with those
+    /// same attributes. The order is the identity's, which is what makes the page cursor a
+    /// stable boundary.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServices` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServicesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServices"))
+        let _ = ctx;
+        if let Some(message) = crate::state::time_range_refusal(&input.start_time, &input.end_time)
+        {
+            return Err(refused(message));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListServicesErrorModeled::ThrottlingException(ThrottlingException {
+                message: crate::state::STATE_UNAVAILABLE.to_string(),
+            })
+            .into());
+        };
+
+        // This emulator holds exactly one account's state, so a request that asks for
+        // another account's selects nothing. For the same reason `IncludeLinkedAccounts` is
+        // not consulted: there is no source account whose services it could add, so the flag
+        // selects nothing extra and the answer is the same either way.
+        let other_account = input
+            .aws_account_id
+            .as_deref()
+            .is_some_and(|account| account != ::engine::emulator_account_id());
+
+        let observed = if other_account {
+            Vec::new()
+        } else {
+            state
+                .lock()
+                .observed_services(&input.start_time, &input.end_time)
+        };
+
+        // `MaxResults` carries the model's own `@default` of 50 and its `range 1..100` is
+        // refused before this handler runs, so the bound is read straight off the input.
+        let (service_summaries, next_token) = crate::state::page_of(
+            observed,
+            crate::state::SERVICES_TOKEN_TAG,
+            input.next_token.as_deref(),
+            input.max_results.max(0) as usize,
+        )
+        .map_err(refused)?;
+
+        Ok(ListServicesOutput {
+            start_time: input.start_time,
+            end_time: input.end_time,
+            service_summaries,
+            next_token,
+        })
     }
+}
+
+/// This operation's modelled refusal of a request it will not serve: `ValidationException`
+/// (HTTP 400), the only client error it declares beyond throttling.
+fn refused(message: String) -> ListServicesError {
+    ListServicesErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }
