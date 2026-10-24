@@ -7,7 +7,8 @@
 //! a transient `UPDATING` status before the clock owes it `ACTIVE` again, which
 //! `DescribeRescoreExecutionPlan` and `ListRescoreExecutionPlans` read back. A plan
 //! that is not `ACTIVE` when the call arrives is refused with the modelled
-//! `ConflictException`.
+//! `ConflictException`, and a `CapacityUnits` asking for more extra capacity than the
+//! service publishes a ceiling for with the modelled `ServiceQuotaExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -238,6 +239,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into(),
             );
+        }
+
+        // The amount of extra capacity a `CapacityUnits` member may ask for has a
+        // published ceiling the model's `@range` cannot carry, so it is the handler that
+        // enforces it: a request past the ceiling is refused with the modelled quota
+        // error. Checked BEFORE any member is written, so the whole request is rejected
+        // and the plan keeps the capacity — and the name and description — it already
+        // had.
+        if let Some(capacity_units) = &input.capacity_units {
+            if let Some(over_quota) = crate::state::capacity_units_over_quota(capacity_units) {
+                return Err(
+                    UpdateRescoreExecutionPlanErrorModeled::ServiceQuotaExceededException(
+                        over_quota,
+                    )
+                    .into(),
+                );
+            }
         }
 
         // Only the members the request carries are replaced; an absent member leaves the

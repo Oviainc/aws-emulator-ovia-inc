@@ -239,7 +239,10 @@ pub(crate) fn is_modelled_ipv4(value: &str) -> bool {
 ///
 /// The transition is owed by the clock, not by the poll: it arrives without
 /// anyone asking more than once.
-async fn wait_for_state(emulator: &Emulator, name: &str, want: &str) -> Value {
+///
+/// `pub(crate)` so a sibling suite in this test target waits for a settled state
+/// through the same loop rather than carrying a second copy of it.
+pub(crate) async fn wait_for_state(emulator: &Emulator, name: &str, want: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let body = emulator

@@ -909,6 +909,77 @@ impl Workspace {
             .into_iter()
             .find_map(|component_type| component_type.property_groups.get(group_name))
     }
+
+    /// The external ids a component carries: the value of every property of it
+    /// whose EFFECTIVE definition marks the property as the external id — "the
+    /// primary key of an external storage system".
+    ///
+    /// `isExternalId` is a member of the property DEFINITION, and a definition
+    /// normally lives on the component TYPE the component instantiates — naming
+    /// a `componentTypeId` is what gives a component that type's properties, so
+    /// a component usually supplies only the VALUE of its external-id property.
+    /// Which property is the external id is therefore resolved through
+    /// [`effective_property_definition`](Self::effective_property_definition),
+    /// exactly as every other member of a definition is: the component's own
+    /// inline definition where it declares one, else the one it inherits from
+    /// the component type it instantiates or from a type that type extends. The
+    /// value is the one a READ of the property reports
+    /// ([`latest_property_value`]), so a property whose value comes from its
+    /// definition's `defaultValue` carries the same external id a read of it
+    /// shows.
+    ///
+    /// `properties` are the component's stored properties and
+    /// `component_type_id` the type it instantiates, so one component and one
+    /// composite component — which carry the same property records — resolve
+    /// their external ids the same way. `ListEntities`' `externalId` filter
+    /// selects on this.
+    ///
+    /// The cost is bounded by the component's own properties plus the
+    /// definitions on its inheritance chain, which
+    /// [`component_type_chain`](Self::component_type_chain) walks at most once
+    /// per component type reached.
+    pub fn component_external_ids(
+        &self,
+        component_type_id: Option<&str>,
+        properties: &BTreeMap<String, PropertyRecord>,
+    ) -> BTreeSet<String> {
+        // Every property the component HAS: the ones it stores itself plus the
+        // ones its component type gives it and that it never restated — the
+        // external-id property is normally one of the latter.
+        let mut property_names: BTreeSet<&str> =
+            properties.keys().map(String::as_str).collect();
+        if let Some(component_type_id) = component_type_id {
+            for component_type in self.component_type_chain(component_type_id) {
+                property_names.extend(
+                    component_type
+                        .property_definitions
+                        .keys()
+                        .map(String::as_str),
+                );
+            }
+        }
+        let mut external_ids = BTreeSet::new();
+        for property_name in property_names {
+            let Some(definition) =
+                self.effective_property_definition(component_type_id, properties, property_name)
+            else {
+                continue;
+            };
+            if !definition.is_external_id.unwrap_or(false) {
+                continue;
+            }
+            if let Some(value) = latest_property_value(properties.get(property_name), Some(definition))
+            {
+                // Only a STRING value is an external id: `externalId` on the
+                // filter is a string, so a property of any other data type
+                // carries nothing to match against.
+                if let Some(string_value) = value.string_value {
+                    external_ids.insert(string_value);
+                }
+            }
+        }
+        external_ids
+    }
 }
 
 /// One stored scene.
@@ -2029,42 +2100,17 @@ pub fn resolve_composite_component_path(
     })
 }
 
-impl ComponentRecord {
-    /// The external id this component carries, if any: the string value of the
-    /// property its definition marked `isExternalId`. `ListEntities`'
-    /// `externalId` filter matches on this.
-    pub fn external_ids(&self) -> impl Iterator<Item = &str> {
-        self.properties
-            .values()
-            .filter_map(PropertyRecord::external_id)
-    }
-}
-
 /// One property of a component: the definition and value the request gave it.
+///
+/// Whether the property is the component's external id is NOT answerable from
+/// this record alone: `isExternalId` lives on the property DEFINITION, which a
+/// component normally inherits from the component type it instantiates rather
+/// than restating, so it is resolved against the workspace
+/// ([`Workspace::component_external_ids`]).
 #[derive(Debug, Clone, Default)]
 pub struct PropertyRecord {
     pub definition: Option<crate::ops::types::PropertyDefinitionRequest>,
     pub value: Option<crate::ops::types::DataValue>,
-}
-
-impl PropertyRecord {
-    /// Whether this property's definition marks it as the external id — the
-    /// primary key of an external storage system.
-    pub fn is_external_id(&self) -> bool {
-        self.definition
-            .as_ref()
-            .and_then(|definition| definition.is_external_id)
-            .unwrap_or(false)
-    }
-
-    /// This property's value as an external id: its string value, and only when
-    /// its definition marks it as the external id.
-    pub fn external_id(&self) -> Option<&str> {
-        if !self.is_external_id() {
-            return None;
-        }
-        self.value.as_ref()?.string_value.as_deref()
-    }
 }
 
 /// One property group of a component or of a component type.

@@ -39,6 +39,15 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The workspace data plane: the native Grafana HTTP API
+//!
+//! `WorkspaceDescription$endpoint` is "The URL that users can use to access the
+//! Grafana console in the workspace", so it is a promise that a caller can follow it:
+//! reading the field and calling Grafana's own REST API under it is what a client that
+//! minted a workspace API key or a service-account token does with it. That API is not
+//! in the Smithy model, so it is claimed by PATH and served from the two seams below;
+//! [`workspace_api`] is the module that answers it.
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,

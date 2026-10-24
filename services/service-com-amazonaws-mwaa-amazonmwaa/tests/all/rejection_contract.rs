@@ -734,7 +734,7 @@ async fn the_token_operations_report_the_stored_environments_web_server_host() {
 }
 
 #[tokio::test]
-async fn invoke_rest_api_does_not_synthesise_an_apache_airflow_answer() {
+async fn invoke_rest_api_refuses_an_input_outside_its_modelled_constraints() {
     let harness = Harness::new();
     assert_eq!(
         harness.create("RestApiEnv").await.status,
@@ -742,46 +742,12 @@ async fn invoke_rest_api_does_not_synthesise_an_apache_airflow_answer() {
         "the fixture create must succeed"
     );
 
-    // No Apache Airflow runs in this emulator, so a call against an environment that
-    // EXISTS answers the 501 that claims nothing rather than a synthesised REST response.
-    for (label, body) in [
-        ("GET /dags", json!({"Path": "/dags", "Method": "GET"})),
-        (
-            "POST /dags/x/dagRuns",
-            json!({"Path": "/dags/x/dagRuns", "Method": "POST", "Body": {"conf": {}}}),
-        ),
-        (
-            "DELETE with query parameters",
-            json!({
-                "Path": "/dags/x",
-                "Method": "DELETE",
-                "QueryParameters": {"limit": 1},
-            }),
-        ),
-    ] {
-        let answer = harness
-            .send("POST", "/restapi/RestApiEnv", Some(body))
-            .await;
-        assert_eq!(
-            answer.status, 501,
-            "case {label:?}: expected 501 for an Airflow call nothing can serve, got {} {}",
-            answer.status,
-            answer.text()
-        );
-        assert_eq!(
-            answer.error_code(),
-            "NotImplemented",
-            "case {label:?}: expected NotImplemented, got {:?}",
-            answer.error_code()
-        );
-        assert!(
-            !answer.text().contains("RestApiStatusCode"),
-            "case {label:?}: no status code may be reported for a call nothing made, got {}",
-            answer.text()
-        );
-    }
-
-    // A bad request is still a bad request, not a 501: `RestApiPath` is `@length(1, 64)`.
+    // What the operation ANSWERS for an environment that exists — the Apache Airflow REST
+    // API call routed over that environment's own state — has its own suite
+    // (`tests/all/airflow_rest_api.rs`). What belongs here is the refusal: a request the
+    // model's own constraints rule out never reaches that routing.
+    //
+    // A bad request is a bad request: `RestApiPath` is `@length(1, 64)`.
     let refused = harness
         .send(
             "POST",

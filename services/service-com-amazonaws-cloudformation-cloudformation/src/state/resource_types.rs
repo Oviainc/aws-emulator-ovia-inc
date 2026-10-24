@@ -498,6 +498,9 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::Glue::Table",
     "AWS::Glue::Trigger",
     "AWS::Glue::Workflow",
+    // Amazon Managed Grafana — the type a workspace is declared as
+    // (`super::provisioner` creates it in that service).
+    "AWS::Grafana::Workspace",
     // Amazon GuardDuty
     "AWS::GuardDuty::Detector",
     "AWS::GuardDuty::Filter",

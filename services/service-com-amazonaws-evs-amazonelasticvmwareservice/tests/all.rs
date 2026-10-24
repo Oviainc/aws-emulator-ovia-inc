@@ -22,6 +22,8 @@ mod connectors;
 // under tests/all/ to be declared, and this agent's tools cannot delete a file.
 #[path = "all/connectors_and_hosts.rs"]
 mod connectors_and_hosts;
+#[path = "all/create_environment_network_membership.rs"]
+mod create_environment_network_membership;
 #[path = "all/create_environment_validation.rs"]
 mod create_environment_validation;
 #[path = "all/created_environment_hosts.rs"]

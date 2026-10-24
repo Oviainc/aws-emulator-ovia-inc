@@ -21,14 +21,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Opaque list-pagination cursors: the inclusive start key, hex-encoded.
-hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# Builds the opaque-looking pagination tokens the listing tests send back: neither
+# listing returns one, so every form of them has to be refused.
+hex = { workspace = true }
 
 [lints]
 workspace = true

@@ -19,6 +19,8 @@ mod list_monitors_pagination;
 mod monitor_and_probe;
 #[path = "all/monitor_lifecycle_and_front_door.rs"]
 mod monitor_lifecycle_and_front_door;
+#[path = "all/region_isolation.rs"]
+mod region_isolation;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

@@ -793,13 +793,33 @@ const UNINITIALIZED_ACCOUNT_MESSAGE: &str = "Account not initialized";
 
 /// The modelled refusal for an `applicationID` the account holds no record of.
 pub fn application_not_found(application_id: &str) -> ResourceNotFoundException {
+    resource_not_found(APPLICATION_RESOURCE_TYPE, application_id)
+}
+
+/// The modelled `ResourceNotFoundException` for an id of `resource_type` that the
+/// account holds no record of — the ONE place this service words a missing resource.
+///
+/// `resourceType` names the resource KIND the way the API spells it: the modelled
+/// resource shape's own name (`Application`, `NetworkMigrationDefinition`), which is
+/// what a client branching on the member compares against. The ARN path segment
+/// (`application/…`, `network-migration-definition/…`) is a different spelling of the
+/// same kind and belongs in an ARN, not here. The message is composed from that type
+/// name and the id the request asked for, so it names what was missing and which one.
+fn resource_not_found(resource_type: &str, resource_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("Application {application_id} does not exist.")),
+        message: Some(format!(
+            "{resource_type} with Id: '{resource_id}' was not found"
+        )),
         code: None,
-        resource_id: Some(application_id.to_string()),
-        resource_type: Some("application".to_string()),
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
     }
 }
+
+/// The `resourceType` an application refusal names: the modelled resource shape
+/// `com.amazonaws.mgn#ApplicationResource` without the `Resource` suffix, as the API
+/// spells the kind.
+const APPLICATION_RESOURCE_TYPE: &str = "Application";
 
 /// The modelled refusal for a `name` another of the account's applications already
 /// carries: within one account an application name identifies the application a caller
@@ -811,7 +831,7 @@ pub fn application_name_in_use(name: &str, application_id: &str) -> ConflictExce
         )),
         code: None,
         resource_id: Some(application_id.to_string()),
-        resource_type: Some("application".to_string()),
+        resource_type: Some(APPLICATION_RESOURCE_TYPE.to_string()),
         errors: None,
     }
 }
@@ -825,7 +845,7 @@ pub fn application_archived(application_id: &str) -> ConflictException {
         )),
         code: None,
         resource_id: Some(application_id.to_string()),
-        resource_type: Some("application".to_string()),
+        resource_type: Some(APPLICATION_RESOURCE_TYPE.to_string()),
         errors: None,
     }
 }
@@ -852,7 +872,7 @@ pub fn application_quota_exceeded(account_id: &str) -> ServiceQuotaExceededExcep
         )),
         code: None,
         resource_id: None,
-        resource_type: Some("application".to_string()),
+        resource_type: Some(APPLICATION_RESOURCE_TYPE.to_string()),
         service_code: Some(ARN_NAMESPACE.to_string()),
         quota_code: None,
         quota_value: i32::try_from(APPLICATION_QUOTA).ok(),
@@ -862,14 +882,7 @@ pub fn application_quota_exceeded(account_id: &str) -> ServiceQuotaExceededExcep
 /// The modelled refusal for a `networkMigrationDefinitionID` the account holds no
 /// record of.
 pub fn network_migration_definition_not_found(definition_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!(
-            "Network migration definition {definition_id} does not exist."
-        )),
-        code: None,
-        resource_id: Some(definition_id.to_string()),
-        resource_type: Some(NETWORK_MIGRATION_DEFINITION_RESOURCE_TYPE.to_string()),
-    }
+    resource_not_found(NETWORK_MIGRATION_DEFINITION_RESOURCE_TYPE, definition_id)
 }
 
 /// The modelled refusal for an account already holding
@@ -891,8 +904,10 @@ pub fn network_migration_definition_quota_exceeded(
     }
 }
 
-/// The `resourceType` a network-migration-definition refusal names.
-const NETWORK_MIGRATION_DEFINITION_RESOURCE_TYPE: &str = "network-migration-definition";
+/// The `resourceType` a network-migration-definition refusal names: the modelled
+/// resource shape `com.amazonaws.mgn#NetworkMigrationDefinitionResource` without the
+/// `Resource` suffix, as the API spells the kind.
+const NETWORK_MIGRATION_DEFINITION_RESOURCE_TYPE: &str = "NetworkMigrationDefinition";
 
 /// The modelled refusal for `cidrMappings` on a definition that is not migrating into
 /// VPCs that already exist.

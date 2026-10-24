@@ -12,7 +12,7 @@
 //!    closing with "Try your request again.". That holds for every such rule this
 //!    service enforces: the `notifyOnCaseSeverity` / notification-flag combination
 //!    documented on `CreateSlackChannelConfigurationRequest$notifyOnCaseSeverity`, a
-//!    `nextToken` that is not a cursor this service minted, and a registration past the
+//!    `nextToken` no listing of this service returned, and a registration past the
 //!    documented Slack workspace quota.
 //! 2. A request refused for a constraint the model DOES declare is answered in the
 //!    standard validation envelope (`N validation error(s) detected: ` over one
@@ -613,13 +613,14 @@ fn workspace_quota_rule() -> String {
     )
 }
 
-/// Tokens no `nextToken` this service mints can be, each row a different reason: not
-/// hex at all, hex that is not a whole number of bytes, hex that decodes to bytes that
-/// are not text, hex of whitespace, hex of an id rather than a position, hex of a
-/// position spelled in a way the codec never mints, hex of a count no `usize` holds,
-/// and a token at the published `paginationToken` length maximum. Every row satisfies
-/// the member's own `@length` / `@pattern` constraints, so each is refused by the
-/// HANDLER rather than by the boundary validator.
+/// Tokens no `nextToken` of this service can be — neither listing returns one, because
+/// each reports a collection a documented account quota bounds and is served whole.
+/// Each row is a different form a client could send: not hex at all, hex that is not a
+/// whole number of bytes, hex that decodes to bytes that are not text, hex of
+/// whitespace, hex of an id, hex of a position, hex of a count no `usize` holds, and a
+/// token at the published `paginationToken` length maximum. Every row satisfies the
+/// member's own `@length` / `@pattern` constraints, so each is refused by the HANDLER
+/// rather than by the boundary validator.
 fn bogus_tokens() -> Vec<(&'static str, String)> {
     vec![
         ("not hex", "not-a-cursor".to_string()),
@@ -638,7 +639,7 @@ fn bogus_tokens() -> Vec<(&'static str, String)> {
 }
 
 #[tokio::test]
-async fn a_pagination_token_this_service_did_not_mint_is_refused_in_the_service_prose_envelope() {
+async fn a_pagination_token_no_listing_returned_is_refused_in_the_service_prose_envelope() {
     let emulator = Emulator::new();
     // Stored state on both resources, so each refusal is about the token rather than
     // about an empty store.
@@ -652,8 +653,8 @@ async fn a_pagination_token_this_service_did_not_mint_is_refused_in_the_service_
     );
 
     // Rows span both paginated operations — each names ITSELF, because the message
-    // states which request was refused — and every form of a token this service cannot
-    // have minted.
+    // states which request was refused — and every form of a token no listing of this
+    // service returned.
     for (label, token) in bogus_tokens() {
         for operation in [
             "ListSlackChannelConfigurations",

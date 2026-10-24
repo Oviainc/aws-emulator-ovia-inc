@@ -311,16 +311,16 @@ async fn every_other_answer_of_this_service_stays_a_serialized_exception_object(
         );
     }
 
-    // And the proxied operation's OTHER answers: the scaffold's 501 for an environment that
-    // exists (no Apache Airflow runs in this process) and the framework's 400 for an input
-    // outside its modelled constraints both stay exception objects.
+    // And the proxied operation's OTHER answers: an Apache Airflow call the environment's
+    // own state refuses (HTTP 400 `RestApiClientException`) and the framework's 400 for an
+    // input outside its modelled constraints both stay exception objects.
     for (case, name, body, status, code) in [
         (
-            "an environment that exists",
+            "an Apache Airflow path that resolves to nothing",
             "TheOnlyEnvironment",
-            json!({"Path": "/dags", "Method": "GET"}),
-            501u16,
-            "NotImplemented",
+            json!({"Path": "/variables/absent", "Method": "GET"}),
+            400u16,
+            "RestApiClientException",
         ),
         (
             "a Path past @length(1, 64)",
@@ -351,4 +351,26 @@ async fn every_other_answer_of_this_service_stays_a_serialized_exception_object(
             answer.text()
         );
     }
+
+    // Nor is a SERVED call reshaped: its body is the serialized output object, carrying the
+    // operation's own members.
+    let served = harness
+        .invoke(
+            "TheOnlyEnvironment",
+            json!({"Path": "/version", "Method": "GET"}),
+        )
+        .await;
+    assert_eq!(
+        served.status,
+        200,
+        "a served Apache Airflow call must answer 200, got {} {}",
+        served.status,
+        served.text()
+    );
+    assert_eq!(
+        served.json().get("RestApiStatusCode").and_then(Value::as_i64),
+        Some(200),
+        "the served body must carry RestApiStatusCode, got {}",
+        served.text()
+    );
 }
