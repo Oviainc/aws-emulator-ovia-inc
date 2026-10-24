@@ -70,7 +70,7 @@ fn crawler_body(name: &str) -> Value {
 
 /// Assert one refusal: HTTP 400, the expected error code, and the expected `Message`
 /// verbatim.
-async fn assert_refusal(
+pub(crate) async fn assert_refusal(
     router: &MultiServiceRouter,
     case: &str,
     operation: &str,
@@ -103,7 +103,7 @@ async fn assert_refusal(
 /// of characters inside a word: without that, a one-character name would be "found"
 /// inside ordinary wording ("Database already exists." carries the "d" of "already")
 /// and a disclosure would be reported where there is none.
-fn assert_withholds(case: &str, message: &str, name: &str) {
+pub(crate) fn assert_withholds(case: &str, message: &str, name: &str) {
     for candidate in [name.to_string(), name.to_ascii_lowercase()] {
         assert!(
             !names_token(message, &candidate),
