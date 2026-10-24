@@ -266,6 +266,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::StoredBudget {
                 budget,
                 notifications,
+                // A budget is created with no actions: an action is created by its own
+                // `CreateBudgetAction` call, against a budget that already exists.
                 actions: Vec::new(),
                 tags: input.resource_tags.unwrap_or_default(),
             },

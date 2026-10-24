@@ -234,7 +234,7 @@ async fn requests_on_its_own_routes_reach_this_service() {
     let router = router();
 
     // (case, method, uri, body, expected status, expected error code)
-    let rows: [(&str, &str, &str, Value, u16, &str); 5] = [
+    let rows: [(&str, &str, &str, Value, u16, &str); 6] = [
         (
             "CreateGateway, implemented",
             "POST",
@@ -249,9 +249,17 @@ async fn requests_on_its_own_routes_reach_this_service() {
             "",
         ),
         (
-            "ListGateways, still scaffolded",
+            "ListGateways, implemented",
             "GET",
             "/gateways/",
+            Value::Null,
+            200,
+            "",
+        ),
+        (
+            "ListGatewayRules, still scaffolded",
+            "GET",
+            "/gateways/my-gateway-abcdefghij/rules",
             Value::Null,
             501,
             "NotImplemented",

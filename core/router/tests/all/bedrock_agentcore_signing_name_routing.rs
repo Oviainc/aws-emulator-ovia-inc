@@ -395,12 +395,12 @@ async fn every_agentcore_signed_request_is_dispatched_instead_of_refused_as_ambi
             "",
         ),
         (
-            "ListGateways, still scaffolded",
+            "ListGateways, implemented",
             "GET",
             "/gateways/",
             Value::Null,
-            501,
-            "NotImplemented",
+            200,
+            "",
         ),
         (
             "GetGatewayTarget on a gateway that does not exist",
