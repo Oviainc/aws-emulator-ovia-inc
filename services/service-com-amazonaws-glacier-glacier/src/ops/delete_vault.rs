@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVault
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVault`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVault::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes the vault from the store, and only while it holds no archives.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +178,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVault` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVaultErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state;
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(DeleteVaultErrorModeled::ServiceUnavailableException(
+                state::service_unavailable(state::NO_STORE_MESSAGE),
+            )
+            .into());
+        };
+
+        let region = state::request_region(ctx);
+        let account_id = match state::resolve_account(&input.account_id) {
+            Ok(account_id) => account_id,
+            Err(refusal) => {
+                return Err(DeleteVaultErrorModeled::InvalidParameterValueException(refusal).into())
+            }
+        };
+        let vault_name = input.vault_name;
+
+        let mut store = store.lock();
+        let key = (account_id, vault_name.clone());
+        let Some(vault) = store.vaults.get(&key) else {
+            return Err(DeleteVaultErrorModeled::ResourceNotFoundException(
+                state::vault_not_found(&region, &vault_name),
+            )
+            .into());
+        };
+
+        // "Amazon Glacier will delete a vault only if there are no archives in the vault
+        // ... If either of these conditions is not satisfied, the vault deletion fails
+        // (that is, the vault is not removed) and Amazon Glacier returns an error."
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVault"))
+        // The documented idempotence is of the DELETE itself: a vault that is already
+        // gone is reported with the `ResourceNotFoundException` this operation's model
+        // declares (and `CreateVault`, idempotent in the same sense, does not), and
+        // deleting twice leaves the same end state either way.
+        let held = vault.number_of_archives();
+        if held > 0 {
+            return Err(DeleteVaultErrorModeled::InvalidParameterValueException(
+                state::invalid_parameter_value(format!(
+                    "Vault not empty: {} still holds {held} archive(s)",
+                    vault.vault_arn
+                )),
+            )
+            .into());
+        }
+
+        store.vaults.remove(&key);
+
+        Ok(DeleteVaultOutput)
     }
 }

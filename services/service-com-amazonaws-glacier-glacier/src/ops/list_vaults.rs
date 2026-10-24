@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListVaults
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListVaults`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListVaults::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: pages the account's stored vaults, each entry rendered exactly as
+//! `DescribeVault` renders it.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +166,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListVaults` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListVaultsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListVaults"))
+        use crate::state;
+
+        // Every vault carries the ARN it was created with, so this listing needs no
+        // request metadata beyond the account the path names.
+        let _ = ctx;
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(ListVaultsErrorModeled::ServiceUnavailableException(
+                state::service_unavailable(state::NO_STORE_MESSAGE),
+            )
+            .into());
+        };
+
+        let account_id = match state::resolve_account(&input.account_id) {
+            Ok(account_id) => account_id,
+            Err(refusal) => {
+                return Err(ListVaultsErrorModeled::InvalidParameterValueException(refusal).into())
+            }
+        };
+
+        // "The default limit is 10. The number of vaults returned might be fewer than
+        // the specified limit, but the number of returned vaults never exceeds the limit."
+        let limit = input.limit.unwrap_or(state::DEFAULT_LIST_VAULTS_LIMIT);
+        if limit < 1 {
+            return Err(ListVaultsErrorModeled::InvalidParameterValueException(
+                state::invalid_parameter_value(format!(
+                    "limit {limit} is not a valid page size: it must be at least 1"
+                )),
+            )
+            .into());
+        }
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+
+        let mut store = store.lock();
+        // The same clock-owed settle `DescribeVault` runs, so a listing and a describe
+        // never disagree about a vault's `LastInventoryDate`.
+        for ((account, _), vault) in store.vaults.iter_mut() {
+            if account == &account_id {
+                state::settle_due_jobs(vault);
+            }
+        }
+        let mut vaults: Vec<&state::Vault> = store
+            .vaults
+            .iter()
+            .filter(|((account, _), _)| account == &account_id)
+            .map(|(_, vault)| vault)
+            .collect();
+        vaults.sort_by(|a, b| a.vault_name.cmp(&b.vault_name));
+
+        // "The marker specifies the vault ARN after which the listing of vaults should
+        // begin": an exclusive start, so the page opens at the vault after it.
+        let start = match input.marker.as_deref().filter(|m| !m.is_empty()) {
+            None => 0,
+            Some(marker) => {
+                let Some(at) = vaults.iter().position(|v| v.vault_arn == marker) else {
+                    return Err(ListVaultsErrorModeled::InvalidParameterValueException(
+                        state::invalid_parameter_value(format!(
+                            "marker {marker:?} does not name a vault of account {account_id}"
+                        )),
+                    )
+                    .into());
+                };
+                at + 1
+            }
+        };
+
+        let page: Vec<&state::Vault> = vaults.iter().skip(start).take(limit).copied().collect();
+        // "The vault ARN at which to continue pagination of the results" — null once the
+        // page reached the end of the list.
+        let marker = (start + page.len() < vaults.len())
+            .then(|| page.last().map(|v| v.vault_arn.clone()))
+            .flatten();
+
+        Ok(ListVaultsOutput {
+            vault_list: Some(page.into_iter().map(state::vault_description).collect()),
+            marker,
+        })
     }
 }

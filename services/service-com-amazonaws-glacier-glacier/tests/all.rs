@@ -13,3 +13,5 @@
 // points it into `tests/all/`.
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/vault_archive_retrieval.rs"]
+mod vault_archive_retrieval;

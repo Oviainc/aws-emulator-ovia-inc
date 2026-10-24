@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVault
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVault`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVault::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: inserts the vault into the store `crate::state` guards, idempotently.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +156,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVault` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVaultErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVault"))
+        use crate::state;
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(CreateVaultErrorModeled::ServiceUnavailableException(
+                state::service_unavailable(state::NO_STORE_MESSAGE),
+            )
+            .into());
+        };
+
+        let region = state::request_region(ctx);
+        let account_id = match state::resolve_account(&input.account_id) {
+            Ok(account_id) => account_id,
+            Err(refusal) => {
+                return Err(CreateVaultErrorModeled::InvalidParameterValueException(refusal).into())
+            }
+        };
+        let vault_name = input.vault_name;
+
+        // The naming rule this operation documents is not expressed by the model's
+        // `string` target, so it is enforced here rather than by the boundary validator.
+        if let Some(violation) = state::vault_name_violation(&vault_name) {
+            return Err(CreateVaultErrorModeled::InvalidParameterValueException(
+                state::invalid_parameter_value(violation),
+            )
+            .into());
+        }
+
+        let mut store = store.lock();
+        let key = (account_id.clone(), vault_name.clone());
+        if !store.vaults.contains_key(&key) {
+            let held = store.vaults.keys().filter(|(a, _)| a == &account_id).count();
+            if held >= state::MAX_VAULTS_PER_ACCOUNT {
+                return Err(CreateVaultErrorModeled::LimitExceededException(
+                    state::limit_exceeded(format!(
+                        "Vault limit exceeded for account {account_id}: at most {} vaults may exist",
+                        state::MAX_VAULTS_PER_ACCOUNT
+                    )),
+                )
+                .into());
+            }
+            store.vaults.insert(
+                key,
+                state::Vault {
+                    vault_name: vault_name.clone(),
+                    vault_arn: state::vault_arn(&region, &vault_name),
+                    creation_date: state::now_iso8601(),
+                    ..state::Vault::default()
+                },
+            );
+        }
+        // "This operation is idempotent": re-creating an existing vault answers the same
+        // 201 and the same Location, and leaves the archives already in it alone.
+
+        Ok(CreateVaultOutput {
+            location: Some(format!("/{account_id}/vaults/{vault_name}")),
+        })
     }
 }

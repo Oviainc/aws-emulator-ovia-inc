@@ -21,13 +21,18 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# SHA-256, the primitive Glacier's SHA256 tree hash is built from.
+sha2 = { workspace = true }
+# Lowercase-hex rendering of a tree hash / a minted opaque id.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# `time` on top of the workspace features: the retrieval tests await the instant a job's
+# completion falls due rather than blocking the runtime thread. No handler sleeps.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

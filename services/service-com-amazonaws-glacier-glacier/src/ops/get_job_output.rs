@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetJobOutput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetJobOutput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetJobOutput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: hands back the bytes the job materialised — the stored archive content or
+//! the rendered vault inventory — whole, or a byte range of it as a 206.
 //!
 //! ## Shape of an operation
 //!
@@ -213,18 +206,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetJobOutput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetJobOutputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetJobOutput"))
+        use crate::state;
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(GetJobOutputErrorModeled::ServiceUnavailableException(
+                state::service_unavailable(state::NO_STORE_MESSAGE),
+            )
+            .into());
+        };
+
+        let region = state::request_region(ctx);
+        let account_id = match state::resolve_account(&input.account_id) {
+            Ok(account_id) => account_id,
+            Err(refusal) => {
+                return Err(GetJobOutputErrorModeled::InvalidParameterValueException(refusal).into())
+            }
+        };
+        let vault_name = input.vault_name;
+        let job_id = input.job_id;
+
+        let mut store = store.lock();
+        let Some(vault) = store.vaults.get_mut(&(account_id, vault_name.clone())) else {
+            return Err(GetJobOutputErrorModeled::ResourceNotFoundException(
+                state::vault_not_found(&region, &vault_name),
+            )
+            .into());
+        };
+
+        // A completion the clock owed before this call is materialised first, so a job
+        // whose output is already due is downloadable here.
+        state::settle_due_jobs(vault);
+
+        let Some(job) = vault.jobs.get(&job_id) else {
+            return Err(GetJobOutputErrorModeled::ResourceNotFoundException(
+                state::resource_not_found(format!("The job ID was not found: {job_id}")),
+            )
+            .into());
+        };
+
+        // "This operation downloads the output of the job you initiated": there is no
+        // output to download until the job has produced it.
+        if !job.completed {
+            return Err(GetJobOutputErrorModeled::InvalidParameterValueException(
+                state::invalid_parameter_value(format!(
+                    "The job is not currently available for download: job {job_id} is {}",
+                    job.status_code
+                )),
+            )
+            .into());
+        }
+
+        // The output this job hands back: a view of the retrieved archive bytes, or the
+        // vault inventory rendered now. Neither is a retained second copy.
+        let (document, content_type) = job.output_document(vault);
+        let total = u64::try_from(document.len()).unwrap_or(0);
+        let archive_retrieval = job.action == state::ACTION_ARCHIVE_RETRIEVAL;
+
+        let (body, status, content_range, checksum) = match input.range.as_deref() {
+            None => (
+                document,
+                200,
+                None,
+                // "This header is returned only when retrieving the output for an
+                // archive retrieval job" — and the whole range is always aligned.
+                archive_retrieval.then(|| job.sha256_tree_hash.clone()).flatten(),
+            ),
+            Some(raw) => {
+                // `parse_http_range` resolves both bounds against the output's own
+                // length, so `start <= end < total` holds and the length below is taken
+                // with checked arithmetic rather than trusted from the header.
+                let Some((start, end)) = state::parse_http_range(raw, total) else {
+                    return Err(GetJobOutputErrorModeled::InvalidParameterValueException(
+                        state::invalid_parameter_value(format!(
+                            "Range {raw:?} is not a satisfiable byte range of this \
+                             {total}-byte job output"
+                        )),
+                    )
+                    .into());
+                };
+                let Some(length) = state::inclusive_range_len(start, end) else {
+                    return Err(GetJobOutputErrorModeled::InvalidParameterValueException(
+                        state::invalid_parameter_value(format!(
+                            "Range {raw:?} is not a satisfiable byte range of this \
+                             {total}-byte job output"
+                        )),
+                    )
+                    .into());
+                };
+                let from = usize::try_from(start).unwrap_or(usize::MAX);
+                let span = usize::try_from(length).unwrap_or(usize::MAX);
+                let slice = document.slice(from..from.saturating_add(span));
+                // Whether the range happens to be the whole output decides the CHECKSUM,
+                // not the status: `status` is documented as "The HTTP response code for a
+                // job output request. The value depends on whether a range was specified
+                // in the request", so a request that specified one is answered 206 with
+                // the `Content-Range` it covers, even when that is everything.
+                let whole = start == 0 && end.saturating_add(1) == total;
+                // The checksum "appears only under the following conditions: you get the
+                // entire range of the archive [or] a range that starts and ends on a
+                // multiple of 1 MB [or] starts on a multiple of 1 MB and goes to the end
+                // of the archive". An aligned range covers whole 1 MiB chunks, so its
+                // hash folds the leaves the upload already computed — the store is never
+                // held while bytes are hashed.
+                let checksum = if !archive_retrieval {
+                    None
+                } else if whole {
+                    job.sha256_tree_hash.clone()
+                } else if state::is_megabyte_aligned(start, end, total) {
+                    job.output_leaves
+                        .get(state::leaf_range(start, end, job.output_leaves.len()))
+                        .map(state::tree_hash_from_leaves)
+                } else {
+                    None
+                };
+                (
+                    slice,
+                    206,
+                    Some(format!("bytes {start}-{end}/{total}")),
+                    checksum,
+                )
+            }
+        };
+
+        Ok(GetJobOutputOutput {
+            body: body.to_vec(),
+            checksum,
+            status,
+            content_range,
+            accept_ranges: Some("bytes".to_string()),
+            content_type: Some(content_type),
+            archive_description: if archive_retrieval {
+                job.archive_id
+                    .as_ref()
+                    .and_then(|id| vault.archives.get(id))
+                    .and_then(|archive| archive.description.clone())
+            } else {
+                None
+            },
+        })
     }
 }

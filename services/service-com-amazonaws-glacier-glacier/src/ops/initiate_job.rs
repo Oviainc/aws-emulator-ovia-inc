@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InitiateJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InitiateJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: records an archive- or inventory-retrieval job against the stored vault
+//! and materialises the output that job will hand back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InitiateJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `select` job, and any job carrying `OutputLocation`, is still answered with the
+//! scaffold's 501: this emulator runs no select engine, and an empty 200 would be worse.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +163,401 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InitiateJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InitiateJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InitiateJob"))
+        use crate::state;
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(InitiateJobErrorModeled::ServiceUnavailableException(
+                state::service_unavailable(state::NO_STORE_MESSAGE),
+            )
+            .into());
+        };
+
+        let region = state::request_region(ctx);
+        let account_id = match state::resolve_account(&input.account_id) {
+            Ok(account_id) => account_id,
+            Err(refusal) => {
+                return Err(InitiateJobErrorModeled::InvalidParameterValueException(refusal).into())
+            }
+        };
+        let vault_name = input.vault_name;
+        let parameters = input.job_parameters.unwrap_or_default();
+
+        let Some(job_type) = parameters.r#type.as_deref().map(str::trim).filter(|t| !t.is_empty())
+        else {
+            return Err(InitiateJobErrorModeled::MissingParameterValueException(
+                state::missing_parameter_value(
+                    "JobParameters.Type is required; valid values are \"select\", \
+                     \"archive-retrieval\" and \"inventory-retrieval\"",
+                ),
+            )
+            .into());
+        };
+
+        // A select job evaluates a caller-supplied SQL expression and writes the result
+        // to S3. Neither is emulated here, so say so rather than inventing a job.
+        if job_type == state::JOB_TYPE_SELECT
+            || parameters.select_parameters.is_some()
+            || parameters.output_location.is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "InitiateJob for a select job or a job with an OutputLocation",
+            ));
+        }
+
+        let archive_retrieval = job_type == state::JOB_TYPE_ARCHIVE_RETRIEVAL;
+        if !archive_retrieval && job_type != state::JOB_TYPE_INVENTORY_RETRIEVAL {
+            return Err(InitiateJobErrorModeled::InvalidParameterValueException(
+                state::invalid_parameter_value(format!(
+                    "JobParameters.Type {job_type:?} is not a valid job type; valid values are \
+                     \"select\", \"archive-retrieval\" and \"inventory-retrieval\""
+                )),
+            )
+            .into());
+        }
+
+        // "The tier to use for a select or an archive retrieval job. Valid values are
+        // Expedited, Standard, or Bulk. Standard is the default."
+        let tier = match parameters.tier.as_deref().map(str::trim) {
+            None | Some("") => state::DEFAULT_TIER.to_string(),
+            Some(requested) => {
+                match state::TIER_VALUES
+                    .iter()
+                    .find(|valid| valid.eq_ignore_ascii_case(requested))
+                {
+                    Some(valid) => (*valid).to_string(),
+                    None => {
+                        return Err(InitiateJobErrorModeled::InvalidParameterValueException(
+                            state::invalid_parameter_value(format!(
+                                "JobParameters.Tier {requested:?} is not a valid tier; valid \
+                                 values are {}",
+                                state::TIER_VALUES.join(", ")
+                            )),
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        if !archive_retrieval {
+            // "An error occurs if you specify this request parameter for an inventory
+            // retrieval job request" — of ArchiveId, and of RetrievalByteRange.
+            if let Some(member) = [
+                parameters.archive_id.as_ref().map(|_| "ArchiveId"),
+                parameters
+                    .retrieval_byte_range
+                    .as_ref()
+                    .map(|_| "RetrievalByteRange"),
+            ]
+            .into_iter()
+            .flatten()
+            .next()
+            {
+                return Err(InitiateJobErrorModeled::InvalidParameterValueException(
+                    state::invalid_parameter_value(format!(
+                        "JobParameters.{member} must not be specified for an \
+                         {} job",
+                        state::JOB_TYPE_INVENTORY_RETRIEVAL
+                    )),
+                )
+                .into());
+            }
+        }
+
+        // "If you are initiating an inventory job and do not specify a Format field,
+        // JSON is the default format."
+        let format = if archive_retrieval {
+            None
+        } else {
+            match parameters.format.as_deref().map(str::trim) {
+                None | Some("") => Some(state::DEFAULT_INVENTORY_FORMAT.to_string()),
+                Some(requested) => match state::INVENTORY_FORMAT_VALUES
+                    .iter()
+                    .find(|valid| valid.eq_ignore_ascii_case(requested))
+                {
+                    Some(&state::DEFAULT_INVENTORY_FORMAT) => {
+                        Some(state::DEFAULT_INVENTORY_FORMAT.to_string())
+                    }
+                    // A documented format this emulator does not render. Saying so is the
+                    // only honest answer: a job accepted here would hand back a document
+                    // in the wrong format under a success status.
+                    Some(_) => {
+                        return Err(crate::scaffolded::Scaffolded::not_implemented(
+                            "InitiateJob for an inventory retrieval in the CSV format",
+                        ))
+                    }
+                    None => {
+                        return Err(InitiateJobErrorModeled::InvalidParameterValueException(
+                            state::invalid_parameter_value(format!(
+                                "JobParameters.Format {requested:?} is not a valid inventory \
+                                 format; valid values are {}",
+                                state::INVENTORY_FORMAT_VALUES.join(", ")
+                            )),
+                        )
+                        .into())
+                    }
+                },
+            }
+        };
+
+        let mut store = store.lock();
+        let Some(vault) = store.vaults.get_mut(&(account_id.clone(), vault_name.clone())) else {
+            return Err(InitiateJobErrorModeled::ResourceNotFoundException(
+                state::vault_not_found(&region, &vault_name),
+            )
+            .into());
+        };
+
+        // Settle first, so the count below reflects what is actually retained: a job
+        // whose retention the clock has already run out does not occupy capacity just
+        // because nobody has described or listed the vault since.
+        state::settle_due_jobs(vault);
+
+        // Real Glacier bounds how much retrieval a vault can have in flight through its
+        // data-retrieval policy and refuses beyond it with PolicyEnforcedException. This
+        // emulator holds its jobs in memory, so the bound it enforces is a count of
+        // retained jobs; a completed job is released after JOB_RETENTION, so a client
+        // that keeps retrieving is never permanently locked out.
+        if vault.jobs.len() >= state::MAX_JOBS_PER_VAULT {
+            return Err(InitiateJobErrorModeled::PolicyEnforcedException(
+                state::policy_enforced(format!(
+                    "A retrieval job would exceed the retrieval limit for {}: at most {} jobs \
+                     may be in flight or downloadable at once",
+                    vault.vault_arn,
+                    state::MAX_JOBS_PER_VAULT
+                )),
+            )
+            .into());
+        }
+
+        // Resolve what this job will hand back, from the vault as it stands now: that is
+        // the instant the retrieval is of.
+        let mut job = state::Job {
+            job_id: String::new(),
+            action: if archive_retrieval {
+                state::ACTION_ARCHIVE_RETRIEVAL.to_string()
+            } else {
+                state::ACTION_INVENTORY_RETRIEVAL.to_string()
+            },
+            archive_id: None,
+            description: parameters.description,
+            format,
+            tier: Some(tier),
+            retrieval_byte_range: None,
+            status_code: state::STATUS_IN_PROGRESS.to_string(),
+            status_message: None,
+            completed: false,
+            creation_date: state::now_iso8601(),
+            completion_date: None,
+            archive_size_in_bytes: None,
+            sha256_tree_hash: None,
+            archive_sha256_tree_hash: None,
+            output: ::bytes::Bytes::new(),
+            output_leaves: Vec::new(),
+            inventory: Vec::new(),
+            inventory_parameters: None,
+            output_size_in_bytes: None,
+            content_type: String::new(),
+            sns_topic: parameters.sns_topic,
+            due_at: ::std::time::Instant::now() + state::JOB_COMPLETION_DELAY,
+            expires_at: None,
+            sequence: 0,
+        };
+
+        if archive_retrieval {
+            let Some(archive_id) = parameters.archive_id.as_deref().filter(|id| !id.is_empty())
+            else {
+                return Err(InitiateJobErrorModeled::InvalidParameterValueException(
+                    state::invalid_parameter_value(format!(
+                        "JobParameters.ArchiveId is required for an {} job",
+                        state::JOB_TYPE_ARCHIVE_RETRIEVAL
+                    )),
+                )
+                .into());
+            };
+            let Some(archive) = vault.archives.get(archive_id) else {
+                return Err(InitiateJobErrorModeled::ResourceNotFoundException(
+                    state::resource_not_found(format!(
+                        "The archive ID was not found: {archive_id}"
+                    )),
+                )
+                .into());
+            };
+            let total = u64::try_from(archive.size_in_bytes).unwrap_or(0);
+            // The range the job retrieves, and the leaves of its hash tree. Both bounds
+            // come from a request string, so the range is resolved with checked
+            // arithmetic: an inverted, out-of-range or saturated range is refused here,
+            // and no wrapped value ever reaches the slicing below.
+            let resolved = match parameters.retrieval_byte_range.as_deref() {
+                // "If not specified, the whole archive is retrieved."
+                None => Some((0u64, total.saturating_sub(1))),
+                // "If RetrievalByteRange is not megabyte aligned, this operation returns
+                // a 400 response." Containment and ordering live in the predicate.
+                Some(raw) => state::parse_retrieval_byte_range(raw)
+                    .filter(|(start, end)| state::is_megabyte_aligned(*start, *end, total)),
+            };
+            let Some(length) = resolved
+                .and_then(|(start, end)| state::inclusive_range_len(start, end).map(|n| (start, n)))
+            else {
+                return Err(InitiateJobErrorModeled::InvalidParameterValueException(
+                    state::invalid_parameter_value(format!(
+                        "JobParameters.RetrievalByteRange {:?} is not a megabyte-aligned range \
+                         of this {total}-byte archive: StartByteValue must be divisible by 1 MB \
+                         and EndByteValue plus 1 must be divisible by 1 MB or be the end of the \
+                         archive",
+                        parameters.retrieval_byte_range.as_deref().unwrap_or_default()
+                    )),
+                )
+                .into());
+            };
+            let (start, length) = length;
+            // The retrieved bytes are a VIEW of the stored archive, not a second copy of
+            // it: a small InitiateJob request can never allocate another archive's worth
+            // of memory, however often it is repeated.
+            let (retrieved, leaves) = if total == 0 {
+                (::bytes::Bytes::new(), archive.chunk_leaves.clone())
+            } else {
+                let from = usize::try_from(start).unwrap_or(usize::MAX);
+                let span = usize::try_from(length).unwrap_or(usize::MAX);
+                let end = start.saturating_add(length).saturating_sub(1);
+                (
+                    archive.body.slice(from..from.saturating_add(span)),
+                    archive
+                        .chunk_leaves
+                        .get(state::leaf_range(start, end, archive.chunk_leaves.len()))
+                        .unwrap_or_default()
+                        .to_vec(),
+                )
+            };
+            job.archive_id = Some(archive_id.to_string());
+            job.retrieval_byte_range = parameters.retrieval_byte_range.clone();
+            job.archive_size_in_bytes = Some(archive.size_in_bytes);
+            job.archive_sha256_tree_hash = Some(archive.sha256_tree_hash.clone());
+            // "The SHA256 tree hash value for the requested range of an archive" — folded
+            // from the leaves the upload computed, so the store is never held while
+            // archive bytes are hashed. The whole archive folds to its own tree hash.
+            job.sha256_tree_hash = Some(state::tree_hash_from_leaves(&leaves));
+            job.output = retrieved;
+            job.output_leaves = leaves;
+            job.content_type = "application/octet-stream".to_string();
+        } else {
+            // An inventory retrieval snapshots the vault's archive METADATA as it stands
+            // now — the instant the inventory is of — and the document is rendered from
+            // that snapshot at download, so no job holds a rendered document and no
+            // archive bytes are copied.
+            let range = parameters.inventory_retrieval_parameters.unwrap_or_default();
+
+            // "The start of the date range in UTC ... that includes archives created on
+            // or after this date", and the end "that includes archives created before
+            // this date". Both are compared as instants, never as date strings.
+            let mut bounds: [Option<(i64, u32)>; 2] = [None, None];
+            for (slot, (member, raw)) in [
+                ("InventoryRetrievalParameters.StartDate", range.start_date.as_deref()),
+                ("InventoryRetrievalParameters.EndDate", range.end_date.as_deref()),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+                    continue;
+                };
+                let Some(instant) = state::parse_iso8601(raw) else {
+                    return Err(InitiateJobErrorModeled::InvalidParameterValueException(
+                        state::invalid_parameter_value(format!(
+                            "{member} {raw:?} is not an ISO 8601 date, for example \
+                             2013-03-20T17:03:43Z"
+                        )),
+                    )
+                    .into());
+                };
+                bounds[slot] = Some(instant);
+            }
+            let [start_date, end_date] = bounds;
+
+            // "Specifies the maximum number of inventory items returned per vault
+            // inventory retrieval request. Valid values are greater than or equal to 1."
+            let limit = match range.limit.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                None => None,
+                Some(raw) => match raw.parse::<usize>() {
+                    Ok(limit) if limit >= 1 => Some(limit),
+                    _ => {
+                        return Err(InitiateJobErrorModeled::InvalidParameterValueException(
+                            state::invalid_parameter_value(format!(
+                                "InventoryRetrievalParameters.Limit {raw:?} is not a valid \
+                                 item count; valid values are greater than or equal to 1"
+                            )),
+                        )
+                        .into())
+                    }
+                },
+            };
+
+            let mut entries: Vec<state::InventoryEntry> = vault
+                .inventory_entries()
+                .into_iter()
+                .filter(|entry| {
+                    // With no bound asked for there is nothing to select on, so a stored
+                    // archive is never dropped by this filter.
+                    if start_date.is_none() && end_date.is_none() {
+                        return true;
+                    }
+                    let created = state::parse_iso8601(&entry.creation_date);
+                    created.is_some_and(|created| {
+                        start_date.is_none_or(|start| created >= start)
+                            && end_date.is_none_or(|end| created < end)
+                    })
+                })
+                .collect();
+
+            // "An opaque string that represents where to continue pagination of the vault
+            // inventory retrieval results": the item the previous job stopped before.
+            if let Some(marker) = range.marker.as_deref().filter(|m| !m.is_empty()) {
+                let Some(at) = entries.iter().position(|entry| entry.archive_id == marker) else {
+                    return Err(InitiateJobErrorModeled::InvalidParameterValueException(
+                        state::invalid_parameter_value(format!(
+                            "InventoryRetrievalParameters.Marker {marker:?} does not name an \
+                             archive in this inventory range"
+                        )),
+                    )
+                    .into());
+                };
+                entries.drain(..at);
+            }
+
+            // Truncating leaves a continuation marker: "If there are no more inventory
+            // items, this value is null."
+            let next_marker = limit
+                .filter(|limit| entries.len() > *limit)
+                .and_then(|limit| entries.get(limit).map(|entry| entry.archive_id.clone()));
+            if let Some(limit) = limit {
+                entries.truncate(limit);
+            }
+
+            job.inventory_parameters = Some(InventoryRetrievalJobDescription {
+                format: job.format.clone(),
+                start_date: range.start_date.clone(),
+                end_date: range.end_date.clone(),
+                limit: range.limit.clone(),
+                marker: next_marker,
+            });
+            job.inventory = entries;
+        }
+
+        let (sequence, job_id) = store.mint_id("job");
+        job.job_id = job_id.clone();
+        job.sequence = sequence;
+        // Inserted under exactly the id that was minted and is about to be returned.
+        store
+            .vaults
+            .get_mut(&(account_id.clone(), vault_name.clone()))
+            .expect("the vault was present under this key a moment ago")
+            .jobs
+            .insert(job_id.clone(), job);
+
+        Ok(InitiateJobOutput {
+            location: Some(format!("/{account_id}/vaults/{vault_name}/jobs/{job_id}")),
+            job_id: Some(job_id),
+            job_output_path: None,
+        })
     }
 }

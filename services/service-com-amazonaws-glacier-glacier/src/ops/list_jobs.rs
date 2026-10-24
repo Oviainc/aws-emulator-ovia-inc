@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: pages the vault's stored jobs, each entry rendered exactly as
+//! `DescribeJob` renders it, after settling the completions the clock already owed.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +184,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListJobs"))
+        use crate::state;
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(ListJobsErrorModeled::ServiceUnavailableException(
+                state::service_unavailable(state::NO_STORE_MESSAGE),
+            )
+            .into());
+        };
+
+        let region = state::request_region(ctx);
+        let account_id = match state::resolve_account(&input.account_id) {
+            Ok(account_id) => account_id,
+            Err(refusal) => {
+                return Err(ListJobsErrorModeled::InvalidParameterValueException(refusal).into())
+            }
+        };
+        let vault_name = input.vault_name;
+
+        // "The default limit is 50. The number of jobs returned might be fewer than the
+        // specified limit, but the number of returned jobs never exceeds the limit."
+        let limit = input.limit.unwrap_or(state::DEFAULT_LIST_JOBS_LIMIT);
+        if limit < 1 {
+            return Err(ListJobsErrorModeled::InvalidParameterValueException(
+                state::invalid_parameter_value(format!(
+                    "limit {limit} is not a valid page size: it must be at least 1"
+                )),
+            )
+            .into());
+        }
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+
+        // "The type of job status to return. You can specify the following values:
+        // InProgress, Succeeded, or Failed."
+        let status_filter = match input.statuscode.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(requested) => match STATUS_CODE_VALUES
+                .iter()
+                .find(|valid| valid.eq_ignore_ascii_case(requested))
+            {
+                Some(valid) => Some(*valid),
+                None => {
+                    return Err(ListJobsErrorModeled::InvalidParameterValueException(
+                        state::invalid_parameter_value(format!(
+                            "statuscode {requested:?} is not a valid job status; valid values \
+                             are {}",
+                            STATUS_CODE_VALUES.join(", ")
+                        )),
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // "The state of the jobs to return. You can specify true or false."
+        let completed_filter = match input.completed.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(requested) if requested.eq_ignore_ascii_case("true") => Some(true),
+            Some(requested) if requested.eq_ignore_ascii_case("false") => Some(false),
+            Some(requested) => {
+                return Err(ListJobsErrorModeled::InvalidParameterValueException(
+                    state::invalid_parameter_value(format!(
+                        "completed {requested:?} is not a valid job state; valid values are \
+                         true and false"
+                    )),
+                )
+                .into())
+            }
+        };
+
+        let mut store = store.lock();
+        let Some(vault) = store.vaults.get_mut(&(account_id, vault_name.clone())) else {
+            return Err(ListJobsErrorModeled::ResourceNotFoundException(
+                state::vault_not_found(&region, &vault_name),
+            )
+            .into());
+        };
+
+        // The same clock-owed completions `DescribeJob` settles, so a listing and a
+        // describe never disagree about whether a job has finished.
+        state::settle_due_jobs(vault);
+
+        let jobs: Vec<&state::Job> = vault
+            .jobs_in_order()
+            .into_iter()
+            .filter(|job| status_filter.is_none_or(|wanted| job.status_code == wanted))
+            .filter(|job| completed_filter.is_none_or(|wanted| job.completed == wanted))
+            .collect();
+
+        // "This value specifies the job at which the listing of jobs should begin": an
+        // inclusive start, so the page opens at the marked job itself.
+        let start = match input.marker.as_deref().filter(|m| !m.is_empty()) {
+            None => 0,
+            Some(marker) => {
+                let Some(at) = jobs.iter().position(|job| job.job_id == marker) else {
+                    return Err(ListJobsErrorModeled::InvalidParameterValueException(
+                        state::invalid_parameter_value(format!(
+                            "marker {marker:?} does not name a job of vault {vault_name}"
+                        )),
+                    )
+                    .into());
+                };
+                at
+            }
+        };
+
+        let page: Vec<&state::Job> = jobs.iter().skip(start).take(limit).copied().collect();
+        // "An opaque string that represents where to continue pagination of the results":
+        // the first job this page did not return, and null once there is none.
+        let marker = jobs.get(start + page.len()).map(|job| job.job_id.clone());
+
+        Ok(ListJobsOutput {
+            job_list: Some(
+                page.into_iter()
+                    .map(|job| state::job_description(job, vault))
+                    .collect(),
+            ),
+            marker,
+        })
     }
 }
