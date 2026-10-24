@@ -33,8 +33,8 @@ use crate::ops::types::{
     Choice, ConflictException, LensSummary, Milestone, MilestoneSummary,
     ResourceNotFoundException,
     ReviewTemplate, ShareInvitationSummary, Workload, WorkloadDiscoveryConfig,
-    WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput, WorkloadShareSummary,
-    WorkloadSummary, QUESTION_VALUES, RISK_VALUES,
+    WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput, WorkloadShare,
+    WorkloadShareSummary, WorkloadSummary, QUESTION_VALUES, RISK_VALUES,
 };
 
 /// `Workload$ImprovementStatus` before any lens review has been answered. The
@@ -2270,10 +2270,9 @@ pub struct CreateMilestoneToken {
 /// did the sharing. It is recorded (rather than re-derived) because it is the modelled
 /// `WorkloadShare$SharedBy` member, which the `WorkloadShare` shape carries and
 /// `WorkloadShareSummary` does not: `ShareInvitationSummary$SharedBy` is what
-/// `ListShareInvitations` reports it as, and the operations that return the
-/// `WorkloadShare` shape itself (`UpdateWorkloadShare`, `DeleteWorkloadShare`) are still
-/// stubs with their own issues, so the share the sharer created already remembers who
-/// shared it when one of them is implemented.
+/// `ListShareInvitations` reports it as, and [`WorkloadShareRecord::to_share`] — the
+/// projection `UpdateWorkloadShare` answers with — reports it from this field, so the
+/// principal that shared the workload survives every change to the share.
 ///
 /// `share_invitation_id` is the id of the invitation the share's recipient has to answer.
 /// The invitation is 1:1 with the share and exists from the moment the share is created
@@ -2306,6 +2305,26 @@ impl WorkloadShareRecord {
             // (`WorkloadShareSummary$StatusMessage` doc): a share that is simply waiting
             // on its invitation has nothing to add to its status.
             status_message: self.status_message.clone(),
+        }
+    }
+
+    /// The `WorkloadShare` shape — "A workload share return object" — that the
+    /// operations answering with the share itself return (`UpdateWorkloadShare`).
+    ///
+    /// It carries two members `WorkloadShareSummary` does not: `SharedBy`, the principal
+    /// that did the sharing, read off the record, and `WorkloadName`, the name of the
+    /// workload the share shares. The name is passed in rather than duplicated on the
+    /// record because the workload owns it and `UpdateWorkload` can change it, so the
+    /// share must never hold a stale copy.
+    pub fn to_share(&self, workload_name: &str) -> WorkloadShare {
+        WorkloadShare {
+            share_id: Some(self.share_id.clone()),
+            shared_by: Some(self.shared_by.clone()),
+            shared_with: Some(self.shared_with.clone()),
+            permission_type: Some(self.permission_type.clone()),
+            status: Some(self.status.clone()),
+            workload_name: Some(workload_name.to_string()),
+            workload_id: Some(self.workload_id.clone()),
         }
     }
 
@@ -2632,6 +2651,17 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         share_id: &str,
     ) -> Option<&WorkloadShareRecord> {
         self.workload_shares.get(workload_id)?.get(share_id)
+    }
+
+    /// The share `share_id` of `workload_id` for modification, if the workload holds it.
+    /// Resolved through the same two-level key as [`Self::workload_share`], so a share id
+    /// is only ever changed within the workload it belongs to.
+    pub fn workload_share_mut(
+        &mut self,
+        workload_id: &str,
+        share_id: &str,
+    ) -> Option<&mut WorkloadShareRecord> {
+        self.workload_shares.get_mut(workload_id)?.get_mut(share_id)
     }
 
     /// Every share invitation addressed to `principal` that is still waiting on an
@@ -3045,6 +3075,21 @@ pub fn workload_not_found(workload_id: &str) -> ResourceNotFoundException {
         WORKLOAD_RESOURCE_TYPE,
         workload_id.to_string(),
         &format!("workload with ID {workload_id}"),
+    )
+}
+
+/// [`resource_not_found`] for a share id that names no share of the workload.
+///
+/// A `ShareId` identifies a share on its own — the id space is unique across every
+/// workload's shares — so the `ResourceId` is that id AS SENT, and the message names the
+/// workload the share was looked for in, so a caller can tell a share of another
+/// workload from a share that was revoked. Shared by every operation that resolves a
+/// workload `ShareId`, so they cannot word it differently.
+pub fn workload_share_not_found(workload_id: &str, share_id: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        WORKLOAD_SHARE_RESOURCE_TYPE,
+        share_id.to_string(),
+        &format!("share with ID {share_id} of a workload with ID {workload_id}"),
     )
 }
 
