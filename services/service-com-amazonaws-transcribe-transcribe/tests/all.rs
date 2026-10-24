@@ -17,6 +17,8 @@ mod call_analytics_categories;
 mod call_analytics_category_listing;
 #[path = "all/call_analytics_category_updates.rs"]
 mod call_analytics_category_updates;
+#[path = "all/call_analytics_job_delete.rs"]
+mod call_analytics_job_delete;
 #[path = "all/call_analytics_jobs.rs"]
 mod call_analytics_jobs;
 #[path = "all/client_error_wire_status.rs"]
