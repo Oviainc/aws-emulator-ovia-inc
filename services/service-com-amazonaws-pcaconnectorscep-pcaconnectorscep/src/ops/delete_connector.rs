@@ -2,9 +2,11 @@
 
 //! @op DeleteConnector
 //!
-//! Removes the connector from state together with its challenges — "This operation also
-//! deletes any challenges associated with the connector" — so the next `GetConnector`
-//! answers 404 and `ListConnectors` no longer returns it.
+//! Accepts the teardown of a connector: the call answers 202 and only schedules the work, so
+//! the connector moves into the modelled `DELETING` status, which `GetConnector` and
+//! `ListConnectors` report until the teardown comes due and the record disappears (then 404).
+//! "This operation also deletes any challenges associated with the connector" — they go with
+//! the record.
 //!
 //! ## Shape of an operation
 //!
@@ -181,26 +183,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
-        // A connector that is still being created is mid-change, and this operation models
-        // `ConflictException` for a resource another request is concurrently modifying.
-        if let Some(stored) = store.connectors.get(&input.connector_arn) {
-            if stored.is_in_transition() {
-                return Err(DeleteConnectorErrorModeled::ConflictException(ConflictException {
-                    message: format!(
-                        "Connector {} cannot be deleted while its status is {}",
-                        input.connector_arn, stored.status
-                    ),
-                    resource_id: input.connector_arn.clone(),
-                    resource_type: crate::state::RESOURCE_TYPE_CONNECTOR.to_string(),
-                })
-                .into());
-            }
-        }
-
+        // A delete is accepted whatever non-terminal status the connector is in: the call
+        // only schedules the teardown, so a still-CREATING connector does not have to settle
+        // first. The record stays readable, reporting `DELETING`, until the clock makes its
+        // removal due — and removing the connector removes the challenges it owns with it.
+        //
         // `@idempotent`: a retry of a delete that already succeeded must succeed too, so a
-        // connector ARN that holds no record is a 202 rather than a 404. Removing the
-        // connector removes the challenges it owns with it.
-        store.connectors.remove(&input.connector_arn);
+        // connector ARN that holds no record is a 202 rather than a 404, and a repeat on one
+        // already tearing down neither extends nor restarts the teardown.
+        if let Some(stored) = store.connectors.get_mut(&input.connector_arn) {
+            stored.begin_deletion(now);
+        }
         Ok(DeleteConnectorOutput)
     }
 }

@@ -39,6 +39,9 @@ const STATUS_CREATING: &str =
 /// The settled status the clock owes a new connector.
 const STATUS_ACTIVE: &str =
     service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state::STATUS_ACTIVE;
+/// The status a connector carries while `DeleteConnector`'s teardown runs.
+const STATUS_DELETING: &str =
+    service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state::STATUS_DELETING;
 
 /// Private-CA ARNs matching `CertificateAuthorityArn`'s own pattern
 /// (`^arn:aws(-[a-z]+)*:acm-pca:<region>:<account>:certificate-authority/<uuid>$`). Rows
@@ -135,13 +138,19 @@ fn hold_creating(engine: &engine::InMemoryEngine, arn: &str) {
     );
 }
 
-/// Make the `ACTIVE` the clock owes `arn` due, so the next call settles it and observes it.
-fn release_to_active(engine: &engine::InMemoryEngine, arn: &str) {
+/// Make the transition the clock owes `arn` due, so the next call settles it and observes
+/// what it left behind.
+fn release_pending(engine: &engine::InMemoryEngine, arn: &str) {
     set_transition_due(
         engine,
         arn,
         std::time::SystemTime::now() - Duration::from_secs(1),
     );
+}
+
+/// Make the `ACTIVE` the clock owes `arn` due, so the next call settles it and observes it.
+fn release_to_active(engine: &engine::InMemoryEngine, arn: &str) {
+    release_pending(engine, arn);
 }
 
 /// Percent-encode a value for use in a single `@httpLabel` path segment or a query-string
@@ -1148,9 +1157,9 @@ async fn pagination_token_of_another_listing_is_refused() {
     );
 }
 
-/// A delete removes the record, so the next reader cannot see it; a repeat delete of the
-/// same ARN still succeeds, which is what `@idempotent` promises. Deleting a connector takes
-/// its challenges with it.
+/// A delete of a challenge removes the record, so the next reader cannot see it; a repeat
+/// delete of the same ARN still succeeds, which is what `@idempotent` promises. Deleting a
+/// connector is accepted (202) and takes its challenges with it once the teardown is due.
 #[tokio::test]
 async fn deletes_are_observable_and_idempotent() {
     for challenges_per_connector in [1usize, 3] {
@@ -1201,8 +1210,8 @@ async fn deletes_are_observable_and_idempotent() {
             again.status, again.body
         );
 
-        // Delete the connector: it stops being readable and listed, and its remaining
-        // challenges go with it.
+        // Delete the connector: it reports DELETING while the teardown runs, then stops
+        // being readable and listed, and its remaining challenges go with it.
         let deleted = delete_connector(&router, &connector).await;
         assert_eq!(
             deleted.status, 202,
@@ -1210,6 +1219,17 @@ async fn deletes_are_observable_and_idempotent() {
              {} / {:?}",
             deleted.status, deleted.body
         );
+        let tearing_down = get_connector(&router, &connector).await;
+        assert_eq!(
+            tearing_down.connector("Status"),
+            &json!(STATUS_DELETING),
+            "case {challenges_per_connector} challenges: a connector under teardown must report \
+             {STATUS_DELETING}, got {:?}",
+            tearing_down.body
+        );
+
+        // Let the clock make the teardown due; the record goes with it.
+        release_pending(&engine, &connector);
         let read = get_connector(&router, &connector).await;
         assert_eq!(
             (read.status, read.error_type.as_str()),
@@ -1408,10 +1428,11 @@ async fn tag_count_limit_is_enforced_on_both_creates() {
     }
 }
 
-/// A connector that is still being created is mid-change, so `DeleteConnector` refuses it
-/// with `ConflictException` and the record is still there afterwards.
+/// `DeleteConnector` answers 202 with an empty body, so it only ACCEPTS the teardown: a
+/// connector that is still being created is deleted rather than refused, and the delete is
+/// observable as `DELETING` before the record disappears.
 #[tokio::test]
-async fn deleting_a_connector_mid_creation_conflicts() {
+async fn deleting_a_connector_mid_creation_is_accepted() {
     let (router, engine) = new_router_with_engine();
     let created = create_connector(&router, json!({ "CertificateAuthorityArn": CA_ARNS[0] })).await;
     let arn = created.text("ConnectorArn");
@@ -1428,33 +1449,32 @@ async fn deleting_a_connector_mid_creation_conflicts() {
     );
     let answer = delete_connector(&router, &arn).await;
     assert_eq!(
-        (answer.status, answer.error_type.as_str()),
-        (409, "ConflictException"),
-        "case \"delete while CREATING\": expected 409 ConflictException, got {} / {:?}",
-        answer.status,
-        answer.body
-    );
-    // And the refusal left the record alone.
-    let still_there = get_connector(&router, &arn).await;
-    assert_eq!(
-        still_there.status, 200,
-        "case \"delete while CREATING\": the refused delete must not remove the connector, \
-         got {} / {:?}",
-        still_there.status, still_there.body
-    );
-
-    // Once the transition is due the connector is settled and the delete succeeds.
-    release_to_active(&engine, &arn);
-    let answer = delete_connector(&router, &arn).await;
-    assert_eq!(
         answer.status, 202,
-        "case \"delete once ACTIVE\": expected 202, got {} / {:?}",
+        "case \"delete while CREATING\": expected 202, got {} / {:?}",
         answer.status, answer.body
     );
+    // The delete was accepted, so the connector is tearing down and no longer waiting for the
+    // ACTIVE the clock used to owe it.
+    let tearing_down = get_connector(&router, &arn).await;
+    assert_eq!(
+        tearing_down.connector("Status"),
+        &json!(STATUS_DELETING),
+        "case \"delete while CREATING\": the accepted delete must move it to DELETING, got {:?}",
+        tearing_down.body
+    );
+
+    // Once the teardown is due the record is gone, and a repeat is still accepted.
+    release_pending(&engine, &arn);
     let gone = get_connector(&router, &arn).await;
     assert_eq!(
         gone.status, 404,
-        "case \"delete once ACTIVE\": the connector must be gone, got {} / {:?}",
+        "case \"teardown due\": the connector must be gone, got {} / {:?}",
         gone.status, gone.body
+    );
+    let answer = delete_connector(&router, &arn).await;
+    assert_eq!(
+        answer.status, 202,
+        "case \"delete once gone\": an @idempotent delete must still answer 202, got {} / {:?}",
+        answer.status, answer.body
     );
 }

@@ -31,6 +31,10 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 pub const STATUS_CREATING: &str = "CREATING";
 /// The ready state: a connector whose SCEP endpoint serves and that can mint challenges.
 pub const STATUS_ACTIVE: &str = "ACTIVE";
+/// `ConnectorStatus` value a connector carries while `DeleteConnector`'s teardown runs: the
+/// delete answers 202 and only accepts the work, so the connector is reported in this status
+/// until the teardown completes and the record (with its challenges) disappears.
+pub const STATUS_DELETING: &str = "DELETING";
 
 /// `ConnectorType` value of a connector created without `MobileDeviceManagement` — the
 /// member's own doc: "If you don't supply a value, by default Connector for SCEP creates a
@@ -51,15 +55,16 @@ pub const REASON_INVALID_STATE: &str = "INVALID_STATE";
 /// `ValidationExceptionReason` for a call that does not apply to the connector's `Type`.
 pub const REASON_INVALID_CONNECTOR_TYPE: &str = "INVALID_CONNECTOR_TYPE";
 
-/// How long a connector stays `CREATING` before the clock owes it `ACTIVE`.
+/// How long a connector stays in a non-terminal status before the clock settles it:
+/// `CREATING` before it owes `ACTIVE`, and `DELETING` before the record disappears.
 ///
-/// `CreateConnector` answers HTTP 202 and the connector's own `Status` enum carries
-/// `CREATING`, so creation is asynchronous: a resource the service reports in a
-/// non-terminal status has a transition the clock owes. The span is the emulator's own
-/// choice (no AWS-documented duration applies to connector provisioning) and is
-/// deliberately non-zero, so a caller reading straight after the create still observes the
-/// transient status — and the state errors that go with it — as it does against the real
-/// service. The instant it comes due is stored on the record
+/// `CreateConnector` and `DeleteConnector` both answer HTTP 202 and the connector's own
+/// `Status` enum carries `CREATING` and `DELETING`, so both are asynchronous: a resource the
+/// service reports in a non-terminal status has a transition the clock owes. The span is the
+/// emulator's own choice (no AWS-documented duration applies to connector provisioning or
+/// teardown) and is deliberately non-zero, so a caller reading straight after the call still
+/// observes the transient status — and the state errors that go with it — as it does against
+/// the real service. The instant it comes due is stored on the record
 /// ([`PendingTransition::due_at`]) and materialised by [`StoredConnector::settle`];
 /// nothing sleeps.
 pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
@@ -113,10 +118,23 @@ const CHALLENGE_SEGMENT: &str = "/challenge/";
 /// A status change the clock owes a connector: where it lands, and when.
 #[derive(Debug, Clone)]
 pub struct PendingTransition {
-    /// The `ConnectorStatus` the connector settles into.
-    pub to: String,
+    /// What the clock owes this connector.
+    pub outcome: PendingOutcome,
     /// The instant the transition comes due.
     pub due_at: SystemTime,
+}
+
+/// Where a pending transition leaves the connector.
+///
+/// A connector in a non-terminal `ConnectorStatus` either settles into another status
+/// (`CREATING` -> `ACTIVE`) or ceases to exist (`DELETING` -> gone, taking its challenges
+/// with it), so those are the only two outcomes the clock can owe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingOutcome {
+    /// The connector settles into this `ConnectorStatus` value.
+    Status(String),
+    /// The teardown completes: the record, its challenges and its tags are gone.
+    Removed,
 }
 
 /// A `ClientToken` and the resource the call carrying it created.
@@ -206,22 +224,51 @@ pub struct StoredConnector {
 }
 
 impl StoredConnector {
-    /// Materialise the transition the clock already owes this connector.
+    /// Materialise the transition the clock already owes this connector, answering whether
+    /// the record survives it (`false` once a teardown has come due, so the caller drops it).
     ///
     /// This is the ONLY write a reporting operation makes: the change was owed at this
     /// instant whether or not anybody called.
-    fn settle(&mut self, now: SystemTime) {
+    fn settle(&mut self, now: SystemTime) -> bool {
         let Some(pending) = self.pending.clone() else {
-            return;
+            return true;
         };
         if now < pending.due_at {
+            return true;
+        }
+        match pending.outcome {
+            PendingOutcome::Status(status) => {
+                self.status = status;
+                // The change happened when the clock made it due, not when someone looked.
+                self.updated_at = pending.due_at.max(self.updated_at);
+                self.status_reason = None;
+                self.pending = None;
+                true
+            }
+            // The teardown is complete, so there is no record left to report.
+            PendingOutcome::Removed => false,
+        }
+    }
+
+    /// Accept a delete: the connector moves into `DELETING` and the clock owes its removal.
+    ///
+    /// `DeleteConnector` answers 202 with an empty body — it only accepts the work — so this
+    /// is correct whatever non-terminal status the connector is in: a pending `ACTIVE` is
+    /// replaced by the teardown rather than being waited for. A connector already tearing
+    /// down keeps the due instant it was given, so repeating the `@idempotent` delete can
+    /// neither extend the teardown nor restart it.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        if self.is_deleting() {
             return;
         }
-        self.status = pending.to;
-        // The change happened when the clock made it due, not when someone looked.
-        self.updated_at = pending.due_at.max(self.updated_at);
+        self.status = STATUS_DELETING.to_string();
+        // `StatusReason` says why a connector FAILED; one being torn down carries none.
         self.status_reason = None;
-        self.pending = None;
+        self.updated_at = now;
+        self.pending = Some(PendingTransition {
+            outcome: PendingOutcome::Removed,
+            due_at: now + TRANSITION_SPAN,
+        });
     }
 
     /// True while a transition is still owed — the connector is mid-flight.
@@ -232,6 +279,12 @@ impl StoredConnector {
     /// True once the connector is in the one status that lets a caller use it.
     pub fn is_active(&self) -> bool {
         self.status == STATUS_ACTIVE
+    }
+
+    /// True while the connector's teardown is running: it is still reported, but nothing can
+    /// be built on it and it is about to disappear.
+    pub fn is_deleting(&self) -> bool {
+        self.status == STATUS_DELETING
     }
 
     /// The modelled `Connector`, as `GetConnector` returns it.
@@ -282,15 +335,14 @@ pub struct ComAmazonawsPcaconnectorscepPcaconnectorscepState {
 }
 
 impl ComAmazonawsPcaconnectorscepPcaconnectorscepState {
-    /// Materialise everything the clock already owes: each connector's status transition,
-    /// and the expiry of every `ClientToken` past its five-minute window.
+    /// Materialise everything the clock already owes: each connector's status transition or
+    /// completed teardown, and the expiry of every `ClientToken` past its five-minute window.
     ///
     /// Called at the top of each handler, reporting ones included: they may write only a
     /// change that was already due at this instant.
     pub fn settle(&mut self, now: SystemTime) {
-        for connector in self.connectors.values_mut() {
-            connector.settle(now);
-        }
+        // A connector whose teardown has come due is gone, challenges and tags with it.
+        self.connectors.retain(|_, connector| connector.settle(now));
         let live = |record: &IdempotencyRecord| record.created_at + CLIENT_TOKEN_TTL > now;
         self.connector_tokens.retain(|_, record| live(record));
         self.challenge_tokens.retain(|_, record| live(record));
