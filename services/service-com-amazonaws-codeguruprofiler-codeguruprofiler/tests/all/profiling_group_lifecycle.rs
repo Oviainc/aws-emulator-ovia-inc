@@ -70,7 +70,9 @@ impl Answer {
 
 /// The emulator, assembled exactly as the router assembles it: one shared engine
 /// behind one mounted service. The engine is kept so a test can assert on the stored
-/// state itself, which is the only way to observe a retention bound.
+/// state itself, which is the only way to observe a retention bound. `pub(crate)` so
+/// the other suites in this test target drive the emulator through this one harness
+/// rather than each building its own.
 pub(crate) struct Harness {
     router: MultiServiceRouter,
     /// `pub(crate)` for the same reason as the harness itself: a sibling suite that

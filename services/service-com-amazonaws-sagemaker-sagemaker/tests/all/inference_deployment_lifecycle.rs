@@ -162,6 +162,27 @@ pub(crate) fn epoch_seconds(at: std::time::SystemTime) -> f64 {
     since_epoch.as_secs_f64()
 }
 
+/// Materialise the lineage group `name` in `region` at `at` on `emulator`'s shared engine,
+/// exactly as a lineage-entity create does, and answer the ARN when THIS call is what
+/// materialised it.
+///
+/// Shared by the lineage-group suites (`lineage_groups`, `lineage_group_reporting`) so the
+/// one write path is named once: it reaches the store directly because that is the only way
+/// to put a group there with a chosen name, Region and instant — SageMaker models no
+/// `CreateLineageGroup`, so `ensure_lineage_group` is the service's own write path.
+pub(crate) fn materialise_lineage_group(
+    emulator: &Emulator,
+    region: &str,
+    name: &str,
+    at: std::time::SystemTime,
+) -> Option<String> {
+    let state = emulator.engine.state::<
+        service_com_amazonaws_sagemaker_sagemaker::ComAmazonawsSagemakerSagemakerState,
+    >();
+    let mut store = state.lock();
+    store.ensure_lineage_group(region, name, at)
+}
+
 pub(crate) fn primary_container(image: &str) -> Value {
     json!({ "Image": image })
 }
