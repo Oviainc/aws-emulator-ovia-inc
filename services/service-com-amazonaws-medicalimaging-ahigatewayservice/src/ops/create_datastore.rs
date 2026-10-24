@@ -10,6 +10,13 @@
 //! and the clock owes its move to `ACTIVE` — see
 //! [`crate::state::DATASTORE_ACTIVATION_DELAY`]. Nothing here sleeps.
 //!
+//! The store is minted IN the region this request was addressed to
+//! ([`crate::state::request_region`]), which is both the region its ARN names and the
+//! only region any later request can reach it from — and the region whose data stores
+//! its quota counts. The `clientToken` ledger is scoped the same way, so the same token
+//! replayed against another region mints that region's own store rather than reporting
+//! one the caller cannot read.
+//!
 //! The `tags` map is validated before anything is minted, by the rules of the TAG MAP
 //! rather than of this operation: a key outside `TagKey`'s modelled constraints, or more
 //! entries than one resource may hold ([`crate::state::MAX_TAGS_PER_RESOURCE`]), is
@@ -189,9 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@idempotencyToken`: a token already in the ledger names the store it minted,
         // so the repeat call reports that store's CURRENT status rather than creating
         // a second one.
-        let token_key = crate::state::client_token_key("CreateDatastore", &input.client_token);
+        let token_key =
+            crate::state::client_token_key(&region, "CreateDatastore", &input.client_token);
         if let Some(existing_id) = store.client_tokens.get(&token_key).cloned() {
-            if let Some(existing) = store.datastores.get(&existing_id) {
+            if let Some(existing) = store.datastore_in(&region, &existing_id) {
                 return Ok(CreateDatastoreOutput {
                     datastore_id: existing.datastore_id.clone(),
                     datastore_status: existing.datastore_status.as_wire().to_string(),
@@ -201,13 +209,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Bound the memory one caller can make this emulator hold. The cap is the
         // emulator's own ([`crate::state::MAX_DATASTORES`]), refused with the
-        // operation's modelled quota error rather than an unmodelled one.
-        if store.datastores.len() >= crate::state::MAX_DATASTORES {
+        // operation's modelled quota error rather than an unmodelled one. It counts the
+        // data stores of THIS region, because those are the only ones a request
+        // addressed to it can reach — a store in another region neither occupies nor
+        // frees a place here.
+        if store.datastores_in(&region).count() >= crate::state::MAX_DATASTORES {
             return Err(CreateDatastoreErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: format!(
-                        "this emulator holds at most {} data stores; delete one before creating another",
+                        "this emulator holds at most {} data stores per region; delete one before creating another",
                         crate::state::MAX_DATASTORES
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // And the process-wide companion to it: a per-region cap alone bounds no memory,
+        // because a caller may address as many regions as it likes
+        // ([`crate::state::MAX_DATASTORES_ALL_REGIONS`]).
+        if store.datastores.len() >= crate::state::MAX_DATASTORES_ALL_REGIONS {
+            return Err(CreateDatastoreErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator holds at most {} data stores in total; delete one before creating another",
+                        crate::state::MAX_DATASTORES_ALL_REGIONS
                     ),
                 },
             )
@@ -217,6 +243,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let datastore_id = store.mint_id();
         let datastore = Datastore {
             datastore_id: datastore_id.clone(),
+            // The region this request was addressed to is the region the data store
+            // EXISTS in, not merely the one its ARN spells: it is what every later
+            // request has to address to reach it.
+            region: region.clone(),
             datastore_name: input.datastore_name.clone(),
             datastore_status: DatastoreStatus::Creating,
             datastore_arn: crate::state::datastore_arn(&region, &datastore_id),

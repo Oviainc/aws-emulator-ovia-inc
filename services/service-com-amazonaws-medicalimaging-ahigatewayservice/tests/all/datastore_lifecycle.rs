@@ -25,10 +25,19 @@ use service_com_amazonaws_medicalimaging_ahigatewayservice::state::{
     MAX_DATASTORES, MAX_IMPORT_JOBS_PER_DATASTORE,
 };
 
+/// The region every suite signs for unless it names another: the one
+/// [`Emulator::call`] uses.
+pub(crate) const DEFAULT_TEST_REGION: &str = "us-east-1";
+
 /// A SigV4 header naming this service's signing name, which is how the router's
-/// `can_handle` resolves the request to this service, and where the ARN region comes
-/// from. Signatures are not verified (see `set_request_authentication(false)`).
-const SIGV4: &str = "AWS4-HMAC-SHA256 Credential=AKIDTESTKEY/20260101/us-east-1/medical-imaging/aws4_request, SignedHeaders=host, Signature=abc";
+/// `can_handle` resolves the request to this service, and whose credential scope is
+/// where the request's REGION comes from. Signatures are not verified (see
+/// `set_request_authentication(false)`).
+pub(crate) fn sigv4_for(region: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential=AKIDTESTKEY/20260101/{region}/medical-imaging/aws4_request, SignedHeaders=host, Signature=abc"
+    )
+}
 
 /// The account id every emulated ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
 pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
@@ -93,13 +102,26 @@ impl Emulator {
         &self.engine
     }
 
+    /// One call signed for [`DEFAULT_TEST_REGION`].
     pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
+        self.call_in(DEFAULT_TEST_REGION, method, uri, body).await
+    }
+
+    /// One call signed for `region`: the credential scope and the `host` header both
+    /// name it, exactly as an SDK client configured for that region sends.
+    pub(crate) async fn call_in(
+        &self,
+        region: &str,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> Answer {
         let payload = body.map(|value| value.to_string()).unwrap_or_default();
         let request = http::Request::builder()
             .method(method)
             .uri(uri)
-            .header("host", "medical-imaging.us-east-1.amazonaws.com")
-            .header("authorization", SIGV4)
+            .header("host", format!("medical-imaging.{region}.amazonaws.com"))
+            .header("authorization", sigv4_for(region))
             .header("content-type", "application/json")
             .body(Bytes::from(payload))
             .expect("a well-formed test request");
@@ -214,6 +236,16 @@ impl Emulator {
 /// clock-owed transition. Sleeping exactly one span would make the assertion race a
 /// scheduling hiccup; a multiple cannot.
 pub(crate) const SETTLE_MULTIPLE: u32 = 4;
+
+/// A well-formed `[0-9a-z]{32}` resource id that no call ever mints (the ids `mint_id`
+/// produces are SplitMix64 output, never all zeros), for a case that needs an id of a
+/// resource this emulator does not hold.
+///
+/// `pub(crate)` beside the harness, so a suite needing one borrows this rather than
+/// spelling it again.
+pub(crate) fn unheld_id() -> String {
+    "0".repeat(32)
+}
 
 /// `DatastoreId` is `^[0-9a-z]{32}$`; `JobId` is `^[0-9a-z]+$`, 1..32
 /// (`smithy_query(query="operation",operation="CreateDatastore,StartDICOMImportJob")`).
