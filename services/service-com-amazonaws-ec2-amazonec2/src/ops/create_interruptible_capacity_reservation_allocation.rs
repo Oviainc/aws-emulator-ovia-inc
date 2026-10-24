@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInterruptibleCapacityReservationAllocation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInterruptibleCapacityReservationAllocation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInterruptibleCapacityReservationAllocation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: moves unused capacity out of the source Capacity Reservation the request
+//! names into a new interruptible Capacity Reservation [`crate::state`] stores, and
+//! answers the allocation's own status. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +152,344 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInterruptibleCapacityReservationAllocation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInterruptibleCapacityReservationAllocationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInterruptibleCapacityReservationAllocation"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // "Specify `retain` to keep the interruptible Capacity Reservation active at zero
+        // capacity … Specify `default` to cancel the interruptible Capacity Reservation and
+        // return the capacity to your source Capacity Reservation. The default value is
+        // `default`" (`ZeroSizePreference`). The member targets a modelled enum, so the
+        // boundary validator has already refused any other word; this maps the one the
+        // request carries onto the catalog's own `&'static str`, so nothing taken from a
+        // request is ever stored as a state word.
+        let zero_size_preference = match input.zero_size_preference.as_deref() {
+            None => state::ZERO_SIZE_PREFERENCE_DEFAULT,
+            Some(state::ZERO_SIZE_PREFERENCE_RETAIN) => state::ZERO_SIZE_PREFERENCE_RETAIN,
+            Some(state::ZERO_SIZE_PREFERENCE_DEFAULT) => state::ZERO_SIZE_PREFERENCE_DEFAULT,
+            Some(other) => {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{other}' for zeroSizePreference"
+                )))
+            }
+        };
+
+        // "The tags to apply to the interruptible Capacity Reservation during creation"
+        // (`TagSpecifications`) — the interruptible Capacity Reservation is the only
+        // resource this action creates, so a specification naming any other resource type
+        // is refused rather than accepted and discarded. The tag payload's own bounds are
+        // applied by the one shared reader every create holds its tags to.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_CAPACITY_RESERVATION,
+            Self::NAME,
+        )?;
+
+        // The token map keeps the token for the process's lifetime, so its length is
+        // bounded the way every other create of this crate bounds its own.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {} characters",
+                state::MAX_CLIENT_TOKEN_CHARS
+            )));
+        }
+
+        // "The number of instances to allocate from your source reservation. You can only
+        // allocate available instances (also called unused capacity)"
+        // (`InstanceCount`): an allocation allocates instances, so there has to be at least
+        // one of them. The model puts no range on the member, so the handler is the only
+        // place this bound can be enforced; how many are AVAILABLE is a fact of the source
+        // reservation and is checked below, once it has been resolved.
+        if input.instance_count < 1 {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for instanceCount: an interruptible allocation \
+                 allocates at least 1 instance",
+                input.instance_count
+            )));
+        }
+
+        let region = state::request_region(ctx.parts());
+        // ONE reading of the wall clock for this call: the state the source is judged in,
+        // and the creation time of the reservation an allocation mints, are the same instant.
+        let now = ::std::time::SystemTime::now();
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // Every move the clock already owed — including an earlier allocation's
+        // `pending` -> `active` — is materialised before anything is read, so this call
+        // decides against the state a caller would have been shown anyway.
+        store.materialize_due_transitions();
+
+        // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
+        // idempotency of the request" (`ClientToken`) — one token names the ONE allocation
+        // it made, so a replay reports that allocation and allocates nothing more. A repeat
+        // that carries the same token but asks for something ELSE is not a replay: every
+        // member of the first request is compared against what it stored (the source it
+        // allocated from, the instances it asked for, the zero-size preference, and the tags
+        // that went on the reservation it created), and a difference in any of them is
+        // answered with `IdempotentParameterMismatch` rather than with the first result. A
+        // token whose allocation the store no longer holds is a MISS, not a mismatch: there
+        // is nothing left to answer with, so the request is served as a fresh allocation.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.interruptible_allocation_client_tokens.get(token).cloned())
+            .filter(|first_source_id| {
+                store
+                    .capacity_reservations
+                    .get(first_source_id)
+                    .is_some_and(|record| {
+                        record.view.interruptible_capacity_allocation.is_some()
+                    })
+            });
+        if let Some(first_source_id) = replayed {
+            let allocation = store
+                .capacity_reservations
+                .get(&first_source_id)
+                .and_then(|record| record.view.interruptible_capacity_allocation.clone());
+            let first_tags: Vec<Tag> = allocation
+                .as_ref()
+                .and_then(|allocation| allocation.interruptible_capacity_reservation_id.as_deref())
+                .and_then(|minted| store.capacity_reservations.get(minted))
+                .and_then(|record| record.view.tags.clone())
+                .unwrap_or_default();
+            let identical = first_source_id == input.capacity_reservation_id
+                && allocation.as_ref().is_some_and(|allocation| {
+                    allocation.target_instance_count == Some(input.instance_count)
+                        && allocation.zero_size_preference.as_deref()
+                            == Some(zero_size_preference)
+                })
+                && state::tag_pairs(&first_tags) == state::tag_pairs(&tags);
+            if !identical {
+                // EC2's own wording for the code, from the one place this crate words it.
+                return Err(state::idempotent_parameter_mismatch());
+            }
+            // A replay writes nothing, so DryRun is the only thing left that can change
+            // the answer.
+            if input.dry_run == Some(true) {
+                return Err(Scaffolded::dry_run_operation());
+            }
+            return allocation_response(&store, &first_source_id);
+        }
+
+        // "The ID of the source Capacity Reservation from which to create the interruptible
+        // Capacity Reservation" — an id the account holds no reservation for is an error,
+        // not a silent no-op.
+        let source = state::require_known_capacity_reservation(&store, &input.capacity_reservation_id)?;
+        let source_id = input.capacity_reservation_id.clone();
+        // ONE reading of the clock, so the state this refuses on and the state its message
+        // names cannot differ.
+        let source_state = source.state_at(now).to_string();
+
+        // "Your Capacity Reservation must be in active state with no end date set and have
+        // available capacity for allocation" (`CapacityReservationId`). Each of those is a
+        // fact of the stored source reservation, so each is answered with the state that
+        // forbids the allocation rather than with a generic refusal.
+        if source.view.interruptible == Some(true) {
+            return Err(state::incorrect_state(format!(
+                "The Capacity Reservation '{source_id}' is itself an interruptible \
+                 Capacity Reservation, so capacity cannot be allocated from it"
+            )));
+        }
+        if source_state != state::CAPACITY_RESERVATION_STATE_ACTIVE {
+            return Err(state::incorrect_state(format!(
+                "The Capacity Reservation '{source_id}' is in state '{source_state}', \
+                 not '{}', so capacity cannot be allocated from it",
+                state::CAPACITY_RESERVATION_STATE_ACTIVE,
+            )));
+        }
+        if source.view.end_date.is_some() {
+            return Err(state::incorrect_state(format!(
+                "The Capacity Reservation '{source_id}' has an end date set, \
+                 so capacity cannot be allocated from it"
+            )));
+        }
+        // The modelled source carries ONE `InterruptibleCapacityAllocation`
+        // (`CapacityReservation$InterruptibleCapacityAllocation`), and
+        // `UpdateInterruptibleCapacityReservationAllocation` is what changes its size, so a
+        // second allocation from the same source has nowhere to be recorded.
+        if source.view.interruptible_capacity_allocation.is_some() {
+            return Err(state::incorrect_state(format!(
+                "The Capacity Reservation '{source_id}' already has an interruptible \
+                 allocation; change its size with \
+                 UpdateInterruptibleCapacityReservationAllocation"
+            )));
+        }
+        let available = source.available_instance_count();
+        if input.instance_count > available {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for instanceCount: Capacity Reservation \
+                 '{source_id}' has {available} instances available for allocation",
+                input.instance_count
+            )));
+        }
+
+        // The interruptible reservation reserves the same capacity as the source it is
+        // allocated from — the same instance type, platform, zone, tenancy and match
+        // criteria — because it IS part of that reservation's capacity, held under its own
+        // id. Read out of the store, never from the request.
+        let instance_type = source.view.instance_type.clone().unwrap_or_default();
+        let instance_platform = source.view.instance_platform.clone().unwrap_or_default();
+        let availability_zone = source.view.availability_zone.clone().unwrap_or_default();
+        let availability_zone_id = source.view.availability_zone_id.clone().unwrap_or_default();
+        let tenancy = source.view.tenancy.clone().unwrap_or_default();
+        let instance_match_criteria = source
+            .view
+            .instance_match_criteria
+            .clone()
+            .unwrap_or_default();
+        let ebs_optimized = source.view.ebs_optimized.unwrap_or(false);
+        let ephemeral_storage = source.view.ephemeral_storage.unwrap_or(false);
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if !store.has_capacity_reservation_capacity(1) {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds {} Capacity Reservations, which is as many as it stores",
+                state::MAX_STORED_CAPACITY_RESERVATIONS
+            )));
+        }
+        let payload_bytes = state::tag_list_bytes(&tags)
+            .saturating_add(instance_type.len())
+            .saturating_add(input.client_token.as_deref().map_or(0, str::len));
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and the source resolved, and
+        // BEFORE the first write: "Checks whether you have the required permissions for the
+        // action, without actually making the request" (`DryRun`), so a request that would
+        // have been refused is refused with that reason instead, and one that would have
+        // succeeded leaves the store untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The interruptible Capacity Reservation the allocation creates. It comes up
+        // `pending` — "the Capacity Reservation request was successful but the capacity
+        // provisioning is still pending" (`CapacityReservation$State`) — because the
+        // allocation that fills it is still in flight (see the allocation's own status
+        // below), and the clock owes it `active` one TRANSITION_DELAY later, whether or not
+        // anybody calls again.
+        let Some(interruptible_id) =
+            store.insert_capacity_reservation(state::CapacityReservationSpec {
+                instance_type,
+                instance_platform,
+                availability_zone,
+                availability_zone_id,
+                region,
+                tenancy,
+                instance_count: input.instance_count,
+                ebs_optimized,
+                // "Deprecated" (`CapacityReservation$EphemeralStorage`), and not something
+                // this call takes: the interruptible reservation inherits the source's
+                // answer.
+                ephemeral_storage,
+                // "Your Capacity Reservation must be … with no end date set", and the
+                // interruptible reservation lives for as long as the capacity is allocated
+                // to it, so it has no end date either.
+                end_date: None,
+                instance_match_criteria,
+                created_at: now,
+                state: state::CAPACITY_RESERVATION_STATE_PENDING,
+                tags,
+                interruption_info: Some(InterruptionInfo {
+                    source_capacity_reservation_id: Some(source_id.clone()),
+                    interruption_type: Some(state::INTERRUPTION_TYPE_ADHOC.to_string()),
+                }),
+                zero_size_preference: Some(zero_size_preference),
+                pending: Some(state::CapacityReservationTransition::starting_now(
+                    state::CapacityReservationMove::Active,
+                )),
+            })
+        else {
+            // The store refused the write at one of its own ceilings: a quota, not
+            // something the request got wrong, and nothing has been written.
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds {} Capacity Reservations and {} bytes of \
+                 caller-supplied data, which is as much as it stores",
+                state::MAX_STORED_CAPACITY_RESERVATIONS,
+                state::MAX_STORED_BYTES,
+            )));
+        };
+        // The token's own bytes, which `insert_capacity_reservation` does not know about:
+        // charged here so no path can store them uncharged.
+        store.add_stored_bytes(input.client_token.as_deref().map_or(0, str::len));
+
+        // The source gives up the capacity it just allocated: "the number of unused
+        // instances you want to allocate from your source reservation" is not available for
+        // it to launch any more, so a second allocation cannot claim the same instances.
+        // The allocation itself is recorded on the source, which is where the model carries
+        // it, and reports the move it has just started. The modelled
+        // `InterruptibleCapacityReservationAllocationStatus` carries ONE word for a request
+        // that was accepted and is not complete — `pending` — and "active when complete"
+        // (`InterruptibleCapacityAllocation$Status`) for the end of it, so the allocation is
+        // `pending` with nothing allocated yet while the capacity moves, and the clock owes
+        // it `active` with the whole target allocated one TRANSITION_DELAY later.
+        let Some(record) = store.capacity_reservations.get_mut(&source_id) else {
+            return Err(Scaffolded::internal_error(format!(
+                "the Capacity Reservation '{source_id}' could not be read back to \
+                 record its allocation"
+            )));
+        };
+        record.view.available_instance_count = Some(available - input.instance_count);
+        record.view.interruptible_capacity_allocation = Some(InterruptibleCapacityAllocation {
+            instance_count: Some(0),
+            target_instance_count: Some(input.instance_count),
+            status: Some(state::INTERRUPTIBLE_ALLOCATION_STATUS_PENDING.to_string()),
+            interruptible_capacity_reservation_id: Some(interruptible_id),
+            interruption_type: Some(state::INTERRUPTION_TYPE_ADHOC.to_string()),
+            zero_size_preference: Some(zero_size_preference.to_string()),
+        });
+        record.pending = Some(state::CapacityReservationTransition::starting_now(
+            state::CapacityReservationMove::AllocationActive,
+        ));
+        if let Some(token) = input.client_token.clone() {
+            store
+                .interruptible_allocation_client_tokens
+                .insert(token, source_id.clone());
+        }
+
+        // The answer is read back OUT of the store, so this call and a later
+        // `GetCapacityReservationUsage` cannot report one allocation differently.
+        allocation_response(&store, &source_id)
     }
+}
+
+/// The allocation recorded on the source Capacity Reservation `source_id`, as this
+/// operation answers it.
+///
+/// Read out of the store rather than built from the request, so a replay of an idempotent
+/// request and the call that made it answer the same thing, and both report the status the
+/// clock has actually reached.
+fn allocation_response(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    source_id: &str,
+) -> Result<
+    CreateInterruptibleCapacityReservationAllocationOutput,
+    CreateInterruptibleCapacityReservationAllocationError,
+> {
+    let allocation = store
+        .capacity_reservations
+        .get(source_id)
+        .and_then(|record| record.view.interruptible_capacity_allocation.clone())
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::internal_error(format!(
+                "the Capacity Reservation '{source_id}' holds no interruptible allocation \
+                 to report"
+            ))
+        })?;
+    Ok(CreateInterruptibleCapacityReservationAllocationOutput {
+        source_capacity_reservation_id: Some(source_id.to_string()),
+        target_instance_count: allocation.target_instance_count,
+        status: allocation.status,
+        interruption_type: allocation.interruption_type,
+    })
 }

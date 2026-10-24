@@ -592,6 +592,30 @@
 //! deliver, one that was cancelled, one whose payment is pending or failed — are stored, as
 //! [`CapacityBlockRecord::pinned_state`].
 //!
+//! ## Capacity Reservations
+//!
+//! [`ComAmazonawsEc2Amazonec2State::capacity_reservations`] holds the account's Capacity
+//! Reservations as [`CapacityReservationRecord`]s: the modelled [`CapacityReservation`]
+//! every operation that reports one answers with, plus the move the clock owes it
+//! ([`CapacityReservationTransition`]), keyed by `CapacityReservationId` in a [`BTreeMap`]
+//! — the same stable order every other store is kept in.
+//! [`ComAmazonawsEc2Amazonec2State::insert_capacity_reservation`] is the one place a record
+//! is built, so the id, the ARN, the owning account, the end type and the available count a
+//! fresh reservation starts at are decided once however many writers there are. A
+//! reservation's expiry is NOT stored: "The Capacity Reservation's state changes to
+//! `expired` when it reaches its end date and time" (`CapacityReservation$EndDate`), so
+//! [`CapacityReservationRecord::state_at`] derives it from that date on read, the way
+//! [`CapacityBlockRecord::state_at`] derives a Capacity Block's window.
+//!
+//! An INTERRUPTIBLE reservation is one of these records too, not a second kind of resource:
+//! `CreateInterruptibleCapacityReservationAllocation` moves unused capacity out of a source
+//! reservation into a new one that carries `Interruptible` and an `InterruptionInfo` naming
+//! that source, while the source carries the `InterruptibleCapacityAllocation` naming what
+//! was allocated and the reservation it went to. The allocation's `pending` -> `active`
+//! move, and the new reservation's own `pending` -> `active`, fall due on the same monotonic
+//! clock and the same [`TRANSITION_DELAY`] as an instance's [`PendingTransition`], and
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies them.
+//!
 //! ## Capacity Reservation Fleets
 //!
 //! [`ComAmazonawsEc2Amazonec2State::capacity_reservation_fleets`] holds the account's
@@ -723,7 +747,8 @@ use crate::ops::types::{
     AvailabilityZone, AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
     ByoipCidr,
     DhcpConfiguration, DhcpOptions,
-    CapacityBlock, ExportTask, FpgaImage, FpgaImageState, ImageUsageReport, LoadPermission,
+    CapacityBlock, CapacityReservation, ExportTask, FpgaImage, FpgaImageState, ImageUsageReport,
+    LoadPermission,
     CapacityReservationFleet, FleetCapacityReservation,
     StorageLocation, VolumeRecycleBinInfo,
     CreateVolumeOutput, DefaultConnectionTrackingConfiguration,
@@ -735,7 +760,8 @@ use crate::ops::types::{
     IpamInternetRegistryAssociation, IpamPool, IpamRoutingPolicyRegistration,
     IpamResourceTag, IpamRoutingPolicyRegistrationDelta, IpamScope,
     MemoryInfo, NetworkInfo, NitroTpmInfo, PlacementGroupInfo, ProcessorInfo, VCpuInfo,
-    InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
+    InstanceState, InstanceTypeOffering, InterruptionInfo, IpPermission, IpRange,
+    LOCATION_TYPE_VALUES,
     LaunchTemplate, MacHost, Monitoring, NatGateway, NetworkInsightsAccessScope,
     NetworkInsightsAccessScopeAnalysis, OperatorResponse, PeeringAttachmentStatus, Placement,
     PlacementGroup,
@@ -1741,6 +1767,20 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Every Capacity Block the account holds, by `CapacityBlockId` — see the module docs.
     /// Ordered by id, which is the order `DescribeCapacityBlocks` reports and pages over.
     pub capacity_blocks: BTreeMap<String, CapacityBlockRecord>,
+    /// Every Capacity Reservation the account holds, by `CapacityReservationId`, as
+    /// [`CapacityReservationRecord`]s — see the "Capacity Reservations" section below.
+    /// Ordered by id, the stable order a report of them pages over.
+    pub capacity_reservations: BTreeMap<String, CapacityReservationRecord>,
+    /// A `CreateInterruptibleCapacityReservationAllocation` `ClientToken` and the SOURCE
+    /// `CapacityReservationId` whose allocation that request made, so a repeat of the same
+    /// request answers with that allocation instead of allocating the capacity twice:
+    /// "Unique, case-sensitive identifier that you provide to ensure the idempotency of the
+    /// request" (`CreateInterruptibleCapacityReservationAllocationRequest$ClientToken`).
+    pub interruptible_allocation_client_tokens: HashMap<String, String>,
+    /// A `CreateCapacityReservation` `ClientToken` and the `CapacityReservationId` it
+    /// minted, so a repeat of the same request answers with that reservation instead of
+    /// reserving capacity twice.
+    pub capacity_reservation_client_tokens: HashMap<String, String>,
     /// What each instance's application health status is derived from, by `InstanceId` —
     /// see [`InstanceApplicationStatusRecord`] and the module docs. An instance with no
     /// entry has had no application status check reported for it, which is exactly the
@@ -2095,6 +2135,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             public_ipv4_pools: BTreeMap::new(),
             coip_pools: BTreeMap::new(),
             capacity_blocks: BTreeMap::new(),
+            capacity_reservations: BTreeMap::new(),
+            interruptible_allocation_client_tokens: HashMap::new(),
+            capacity_reservation_client_tokens: HashMap::new(),
             application_status: BTreeMap::new(),
             fast_launch_images: BTreeMap::new(),
             addresses: BTreeMap::new(),
@@ -3704,6 +3747,39 @@ impl ComAmazonawsEc2Amazonec2State {
                 record.pending = None;
             }
         }
+        // The move a Capacity Reservation is owed: the interruptible allocation a
+        // `CreateInterruptibleCapacityReservationAllocation` started completes, and the
+        // interruptible Capacity Reservation it minted becomes usable. Each was due at its
+        // instant whether or not anybody called again, so applying it here changes nothing
+        // a later caller would not have seen anyway.
+        for record in self.capacity_reservations.values_mut() {
+            let Some(pending) = record
+                .pending
+                .as_ref()
+                .filter(|pending| now >= pending.due_at)
+                .cloned()
+            else {
+                continue;
+            };
+            match pending.to {
+                CapacityReservationMove::Active => {
+                    record.view.state = Some(CAPACITY_RESERVATION_STATE_ACTIVE.to_string());
+                }
+                CapacityReservationMove::AllocationActive => {
+                    if let Some(allocation) = record.view.interruptible_capacity_allocation.as_mut()
+                    {
+                        // "The current status of the allocation (updating during
+                        // reclamation, active when complete)"
+                        // (`InterruptibleCapacityAllocation$Status`): complete, so the
+                        // instances the request asked for are the instances allocated.
+                        allocation.status =
+                            Some(INTERRUPTIBLE_ALLOCATION_STATUS_ACTIVE.to_string());
+                        allocation.instance_count = allocation.target_instance_count;
+                    }
+                }
+            }
+            record.pending = None;
+        }
         // The end of an enable or a disable of one route propagation: the pair either
         // reaches `enabled`, or stops being a propagation of that route table at all —
         // `TransitGatewayPropagationState` has no word for a pair that does not propagate,
@@ -4086,6 +4162,23 @@ pub fn tag_list_bytes(tags: &[Tag]) -> usize {
             tag.key.as_ref().map_or(0, String::len) + tag.value.as_ref().map_or(0, String::len)
         })
         .sum()
+}
+
+/// A modelled `Tag` list as comparable pairs, in a canonical order.
+///
+/// The modelled [`Tag`] carries no `PartialEq`, so this is how two tag lists are compared —
+/// which an idempotency check has to do, to tell a replay of one request from a second,
+/// non-identical request carrying the same `ClientToken`. The pairs are SORTED because
+/// "tag keys must be unique per resource" makes a tag list a set: a replay that sends the
+/// same tags in another order is the same request, which is also how
+/// `ops/create_route_server.rs`'s own comparison reads one.
+pub fn tag_pairs(tags: &[Tag]) -> Vec<(Option<&str>, Option<&str>)> {
+    let mut pairs: Vec<(Option<&str>, Option<&str>)> = tags
+        .iter()
+        .map(|tag| (tag.key.as_deref(), tag.value.as_deref()))
+        .collect();
+    pairs.sort_unstable();
+    pairs
 }
 
 /// The bytes a modelled `IpamResourceTag` list holds — the [`tag_list_bytes`] of the
@@ -11328,6 +11421,405 @@ pub fn require_known_capacity_block<E>(
 }
 
 // =============================================================================
+// Capacity Reservations
+// =============================================================================
+
+/// The id prefix a Capacity Reservation's id carries, in the `<prefix>-<hex>` form every
+/// EC2 resource id takes (see [`ComAmazonawsEc2Amazonec2State::next_id`]).
+pub const CAPACITY_RESERVATION_ID_PREFIX: &str = "cr";
+
+/// The code EC2 answers for a Capacity Reservation id the account holds no reservation
+/// for, in the `Invalid<Resource>Id.NotFound` family every other id of this service is
+/// refused with ([`INVALID_CAPACITY_BLOCK_ID_NOT_FOUND`], [`INVALID_SUBNET_ID_NOT_FOUND`]).
+pub const INVALID_CAPACITY_RESERVATION_ID_NOT_FOUND: &str =
+    "InvalidCapacityReservationId.NotFound";
+
+/// "`active` - The capacity is available for use" (`CapacityReservation$State`).
+pub const CAPACITY_RESERVATION_STATE_ACTIVE: &str = "active";
+
+/// "`pending` - The Capacity Reservation request was successful but the capacity
+/// provisioning is still pending" (`CapacityReservation$State`), which is where a
+/// reservation this emulator has just minted sits until [`TRANSITION_DELAY`] has passed.
+pub const CAPACITY_RESERVATION_STATE_PENDING: &str = "pending";
+
+/// "`expired` - The Capacity Reservation expired automatically at the date and time
+/// specified in your reservation request" (`CapacityReservation$State`), which is where a
+/// reservation with an end date sits once the WALL clock has passed it
+/// ([`CapacityReservationRecord::state_at`]).
+pub const CAPACITY_RESERVATION_STATE_EXPIRED: &str = "expired";
+
+/// "Valid range: 1 - 1000" (`CreateCapacityReservationRequest$InstanceCount`). The model
+/// puts no `@range` on the member, so this is the only place the published one is kept.
+pub const CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE: ::std::ops::RangeInclusive<i32> = 1..=1000;
+
+/// The tenancy a Capacity Reservation gets when the request names none: "`default` - The
+/// Capacity Reservation is created on hardware that is shared with other Amazon Web
+/// Services accounts" (`CapacityReservation$Tenancy`).
+pub const DEFAULT_CAPACITY_RESERVATION_TENANCY: &str = "default";
+
+/// The match criteria a Capacity Reservation gets when the request names none: "Default:
+/// `open`" (`CreateCapacityReservationRequest$InstanceMatchCriteria`).
+pub const DEFAULT_INSTANCE_MATCH_CRITERIA: &str = "open";
+
+/// "`unlimited` - The Capacity Reservation remains active until you explicitly cancel it"
+/// (`CapacityReservation$EndDateType`), the end type of a reservation with no end date.
+pub const END_DATE_TYPE_UNLIMITED: &str = "unlimited";
+
+/// "`limited` - The Capacity Reservation expires automatically at a specified date and
+/// time" (`CapacityReservation$EndDateType`), the end type of one that carries an end date.
+pub const END_DATE_TYPE_LIMITED: &str = "limited";
+
+/// "The type of Capacity Reservation" (`CapacityReservation$ReservationType`) for one that
+/// is not a Capacity Block: the `default` member of the modelled `CapacityReservationType`
+/// enum (`smithy_query(query="shape",shape="CapacityReservationType")`).
+pub const CAPACITY_RESERVATION_TYPE_DEFAULT: &str = "default";
+
+/// The only member of the modelled `InterruptionType` enum
+/// (`smithy_query(query="shape",shape="InterruptionType")`), so it is the one value
+/// `InterruptionInfo$InterruptionType` and the allocation's own `InterruptionType` carry.
+pub const INTERRUPTION_TYPE_ADHOC: &str = "adhoc";
+
+/// The status of an interruptible allocation whose capacity is still being taken out of
+/// the source reservation: the `pending` member of the modelled
+/// `InterruptibleCapacityReservationAllocationStatus` enum
+/// (`smithy_query(query="shape",shape="InterruptibleCapacityReservationAllocationStatus")`)
+/// — the one word that enum carries for a request that was accepted and is not complete,
+/// the same word `CapacityReservation$State` gives the reservation the allocation mints
+/// while its capacity is still being provisioned.
+pub const INTERRUPTIBLE_ALLOCATION_STATUS_PENDING: &str = "pending";
+
+/// The status of an interruptible allocation that is complete: that enum's `active`
+/// member — "active when complete" (`InterruptibleCapacityAllocation$Status`) — which
+/// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] moves a `pending`
+/// allocation to once [`TRANSITION_DELAY`] has passed.
+pub const INTERRUPTIBLE_ALLOCATION_STATUS_ACTIVE: &str = "active";
+
+/// "Specify `default` to cancel the interruptible Capacity Reservation and return the
+/// capacity to your source Capacity Reservation. The default value is `default`"
+/// (`CreateInterruptibleCapacityReservationAllocationRequest$ZeroSizePreference`).
+pub const ZERO_SIZE_PREFERENCE_DEFAULT: &str = "default";
+
+/// "Specify `retain` to keep the interruptible Capacity Reservation active at zero capacity
+/// so that you can allocate instances to it again later" (same member).
+pub const ZERO_SIZE_PREFERENCE_RETAIN: &str = "retain";
+
+/// The `ResourceType` a Capacity Reservation tag specification may name.
+pub const RESOURCE_TYPE_CAPACITY_RESERVATION: &str = "capacity-reservation";
+
+/// How many Capacity Reservations this emulator stores before a writer must refuse.
+///
+/// CHOSEN, like [`MAX_STORED_CAPACITY_BLOCKS`] and for the same reason: nothing in this
+/// emulator reclaims a stored reservation, so the store needs a ceiling that is not the
+/// process's memory. A count ceiling is no bound on the caller-chosen bytes each record
+/// holds, so those are charged against [`MAX_STORED_BYTES`] too
+/// ([`capacity_reservation_payload_bytes`]).
+pub const MAX_STORED_CAPACITY_RESERVATIONS: usize = 4096;
+
+/// The caller-chosen bytes one stored Capacity Reservation holds: its tags and the instance
+/// type it reserves capacity for. Everything else on the record — the id, the ARN, the
+/// zone, the counts, the state — is derived by this module or bounded by the model, so it
+/// is fixed-size.
+///
+/// The ONE definition of that charge, the way [`capacity_block_payload_bytes`] is for its
+/// own store: [`ComAmazonawsEc2Amazonec2State::insert_capacity_reservation`] charges
+/// exactly it, and a removal path must give back the same number.
+pub fn capacity_reservation_payload_bytes(reservation: &CapacityReservation) -> usize {
+    tag_list_bytes(reservation.tags.as_deref().unwrap_or_default())
+        .saturating_add(reservation.instance_type.as_deref().map_or(0, str::len))
+}
+
+/// What the clock owes one stored Capacity Reservation next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityReservationMove {
+    /// `pending` -> `active`: the capacity the reservation was minted for is provisioned.
+    Active,
+    /// The interruptible allocation the reservation carries reaches `active` with the whole
+    /// `TargetInstanceCount` allocated — the completion of the `pending` move
+    /// `CreateInterruptibleCapacityReservationAllocation` starts on the SOURCE reservation.
+    AllocationActive,
+}
+
+/// The move the clock owes one Capacity Reservation: a [`ClockTransition`] to the next
+/// [`CapacityReservationMove`].
+pub type CapacityReservationTransition = ClockTransition<CapacityReservationMove>;
+
+/// One stored Capacity Reservation: the modelled [`CapacityReservation`] every operation
+/// that reports one answers with, plus the move the clock owes it.
+///
+/// The view is the modelled shape itself rather than a parallel record, so every member a
+/// writer sets round-trips through a reader without a field-by-field copy that can silently
+/// drop one — the same arrangement [`CapacityBlockRecord`] and the VPC store use.
+#[derive(Debug, Clone)]
+pub struct CapacityReservationRecord {
+    /// The reservation as the model shapes it.
+    pub view: CapacityReservation,
+    /// The move the clock owes this reservation, while one is owed.
+    pub pending: Option<CapacityReservationTransition>,
+}
+
+impl CapacityReservationRecord {
+    /// The reservation's `CapacityReservationState` as it was last WRITTEN.
+    ///
+    /// [`Self::state_at`] is what a reader reports: a reservation with an end date expires
+    /// when the wall clock passes it, which is a fact of that date rather than something a
+    /// writer stored.
+    pub fn state(&self) -> &str {
+        self.view.state.as_deref().unwrap_or_default()
+    }
+
+    /// The reservation's state at `now`.
+    ///
+    /// "The Capacity Reservation's state changes to `expired` when it reaches its end date
+    /// and time" (`CapacityReservation$EndDate`), so an `active` reservation whose end date
+    /// the WALL clock has passed is `expired` whether or not anybody called — the same
+    /// arrangement [`CapacityBlockRecord::state_at`] gives a Capacity Block's reserved
+    /// window. Every other state is a word a writer stored, and no passage of time moves a
+    /// cancelled or failed reservation anywhere.
+    pub fn state_at(&self, now: SystemTime) -> &str {
+        let stored = self.state();
+        if stored != CAPACITY_RESERVATION_STATE_ACTIVE {
+            return stored;
+        }
+        let now = date_time_key(system_time_to_date_time(now));
+        if self
+            .view
+            .end_date
+            .map(date_time_key)
+            .is_some_and(|end| now >= end)
+        {
+            return CAPACITY_RESERVATION_STATE_EXPIRED;
+        }
+        stored
+    }
+
+    /// This reservation as of `now`: the stored view with the state the clock has reached.
+    /// A read observes the expiry the clock already owed without writing anything.
+    pub fn view_at(&self, now: SystemTime) -> CapacityReservation {
+        let mut view = self.view.clone();
+        view.state = Some(self.state_at(now).to_string());
+        view
+    }
+
+    /// "The remaining capacity. Indicates the number of instances that can be launched in
+    /// the Capacity Reservation" (`CapacityReservation$AvailableInstanceCount`).
+    pub fn available_instance_count(&self) -> i32 {
+        self.view.available_instance_count.unwrap_or_default()
+    }
+}
+
+/// What one stored Capacity Reservation is created with, for
+/// [`ComAmazonawsEc2Amazonec2State::insert_capacity_reservation`].
+///
+/// The instants are [`SystemTime`]s rather than modelled timestamps because every writer
+/// computes them from the clock it already holds; the store converts them once. Everything
+/// the service itself owns — the id, the ARN, the owning account, the end type, the
+/// reservation type and the available count a fresh reservation starts at — is derived by
+/// the insert rather than named here.
+#[derive(Debug, Clone)]
+pub struct CapacityReservationSpec {
+    /// "The instance type for which the Capacity Reservation reserves capacity."
+    pub instance_type: String,
+    /// "The type of operating system for which to reserve capacity"
+    /// (`CapacityReservation$InstancePlatform`).
+    pub instance_platform: String,
+    /// The Availability Zone the capacity is reserved in.
+    pub availability_zone: String,
+    /// That zone's id.
+    pub availability_zone_id: String,
+    /// The Region the reservation's ARN is built in.
+    pub region: String,
+    /// "Indicates the tenancy of the Capacity Reservation"
+    /// (`CapacityReservation$Tenancy`).
+    pub tenancy: String,
+    /// "The total number of instances for which the Capacity Reservation reserves
+    /// capacity" (`CapacityReservation$TotalInstanceCount`).
+    pub instance_count: i32,
+    /// "Indicates whether the Capacity Reservation supports EBS-optimized instances."
+    pub ebs_optimized: bool,
+    /// "Deprecated" (`CapacityReservation$EphemeralStorage`), kept because the create path
+    /// takes it and a member a request sets must not be silently dropped.
+    pub ephemeral_storage: bool,
+    /// When the reservation expires, or `None` for one with no end date — which is also
+    /// what decides its `EndDateType`.
+    pub end_date: Option<SystemTime>,
+    /// "Indicates the type of instance launches that the Capacity Reservation accepts"
+    /// (`CapacityReservation$InstanceMatchCriteria`).
+    pub instance_match_criteria: String,
+    /// When the reservation was created, which is also when its capacity starts.
+    pub created_at: SystemTime,
+    /// The `CapacityReservationState` the reservation is created in. A `&'static str` so
+    /// only a member of the modelled enum can be stored, never text from a request.
+    pub state: &'static str,
+    /// "Any tags assigned to the Capacity Reservation."
+    pub tags: Vec<Tag>,
+    /// Set for an INTERRUPTIBLE reservation: the source it was allocated from and how its
+    /// instances are interrupted. A reservation that carries one is `Interruptible`.
+    pub interruption_info: Option<InterruptionInfo>,
+    /// The zero-size preference of an interruptible reservation, or `None` for one that is
+    /// not interruptible. A `&'static str` for the same reason as `state`.
+    pub zero_size_preference: Option<&'static str>,
+    /// The move the clock owes the reservation, or `None` for one that is already in a
+    /// terminal state.
+    pub pending: Option<CapacityReservationTransition>,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another `count` Capacity Reservations fit inside the store's ceiling
+    /// ([`MAX_STORED_CAPACITY_RESERVATIONS`]).
+    ///
+    /// A writer must ask this BEFORE inserting and refuse when it answers `false`, the way
+    /// [`Self::has_capacity_block_capacity`] gates its own store.
+    pub fn has_capacity_reservation_capacity(&self, count: usize) -> bool {
+        self.capacity_reservations.len().saturating_add(count)
+            <= MAX_STORED_CAPACITY_RESERVATIONS
+    }
+
+    /// Store one Capacity Reservation and answer the `CapacityReservationId` it was given,
+    /// or `None` when the store's own ceilings refuse it.
+    ///
+    /// The one place a Capacity Reservation enters this store, so every writer of one — and
+    /// every reader that reports what this wrote — agrees on the id form, the stored shape
+    /// and which members a reservation carries. BOTH ceilings are asked HERE, before the
+    /// first write and before an id is minted — the record count
+    /// ([`MAX_STORED_CAPACITY_RESERVATIONS`]) and the caller-chosen bytes
+    /// ([`MAX_STORED_BYTES`]) — exactly as [`Self::insert_capacity_block`] asks its own, so
+    /// no path can get past them by forgetting to: nothing in this emulator reclaims a
+    /// stored reservation, so an unbounded write path would grow this process without
+    /// limit. A caller must map `None` onto the quota error its operation answers. The
+    /// bytes the record retains are charged here, and the clock-owed move is recorded
+    /// rather than slept for.
+    pub fn insert_capacity_reservation(
+        &mut self,
+        spec: CapacityReservationSpec,
+    ) -> Option<String> {
+        // The charge of the record this spec becomes, computed from the spec so it can be
+        // asked BEFORE anything is written or an id is minted. It is exactly what
+        // [`capacity_reservation_payload_bytes`] counts on the stored view below — the tags
+        // and the instance type — which is the ONE definition of this store's charge.
+        let charge = tag_list_bytes(&spec.tags).saturating_add(spec.instance_type.len());
+        if !self.has_capacity_reservation_capacity(1) || self.would_exceed_stored_bytes(charge) {
+            return None;
+        }
+        let capacity_reservation_id = self.next_id(CAPACITY_RESERVATION_ID_PREFIX);
+        let view = CapacityReservation {
+            capacity_reservation_id: Some(capacity_reservation_id.clone()),
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            capacity_reservation_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("capacity-reservation/{capacity_reservation_id}"),
+            )),
+            availability_zone_id: Some(spec.availability_zone_id),
+            instance_type: Some(spec.instance_type),
+            instance_platform: Some(spec.instance_platform),
+            availability_zone: Some(spec.availability_zone),
+            tenancy: Some(spec.tenancy),
+            total_instance_count: Some(spec.instance_count),
+            // Nothing has launched into a reservation this call mints, so all of its
+            // capacity is "the number of instances that can be launched in the Capacity
+            // Reservation" (`CapacityReservation$AvailableInstanceCount`).
+            available_instance_count: Some(spec.instance_count),
+            ebs_optimized: Some(spec.ebs_optimized),
+            // "Deprecated" (`CapacityReservation$EphemeralStorage`), and reported as the
+            // request asked for it rather than dropped.
+            ephemeral_storage: Some(spec.ephemeral_storage),
+            state: Some(spec.state.to_string()),
+            // "The date and time the Capacity Reservation was started."
+            start_date: Some(system_time_to_date_time(spec.created_at)),
+            end_date: spec.end_date.map(system_time_to_date_time),
+            // "You must provide an EndDate value if EndDateType is limited. Omit EndDate if
+            // EndDateType is unlimited" (`CreateCapacityReservationRequest$EndDate`), so the
+            // end type is a fact of whether the reservation has an end date.
+            end_date_type: Some(
+                if spec.end_date.is_some() {
+                    END_DATE_TYPE_LIMITED
+                } else {
+                    END_DATE_TYPE_UNLIMITED
+                }
+                .to_string(),
+            ),
+            instance_match_criteria: Some(spec.instance_match_criteria),
+            create_date: Some(system_time_to_date_time(spec.created_at)),
+            tags: Some(spec.tags),
+            // This emulator has no Outposts, no Capacity Reservation Fleets and no cluster
+            // placement groups to create a reservation in, so a reservation belongs to
+            // none of them.
+            outpost_arn: None,
+            capacity_reservation_fleet_id: None,
+            placement_group_arn: None,
+            // "Information about instance capacity usage": nothing in this emulator
+            // launches an instance INTO a Capacity Reservation, so no capacity of one is
+            // allocated to a running instance.
+            capacity_allocations: Some(Vec::new()),
+            reservation_type: Some(CAPACITY_RESERVATION_TYPE_DEFAULT.to_string()),
+            // Billing of the unused capacity is assigned to another account only by
+            // `AssociateCapacityReservationBillingOwner`, which is still a scaffold.
+            unused_reservation_billing_owner_id: None,
+            // A commitment and a delivery preference are members of a future-dated
+            // reservation only, and a reservation starts here for immediate use.
+            commitment_info: None,
+            delivery_preference: None,
+            capacity_block_id: None,
+            interruptible: Some(spec.interruption_info.is_some()),
+            // Filled in by the allocation path on the SOURCE reservation, which is the
+            // reservation an allocation is made FROM; see
+            // `ops/create_interruptible_capacity_reservation_allocation.rs`.
+            interruptible_capacity_allocation: None,
+            interruption_info: spec.interruption_info,
+            // "This field is not returned if the Capacity Reservation has never been
+            // modified" (`CapacityReservation$AdjustmentStatus`).
+            adjustment_status: None,
+            adjustment_details: None,
+            // "This value doesn't change when you push out the start date"
+            // (`CapacityReservation$OriginalStartDate`): the start date it was created with.
+            original_start_date: Some(system_time_to_date_time(spec.created_at)),
+            zero_size_preference: spec.zero_size_preference.map(str::to_string),
+            // "Only supported for UltraServers" (`CapacityReservation$LaunchStatus`), and
+            // this reservation is of plain instances.
+            launch_status: None,
+        };
+        self.add_stored_bytes(capacity_reservation_payload_bytes(&view));
+        self.capacity_reservations.insert(
+            capacity_reservation_id.clone(),
+            CapacityReservationRecord {
+                view,
+                pending: spec.pending,
+            },
+        );
+        Some(capacity_reservation_id)
+    }
+}
+
+/// Refuse a request that named a Capacity Reservation id no reservation of the account
+/// has: HTTP 400 `InvalidCapacityReservationId.NotFound`.
+///
+/// The model publishes no pattern for `CapacityReservationId`
+/// (`smithy_query(query="shape",shape="CapacityReservationId")`), so there is no shape to
+/// call malformed ahead of the lookup the way a volume id has one: an id this store cannot
+/// resolve is reported not found whatever it looks like.
+pub fn invalid_capacity_reservation_id_not_found<E>(
+    capacity_reservation_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_CAPACITY_RESERVATION_ID_NOT_FOUND,
+        400,
+        format!("The capacity-reservation ID '{capacity_reservation_id}' does not exist"),
+    )
+}
+
+/// The record of the Capacity Reservation `capacity_reservation_id` names, or the refusal
+/// for an id the account holds no reservation for.
+pub fn require_known_capacity_reservation<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    capacity_reservation_id: &str,
+) -> Result<&'store CapacityReservationRecord, crate::scaffolded::Scaffolded<E>> {
+    store
+        .capacity_reservations
+        .get(capacity_reservation_id)
+        .ok_or_else(|| invalid_capacity_reservation_id_not_found(capacity_reservation_id))
+}
+
+// =============================================================================
 // Capacity Block offerings
 // =============================================================================
 
@@ -11586,6 +12078,7 @@ pub fn invalid_request<E>(message: impl Into<String>) -> Scaffolded<E> {
 pub fn incorrect_state<E>(message: impl Into<String>) -> Scaffolded<E> {
     Scaffolded::service_error(INCORRECT_STATE, 400, message)
 }
+
 
 /// What the clock owes a stored Windows fast launch configuration next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18281,10 +18774,6 @@ impl NatGatewayAddressTransition {
 /// `CapacityReservationFleetId` AWS's own error text spells ("Capacity Reservation Fleet ID
 /// 'crf-…'").
 pub const CAPACITY_RESERVATION_FLEET_ID_PREFIX: &str = "crf";
-
-/// The id prefix of one Capacity Reservation — the resource a Fleet creates per instance
-/// type it reserves for (`FleetCapacityReservation$CapacityReservationId`).
-pub const CAPACITY_RESERVATION_ID_PREFIX: &str = "cr";
 
 /// The `ResourceType` a `CreateCapacityReservationFleet` tag specification may name: the
 /// Fleet it creates (the modelled `ResourceType` enum's `capacity-reservation-fleet`

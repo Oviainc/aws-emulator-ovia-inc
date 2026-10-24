@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes one node of one cluster, which for a node is a DEREGISTRATION: the
+//! `NodeState` enum models no `DELETING`/`DELETED` pair, it models
+//! `DEREGISTERING` and the terminal `DEREGISTERED`
+//! (`smithy_query(query="shape", shape="NodeState")`). So the delete is
+//! ASYNCHRONOUS — it keeps the model's `202 Accepted`, answers the node in
+//! `DEREGISTERING`, and the clock settles it into `DEREGISTERED`, which a later
+//! `DescribeNode` reports. As everywhere else in this service the record stays
+//! in the account in its terminal state rather than vanishing.
 //!
 //! ## Shape of an operation
 //!
@@ -166,6 +166,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "DeleteNode";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_NODE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_NODE_OUTPUT_SCHEMA;
+    // The model's own `@http` code, kept: deleting a node is genuinely
+    // asynchronous (the node deregisters, and the body reports it in
+    // `DEREGISTERING`), so `202 Accepted` is exactly what this answer is — the
+    // caller polls `DescribeNode` for the terminal `DEREGISTERED`. The
+    // SYNCHRONOUS deletes in this service are the ones that answer 200
+    // (`DeleteSdiSource`, `DeleteInput`).
     const SUCCESS_STATUS: u16 = 202u16;
 
     async fn handle(
@@ -173,18 +179,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteNode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteNodeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.settle(now);
+
+        // A node is addressed by its cluster AND its id, and both have to match:
+        // `Id` is "Unique in the Cluster", so a node id presented under a cluster
+        // it does not belong to names no node and is refused with this
+        // operation's modelled `NotFoundException`, exactly as an id no node ever
+        // had is.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteNode"))
+        // A delete already accepted (the node is `DEREGISTERING`, or has reached
+        // the terminal `DEREGISTERED`) is answered 202 rather than with
+        // `ConflictException`: the state the caller is asking for is the one the
+        // node is already heading for or in, so nothing about the request
+        // conflicts with the stored node — and the acceptance keeps the instant
+        // the first call set, so a repeat can neither restart the clock nor
+        // revive a deregistered node. This is the same answer `DeleteInput`
+        // gives a repeated delete.
+        //
+        // "The Node must be IDLE" is the documented precondition, and the
+        // modelled `ConflictException` is what refuses a node that is not: a node
+        // the real service is RUNNING a channel on (`IN_USE`, `DRAINING`). No
+        // node in this emulator can be in either state — nothing encodes on a
+        // node here, and a channel placed in a ChannelPlacementGroup that names
+        // a node is an association the node reports through its
+        // `ChannelPlacementGroups`, not work running on it — so that refusal
+        // belongs to the change that makes a node run something, and claiming it
+        // now would refuse a delete no stored state justifies.
+        //
+        // The response is the node this call deregistered, projected by the
+        // store: its `State` is the one the acceptance just wrote and every other
+        // member is the stored record's.
+        let node = state
+            .deregister_node_description(&input.cluster_id, &input.node_id, now)
+            .ok_or_else(|| {
+                DeleteNodeError::from(DeleteNodeErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::not_found_message("Node", &input.node_id)),
+                    },
+                ))
+            })?;
+
+        Ok(crate::state::node_description_output!(DeleteNodeOutput, node))
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no node store to delete from. A modelled server error, never a
+/// fresh engine (which would drop the deletion on return).
+fn unavailable() -> DeleteNodeError {
+    DeleteNodeErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }
