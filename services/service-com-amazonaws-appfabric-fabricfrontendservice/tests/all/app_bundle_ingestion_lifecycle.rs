@@ -669,6 +669,28 @@ async fn a_token_from_another_listing_is_refused() {
     );
 }
 
+/// The model's `UUID` pattern, as a check over the rendered form
+/// (`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`, RFC 9562
+/// §5.4: version nibble `4`, variant nibble in `8..=b`). Shared, because more
+/// than one suite asserts that a minted id has this form.
+pub(crate) fn is_v4_uuid(id: &str) -> bool {
+    let groups: Vec<&str> = id.split('-').collect();
+    groups.len() == 5
+        && [8_usize, 4, 4, 4, 12]
+            .iter()
+            .zip(&groups)
+            .all(|(len, group)| {
+                group.len() == *len
+                    && group
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        // Version 4 is the first nibble of the third group, and the variant
+        // nibble (the first of the fourth group) is one of 8, 9, a, b.
+        && groups[2].starts_with('4')
+        && groups[3].starts_with(['8', '9', 'a', 'b'])
+}
+
 /// RULE: every resource id the service mints is a version-4 UUID in the
 /// lowercase hyphenated form the model's `UUID`/`Identifier` pattern requires
 /// (`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`, RFC 9562
@@ -677,25 +699,6 @@ async fn a_token_from_another_listing_is_refused() {
 /// uniqueness is a property of the minting, not of one call.
 #[tokio::test]
 async fn every_minted_id_is_a_distinct_version_4_uuid() {
-    /// The model's `UUID` pattern, as a check over the rendered form.
-    fn is_v4_uuid(id: &str) -> bool {
-        let groups: Vec<&str> = id.split('-').collect();
-        groups.len() == 5
-            && [8_usize, 4, 4, 4, 12]
-                .iter()
-                .zip(&groups)
-                .all(|(len, group)| {
-                    group.len() == *len
-                        && group
-                            .bytes()
-                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                })
-            // Version 4 is the first nibble of the third group, and the variant
-            // nibble (the first of the fourth group) is one of 8, 9, a, b.
-            && groups[2].starts_with('4')
-            && groups[3].starts_with(['8', '9', 'a', 'b'])
-    }
-
     let emulator = Emulator::new();
     let mut ids: BTreeSet<String> = BTreeSet::new();
     let mut minted = 0_usize;
