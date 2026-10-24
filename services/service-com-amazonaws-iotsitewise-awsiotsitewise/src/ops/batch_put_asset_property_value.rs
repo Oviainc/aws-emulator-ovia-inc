@@ -507,7 +507,7 @@ fn resolve_entry(
                 .ok_or_else(|| {
                     (
                         "ResourceNotFoundException",
-                        format!("The property alias {alias} could not be found."),
+                        crate::state::not_found_message(crate::state::RESOURCE_TIME_SERIES, alias),
                     )
                 })?;
             return Ok((stream, data_type));

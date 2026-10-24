@@ -246,9 +246,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             input.alias
                         )))
                     }
-                    _ => Err(not_found(format!(
-                        "The time series {} could not be found.",
-                        input.alias
+                    _ => Err(not_found(crate::state::not_found_message(
+                        crate::state::RESOURCE_TIME_SERIES,
+                        &input.alias,
                     ))),
                 };
             }

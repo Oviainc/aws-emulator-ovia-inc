@@ -194,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn not_found(gateway_id: &str) -> DescribeGatewayError {
     DescribeGatewayError::Modeled(DescribeGatewayErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: format!("The gateway {gateway_id} could not be found."),
+            message: crate::state::not_found_message(crate::state::RESOURCE_GATEWAY, gateway_id),
         },
     ))
 }

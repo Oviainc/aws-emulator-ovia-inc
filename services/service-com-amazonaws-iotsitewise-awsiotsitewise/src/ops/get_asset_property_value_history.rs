@@ -232,7 +232,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             (Some(asset_label), Some(property_id), None) => {
                 let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
-                    not_found(format!("The asset {asset_label} could not be found."))
+                    not_found(crate::state::not_found_message(
+                        crate::state::RESOURCE_ASSET,
+                        asset_label,
+                    ))
                 })?;
                 let has_property = store.assets.get(&asset_id).is_some_and(|asset| {
                     asset
@@ -251,7 +254,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // associated with it or not: a disassociated series keeps the samples it
             // carried and its alias is what addresses them.
             (None, None, Some(alias)) => store.resolve_alias_series(alias).ok_or_else(|| {
-                not_found(format!("The property alias {alias} could not be found."))
+                not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_TIME_SERIES,
+                    alias,
+                ))
             })?,
             _ => {
                 return Err(invalid_request(

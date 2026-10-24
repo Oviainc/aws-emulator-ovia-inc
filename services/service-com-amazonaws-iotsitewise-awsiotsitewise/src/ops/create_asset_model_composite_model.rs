@@ -312,7 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(already_exists(
                     &region,
                     &asset_model_id,
-                    format!("The composite model {requested} already exists."),
+                    crate::state::already_using_message("composite model", "ID"),
                 ));
             }
         }
@@ -496,7 +496,7 @@ fn limit_exceeded(message: String) -> CreateAssetModelCompositeModelError {
 fn model_not_found(label: &str) -> CreateAssetModelCompositeModelError {
     CreateAssetModelCompositeModelErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: format!("The asset model {label} could not be found."),
+            message: crate::state::not_found_message(crate::state::RESOURCE_ASSET_MODEL, label),
         },
     )
     .into()
@@ -507,7 +507,10 @@ fn model_not_found(label: &str) -> CreateAssetModelCompositeModelError {
 fn composite_not_found(label: &str) -> CreateAssetModelCompositeModelError {
     CreateAssetModelCompositeModelErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: format!("The composite model {label} could not be found."),
+            message: crate::state::not_found_message(
+                crate::state::RESOURCE_ASSET_MODEL_COMPOSITE_MODEL,
+                label,
+            ),
         },
     )
     .into()

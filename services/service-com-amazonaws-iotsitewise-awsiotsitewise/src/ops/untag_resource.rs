@@ -197,7 +197,7 @@ fn invalid_request(message: String) -> UntagResourceError {
 /// resource.
 fn not_found(resource_arn: &str) -> UntagResourceError {
     UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: format!("Resource with ARN {resource_arn} not found"),
+        message: crate::state::not_found_arn_message(resource_arn),
     })
     .into()
 }

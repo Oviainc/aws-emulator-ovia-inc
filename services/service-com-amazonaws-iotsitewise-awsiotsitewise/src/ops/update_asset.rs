@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // is already in, so it is a no-op rather than a collision.
                 if owner != &id {
                     let owner = owner.clone();
-                    return Err(already_exists(&region, &owner));
+                    return Err(already_exists(&region, &owner, "externalId"));
                 }
             } else if let Some(current) = store
                 .assets
@@ -250,21 +250,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// HTTP 404 `ResourceNotFoundException` naming the label that resolved to nothing.
+/// HTTP 404 `ResourceNotFoundException` naming the label that resolved to nothing,
+/// worded by this service's one not-found rule rather than by a template of this
+/// handler's own.
 fn not_found(label: &str) -> UpdateAssetError {
     UpdateAssetError::Modeled(UpdateAssetErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: format!("The asset {label} could not be found."),
+            message: crate::state::not_found_message(crate::state::RESOURCE_ASSET, label),
         },
     ))
 }
 
-/// HTTP 409 `ResourceAlreadyExistsException` naming the asset that already holds the
-/// requested external id.
-fn already_exists(region: &str, asset_id: &str) -> UpdateAssetError {
+/// HTTP 409 `ResourceAlreadyExistsException` for a `dimension` of the request
+/// (here the external id) that another asset already holds; the message names THAT
+/// dimension, as `CreateAsset` does, and `asset_id` is the asset holding it — the
+/// only asset in the exchange that exists — so `resourceId`/`resourceArn` point the
+/// caller at it.
+fn already_exists(region: &str, asset_id: &str, dimension: &str) -> UpdateAssetError {
     UpdateAssetError::Modeled(UpdateAssetErrorModeled::ResourceAlreadyExistsException(
         ResourceAlreadyExistsException {
-            message: format!("The asset {asset_id} already exists."),
+            message: crate::state::already_using_message("asset", dimension),
             resource_id: asset_id.to_string(),
             resource_arn: crate::state::asset_arn(region, asset_id),
         },
