@@ -45,6 +45,8 @@ mod remove_flow_output;
 mod resource_tags;
 #[path = "all/revoke_flow_entitlement.rs"]
 mod revoke_flow_entitlement;
+#[path = "all/router_outputs.rs"]
+mod router_outputs;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_bridge.rs"]
