@@ -15,8 +15,9 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Accessor, AccessorSummary, InvalidRequestException, Invitation, Member,
-    MemberFabricAttributes, MemberFrameworkAttributes, MemberLogPublishingConfiguration,
+    Accessor, AccessorSummary, InvalidRequestException, Invitation, LogConfiguration,
+    LogConfigurations, Member, MemberFabricAttributes, MemberFrameworkAttributes,
+    MemberLogPublishingConfiguration,
     MemberSummary, Network, NetworkEthereumAttributes, NetworkFabricAttributes,
     NetworkFrameworkAttributes, NetworkSummary, Node,
     NodeEthereumAttributes, NodeFabricAttributes, NodeFrameworkAttributes,
@@ -685,6 +686,44 @@ impl StoredMember {
             arn: Some(self.arn.clone()),
         }
     }
+}
+
+/// Apply the `LogConfigurations` a request named for ONE log stream on top of the stored
+/// one; a stream the request does not name keeps what it had.
+///
+/// `LogConfigurations`' only member is the CloudWatch one
+/// (`LogConfigurations$Cloudwatch`, "Parameters for publishing logs to Amazon CloudWatch
+/// Logs"). Both log-publishing trees this service stores — a member's
+/// (`MemberFabricLogPublishingConfiguration$CaLogs`) and a node's
+/// (`NodeFabricLogPublishingConfiguration$ChaincodeLogs` / `$PeerLogs`) — bottom out in
+/// this shape, so every update merges a stream through here.
+pub fn merge_log_configurations(
+    stored: Option<LogConfigurations>,
+    requested: Option<LogConfigurations>,
+) -> Option<LogConfigurations> {
+    let Some(requested) = requested else {
+        return stored;
+    };
+    let stored = stored.unwrap_or_default();
+    Some(LogConfigurations {
+        cloudwatch: merge_log_configuration(stored.cloudwatch, requested.cloudwatch),
+    })
+}
+
+/// Merge one `LogConfiguration`: a named `Enabled` wins, an omitted one keeps the stored
+/// setting (`LogConfiguration$Enabled`, "Indicates whether logging is enabled", is the
+/// only leaf there is).
+pub fn merge_log_configuration(
+    stored: Option<LogConfiguration>,
+    requested: Option<LogConfiguration>,
+) -> Option<LogConfiguration> {
+    let Some(requested) = requested else {
+        return stored;
+    };
+    let stored = stored.unwrap_or_default();
+    Some(LogConfiguration {
+        enabled: requested.enabled.or(stored.enabled),
+    })
 }
 
 /// The endpoints a node exposes, which differ by the framework of the network it runs on:

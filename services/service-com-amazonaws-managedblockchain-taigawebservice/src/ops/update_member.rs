@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMember
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMember`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMember::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `UpdateMember` applies the member configuration parameters a request names to the
+//! stored member record; `GetMember` reads the result back.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +144,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMember` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMemberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMember"))
+        // The update is driven entirely by stored state and the request body; nothing
+        // region-dependent is minted here (the member's ARN and CA endpoint were minted by
+        // its create and are never recomputed).
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateMemberErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        guard.settle(::std::time::SystemTime::now());
+
+        // `PATCH /networks/{NetworkId}/members/{MemberId}` nests the member INSIDE the
+        // network, so the path labels resolve left to right: a `NetworkId` this service
+        // does not hold is itself the missing resource, and the member inside it is never
+        // reached (and nothing is written for the request).
+        let Some(network) = guard.networks.get_mut(&input.network_id) else {
+            return Err(UpdateMemberErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
+            )
+            .into());
+        };
+
+        // The network resolved, so the leaf label is next: the MEMBER is the resource this
+        // operation was asked to update, and one the network does not hold is the resource
+        // the request asked for and did not get.
+        let Some(member) = network.members.get_mut(&input.member_id) else {
+            return Err(UpdateMemberErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_MEMBER, &input.member_id),
+            )
+            .into());
+        };
+
+        // "Updates a member configuration with new parameters", over HTTP `PATCH`: the
+        // parameters the request names are applied to the stored record and every one it
+        // leaves out keeps the value it already had, so a request that names no
+        // configuration at all changes nothing.
+        if let Some(requested) = input.log_publishing_configuration {
+            let merged = merge_member_logs(member.log_publishing_configuration.take(), requested);
+            member.log_publishing_configuration = Some(merged);
+        }
+
+        // `UpdateMemberOutput` models no members: the updated record is read back through
+        // `GetMember`.
+        Ok(UpdateMemberOutput {})
     }
+}
+
+/// Apply the `MemberLogPublishingConfiguration` a request named on top of the stored one.
+///
+/// Each nested structure the request names carries only the members it itself names, so a
+/// request that names one part of the tree leaves every other part as it was. The merge
+/// bottoms out in [`crate::state::merge_log_configurations`], the one `LogConfigurations`
+/// merge this service has.
+fn merge_member_logs(
+    stored: Option<MemberLogPublishingConfiguration>,
+    requested: MemberLogPublishingConfiguration,
+) -> MemberLogPublishingConfiguration {
+    let stored = stored.unwrap_or_default();
+    MemberLogPublishingConfiguration {
+        fabric: merge_fabric_logs(stored.fabric, requested.fabric),
+    }
+}
+
+/// Merge `MemberFabricLogPublishingConfiguration`, whose one log stream is the member's
+/// Certificate Authority log (`$CaLogs`).
+fn merge_fabric_logs(
+    stored: Option<MemberFabricLogPublishingConfiguration>,
+    requested: Option<MemberFabricLogPublishingConfiguration>,
+) -> Option<MemberFabricLogPublishingConfiguration> {
+    let Some(requested) = requested else {
+        return stored;
+    };
+    let stored = stored.unwrap_or_default();
+    Some(MemberFabricLogPublishingConfiguration {
+        ca_logs: crate::state::merge_log_configurations(stored.ca_logs, requested.ca_logs),
+    })
 }
