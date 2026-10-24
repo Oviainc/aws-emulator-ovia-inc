@@ -19,6 +19,8 @@ mod findings_metrics;
 mod metrics_summary;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/scan_completion.rs"]
+mod scan_completion;
 #[path = "all/scan_lifecycle.rs"]
 mod scan_lifecycle;
 #[path = "all/state_roundtrip.rs"]
