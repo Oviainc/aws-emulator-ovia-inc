@@ -58,7 +58,8 @@
 //!   unique identifier that you can provide to ensure the idempotency of the request.
 //!   Case-sensitive.
 //! * `kmsKeyArn` (KmsKeyArn, len 20..2048, pattern
-//!   ^arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/[-a-f0-9]+$) — (optional) The ARN for a
+//!   ^arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/[-a-f0-9]+$; enforced as `key/.+`, see
+//!   the section below) — (optional) The ARN for a
 //!   customer managed KMS key to use for encrypting data within your workspace. For more
 //!   information about using your own key in your workspace, see Encryption at rest in the
 //!   Amazon Managed Service for Prometheus User Guide.
@@ -91,6 +92,32 @@
 //! * `ThrottlingException` (HTTP 429) — The request was denied due to request throttling.
 //! * `ValidationException` (HTTP 400) — The input fails to satisfy the constraints specified
 //!   by an Amazon Web Services service.
+//!
+//! ## `KmsKeyArn`'s key-id segment
+//!
+//! RECORDED BEHAVIOUR. The model constrains `KmsKeyArn` with
+//! `@pattern("^arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/[-a-f0-9]+$")`, but the
+//! recorded live refusal for a malformed `kmsKeyArn` quotes the requirement the service
+//! actually applies — `arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/.+` — so the key-id
+//! segment is unconstrained rather than restricted to lowercase hex and dashes. That
+//! message is built FROM the request (it names the member and the constraint the value
+//! failed), so the constraint it reports is the service's own; under the narrower pattern
+//! the emulator refuses key ARNs AWS accepts, multi-region keys (`key/mrk-<hex>`) among
+//! them, and reports a requirement no aps response states.
+//!
+//! The model in `smithy-model/` is left EXACTLY as shipped. Instead `CreateWorkspaceInput`
+//! carries `skip_validation = ["kmsKeyArn"]`
+//! (`src/ops/types/create_workspace_types.rs`) and [`crate::state::check_kms_key_arn`]
+//! re-declares that one member's constraints — its modelled `@length(20..2048)` unchanged,
+//! its pattern with the key-id segment read as the service reads it — in the framework's
+//! own trait form, checked by the framework's own constraint walk and refused through
+//! `crate::state::constraint_validation_failed`, the same composition the request boundary
+//! uses. So the ENFORCED constraint and the REPORTED requirement still come from one
+//! place, a refusal made in the handler is indistinguishable from one made at the
+//! boundary, and no rule is restated in prose. It is the pattern
+//! `services/service-com-amazonaws-ivschat-amazoninteractivevideoservicechat` already uses
+//! for a member whose published `@pattern` the real service does not apply.
+//! `tests/all/kms_key_arn_and_parent_resolution.rs` holds both halves of the rule.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -180,6 +207,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
+
+        // `kmsKeyArn` is the one member the request boundary does not check (it carries
+        // `skip_validation` in `src/ops/types/create_workspace_types.rs`, because the
+        // published `@pattern` over-states the key-id segment), so its modelled length
+        // bound and the pattern the service applies are checked here — through the same
+        // constraint walk and the same refusal composition the boundary uses. First, so a
+        // caller reads the member refusal the boundary would have made before any rule
+        // this handler adds.
+        if let Some(kms_key_arn) = input.kms_key_arn.as_deref() {
+            if let Err(refused) = crate::state::check_kms_key_arn(kms_key_arn) {
+                return Err(CreateWorkspaceErrorModeled::ValidationException(refused).into());
+            }
+        }
 
         // "Keys must not begin with aws:" (`TagResource$tags`) — the service's rule for
         // its own tag keys, so it holds for the tags a workspace is created with too.
