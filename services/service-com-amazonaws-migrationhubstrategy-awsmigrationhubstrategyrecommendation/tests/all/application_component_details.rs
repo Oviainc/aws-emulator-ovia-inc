@@ -203,6 +203,11 @@ fn component(row: usize) -> ApplicationComponentRecord {
         // two "more than one" flags are decided off these two lists.
         associated_server_ids: (0..row % 4).map(|index| format!("{index}b{row}")).collect(),
         associated_applications: (0..row % 3).map(|index| application(row, index)).collect(),
+        // No caller has chosen a preferred strategy for these rows: the preference
+        // `UpdateApplicationComponentConfig` stores is the subject of
+        // `application_component_config.rs`, and this detail read reports the service's own
+        // recommendation rather than a choice.
+        preferred_strategy: None,
     }
 }
 
@@ -225,7 +230,11 @@ fn bare_row_id() -> String {
 
 /// One emulator over one shared engine, with `application_components` seeded into this
 /// service's store — the same map an ingestion writes and this operation reads.
-fn emulator_with(components: Vec<ApplicationComponentRecord>) -> MultiServiceRouter {
+///
+/// `pub(crate)` so the suites beside this one (the update this read reports, in
+/// `application_component_config.rs`) seed the same store through the same harness rather
+/// than standing up a second copy of it.
+pub(crate) fn emulator_with(components: Vec<ApplicationComponentRecord>) -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     {
         let state = engine
@@ -244,7 +253,10 @@ fn emulator_with(components: Vec<ApplicationComponentRecord>) -> MultiServiceRou
 }
 
 /// `GET /get-applicationcomponent-details/{applicationComponentId}`.
-async fn get_component(router: &MultiServiceRouter, id: &str) -> Answer {
+///
+/// `pub(crate)` for the same reason as [`emulator_with`]: the suite that drives the update
+/// reads what it stored back through this very route.
+pub(crate) async fn get_component(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",

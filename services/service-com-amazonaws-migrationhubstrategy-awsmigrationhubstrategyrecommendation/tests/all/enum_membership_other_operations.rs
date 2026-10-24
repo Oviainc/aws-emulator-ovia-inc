@@ -177,10 +177,11 @@ fn update_with(value: &str, member: &str) -> Value {
 /// read against `smithy_query(query="shape",shape="Group,StrategyOption,DatabasePreferences,ManagementPreference,AwsManagedResources")`.
 ///
 /// The members of operations that still answer 501 (`ListApplicationComponents`,
-/// `ListAnalyzableServers`, `UpdateApplicationComponentConfig`,
-/// `GetApplicationComponentStrategies`, `ListCollectors`, `GetPortfolioSummary`) belong to
-/// their own stub issues; the other implemented operations take only ids and pagination,
-/// so they carry no enum-targeting member.
+/// `ListAnalyzableServers`, `ListCollectors`, `GetPortfolioSummary`) belong to their own
+/// stub issues; `UpdateApplicationComponentConfig`'s own enum-targeting members are a table
+/// in `application_component_config.rs`, beside the round trip they are part of. The other
+/// implemented operations take only ids and pagination, so they carry no enum-targeting
+/// member.
 fn enum_members() -> Vec<EnumMember> {
     vec![
         EnumMember {

@@ -14,6 +14,9 @@
 #[path = "all/analyzable_servers.rs"]
 mod analyzable_servers;
 
+#[path = "all/application_component_config.rs"]
+mod application_component_config;
+
 #[path = "all/application_component_details.rs"]
 mod application_component_details;
 
