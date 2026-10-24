@@ -31,6 +31,8 @@ mod default_cluster_parameters;
 mod error_envelope;
 #[path = "all/existence_preconditions.rs"]
 mod existence_preconditions;
+#[path = "all/hsm_configurations.rs"]
+mod hsm_configurations;
 #[path = "all/maintenance_tracks.rs"]
 mod maintenance_tracks;
 #[path = "all/modify_cluster_parameter_group.rs"]
