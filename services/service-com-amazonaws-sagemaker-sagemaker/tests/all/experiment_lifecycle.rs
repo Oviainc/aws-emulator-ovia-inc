@@ -115,9 +115,9 @@ async fn describe_experiment_replays_exactly_what_create_experiment_stored() {
         ),
         (
             "tags-and-display-name",
-            // `Tags` are persisted but have no reader yet: `ListTags`/`AddTags` are still
-            // scaffolded stubs, so asserting them waits on their own issues. The row is
-            // here so the create path is exercised with tags present.
+            // `Tags` the create carries are reported by `ListTags`, which the
+            // resource_tagging suite asserts over the whole tag surface; this row keeps
+            // the create path exercised with tags present.
             json!({
                 "DisplayName": "Tagged",
                 "Tags": [{ "Key": "team", "Value": "ml" }, { "Key": "env", "Value": "test" }],

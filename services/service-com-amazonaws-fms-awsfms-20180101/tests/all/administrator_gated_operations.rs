@@ -788,7 +788,9 @@ async fn batch_associate_resource_classifies_each_item_and_associates_the_rest()
                     "Type": "WAFV2",
                     "ManagedServiceData": "{\"type\":\"WAFV2\"}"
                 },
-                "ResourceType": "AWS::EC2::Instance",
+                // A resource type the model lists for a WAFV2 policy; what this
+                // policy is here for is the scope map below.
+                "ResourceType": "AWS::ElasticLoadBalancingV2::LoadBalancer",
                 "ExcludeResourceTags": false,
                 "RemediationEnabled": false,
                 "IncludeMap": { "ACCOUNT": [member] },
