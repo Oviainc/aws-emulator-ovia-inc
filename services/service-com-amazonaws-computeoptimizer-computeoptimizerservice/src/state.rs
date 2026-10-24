@@ -41,7 +41,7 @@ use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     AccountEnrollmentStatus, AutoScalingGroupConfiguration, CustomizableMetricParameters,
-    DBStorageConfiguration,
+    DBStorageConfiguration, Filter,
     EBSEffectiveRecommendationPreferences, EBSEstimatedMonthlySavings, EBSSavingsEstimationMode,
     EBSSavingsOpportunityAfterDiscounts, EBSUtilizationMetric, EffectivePreferredResource,
     EffectiveRecommendationPreferences, EnrollmentFilter, EstimatedMonthlySavings,
@@ -57,13 +57,17 @@ use crate::ops::types::{
     RDSDBUtilizationMetric, RecommendationExportJob, RecommendationPreferencesDetail,
     S3Destination, SavingsOpportunity, Scope, Tag, UtilizationMetric, UtilizationPreference,
     VolumeConfiguration, VolumeRecommendation, VolumeRecommendationOption,
-    ENROLLMENT_FILTER_NAME_VALUES, IDLE_FINDING_VALUES,
+    ENROLLMENT_FILTER_NAME_VALUES, FILTER_NAME_VALUES, FINDING_VALUES,
+    IDLE_FINDING_VALUES,
     IDLE_RECOMMENDATION_FILTER_NAME_VALUES, IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES,
-    IDLE_VALUES, JOB_FILTER_NAME_VALUES, JOB_STATUS_VALUES,
+    IDLE_VALUES, INFERRED_WORKLOAD_TYPE_VALUES,
+    INSTANCE_RECOMMENDATION_FINDING_REASON_CODE_VALUES, JOB_FILTER_NAME_VALUES,
+    JOB_STATUS_VALUES,
     LAMBDA_FUNCTION_RECOMMENDATION_FILTER_NAME_VALUES,
     LAMBDA_FUNCTION_RECOMMENDATION_FINDING_REASON_CODE_VALUES,
     LAMBDA_FUNCTION_RECOMMENDATION_FINDING_VALUES, LICENSE_FINDING_REASON_CODE_VALUES,
     LICENSE_FINDING_VALUES, LICENSE_NAME_VALUES, LICENSE_RECOMMENDATION_FILTER_NAME_VALUES,
+    RECOMMENDATION_SOURCE_TYPE_VALUES,
     R_D_S_D_B_RECOMMENDATION_FILTER_NAME_VALUES, R_D_S_INSTANCE_FINDING_REASON_CODE_VALUES,
     R_D_S_INSTANCE_FINDING_VALUES, R_D_S_STORAGE_FINDING_REASON_CODE_VALUES,
     R_D_S_STORAGE_FINDING_VALUES, RESOURCE_TYPE_VALUES, STATUS_VALUES,
@@ -2616,6 +2620,76 @@ pub fn reason_codes_in(vocabulary: &[&str], codes: &[String]) -> Vec<String> {
         .filter(|code| vocabulary.contains(&code.as_str()))
         .cloned()
         .collect()
+}
+
+/// The `FilterName` values (`crate::ops::types::FILTER_NAME_VALUES`), named so the filter
+/// rule below reads as the model's own vocabulary.
+pub const FILTER_FINDING: &str = "Finding";
+/// See [`FILTER_FINDING`].
+pub const FILTER_FINDING_REASON_CODES: &str = "FindingReasonCodes";
+/// See [`FILTER_FINDING`].
+pub const FILTER_RECOMMENDATION_SOURCE_TYPE: &str = "RecommendationSourceType";
+/// See [`FILTER_FINDING`].
+pub const FILTER_INFERRED_WORKLOAD_TYPES: &str = "InferredWorkloadTypes";
+
+/// Check a `Filters` list — "a filter that returns a more specific list of
+/// recommendations", the filter the EC2 instance and Auto Scaling group surface selects
+/// with — against the vocabulary the model declares for it, returning the reason it is not
+/// valid.
+///
+/// `name` is a `FilterName` and the values a filter carries are the value set of the member
+/// that name selects on. A name or a value outside those sets is refused rather than
+/// silently matching nothing — the same rule [`rds_filter_rejection`] applies to the
+/// database surface's filters. A value the model declares is well formed even where no
+/// recommendation of the resource type asked about can carry it (an Auto Scaling group
+/// reports no finding reason codes): such a filter selects nothing. Shared by every reader
+/// and export of this surface, so none of them accepts a filter another refuses.
+pub fn resource_filter_rejection(filters: &[Filter]) -> Option<String> {
+    for filter in filters {
+        let Some(name) = filter.name.as_deref() else {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: a filter name must be \
+                 supplied, one of [{}].",
+                FILTER_NAME_VALUES.join(", ")
+            ));
+        };
+        let Some(vocabulary) = resource_filter_vocabulary(name) else {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: {name} is not a filter \
+                 name, which must be one of [{}].",
+                FILTER_NAME_VALUES.join(", ")
+            ));
+        };
+        if let Some(value) = filter
+            .values
+            .iter()
+            .flatten()
+            .find(|value| !vocabulary.contains(&value.as_str()))
+        {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: {value} is not a value \
+                 of the {name} filter, which must be one of [{}].",
+                vocabulary.join(", ")
+            ));
+        }
+    }
+    None
+}
+
+/// The value set a `FilterName` selects on, or `None` for a name the model does not declare.
+///
+/// `FindingReasonCodes` selects on either reason-code vocabulary this surface declares; the
+/// instance one is the superset, so it is what a filter's values are checked against.
+fn resource_filter_vocabulary(name: &str) -> Option<&'static [&'static str]> {
+    match name {
+        FILTER_FINDING => Some(FINDING_VALUES),
+        FILTER_RECOMMENDATION_SOURCE_TYPE => Some(RECOMMENDATION_SOURCE_TYPE_VALUES),
+        FILTER_INFERRED_WORKLOAD_TYPES => Some(INFERRED_WORKLOAD_TYPE_VALUES),
+        FILTER_FINDING_REASON_CODES => {
+            Some(INSTANCE_RECOMMENDATION_FINDING_REASON_CODE_VALUES)
+        }
+        _ => None,
+    }
 }
 
 /// Check an `RDSDBRecommendationFilters` list against the vocabulary the model declares for

@@ -225,10 +225,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        for filter in input.filters.iter().flatten() {
-            if let Some(reason) = filter_rejection(filter) {
-                return Err(invalid_parameter(reason));
-            }
+        // The filters are the `Filters` vocabulary of this surface, checked once in
+        // [`crate::state::resource_filter_rejection`] so this reader and the export of the
+        // same recommendations accept exactly the same filter sets.
+        if let Some(reason) =
+            crate::state::resource_filter_rejection(input.filters.as_deref().unwrap_or_default())
+        {
+            return Err(invalid_parameter(reason));
         }
 
         // `cpuVendorArchitectures` selects which candidate configurations are reported:
@@ -402,48 +405,6 @@ fn invalid_parameter(message: String) -> GetAutoScalingGroupRecommendationsError
         },
     )
     .into()
-}
-
-/// Why `filter` is not a filter this operation accepts, or `None` when it is.
-///
-/// The name must be a `FilterName` and each value must belong to the vocabulary that name
-/// filters on — the modelled enum for it, so a value the model knows is accepted even
-/// where no Auto Scaling group recommendation can carry it (a `Finding` of
-/// `Underprovisioned`, which is an EC2 instance finding, or a finding reason code, which
-/// an Auto Scaling group recommendation does not report): such a filter is well formed and
-/// selects nothing.
-fn filter_rejection(filter: &Filter) -> Option<String> {
-    let Some(name) = filter.name.as_deref() else {
-        // A filter is a name/value pair: values with no name name no vocabulary to
-        // filter on, so the request cannot be acted on.
-        return Some(
-            "The value supplied for parameter filters is not valid: a filter name must be \
-             supplied."
-                .to_string(),
-        );
-    };
-    if !FILTER_NAME_VALUES.contains(&name) {
-        return Some(format!(
-            "The value supplied for parameter filters is not valid: {name} is not a filter name.",
-        ));
-    }
-    let vocabulary: &[&str] = match name {
-        "Finding" => FINDING_VALUES,
-        "RecommendationSourceType" => RECOMMENDATION_SOURCE_TYPE_VALUES,
-        "InferredWorkloadTypes" => INFERRED_WORKLOAD_TYPE_VALUES,
-        // `FindingReasonCodes` filters on either reason-code vocabulary the model
-        // declares; the instance one is the superset this operation checks against.
-        _ => INSTANCE_RECOMMENDATION_FINDING_REASON_CODE_VALUES,
-    };
-    let value = filter
-        .values
-        .iter()
-        .flatten()
-        .find(|value| !vocabulary.contains(&value.as_str()))?;
-    Some(format!(
-        "The value supplied for parameter filters is not valid: {value} is not a value of the \
-         {name} filter.",
-    ))
 }
 
 /// Whether `group` passes `filter`.
