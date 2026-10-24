@@ -31,6 +31,8 @@ mod lifecycle_policy;
 mod policies_stats;
 #[path = "all/policy_and_group_writes.rs"]
 mod policy_and_group_writes;
+#[path = "all/security_config_update.rs"]
+mod security_config_update;
 #[path = "all/security_configs.rs"]
 mod security_configs;
 #[path = "all/security_policy_listing.rs"]
