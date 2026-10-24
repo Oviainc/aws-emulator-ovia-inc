@@ -77,6 +77,8 @@ mod list_artifacts;
 mod list_code_repositories;
 #[path = "all/list_endpoints.rs"]
 mod list_endpoints;
+#[path = "all/list_model_card_export_jobs.rs"]
+mod list_model_card_export_jobs;
 #[path = "all/list_model_packages.rs"]
 mod list_model_packages;
 #[path = "all/list_pipeline_execution_steps.rs"]
