@@ -159,10 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(directory) => directory.directory_type.clone(),
             None => {
                 return Err(CreateSnapshotErrorModeled::EntityDoesNotExistException(
-                    EntityDoesNotExistException {
-                        message: Some(crate::state::no_such_directory(&input.directory_id)),
-                        request_id: None,
-                    },
+                    crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
                 )
                 .into());
             }
@@ -191,13 +188,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // keeps it so, and it reports the store-wide bound rather than a directory's.
         if store.snapshots.len() >= crate::state::MAX_SNAPSHOTS {
             return Err(CreateSnapshotErrorModeled::SnapshotLimitExceededException(
-                SnapshotLimitExceededException {
-                    message: Some(format!(
-                        "Maximum number of snapshots has been reached: {max}",
-                        max = crate::state::MAX_SNAPSHOTS
-                    )),
-                    request_id: None,
-                },
+                crate::state::refusal(format!(
+                    "Maximum number of snapshots has been reached: {max}",
+                    max = crate::state::MAX_SNAPSHOTS
+                )),
             )
             .into());
         }
@@ -208,14 +202,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let held = store.manual_snapshot_count(&input.directory_id);
         if held >= crate::state::MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY {
             return Err(CreateSnapshotErrorModeled::SnapshotLimitExceededException(
-                SnapshotLimitExceededException {
-                    message: Some(format!(
-                        "Maximum number of manual snapshots for directory {id} has been reached: {max}",
-                        id = input.directory_id,
-                        max = crate::state::MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY
-                    )),
-                    request_id: None,
-                },
+                crate::state::refusal(format!(
+                    "Maximum number of manual snapshots for directory {id} has been reached: {max}",
+                    id = input.directory_id,
+                    max = crate::state::MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY
+                )),
             )
             .into());
         }
@@ -251,9 +242,5 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Refuse the request with the modelled `InvalidParameterException`, naming the member
 /// and the rule it broke so the caller can fix the request from the message alone.
 fn invalid_parameter(message: String) -> CreateSnapshotError {
-    CreateSnapshotErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(message),
-        request_id: None,
-    })
-    .into()
+    CreateSnapshotErrorModeled::InvalidParameterException(crate::state::refusal(message)).into()
 }

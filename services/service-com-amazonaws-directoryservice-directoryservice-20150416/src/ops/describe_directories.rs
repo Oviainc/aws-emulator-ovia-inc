@@ -207,10 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .ok_or_else(|| {
                     DescribeDirectoriesErrorModeled::InvalidNextTokenException(
-                        InvalidNextTokenException {
-                            message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
-                            request_id: None,
-                        },
+                        crate::state::invalid_next_token(),
                     )
                 })?,
         };
@@ -232,10 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             for directory_id in requested {
                 if !store.directories.contains_key(*directory_id) {
                     return Err(DescribeDirectoriesErrorModeled::EntityDoesNotExistException(
-                        EntityDoesNotExistException {
-                            message: Some(crate::state::no_such_directory(directory_id)),
-                            request_id: None,
-                        },
+                        crate::state::refusal(crate::state::no_such_directory(directory_id)),
                     )
                     .into());
                 }
@@ -288,11 +282,8 @@ const CURSOR_KIND: &str = "directories";
 /// Refuse the request with the modelled `InvalidParameterException`, naming the member
 /// and the rule it broke so the caller can fix the request from the message alone.
 fn invalid_parameter(message: String) -> DescribeDirectoriesError {
-    DescribeDirectoriesErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(message),
-        request_id: None,
-    })
-    .into()
+    DescribeDirectoriesErrorModeled::InvalidParameterException(crate::state::refusal(message))
+        .into()
 }
 
 /// How a `DirectoryIds` filter is recorded in a cursor: the ids as the request listed

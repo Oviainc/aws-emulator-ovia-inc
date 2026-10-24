@@ -21,6 +21,8 @@ mod offering_product_type_coverage;
 mod queued_plan_wire_rules;
 #[path = "all/queued_purchase_deletion.rs"]
 mod queued_purchase_deletion;
+#[path = "all/return_monthly_allowance.rs"]
+mod return_monthly_allowance;
 #[path = "all/savings_plans_lifecycle.rs"]
 mod savings_plans_lifecycle;
 #[path = "all/state_roundtrip.rs"]

@@ -185,10 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                     .ok_or_else(|| {
                         DescribeLDAPSSettingsErrorModeled::InvalidNextTokenException(
-                            InvalidNextTokenException {
-                                message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
-                                request_id: None,
-                            },
+                            crate::state::invalid_next_token(),
                         )
                     })?,
             ),
@@ -200,10 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let directory = store.directories.get(&input.directory_id).ok_or_else(|| {
             DescribeLDAPSSettingsErrorModeled::DirectoryDoesNotExistException(
-                DirectoryDoesNotExistException {
-                    message: Some(crate::state::no_such_directory(&input.directory_id)),
-                    request_id: None,
-                },
+                crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
             )
         })?;
 

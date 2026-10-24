@@ -122,3 +122,5 @@ mod update_stage_setting_spellings;
 mod deployment_collection;
 #[path = "all/update_stage_readers.rs"]
 mod update_stage_readers;
+#[path = "all/execution_logging_prerequisites.rs"]
+mod execution_logging_prerequisites;

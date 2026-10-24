@@ -164,10 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.assessment_id)
             .ok_or_else(|| {
                 DescribeADAssessmentErrorModeled::EntityDoesNotExistException(
-                    EntityDoesNotExistException {
-                        message: Some(crate::state::no_such_assessment(&input.assessment_id)),
-                        request_id: None,
-                    },
+                    crate::state::refusal(crate::state::no_such_assessment(&input.assessment_id)),
                 )
             })?
             .to_assessment();
