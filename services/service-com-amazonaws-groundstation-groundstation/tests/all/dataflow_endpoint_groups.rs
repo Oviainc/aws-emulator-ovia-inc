@@ -158,7 +158,7 @@ fn endpoint_kinds() -> Vec<Kind> {
 /// The subnets, security groups and role Ground Station connects an endpoint's streams
 /// with (`SecurityDetails`, whose three members are all required; the role ARN satisfies
 /// the modelled `RoleArn` pattern).
-fn security_details() -> Value {
+pub(crate) fn security_details() -> Value {
     json!({
         "subnetIds": ["subnet-0123456789abcdef0"],
         "securityGroupIds": ["sg-0123456789abcdef0"],

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/accessor_lifecycle.rs"]
 mod accessor_lifecycle;
+#[path = "all/delete_member.rs"]
+mod delete_member;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/invitations.rs"]

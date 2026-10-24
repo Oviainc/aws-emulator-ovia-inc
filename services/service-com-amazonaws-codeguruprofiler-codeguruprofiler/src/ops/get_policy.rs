@@ -4,11 +4,15 @@
 //! Reports the profiling group's stored resource-based policy.
 //!
 //! `GetPolicy` is `@readonly`: it renders the document from the grants stored on the
-//! group and never attaches, rotates or clears anything. Its output models `policy` and
-//! `revisionId` as REQUIRED, so there is no 200 that says "no policy": a group with no
-//! resource-based policy is answered with the operation's own 404
-//! `ResourceNotFoundException` — "The resource specified in the request does not exist"
-//! — as is a request naming a profiling group that does not exist.
+//! group and never attaches, rotates or clears anything. A profiling group that EXISTS
+//! but has no resource-based policy attached — the state it is created in, and the state
+//! its last `RemovePermission` leaves it in — is answered 200 with `policy` and
+//! `revisionId` both ABSENT, i.e. an empty body, because there is no policy to report
+//! and no revision to report; the operation's 404 `ResourceNotFoundException` — "The
+//! resource specified in the request does not exist" — is reserved for a request naming
+//! a profiling group that does not exist, and states the lookup that found nothing.
+//! The two are distinct classes, and a client telling "unshared" from "deleted" is
+//! exactly what the 404 would destroy.
 //!
 //! A read never changes what a later caller sees: the handler takes the state guard,
 //! renders, and writes nothing.
@@ -157,24 +161,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let guard = state.lock();
         let group = guard.groups.get(&input.profiling_group_name).ok_or_else(|| {
             GetPolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: crate::state::group_not_found_message(&input.profiling_group_name),
-            })
-        })?;
-        let policy = group.resource_policy().ok_or_else(|| {
-            GetPolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "no resource-based policy is attached to profiling group {}",
-                    input.profiling_group_name
+                // This operation's own not-found sentence: it states the LOOKUP that
+                // found nothing (the account it was scoped to, the name it looked for),
+                // which is what tells this 404 apart from the one a group with no policy
+                // would get — see `crate::state::policy_group_not_found_message`.
+                message: crate::state::policy_group_not_found_message(
+                    &input.profiling_group_name,
                 ),
             })
         })?;
-
-        Ok(GetPolicyOutput {
-            // Rendered from the stored grants and the group's own stored ARN, so the
-            // document names the resource the policy is attached to rather than
-            // anything the request carried.
-            policy: policy.document(&group.arn),
-            revision_id: policy.revision_id.clone(),
+        // The group resolved, so this is a 200 either way: it carries the policy only
+        // when one is attached, and nothing at all when none is.
+        Ok(match group.resource_policy() {
+            Some(policy) => GetPolicyOutput {
+                // Rendered from the stored grants and the group's own stored ARN, so the
+                // document names the resource the policy is attached to rather than
+                // anything the request carried.
+                policy: Some(policy.document(&group.arn)),
+                revision_id: Some(policy.revision_id.clone()),
+            },
+            None => GetPolicyOutput {
+                policy: None,
+                revision_id: None,
+            },
         })
     }
 }
