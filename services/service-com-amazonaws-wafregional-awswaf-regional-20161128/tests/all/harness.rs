@@ -3,39 +3,51 @@
 //! The `WebACL` test harness: the fixtures a web-ACL suite needs on top of the wire
 //! harness in `wire.rs` (which owns the router, the awsJson1_1 call and the
 //! change-token helpers every suite in this crate shares).
+//!
+//! AWS WAF Classic is past its end of support, so `CreateWebACL` refuses every request
+//! (`web_acl_end_of_support.rs` pins that rule) and no call mints a web ACL any more.
+//! The web ACLs that exist are the ones that already existed, so a suite needing one to
+//! read, tag or reference puts the record in the store with [`store_web_acl`].
 
-use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
+use std::collections::BTreeMap;
 
-use crate::wire::{call_in_region, change_token, DEFAULT_TEST_REGION};
+use service_com_amazonaws_wafregional_awswaf_regional_20161128::state::{
+    service_state, web_acl_arn, WebACLEntry,
+};
 
-/// Submit `CreateWebACL` for `request` (a body WITHOUT `ChangeToken`) with a change
-/// token freshly minted for this call, signed for `region`. Answers
-/// `(http status, body, the token the request carried)`.
-pub async fn create_in_region(
-    router: &MultiServiceRouter,
+/// Store a web ACL that EXISTS: one of the web ACLs created before AWS WAF Classic
+/// reached end of support, which is the only kind there is now.
+///
+/// The record goes in through the service's OWN state types — the id
+/// `ComAmazonawsWafregionalAwswafRegional20161128State::mint_id` hands out, the ARN
+/// `state::web_acl_arn` mints for `region` and the `WebACLEntry` every reader projects —
+/// so what a suite then reads over the wire is a record indistinguishable from one this
+/// service minted itself. Answers the stored `WebACLId`.
+pub fn store_web_acl(
+    engine: &engine::InMemoryEngine,
     region: &str,
-    request: &Value,
-) -> (u16, Value, String) {
-    let token = change_token(router).await;
-    let mut body = request.clone();
-    body["ChangeToken"] = json!(token);
-    let (status, parsed) = call_in_region(router, region, "CreateWebACL", &body).await;
-    (status, parsed, token)
-}
-
-/// [`create_in_region`] signed for the wire harness's default region.
-pub async fn create(router: &MultiServiceRouter, request: &Value) -> (u16, Value, String) {
-    create_in_region(router, DEFAULT_TEST_REGION, request).await
-}
-
-/// The `WebACL` a successful create answered, or an explanation.
-pub fn created_web_acl(status: u16, body: &Value, label: &str) -> Value {
-    assert_eq!(
-        status, 200,
-        "case {label}: CreateWebACL must answer 200, got {status}: {body}"
+    name: &str,
+    metric_name: &str,
+    default_action: &str,
+    tags: &[(&str, &str)],
+) -> String {
+    let state = service_state(engine).expect("the service state is reachable from the engine");
+    let mut state = state.lock();
+    let web_acl_id = state.mint_id();
+    let tags: BTreeMap<String, String> = tags
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect();
+    let entry = WebACLEntry::new(
+        web_acl_id.clone(),
+        name.to_string(),
+        metric_name.to_string(),
+        default_action.to_string(),
+        web_acl_arn(region, &web_acl_id),
+        tags,
     );
-    body["WebACL"].clone()
+    state.web_acls.insert(web_acl_id.clone(), entry);
+    web_acl_id
 }
 
 /// The ARN AWS WAF Classic's regional endpoints give a web ACL:
