@@ -6,7 +6,9 @@
 //! operation mints for it, and leaves it in `ActionStatus$STANDBY` — armed, waiting for
 //! its threshold. `Action$ActionType` determines which member of `Definition` describes
 //! the work, so a mismatch is an `InvalidParameterException`
-//! ([`crate::state::validate_action_definition`]); a budget this account does not hold
+//! ([`crate::state::validate_action_definition`]); a subscriber set past the documented
+//! per-type split is the subscriber limit `CreationLimitExceededException` names
+//! ([`crate::state::subscriber_limit_violation`]); a budget this account does not hold
 //! is a `NotFoundException`. The call is recorded as the action's `CREATE_ACTION` event,
 //! which `DescribeBudgetActionHistories` reports.
 //!
@@ -223,6 +225,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             },
         )?;
+
+        // "A notification can have one SNS subscriber and up to 10 email subscribers,
+        // for a total of 11 subscribers" — the PER-TYPE halves of the subscriber set
+        // this write establishes, which no constraint trait can express. The total and
+        // the at-least-one are the modelled `@length(1, 11)` on `Subscribers`, already
+        // refused before this handler runs; a set past either half is the subscriber
+        // limit `CreationLimitExceededException` names. Checked before the budget is
+        // looked up, so nothing is persisted by a refused create.
+        crate::state::subscriber_limit_violation(&input.subscribers).map_err(|message| {
+            CreateBudgetActionErrorModeled::CreationLimitExceededException(
+                CreationLimitExceededException {
+                    message: Some(message),
+                },
+            )
+        })?;
 
         let mut store = state.lock();
         // An action is a resource OF the budget it names (`Action$BudgetName`), so the
