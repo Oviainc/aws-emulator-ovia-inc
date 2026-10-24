@@ -560,6 +560,22 @@ pub fn kafka_version_page(resume_after: Option<usize>, page_size: usize) -> Kafk
 /// knows which member it was still says the same thing about the resource.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource doesn\u{2019}t exist.";
 
+/// The same refusal, as the replicator APIs phrase it: the input member that
+/// failed to resolve, then [`RESOURCE_NOT_FOUND_MESSAGE`] and nothing else.
+///
+/// `member` is the member's name as the wire carries it (`replicatorArn`), so the
+/// text names what the CALLER sent rather than anything about the serving
+/// endpoint. Built here, from one place, so every operation that resolves a
+/// replicator by ARN answers one form instead of describing its own state.
+pub fn parameter_not_found_message(member: &str) -> String {
+    format!("Invalid parameter {member}: {RESOURCE_NOT_FOUND_MESSAGE}")
+}
+
+/// The input member every replicator operation resolves its target through, named
+/// as the wire carries it — what the refusals of those operations report as the
+/// parameter at fault.
+pub const REPLICATOR_ARN_MEMBER: &str = "replicatorArn";
+
 /// The `ClusterType` of a cluster whose brokers this emulator provisions — one of
 /// the two values the model's `ClusterType` enum names. It is STORED on the record
 /// (see [`Cluster::cluster_type`]) rather than assumed by a reader, so a listing's
@@ -959,6 +975,9 @@ pub struct ClusterPage {
 pub const REPLICATOR_STATE_CREATING: &str = "CREATING";
 /// The `ReplicatorState` value a settled replicator reports.
 pub const REPLICATOR_STATE_RUNNING: &str = "RUNNING";
+/// The `ReplicatorState` value a deleted replicator is reported in — the state
+/// `DeleteReplicator` answers with, another member of the same model enum.
+pub const REPLICATOR_STATE_DELETING: &str = "DELETING";
 
 /// One Kafka cluster a replicator replicates between, under the alias the
 /// replicator knows it by.
@@ -2428,11 +2447,14 @@ pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 /// Why `key` is not a tag key a caller may set or remove, phrased as the message
 /// a `BadRequestException` carries — or `None` when the key is acceptable.
 ///
-/// Every rule here is stated by the model's own `UntagResourceRequest$TagKeys`
-/// documentation: 1..128 Unicode characters, no `aws:` prefix, and a character
-/// set of "Unicode letters, digits, white space, and the following special
-/// characters: _ . / = + - @". The message names the member's constraint and the
-/// offending key, so a caller can fix the request from the text alone.
+/// The length bound and the reserved prefix are stated by the model's own
+/// `UntagResourceRequest$TagKeys` documentation: 1..128 Unicode characters and no
+/// `aws:` prefix. The character set is AWS's own tagging rule (AWS General
+/// Reference, "Tagging AWS resources"): Unicode letters, digits, white space and
+/// the characters `+ - = . _ : / @` — the colon included, which is what makes a
+/// namespaced key (`<namespace>:<name>`) a legal key everywhere tags are written.
+/// The message names the member's constraint and the offending key, so a caller
+/// can fix the request from the text alone.
 pub fn tag_key_violation(key: &str) -> Option<String> {
     let length = key.chars().count();
     if !(1..=MAX_TAG_KEY_LENGTH).contains(&length) {
@@ -2447,18 +2469,19 @@ pub fn tag_key_violation(key: &str) -> Option<String> {
     }
     if let Some(offending) = key.chars().find(|c| !is_tag_key_character(*c)) {
         return Some(format!(
-            "Tag key '{key}' contains the unsupported character '{offending}'; a tag key must consist of Unicode letters, digits, white space and the special characters _ . / = + - @."
+            "Tag key '{key}' contains the unsupported character '{offending}'; a tag key must consist of Unicode letters, digits, white space and the special characters + - = . _ : / @."
         ));
     }
     None
 }
 
-/// Whether `c` is one of the characters the model's tag-key documentation allows.
+/// Whether `c` is one of the characters AWS's tagging rule admits in a tag key:
+/// a Unicode letter, a digit, white space, or one of `+ - = . _ : / @`.
 fn is_tag_key_character(c: char) -> bool {
     c.is_alphabetic()
         || c.is_numeric()
         || c.is_whitespace()
-        || matches!(c, '_' | '.' | '/' | '=' | '+' | '-' | '@')
+        || matches!(c, '+' | '-' | '=' | '.' | '_' | ':' | '/' | '@')
 }
 
 /// The most tags one resource may carry, from the Amazon MSK tag restrictions

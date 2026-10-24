@@ -208,6 +208,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
 
+        // The configuration's documented defaults are applied, and the storage
+        // configuration it REFERS to resolved, in one place, so the stage a create
+        // attaches one to and the stage an update attaches one to report the same members
+        // and refuse the same reference. Decided before anything is minted or persisted,
+        // so a refused request leaves no stage.
+        let recording_configuration = crate::state::resolved_recording_configuration(
+            &store,
+            Self::NAME,
+            input.auto_participant_recording_configuration,
+        )
+        .map_err(|message| {
+            crate::state::validation_failed(
+                CreateStageErrorModeled::ValidationException,
+                message,
+            )
+        })?;
+
         // The store grows only here and in `CreateParticipantToken`, so the bound is
         // checked before anything is minted or persisted. A stage created here holds
         // at most the 12 token records the model allows in one request, which is far
@@ -266,13 +283,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A stage AWS has just created holds no session yet.
             active_session_id: None,
             tags,
-            // The configuration's documented defaults are applied in one place, so the
-            // stage a create attaches one to and the stage an update attaches one to
-            // report the same members.
-            auto_participant_recording_configuration:
-                crate::state::effective_recording_configuration(
-                    input.auto_participant_recording_configuration,
-                ),
+            // Resolved and defaulted above, through the seam `UpdateStage` uses too.
+            auto_participant_recording_configuration: recording_configuration,
             // Assigned at creation, which is where the model's `StageEndpoints` doc
             // tells a caller to cache them.
             endpoints: crate::state::stage_endpoints(&arn),

@@ -187,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !crate::state::is_replicator_arn(&input.replicator_arn) {
             return Err(
                 DescribeReplicatorErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("ReplicatorArn".to_string()),
+                    invalid_parameter: Some(crate::state::REPLICATOR_ARN_MEMBER.to_string()),
                     message: Some(format!(
                         "{} is not a valid Amazon MSK replicator ARN.",
                         input.replicator_arn
@@ -214,10 +214,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(settled) = settled else {
                 return Err(
                     DescribeReplicatorErrorModeled::NotFoundException(NotFoundException {
-                        invalid_parameter: Some("ReplicatorArn".to_string()),
-                        message: Some(format!(
-                            "No replicator exists in {region} with the ARN {}",
-                            input.replicator_arn
+                        invalid_parameter: Some(crate::state::REPLICATOR_ARN_MEMBER.to_string()),
+                        // The refusal names the input member that resolved to
+                        // nothing and says nothing about this endpoint's own
+                        // state: which region looked, and what it holds, is not
+                        // the caller's business and not part of the refusal.
+                        message: Some(crate::state::parameter_not_found_message(
+                            crate::state::REPLICATOR_ARN_MEMBER,
                         )),
                     })
                     .into(),

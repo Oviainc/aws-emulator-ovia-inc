@@ -21,25 +21,10 @@ use std::collections::BTreeMap;
 use serde_json::json;
 use service_com_amazonaws_apigateway_backplanecontrolservice::ops::put_method::HTTP_METHODS;
 
+use crate::method_integration::put_method;
 use crate::rest_api_lifecycle::{
     assert_failure, create_api, create_resource, page_items, string_member, Answer, Gateway,
 };
-
-/// `PutMethod` for `verb` on `resource`, asserting the modelled 201.
-async fn put_method(gateway: &Gateway, api: &str, resource: &str, verb: &str) {
-    let answer = gateway
-        .call(
-            "PUT",
-            &format!("/restapis/{api}/resources/{resource}/methods/{verb}"),
-            Some(json!({ "authorizationType": "NONE" })),
-        )
-        .await;
-    assert_eq!(
-        answer.status, 201,
-        "case PutMethod({verb}): expected 201, got {} with {:?}",
-        answer.status, answer.body
-    );
-}
 
 /// `GetMethod` for `verb` on `resource`.
 async fn get_method(gateway: &Gateway, api: &str, resource: &str, verb: &str) -> Answer {

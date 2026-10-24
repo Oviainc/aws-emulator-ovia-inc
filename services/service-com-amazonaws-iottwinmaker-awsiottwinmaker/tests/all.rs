@@ -83,6 +83,9 @@ mod sync_job;
 #[path = "all/sync_job_listing.rs"]
 mod sync_job_listing;
 
+#[path = "all/workspace_built_in_component_types.rs"]
+mod workspace_built_in_component_types;
+
 #[path = "all/workspace_entity_lifecycle.rs"]
 mod workspace_entity_lifecycle;
 

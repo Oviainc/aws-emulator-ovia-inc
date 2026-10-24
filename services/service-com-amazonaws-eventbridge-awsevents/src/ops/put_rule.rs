@@ -257,7 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(bus) = store.bus_mut(&bus_name) else {
             return Err(PutRuleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Event bus {bus_name} does not exist.")),
+                    message: Some(crate::state::no_such_event_bus(&bus_name)),
                 },
             )
             .into());

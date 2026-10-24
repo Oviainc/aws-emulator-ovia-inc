@@ -9,8 +9,9 @@
 //!
 //! The tests assert RULES over tables of inputs rather than one recorded case:
 //!
-//! * a listing reports every STORED component type of the workspace it names, in
-//!   `componentTypeId` order, each summary carrying the members
+//! * a listing reports every STORED component type of the workspace it names —
+//!   the ones a caller created AND the built-ins the workspace was provisioned
+//!   with — in `componentTypeId` order, each summary carrying the members
 //!   `GetComponentType` reports for that same component type — so a create is
 //!   visible in the listing, a delete is not, and another workspace's component
 //!   types never are;
@@ -33,7 +34,7 @@ use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
     COMPONENT_TYPE_SETTLE_SPAN, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, STATE_ACTIVE, STATE_CREATING,
 };
 
-use crate::harness::{component_type_arn, Emulator, Resp};
+use crate::harness::{component_type_arn, with_built_in_component_types, Emulator, Resp};
 
 /// The workspace every case that needs only one takes its listing in.
 const WORKSPACE: &str = "ctListWorkspace";
@@ -191,11 +192,9 @@ async fn a_listing_reports_every_stored_component_type_as_the_single_read_does()
     // A component type of ANOTHER workspace, which this listing must never show.
     create(&emulator, "otherWorkspace", "mid.sensor", json!({})).await;
 
-    let mut expected_ids: Vec<String> = rows
-        .iter()
-        .map(|(component_type_id, _)| component_type_id.to_string())
-        .collect();
-    expected_ids.sort();
+    let mut expected_ids: Vec<String> = with_built_in_component_types(
+        rows.iter().map(|(component_type_id, _)| *component_type_id),
+    );
 
     // Both the listing and the reads below are taken after the settle span, so
     // every record is in its terminal state and the two cannot straddle the
@@ -274,13 +273,14 @@ async fn a_listing_reports_every_stored_component_type_as_the_single_read_does()
         "case \"afterDelete\": a deleted component type must not be listed, got {after_delete:?}"
     );
 
-    // The other workspace holds exactly its own one.
+    // The other workspace holds exactly its own one, beside the built-ins it
+    // was provisioned with.
     let other = emulator
         .list_component_types("otherWorkspace", json!({}))
         .await;
     assert_eq!(
         page_ids("otherWorkspace", &other),
-        vec!["mid.sensor".to_string()],
+        with_built_in_component_types(["mid.sensor"]),
         "case \"otherWorkspace\": a listing is scoped to the workspace it names, got {other:?}"
     );
 }
@@ -327,17 +327,18 @@ async fn a_listing_of_an_unknown_workspace_is_refused() {
         );
     }
 
-    // An EMPTY workspace, by contrast, lists an empty array and no token.
+    // A workspace a caller created NOTHING in, by contrast, lists exactly the
+    // built-in component types it was provisioned with, and on one page.
     let empty = emulator.list_component_types(WORKSPACE, json!({})).await;
     assert_eq!(
-        (empty.status, summaries_of("emptyWorkspace", &empty).len()),
-        (200, 0),
-        "case \"emptyWorkspace\": a workspace with no component type lists an empty array, got \
-         {empty:?}"
+        (empty.status, page_ids("emptyWorkspace", &empty)),
+        (200, with_built_in_component_types::<[&str; 0]>([])),
+        "case \"emptyWorkspace\": a workspace nobody created a component type in lists the \
+         built-ins, got {empty:?}"
     );
     assert!(
         empty.member("nextToken").is_null(),
-        "case \"emptyWorkspace\": an empty listing carries no token, got {empty:?}"
+        "case \"emptyWorkspace\": a listing with nothing left over carries no token, got {empty:?}"
     );
 }
 
@@ -345,9 +346,10 @@ async fn a_listing_of_an_unknown_workspace_is_refused() {
 /// served exactly once, in `componentTypeId` order, no page is larger than the
 /// page size, and only the last page carries no `nextToken`.
 ///
-/// The rows span how many component types are stored (none, one, several, more
-/// than one page at every size under test) crossed with the page size (the
-/// documented default, one, several, and the top of the published range).
+/// The rows span how many component types a caller created (none, one, several,
+/// more than one page at every size under test — the workspace's built-ins are
+/// listed beside them) crossed with the page size (the documented default, one,
+/// several, and the top of the published range).
 #[tokio::test]
 async fn page_sequences_partition_the_listing_at_every_page_size() {
     let totals = [0usize, 1, 2, 7, DEFAULT_PAGE_SIZE + 5];
@@ -363,11 +365,12 @@ async fn page_sequences_partition_the_listing_at_every_page_size() {
     for total in totals {
         let emulator = Emulator::new();
         create_workspace(&emulator, WORKSPACE).await;
-        let mut expected_ids: Vec<String> = (0..total).map(|i| format!("ct{i:03}")).collect();
-        for component_type_id in &expected_ids {
+        let created: Vec<String> = (0..total).map(|i| format!("ct{i:03}")).collect();
+        for component_type_id in &created {
             create(&emulator, WORKSPACE, component_type_id, json!({})).await;
         }
-        expected_ids.sort();
+        let expected_ids = with_built_in_component_types(created);
+        let listed_total = expected_ids.len();
 
         for max_results in page_sizes {
             let case = format!("total={total} maxResults={max_results:?}");
@@ -378,7 +381,7 @@ async fn page_sequences_partition_the_listing_at_every_page_size() {
                  order, got {ids:?}"
             );
             let size = effective_page_size(max_results);
-            let expected_pages = total.div_ceil(size).max(1);
+            let expected_pages = listed_total.div_ceil(size).max(1);
             assert_eq!(
                 pages, expected_pages,
                 "case {case:?}: expected {expected_pages} pages at page size {size}, got {pages}"
@@ -415,13 +418,17 @@ async fn the_page_size_is_the_documented_one_and_is_bounded() {
 
     // More component types than the default page serves, so a page is truncated
     // by the page size rather than by the stored count, and fewer than the top
-    // of the range, so a page size at the top serves the whole set.
-    let total = DEFAULT_PAGE_SIZE + 5;
-    let mut all_ids: Vec<String> = (0..total).map(|i| format!("ct{i:03}")).collect();
-    for component_type_id in &all_ids {
+    // of the range, so a page size at the top serves the whole set. The
+    // workspace's built-ins are listed beside the created ones, so the whole
+    // listing is both together.
+    let created: Vec<String> = (0..DEFAULT_PAGE_SIZE + 5)
+        .map(|i| format!("ct{i:03}"))
+        .collect();
+    for component_type_id in &created {
         create(&emulator, WORKSPACE, component_type_id, json!({})).await;
     }
-    all_ids.sort();
+    let all_ids = with_built_in_component_types(created);
+    let total = all_ids.len();
 
     // (what the caller asks for, how many summaries the service serves)
     let rows: Vec<(Option<u32>, usize)> = vec![
@@ -583,8 +590,10 @@ async fn only_a_token_this_listing_minted_resumes_it() {
 /// set both matches and misses: a parent with two children, one with two, one
 /// with none, and a GRANDparent (whose grandchild is not selected, since a
 /// component type's stored parents are the ones its create declared); a
-/// namespace at three depths, a whole id and one no id lies in; and both
-/// booleans.
+/// namespace at three depths, the namespace the service's own built-ins lie in,
+/// a whole id and one no id lies in; and both booleans, which split the stored
+/// set into the concrete component types a caller created and the abstract
+/// built-ins the workspace was provisioned with.
 #[tokio::test]
 async fn one_filter_object_selects_the_component_types_it_names() {
     let emulator = Emulator::new();
@@ -614,82 +623,128 @@ async fn one_filter_object_selects_the_component_types_it_names() {
     for (component_type_id, body) in &stored {
         create(&emulator, WORKSPACE, component_type_id, body.clone()).await;
     }
-    let mut every_id: Vec<String> = stored
-        .iter()
-        .map(|(component_type_id, _)| component_type_id.to_string())
-        .collect();
+    let mut every_id: Vec<String> = with_built_in_component_types(
+        stored.iter().map(|(component_type_id, _)| *component_type_id),
+    );
     every_id.sort();
+    // The ids the workspace was PROVISIONED with, split by the abstractness the
+    // single-resource read reports for each of them, so the two `isAbstract`
+    // rows below cannot drift from what the service seeds: no component type a
+    // caller creates is abstract, so every other id is concrete.
+    let mut abstract_ids: Vec<String> = Vec::new();
+    let built_in_ids = crate::harness::built_in_component_type_ids();
+    for component_type_id in built_in_ids.clone() {
+        let read = emulator
+            .get_component_type(WORKSPACE, &component_type_id)
+            .await;
+        assert_eq!(
+            read.status, 200,
+            "case {component_type_id:?}: a provisioned built-in must read back, got {read:?}"
+        );
+        if read.member("isAbstract").as_bool() == Some(true) {
+            abstract_ids.push(component_type_id);
+        }
+    }
+    abstract_ids.sort();
+    let concrete_ids: Vec<String> = every_id
+        .iter()
+        .filter(|component_type_id| !abstract_ids.contains(component_type_id))
+        .cloned()
+        .collect();
 
     // (case, the single filter object, the ids it must select in id order)
-    let rows: Vec<(&str, Value, Vec<&str>)> = vec![
+    let ids = |list: &[&str]| -> Vec<String> { list.iter().map(|id| id.to_string()).collect() };
+    let rows: Vec<(&str, Value, Vec<String>)> = vec![
         (
             "extendsFromWithTwoChildren",
             json!({"extendsFrom": "com.example.base"}),
             // The grandchild is NOT here: this service resolves no inheritance
             // chain beyond the parents a create declared.
-            vec!["com.example.sensors.pump", "com.example.sensors.valve"],
+            ids(&["com.example.sensors.pump", "com.example.sensors.valve"]),
         ),
         (
             "extendsFromWithTwoDirectChildren",
             json!({"extendsFrom": "com.example.sensors.pump"}),
-            vec!["com.example.sensors.deep", "com.example.sensors.valve"],
+            ids(&["com.example.sensors.deep", "com.example.sensors.valve"]),
         ),
         (
             "extendsFromWithNoChild",
             json!({"extendsFrom": "plainType"}),
-            vec![],
+            ids(&[]),
         ),
         (
+            // The built-ins extend nothing, so no `extendsFrom` filter names
+            // one of them as a parent of a stored type here.
+            "extendsFromABuiltIn",
+            json!({"extendsFrom": "com.amazon.iottwinmaker.alarm.basic"}),
+            ids(&[]),
+        ),
+        (
+            // The whole `com` namespace: the workspace's built-ins lie in it
+            // too, since the service publishes them under `com.amazon.`.
             "namespaceAtTheTop",
             json!({"namespace": "com"}),
-            vec![
+            with_built_in_component_types([
                 "com.example.base",
                 "com.example.sensors.deep",
                 "com.example.sensors.pump",
                 "com.example.sensors.valve",
                 "com.other.widget",
-            ],
+            ]),
+        ),
+        (
+            // The service's own namespace selects exactly the built-ins.
+            "namespaceOfTheBuiltIns",
+            json!({"namespace": "com.amazon"}),
+            built_in_ids.clone(),
         ),
         (
             "namespaceOneDeeper",
             json!({"namespace": "com.example"}),
-            vec![
+            ids(&[
                 "com.example.base",
                 "com.example.sensors.deep",
                 "com.example.sensors.pump",
                 "com.example.sensors.valve",
-            ],
+            ]),
         ),
         (
             "namespaceTwoDeeper",
             json!({"namespace": "com.example.sensors"}),
-            vec![
+            ids(&[
                 "com.example.sensors.deep",
                 "com.example.sensors.pump",
                 "com.example.sensors.valve",
-            ],
+            ]),
         ),
         (
             // A whole id is not a namespace of itself: nothing continues it
             // with a further segment.
             "namespaceThatIsAWholeId",
             json!({"namespace": "com.example.base"}),
-            vec![],
+            ids(&[]),
         ),
         (
             // An id carrying no dotted prefix lies in no namespace.
             "namespaceOfANamespacelessId",
             json!({"namespace": "plainType"}),
-            vec![],
+            ids(&[]),
         ),
         (
             // Every component type created through this API is concrete, which
-            // is what `GetComponentType` reports for each of them.
+            // is what `GetComponentType` reports for each of them — as is the
+            // one built-in an entity instantiates directly.
             "isAbstractFalse",
             json!({"isAbstract": false}),
-            every_id.iter().map(String::as_str).collect(),
+            concrete_ids.clone(),
         ),
-        ("isAbstractTrue", json!({"isAbstract": true}), vec![]),
+        (
+            // The abstract ones are the service's own: provisioned with the
+            // workspace, never created through this API.
+            "isAbstractTrue",
+            json!({"isAbstract": true}),
+            abstract_ids.clone(),
+        ),
     ];
 
     for (case, filter, expected) in &rows {
@@ -775,8 +830,9 @@ async fn one_filter_object_selects_the_component_types_it_names() {
 /// RULE: listing is a READ — the only thing it writes is the lifecycle
 /// transition the CLOCK already made due, so a component type inside its settle
 /// span lists as `CREATING`, the same component type lists as `ACTIVE` once the
-/// span has elapsed whether or not anybody polled, and nothing else a later
-/// caller sees changes.
+/// span has elapsed whether or not anybody polled, a built-in the workspace was
+/// provisioned with lists as `ACTIVE` throughout (nothing is in flight for it),
+/// and nothing else a later caller sees changes.
 ///
 /// The rows are the page sizes and resume points a caller can drive the listing
 /// at; after every one, the whole listing and each component type's
@@ -787,17 +843,25 @@ async fn listing_writes_only_the_transition_the_clock_owed() {
     create_workspace(&emulator, WORKSPACE).await;
 
     // Inside the settle span the listing reports the non-terminal state the
-    // create answered with — the same state `GetComponentType` reports.
+    // create answered with — the same state `GetComponentType` reports — while
+    // the workspace's built-ins are already settled, the create of a workspace
+    // owing them no transition.
     create(&emulator, WORKSPACE, "ct.settling", json!({})).await;
     let during = emulator.list_component_types(WORKSPACE, json!({})).await;
-    assert_eq!(
-        summaries_of("duringSettleSpan", &during)
-            .first()
-            .and_then(|summary| summary["status"]["state"].as_str()),
-        Some(STATE_CREATING),
-        "case \"duringSettleSpan\": a listing inside the settle span reports CREATING, got \
-         {during:?}"
-    );
+    for summary in summaries_of("duringSettleSpan", &during) {
+        let component_type_id = summary["componentTypeId"].as_str().unwrap_or_default();
+        let expected = if component_type_id == "ct.settling" {
+            STATE_CREATING
+        } else {
+            STATE_ACTIVE
+        };
+        assert_eq!(
+            summary["status"]["state"].as_str(),
+            Some(expected),
+            "case \"duringSettleSpan\": {component_type_id:?} must list as {expected}, got \
+             {summary:?}"
+        );
+    }
 
     for component_type_id in ["ct.a", "ct.b", "ct.c"] {
         create(
@@ -808,7 +872,8 @@ async fn listing_writes_only_the_transition_the_clock_owed() {
         )
         .await;
     }
-    let component_type_ids = ["ct.a", "ct.b", "ct.c", "ct.settling"];
+    let component_type_ids =
+        with_built_in_component_types(["ct.a", "ct.b", "ct.c", "ct.settling"]);
 
     wait_until_settled();
 
@@ -825,10 +890,10 @@ async fn listing_writes_only_the_transition_the_clock_owed() {
              {summary:?}"
         );
     }
-    let mut before_reads: BTreeMap<&str, Value> = BTreeMap::new();
-    for component_type_id in component_type_ids {
+    let mut before_reads: BTreeMap<String, Value> = BTreeMap::new();
+    for component_type_id in &component_type_ids {
         before_reads.insert(
-            component_type_id,
+            component_type_id.clone(),
             snapshot(
                 &emulator
                     .get_component_type(WORKSPACE, component_type_id)
@@ -855,7 +920,7 @@ async fn listing_writes_only_the_transition_the_clock_owed() {
             again, before_listing,
             "case {case:?}: listing must not change what a later listing reports, got {again:?}"
         );
-        for component_type_id in component_type_ids {
+        for component_type_id in &component_type_ids {
             let read = snapshot(
                 &emulator
                     .get_component_type(WORKSPACE, component_type_id)

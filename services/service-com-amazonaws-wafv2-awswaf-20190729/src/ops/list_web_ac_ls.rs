@@ -124,10 +124,6 @@ impl From<ListWebACLsErrorModeled> for ListWebACLsError {
     }
 }
 
-/// The largest page `ListWebACLs` answers with when the request names no `Limit`:
-/// the upper bound of the model's `PaginationLimit` (`range 1..100`).
-const MAX_PAGE_SIZE: i32 = 100;
-
 /// The `ListWebACLs` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -203,23 +199,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Absent `Limit`, a page holds as many as the model's `PaginationLimit` range
-        // allows (`range 1..100`); a `Limit` outside that range is refused rather
-        // than clamped, so no caller gets a silently empty terminal page.
-        let page_size = match input.limit {
-            None => MAX_PAGE_SIZE,
-            Some(limit) if (1..=MAX_PAGE_SIZE).contains(&limit) => limit,
-            Some(limit) => {
-                return Err(ListWebACLsErrorModeled::WAFInvalidParameterException(
-                    crate::state::invalid_parameter_exception(
-                        crate::state::FIELD_ENTITY_LIMIT,
-                        &limit.to_string(),
-                        &format!("a page holds between 1 and {MAX_PAGE_SIZE} summaries"),
-                    ),
-                )
-                .into());
-            }
-        };
-        let page_size = usize::try_from(page_size).unwrap_or(0);
+        // allows; a `Limit` outside that range is refused rather than clamped, so no
+        // caller gets a silently empty terminal page. That reading of the range is
+        // `crate::state::page_size`, shared with every other paginated operation of
+        // this service.
+        let page_size = crate::state::page_size(input.limit, "summaries")
+            .map_err(ListWebACLsErrorModeled::WAFInvalidParameterException)?;
         entries.truncate(page_size);
 
         // WAF answers every non-empty page with a `NextMarker`: the recorded
