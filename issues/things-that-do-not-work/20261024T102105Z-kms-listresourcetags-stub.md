@@ -31,3 +31,15 @@ botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling
 Boot the kms emulator
 Call ListResourceTags and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Status note (added by the TagResource fix)
+The Evidence and Steps above describe the code BEFORE the fix for
+`20261024T102105Z-kms-tagresource-stub.md`. That fix implemented
+`ListResourceTags` and deleted its `//! SCAFFOLDED, NOT IMPLEMENTED:` marker,
+because it is this service's only reader of a key's tags and so the only way to
+prove the `TagResource` write it was fixing: the operation now reports the tag
+map the key holds, paged by `Limit`/`Marker`, covered by
+`services/service-com-amazonaws-kms-trentservice/tests/all/resource_tags.rs`.
+This report stays filed here for its own work item to close, which is the only
+place its recorded unit (`kms.list-resource-tags-empty`) can be replayed and
+the report moved.
