@@ -117,15 +117,18 @@ async fn call_in(
     (status, error_type, parsed)
 }
 
-/// [`call_in`] in [`REGION`]: every operation below but the create resolves its group
-/// through an ARN, which names its own Region.
-async fn call(
-    router: &MultiServiceRouter,
-    method: &str,
-    uri: &str,
-    body: Option<&Value>,
-) -> (u16, String, Value) {
-    call_in(router, REGION, method, uri, body).await
+/// The Region a call addressing `identifier` is signed for.
+///
+/// This service is regional (`aiops.<region>.<dns-suffix>`), so an endpoint serves only
+/// its own Region's groups and a caller reaches a group through the Region its ARN
+/// names. An identifier that is not a group ARN names no Region, so those rows sign for
+/// [`REGION`] — and still resolve nothing, which is what they assert.
+fn region_of(identifier: &str) -> String {
+    identifier
+        .strip_prefix("arn:")
+        .map(|rest| rest.split(':').collect::<Vec<_>>())
+        .filter(|fields| fields.len() > 3 && fields[1] == "aiops")
+        .map_or_else(|| REGION.to_string(), |fields| fields[2].to_string())
 }
 
 /// Percent-encode a value for use as a single `@httpLabel` path segment, which is
@@ -167,8 +170,9 @@ async fn put_policy(
     identifier: &str,
     document: &str,
 ) -> (u16, String, Value) {
-    call(
+    call_in(
         router,
+        &region_of(identifier),
         "POST",
         &format!("/investigationGroups/{}/policy", label(identifier)),
         Some(&json!({ "policy": document })),
@@ -177,8 +181,9 @@ async fn put_policy(
 }
 
 async fn get_policy(router: &MultiServiceRouter, identifier: &str) -> (u16, String, Value) {
-    call(
+    call_in(
         router,
+        &region_of(identifier),
         "GET",
         &format!("/investigationGroups/{}/policy", label(identifier)),
         None,
@@ -187,8 +192,9 @@ async fn get_policy(router: &MultiServiceRouter, identifier: &str) -> (u16, Stri
 }
 
 async fn delete_policy(router: &MultiServiceRouter, identifier: &str) -> (u16, String, Value) {
-    call(
+    call_in(
         router,
+        &region_of(identifier),
         "DELETE",
         &format!("/investigationGroups/{}/policy", label(identifier)),
         None,
@@ -291,8 +297,9 @@ async fn deleting_a_policy_removes_the_stored_document_and_keeps_the_group() {
         );
 
         // The GROUP survived its policy: it is still readable.
-        let (status, code, group) = call(
+        let (status, code, group) = call_in(
             &router,
+            &region(index),
             "GET",
             &format!("/investigationGroups/{}", label(&arn)),
             None,
@@ -436,8 +443,9 @@ async fn deleting_a_policy_that_is_not_there_is_the_absent_resource_it_names() {
     }
 
     // And once the GROUP is gone the same call reports the group again, not the policy.
-    let (status, code, body) = call(
+    let (status, code, body) = call_in(
         &router,
+        &region_of(&arn),
         "DELETE",
         &format!("/investigationGroups/{}", label(&arn)),
         None,

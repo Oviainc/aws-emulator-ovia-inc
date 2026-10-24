@@ -44,8 +44,9 @@ pub(crate) fn router() -> MultiServiceRouter {
 /// declaring one of those types must have them there — Amazon SNS among them, since the
 /// `AWS::SNS::Topic` most cases here declare is really created in SNS by the stack. (Amazon
 /// Data Firehose is deliberately NOT one of them — `unprovisioned_resources.rs` is the
-/// suite that pins what a stack does when an owning service cannot be reached.) No case
-/// here calls SNS itself; what a stack and SNS must agree about is
+/// suite that pins what a stack does when an owning service cannot be reached.) A case that
+/// has to read a stack's topic back goes through SNS's own wire ([`sns`]); what a stack and
+/// SNS must agree about beyond that is
 /// `core/router/tests/all/cloudformation_provisions_sns_topics.rs`.
 pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -188,6 +189,45 @@ pub(crate) async fn iam(
     (status, body)
 }
 
+/// One awsQuery call to Amazon SNS over the same router, answered with the HTTP status and
+/// the XML body.
+///
+/// The ONE SNS caller of this crate's suites: the topics a stack CREATES live in Amazon SNS,
+/// so a case that reads one back — its attributes, its tags — goes through SNS's own wire
+/// here, signed for `sns` in the same Region the stack was created in, which is the Region
+/// its topic ARNs carry.
+pub(crate) async fn sns(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
+    let mut body = format!("Action={action}&Version=2010-03-31");
+    for (name, value) in params {
+        body.push('&');
+        body.push_str(&form_encode(name));
+        body.push('=');
+        body.push_str(&form_encode(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", format!("sns.{REGION}.amazonaws.com"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/sns/aws4_request, \
+                 SignedHeaders=host, Signature=0123456789abcdef"
+            ),
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("a well-formed SNS request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8_lossy(response.body()).to_string();
+    (status, body)
+}
+
 /// Undo the XML text escaping the serializer applies, so a round-tripped value can be
 /// compared with what was sent.
 pub(crate) fn xml_unescape(text: &str) -> String {
@@ -218,23 +258,34 @@ pub(crate) fn xml_text(xml: &str, tag: &str) -> Option<String> {
     xml_texts(xml, tag).into_iter().next()
 }
 
-/// The inner text of every non-nested `<tag>…</tag>` BLOCK, in document order, left exactly
-/// as the serializer wrote it.
+/// The inner text of every non-nested `<tag …>…</tag>` BLOCK, in document order, left
+/// exactly as the serializer wrote it.
 ///
 /// [`xml_texts`] is the leaf form of this scan: it unescapes what it finds, which is right
 /// for a value and wrong for a block that carries more elements. A caller reading a nested
 /// list (the `<member>`s inside one `<Details>`) takes the block first and scans INSIDE it,
 /// so a sibling list's members cannot be swept up with it.
+///
+/// The open tag may carry ATTRIBUTES — the query serializer puts an `xmlns` on the first
+/// member of a list it renders — so the element NAME is matched and whatever follows it up
+/// to the `>` is skipped. A longer element name that merely starts with `tag` is not that
+/// element (`<Tagging>` is not a `<Tag>`), so the scan moves past it.
 pub(crate) fn xml_blocks(xml: &str, tag: &str) -> Vec<String> {
-    let open = format!("<{tag}>");
+    let open = format!("<{tag}");
     let close = format!("</{tag}>");
     let mut found = Vec::new();
     let mut rest = xml;
     while let Some(start) = rest.find(&open) {
         let after = &rest[start + open.len()..];
-        let Some(end) = after.find(&close) else { break };
-        found.push(after[..end].to_string());
-        rest = &after[end + close.len()..];
+        if !after.starts_with('>') && !after.starts_with(char::is_whitespace) {
+            rest = &rest[start + 1..];
+            continue;
+        }
+        let Some(open_end) = after.find('>') else { break };
+        let inner = &after[open_end + 1..];
+        let Some(end) = inner.find(&close) else { break };
+        found.push(inner[..end].to_string());
+        rest = &inner[end + close.len()..];
     }
     found
 }

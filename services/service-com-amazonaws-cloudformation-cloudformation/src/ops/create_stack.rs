@@ -403,7 +403,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the calls that create the stack's resources run after it, and each of those
         // reaches another service's own handler, which takes that service's lock — a
         // client reading THIS service meanwhile must not be blocked behind them.
-        let (stack_id, declared) = {
+        let (stack_id, declared, provenance) = {
             let mut store = state.lock();
             store.settle(now);
 
@@ -454,10 +454,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             let stack_id = stack.stack_id.clone();
             // What the template declared, as the deployment computed it: the resources
-            // whose owning services now have to create them.
+            // whose owning services now have to create them, and the stack identity and
+            // tags CloudFormation tags each of them with.
             let declared = stack.current_resources().to_vec();
+            let provenance = stack.provenance();
             store.stacks.push(stack);
-            (stack_id, declared)
+            (stack_id, declared, provenance)
         };
 
         // "Creates a stack as specified in the template": each declared resource is
@@ -465,7 +467,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stack records for it. A create has nothing to reconcile against, so the previous
         // set is empty.
         let materialised =
-            crate::state::provisioning::reconcile(ctx, &region, declared, &[]).await;
+            crate::state::provisioning::reconcile(ctx, &region, &provenance, declared, &[])
+                .await;
 
         let output = CreateStackOutput {
             stack_id: Some(stack_id.clone()),

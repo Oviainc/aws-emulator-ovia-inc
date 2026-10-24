@@ -15,7 +15,10 @@ use crate::workflow_lifecycle::{role_arn, Harness};
 
 /// The status the recorded service answers a lookup miss with (fixture
 /// `mwaa-serverless-resource-not-found-errors`, every step).
-const LOOKUP_MISS_STATUS: u16 = 400;
+///
+/// `pub(crate)` so another suite asserting a lookup miss uses the same status rather
+/// than restating it.
+pub(crate) const LOOKUP_MISS_STATUS: u16 = 400;
 
 /// The wire error code the recorded service answers a lookup miss with — the modelled
 /// shape, which is also what `smithy_query(query="operation", …)` lists for each of
@@ -24,7 +27,10 @@ const LOOKUP_MISS_TYPE: &str = "ResourceNotFoundException";
 
 /// The entity-level message for an absent workflow. Recorded example from fixture
 /// `mwaa-serverless-resource-not-found-errors` (GetWorkflow, DeleteWorkflow).
-const WORKFLOW_MISSING: &str = "Resource not found";
+///
+/// `pub(crate)` so another suite whose operation resolves the WORKFLOW asserts the
+/// same entity-level message rather than restating it.
+pub(crate) const WORKFLOW_MISSING: &str = "Resource not found";
 
 /// The entity-level message for the latest version a run would have executed.
 /// Recorded example from the same fixture (StartWorkflowRun, which names no version).
@@ -63,7 +69,9 @@ fn ghost_arn(region: &str, account: &str, name_and_suffix: &str) -> String {
 
 /// Pattern-valid ARNs for workflows that were never created, differing in region,
 /// account, and the form and length of the resource name.
-fn ghost_arns() -> Vec<String> {
+///
+/// `pub(crate)` so every suite that needs an ARN no store ever held draws from one set.
+pub(crate) fn ghost_arns() -> Vec<String> {
     // 244 name characters + '-' + 10 suffix characters = the 255-character maximum the
     // `WorkflowArn` resource segment allows.
     let longest = format!("{}-0123456789", "n".repeat(244));

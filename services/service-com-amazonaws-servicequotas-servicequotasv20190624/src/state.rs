@@ -163,10 +163,43 @@ pub const TEMPLATE_HOME_REGION: &str = "us-east-1";
 pub const REQUEST_DECISION_DELAY: Duration = Duration::from_millis(500);
 
 /// The largest page size a CALLER may ask for: the maximum the model's `MaxResults`
-/// range declares (1..100). It bounds `MaxResults`, NOT the unpaginated listing — a
-/// caller that names no `MaxResults` gets the whole listing in one page (see
-/// [`paginate`]).
+/// range declares (1..100). It bounds `MaxResults`, NOT the page a caller that names
+/// none is served — that is [`UNASKED_PAGE_SIZE`], applied by [`paginate`].
 pub const MAX_PAGE_SIZE: usize = 100;
+
+/// The page size a listing of this service applies when the caller names no
+/// `MaxResults`.
+///
+/// `MaxResults`'s own documentation — the same paragraph on every paginated input of
+/// this service — is what makes this a service-side page size rather than "no
+/// limit": "If you do not include this parameter, it defaults to a value appropriate
+/// to the operation. If additional items exist beyond those included in the current
+/// response, the `NextToken` response element is present" (`smithy_query(query="doc",
+/// shape="ListServiceQuotasRequest", member="MaxResults")`), and its note adds that
+/// "An API operation can return fewer results than the maximum even when there are
+/// more results available". So an unasked listing comes back one PAGE at a time, with
+/// a `NextToken` for as long as rows remain, and a caller that wants the whole
+/// listing walks it — which is what every AWS SDK paginator does.
+///
+/// The number itself is CHOSEN: the documentation names a default per operation but
+/// not its value, and a recorded `NextToken` is opaque, so nothing published fixes
+/// it. WHY TEN, rather than any other number inside the model's `MaxResults` range:
+///
+/// * it has to be well below the shortest listing this service publishes that is
+///   worth paging, or the `NextToken` path is dead for every caller that names no
+///   `MaxResults` — at [`MAX_PAGE_SIZE`] (100) a service's quota set would come back
+///   whole and no unasked listing would ever report a next page;
+/// * it has to be large enough to be a page rather than a trickle, so a client that
+///   reads one page sees a useful slice of the listing;
+/// * ten is the smallest round decade that satisfies both, and being a round decade
+///   is all the justification there is — the value is a page size, not data, so a
+///   client that cares reads `MaxResults` and the token instead of assuming one.
+///
+/// It is ONE number for every listing of this service rather than a per-operation
+/// one, because nothing published distinguishes them. `GetQuotaUtilizationReport`
+/// keeps its own documented default of 1,000 ([`UTILIZATION_REPORT_PAGE_SIZE`]),
+/// which its model states outright.
+pub const UNASKED_PAGE_SIZE: usize = 10;
 
 /// `ReportStatus` member `PENDING`: the status a report carries from the call that
 /// initiates it until its generation starts.
@@ -1358,36 +1391,34 @@ pub struct Page<T> {
 #[derive(Debug)]
 pub struct InvalidPageToken;
 
-/// Cut one page out of an ordered listing.
+/// Cut one page out of an ordered listing of this service.
 ///
 /// `listing` names the listing the token belongs to (the operation's own name), so a
 /// token issued by one listing is refused by another instead of resuming at an
 /// unrelated position. `max_results` is the caller's page size (the model bounds it
-/// to 1..100 before a handler runs) — a caller that names NONE gets every item in
-/// one page — and `next_token` is an opaque position from a
+/// to 1..100 before a handler runs), and `next_token` is an opaque position from a
 /// previous page. The token is base64 of `<listing>:<offset>` over the standard
 /// alphabet, so it matches the modelled `NextToken` pattern
 /// `^[a-zA-Z0-9/+]*={0,2}$` and tells a caller nothing it should be reading.
+///
+/// A caller that names NO `MaxResults` is served [`UNASKED_PAGE_SIZE`] items, with a
+/// `NextToken` for as long as items remain: `MaxResults` "defaults to a value
+/// appropriate to the operation", so an unasked listing is a PAGE and not the whole
+/// listing. A listing whose own model declares a different default goes through
+/// [`paginate_bounded`] with it (`GetQuotaUtilizationReport` does).
 pub fn paginate<T>(
     listing: &str,
     all: Vec<T>,
     max_results: Option<i32>,
     next_token: Option<&str>,
 ) -> Result<Page<T>, InvalidPageToken> {
-    // No `MaxResults` is no page size: the listing is returned whole, in one page,
-    // and only a caller that asks for a page size gets one. `MaxResults` bounds what
-    // a CALLER may ask for (1..100), not what the service returns unasked — a
-    // catalog listing of several hundred entries comes back in a single response.
-    // Nothing here grows without bound: the catalog and the defaults are seeded
-    // tables and the request store is capped by [`MAX_REQUESTS_PER_REGION`].
-    let whole_listing = all.len();
     paginate_bounded(
         listing,
         all,
         max_results,
         next_token,
         MAX_PAGE_SIZE,
-        whole_listing,
+        UNASKED_PAGE_SIZE,
     )
 }
 
@@ -1396,10 +1427,12 @@ pub fn paginate<T>(
 /// `caller_page_limit` is the ceiling a caller's `MaxResults` is clamped to, and
 /// `unasked_page_limit` the page size a caller that names no `MaxResults` gets, so
 /// each listing pages at the bounds ITS model declares: the quota listings carry
-/// `MaxResults` (1..100) and document no default, so an unasked listing comes back
-/// whole, while `GetQuotaUtilizationReport` carries `MaxResultsUtilization` (1..1000)
-/// and documents 1,000 as both the default and the maximum — which is also the most
-/// records `QuotaUtilizationInfoList` may hold, so its pages are bounded either way.
+/// `MaxResults` (1..100) whose default is documented only as "a value appropriate to
+/// the operation", so they take [`UNASKED_PAGE_SIZE`] through [`paginate`], while
+/// `GetQuotaUtilizationReport` carries
+/// `MaxResultsUtilization` (1..1000) and documents 1,000 as both the default and the
+/// maximum, which is also the most records `QuotaUtilizationInfoList` may hold, so
+/// its pages are bounded either way.
 pub fn paginate_bounded<T>(
     listing: &str,
     all: Vec<T>,
@@ -2188,15 +2221,17 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "lambda",
             "AWS Lambda",
             vec![
-                // AWS's own `QuotaCode`s for nine of Lambda's published quotas, in
-                // the order the service reports them — the order a recorded
-                // `ListServiceQuotas("lambda")` page carries, which is why the rate
-                // quotas come first. Their names, values and units are the ones the
-                // AWS Lambda quotas page publishes; a code this table does not carry
-                // gets the derived one ([`derived_quota_code`]).
+                // The quotas AWS's own `QuotaCode`s name, in the order the service
+                // reports them — the order a recorded `ListServiceQuotas("lambda")`
+                // page carries, which is why the rate quotas come first. A
+                // `QuotaCode` IDENTIFIES one quota, so a row claims AWS's code only
+                // where the recorded response for that pair says which quota the code
+                // names; every other row takes the derived code
+                // ([`derived_quota_code`]) rather than a pairing this catalog would
+                // be guessing at.
                 //
-                // The API request-rate quotas AWS publishes as not adjustable, each
-                // with its own `Period`: so many requests per second.
+                // Most of the API request-rate quotas AWS publishes as not
+                // adjustable, each with its own `Period`: so many requests per second.
                 quota(
                     "Rate of control plane API requests (excludes invocation, GetFunction, \
                      and GetPolicy requests)",
@@ -2206,45 +2241,56 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 .fixed()
                 .period(1, "SECOND")
                 .describe(
-                    "The maximum rate of control plane API requests, excluding invocation, \
-                     GetFunction and GetPolicy requests.",
+                    "The maximum number of API requests per second (excluding invocation, \
+                     GetFunction, and GetPolicy requests).",
                 ),
-                quota("Rate of GetFunction API requests", 100.0)
+                // Lambda builds a MicroVM image before it can run one, and publishes
+                // how many of those builds may be in flight: a `Count`, adjustable,
+                // over the one-second window this row carries.
+                quota("Number of concurrent MicroVM image builds", 10.0)
                     .code("L-72E0D058")
-                    .fixed()
-                    .period(1, "SECOND")
-                    .describe("The maximum rate of GetFunction API requests."),
-                quota("Rate of GetPolicy API requests", 15.0)
+                    .unit("Count")
+                    .describe("Number of concurrent MicroVM image builds per account per region"),
+                // The capacity-provider control plane is rate limited over ALL of its
+                // write APIs together, which is what this quota's own description
+                // says, so the limit is one combined requests-per-second figure.
+                quota("Rate of capacity provider write API requests", 1.0)
                     .code("L-F55076EC")
                     .fixed()
                     .period(1, "SECOND")
-                    .describe("The maximum rate of GetPolicy API requests."),
-                quota("Function timeout", 900.0)
-                    .code("L-B82A30EA")
-                    .unit("Seconds")
-                    .fixed()
                     .describe(
-                        "The maximum amount of time that a function can run before Lambda \
-                         stops it.",
+                        "The maximum combined rate (requests per second) for all capacity \
+                         provider write APIs.",
                     ),
+                // A durable execution reports a completed callback through this API;
+                // AWS publishes its rate as adjustable and counted in plain requests.
+                //
+                // The `Description` is this catalog's own wording: AWS's published
+                // text for this quota is not among the recorded values available
+                // here, and no rule in the model derives one.
+                quota("Rate of SendDurableExecutionCallbackSuccess API requests", 6000.0)
+                    .code("L-B82A30EA")
+                    .describe(
+                        "The maximum rate of SendDurableExecutionCallbackSuccess API requests.",
+                    ),
+                // The published function-shape quotas. AWS's `QuotaCode`s for them are
+                // NOT in this catalog: the codes it used to carry on these rows are
+                // AWS's codes for other quotas of this service, so each row takes its
+                // derived code instead of asserting a pairing nothing here can source.
                 quota("Function layers", 5.0)
-                    .code("L-14320ECE")
                     .fixed()
                     .describe("The maximum number of layers that a function can use."),
                 quota("Environment variable size", 4.0)
-                    .code("L-25EEC0A4")
                     .unit("Kilobytes")
                     .fixed()
                     .describe(
                         "The maximum total size of the environment variables of a function.",
                     ),
                 quota("Function resource-based policy", 20.0)
-                    .code("L-4273958C")
                     .unit("Kilobytes")
                     .fixed()
                     .describe("The maximum size of the resource-based policy of a function."),
                 quota("Invocation payload (synchronous)", 6.0)
-                    .code("L-B430C318")
                     .unit("Megabytes")
                     .fixed()
                     .describe(
@@ -2252,12 +2298,26 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                          synchronous invocation.",
                     ),
                 quota("Invocation payload (asynchronous)", 256.0)
-                    .code("L-BA29C22B")
                     .unit("Kilobytes")
                     .fixed()
                     .describe(
                         "The maximum size of the event payload of an asynchronous invocation.",
                     ),
+                quota("Function timeout", 900.0)
+                    .unit("Seconds")
+                    .fixed()
+                    .describe(
+                        "The maximum amount of time that a function can run before Lambda \
+                         stops it.",
+                    ),
+                quota("Rate of GetFunction API requests", 100.0)
+                    .fixed()
+                    .period(1, "SECOND")
+                    .describe("The maximum rate of GetFunction API requests."),
+                quota("Rate of GetPolicy API requests", 15.0)
+                    .fixed()
+                    .period(1, "SECOND")
+                    .describe("The maximum rate of GetPolicy API requests."),
                 quota("Function and layer storage", 75.0)
                     .code("L-2ACBD22F")
                     .unit("Gigabytes")
@@ -2283,6 +2343,83 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                     "The maximum number of elastic network interfaces that the functions of \
                      this account can attach to one VPC.",
                 ),
+                // The rest of the quotas the AWS Lambda quotas page publishes, with
+                // the names, values and units it publishes for them. Lambda's
+                // published list runs well past one page, which is what makes a
+                // `ListServiceQuotas("lambda")` walk take more than one: a page stops
+                // at the page size and a `NextToken` resumes it. None of them carries
+                // AWS's own `QuotaCode` here, so each takes its derived one.
+                //
+                // Their `Description`s are this catalog's own wording — the quotas
+                // page publishes the limit, not a Service Quotas description string —
+                // so a later fidelity pass that gets AWS's text should replace them,
+                // the same way the L-B82A30EA row above is flagged.
+                quota("Function memory allocation", 10240.0)
+                    .unit("Megabytes")
+                    .fixed()
+                    .describe("The maximum memory that can be allocated to a function."),
+                quota("Deployment package size (direct upload)", 50.0)
+                    .unit("Megabytes")
+                    .fixed()
+                    .describe(
+                        "The maximum size of a .zip deployment package uploaded directly to \
+                         Lambda.",
+                    ),
+                quota("Deployment package size (unzipped, including layers)", 250.0)
+                    .unit("Megabytes")
+                    .fixed()
+                    .describe(
+                        "The maximum unzipped size of a function's deployment package and its \
+                         layers.",
+                    ),
+                quota("Container image code package size", 10.0)
+                    .unit("Gigabytes")
+                    .fixed()
+                    .describe("The maximum size of a container image deployment package."),
+                quota("/tmp directory storage", 512.0)
+                    .unit("Megabytes")
+                    .fixed()
+                    .describe(
+                        "The ephemeral storage a function's /tmp directory holds unless the \
+                         function configures more.",
+                    ),
+                quota("File descriptors", 1024.0)
+                    .fixed()
+                    .describe(
+                        "The maximum number of file descriptors one execution environment can \
+                         hold open.",
+                    ),
+                quota("Execution processes/threads", 1024.0)
+                    .fixed()
+                    .describe(
+                        "The maximum number of processes and threads one execution environment \
+                         can run.",
+                    ),
+                // The AWS Lambda quotas page publishes this one as a rate over a TEN
+                // SECOND window ("1,000 execution environment instances every 10
+                // seconds"), which is the `Period` it carries.
+                quota("Concurrency scaling rate", 1000.0)
+                    .fixed()
+                    .period(10, "SECOND")
+                    .describe(
+                        "The rate at which a function can add execution environment instances.",
+                    ),
+                quota("Maximum event age", 21600.0)
+                    .unit("Seconds")
+                    .fixed()
+                    .describe(
+                        "The longest an asynchronous invocation request stays in the event \
+                         queue before Lambda discards it.",
+                    ),
+                quota("Retry attempts for asynchronous invocation", 2.0)
+                    .fixed()
+                    .describe(
+                        "The maximum number of times Lambda retries an asynchronous invocation \
+                         whose function returned an error.",
+                    ),
+                quota("Test events (console editor)", 10.0)
+                    .fixed()
+                    .describe("The maximum number of saved test events per function."),
             ],
         ),
         service(
@@ -3126,13 +3263,22 @@ fn vpc_quotas() -> Vec<QuotaRow> {
             .code("L-F678F1CE")
             // The VPC resource counts CloudWatch publishes sit under the EC2 service
             // dimension — VPC is served by the EC2 API — which is the dimension the
-            // recorded response for this quota carries.
+            // recorded response for this quota carries. `Resource` is the dimension
+            // VALUE a client queries usage with, so it is the one CloudWatch
+            // publishes the count under (`VPCsPerRegion`), not the resource type.
             .metric(usage_metric(
                 "EC2",
-                &[("Class", "None"), ("Resource", "VPC"), ("Type", "Resource")],
+                &[
+                    ("Class", "None"),
+                    ("Resource", "VPCsPerRegion"),
+                    ("Type", "Resource"),
+                ],
             ))
             .period(5, "MINUTE")
-            .describe("The maximum number of VPCs per Region in this account."),
+            .describe(
+                "The maximum number of VPCs per Region. This quota is directly tied to the \
+                 maximum number of internet gateways per Region.",
+            ),
         quota("Internet gateways per Region", 5.0).code("L-A4707A72"),
         quota("Network interfaces per Region", 5000.0).code("L-045E6E9C"),
         // AWS publishes this one as not adjustable.

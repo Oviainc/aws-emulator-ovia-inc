@@ -29,6 +29,8 @@ mod existence_preconditions;
 mod modify_cluster_parameter_group;
 #[path = "all/orderable_cluster_options.rs"]
 mod orderable_cluster_options;
+#[path = "all/reset_cluster_parameter_group.rs"]
+mod reset_cluster_parameter_group;
 #[path = "all/snapshot_restore.rs"]
 mod snapshot_restore;
 #[path = "all/state_roundtrip.rs"]

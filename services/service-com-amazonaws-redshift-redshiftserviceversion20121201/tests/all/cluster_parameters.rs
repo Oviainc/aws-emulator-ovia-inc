@@ -347,7 +347,7 @@ async fn the_published_catalog_carries_the_documented_settings() {
             "0",
             "integer",
             Some("0,100-2147483647"),
-            "dynamic",
+            "static",
         ),
         (
             "max_concurrency_scaling_clusters",

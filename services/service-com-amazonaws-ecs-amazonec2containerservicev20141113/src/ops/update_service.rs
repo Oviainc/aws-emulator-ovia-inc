@@ -385,6 +385,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
+        // The target groups this update leaves the service registering its tasks into:
+        // the ones the request names, else the ones the service already holds. Their
+        // `TargetType` lives in the Elastic Load Balancing v2 service's store, and both
+        // reads happen BEFORE this service's store is locked for the update, so the
+        // cross-service read holds no guard of ours (see
+        // `crate::state::target_group_target_types`).
+        let key = (cluster_name.clone(), name.clone());
+        // The list is caller-supplied and every entry costs a lookup in another service's
+        // store, so a list the REQUEST names is bounded here, before any per-entry work
+        // and before either store is locked, at the ECS service quota for target groups
+        // per service, with the same `ClientException` `CreateService` uses for it. A
+        // stored list was bounded by the same cap when it was set.
+        if let Some(requested) = input.load_balancers.as_ref() {
+            if requested.len() > crate::state::MAX_LOAD_BALANCERS {
+                return Err(UpdateServiceErrorModeled::ClientException(ClientException {
+                    message: Some(format!(
+                        "loadBalancers must name at most {} load balancers; got {}",
+                        crate::state::MAX_LOAD_BALANCERS,
+                        requested.len()
+                    )),
+                })
+                .into());
+            }
+        }
+        let effective_load_balancers = match &input.load_balancers {
+            Some(requested) => requested.clone(),
+            // An update that names neither a `loadBalancers` list nor a `taskDefinition`
+            // cannot change the pairing, so neither store is read for it at all.
+            None if input.task_definition.is_none() => Vec::new(),
+            None => {
+                // The stored attachments, snapshotted under their own short-lived guard
+                // so the cross-service read below holds none of ours. The snapshot is
+                // what the pairing is checked against; the update itself re-reads the
+                // service under the second guard, so a concurrent writer can at worst
+                // make this check advisory for ITS list, never half-apply this one.
+                let guard = state.lock();
+                guard
+                    .services
+                    .get(&key)
+                    .map(|stored| stored.load_balancers.clone())
+                    .unwrap_or_default()
+            }
+        };
+        let target_group_arns =
+            crate::state::requested_target_group_arns(&effective_load_balancers);
+        let target_types = if target_group_arns.is_empty() {
+            ::std::collections::HashMap::new()
+        } else {
+            crate::state::target_group_target_types(&*self.engine, &target_group_arns)
+                .ok_or_else(|| {
+                    UpdateServiceErrorModeled::ServerException(ServerException {
+                        message: Some(
+                            "the Elastic Load Balancing store is unavailable".to_string(),
+                        ),
+                    })
+                })?
+        };
+
         let mut guard = state.lock();
         guard.advance_clock(now);
 
@@ -397,7 +455,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let key = (cluster_name.clone(), name.clone());
         let Some(stored) = guard.services.get(&key) else {
             return Err(UpdateServiceErrorModeled::ServiceNotFoundException(
                 ServiceNotFoundException {
@@ -512,6 +569,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+        }
+
+        // A `loadBalancers` list this request NAMES is validated whole — every target
+        // group it names has to exist and to carry the target type the revision's
+        // `networkMode` registers tasks as — and a request that names a task definition
+        // is checked the same way against the target groups the service already holds,
+        // because moving a service onto a revision with a different network mode changes
+        // how its tasks register (`crate::state::load_balancer_refusal`).
+        let network_mode = definition
+            .as_ref()
+            .map(|found| found.network_mode.as_str());
+        let refusal = if input.load_balancers.is_some() {
+            crate::state::load_balancer_refusal(
+                &effective_load_balancers,
+                network_mode,
+                &target_types,
+            )
+        } else if input.task_definition.is_some() {
+            // The attachments the service already holds, against the REQUESTED revision's
+            // network mode. Only a request that names a task definition can change how
+            // the tasks register, so an update that names neither is not re-checked: the
+            // pairing it would be checked against is the one its own create or a previous
+            // update already validated.
+            network_mode.and_then(|mode| {
+                crate::state::target_group_type_refusal(&target_group_arns, mode, &target_types)
+            })
+        } else {
+            None
+        };
+        if let Some(message) = refusal {
+            return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
         }
 
         // "Determines whether to force a new deployment of the service. ... You can use

@@ -135,7 +135,7 @@ async fn call_in(
     (status, parsed)
 }
 
-/// [`call_in`] in [`REGION`].
+/// [`call_in`] in [`REGION`], for a call that addresses no single resource.
 async fn call(
     router: &MultiServiceRouter,
     method: &str,
@@ -143,6 +143,20 @@ async fn call(
     body: Option<&Value>,
 ) -> (u16, Value) {
     call_in(router, REGION, method, uri, body).await
+}
+
+/// The Region a call addressing `identifier` is signed for.
+///
+/// This service is regional (`aiops.<region>.<dns-suffix>`), so an endpoint serves only
+/// its own Region's groups and a caller reaches a group through the Region its ARN
+/// names. An identifier that is not a group ARN names no Region, so those rows sign for
+/// [`REGION`] — and still resolve nothing, which is what they assert.
+fn region_of(identifier: &str) -> String {
+    identifier
+        .strip_prefix("arn:")
+        .map(|rest| rest.split(':').collect::<Vec<_>>())
+        .filter(|fields| fields.len() > 3 && fields[1] == "aiops")
+        .map_or_else(|| REGION.to_string(), |fields| fields[2].to_string())
 }
 
 /// The modelled error shape a failed call reported.
@@ -252,8 +266,9 @@ async fn put_policy(
     identifier: &str,
     document: &str,
 ) -> (u16, Value) {
-    call(
+    call_in(
         router,
+        &region_of(identifier),
         "POST",
         &format!("/investigationGroups/{}/policy", label(identifier)),
         Some(&json!({ "policy": document })),
@@ -262,8 +277,9 @@ async fn put_policy(
 }
 
 async fn get_policy(router: &MultiServiceRouter, identifier: &str) -> (u16, Value) {
-    call(
+    call_in(
         router,
+        &region_of(identifier),
         "GET",
         &format!("/investigationGroups/{}/policy", label(identifier)),
         None,
@@ -319,8 +335,9 @@ fn tag_pairs(count: usize) -> Vec<(String, String)> {
 }
 
 async fn tag(router: &MultiServiceRouter, identifier: &str, tags: &Value) -> (u16, Value) {
-    call(
+    call_in(
         router,
+        &region_of(identifier),
         "POST",
         &format!("/tags/{}", label(identifier)),
         Some(&json!({ "tags": tags })),
@@ -330,8 +347,9 @@ async fn tag(router: &MultiServiceRouter, identifier: &str, tags: &Value) -> (u1
 
 /// The tag set `ListTagsForResource` reports for `identifier`.
 async fn stored_tags(router: &MultiServiceRouter, identifier: &str) -> BTreeMap<String, String> {
-    let (status, body) = call(
+    let (status, body) = call_in(
         router,
+        &region_of(identifier),
         "GET",
         &format!("/tags/{}", label(identifier)),
         None,

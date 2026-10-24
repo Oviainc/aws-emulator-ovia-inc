@@ -15,6 +15,8 @@
 mod call_analytics_categories;
 #[path = "all/client_error_wire_status.rs"]
 mod client_error_wire_status;
+#[path = "all/medical_vocabularies.rs"]
+mod medical_vocabularies;
 #[path = "all/rpc_success_status.rs"]
 mod rpc_success_status;
 #[path = "all/service_claim.rs"]

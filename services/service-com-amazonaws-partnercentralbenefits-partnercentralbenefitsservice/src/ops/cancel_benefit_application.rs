@@ -4,7 +4,9 @@
 //! Cancels one stored benefit application: the record becomes `CANCELED`, the supplied
 //! `Reason` becomes its `StatusReason`, and its revision and `UpdatedAt` advance.
 //!
-//! `CANCELED` is terminal, so cancelling an application that is already cancelled is
+//! A cancel ends an application AWS is still working on ("Cancels a benefit application
+//! that is currently in progress"), so an application in a terminal status —
+//! [`crate::state::TERMINAL_STATUSES`]: `APPROVED`, `REJECTED` or already `CANCELED` — is
 //! refused with the modelled `ConflictException`.
 //!
 //! ## Shape of an operation
@@ -183,13 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        if application.status == crate::state::STATUS_CANCELED {
+        // AWS has finished with a terminal application, so there is nothing left to
+        // cancel and the record is left exactly as it is.
+        if application.is_terminal() {
             return Err(CancelBenefitApplicationErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "benefit application {} is already {}",
-                        application.id,
-                        crate::state::STATUS_CANCELED
+                    message: crate::state::status_conflict_message(
+                        &application.id,
+                        &application.status,
+                        "canceled",
                     ),
                 },
             )

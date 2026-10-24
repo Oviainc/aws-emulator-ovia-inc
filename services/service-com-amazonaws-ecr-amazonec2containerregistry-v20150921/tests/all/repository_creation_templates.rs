@@ -14,8 +14,8 @@ use std::time::SystemTime;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::{
-    ComAmazonawsEcrAmazonec2containerregistryV20150921State, CreationTemplate,
-    MAX_REPOSITORY_CREATION_TEMPLATES,
+    default_template_encryption, ComAmazonawsEcrAmazonec2containerregistryV20150921State,
+    CreationTemplate, MAX_REPOSITORY_CREATION_TEMPLATES,
 };
 
 use crate::wire::{call, emulator, emulator_with_engine, ok, REGISTRY_ID};
@@ -83,6 +83,7 @@ fn create_cases() -> Vec<TemplateCase> {
                 "prefix": "prod",
                 "appliedFor": ["PULL_THROUGH_CACHE"],
                 "imageTagMutability": "MUTABLE",
+                "encryptionConfiguration": {"encryptionType": "AES256"},
             }),
         ),
         (
@@ -92,6 +93,7 @@ fn create_cases() -> Vec<TemplateCase> {
                 "prefix": "ROOT",
                 "appliedFor": ["CREATE_ON_PUSH"],
                 "imageTagMutability": "MUTABLE",
+                "encryptionConfiguration": {"encryptionType": "AES256"},
             }),
         ),
         (
@@ -101,6 +103,7 @@ fn create_cases() -> Vec<TemplateCase> {
                 "prefix": "stage",
                 "appliedFor": ["REPLICATION"],
                 "imageTagMutability": "MUTABLE",
+                "encryptionConfiguration": {"encryptionType": "AES256"},
             }),
         ),
         (
@@ -117,6 +120,7 @@ fn create_cases() -> Vec<TemplateCase> {
                 "description": longest_description,
                 "customRoleArn": "arn:aws:iam::000000000000:role/ecr-template",
                 "imageTagMutability": "MUTABLE",
+                "encryptionConfiguration": {"encryptionType": "AES256"},
             }),
         ),
         (
@@ -170,6 +174,7 @@ fn create_cases() -> Vec<TemplateCase> {
                     {"Key": "env", "Value": "prod"},
                     {"Key": "team", "Value": "platform"},
                 ],
+                "encryptionConfiguration": {"encryptionType": "AES256"},
             }),
         ),
         (
@@ -189,6 +194,7 @@ fn create_cases() -> Vec<TemplateCase> {
                 "imageTagMutabilityExclusionFilters": [
                     {"filterType": "WILDCARD", "filter": "release-*"},
                 ],
+                "encryptionConfiguration": {"encryptionType": "AES256"},
             }),
         ),
         (
@@ -216,6 +222,7 @@ fn create_cases() -> Vec<TemplateCase> {
                     {"filterType": "WILDCARD", "filter": "a.b_c-*"},
                     {"filterType": "WILDCARD", "filter": "nightly"},
                 ],
+                "encryptionConfiguration": {"encryptionType": "AES256"},
             }),
         ),
     ]
@@ -663,7 +670,7 @@ async fn a_create_past_the_store_cap_is_refused() {
                 CreationTemplate {
                     prefix,
                     description: None,
-                    encryption_config: None,
+                    encryption_config: default_template_encryption(),
                     resource_tags: Vec::new(),
                     image_tag_mutability: "MUTABLE".to_string(),
                     image_tag_mutability_exclusion_filters: Vec::new(),

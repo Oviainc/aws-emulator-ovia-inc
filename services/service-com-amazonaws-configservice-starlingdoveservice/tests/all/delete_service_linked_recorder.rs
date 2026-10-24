@@ -569,21 +569,11 @@ async fn deleting_a_third_party_recorder_leaves_its_connector() {
     for (case, selector) in [("by ARN", By::Arn), ("by service principal", By::ServicePrincipal)] {
         let emulator = Emulator::new();
         let service_principal = "securityhub.amazonaws.com";
-        let connector = emulator
-            .ok(
-                "PutConnector",
-                &json!({
-                    "ConnectorConfiguration": { "azure": {
-                        "tenantIdentifier": "tenant-delete",
-                        "clientIdentifier": "client-delete",
-                    } },
-                }),
-            )
-            .await;
-        let connector_arn = connector["Arn"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {case:?}: PutConnector must answer an Arn"))
-            .to_string();
+        // The connector is seeded in the store rather than created over the wire:
+        // `PutConnector` refuses a provider credential it cannot verify with the
+        // provider, which is every one (see `connector_credential_verification.rs`).
+        let connector_arn =
+            crate::config_connectors::seed_connector(&emulator, "tenant-delete", "client-delete");
         let scope = json!({ "scopeType": "tenant", "allRegions": true });
 
         let created = emulator

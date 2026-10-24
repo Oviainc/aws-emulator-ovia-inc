@@ -181,9 +181,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let principal = crate::state::caller_principal(ctx.parts());
         let modified_at = crate::state::now_epoch_seconds();
+        // This service is regional: the endpoint this request reached holds only the
+        // groups of the Region it was signed for, so another Region's group is absent
+        // here and no policy can be attached to it through this endpoint.
+        let region = crate::state::request_region(ctx.parts());
 
         let mut store = state.lock();
-        let group = store.group_mut(&input.identifier).ok_or_else(|| {
+        let group = store.group_mut(&input.identifier, &region).ok_or_else(|| {
             PutInvestigationGroupPolicyErrorModeled::ResourceNotFoundException(
                 crate::state::investigation_group_not_found(),
             )

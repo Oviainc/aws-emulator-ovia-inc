@@ -5,6 +5,11 @@
 //! Reports the connector the request's `Arn` names, read out of state. A reporting
 //! operation: it writes nothing.
 //!
+//! An `Arn` that does not resolve to a connector of this account in the Region the
+//! request is scoped to is refused with the modelled `ValidationException` and
+//! [`crate::state::CONNECTOR_ARN_NOT_VALID_MESSAGE`] — the same class and the same
+//! text whether the value is malformed or merely names no connector.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -144,24 +149,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
         })?;
 
-        // A value that is not a connector ARN at all is a bad request; an ARN that is
-        // well formed but names no connector this account holds in the Region this
-        // request is scoped to is a missing resource.
-        let Some((region, _name)) = crate::state::connector_arn_parts(&input.arn) else {
-            return Err(GetConnectorErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::invalid_connector_arn_message(&input.arn)),
-            })
-            .into());
-        };
-        let serves_region = region == crate::state::request_region(ctx);
+        // `Arn` is the connector this call reads, and resolving it is all this
+        // operation does: a value that is no connector ARN at all, and a well-formed
+        // connector ARN that names no connector this account holds in the Region this
+        // request is scoped to, both fail to resolve — so both are refused the SAME
+        // way, with one class and one text, and neither tells the caller which of the
+        // two it was.
+        let resolvable = crate::state::connector_arn_parts(&input.arn)
+            .is_some_and(|(region, _name)| region == crate::state::request_region(ctx));
 
         let store = state.lock();
-        let Some(entry) = store.connectors.get(&input.arn).filter(|_| serves_region) else {
-            return Err(GetConnectorErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::no_such_connector_message(&input.arn)),
-                },
-            )
+        let Some(entry) = store.connectors.get(&input.arn).filter(|_| resolvable) else {
+            return Err(GetConnectorErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::CONNECTOR_ARN_NOT_VALID_MESSAGE.to_string()),
+            })
             .into());
         };
 

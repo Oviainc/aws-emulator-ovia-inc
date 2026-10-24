@@ -2,14 +2,16 @@
 
 //! Engine state for the com-amazonaws-transcribe-transcribe service.
 //!
-//! Three resource families live here: the transcription-job lifecycle — the stored
+//! Four resource families live here: the transcription-job lifecycle — the stored
 //! record, the clock-owed status transitions, and the projections of a record onto
 //! the modelled `TranscriptionJob` / `TranscriptionJobSummary` shapes — the
 //! custom-vocabulary family (vocabularies and vocabulary filters), with its own
 //! records, its `PENDING` -> `READY` transition and its projections onto
-//! `VocabularyInfo` / `VocabularyFilterInfo`, and the Call Analytics categories, each
-//! a record of the rules and input type it was created with and its projection onto
-//! `CategoryProperties`. Several operations read each record, so
+//! `VocabularyInfo` / `VocabularyFilterInfo` — the custom MEDICAL vocabularies
+//! ([`MedicalVocabularyRecord`]), a family of the same shape projected onto the same
+//! `VocabularyInfo` — and the Call Analytics categories, each a record of the rules
+//! and input type it was created with and its projection onto `CategoryProperties`.
+//! Several operations read each record, so
 //! the projections are single-homed here rather than copied into each handler; the
 //! three tagging operations reach every family's tag set through one lookup
 //! ([`ComAmazonawsTranscribeTranscribeState::tags_mut`]).
@@ -28,11 +30,15 @@
 //! [`vocabulary_download_uri`]) and no operation of this service reports the terms
 //! themselves — none of their output shapes has a member for them. A vocabulary whose
 //! content would have to be READ from a file URI is refused at the create rather than
-//! recorded: this emulator reads no object store and makes no outbound request, so it
-//! would have nothing to build the vocabulary from. A Call Analytics category is the
-//! same kind of record: its rules are held here, where a Call Analytics job that
-//! applies the category would read them from, and nothing evaluates a rule against a
-//! call, because no audio is analysed.
+//! recorded wherever the caller can send the same terms inline instead; the custom
+//! MEDICAL vocabulary family, which has no inline alternative at all, records the
+//! resource and ends its unperformable build in the service's own modelled `FAILED`
+//! state (see [`MedicalVocabularyRecord`]). Either way this emulator reads no object
+//! store and makes no outbound request, so it would have nothing to build a
+//! vocabulary's terms from. A Call Analytics category is the same kind of record: its
+//! rules are held here, where a Call Analytics job that applies the category would
+//! read them from, and nothing evaluates a rule against a call, because no audio is
+//! analysed.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -113,13 +119,17 @@ pub const MAX_TRANSCRIPTION_JOBS: usize = 100;
 pub const VOCABULARY_STATE_PENDING: &str = "PENDING";
 /// See [`VOCABULARY_STATE_PENDING`].
 pub const VOCABULARY_STATE_READY: &str = "READY";
-/// See [`VOCABULARY_STATE_PENDING`]. No vocabulary this emulator records reaches it:
-/// a create whose content it cannot build is refused with the operation's modelled
-/// `BadRequestException` instead of being recorded as a failed vocabulary.
+/// See [`VOCABULARY_STATE_PENDING`]. No NON-medical custom vocabulary this emulator
+/// records reaches it: a create whose content it cannot build is refused with the
+/// operation's modelled `BadRequestException` instead of being recorded as a failed
+/// vocabulary, because the caller can send the same terms inline instead. A custom
+/// MEDICAL vocabulary has no inline alternative, so it is recorded and ends here —
+/// see [`MedicalVocabularyRecord`].
 pub const VOCABULARY_STATE_FAILED: &str = "FAILED";
 
-/// How long after the call that starts it a custom vocabulary's
-/// `PENDING` -> `READY` transition is owed.
+/// How long after the call that starts it a custom vocabulary's next state
+/// transition is owed (`PENDING` -> `READY` for one built from inline terms,
+/// `PENDING` -> `FAILED` for a medical one whose file this emulator cannot read).
 ///
 /// A chosen span, not a documented one: Amazon Transcribe gives no processing-time
 /// guarantee for building a custom vocabulary. It is deliberately non-zero, so a
@@ -128,19 +138,31 @@ pub const VOCABULARY_STATE_FAILED: &str = "FAILED";
 /// terminates quickly. The due instant is stored on the record; nothing sleeps for it.
 pub const VOCABULARY_TRANSITION_DELAY: Duration = Duration::from_millis(500);
 
+/// The only language a custom medical vocabulary (or any Amazon Transcribe Medical
+/// resource) may be in: "US English (en-US) is the only language supported with
+/// Amazon Transcribe Medical" (model doc for
+/// `CreateMedicalVocabularyRequest$LanguageCode`).
+///
+/// The member targets the service-wide `LanguageCode` enum, so the model's own
+/// constraint traits cannot express this narrowing: the handler is where a request in
+/// any other language is refused.
+pub const MEDICAL_LANGUAGE_CODE: &str = "en-US";
+
 /// The most custom vocabularies this emulator holds for an account.
 ///
 /// Amazon Transcribe publishes a default quota of 100 custom vocabularies per account
-/// per Region, and the same figure for custom vocabulary filters. Applying the
-/// published figure keeps the store bounded: a caller that never deletes cannot grow
-/// it without end, and `DeleteVocabulary` / `DeleteVocabularyFilter` is what makes
-/// room again.
+/// per Region, and the same figure for custom medical vocabularies and for custom
+/// vocabulary filters. Applying the published figure to each family keeps the store
+/// bounded: a caller that never deletes cannot grow it without end, and
+/// `DeleteVocabulary` / `DeleteMedicalVocabulary` / `DeleteVocabularyFilter` is what
+/// makes room again.
 pub const MAX_VOCABULARIES: usize = 100;
 
-/// The number of custom vocabularies `ListVocabularies` / `ListVocabularyFilters`
-/// return when the request names no `MaxResults`: "If you do not specify a value, a
-/// default of 5 is used" (model doc for `ListVocabulariesRequest$MaxResults` and
-/// `ListVocabularyFiltersRequest$MaxResults`).
+/// The number of custom vocabularies `ListVocabularies` / `ListMedicalVocabularies` /
+/// `ListVocabularyFilters` return when the request names no `MaxResults`: "If you do
+/// not specify a value, a default of 5 is used" (model doc for
+/// `ListVocabulariesRequest$MaxResults`, `ListMedicalVocabulariesRequest$MaxResults`
+/// and `ListVocabularyFiltersRequest$MaxResults`).
 pub const DEFAULT_VOCABULARY_LIST_MAX_RESULTS: i32 = 5;
 
 /// `InputType` values, from the model's enum
@@ -176,6 +198,11 @@ pub const RESOURCE_TYPE_TRANSCRIPTION_JOB: &str = "transcription-job";
 /// The ARN resource type of a custom vocabulary. See
 /// [`RESOURCE_TYPE_TRANSCRIPTION_JOB`].
 pub const RESOURCE_TYPE_VOCABULARY: &str = "vocabulary";
+/// The ARN resource type of a custom MEDICAL vocabulary, as the Amazon Transcribe
+/// "Tagging resources" guide lists it — a resource type of its own, so a medical
+/// vocabulary and a custom vocabulary of the same name are two resources. See
+/// [`RESOURCE_TYPE_TRANSCRIPTION_JOB`].
+pub const RESOURCE_TYPE_MEDICAL_VOCABULARY: &str = "medical-vocabulary";
 /// The ARN resource type of a custom vocabulary filter. See
 /// [`RESOURCE_TYPE_TRANSCRIPTION_JOB`].
 pub const RESOURCE_TYPE_VOCABULARY_FILTER: &str = "vocabulary-filter";
@@ -191,6 +218,8 @@ pub const KIND_JOB: &str = "job";
 /// See [`KIND_JOB`].
 pub const KIND_VOCABULARY: &str = "vocabulary";
 /// See [`KIND_JOB`].
+pub const KIND_MEDICAL_VOCABULARY: &str = "medical vocabulary";
+/// See [`KIND_JOB`].
 pub const KIND_VOCABULARY_FILTER: &str = "vocabulary filter";
 /// See [`KIND_JOB`]: the word the recorded Call Analytics category responses name
 /// that family by ("The category that you've specified couldn't be found. Check the
@@ -202,13 +231,14 @@ pub const KIND_RESOURCE: &str = "resource";
 /// The resource kind the ARN resource type `resource_type` denotes — the word a
 /// refusal about that resource names it by.
 ///
-/// The three mapped types are the ones [`ComAmazonawsTranscribeTranscribeState::tags`]
+/// The mapped types are the ones [`ComAmazonawsTranscribeTranscribeState::tags`]
 /// and [`ComAmazonawsTranscribeTranscribeState::tags_mut`] can find a record for, so
 /// the two agree about which ARN names which family.
 pub fn resource_kind(resource_type: &str) -> &'static str {
     match resource_type {
         RESOURCE_TYPE_TRANSCRIPTION_JOB => KIND_JOB,
         RESOURCE_TYPE_VOCABULARY => KIND_VOCABULARY,
+        RESOURCE_TYPE_MEDICAL_VOCABULARY => KIND_MEDICAL_VOCABULARY,
         RESOURCE_TYPE_VOCABULARY_FILTER => KIND_VOCABULARY_FILTER,
         _ => KIND_RESOURCE,
     }
@@ -258,6 +288,10 @@ pub struct ComAmazonawsTranscribeTranscribeState {
     /// Every custom vocabulary this account holds, keyed by its name (which
     /// `CreateVocabulary` requires to be unique within an account).
     pub vocabularies: BTreeMap<String, VocabularyRecord>,
+    /// Every custom MEDICAL vocabulary this account holds, keyed by its name (which
+    /// `CreateMedicalVocabulary` requires to be unique within an account). A family
+    /// of its own: a medical vocabulary and a custom vocabulary may share a name.
+    pub medical_vocabularies: BTreeMap<String, MedicalVocabularyRecord>,
     /// Every custom vocabulary filter this account holds, keyed by its name (which
     /// `CreateVocabularyFilter` requires to be unique within an account).
     pub vocabulary_filters: BTreeMap<String, VocabularyFilterRecord>,
@@ -316,6 +350,36 @@ impl ComAmazonawsTranscribeTranscribeState {
         records
     }
 
+    /// The custom MEDICAL vocabulary named `name`, with every clock-owed transition
+    /// of it already materialised, or `None` when this account holds no such medical
+    /// vocabulary.
+    pub fn medical_vocabulary_mut(
+        &mut self,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<&mut MedicalVocabularyRecord> {
+        let record = self.medical_vocabularies.get_mut(name)?;
+        record.advance_clock(now);
+        Some(record)
+    }
+
+    /// Materialise every clock-owed medical-vocabulary transition, then the stored
+    /// medical vocabularies newest first — the order `ListMedicalVocabularies`
+    /// documents ("Custom vocabularies are ordered by creation date, with the newest
+    /// vocabulary first").
+    pub fn medical_vocabularies_newest_first(
+        &mut self,
+        now: SystemTime,
+    ) -> Vec<&MedicalVocabularyRecord> {
+        for record in self.medical_vocabularies.values_mut() {
+            record.advance_clock(now);
+        }
+        let mut records: Vec<&MedicalVocabularyRecord> =
+            self.medical_vocabularies.values().collect();
+        records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
+        records
+    }
+
     /// The stored custom vocabulary filters, newest first. A filter has no
     /// `VocabularyState` in the model, so none of them has a clock-owed transition.
     pub fn vocabulary_filters_newest_first(&self) -> Vec<&VocabularyFilterRecord> {
@@ -340,6 +404,10 @@ impl ComAmazonawsTranscribeTranscribeState {
                 .map(|record| &record.tags),
             RESOURCE_TYPE_VOCABULARY => self
                 .vocabularies
+                .get(&resource.name)
+                .map(|record| &record.tags),
+            RESOURCE_TYPE_MEDICAL_VOCABULARY => self
+                .medical_vocabularies
                 .get(&resource.name)
                 .map(|record| &record.tags),
             RESOURCE_TYPE_VOCABULARY_FILTER => self
@@ -368,6 +436,10 @@ impl ComAmazonawsTranscribeTranscribeState {
                 .map(|record| &mut record.tags),
             RESOURCE_TYPE_VOCABULARY => self
                 .vocabularies
+                .get_mut(&resource.name)
+                .map(|record| &mut record.tags),
+            RESOURCE_TYPE_MEDICAL_VOCABULARY => self
+                .medical_vocabularies
                 .get_mut(&resource.name)
                 .map(|record| &mut record.tags),
             RESOURCE_TYPE_VOCABULARY_FILTER => self
@@ -484,6 +556,136 @@ impl VocabularyRecord {
     pub fn download_uri(&self) -> String {
         vocabulary_download_uri(RESOURCE_TYPE_VOCABULARY, &self.name, &self.region)
     }
+}
+
+/// One stored custom MEDICAL vocabulary: the file the request named as the source of
+/// its terms, plus the lifecycle facts the service itself owns (its processing state,
+/// why that state is what it is, and when it was last modified).
+///
+/// WHY THIS FAMILY NEVER REACHES `READY`: a custom medical vocabulary can only be
+/// built by READING the table file at `VocabularyFileUri`, which
+/// `CreateMedicalVocabulary` and `UpdateMedicalVocabulary` both model `@required`
+/// with no inline alternative (`smithy_query(query="operation",
+/// operation="CreateMedicalVocabulary")`) — unlike `CreateVocabulary`, which also
+/// takes the terms in `Phrases`. This emulator reads no object store and makes no
+/// outbound request, so that build is work it cannot perform. The RECORD is still
+/// real and is kept — the name, the language, the state, the timestamps and the tag
+/// set are the control plane every operation of this family reports — and the build
+/// it cannot run ends in the service's own modelled failure state: `PENDING` at the
+/// create, then `FAILED` with a `FailureReason` that says the file was not read
+/// ([`medical_vocabulary_failure_reason`]). Nothing here reports a `READY` medical
+/// vocabulary, because nothing ever read its terms; the non-medical family is
+/// refused at the create instead ([`VOCABULARY_STATE_FAILED`]) because there the
+/// caller can send the same terms inline.
+#[derive(Debug, Clone)]
+pub struct MedicalVocabularyRecord {
+    /// `VocabularyName`, also this record's key in the store.
+    pub name: String,
+    /// Creation order, newest = largest. Also the cursor
+    /// `ListMedicalVocabularies` pages with.
+    pub sequence: u64,
+    /// `LanguageCode`: the one language this vocabulary's terms are in.
+    pub language_code: String,
+    /// `VocabularyFileUri`: where the terms would be read from. Held so the failure
+    /// reason can name it and an update can replace it; never fetched.
+    pub file_uri: String,
+    /// `VocabularyState`: [`VOCABULARY_STATE_PENDING`] until the clock makes the
+    /// build due, then [`VOCABULARY_STATE_FAILED`].
+    pub state: String,
+    /// `FailureReason`, set only on a `FAILED` vocabulary.
+    pub failure_reason: Option<String>,
+    /// When `PENDING` -> `FAILED` falls due; `None` once it has been materialised.
+    pub failed_due: Option<SystemTime>,
+    pub last_modified_time: SystemTime,
+    /// The region the request that created or last updated it was signed for.
+    pub region: String,
+    pub tags: Vec<Tag>,
+}
+
+impl MedicalVocabularyRecord {
+    /// The record a create of `name` from the file at `file_uri` stores: `PENDING`,
+    /// with its one clock-owed transition already due at a fixed span from `now`.
+    ///
+    /// Single-homed so the create and any later update cannot disagree about the
+    /// invariant that a `PENDING` record always carries the instant its transition
+    /// falls due.
+    pub fn pending(
+        name: String,
+        sequence: u64,
+        language_code: String,
+        file_uri: String,
+        region: String,
+        tags: Vec<Tag>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            name,
+            sequence,
+            language_code,
+            file_uri,
+            state: VOCABULARY_STATE_PENDING.to_string(),
+            failure_reason: None,
+            failed_due: Some(now + VOCABULARY_TRANSITION_DELAY),
+            last_modified_time: now,
+            region,
+            tags,
+        }
+    }
+
+    /// Materialise the state transition the CLOCK already owes this medical
+    /// vocabulary: it was due at its stored instant whether or not anybody called. A
+    /// reporting operation (`Get`, `List`) runs this before projecting the record,
+    /// and that is the only write it performs.
+    pub fn advance_clock(&mut self, now: SystemTime) {
+        if self.state != VOCABULARY_STATE_PENDING {
+            return;
+        }
+        if let Some(due) = self.failed_due.filter(|due| now >= *due) {
+            self.state = VOCABULARY_STATE_FAILED.to_string();
+            self.failure_reason = Some(medical_vocabulary_failure_reason(&self.file_uri));
+            // The resource changed when the build ended, so the modification instant
+            // is that of the transition, not of the request that started it.
+            self.last_modified_time = due;
+            self.failed_due = None;
+        }
+    }
+
+    /// This record as the modelled `VocabularyInfo` shape
+    /// (`ListMedicalVocabularies`), the same projection the non-medical family uses:
+    /// the two listings report the same shape.
+    pub fn to_info(&self) -> VocabularyInfo {
+        VocabularyInfo {
+            vocabulary_name: Some(self.name.clone()),
+            language_code: Some(self.language_code.clone()),
+            last_modified_time: Some(to_date_time(self.last_modified_time)),
+            vocabulary_state: Some(self.state.clone()),
+        }
+    }
+
+    /// Where this medical vocabulary's own file is reported to live, for one this
+    /// service built — and `None` for one it did not, which is every record of this
+    /// family (see the type's own docs): a vocabulary whose terms were never loaded
+    /// has no file to download. See [`vocabulary_download_uri`].
+    pub fn download_uri(&self) -> Option<String> {
+        (self.state == VOCABULARY_STATE_READY).then(|| {
+            vocabulary_download_uri(RESOURCE_TYPE_MEDICAL_VOCABULARY, &self.name, &self.region)
+        })
+    }
+}
+
+/// Why a custom medical vocabulary this emulator recorded ends `FAILED`: the file its
+/// terms would have come from is one this emulator does not read (see
+/// [`MedicalVocabularyRecord`]).
+///
+/// The wording is this emulator's own — AWS publishes no text for a medical
+/// vocabulary's `FailureReason` — and it names the URI the request gave, so a caller
+/// can see which file was not read.
+pub fn medical_vocabulary_failure_reason(file_uri: &str) -> String {
+    format!(
+        "The VocabularyFileUri {file_uri} was not read: this emulator reads no object \
+         store and makes no outbound request, so it cannot build a custom medical \
+         vocabulary from a file. No terms were loaded for this vocabulary."
+    )
 }
 
 /// One stored custom vocabulary filter: the words it holds and when it was last
