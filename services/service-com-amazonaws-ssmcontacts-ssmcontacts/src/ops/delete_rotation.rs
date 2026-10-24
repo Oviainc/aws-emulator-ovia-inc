@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRotation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRotation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the on-call rotation `RotationId` names from
+//! [`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::rotations`], and removes its ARN
+//! from the plan of every contact that referenced it — "if a rotation belongs to more than
+//! one on-call schedule, this operation deletes it from all of them" — so no later read can
+//! report a rotation this call deleted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRotation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The account-level Incident Manager precondition is evaluated FIRST, before `RotationId`
+//! is resolved, exactly as `GetRotation` evaluates it: a rotation lives in the Regions of
+//! the account's replication set, so without an ACTIVE one the ARN resolves to nothing and
+//! the call is refused HTTP 400 `ValidationException` rather than serviced. An admitted call
+//! naming a rotation this store does not hold answers HTTP 404
+//! `ResourceNotFoundException`, so a repeated delete is refused rather than reported as a
+//! fresh success.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +152,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRotation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRotationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRotation"))
+        // This operation addresses its rotation by ARN and reads nothing off the request
+        // envelope, so no request metadata is consulted.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal());
+        };
+
+        let mut state = state.lock();
+
+        // The account gate comes FIRST: it is evaluated before `RotationId` is resolved and
+        // before anything is removed, so a non-onboarded account is refused identically
+        // whether or not the rotation it named exists. This operation's whole subject is one
+        // resource ARN, so the refusal is the ARN-shaped one the crate reserves for that
+        // case — the same one `GetRotation` answers for the same `RotationId`.
+        state
+            .require_active_replication_set_for(&input.rotation_id)
+            .map_err(account_precondition_failed)?;
+
+        if state.rotations.remove(&input.rotation_id).is_none() {
+            return Err(DeleteRotationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Rotation {} not found", input.rotation_id),
+                    resource_id: input.rotation_id.clone(),
+                    resource_type: ROTATION_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // "If a rotation belongs to more than one on-call schedule, this operation deletes
+        // it from all of them": an on-call schedule references its rotations through the
+        // `RotationIds` of the contact's `Plan` (modelled `length` 0..25, so a plan left
+        // with none is still a representable plan), and the rotation is gone, so every plan
+        // that named it loses the reference instead of reporting an ARN that now names
+        // nothing. Plans that never named it are untouched.
+        for contact in state.contacts.values_mut() {
+            if let Some(rotation_ids) = contact.plan.rotation_ids.as_mut() {
+                rotation_ids.retain(|rotation_id| *rotation_id != input.rotation_id);
+            }
+        }
+
+        // The rotation is gone, so no idempotency token can ever replay it: drop the
+        // ledger entries that named it rather than leaving them resident.
+        state.forget_idempotency_tokens_for(&input.rotation_id);
+
+        Ok(DeleteRotationOutput {})
     }
+}
+
+/// The `resourceType` this operation's not-found error names, spelled as the other rotation
+/// handlers spell it.
+const ROTATION_RESOURCE_TYPE: &str = "rotation";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` (the account-level failure is none of the model's
+/// `CANNOT_PARSE`/`FIELD_VALIDATION_FAILED`/`UNKNOWN_OPERATION`) and `fields` is present but
+/// EMPTY, because no member of the request is at fault.
+fn account_precondition_failed(message: String) -> DeleteRotationError {
+    DeleteRotationErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// The modelled server fault for an engine that holds no state at all: without a store there
+/// is no rotation to remove, and that is this emulator's own failure rather than anything
+/// about the request.
+fn internal() -> DeleteRotationError {
+    DeleteRotationErrorModeled::InternalServerException(InternalServerException {
+        message: "this service is mounted on an engine that holds no state".to_string(),
+        retry_after_seconds: 0,
+    })
+    .into()
 }
