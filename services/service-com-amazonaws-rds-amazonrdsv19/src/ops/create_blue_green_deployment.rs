@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBlueGreenDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBlueGreenDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a blue/green deployment: the SOURCE database the request names stays the blue
+//! environment, and this service clones it into a green one — a real DB instance or DB
+//! cluster record of its own, with the target settings the request asked for — then pairs
+//! the two in a deployment record. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBlueGreenDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `Source` is a `DatabaseArn`, so the ARN is read for the resource type it names BEFORE
+//! anything is looked up: that type decides which store the source is resolved in, and so
+//! which not-found fault a source that resolves to nothing is answered with.
 //!
 //! ## Shape of an operation
 //!
@@ -238,18 +237,315 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBlueGreenDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBlueGreenDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBlueGreenDeployment"))
+        let region = crate::state::request_region(ctx)
+            .map_err(CreateBlueGreenDeploymentError::validation)?;
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tags(&tags)
+            .map_err(CreateBlueGreenDeploymentError::invalid_parameter_value)?;
+
+        // `Source` is "the Amazon Resource Name (ARN) of the source production database",
+        // and the model constrains it only to the ARN alphabet: which RDS resource it names
+        // is read here. A value that is not an ARN of a DB instance or a DB cluster of this
+        // region names no source database this service could resolve, which is a value the
+        // parameter does not accept rather than a database that is missing.
+        let source_named = input.source.clone();
+        let Some(source_arn) = crate::state::parse_rds_resource_arn(&source_named) else {
+            return Err(CreateBlueGreenDeploymentError::invalid_parameter_value(
+                format!(
+                    "invalid value '{source_named}' for Source: expected the ARN of an Amazon \
+                     RDS DB instance or DB cluster"
+                ),
+            ));
+        };
+        let source_is_cluster = match source_arn.resource_type {
+            "db" => false,
+            "cluster" => true,
+            other => {
+                return Err(CreateBlueGreenDeploymentError::invalid_parameter_value(
+                    format!(
+                        "invalid value '{source_named}' for Source: a blue/green deployment's \
+                         source is a DB instance (db) or a DB cluster (cluster), not a \
+                         {other}"
+                    ),
+                ))
+            }
+        };
+        if source_arn.region != region {
+            return Err(CreateBlueGreenDeploymentError::invalid_parameter_value(
+                format!(
+                    "invalid value '{source_named}' for Source: the source database must be \
+                     in {region}, the region this request is signed for"
+                ),
+            ));
+        }
+        // The source identifier is stored lowercased, as both database types' identifiers
+        // are.
+        let source_identifier = source_arn.identifier.to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated deployment.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // "The name of the blue/green deployment" is the caller's, and one name names one
+        // deployment.
+        if store
+            .blue_green_deployments_in(&region)
+            .into_iter()
+            .any(|stored| stored.name == input.blue_green_deployment_name)
+        {
+            return Err(
+                CreateBlueGreenDeploymentErrorModeled::BlueGreenDeploymentAlreadyExistsFault(
+                    BlueGreenDeploymentAlreadyExistsFault {
+                        message: Some(format!(
+                            "A blue/green deployment named {} already exists",
+                            input.blue_green_deployment_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.blue_green_deployments_in(&region).len()
+            >= crate::state::BLUE_GREEN_DEPLOYMENT_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(quota_exceeded(source_is_cluster, &region));
+        }
+
+        // The green environment is a CLONE of the source, so the source has to be there
+        // and has to be in a state it can be cloned from.
+        let mint = store.next_mint();
+        let deployment_identifier = crate::state::mint_blue_green_deployment_identifier(mint);
+        let target_arn = if source_is_cluster {
+            let Some(source) = store
+                .db_clusters
+                .get(&(region.clone(), source_identifier.clone()))
+            else {
+                return Err(
+                    CreateBlueGreenDeploymentErrorModeled::DBClusterNotFoundFault(
+                        DBClusterNotFoundFault {
+                            message: Some(format!("DBCluster {source_named} not found.")),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            if source.status != crate::state::DB_CLUSTER_STATUS_AVAILABLE {
+                return Err(
+                    CreateBlueGreenDeploymentErrorModeled::InvalidDBClusterStateFault(
+                        InvalidDBClusterStateFault {
+                            message: Some(format!(
+                                "DB cluster {source_identifier} is in state {} and cannot be \
+                                 the source of a blue/green deployment",
+                                source.status
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if store.clusters_in(&region).len() >= crate::state::DB_CLUSTER_QUOTA_PER_REGION {
+                return Err(quota_exceeded(source_is_cluster, &region));
+            }
+            let mut green = source.clone();
+            green.identifier = crate::state::green_identifier(
+                &source_identifier,
+                mint,
+                crate::state::db_cluster_identifier_max_len(&green.engine),
+            );
+            green.resource_id = crate::state::mint_db_cluster_resource_id(mint);
+            green.endpoint_host = crate::state::mint_endpoint_host(mint);
+            green.status = crate::state::DB_CLUSTER_STATUS_CREATING.to_string();
+            green.pending_status = Some(crate::state::PendingStatus::in_a_moment(
+                crate::state::DB_CLUSTER_STATUS_AVAILABLE,
+            ));
+            green.cluster_create_time = crate::state::now_as_wire_timestamp();
+            // A clone of a cluster is not a member of the source's global database and
+            // replicates from nothing: those are properties of the blue cluster alone.
+            green.global_cluster_identifier = None;
+            green.replication_source_arn = None;
+            green.tags = tags.clone();
+            // The target settings the request asked for are what the GREEN environment is
+            // built with — that is what a blue/green deployment is for.
+            if let Some(version) = resolve_target_version(&green.engine, &input.target_engine_version)?
+            {
+                green.engine_version = Some(version);
+            }
+            if let Some(name) = &input.target_db_cluster_parameter_group_name {
+                green.db_cluster_parameter_group_name = Some(name.to_ascii_lowercase());
+            }
+            if let Some(class) = &input.target_db_instance_class {
+                green.db_cluster_instance_class = Some(class.clone());
+            }
+            if let Some(storage_type) = &input.target_storage_type {
+                green.storage_type = Some(storage_type.clone());
+            }
+            if let Some(iops) = input.target_iops {
+                green.iops = Some(iops);
+            }
+            if let Some(allocated) = input.target_allocated_storage {
+                green.allocated_storage = Some(allocated);
+            }
+            let arn = green.arn();
+            store
+                .db_clusters
+                .insert((region.clone(), green.identifier.clone()), green);
+            arn
+        } else {
+            let Some(source) = store
+                .db_instances
+                .get(&(region.clone(), source_identifier.clone()))
+            else {
+                return Err(
+                    CreateBlueGreenDeploymentErrorModeled::DBInstanceNotFoundFault(
+                        DBInstanceNotFoundFault {
+                            message: Some(format!("DBInstance {source_named} not found.")),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            if source.status != "available" {
+                return Err(
+                    CreateBlueGreenDeploymentErrorModeled::InvalidDBInstanceStateFault(
+                        InvalidDBInstanceStateFault {
+                            message: Some(format!(
+                                "DB instance {source_identifier} is in state {} and cannot be \
+                                 the source of a blue/green deployment",
+                                source.status
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if store.instances_in(&region).len() >= crate::state::DB_INSTANCE_QUOTA_PER_REGION {
+                return Err(quota_exceeded(source_is_cluster, &region));
+            }
+            let mut green = source.clone();
+            green.identifier = crate::state::green_identifier(&source_identifier, mint, 63);
+            green.dbi_resource_id = crate::state::mint_dbi_resource_id(mint);
+            green.endpoint_host = crate::state::mint_endpoint_host(mint);
+            green.status = "creating".to_string();
+            green.pending_status = Some(crate::state::PendingStatus::in_a_moment("available"));
+            green.instance_create_time = crate::state::now_as_wire_timestamp();
+            green.tags = tags.clone();
+            // The green database starts its own log, with the reason it exists as its
+            // first line.
+            green.engine_log = crate::state::InstanceLog::default();
+            green.engine_log.record(format!(
+                "DB instance {} created as the green environment of blue/green deployment \
+                 {deployment_identifier}",
+                green.identifier
+            ));
+            if let Some(version) = resolve_target_version(&green.engine, &input.target_engine_version)?
+            {
+                green.engine_version = Some(version);
+            }
+            if let Some(name) = &input.target_db_parameter_group_name {
+                green.db_parameter_group_name = Some(name.clone());
+            }
+            if let Some(class) = &input.target_db_instance_class {
+                green.db_instance_class = class.clone();
+            }
+            if let Some(storage_type) = &input.target_storage_type {
+                green.storage_type = storage_type.clone();
+            }
+            if let Some(iops) = input.target_iops {
+                green.iops = Some(iops);
+            }
+            if let Some(allocated) = input.target_allocated_storage {
+                green.allocated_storage = Some(allocated);
+            }
+            if let Some(throughput) = input.target_storage_throughput {
+                green.storage_throughput = throughput;
+            }
+            let arn = green.arn();
+            store
+                .db_instances
+                .insert((region.clone(), green.identifier.clone()), green);
+            arn
+        };
+
+        // Resources are being created in the green environment, which is what
+        // `PROVISIONING` reports; the deployment reaches `AVAILABLE` on its own, once they
+        // are there. The due instant is stored on the record — nothing sleeps.
+        let record = crate::state::BlueGreenDeploymentRecord {
+            identifier: deployment_identifier.clone(),
+            name: input.blue_green_deployment_name,
+            region: region.clone(),
+            source_arn: source_named,
+            target_arn,
+            target_is_cluster: source_is_cluster,
+            status: crate::state::BLUE_GREEN_STATUS_PROVISIONING.to_string(),
+            pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                crate::state::BLUE_GREEN_STATUS_AVAILABLE,
+            )),
+            create_time: crate::state::now_as_wire_timestamp(),
+            delete_time: None,
+            tags,
+        };
+        let blue_green_deployment = record.to_wire();
+        store
+            .blue_green_deployments
+            .insert((region, deployment_identifier), record);
+
+        Ok(CreateBlueGreenDeploymentOutput {
+            blue_green_deployment: Some(blue_green_deployment),
+        })
     }
+}
+
+/// The quota fault for the resource type the green environment needs: creating a
+/// deployment creates a database in it, so the quota a request runs into is that
+/// database's.
+fn quota_exceeded(source_is_cluster: bool, region: &str) -> CreateBlueGreenDeploymentError {
+    if source_is_cluster {
+        CreateBlueGreenDeploymentErrorModeled::DBClusterQuotaExceededFault(
+            DBClusterQuotaExceededFault {
+                message: Some(format!(
+                    "Cannot create more than {} DB clusters in {region}",
+                    crate::state::DB_CLUSTER_QUOTA_PER_REGION
+                )),
+            },
+        )
+        .into()
+    } else {
+        CreateBlueGreenDeploymentErrorModeled::InstanceQuotaExceededFault(
+            InstanceQuotaExceededFault {
+                message: Some(format!(
+                    "Cannot create more than {} DB instances in {region}",
+                    crate::state::DB_INSTANCE_QUOTA_PER_REGION
+                )),
+            },
+        )
+        .into()
+    }
+}
+
+/// The engine version the green database runs when the request names a
+/// `TargetEngineVersion`: the same resolution `CreateDBInstance` and `CreateDBCluster` do
+/// against the engine-version catalogue, so a version this service cannot provision is
+/// refused before any record is written.
+fn resolve_target_version(
+    engine: &str,
+    requested: &Option<String>,
+) -> Result<Option<String>, CreateBlueGreenDeploymentError> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    let resolved =
+        crate::ops::describe_db_engine_versions::resolve_version(engine, Some(requested.as_str()))
+            .map_err(CreateBlueGreenDeploymentError::invalid_parameter_combination)?;
+    Ok(Some(match resolved {
+        Some(entry) => entry.engine_version.to_string(),
+        // An engine the catalogue publishes no available version for: there is nothing to
+        // resolve against, so what the request named stands.
+        None => requested.clone(),
+    }))
 }

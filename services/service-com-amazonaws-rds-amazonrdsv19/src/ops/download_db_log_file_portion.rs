@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DownloadDBLogFilePortion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DownloadDBLogFilePortion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Serves a portion of one log file of a DB instance this service holds, from the line the
+//! `Marker` names and at most `NumberOfLines` of them. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DownloadDBLogFilePortion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What the file CONTAINS is this service's own record of the instance's lifecycle — no
+//! database engine runs behind this emulator, so there is no engine log to copy and nothing
+//! is invented in its place; see `crate::state::engine_log`.
+//!
+//! Log access reaches an instance only once it has FINISHED being created: against one that
+//! is still `creating`, as against an identifier that never existed, the answer is
+//! `DBInstanceNotFoundFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +166,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DownloadDBLogFilePortion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DownloadDBLogFilePortionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DownloadDBLogFilePortion"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DownloadDBLogFilePortionError::validation)?;
+        let identifier = input.db_instance_identifier.to_ascii_lowercase();
+        // `NumberOfLines`: "the number of lines to download" — a count, so a negative one
+        // names no portion.
+        if input.number_of_lines.is_some_and(|lines| lines < 0) {
+            return Err(DownloadDBLogFilePortionError::invalid_parameter_value(
+                "invalid value for NumberOfLines: must not be negative",
+            ));
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never fabricated log data.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones owed
+        // at this instant whether or not anybody called — which is also what takes an
+        // instance out of `creating` once its span has passed.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope. An
+        // instance that has not finished being created is not reachable through log access
+        // at all — see the module docs. The two misses are worded the way the service
+        // words them: an instance that is there but not yet reachable names itself first,
+        // while an identifier this service holds no record of is reported as a name that
+        // resolves to nothing.
+        let instance = match store.db_instances.get(&(region, identifier.clone())) {
+            Some(instance) if instance.status != "creating" => instance,
+            Some(_) => {
+                return Err(
+                    DownloadDBLogFilePortionErrorModeled::DBInstanceNotFoundFault(
+                        DBInstanceNotFoundFault {
+                            message: Some(format!("DBInstance {identifier} not found.")),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            None => {
+                return Err(
+                    DownloadDBLogFilePortionErrorModeled::DBInstanceNotFoundFault(
+                        DBInstanceNotFoundFault {
+                            message: Some(format!("DBInstance not found: {identifier}")),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+        // The instance writes the one log file its engine names, so any other name names
+        // no log file of this instance.
+        if input.log_file_name != instance.log_file_name() {
+            return Err(
+                DownloadDBLogFilePortionErrorModeled::DBLogFileNotFoundFault(
+                    DBLogFileNotFoundFault {
+                        message: Some(format!(
+                            "DB log file {} not found for DB instance {identifier}.",
+                            input.log_file_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let lines = instance.engine_log.lines();
+        // `Marker`: "the pagination token provided in the previous request or '0'". The
+        // token this operation hands out is the index of the line the next portion starts
+        // at, so a token it never issued — one that is not an index of this file — is
+        // refused rather than resynchronised to the nearest line, for the reason
+        // `crate::state::paginate` gives.
+        let start = match input.marker.as_deref() {
+            None | Some("") | Some("0") => 0usize,
+            Some(marker) => match marker.parse::<usize>() {
+                Ok(index) if index <= lines.len() => index,
+                _ => {
+                    return Err(DownloadDBLogFilePortionError::invalid_parameter_value(
+                        format!(
+                            "invalid value '{marker}' for Marker: it was not returned by a \
+                             prior request; omit Marker or pass 0 to start at the first line"
+                        ),
+                    ))
+                }
+            },
+        };
+        // "If the NumberOfLines parameter is specified, then the block of lines returned
+        // can be from the beginning or the end of the log file"; where it is not, the rest
+        // of the file is returned.
+        let wanted = match input.number_of_lines {
+            Some(lines) if lines > 0 => lines as usize,
+            _ => lines.len().saturating_sub(start),
+        };
+        let end = start.saturating_add(wanted).min(lines.len());
+        let portion: String = lines[start..end]
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let additional_data_pending = end < lines.len();
+
+        Ok(DownloadDBLogFilePortionOutput {
+            log_file_data: Some(portion),
+            // The token the next portion resumes from, which is the index the caller has
+            // read up to.
+            marker: Some(end.to_string()),
+            additional_data_pending: Some(additional_data_pending),
+        })
     }
 }

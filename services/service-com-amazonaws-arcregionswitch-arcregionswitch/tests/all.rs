@@ -23,6 +23,8 @@ mod plan_execution_listing;
 mod plan_lifecycle;
 #[path = "all/plan_update.rs"]
 mod plan_update;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/route53_health_checks.rs"]
 mod route53_health_checks;
 #[path = "all/state_roundtrip.rs"]

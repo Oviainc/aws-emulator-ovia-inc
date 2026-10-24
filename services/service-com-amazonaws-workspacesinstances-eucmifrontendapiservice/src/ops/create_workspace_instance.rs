@@ -154,7 +154,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::TokenOutcome;
 
-        let _ = ctx;
+        // A regional resource belongs to the Region its create call was signed for, so
+        // the Region comes from the credential scope, never from a member: the instance
+        // this call creates exists in that Region alone.
+        let region = crate::state::request_region(ctx.parts());
+        // A Region this service is not available in has no endpoint of this service, so
+        // it holds no WorkSpace Instances and admits none. Refused before the store is
+        // reached: nothing is written for a request that is going to be refused.
+        if !crate::state::is_supported_region(&region) {
+            return Err(CreateWorkspaceInstanceErrorModeled::ValidationException(
+                crate::state::region_not_supported(),
+            )
+            .into());
+        }
+
         // A key in the reserved `aws:` namespace names a tag AWS generates, not one a
         // caller may set. The request is refused before the store is reached, so it
         // neither replays an idempotency token nor creates an instance.
@@ -199,6 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let fingerprint = crate::state::request_fingerprint(&parameters);
         match crate::state::resolve_client_token(
             &state.client_tokens,
+            &region,
             input.client_token.as_deref(),
             &fingerprint,
         ) {
@@ -226,10 +240,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a second bound on the records held in total keeps the store from growing
         // without bound through those (see `state::MAX_HELD_INSTANCES`). The count the
         // error reports is what the account HOLDS, whichever bound was reached.
-        if !state.has_instance_capacity() {
+        if !state.has_instance_capacity(&region) {
             return Err(
                 CreateWorkspaceInstanceErrorModeled::ServiceQuotaExceededException(
-                    crate::state::instance_quota_exceeded(state.instances.len()),
+                    crate::state::instance_quota_exceeded(state.held_instance_count(&region)),
                 )
                 .into(),
             );
@@ -251,6 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let record = crate::state::WorkspaceInstanceRecord {
             id: instance_id.clone(),
+            region: region.clone(),
             // The instance is launched, not ready: it starts in the non-terminal
             // `ALLOCATING` state and the move to `ALLOCATED` falls due one
             // `ALLOCATION_SPAN` from now.
@@ -274,7 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if let Some(token) = input.client_token {
             state.client_tokens.insert(
-                token,
+                (region, token),
                 crate::state::IdempotencyClaim {
                     resource_id: instance_id.clone(),
                     fingerprint,

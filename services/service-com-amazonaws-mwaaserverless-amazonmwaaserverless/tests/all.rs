@@ -33,3 +33,5 @@ mod workflow_lifecycle;
 mod workflow_run_listing;
 #[path = "all/workflow_update_versions.rs"]
 mod workflow_update_versions;
+#[path = "all/workflow_version_listing.rs"]
+mod workflow_version_listing;

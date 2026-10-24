@@ -1015,6 +1015,46 @@ pub fn cursor_customer_managed_policies(instance_arn: &str, permission_set_arn: 
     format!("customerManagedPolicies|{instance_arn}|{permission_set_arn}")
 }
 
+/// The greatest number of AWS MANAGED POLICY ARNs this emulator holds on ONE permission
+/// set.
+///
+/// NOT a figure the model carries: it is the emulator's own ceiling, the AWS-managed
+/// counterpart of [`MAX_CUSTOMER_MANAGED_POLICIES_PER_PERMISSION_SET`]. An attach inserts
+/// one entry per distinct `ManagedPolicyArn`, the member's pattern admits unboundedly many
+/// of them, and an attached policy lives until a caller detaches it — so without a ceiling
+/// a caller could grow the process until the host runs out of memory. An attach that would
+/// add a policy beyond it is refused with the modelled `ServiceQuotaExceededException`,
+/// which AWS documents as "the principal has crossed the permitted number of resources
+/// that can be created".
+pub const MAX_MANAGED_POLICIES_PER_PERMISSION_SET: usize = 20;
+
+/// The message an attach refuses a new managed policy with once a permission set already
+/// holds [`MAX_MANAGED_POLICIES_PER_PERMISSION_SET`] of them; built from the request,
+/// which names the permission set the ceiling was reached on.
+pub fn managed_policy_ceiling_message(permission_set_arn: &str) -> String {
+    format!(
+        "Cannot attach another managed policy: this emulator holds at most \
+         {MAX_MANAGED_POLICIES_PER_PERMISSION_SET} managed policies per permission set, \
+         and {permission_set_arn} already holds that many"
+    )
+}
+
+/// The refusal a detach of an AWS managed policy the permission set does not hold earns,
+/// as the message of the modelled `ResourceNotFoundException`.
+///
+/// Built from the request: it names the ARN that resolved to nothing and the permission set
+/// it was looked for on, because an unattached policy on a known permission set is a
+/// different failure from an unknown permission set.
+pub fn managed_policy_not_attached_message(
+    permission_set_arn: &str,
+    managed_policy_arn: &str,
+) -> String {
+    format!(
+        "Could not find managed policy with arn {managed_policy_arn} attached to \
+         permission set {permission_set_arn}."
+    )
+}
+
 /// The permissions boundary attached to a permission set: EXACTLY ONE of an AWS managed
 /// policy ARN or a customer managed policy reference.
 ///
@@ -1109,6 +1149,17 @@ pub struct PermissionSetRecord {
     pub session_duration: Option<String>,
     pub relay_state: Option<String>,
     pub tags: Vec<Tag>,
+    /// The AWS MANAGED POLICY ARNs attached to this permission set.
+    ///
+    /// An attachment's IDENTITY is its `ManagedPolicyArn` — a permission set holds a given
+    /// AWS managed policy at most once, so attaching the same ARN twice attaches it once
+    /// and a detach removes the one entry its ARN names. They live ON the permission-set
+    /// record rather than in a second map, for the same reason as
+    /// [`Self::customer_managed_policies`]: a permission set that no longer exists holds
+    /// none of them, and the attach, detach and list operations all resolve the same
+    /// permission set every other read resolves. Holds at most
+    /// [`MAX_MANAGED_POLICIES_PER_PERMISSION_SET`] ARNs; an attach that would add one
+    /// beyond that ceiling is refused rather than grown into.
     pub managed_policies: Vec<String>,
     /// The CUSTOMER MANAGED POLICY REFERENCES attached to this permission set, by
     /// [`CustomerManagedPolicyReferenceRecord::identity`].
