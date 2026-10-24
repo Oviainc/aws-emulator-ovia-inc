@@ -7,6 +7,11 @@
 //! `Name` is part of its ARN and therefore not a settable parameter: a request whose
 //! `Export.Name` names a different export is refused rather than silently ignored.
 //!
+//! Because the update "[overwrites] all export parameters", the REPLACEMENT definition is
+//! judged exactly as a create's is — its statement read against the table catalog and the
+//! columns that catalog publishes for the configuration the request states — and a
+//! definition this service could not deliver leaves the stored one untouched.
+//!
 //! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
 //! reaching this service's state and the modelled contract still apply.
 //!
@@ -203,10 +208,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Updates an existing data export by overwriting all export parameters. All
         // export parameters must be specified in the UpdateExport request" (smithy_query
         // operation `UpdateExport`): the submitted query is validated against the SQL
-        // subset this service publishes and the table catalog, and because the update
-        // REPLACES the definition rather than merging into it, each named table that
-        // publishes table properties must restate its `TableConfigurations` entry. See
-        // `crate::state::query`.
+        // subset this service publishes, the table catalog and the COLUMNS that catalog
+        // publishes for the tables it names under the table configuration this request
+        // states, and because the update REPLACES the definition rather than merging into
+        // it, each named table that publishes table properties must restate its
+        // `TableConfigurations` entry. The whole replacement is judged BEFORE anything is
+        // written, so a definition this service could not deliver never displaces the
+        // stored one. See `crate::state::query`.
         crate::state::validate_data_query(&input.export.data_query, true).map_err(
             |refusal| match refusal {
                 crate::state::QueryRefusal::Invalid(invalid) => {
