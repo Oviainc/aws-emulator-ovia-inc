@@ -238,7 +238,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // any package the graph was ingesting that this request leaves out is stopped.
         // A package already in the state the request asks for keeps the instant it
         // changed, so `LastIngestStateChange` reports when ingest actually changed
-        // rather than when it was last confirmed.
+        // rather than when it was last confirmed (see
+        // `crate::state::DatasourcePackageIngest::enter`).
         for (package, ingest) in graph.datasource_packages.iter_mut() {
             let wanted = if input.datasource_packages.contains(package) {
                 crate::state::DATASOURCE_PACKAGE_STATE_STARTED

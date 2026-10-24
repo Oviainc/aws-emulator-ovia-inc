@@ -19,6 +19,8 @@ mod behavior_graph_lifecycle;
 mod datasource_package_ingest;
 #[path = "all/datasource_package_reporting.rs"]
 mod datasource_package_reporting;
+#[path = "all/member_datasource_ingest_history.rs"]
+mod member_datasource_ingest_history;
 #[path = "all/member_verification_outcome.rs"]
 mod member_verification_outcome;
 #[path = "all/not_found_and_validation_semantics.rs"]
