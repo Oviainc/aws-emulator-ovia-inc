@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
     Pipe, PipeEnrichmentParameters, PipeLogConfiguration, PipeSourceParameters,
-    PipeTargetParameters,
+    PipeTargetParameters, ValidationException, ValidationExceptionField,
 };
 
 /// The `PipeState` members this slice reports. Source: the `PipeState` enum of
@@ -68,6 +68,84 @@ pub const MAX_PIPES: usize = 100;
 /// validator; `TagResource` re-checks the bound against the tags ALREADY on the pipe, which
 /// no per-request constraint can express.
 pub const MAX_TAGS_PER_PIPE: usize = 50;
+
+/// The length a tag key must be within: `@length(min: 1, max: 128)` on `TagKey`. Source:
+/// the `TagMap` key member of `smithy-model/com-amazonaws-pipes-pipes.json`.
+///
+/// A constraint on a MAP KEY is not one the boundary validator checks (it walks the
+/// collection's own `@length` and its values), so the writes that install tags enforce it
+/// themselves — and refuse a key outside it with the `ValidationException` their models
+/// declare, exactly as the boundary would have.
+pub const TAG_KEY_LENGTH: std::ops::RangeInclusive<usize> = 1..=128;
+
+/// The length a tag value must be within: `@length(min: 0, max: 256)` on `TagValue`.
+/// Source: the `TagMap` value member of the same model. The empty string is therefore a
+/// value a tag can hold, not a way of removing one.
+pub const TAG_VALUE_LENGTH: std::ops::RangeInclusive<usize> = 0..=256;
+
+/// The tag-key prefix AWS reserves for its own tags: "You cannot edit or delete tag keys
+/// or values with this prefix. Tags with this prefix do not count against your tags per
+/// resource limit." (AWS General Reference, "Tag naming limits and requirements"), so a
+/// caller-supplied key carrying it is refused rather than stored. Matched
+/// case-insensitively, the way the reservation is stated.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Why a tag the request carries is not one this service accepts, worded for the
+/// `ValidationException` the writes that install tags answer with.
+///
+/// `@length` counts CHARACTERS, not bytes (the framework's own constraint checker counts
+/// `chars()`), so a unicode key or value is measured the same way AWS measures it.
+pub fn tag_violation(key: &str, value: &str) -> Option<String> {
+    let key_length = key.chars().count();
+    if !TAG_KEY_LENGTH.contains(&key_length) {
+        return Some(format!(
+            "tag key must have length between {} and {} characters; got {key_length}",
+            TAG_KEY_LENGTH.start(),
+            TAG_KEY_LENGTH.end(),
+        ));
+    }
+    if key
+        .get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+    {
+        return Some(format!(
+            "tag key '{key}' uses the reserved prefix '{RESERVED_TAG_KEY_PREFIX}'",
+        ));
+    }
+    let value_length = value.chars().count();
+    if !TAG_VALUE_LENGTH.contains(&value_length) {
+        return Some(format!(
+            "the value of tag key '{key}' must have length between {} and {} characters; \
+             got {value_length}",
+            TAG_VALUE_LENGTH.start(),
+            TAG_VALUE_LENGTH.end(),
+        ));
+    }
+    None
+}
+
+/// The refusal a write that installs tags answers with when [`tag_violation`] names one:
+/// the modelled `ValidationException`, carrying the violation as the `fieldList` entry for
+/// `member` (the input member the tags arrived on, which the operations name differently)
+/// and a message derived FROM that list, so the count it states cannot drift from it.
+pub fn tag_violation_error(member: &str, violation: String) -> ValidationException {
+    let field_list = vec![ValidationExceptionField {
+        name: member.to_string(),
+        message: violation,
+    }];
+    ValidationException {
+        message: Some(format!(
+            "{} validation error detected: {}",
+            field_list.len(),
+            field_list
+                .iter()
+                .map(|field| field.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )),
+        field_list: Some(field_list),
+    }
+}
 
 /// The region an ARN carries when the request names none.
 const DEFAULT_REGION: &str = "us-east-1";
