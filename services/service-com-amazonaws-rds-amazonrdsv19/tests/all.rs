@@ -41,6 +41,8 @@ mod db_major_engine_versions;
 mod db_subnet_group_deletion;
 #[path = "all/docdb_query_surface.rs"]
 mod docdb_query_surface;
+#[path = "all/engine_default_parameters.rs"]
+mod engine_default_parameters;
 #[path = "all/engine_version_families.rs"]
 mod engine_version_families;
 #[path = "all/event_subscriptions.rs"]

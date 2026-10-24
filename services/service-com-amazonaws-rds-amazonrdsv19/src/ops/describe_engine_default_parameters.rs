@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEngineDefaultParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEngineDefaultParameters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the parameter catalog the engine named by a DB
+//! parameter group family publishes. The SCAFFOLDED marker line is gone, which is what
+//! records it as no longer a stub
+//! (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`); the paragraphs below are
+//! the scaffold's notes on how an operation of this service is wired. This is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEngineDefaultParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The catalog itself lives here, beside the handler that reports it, for the same reason
+//! the engine-version catalogue lives in `crate::ops::describe_db_engine_versions`: it is
+//! reference data this front door publishes rather than a record any request creates. It
+//! is `pub(crate)` so the other parameter operations of this service report the same
+//! defaults rather than growing a second copy of them.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +153,638 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEngineDefaultParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEngineDefaultParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEngineDefaultParameters"))
+        // "Returns the default engine and system parameter information for the specified
+        // database engine": the engine's own defaults, which belong to the FAMILY and not
+        // to any group a caller created. They are reference data this front door
+        // publishes — the same answer before and after anything is created, in every
+        // region — so this handler reads no record and, being a report, writes nothing at
+        // all. Both the store seam and the request context are bound so the generated
+        // signature stays as it is.
+        let _ = (ctx, &self.engine);
+
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeEngineDefaultParametersError::validation)?;
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters)
+            .map_err(DescribeEngineDefaultParametersError::invalid_parameter_value)?;
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribeEngineDefaultParametersError::validation)?;
+
+        let family = input.db_parameter_group_family;
+        let Some(published) = engine_default_parameters(&family) else {
+            return Err(
+                DescribeEngineDefaultParametersError::invalid_parameter_value(format!(
+                    "Invalid value '{family}' for DBParameterGroupFamily: a DB parameter group \
+                     family names an engine this service serves followed by that engine's \
+                     version (mysql8.0, aurora-postgresql16, sqlserver-ee-15.0)"
+                )),
+            );
+        };
+
+        // `Filters`: "The only supported filter is parameter-name. The results list only
+        // includes information about the parameters with these names." Every admitted
+        // filter is therefore a parameter-name filter, and a parameter is reported only
+        // when EVERY one of them names it — the intersection a repeated filter asks for.
+        // The catalog is kept in parameter-name order, so its own order is the report's
+        // and a page is a window over it.
+        let records: Vec<(String, Parameter)> = published
+            .iter()
+            .filter(|spec| {
+                filters
+                    .iter()
+                    .all(|filter| filter.values.iter().any(|value| value == spec.name))
+            })
+            .map(|spec| {
+                (
+                    spec.name.to_string(),
+                    crate::state::engine_default_parameter_to_wire(spec),
+                )
+            })
+            .collect();
+
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(records, input.marker.as_deref(), page_size)
+            .map_err(DescribeEngineDefaultParametersError::invalid_parameter_value)?;
+        Ok(DescribeEngineDefaultParametersOutput {
+            engine_defaults: Some(EngineDefaults {
+                db_parameter_group_family: Some(family),
+                marker: page.next_marker,
+                parameters: Some(page.items),
+            }),
+        })
     }
 }
+
+/// The one filter name this operation's `Filters` member documents: "The only supported
+/// filter is `parameter-name`." Any other name is refused with a 400 rather than ignored,
+/// because ignoring a filter would report parameters the caller excluded.
+const SUPPORTED_FILTER_NAMES: [&str; 1] = ["parameter-name"];
+
+/// Refuse a filter this operation does not support. "Filter names are case-sensitive."
+///
+/// The caller answers this with `InvalidParameterValue` — the Query API common error Amazon
+/// RDS itself answers an unrecognized filter name with — rather than the synthetic
+/// `ValidationException` some older report handlers in this crate still use for it.
+fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    for filter in filters {
+        if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
+            return Err(format!(
+                "unrecognized filter name: {}; supported filters are {}",
+                filter.name,
+                SUPPORTED_FILTER_NAMES.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The parameters the engine named by `family` publishes as its defaults, or `None` when
+/// `family` is not a DB parameter group family at all.
+///
+/// A family is an ENGINE this front door serves followed by that engine's version, written
+/// with a hyphen where the engine name itself carries one (`mysql8.0`,
+/// `aurora-postgresql16`, `oracle-ee-cdb-19`, `sqlserver-ee-15.0`, `docdb5.0`) — which is
+/// how [`family_engine`] reads it, and the form every family in this service's
+/// engine-version catalogue takes, next to the versionless Db2 ones the member's own value
+/// list publishes. A value naming no served engine, or naming one with no version, names no
+/// family: the caller refuses it rather than reporting an empty list for it, which would
+/// read as "that engine publishes no defaults".
+///
+/// A family whose engine this emulator publishes no catalog for is a different answer, and
+/// deliberately a 200 with an empty list: the family IS one this front door serves, and the
+/// honest report of a catalog this emulator does not hold is no parameters rather than
+/// invented ones (see the `_` arm below, which is the Db2 engines today).
+///
+/// The parameters are the ENGINE's, not the family's: a family is one major version of an
+/// engine, and the catalog below publishes the parameters that engine carries across the
+/// versions this service serves (see [`MYSQL_PARAMETERS`] for where the data comes from).
+pub(crate) fn engine_default_parameters(
+    family: &str,
+) -> Option<&'static [crate::state::ClusterParameterSpec]> {
+    let engine = family_engine(family)?;
+    // The MySQL-compatible engines share one parameter vocabulary, and so do the
+    // PostgreSQL-compatible ones: Aurora MySQL is MySQL's, Amazon RDS for MariaDB is
+    // MySQL's, and Aurora PostgreSQL is PostgreSQL's. The RDS Custom engines run the same
+    // Oracle and SQL Server engines as their non-custom counterparts.
+    Some(match engine {
+        _ if engine.ends_with("mysql") || engine == "mariadb" => MYSQL_PARAMETERS,
+        _ if engine.ends_with("postgresql") || engine == "postgres" => POSTGRES_PARAMETERS,
+        _ if engine.contains("oracle") => ORACLE_PARAMETERS,
+        _ if engine.contains("sqlserver") => SQLSERVER_PARAMETERS,
+        // Amazon DocumentDB's catalog is the SHARED one (the cluster-parameter-group
+        // operations of this front door validate values against the same table through
+        // `crate::state::published_parameters`), reported here for every version of that
+        // engine by the same rule as every other engine above: the parameters are the
+        // engine's, and which versions of an engine exist is a question for the
+        // engine-version report and for the create that stores a group, not for this one.
+        "docdb" => crate::state::published_parameters(family)
+            .unwrap_or(crate::state::DOCDB_CLUSTER_PARAMETERS),
+        "neptune" => NEPTUNE_PARAMETERS,
+        // An engine this emulator publishes no parameter catalog for reports no
+        // parameters rather than invented ones: a name, default or allowed-value set this
+        // front door made up would be a constraint AWS never published, and a caller
+        // reading it would configure against a parameter that does not exist. The family
+        // itself is a real one, so the report is a 200 carrying an empty list.
+        _ => &[],
+    })
+}
+
+/// The engine `family` names, or `None` when it names none.
+///
+/// The LONGEST engine name that prefixes the family wins, because the engine names
+/// themselves nest (`oracle-ee` prefixes `oracle-ee-cdb`, and `custom-sqlserver-ee`
+/// carries `sqlserver-ee`), and what follows it must be that engine's version — a dotted
+/// number, optionally introduced by the hyphen the Oracle, SQL Server and Db2 families
+/// write (`oracle-ee-19`, `db2-ae-11.5`). So a name whose version part is not a version
+/// names no family, and neither does a bare engine name — except for the engines whose
+/// family IS the bare name ([`VERSIONLESS_FAMILY_ENGINES`]).
+///
+/// The match is case-INSENSITIVE, as every other name this service resolves against a
+/// published list is (`check_db_cluster_engine`, `crate::state::published_parameters`):
+/// AWS publishes each family lowercase, so a differently-cased value still names the one
+/// family it can only have meant, and the response echoes the caller's own spelling back.
+fn family_engine(family: &str) -> Option<&'static str> {
+    let lowered = family.to_ascii_lowercase();
+    // The engines this front door serves: the ones `CreateDBInstance` publishes, plus the
+    // two sibling control planes' own (`docdb`, `neptune`), which this service claims too.
+    crate::state::DB_INSTANCE_ENGINES
+        .iter()
+        .chain(crate::state::SIBLING_CONTROL_PLANE_ENGINES.iter())
+        .filter(|engine| {
+            let Some(version) = lowered.strip_prefix(**engine) else {
+                return false;
+            };
+            let version = version.strip_prefix('-').unwrap_or(version);
+            if version.is_empty() {
+                return VERSIONLESS_FAMILY_ENGINES.contains(*engine);
+            }
+            version.starts_with(|c: char| c.is_ascii_digit())
+                && version.chars().all(|c| c.is_ascii_digit() || c == '.')
+        })
+        .max_by_key(|engine| engine.len())
+        .copied()
+}
+
+/// The engines whose DB parameter group family is the engine name ITSELF, carrying no
+/// version.
+///
+/// `DescribeEngineDefaultParametersMessage$DBParameterGroupFamily` publishes its own value
+/// list (`smithy_query(query="doc", shape="DescribeEngineDefaultParametersMessage",
+/// member="DBParameterGroupFamily")`), and the three Db2 editions are the only values in
+/// it written without a version: "db2-ae db2-ce db2-se", next to `mysql8.0`,
+/// `oracle-ee-19`, `sqlserver-ee-15.0` and the rest. A family the member's own list names
+/// is served, so the version requirement does not apply to these three.
+const VERSIONLESS_FAMILY_ENGINES: [&str; 3] = ["db2-ae", "db2-ce", "db2-se"];
+
+/// One parameter of the catalog below, so each table reads as a table.
+///
+/// Columns, in order: parameter name, apply type, data type, allowed values, default
+/// value, whether a caller may modify it, the engine version it was introduced in, and
+/// the description the API reports for it. One argument per member of the record it
+/// builds, which is what lets the tables below be read as rows of published data.
+#[allow(clippy::too_many_arguments)]
+const fn parameter(
+    name: &'static str,
+    apply_type: &'static str,
+    data_type: &'static str,
+    allowed_values: &'static str,
+    default_value: &'static str,
+    is_modifiable: bool,
+    minimum_engine_version: &'static str,
+    description: &'static str,
+) -> crate::state::ClusterParameterSpec {
+    crate::state::ClusterParameterSpec {
+        name,
+        apply_type,
+        data_type,
+        allowed_values,
+        default_value,
+        is_modifiable,
+        minimum_engine_version,
+        description,
+    }
+}
+
+/// The parameters the MySQL-compatible engines publish.
+///
+/// Source: the engine parameter lists in the Amazon RDS and Amazon Aurora User Guides
+/// ("Parameters for MySQL" / the MariaDB and Aurora MySQL parameter tables), which publish
+/// each parameter's apply type, data type, allowed values, default value and whether it is
+/// modifiable; `description` is the one-line description the engine's own documentation
+/// gives the parameter, which is the text the API reports. A default the service computes
+/// from the instance class is published as the FORMULA AWS reports
+/// (`{DBInstanceClassMemory/12582880}`), not as a number, because the number depends on an
+/// instance that does not exist at the time of this call.
+///
+/// It is not AWS's whole list — RDS publishes hundreds of parameters per family, and that
+/// list moves with every engine release. What a caller can rely on is that a family this
+/// service serves reports its engine's parameters with the metadata above, each sourced
+/// `engine-default`, in parameter-name order, filtered and paginated as this operation
+/// documents.
+///
+/// `minimum_engine_version` is published only where the version a parameter was introduced
+/// in is the same for every engine that shares this catalog; an entry that names none — one
+/// the engine has carried since before any version this service serves — reports no
+/// `MinimumEngineVersion` rather than a guessed one.
+///
+/// The entries of every catalog here are in ascending parameter-name order, which is the
+/// order the report is paginated in.
+pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
+    parameter(
+        "autocommit",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "1",
+        true,
+        "",
+        "Sets the autocommit mode.",
+    ),
+    parameter(
+        "general_log",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Enables the general query log.",
+    ),
+    parameter(
+        "innodb_file_per_table",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "1",
+        true,
+        "",
+        "Stores each InnoDB table and its indexes in a tablespace file of its own.",
+    ),
+    parameter(
+        "innodb_lock_wait_timeout",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "1-1073741824",
+        "50",
+        true,
+        "",
+        "The time in seconds an InnoDB transaction waits for a row lock before giving up.",
+    ),
+    parameter(
+        "log_bin_trust_function_creators",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Relaxes the privilege checks on stored function and trigger creation when binary \
+         logging is enabled.",
+    ),
+    parameter(
+        "long_query_time",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "float",
+        "0-31536000",
+        "10",
+        true,
+        "",
+        "The time in seconds a statement must run for before the slow query log records it.",
+    ),
+    parameter(
+        "lower_case_table_names",
+        crate::state::APPLY_TYPE_STATIC,
+        "integer",
+        "0-1",
+        "0",
+        true,
+        "",
+        "Whether table names are stored on disk and compared case-insensitively.",
+    ),
+    parameter(
+        "max_connections",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "1-100000",
+        "{DBInstanceClassMemory/12582880}",
+        true,
+        "",
+        "The maximum permitted number of simultaneous client connections.",
+    ),
+    parameter(
+        "max_user_connections",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-4294967295",
+        "0",
+        true,
+        "",
+        "The maximum number of simultaneous connections permitted to any one database \
+         account; 0 means no limit.",
+    ),
+    parameter(
+        "slow_query_log",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Enables the slow query log.",
+    ),
+    parameter(
+        "wait_timeout",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "1-31536000",
+        "28800",
+        true,
+        "",
+        "The time in seconds the server waits for activity on a non-interactive connection \
+         before closing it.",
+    ),
+];
+
+/// The parameters the PostgreSQL-compatible engines publish; see [`MYSQL_PARAMETERS`] for
+/// where the data comes from and what it does and does not claim.
+pub(crate) const POSTGRES_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
+    parameter(
+        "autovacuum",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "1",
+        true,
+        "",
+        "Starts the autovacuum subprocess.",
+    ),
+    parameter(
+        "deadlock_timeout",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "1-2147483647",
+        "1000",
+        true,
+        "",
+        "The time in milliseconds to wait on a lock before checking for a deadlock.",
+    ),
+    parameter(
+        "idle_in_transaction_session_timeout",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-2147483647",
+        "0",
+        true,
+        "",
+        "The time in milliseconds after which a session idle in a transaction is \
+         terminated; 0 disables the timeout.",
+    ),
+    parameter(
+        "log_connections",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Logs each successful connection.",
+    ),
+    parameter(
+        "log_disconnections",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Logs the end of each session, including its duration.",
+    ),
+    parameter(
+        "log_min_duration_statement",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "-1-2147483647",
+        "-1",
+        true,
+        "",
+        "The minimum execution time in milliseconds above which a statement is logged; -1 \
+         disables the logging.",
+    ),
+    parameter(
+        "log_statement",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "string",
+        "none,ddl,mod,all",
+        "none",
+        true,
+        "",
+        "Which SQL statements are logged.",
+    ),
+    parameter(
+        "max_connections",
+        crate::state::APPLY_TYPE_STATIC,
+        "integer",
+        "6-8388607",
+        "LEAST({DBInstanceClassMemory/9531392},5000)",
+        true,
+        "",
+        "The maximum number of concurrent connections to the database server.",
+    ),
+    parameter(
+        "shared_buffers",
+        crate::state::APPLY_TYPE_STATIC,
+        "integer",
+        "16-1073741823",
+        "{DBInstanceClassMemory/32768}",
+        true,
+        "",
+        "The number of shared memory buffers, in 8 kB pages, the database server uses.",
+    ),
+    parameter(
+        "statement_timeout",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-2147483647",
+        "0",
+        true,
+        "",
+        "The time in milliseconds after which a statement is aborted; 0 disables the \
+         timeout.",
+    ),
+    parameter(
+        "work_mem",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "64-2147483647",
+        "4096",
+        true,
+        "",
+        "The memory in kilobytes a query operation may use before it writes to temporary \
+         disk files.",
+    ),
+];
+
+/// The parameters the Oracle engines publish — the RDS Custom for Oracle engines included,
+/// which run the same engine; see [`MYSQL_PARAMETERS`] for where the data comes from and
+/// what it does and does not claim.
+pub(crate) const ORACLE_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
+    parameter(
+        "cursor_sharing",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "string",
+        "EXACT,FORCE",
+        "EXACT",
+        true,
+        "",
+        "Whether statements that differ only in their literals can share a cursor.",
+    ),
+    parameter(
+        "db_block_size",
+        crate::state::APPLY_TYPE_STATIC,
+        "integer",
+        "8192",
+        "8192",
+        false,
+        "",
+        "The size in bytes of an Oracle database block.",
+    ),
+    parameter(
+        "max_string_size",
+        crate::state::APPLY_TYPE_STATIC,
+        "string",
+        "STANDARD,EXTENDED",
+        "STANDARD",
+        true,
+        "",
+        "Whether the VARCHAR2, NVARCHAR2 and RAW types are limited to 4000 bytes \
+         (STANDARD) or to 32767 bytes (EXTENDED).",
+    ),
+    parameter(
+        "open_cursors",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "1-65535",
+        "300",
+        true,
+        "",
+        "The maximum number of cursors a session can have open at once.",
+    ),
+    parameter(
+        "optimizer_mode",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "string",
+        "ALL_ROWS,FIRST_ROWS,FIRST_ROWS_1,FIRST_ROWS_10,FIRST_ROWS_100,FIRST_ROWS_1000",
+        "ALL_ROWS",
+        true,
+        "",
+        "The default behaviour of the cost-based optimizer.",
+    ),
+    parameter(
+        "undo_retention",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-2147483647",
+        "900",
+        true,
+        "",
+        "The time in seconds committed undo information is retained.",
+    ),
+];
+
+/// The parameters the Microsoft SQL Server engines publish — the RDS Custom for SQL Server
+/// engines included, which run the same engine; see [`MYSQL_PARAMETERS`] for where the data
+/// comes from and what it does and does not claim. These are the server configuration
+/// options, so their names carry the spaces SQL Server itself writes them with.
+pub(crate) const SQLSERVER_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
+    parameter(
+        "clr enabled",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Enables the common language runtime.",
+    ),
+    parameter(
+        "contained database authentication",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Allows contained databases to be created or attached.",
+    ),
+    parameter(
+        "cost threshold for parallelism",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-32767",
+        "5",
+        true,
+        "",
+        "The estimated cost above which the query optimizer considers a parallel plan.",
+    ),
+    parameter(
+        "max degree of parallelism",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-32767",
+        "0",
+        true,
+        "",
+        "The maximum number of processors a parallel plan may use; 0 uses all of them.",
+    ),
+    parameter(
+        "optimize for ad hoc workloads",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Stores a compiled plan stub on a batch's first execution rather than the full \
+         plan.",
+    ),
+    parameter(
+        "rds.force_ssl",
+        crate::state::APPLY_TYPE_STATIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Requires client connections to the DB instance to use TLS.",
+    ),
+    parameter(
+        "user connections",
+        crate::state::APPLY_TYPE_STATIC,
+        "integer",
+        "0-32767",
+        "0",
+        true,
+        "",
+        "The maximum number of simultaneous user connections; 0 means no limit.",
+    ),
+];
+
+/// The parameter an Amazon Neptune DB parameter group publishes.
+///
+/// Source: the "Neptune DB parameters" section of the Amazon Neptune User Guide, which
+/// lists `neptune_query_timeout` as the parameter a DB parameter group carries — Neptune's
+/// other parameters belong to a DB CLUSTER parameter group, which
+/// `DescribeEngineDefaultClusterParameters` reports. One entry is the whole published list,
+/// not a sample of it.
+pub(crate) const NEPTUNE_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[parameter(
+    "neptune_query_timeout",
+    crate::state::APPLY_TYPE_DYNAMIC,
+    "integer",
+    "10-2147483647",
+    "120000",
+    true,
+    "",
+    "The time in milliseconds after which a graph query is timed out.",
+)];
+
