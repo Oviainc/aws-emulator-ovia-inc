@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCommandExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCommandExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCommandExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! DELETES the command execution the targeted device holds under `executionId` from
+//! the SHARED store the IoT Jobs data plane serves, where `StartCommandExecution`
+//! enqueued it — so a deleted execution is gone for the device and for
+//! `GetCommandExecution` alike.
+//!
+//! "Only command executions that enter a terminal state can be deleted from your
+//! account", so an execution still `CREATED` or `IN_PROGRESS` is refused 409
+//! `ConflictException` and stays exactly as it was. The deadline the clock has already
+//! passed counts as reached: an execution whose armed timeout is due is `TIMED_OUT`,
+//! hence terminal, hence deletable, which is why the timers are materialised before the
+//! status is read.
+//!
+//! `targetArn` must name a DEVICE (`…:thing/<name>`), or the request is refused 400
+//! `ValidationException` naming how the value was read. This operation models NO
+//! not-found error (`smithy_query(query="operation",operation="DeleteCommandExecution")`:
+//! `ConflictException`, `InternalServerException`, `ThrottlingException`,
+//! `ValidationException`), so a delete of an execution the device does not hold removes
+//! nothing and answers 200 — the delete is idempotent rather than reporting an error the
+//! model does not declare.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +82,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// A refusal of this request as the modelled `ValidationException` (HTTP 400).
+fn invalid_request(message: String) -> DeleteCommandExecutionError {
+    DeleteCommandExecutionErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,18 +162,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCommandExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCommandExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCommandExecution"))
+        // The deletion targets the SHARED store the IoT Jobs data plane serves: the
+        // execution this removes is the one the device polls, not a control-plane copy
+        // of it. The request carries no other metadata this operation needs.
+        let _ = ctx;
+        let Some(executions) = crate::state::job_execution_store(&*self.engine) else {
+            return Err(DeleteCommandExecutionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `targetArn` is "The Amazon Resource Number (ARN) of the target device for
+        // which you want to delete command executions": a value that names no device
+        // names no queue to delete from.
+        let thing_name =
+            crate::state::command_execution_target(&input.target_arn).map_err(invalid_request)?;
+
+        let now = ::service_common::iot_job_executions::now_epoch_seconds();
+
+        let mut store = executions.lock();
+        // The `TIMED_OUT` transitions the clock has already made due are materialised
+        // first, so an execution whose timeout has passed is deleted as the terminal
+        // execution it already is rather than refused as a running one. The move was
+        // owed at its own deadline whether or not this call happened.
+        store.time_out_due_executions(&thing_name, now);
+
+        // Only a COMMAND execution of this device is deletable here; an execution the
+        // device holds for a JOB is not one, and neither is an id nothing is stored
+        // under. The model declares no not-found error for this operation, so either
+        // leaves nothing to delete and the delete is a no-op.
+        let Some(record) =
+            crate::state::command_execution_index(&store, &thing_name, &input.execution_id)
+                .and_then(|index| store.record(&thing_name, index))
+        else {
+            return Ok(DeleteCommandExecutionOutput {});
+        };
+        // Copied out before the store is written: the refusal below reads the status,
+        // and the removal needs the execution's number to address the record.
+        let (status, execution_number, is_pending) = (
+            record.status.clone(),
+            record.execution_number,
+            record.is_pending(),
+        );
+
+        // "Only command executions that enter a terminal state can be deleted from your
+        // account": one that has not is refused, and nothing is removed.
+        if is_pending {
+            return Err(DeleteCommandExecutionErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Command execution {} is in status {} and only command executions in a terminal status can be deleted",
+                        input.execution_id,
+                        // The lookup above only answers for a record this model can
+                        // name a status for, so the projection is always Some here;
+                        // the stored status is the fallback rather than a panic.
+                        crate::state::command_execution_status(&status).unwrap_or(&status)
+                    )),
+                    resource_id: Some(input.execution_id.clone()),
+                },
+            )
+            .into());
+        }
+
+        store.remove_execution(&thing_name, &input.execution_id, execution_number);
+        Ok(DeleteCommandExecutionOutput {})
     }
 }

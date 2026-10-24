@@ -504,7 +504,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one of the device's concurrency slots while it is pending.
         record.command_arn = Some(input.command_arn.clone());
         // "A timer is started as soon as the command execution is created" —
-        // `executionTimeoutSeconds`.
+        // `executionTimeoutSeconds`. The DURATION is recorded beside the deadline it
+        // arms, because the deadline is consumed when the timer fires while the
+        // duration remains what the execution was created with — which is what the
+        // control plane's `GetCommandExecution$executionTimeoutSeconds` reports.
+        record.command_execution_timeout_seconds = input.execution_timeout_seconds;
         record.execution_timeout_expires_at = input
             .execution_timeout_seconds
             .map(|seconds| now.saturating_add(seconds));

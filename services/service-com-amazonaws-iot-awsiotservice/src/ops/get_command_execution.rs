@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCommandExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCommandExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCommandExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! READS the command execution the targeted device holds under `executionId` and
+//! reports it. The executions live in the SHARED store the IoT Jobs data plane serves
+//! (`service_common::iot_job_executions`), where `StartCommandExecution` enqueued this
+//! one, so what is reported is the very record the device polls — projected onto this
+//! model's command shapes by [`crate::state::to_command_execution`].
+//!
+//! It is a REPORTING operation — "Gets information about the specific command
+//! execution on a single device" — so the only write it makes is the one the CLOCK has
+//! already made due: an execution whose armed timeout has passed is `TIMED_OUT`,
+//! materialised before the read (see
+//! `JobExecutionStore::time_out_due_executions`) so the status this reader reports is
+//! the one every later reader of the shared store sees.
+//!
+//! `targetArn` must name a DEVICE (`…:thing/<name>`), or the request is refused 400
+//! `ValidationException` naming how the value was read; an `executionId` that device
+//! holds no command execution under is 404 `ResourceNotFoundException` rather than a
+//! 200 carrying no execution.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +117,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// A refusal of this request as the modelled `ValidationException` (HTTP 400).
+fn invalid_request(message: String) -> GetCommandExecutionError {
+    GetCommandExecutionErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -179,18 +196,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCommandExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCommandExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCommandExecution"))
+        // The executions live in the SHARED store the IoT Jobs data plane serves, so
+        // this read answers from the very record the device polls and updates.
+        let Some(executions) = crate::state::job_execution_store(&*self.engine) else {
+            return Err(GetCommandExecutionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `targetArn` is "The Amazon Resource Number (ARN) of the device on which the
+        // command execution is being performed": a value that names no device names no
+        // queue to look in, so it is refused rather than answered as "not found".
+        let thing_name =
+            crate::state::command_execution_target(&input.target_arn).map_err(invalid_request)?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::service_common::iot_job_executions::now_epoch_seconds();
+
+        let mut store = executions.lock();
+        // A timeout the start armed moves an execution to `TIMED_OUT` by itself, so the
+        // transitions the clock has already made due are recorded before anything is
+        // read: each was owed at its own deadline whether or not this call happened.
+        store.time_out_due_executions(&thing_name, now);
+
+        let Some(record) =
+            crate::state::command_execution_index(&store, &thing_name, &input.execution_id)
+                .and_then(|index| store.record(&thing_name, index))
+                .and_then(|record| crate::state::to_command_execution(record, &region))
+        else {
+            return Err(GetCommandExecutionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No command execution {} exists on target {}",
+                        input.execution_id, input.target_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // `includeResult` asks for the DEVICE-reported result of the execution. The
+        // device-side `UpdateCommandExecution` MQTT API is not served by this emulator,
+        // so no execution carries a result and the member is absent either way — see
+        // `crate::state::to_command_execution`, which reports what the record holds and
+        // invents nothing for what it does not.
+        let _ = input.include_result;
+        Ok(record)
     }
 }

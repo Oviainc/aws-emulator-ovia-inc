@@ -15,6 +15,8 @@
 mod authorizer_registry;
 #[path = "all/command_execution_listing.rs"]
 mod command_execution_listing;
+#[path = "all/command_execution_read.rs"]
+mod command_execution_read;
 #[path = "all/command_registry.rs"]
 mod command_registry;
 #[path = "all/describe_endpoint.rs"]
