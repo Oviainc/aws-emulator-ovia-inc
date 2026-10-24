@@ -29,5 +29,9 @@ mod ssl_policies;
 mod state_roundtrip;
 #[path = "all/target_group_attributes_and_modification.rs"]
 mod target_group_attributes_and_modification;
+#[path = "all/target_group_health_check_port.rs"]
+mod target_group_health_check_port;
+#[path = "all/target_group_health_checks.rs"]
+mod target_group_health_checks;
 #[path = "all/trust_stores.rs"]
 mod trust_stores;

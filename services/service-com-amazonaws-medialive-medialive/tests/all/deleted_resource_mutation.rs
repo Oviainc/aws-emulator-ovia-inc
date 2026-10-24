@@ -19,6 +19,11 @@
 //! window), and, for each kind, the OPERATION doing the mutating — the
 //! resource's own update, the schedule a channel owns, and the two tag writers
 //! that reach a resource by ARN.
+//!
+//! A NODE follows the same rule — its tags cannot be written once its
+//! deregistration has been accepted — but a node is addressed through the
+//! cluster that holds it, which this table's static per-id URIs cannot build, so
+//! that row lives in the node suite (`node_lifecycle`) instead.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;

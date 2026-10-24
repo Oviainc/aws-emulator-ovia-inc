@@ -492,14 +492,40 @@ impl ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState {
     ///
     /// A resource of a resource set declares the cell ARNs that contain it in its
     /// `ReadinessScopes`, and a cell contains whatever its nested cells contain, so
-    /// this is the set a resource's scope is matched against. Cycles terminate: an ARN
-    /// is expanded at most once.
+    /// this is the set a resource's scope is matched against.
     pub fn cell_scope_arns(&self, cell_name: &str) -> BTreeSet<String> {
+        match self.cells.get(cell_name) {
+            Some(root) => self.expand_scope_arns([root.arn.clone()]),
+            None => BTreeSet::new(),
+        }
+    }
+
+    /// Every readiness scope the recovery group named `group_name` covers: its own ARN
+    /// plus the ARN of every cell it contains and, transitively, of every cell nested
+    /// inside those.
+    ///
+    /// `ReadinessScopes` is "a list of recovery group Amazon Resource Names (ARNs) and
+    /// cell ARNs that this resource is contained within"
+    /// (`smithy_query(query="doc", shape="Resource", member="ReadinessScopes")`), so a
+    /// resource can name either this group directly or one of the cells underneath it,
+    /// and both are scopes of the group.
+    pub fn recovery_group_scope_arns(&self, group_name: &str) -> BTreeSet<String> {
+        match self.recovery_groups.get(group_name) {
+            Some(group) => self.expand_scope_arns(
+                ::std::iter::once(group.arn.clone()).chain(group.cell_arns.iter().cloned()),
+            ),
+            None => BTreeSet::new(),
+        }
+    }
+
+    /// The transitive closure of `roots` under cell nesting: every ARN handed in, plus
+    /// the nested-cell ARNs of each one that resolves to a stored cell, repeatedly.
+    ///
+    /// Cycles terminate and the walk is linear in the store: an ARN is expanded at most
+    /// once, whether it was reached as a root or through a nesting cell.
+    fn expand_scope_arns(&self, roots: impl IntoIterator<Item = String>) -> BTreeSet<String> {
         let mut scopes = BTreeSet::new();
-        let Some(root) = self.cells.get(cell_name) else {
-            return scopes;
-        };
-        let mut pending = vec![root.arn.clone()];
+        let mut pending: Vec<String> = roots.into_iter().collect();
         while let Some(arn) = pending.pop() {
             if !scopes.insert(arn.clone()) {
                 continue;
@@ -517,12 +543,25 @@ impl ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState {
 
     /// The names of the readiness checks that watch a resource scoped to the cell named
     /// `cell_name` — the checks a cell's readiness summary aggregates.
-    ///
-    /// A check watches a resource set; that set's resources carry the cell ARNs that
-    /// contain them. So a check belongs to a cell exactly when one of the resources it
-    /// watches is scoped to that cell or to a cell nested inside it.
     pub fn readiness_check_names_in_cell(&self, cell_name: &str) -> BTreeSet<String> {
-        let scopes = self.cell_scope_arns(cell_name);
+        self.readiness_check_names_in_scopes(&self.cell_scope_arns(cell_name))
+    }
+
+    /// The names of the readiness checks that watch a resource scoped to the recovery
+    /// group named `group_name` — the checks a recovery group's readiness summary
+    /// aggregates.
+    pub fn readiness_check_names_in_recovery_group(&self, group_name: &str) -> BTreeSet<String> {
+        self.readiness_check_names_in_scopes(&self.recovery_group_scope_arns(group_name))
+    }
+
+    /// The names of the readiness checks that watch a resource carrying one of `scopes`.
+    ///
+    /// A check watches a resource set; that set's resources carry the readiness scopes
+    /// that contain them. So a check belongs to a container exactly when one of the
+    /// resources it watches is scoped to that container or to something nested inside
+    /// it — the rule a cell's and a recovery group's summary both follow, which is why
+    /// they share this one implementation and differ only in the scope set.
+    fn readiness_check_names_in_scopes(&self, scopes: &BTreeSet<String>) -> BTreeSet<String> {
         self.readiness_checks
             .values()
             .filter(|check| {
@@ -530,7 +569,11 @@ impl ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState {
                     .get(&check.resource_set_name)
                     .is_some_and(|set| {
                         set.resources.iter().any(|resource| {
-                            resource.readiness_scopes.iter().flatten().any(|scope| scopes.contains(scope))
+                            resource
+                                .readiness_scopes
+                                .iter()
+                                .flatten()
+                                .any(|scope| scopes.contains(scope))
                         })
                     })
             })

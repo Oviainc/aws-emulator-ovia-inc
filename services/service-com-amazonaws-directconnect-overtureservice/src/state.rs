@@ -89,29 +89,62 @@ pub fn virtual_interface_name_is_valid(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// The dedicated port speeds a Direct Connect location can offer, ascending, in the
-/// `PortSpeed` form `Location$availablePortSpeeds` reports them in.
+/// The dedicated port speeds a Direct Connect location can offer, in the `PortSpeed`
+/// form `Location$availablePortSpeeds` reports them in.
 ///
 /// Source: `CreateLagRequest$connectionsBandwidth` — "The bandwidth of the individual
 /// physical dedicated connections bundled by the LAG. The possible values are 1Gbps,
 /// 10Gbps, 100Gbps, and 400Gbps." A `PortSpeed` names the same speeds in the short
 /// form (`1Gbps` -> `1G`).
-pub const DEDICATED_PORT_SPEEDS: [&str; 4] = ["1G", "10G", "100G", "400G"];
+///
+/// This is the set a speed must come FROM, never the list a location publishes: which
+/// of these a location offers is that location's own data
+/// ([`CatalogLocationRow::port_speeds`]), because AWS offers 400G — and even 100G — at
+/// some facilities only.
+///
+/// ORDER: `PortSpeed` is a plain string and neither the model nor the operation's
+/// docs fix an order, so the order these are listed in here is the one the recorded
+/// `DescribeLocations` response publishes — `100G`, `1G`, `10G`, `400G`, which is
+/// neither ascending by bandwidth nor lexicographic. Fixed in this ONE place so a
+/// location's `availablePortSpeeds`, its `availableMacSecPortSpeeds` and its billing
+/// mode's port speeds are always in the same order.
+pub const DEDICATED_PORT_SPEEDS: [&str; 4] = ["100G", "1G", "10G", "400G"];
+
+/// `available` narrowed to the speeds a dedicated connection can be ordered at, in
+/// [`DEDICATED_PORT_SPEEDS`] order.
+///
+/// Derived here rather than trusted off a catalog row, so every location publishes
+/// its speeds in that one order, without repeats, and a speed
+/// [`DEDICATED_PORT_SPEEDS`] does not name is dropped rather than published.
+pub fn catalog_port_speeds(available: &[&str]) -> Vec<String> {
+    DEDICATED_PORT_SPEEDS
+        .iter()
+        .filter(|known| available.contains(*known))
+        .map(|known| (*known).to_string())
+        .collect()
+}
 
 /// The port speeds MAC Security (MACsec) is offered on, at a location that offers
 /// MACsec at all.
 ///
 /// Source: `CreateConnectionRequest$requestMACSec` ("MAC Security (MACsec) is
 /// unavailable on hosted connections … see MAC Security in Direct Connect"), which
-/// offers MACsec on the dedicated 10 Gbps and 100 Gbps ports. `availableMacSecPortSpeeds`
-/// is therefore never an independent list: it is the location's own
+/// offers MACsec on the dedicated 10 Gbps, 100 Gbps and 400 Gbps ports — the
+/// sub-10G ports carry none. `availableMacSecPortSpeeds` is therefore never an
+/// independent list: the recorded response shows it is the location's own
 /// `availablePortSpeeds` narrowed to these, which is why it is computed by
 /// [`mac_sec_port_speeds`] rather than stored per location.
-pub const MAC_SEC_PORT_SPEEDS: [&str; 2] = ["10G", "100G"];
+pub const MAC_SEC_PORT_SPEEDS: [&str; 3] = ["10G", "100G", "400G"];
 
-/// The usage-based billing mode every Direct Connect location offers, one of the
-/// values `BillingMode` accepts on the wire
-/// ([`crate::ops::types::BILLING_MODE_VALUES`]).
+/// The billing mode a Direct Connect location publishes, one of the values
+/// `BillingMode` accepts on the wire ([`crate::ops::types::BILLING_MODE_VALUES`]).
+///
+/// The ONLY one: the recorded `DescribeLocations` response carries exactly one
+/// `AvailableBillingMode` per location, `PayAsYouGo`, with no `includedRegions`. The
+/// `FlatRateTier*` values `BillingMode` also accepts are what a CONNECTION can be
+/// billed on (`RequestBillingMode` on `CreateConnection` and
+/// `UpdateConnectionsBillingMode`), not modes a location advertises, so no location
+/// publishes one.
 pub const USAGE_BILLING_MODE: &str = "PayAsYouGo";
 
 /// The MACsec port speeds a location offering `available` port speeds publishes.
@@ -273,23 +306,24 @@ pub struct VirtualInterface {
 /// drift apart.
 #[derive(Debug, Clone)]
 pub struct LocationRecord {
-    /// `Location$locationCode`: "the code for the location".
+    /// `Location$locationCode`: "the code for the location" — the facility's code
+    /// suffixed with the colocation partner's (`EqSe2-WBE`), which is the value a
+    /// client then passes as `CreateConnection`'s `location`.
     pub location_code: String,
     /// `Location$locationName`: "the name of the location. This includes the name of
-    /// the colocation partner and the physical site of the building."
+    /// the colocation partner and the physical site of the building" — so BOTH, the
+    /// building and then the partner's site, joined by `" | "`.
     pub location_name: String,
     /// `Location$region`: "the Amazon Web Services Region for the location."
     pub region: String,
-    /// `Location$availablePortSpeeds`, ascending.
+    /// `Location$availablePortSpeeds`: this location's own subset of
+    /// [`DEDICATED_PORT_SPEEDS`], in [`catalog_port_speeds`] order.
     pub available_port_speeds: Vec<String>,
     /// `Location$availableProviders`: the service providers present at the location.
     pub available_providers: Vec<String>,
     /// Whether the location offers MAC Security at all; which of its port speeds
     /// carry it is [`mac_sec_port_speeds`].
     pub offers_mac_sec: bool,
-    /// The flat-rate `BillingMode` the location offers beside the usage-based
-    /// [`USAGE_BILLING_MODE`], when it offers one.
-    pub flat_rate_billing_mode: Option<String>,
 }
 
 /// Per-service state for com-amazonaws-directconnect-overtureservice. A handler reaches it through [`service_state`].
@@ -501,26 +535,19 @@ impl ComAmazonawsDirectconnectOvertureserviceState {
     /// the ONE rendering of a catalog location, so every operation answers the same
     /// field set.
     ///
-    /// A method rather than a free function because `includedRegions` — "the Amazon
-    /// Web Services Regions included with the billing mode" — is a property of the
-    /// whole catalog, not of one location, so it is counted from the catalog rather
-    /// than kept as a second copy on each location.
+    /// A method rather than a free function so a renderer that has to reach the rest
+    /// of the catalog keeps ONE call site; `availableMacSecPortSpeeds` and
+    /// `availableBillingModes` are derived from the location's own stored speeds, so
+    /// no second copy of them can drift.
     pub fn location_output(&self, location: &LocationRecord) -> crate::ops::types::Location {
-        let mut billing_modes = vec![crate::ops::types::AvailableBillingMode {
-            // Every location offers the usage-based mode, on every port speed it
-            // offers; it includes no Region beyond the location's own, so it
-            // publishes no `includedRegions`.
+        let billing_modes = vec![crate::ops::types::AvailableBillingMode {
+            // The one mode a location publishes ([`USAGE_BILLING_MODE`]), on every
+            // port speed it offers; it includes no Region beyond the location's
+            // own, so it publishes no `includedRegions`.
             billing_mode: Some(USAGE_BILLING_MODE.to_string()),
             available_port_speeds: Some(location.available_port_speeds.clone()),
             included_regions: None,
         }];
-        if let Some(flat_rate) = &location.flat_rate_billing_mode {
-            billing_modes.push(crate::ops::types::AvailableBillingMode {
-                billing_mode: Some(flat_rate.clone()),
-                available_port_speeds: Some(location.available_port_speeds.clone()),
-                included_regions: Some(self.regions_offering_billing_mode(flat_rate)),
-            });
-        }
 
         crate::ops::types::Location {
             location_code: Some(location.location_code.clone()),
@@ -535,166 +562,436 @@ impl ComAmazonawsDirectconnectOvertureserviceState {
             available_billing_modes: Some(billing_modes),
         }
     }
-
-    /// The Regions a flat-rate billing mode covers: every Region the catalog offers
-    /// that mode in, ascending and without repeats.
-    fn regions_offering_billing_mode(&self, billing_mode: &str) -> Vec<String> {
-        let regions: std::collections::BTreeSet<&str> = self
-            .locations
-            .values()
-            .filter(|location| location.flat_rate_billing_mode.as_deref() == Some(billing_mode))
-            .map(|location| location.region.as_str())
-            .collect();
-        regions.into_iter().map(ToString::to_string).collect()
-    }
 }
 
-/// One row of the built-in location catalog: `locationCode`, `locationName`, the
-/// Region, the dedicated port speeds offered there, the service providers present,
-/// whether MAC Security is offered, and the flat-rate `BillingMode` offered beside
-/// [`USAGE_BILLING_MODE`].
-type CatalogRow = (
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static [&'static str],
-    &'static [&'static str],
-    bool,
-    Option<&'static str>,
-);
+/// The service providers a facility publishes in `availableProviders`.
+///
+/// A list PER FACILITY rather than one catalog-wide list: `availableProviders` is
+/// "the name of the service provider for the location", and which Direct Connect
+/// delivery partners have presence at a facility is a property of that facility — a
+/// carrier hotel reaches nearly every partner, a single-tenant data centre a handful.
+type ProviderList = &'static [&'static str];
 
-/// The Direct Connect locations this emulator publishes.
+/// The Direct Connect delivery partners this catalog draws `availableProviders`
+/// from, named the way AWS reports them: the partner's company name
+/// (`Equinix, Inc.`, `Zayo Group`, `Lumen Technologies`), not a shortened trade name
+/// (`Equinix`, `Zayo`).
 ///
-/// CATALOG DATA, the emulator's own: AWS's location list is per-Region, per-account
-/// facility data that no model or request carries, and the recorded
-/// `DescribeLocations` response is one account's snapshot of it. The rows below are
-/// therefore EXAMPLES — colocation facilities AWS publishes Direct Connect locations
-/// in, with the port speeds `DEDICATED_PORT_SPEEDS` names and provider names drawn
-/// from the Direct Connect partner list. What is NOT example data is the shape and
-/// the derived members: every row renders a full `Location`
-/// ([`ComAmazonawsDirectconnectOvertureserviceState::location_output`]), its MACsec
-/// speeds are its own port speeds narrowed to [`MAC_SEC_PORT_SPEEDS`], and its
-/// flat-rate `includedRegions` are read back off the catalog.
-///
-/// The rows deliberately span the class: locations with and without 100G/400G, with
-/// and without MACsec, with and without a flat-rate mode, and several Regions, so a
-/// client that enumerates MACsec-capable or billing-mode-specific locations sees more
-/// than one answer.
-const BUILT_IN_LOCATIONS: &[CatalogRow] = &[
-    (
-        "EqDC2",
-        "Equinix DC2, Ashburn, VA",
-        "us-east-1",
-        &["1G", "10G", "100G"],
-        &["Equinix", "Megaport", "AT&T", "Verizon"],
-        true,
-        Some("FlatRateTier1"),
-    ),
-    (
-        "CSDC1",
-        "Coresite DC1, Reston, VA",
-        "us-east-1",
-        &["1G", "10G"],
-        &["Coresite", "Megaport"],
-        false,
-        Some("FlatRateTier1"),
-    ),
-    (
-        "EqCh2",
-        "Equinix CH2, Chicago, IL",
-        "us-east-2",
-        &["1G", "10G", "100G"],
-        &["Equinix", "Megaport", "Lumen"],
-        true,
-        Some("FlatRateTier1"),
-    ),
-    (
-        "EqSe2",
-        "Equinix SE2, Seattle, WA",
-        "us-west-2",
-        &["1G", "10G", "100G", "400G"],
-        &["Equinix", "Megaport", "Zayo"],
-        true,
-        Some("FlatRateTier1"),
-    ),
-    (
-        "EqSV5",
-        "Equinix SV5, San Jose, CA",
-        "us-west-1",
-        &["1G", "10G", "100G"],
-        &["Equinix", "Digital Realty"],
-        true,
-        None,
-    ),
-    (
-        "EqLD5",
-        "Equinix LD5, Slough, UK",
-        "eu-west-2",
-        &["1G", "10G", "100G"],
-        &["Equinix", "Megaport", "Colt"],
-        true,
-        Some("FlatRateTier2"),
-    ),
-    (
-        "EqFR5",
-        "Equinix FR5, Frankfurt, DE",
-        "eu-central-1",
-        &["1G", "10G", "100G"],
-        &["Equinix", "Interxion", "Colt"],
-        true,
-        Some("FlatRateTier2"),
-    ),
-    (
-        "EqSG2",
-        "Equinix SG2, Singapore",
-        "ap-southeast-1",
-        &["1G", "10G"],
-        &["Equinix", "Megaport"],
-        false,
-        Some("FlatRateTier3"),
-    ),
-    (
-        "EqTY2",
-        "Equinix TY2, Tokyo, JP",
-        "ap-northeast-1",
-        &["1G", "10G", "100G"],
-        &["Equinix", "Megaport", "NTT"],
-        true,
-        Some("FlatRateTier3"),
-    ),
+/// Source: the AWS Direct Connect delivery-partner list, as the recorded
+/// `DescribeLocations` response spells it — one carrier-hotel facility there carries
+/// roughly thirty entries, among them `Equinix, Inc.`, `Megaport`, `Zayo Group`,
+/// `CenturyLink`, `AT&T`, `PacketFabric` and `Arelion`.
+pub const DIRECT_CONNECT_PROVIDERS: [&str; 30] = [
+    "AT&T",
+    "Arelion",
+    "BT",
+    "CenturyLink",
+    "Cogent Communications",
+    "Cologix",
+    "Colt Technology Services",
+    "Comcast Business",
+    "Console Connect by PCCW Global",
+    "CoreSite",
+    "Cox Business",
+    "Crown Castle",
+    "Digital Realty",
+    "Equinix, Inc.",
+    "Flexential",
+    "GTT Communications",
+    "Internet2",
+    "Lumen Technologies",
+    "Megaport",
+    "NTT Communications",
+    "Orange Business Services",
+    "PacketFabric",
+    "Rogers Communications",
+    "Sify Technologies",
+    "Tata Communications",
+    "Telstra",
+    "Verizon",
+    "Vodafone",
+    "Windstream",
+    "Zayo Group",
 ];
 
-/// The catalog [`BUILT_IN_LOCATIONS`] describes, keyed by `locationCode`.
-pub fn built_in_location_catalog() -> BTreeMap<String, LocationRecord> {
-    BUILT_IN_LOCATIONS
-        .iter()
-        .map(
-            |(code, name, region, speeds, providers, offers_mac_sec, flat_rate)| {
-                (
-                    (*code).to_string(),
-                    LocationRecord {
-                        location_code: (*code).to_string(),
-                        location_name: (*name).to_string(),
-                        region: (*region).to_string(),
-                        // Ascending by speed, which is the order
-                        // `DEDICATED_PORT_SPEEDS` lists them in, whatever order a
-                        // row happens to name them in.
-                        available_port_speeds: DEDICATED_PORT_SPEEDS
-                            .iter()
-                            .filter(|speed| speeds.contains(*speed))
-                            .map(|speed| (*speed).to_string())
-                            .collect(),
-                        available_providers: providers
-                            .iter()
-                            .map(|provider| (*provider).to_string())
-                            .collect(),
-                        offers_mac_sec: *offers_mac_sec,
-                        flat_rate_billing_mode: flat_rate.map(ToString::to_string),
-                    },
-                )
+/// What a carrier hotel publishes: every partner in
+/// [`DIRECT_CONNECT_PROVIDERS`], because that is what a meet-me room in one reaches.
+const CARRIER_HOTEL_PROVIDERS: ProviderList = &DIRECT_CONNECT_PROVIDERS;
+
+/// The partners present at the Pacific Northwest facilities that are not carrier
+/// hotels.
+const PACIFIC_NORTHWEST_PROVIDERS: ProviderList = &[
+    "Arelion",
+    "Cologix",
+    "Equinix, Inc.",
+    "Flexential",
+    "Lumen Technologies",
+    "Megaport",
+    "PacketFabric",
+    "Zayo Group",
+];
+
+/// The partners present at a single-operator metro data centre.
+const METRO_PROVIDERS: ProviderList =
+    &["Cologix", "Lumen Technologies", "Megaport", "Zayo Group"];
+
+/// The partners present at the European facilities.
+const EUROPEAN_PROVIDERS: ProviderList = &[
+    "Arelion",
+    "BT",
+    "Colt Technology Services",
+    "Equinix, Inc.",
+    "GTT Communications",
+    "Megaport",
+    "Orange Business Services",
+    "Vodafone",
+];
+
+/// The partners present at the Asia Pacific facilities.
+const ASIA_PACIFIC_PROVIDERS: ProviderList = &[
+    "Console Connect by PCCW Global",
+    "Equinix, Inc.",
+    "Megaport",
+    "NTT Communications",
+    "Tata Communications",
+    "Telstra",
+];
+
+/// One row of the catalog: the demarcation ONE colocation partner offers at a
+/// facility, which is what AWS publishes one `Location` for.
+///
+/// AWS does not publish one location per building: it publishes one per
+/// (facility, partner) pair, because the cross connect a customer orders is to that
+/// partner's patch panel, and the ports AWS lands there differ by partner — which is
+/// why [`Self::port_speeds`] and [`Self::offers_mac_sec`] sit on the row rather than
+/// on the facility.
+struct CatalogLocationRow {
+    /// The partner's code, which suffixes the facility's code to make
+    /// `locationCode`.
+    partner_code: &'static str,
+    /// The partner's own site, which is the second half of `locationName`.
+    partner_site: &'static str,
+    /// The port speeds AWS offers on this demarcation — a subset of
+    /// [`DEDICATED_PORT_SPEEDS`], not all of it.
+    port_speeds: &'static [&'static str],
+    /// Whether MAC Security is offered here at all; which of [`Self::port_speeds`]
+    /// carry it is [`mac_sec_port_speeds`].
+    offers_mac_sec: bool,
+}
+
+/// One colocation facility, and every partner demarcation AWS publishes a location
+/// for at it.
+struct CatalogFacility {
+    /// The facility's code, which every `locationCode` at it begins with.
+    code: &'static str,
+    /// The building's name and city, which is the first half of `locationName`.
+    building: &'static str,
+    /// The Region whose `DescribeLocations` answers these locations.
+    region: &'static str,
+    /// The providers reachable at this facility.
+    providers: ProviderList,
+    /// The partner demarcations at this facility.
+    locations: &'static [CatalogLocationRow],
+}
+
+/// The colocation facilities this emulator publishes Direct Connect locations at.
+///
+/// FACILITY DATA, not caller data and not account data: `DescribeLocations` takes no
+/// input and no caller identity narrows it, so what it answers is the public facility
+/// list for the signed Region. The buildings, partner codes and partner sites below
+/// are the Direct Connect facilities AWS publishes, as the recorded
+/// `DescribeLocations` response for `us-west-2` spells them — a per-partner
+/// `locationCode` (`EqSe2-EQ`, `EqSe2-WBE`) and a `locationName` that names the
+/// building and then the partner's site.
+///
+/// What is derived rather than written down: a row's `locationCode`, its
+/// `locationName`, the order of its port speeds ([`catalog_port_speeds`]), its MACsec
+/// speeds ([`mac_sec_port_speeds`]) and its one billing mode
+/// ([`ComAmazonawsDirectconnectOvertureserviceState::location_output`]) — so no two
+/// of those can disagree with a row's own speeds.
+///
+/// The rows deliberately span the class: facilities with one partner and with
+/// several, port-speed sets with and without 100G and 400G, demarcations with and
+/// without MACsec, carrier hotels reaching every provider and metro sites reaching a
+/// handful, in several Regions.
+const BUILT_IN_FACILITIES: &[CatalogFacility] = &[
+    CatalogFacility {
+        code: "EqDC2",
+        building: "Equinix DC2, Ashburn, VA",
+        region: "us-east-1",
+        providers: CARRIER_HOTEL_PROVIDERS,
+        locations: &[
+            CatalogLocationRow {
+                partner_code: "EQ",
+                partner_site: "Equinix, DC2, Ashburn, VA",
+                port_speeds: &["1G", "10G", "100G"],
+                offers_mac_sec: true,
             },
-        )
-        .collect()
+            CatalogLocationRow {
+                partner_code: "DRT",
+                partner_site: "Digital Realty, IAD38, Ashburn, VA",
+                port_speeds: &["1G", "10G"],
+                offers_mac_sec: false,
+            },
+        ],
+    },
+    CatalogFacility {
+        code: "CSDC1",
+        building: "CoreSite DC1, Reston, VA",
+        region: "us-east-1",
+        providers: METRO_PROVIDERS,
+        locations: &[CatalogLocationRow {
+            partner_code: "CS",
+            partner_site: "CoreSite, DC1, Reston, VA",
+            port_speeds: &["1G", "10G"],
+            offers_mac_sec: false,
+        }],
+    },
+    CatalogFacility {
+        code: "EqCh2",
+        building: "Equinix CH2, Chicago, IL",
+        region: "us-east-2",
+        providers: CARRIER_HOTEL_PROVIDERS,
+        locations: &[
+            CatalogLocationRow {
+                partner_code: "EQ",
+                partner_site: "Equinix, CH2, Chicago, IL",
+                port_speeds: &["1G", "10G", "100G"],
+                offers_mac_sec: true,
+            },
+            CatalogLocationRow {
+                partner_code: "CL",
+                partner_site: "Cologix, CHI1, Chicago, IL",
+                port_speeds: &["1G", "10G", "100G", "400G"],
+                offers_mac_sec: true,
+            },
+        ],
+    },
+    CatalogFacility {
+        code: "EqSe2",
+        building: "Westin Building Exchange, Seattle, WA",
+        region: "us-west-2",
+        providers: CARRIER_HOTEL_PROVIDERS,
+        locations: &[
+            CatalogLocationRow {
+                partner_code: "EQ",
+                partner_site: "Equinix, SE2, Seattle, WA",
+                port_speeds: &["1G", "10G", "100G"],
+                offers_mac_sec: true,
+            },
+            CatalogLocationRow {
+                partner_code: "WBE",
+                partner_site: "Westin Building Exchange, Seattle, WA",
+                port_speeds: &["1G", "10G", "100G", "400G"],
+                offers_mac_sec: true,
+            },
+        ],
+    },
+    CatalogFacility {
+        code: "EqSe3",
+        building: "Equinix SE3, Seattle, WA",
+        region: "us-west-2",
+        providers: PACIFIC_NORTHWEST_PROVIDERS,
+        locations: &[
+            CatalogLocationRow {
+                partner_code: "EQ",
+                partner_site: "Equinix, SE3, Seattle, WA",
+                port_speeds: &["1G", "10G", "100G"],
+                offers_mac_sec: true,
+            },
+            CatalogLocationRow {
+                partner_code: "CL",
+                partner_site: "Cologix, SEA1, Seattle, WA",
+                port_speeds: &["1G", "10G"],
+                offers_mac_sec: false,
+            },
+        ],
+    },
+    CatalogFacility {
+        code: "FlexHB1",
+        building: "Flexential Hillsboro, Hillsboro, OR",
+        region: "us-west-2",
+        providers: PACIFIC_NORTHWEST_PROVIDERS,
+        locations: &[CatalogLocationRow {
+            partner_code: "FLX",
+            partner_site: "Flexential, HIL1, Hillsboro, OR",
+            port_speeds: &["1G", "10G", "100G", "400G"],
+            offers_mac_sec: true,
+        }],
+    },
+    CatalogFacility {
+        code: "Pittock",
+        building: "Pittock Block, Portland, OR",
+        region: "us-west-2",
+        providers: METRO_PROVIDERS,
+        locations: &[
+            CatalogLocationRow {
+                partner_code: "PB",
+                partner_site: "Pittock Block, Portland, OR",
+                port_speeds: &["1G", "10G"],
+                offers_mac_sec: false,
+            },
+            CatalogLocationRow {
+                partner_code: "OPX",
+                partner_site: "Opus Interactive, Pittock Block, Portland, OR",
+                port_speeds: &["1G", "10G", "100G"],
+                offers_mac_sec: true,
+            },
+        ],
+    },
+    CatalogFacility {
+        code: "SUPERNAP8",
+        building: "Switch SUPERNAP 8, Las Vegas, NV",
+        region: "us-west-2",
+        providers: METRO_PROVIDERS,
+        locations: &[CatalogLocationRow {
+            partner_code: "SW",
+            partner_site: "Switch, SUPERNAP 8, Las Vegas, NV",
+            port_speeds: &["1G", "10G", "100G"],
+            offers_mac_sec: true,
+        }],
+    },
+    CatalogFacility {
+        code: "T5PDX",
+        building: "T5@Portland, Hillsboro, OR",
+        region: "us-west-2",
+        providers: PACIFIC_NORTHWEST_PROVIDERS,
+        locations: &[CatalogLocationRow {
+            partner_code: "T5",
+            partner_site: "T5 Data Centers, Hillsboro, OR",
+            port_speeds: &["1G", "10G", "100G"],
+            offers_mac_sec: true,
+        }],
+    },
+    CatalogFacility {
+        code: "TierPointSEA",
+        building: "TierPoint Seattle, Seattle, WA",
+        region: "us-west-2",
+        providers: METRO_PROVIDERS,
+        locations: &[CatalogLocationRow {
+            partner_code: "TP",
+            partner_site: "TierPoint, Seattle, WA",
+            port_speeds: &["1G", "10G"],
+            offers_mac_sec: false,
+        }],
+    },
+    CatalogFacility {
+        code: "EqSV5",
+        building: "Equinix SV5, San Jose, CA",
+        region: "us-west-1",
+        providers: CARRIER_HOTEL_PROVIDERS,
+        locations: &[CatalogLocationRow {
+            partner_code: "EQ",
+            partner_site: "Equinix, SV5, San Jose, CA",
+            port_speeds: &["1G", "10G", "100G"],
+            offers_mac_sec: true,
+        }],
+    },
+    CatalogFacility {
+        code: "EqLD5",
+        building: "Equinix LD5, Slough, UK",
+        region: "eu-west-2",
+        providers: EUROPEAN_PROVIDERS,
+        locations: &[
+            CatalogLocationRow {
+                partner_code: "EQ",
+                partner_site: "Equinix, LD5, Slough, UK",
+                port_speeds: &["1G", "10G", "100G", "400G"],
+                offers_mac_sec: true,
+            },
+            CatalogLocationRow {
+                partner_code: "THN",
+                partner_site: "Telehouse, North Two, London, UK",
+                port_speeds: &["1G", "10G"],
+                offers_mac_sec: false,
+            },
+        ],
+    },
+    CatalogFacility {
+        code: "EqFR5",
+        building: "Equinix FR5, Frankfurt, DE",
+        region: "eu-central-1",
+        providers: EUROPEAN_PROVIDERS,
+        locations: &[
+            CatalogLocationRow {
+                partner_code: "EQ",
+                partner_site: "Equinix, FR5, Frankfurt, DE",
+                port_speeds: &["1G", "10G", "100G"],
+                offers_mac_sec: true,
+            },
+            CatalogLocationRow {
+                partner_code: "ITX",
+                partner_site: "Interxion, FRA6, Frankfurt, DE",
+                port_speeds: &["1G", "10G"],
+                offers_mac_sec: false,
+            },
+        ],
+    },
+    CatalogFacility {
+        code: "EqSG2",
+        building: "Equinix SG2, Singapore",
+        region: "ap-southeast-1",
+        providers: ASIA_PACIFIC_PROVIDERS,
+        locations: &[CatalogLocationRow {
+            partner_code: "EQ",
+            partner_site: "Equinix, SG2, Singapore",
+            port_speeds: &["1G", "10G"],
+            offers_mac_sec: false,
+        }],
+    },
+    CatalogFacility {
+        code: "EqTY2",
+        building: "Equinix TY2, Tokyo, JP",
+        region: "ap-northeast-1",
+        providers: ASIA_PACIFIC_PROVIDERS,
+        locations: &[
+            CatalogLocationRow {
+                partner_code: "EQ",
+                partner_site: "Equinix, TY2, Tokyo, JP",
+                port_speeds: &["1G", "10G", "100G"],
+                offers_mac_sec: true,
+            },
+            CatalogLocationRow {
+                partner_code: "NTT",
+                partner_site: "NTT Communications, Otemachi, Tokyo, JP",
+                port_speeds: &["1G", "10G", "100G", "400G"],
+                offers_mac_sec: true,
+            },
+        ],
+    },
+];
+
+/// The catalog [`BUILT_IN_FACILITIES`] describes, keyed by `locationCode`.
+///
+/// One entry per (facility, partner) pair, because that is what AWS publishes a
+/// `Location` for: its `locationCode` is the facility's code suffixed with the
+/// partner's (`EqSe2` + `WBE` -> `EqSe2-WBE`), and its `locationName` is the building
+/// joined to that partner's own site by `" | "`, which is what
+/// `Location$locationName` means by "the name of the colocation partner and the
+/// physical site of the building".
+pub fn built_in_location_catalog() -> BTreeMap<String, LocationRecord> {
+    let mut catalog = BTreeMap::new();
+    for facility in BUILT_IN_FACILITIES {
+        for row in facility.locations {
+            let location_code = format!("{}-{}", facility.code, row.partner_code);
+            catalog.insert(
+                location_code.clone(),
+                LocationRecord {
+                    location_code,
+                    location_name: format!("{} | {}", facility.building, row.partner_site),
+                    region: facility.region.to_string(),
+                    available_port_speeds: catalog_port_speeds(row.port_speeds),
+                    available_providers: facility
+                        .providers
+                        .iter()
+                        .map(|provider| (*provider).to_string())
+                        .collect(),
+                    offers_mac_sec: row.offers_mac_sec,
+                },
+            );
+        }
+    }
+    catalog
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
