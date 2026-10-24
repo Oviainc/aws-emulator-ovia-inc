@@ -49,6 +49,8 @@ mod event_data_store_update;
 mod event_selectors;
 #[path = "all/federation_lifecycle.rs"]
 mod federation_lifecycle;
+#[path = "all/generate_query.rs"]
+mod generate_query;
 #[path = "all/import_list.rs"]
 mod import_list;
 #[path = "all/import_reads.rs"]

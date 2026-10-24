@@ -45,6 +45,12 @@
 //! reports — live in [`ComAmazonawsCloudwatchlogsLogs20140328State::deliveries`], each one
 //! a [`DeliveryRecord`].
 //!
+//! The account's delivery destinations — each "a logical object that represents the actual
+//! delivery destination", which `PutDeliveryDestination` creates or updates and
+//! `GetDeliveryDestination` reports — live in
+//! [`ComAmazonawsCloudwatchlogsLogs20140328State::delivery_destinations`], each one a
+//! [`DeliveryDestinationRecord`], keyed by the name that identifies one.
+//!
 //! The account's log anomaly detectors — "one anomaly detector in the account", which
 //! `CreateLogAnomalyDetector` creates and `GetLogAnomalyDetector` reports — live in
 //! [`ComAmazonawsCloudwatchlogsLogs20140328State::anomaly_detectors`], each one an
@@ -533,6 +539,18 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// its destination are both named by their own resources, so it lives here and not on
     /// [`LogGroupRecord`].
     pub deliveries: BTreeMap<String, DeliveryRecord>,
+    /// Every delivery destination of this account — the resource `PutDeliveryDestination`
+    /// creates or updates and `GetDeliveryDestination` / `DescribeDeliveryDestinations`
+    /// report — keyed by `DeliveryDestination$name`, which is the only thing that
+    /// identifies one ("This name must be unique for all delivery destinations in your
+    /// account"). A `BTreeMap` so `DescribeDeliveryDestinations` enumerates in
+    /// destination-name order without re-sorting, which is also what makes its pagination
+    /// cursor stable.
+    ///
+    /// A delivery destination is a LOGICAL object naming a resource of another service (or
+    /// another log group), so it lives here rather than on [`LogGroupRecord`]: deleting the
+    /// log group it points at does not delete the destination.
+    pub delivery_destinations: BTreeMap<String, DeliveryDestinationRecord>,
     /// Every log anomaly detector of this account — the resource `CreateLogAnomalyDetector`
     /// creates and `GetLogAnomalyDetector` reports — keyed by `anomalyDetectorArn`, the one
     /// member every other anomaly-detector operation identifies one by. A `BTreeMap` so
@@ -953,6 +971,164 @@ pub fn delivery_destination_type_for_arn(arn: &str) -> Option<&'static str> {
         .iter()
         .find(|(namespace, _)| vendor == *namespace)
         .map(|(_, destination_type)| *destination_type)
+}
+
+/// The `DeliveryDestinationType` of a TRACE delivery destination: the one value of the
+/// model's `DeliveryDestinationType` that `PutDeliveryDestination` documents as needing no
+/// `deliveryDestinationConfiguration` ("deliveryDestinationConfiguration is required for
+/// CloudWatch Logs, Amazon S3, Firehose log delivery destinations and not required for X-Ray
+/// trace delivery destinations"), and the one kind `roleArn` is supported for ("This
+/// parameter is supported only for X-Ray trace delivery destinations").
+///
+/// Spelled as the model's enum spells it
+/// ([`crate::ops::types::DELIVERY_DESTINATION_TYPE_VALUES`]), never a string typed here.
+pub const TRACE_DELIVERY_DESTINATION_TYPE: &str = "XRAY";
+
+/// The ARN service namespace of CloudWatch Logs itself, the vendor whose
+/// `destinationResourceArn` must name a log group.
+const CLOUDWATCH_LOGS_VENDOR: &str = "logs";
+
+/// THE EMULATOR'S OWN CEILING on the delivery destinations one account holds, not a quota
+/// cited from AWS: each destination keeps its configuration and tag set in memory for as
+/// long as the process runs and nothing expires one, so `PutDeliveryDestination` refuses to
+/// CREATE more than this many with the `ServiceQuotaExceededException` it models ("This
+/// request exceeds a service quota") rather than growing without bound on request. A put
+/// that UPDATES a destination already stored is never refused by it: it adds nothing.
+pub const MAX_DELIVERY_DESTINATIONS: usize = 1_000;
+
+/// Judge a `DeliveryDestinationConfiguration$destinationResourceArn`, answering the
+/// `DeliveryDestinationType` of the resource it names or the message to refuse it with.
+///
+/// The resources a delivery destination can represent are the ones the member documents —
+/// "That Amazon Web Services destination can be a log group in CloudWatch Logs, an Amazon S3
+/// bucket, or a delivery stream in Firehose" — plus the X-Ray trace destination the model's
+/// `DeliveryDestinationType` adds, which is exactly
+/// [`DELIVERY_DESTINATION_VENDOR_TYPES`]. A CloudWatch Logs ARN qualifies only when it names
+/// a LOG GROUP: a log stream or any other `logs` resource is not a destination logs can be
+/// delivered to.
+///
+/// Whether that resource exists is a question this service cannot answer for another
+/// service's bucket or stream, and the operation documents no existence requirement, so it
+/// is not asked here.
+pub fn check_destination_resource_arn(arn: &str) -> Result<&'static str, String> {
+    if let Some(message) = unparsable_arn_message("destinationResourceArn", arn) {
+        return Err(message);
+    }
+    let Some(destination_type) = delivery_destination_type_for_arn(arn) else {
+        return Err(format!(
+            "destinationResourceArn must name a resource of one of: [{}]",
+            DELIVERY_DESTINATION_VENDOR_TYPES
+                .iter()
+                .map(|(vendor, _)| *vendor)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    };
+    let names_a_cloudwatch_logs_resource = arn_service_and_resource(arn)
+        .is_some_and(|(vendor, _resource)| vendor == CLOUDWATCH_LOGS_VENDOR);
+    if names_a_cloudwatch_logs_resource && !is_log_group_arn(arn) {
+        return Err(
+            "destinationResourceArn for a CloudWatch Logs delivery destination must name a \
+             log group"
+                .to_string(),
+        );
+    }
+    Ok(destination_type)
+}
+
+/// One delivery destination — "a logical object that represents the actual delivery
+/// destination", the Amazon Web Services resource logs are sent to — as it is stored. Every
+/// member of the model's `DeliveryDestination` shape is reported from this record, so
+/// `GetDeliveryDestination` answers from state alone.
+#[derive(Debug, Clone)]
+pub struct DeliveryDestinationRecord {
+    /// `DeliveryDestination$name` — "The name of this delivery destination." Also the key
+    /// the store enumerates by, because the name "must be unique for all delivery
+    /// destinations in your account".
+    pub name: String,
+    /// `DeliveryDestination$arn` — "The Amazon Resource Name (ARN) that uniquely identifies
+    /// this delivery destination", as [`delivery_destination_arn`] builds it.
+    pub arn: String,
+    /// `DeliveryDestination$deliveryDestinationType` — "Displays whether this delivery
+    /// destination is CloudWatch Logs, Amazon S3, Firehose, or X-Ray". `None` only for a
+    /// destination created with neither a configuration nor a type, which no accepted put
+    /// produces.
+    pub delivery_destination_type: Option<String>,
+    /// `DeliveryDestination$outputFormat` — "The format of the logs that are sent to this
+    /// delivery destination."
+    pub output_format: Option<String>,
+    /// `DeliveryDestinationConfiguration$destinationResourceArn` — "The ARN of the Amazon
+    /// Web Services destination that this delivery destination represents." `None` for a
+    /// trace delivery destination, the one kind that needs no configuration.
+    pub destination_resource_arn: Option<String>,
+    /// `DeliveryDestination$roleArn` — "The ARN of the IAM role that CloudWatch Logs assumes
+    /// to deliver to this delivery destination. This field is present only for X-Ray trace
+    /// delivery destinations that were created with a role."
+    pub role_arn: Option<String>,
+    /// `DeliveryDestination$tags` — "The tags that have been assigned to this delivery
+    /// destination." A `BTreeMap` so the stored order is stable; `Tags` is `@length(min: 1)`,
+    /// so a destination carrying none reports no member at all.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl DeliveryDestinationRecord {
+    /// A brand-new delivery destination of `destination_type`, with its ARN DERIVED rather
+    /// than taken from the caller: the ARN identifies the logical object this service just
+    /// created, so it is built from the name and the request's Region.
+    ///
+    /// The optional members a put may name — `outputFormat`, the configuration's
+    /// `destinationResourceArn`, `roleArn`, `tags` — are left at their "the request named
+    /// none" value and set on the returned record by the caller that has them.
+    pub fn new(region: &str, name: &str, destination_type: Option<&str>) -> Self {
+        Self {
+            name: name.to_string(),
+            arn: delivery_destination_arn(region, name),
+            delivery_destination_type: destination_type.map(ToString::to_string),
+            output_format: None,
+            destination_resource_arn: None,
+            role_arn: None,
+            tags: BTreeMap::new(),
+        }
+    }
+
+    /// Whether this destination is a TRACE delivery destination
+    /// ([`TRACE_DELIVERY_DESTINATION_TYPE`]) — the one kind that carries no destination
+    /// configuration and the one kind `roleArn` applies to.
+    pub fn is_trace_destination(&self) -> bool {
+        self.delivery_destination_type.as_deref() == Some(TRACE_DELIVERY_DESTINATION_TYPE)
+    }
+
+    /// This destination as the model's `DeliveryDestination` structure, which is what
+    /// `PutDeliveryDestination`, `GetDeliveryDestination` and `DescribeDeliveryDestinations`
+    /// all report, so one record renders the same way through any of them.
+    pub fn reported(&self) -> crate::ops::types::DeliveryDestination {
+        crate::ops::types::DeliveryDestination {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            delivery_destination_type: self.delivery_destination_type.clone(),
+            output_format: self.output_format.clone(),
+            delivery_destination_configuration: self.destination_resource_arn.clone().map(
+                |destination_resource_arn| crate::ops::types::DeliveryDestinationConfiguration {
+                    destination_resource_arn,
+                },
+            ),
+            role_arn: self.role_arn.clone(),
+            tags: (!self.tags.is_empty()).then(|| {
+                self.tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// A delivery destination's ARN, the form `DeliveryDestination$arn` ("The Amazon Resource
+/// Name (ARN) that uniquely identifies this delivery destination") carries: a
+/// `delivery-destination` resource of this service, identified by the destination's own
+/// name.
+pub fn delivery_destination_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn("logs", region, &format!("delivery-destination:{name}"))
 }
 
 /// One log anomaly detector — "one anomaly detector in the account" — as it is stored.

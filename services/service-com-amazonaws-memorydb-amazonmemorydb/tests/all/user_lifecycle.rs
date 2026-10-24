@@ -137,8 +137,8 @@ async fn a_created_user_is_read_back_from_state() {
             ]),
             json!({ "Type": "password", "PasswordCount": 2 }),
             // The service canonicalises the rule list, which always states the pub/sub
-            // channel permission.
-            "on ~app:* resetchannels +@read",
+            // channel permission and the command baseline.
+            "on ~app:* resetchannels -@all +@read",
             "6.2",
         ),
         (
@@ -146,7 +146,7 @@ async fn a_created_user_is_read_back_from_state() {
             "off ~* +@admin",
             json!({ "Type": "iam" }),
             json!({ "Type": "iam" }),
-            "off ~* resetchannels +@admin",
+            "off ~* resetchannels -@all +@admin",
             // IAM authentication arrived with engine version 7.0.
             "7.0",
         ),

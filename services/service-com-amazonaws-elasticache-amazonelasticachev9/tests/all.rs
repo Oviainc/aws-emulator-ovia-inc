@@ -111,6 +111,10 @@ mod rbac_user_access_string_and_deletion;
 #[path = "all/cache_node_type_validation.rs"]
 mod cache_node_type_validation;
 
+// Appended for the same reason: the `ModifyUserGroup` membership-change suite.
+#[path = "all/user_group_membership.rs"]
+mod user_group_membership;
+
 // Appended for the same reason: the `DeleteSnapshot` suite.
 #[path = "all/snapshot_delete.rs"]
 mod snapshot_delete;

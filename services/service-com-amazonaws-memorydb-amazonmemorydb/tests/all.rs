@@ -15,6 +15,8 @@
 mod acl_membership;
 #[path = "all/acl_pending_changes.rs"]
 mod acl_pending_changes;
+#[path = "all/canonical_access_string.rs"]
+mod canonical_access_string;
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
 #[path = "all/default_parameter_groups.rs"]

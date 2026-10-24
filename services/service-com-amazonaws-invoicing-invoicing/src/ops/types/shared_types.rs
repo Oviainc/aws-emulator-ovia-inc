@@ -11,6 +11,91 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-invoicing-invoicing.json");
 
+/// Which WIRE KEY an error body of this service carries its explanatory text under.
+///
+/// Recorded behaviour, and a property of the PLANE that answers rather than of the error
+/// shape: every recorded refusal of the PROCUREMENT-PORTAL-PREFERENCE plane keys that
+/// text as `Message`, while the invoice-unit, invoice-profile and tag planes key it as
+/// `message` — the name the model spells the member with (`smithy_query(query="shape",
+/// shape="ResourceNotFoundException,ValidationException")`: a member `message`, no
+/// `@jsonName`). Invoicing is fronted by more than one backend — the same recorded
+/// detail that makes the invoice-unit plane announce the awsJson `1.1` media type while
+/// the tag plane announces `1.0` (see `crate::service`) — and the key a client reads is
+/// whatever the plane that answered wrote.
+///
+/// The awsJson codecs take a member's NAME as its JSON key (`@jsonName` is honoured by
+/// restJson1 only), so the key is a property of the member SCHEMA the text is written
+/// through: each error shape below therefore carries the pair of schemas
+/// [`message_member_schemas`] emits, and this picks between them per refusal. It is NOT
+/// a modelled member of any shape, so it never reaches the wire itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MessageKey {
+    /// `message`: the member name the model spells. The invoice-unit, invoice-profile
+    /// and tag planes, and the default — a refusal says nothing about a plane unless it
+    /// is answered by one that keys the text differently.
+    #[default]
+    ModelMemberName,
+    /// `Message`: the procurement-portal-preference plane.
+    Capitalised,
+}
+
+impl MessageKey {
+    /// The member schema the explanatory text is written through under this key: one of
+    /// the pair [`message_member_schemas`] emits for an error shape of this service.
+    fn schema<'s>(
+        self,
+        model_member_name: &'s ::aws_smithy_schema::Schema,
+        capitalised: &'s ::aws_smithy_schema::Schema,
+    ) -> &'s ::aws_smithy_schema::Schema {
+        match self {
+            Self::ModelMemberName => model_member_name,
+            Self::Capitalised => capitalised,
+        }
+    }
+}
+
+/// Emit the PAIR of member schemas one error shape of this service writes its
+/// explanatory text through: the member keyed as the model names it (`message`) and the
+/// same member keyed `Message`, which is what [`MessageKey`] picks between.
+///
+/// The two differ only in the WIRE NAME — the shape id stays the model's own
+/// `<Shape>$message`, and so does the member index — because the only thing that differs
+/// between the planes is the key a client reads. `@jsonName` is carried on the
+/// capitalised one as well, so a codec that honours it (restJson1) spells the member the
+/// way the awsJson codecs do here, and `@xmlName` keeps the `Message` casing the XML
+/// error envelopes use, exactly as the model-derived expansion emits it.
+macro_rules! message_member_schemas {
+    ($shape:literal, $index:literal, $model_member_name:ident, $capitalised:ident) => {
+        static $model_member_name: ::aws_smithy_schema::Schema =
+            ::aws_smithy_schema::Schema::new_member(
+                ::aws_smithy_schema::ShapeId::from_static(
+                    concat!("com.amazonaws.invoicing#", $shape, "$message"),
+                    "com.amazonaws.invoicing",
+                    "message",
+                ),
+                ::aws_smithy_schema::ShapeType::String,
+                "message",
+                $index,
+            )
+            .with_xml_name("Message");
+
+        static $capitalised: ::aws_smithy_schema::Schema =
+            ::aws_smithy_schema::Schema::new_member(
+                ::aws_smithy_schema::ShapeId::from_static(
+                    concat!("com.amazonaws.invoicing#", $shape, "$message"),
+                    "com.amazonaws.invoicing",
+                    "message",
+                ),
+                ::aws_smithy_schema::ShapeType::String,
+                // THE wire key on the awsJson protocols, which read the member name.
+                "Message",
+                $index,
+            )
+            .with_xml_name("Message")
+            .with_json_name("Message");
+    };
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.invoicing#AccessDeniedException")]
 #[derive(Debug, Clone, Default)]
 pub struct AccessDeniedException {
@@ -26,9 +111,10 @@ pub struct InternalServerException {
 }
 
 /// `ResourceNotFoundException` — hand-written rather than expanded from the model,
-/// because the ARN member's WIRE NAME is not the model's member name.
+/// because neither the ARN member's WIRE NAME nor the key its message travels under is
+/// the model's member name.
 ///
-/// The model spells that member `resourceName` (`smithy_query(query="shape",
+/// The model spells that ARN member `resourceName` (`smithy_query(query="shape",
 /// shape="ResourceNotFoundException")`), but every recorded 404 of this service
 /// carries the requested ARN under the key `resourceId`: Invoicing is served by the
 /// `awsinsightsindexservice` backend — the recorded error bodies' `__type` values are
@@ -36,32 +122,30 @@ pub struct InternalServerException {
 /// reaches a client. The awsJson codecs take a member's NAME as its JSON key
 /// (`@jsonName` is honoured by restJson1 only), so the wire name has to be set on the
 /// member schema itself, which the `#[smithy_macros::smithy(shape = …)]` expansion
-/// derives from the model and cannot be told.
+/// derives from the model and cannot be told. The message member is the same story one
+/// step further: WHICH key it travels under depends on the plane that answered, which
+/// [`MessageKey`] carries.
 ///
 /// Everything below is what that expansion emits for an `@error` structure — the
 /// member statics, the `SCHEMA_*` static each operation's error enum references,
 /// `shape_name`, `Display`, `Error` and `SerializableStruct` — with the one member
-/// name changed.
+/// name changed and the message member's key chosen per refusal.
 #[derive(Debug, Clone, Default)]
 pub struct ResourceNotFoundException {
     pub message: Option<String>,
     /// The model's `resourceName`: the ARN of the resource that was not found.
     /// Serialized as `resourceId` (see the note above).
     pub resource_id: Option<String>,
+    /// NOT a modelled member: which wire key [`Self::message`] travels under.
+    pub message_key: MessageKey,
 }
 
-static RESOURCE_NOT_FOUND_EXCEPTION_M_MESSAGE: ::aws_smithy_schema::Schema =
-    ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.invoicing#ResourceNotFoundException$message",
-            "com.amazonaws.invoicing",
-            "message",
-        ),
-        ::aws_smithy_schema::ShapeType::String,
-        "message",
-        0,
-    )
-    .with_xml_name("Message");
+message_member_schemas!(
+    "ResourceNotFoundException",
+    0,
+    RESOURCE_NOT_FOUND_EXCEPTION_M_MESSAGE,
+    RESOURCE_NOT_FOUND_EXCEPTION_M_MESSAGE_CAPITALISED
+);
 
 /// The ARN member: the model's `resourceName`, wired as `resourceId`.
 static RESOURCE_NOT_FOUND_EXCEPTION_M_RESOURCE_ID: ::aws_smithy_schema::Schema =
@@ -88,6 +172,9 @@ pub static SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION: ::aws_smithy_schema::Schema =
             "ResourceNotFoundException",
         ),
         ::aws_smithy_schema::ShapeType::Structure,
+        // The members as the MODEL declares them, which is what this shape's schema is:
+        // the key a refusal's message is written under is chosen per refusal (see
+        // [`MessageKey`]) and is not a second member of the shape.
         &[
             &RESOURCE_NOT_FOUND_EXCEPTION_M_MESSAGE,
             &RESOURCE_NOT_FOUND_EXCEPTION_M_RESOURCE_ID,
@@ -119,7 +206,13 @@ impl ::aws_smithy_schema::serde::SerializableStruct for ResourceNotFoundExceptio
         serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
     ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
         if let Some(message) = self.message.as_ref() {
-            serializer.write_string(&RESOURCE_NOT_FOUND_EXCEPTION_M_MESSAGE, message.as_str())?;
+            serializer.write_string(
+                self.message_key.schema(
+                    &RESOURCE_NOT_FOUND_EXCEPTION_M_MESSAGE,
+                    &RESOURCE_NOT_FOUND_EXCEPTION_M_MESSAGE_CAPITALISED,
+                ),
+                message.as_str(),
+            )?;
         }
         if let Some(resource_id) = self.resource_id.as_ref() {
             serializer.write_string(
@@ -137,13 +230,142 @@ pub struct ThrottlingException {
     pub message: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.invoicing#ValidationException")]
+/// `ValidationException` — hand-written rather than expanded from the model, for the
+/// same reason as [`ResourceNotFoundException`] above: the key its message travels under
+/// is decided by the PLANE that answers, which [`MessageKey`] carries, and the
+/// `#[smithy_macros::smithy(shape = …)]` expansion derives every member's wire name from
+/// the model and cannot be told.
+///
+/// Everything below is what that expansion emits for an `@error` structure — the member
+/// statics, the `SCHEMA_*` static each operation's error enum references, `shape_name`,
+/// `Display`, `Error` and `SerializableStruct` — with the message member's key chosen per
+/// refusal.
 #[derive(Debug, Clone, Default)]
 pub struct ValidationException {
     pub message: Option<String>,
     pub resource_name: Option<String>,
     pub reason: Option<String>,
     pub field_list: Option<Vec<ValidationExceptionField>>,
+    /// NOT a modelled member: which wire key [`Self::message`] travels under.
+    pub message_key: MessageKey,
+}
+
+message_member_schemas!(
+    "ValidationException",
+    0,
+    VALIDATION_EXCEPTION_M_MESSAGE,
+    VALIDATION_EXCEPTION_M_MESSAGE_CAPITALISED
+);
+
+static VALIDATION_EXCEPTION_M_RESOURCE_NAME: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.invoicing#ValidationException$resourceName",
+            "com.amazonaws.invoicing",
+            "resourceName",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "resourceName",
+        1,
+    );
+
+/// `reason`, whose target is the `ValidationExceptionReason` enum — a string on the wire
+/// ([`VALIDATION_EXCEPTION_REASON_VALUES`] are the values it admits).
+static VALIDATION_EXCEPTION_M_REASON: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.invoicing#ValidationException$reason",
+            "com.amazonaws.invoicing",
+            "reason",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "reason",
+        2,
+    );
+
+/// `fieldList`, whose elements are written with [`ValidationExceptionField::SCHEMA`].
+static VALIDATION_EXCEPTION_M_FIELD_LIST: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.invoicing#ValidationException$fieldList",
+            "com.amazonaws.invoicing",
+            "fieldList",
+        ),
+        ::aws_smithy_schema::ShapeType::List,
+        "fieldList",
+        3,
+    );
+
+pub static SCHEMA_VALIDATION_EXCEPTION: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.invoicing#ValidationException",
+            "com.amazonaws.invoicing",
+            "ValidationException",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        // The members as the MODEL declares them; see the note on
+        // [`SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION`] about the message key.
+        &[
+            &VALIDATION_EXCEPTION_M_MESSAGE,
+            &VALIDATION_EXCEPTION_M_RESOURCE_NAME,
+            &VALIDATION_EXCEPTION_M_REASON,
+            &VALIDATION_EXCEPTION_M_FIELD_LIST,
+        ],
+    );
+
+impl ValidationException {
+    /// The wire error code (`__type`): the model's shape name, unchanged.
+    pub const fn shape_name() -> &'static str {
+        "ValidationException"
+    }
+}
+
+impl ::std::fmt::Display for ValidationException {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        write!(f, "ValidationException")?;
+        if let Some(message) = &self.message {
+            write!(f, ": {message}")?;
+        }
+        Ok(())
+    }
+}
+
+impl ::std::error::Error for ValidationException {}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ValidationException {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(message) = self.message.as_ref() {
+            serializer.write_string(
+                self.message_key.schema(
+                    &VALIDATION_EXCEPTION_M_MESSAGE,
+                    &VALIDATION_EXCEPTION_M_MESSAGE_CAPITALISED,
+                ),
+                message.as_str(),
+            )?;
+        }
+        if let Some(resource_name) = self.resource_name.as_ref() {
+            serializer.write_string(
+                &VALIDATION_EXCEPTION_M_RESOURCE_NAME,
+                resource_name.as_str(),
+            )?;
+        }
+        if let Some(reason) = self.reason.as_ref() {
+            serializer.write_string(&VALIDATION_EXCEPTION_M_REASON, reason.as_str())?;
+        }
+        if let Some(field_list) = self.field_list.as_ref() {
+            serializer.write_list(&VALIDATION_EXCEPTION_M_FIELD_LIST, &|elements| {
+                for field in field_list.iter() {
+                    elements.write_struct(&ValidationExceptionField::SCHEMA, field)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
 }
 
 /// `ValidationExceptionField` — hand-written rather than expanded from the model,
@@ -332,18 +554,165 @@ pub struct Contact {
     pub email: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.invoicing#ConflictException")]
+/// `ConflictException` — hand-written for the same reason as the two error shapes above:
+/// the key its message travels under is the answering plane's, which [`MessageKey`]
+/// carries (see [`ResourceNotFoundException`]).
 #[derive(Debug, Clone, Default)]
 pub struct ConflictException {
     pub message: Option<String>,
     pub resource_id: Option<String>,
     pub resource_type: Option<String>,
+    /// NOT a modelled member: which wire key [`Self::message`] travels under.
+    pub message_key: MessageKey,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.invoicing#ServiceQuotaExceededException")]
+message_member_schemas!(
+    "ConflictException",
+    0,
+    CONFLICT_EXCEPTION_M_MESSAGE,
+    CONFLICT_EXCEPTION_M_MESSAGE_CAPITALISED
+);
+
+static CONFLICT_EXCEPTION_M_RESOURCE_ID: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.invoicing#ConflictException$resourceId",
+            "com.amazonaws.invoicing",
+            "resourceId",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "resourceId",
+        1,
+    );
+
+static CONFLICT_EXCEPTION_M_RESOURCE_TYPE: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.invoicing#ConflictException$resourceType",
+            "com.amazonaws.invoicing",
+            "resourceType",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "resourceType",
+        2,
+    );
+
+pub static SCHEMA_CONFLICT_EXCEPTION: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.invoicing#ConflictException",
+            "com.amazonaws.invoicing",
+            "ConflictException",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &CONFLICT_EXCEPTION_M_MESSAGE,
+            &CONFLICT_EXCEPTION_M_RESOURCE_ID,
+            &CONFLICT_EXCEPTION_M_RESOURCE_TYPE,
+        ],
+    );
+
+impl ConflictException {
+    /// The wire error code (`__type`): the model's shape name, unchanged.
+    pub const fn shape_name() -> &'static str {
+        "ConflictException"
+    }
+}
+
+impl ::std::fmt::Display for ConflictException {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        write!(f, "ConflictException")?;
+        if let Some(message) = &self.message {
+            write!(f, ": {message}")?;
+        }
+        Ok(())
+    }
+}
+
+impl ::std::error::Error for ConflictException {}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ConflictException {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(message) = self.message.as_ref() {
+            serializer.write_string(
+                self.message_key.schema(
+                    &CONFLICT_EXCEPTION_M_MESSAGE,
+                    &CONFLICT_EXCEPTION_M_MESSAGE_CAPITALISED,
+                ),
+                message.as_str(),
+            )?;
+        }
+        if let Some(resource_id) = self.resource_id.as_ref() {
+            serializer.write_string(&CONFLICT_EXCEPTION_M_RESOURCE_ID, resource_id.as_str())?;
+        }
+        if let Some(resource_type) = self.resource_type.as_ref() {
+            serializer.write_string(&CONFLICT_EXCEPTION_M_RESOURCE_TYPE, resource_type.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+/// `ServiceQuotaExceededException` — hand-written for the same reason as the error shapes
+/// above: the key its message travels under is the answering plane's, which
+/// [`MessageKey`] carries (see [`ResourceNotFoundException`]). `message` is `@required`,
+/// so it is a bare field rather than an `Option`.
 #[derive(Debug, Clone, Default)]
 pub struct ServiceQuotaExceededException {
     pub message: String,
+    /// NOT a modelled member: which wire key [`Self::message`] travels under.
+    pub message_key: MessageKey,
+}
+
+message_member_schemas!(
+    "ServiceQuotaExceededException",
+    0,
+    SERVICE_QUOTA_EXCEEDED_EXCEPTION_M_MESSAGE,
+    SERVICE_QUOTA_EXCEEDED_EXCEPTION_M_MESSAGE_CAPITALISED
+);
+
+pub static SCHEMA_SERVICE_QUOTA_EXCEEDED_EXCEPTION: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.invoicing#ServiceQuotaExceededException",
+            "com.amazonaws.invoicing",
+            "ServiceQuotaExceededException",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&SERVICE_QUOTA_EXCEEDED_EXCEPTION_M_MESSAGE],
+    );
+
+impl ServiceQuotaExceededException {
+    /// The wire error code (`__type`): the model's shape name, unchanged.
+    pub const fn shape_name() -> &'static str {
+        "ServiceQuotaExceededException"
+    }
+}
+
+impl ::std::fmt::Display for ServiceQuotaExceededException {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        write!(f, "ServiceQuotaExceededException: {}", self.message)
+    }
+}
+
+impl ::std::error::Error for ServiceQuotaExceededException {}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ServiceQuotaExceededException {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        serializer.write_string(
+            self.message_key.schema(
+                &SERVICE_QUOTA_EXCEEDED_EXCEPTION_M_MESSAGE,
+                &SERVICE_QUOTA_EXCEEDED_EXCEPTION_M_MESSAGE_CAPITALISED,
+            ),
+            self.message.as_str(),
+        )?;
+        Ok(())
+    }
 }
 
 /// The values `BillType` accepts on the wire.

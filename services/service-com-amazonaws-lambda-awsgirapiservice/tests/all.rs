@@ -21,6 +21,8 @@ mod capacity_provider_bounds;
 mod capacity_provider_naming;
 #[path = "all/capacity_providers.rs"]
 mod capacity_providers;
+#[path = "all/code_signing_configs.rs"]
+mod code_signing_configs;
 #[path = "all/event_source_mappings.rs"]
 mod event_source_mappings;
 #[path = "all/function_aliases.rs"]

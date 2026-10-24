@@ -52,7 +52,7 @@
 
 use smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
 
-use crate::ops::types::{ValidationException, ValidationExceptionField};
+use crate::ops::types::{MessageKey, ValidationException, ValidationExceptionField};
 
 /// The error code this service answers an input-constraint violation with: its own
 /// modelled `ValidationException`, which every operation declares and which the model
@@ -178,6 +178,12 @@ pub(crate) fn field_validation_failed(violations: &[Violation]) -> ValidationExc
         message: envelope(violations).or_else(|| Some(VALIDATION_EXCEPTION_DOC.to_string())),
         resource_name: None,
         reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
+        // A refusal of the REQUEST is answered by the input validator in FRONT of the
+        // service, not by the plane the request was for (see this module's docs and
+        // `crate::service`), so the text travels under the member name the model spells
+        // — the key every recorded refusal of a request carries
+        // (`crate::ops::types::MessageKey`).
+        message_key: MessageKey::ModelMemberName,
         field_list: Some(
             violations
                 .iter()

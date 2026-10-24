@@ -219,6 +219,12 @@ fn not_found_with_administrator() -> Vec<Row> {
             lookup: Some(UNKNOWN_RESOURCE_SET_ID.to_string()),
         },
         Row {
+            case: "DeleteResourceSet with an unknown identifier",
+            operation: "DeleteResourceSet",
+            body: json!({ "Identifier": OTHER_UNKNOWN_RESOURCE_SET_ID }),
+            lookup: Some(OTHER_UNKNOWN_RESOURCE_SET_ID.to_string()),
+        },
+        Row {
             case: "BatchAssociateResource with a second unknown resource-set identifier",
             operation: "BatchAssociateResource",
             body: json!({

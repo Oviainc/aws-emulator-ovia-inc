@@ -29,6 +29,10 @@ use crate::fhir_datastore_lifecycle::{error_code, HealthLake, PAST_TRANSITION};
 /// `service_com_amazonaws_healthlake_healthlake::state` spells it. Read from the
 /// crate rather than retyped, so the test and the service cannot drift.
 const NOT_FOUND: &str = service_com_amazonaws_healthlake_healthlake::state::DATASTORE_NOT_FOUND_MESSAGE;
+/// The fixed sentence this service refuses a data transformation profile no record
+/// holds with.
+const PROFILE_NOT_FOUND: &str =
+    service_com_amazonaws_healthlake_healthlake::state::PROFILE_NOT_FOUND_MESSAGE;
 
 /// The text this service refuses a mutation on a data store that is not
 /// `ACTIVE` with.
@@ -57,11 +61,18 @@ fn enum_envelope(path: &str, allowed: &[&str]) -> String {
 }
 
 /// Assert that `payload` is this service's not-found answer for `request_value`:
-/// the fixed text, and no echo of what was asked for.
-fn assert_not_found(case: &str, status: u16, payload: &Value, request_value: &str) {
+/// `expected`, the fixed text of the resource that was addressed, and no echo of what
+/// was asked for.
+fn assert_not_found(
+    case: &str,
+    status: u16,
+    payload: &Value,
+    request_value: &str,
+    expected: &str,
+) {
     assert_eq!(
         status, 400,
-        "case {case:?}: a data store no record holds must answer 400, got {status}: {payload}"
+        "case {case:?}: a resource no record holds must answer 400, got {status}: {payload}"
     );
     assert_eq!(
         error_code(payload),
@@ -70,8 +81,8 @@ fn assert_not_found(case: &str, status: u16, payload: &Value, request_value: &st
     );
     let message = error_message(payload);
     assert_eq!(
-        message, NOT_FOUND,
-        "case {case:?}: the not-found text is fixed, expected {NOT_FOUND:?}, got {message:?}"
+        message, expected,
+        "case {case:?}: the not-found text is fixed, expected {expected:?}, got {message:?}"
     );
     // The fixed sentence is short and shares letters with any input, so the
     // echo check only applies to a value long enough that its presence would be
@@ -131,34 +142,56 @@ async fn the_not_found_text_is_fixed_and_quotes_no_requested_identifier() {
             let (status, payload) = service
                 .call(operation, &json!({ "DatastoreId": id }))
                 .await;
-            assert_not_found(&format!("{operation} with id {id:?}"), status, &payload, id);
+            assert_not_found(
+                &format!("{operation} with id {id:?}"),
+                status,
+                &payload,
+                id,
+                NOT_FOUND,
+            );
         }
     }
 
     // And every operation that resolves one BY ARN. Rows span the ARN forms the
-    // modelled `AmazonResourceName` pattern admits: another resource type, an
-    // unknown data store, the real data store in another region, in another
-    // account, and in another partition.
+    // modelled `AmazonResourceName` pattern admits, each paired with the fixed
+    // sentence of the resource its form names: a data transformation profile no
+    // profile was minted under, an unknown data store, and the real data store in
+    // another region, in another account, and in another partition.
     let parts: Vec<&str> = real_arn.split(':').collect();
     assert_eq!(parts.len(), 6, "a data store ARN has six fields: {real_arn}");
-    let arn_cases = vec![
-        format!(
-            "arn:aws:healthlake:us-east-1:000000000000:dataTransformationProfile/{}",
-            "deadbeefdeadbeefdeadbeefdeadbeef"
+    let arn_cases: Vec<(String, &str)> = vec![
+        (
+            format!(
+                "arn:aws:healthlake:us-east-1:000000000000:dataTransformationProfile/{}",
+                "deadbeefdeadbeefdeadbeefdeadbeef"
+            ),
+            PROFILE_NOT_FOUND,
         ),
-        "arn:aws:healthlake:us-east-1:000000000000:datastore/fhir/00000000000000000000000000000000"
-            .to_string(),
-        format!(
-            "arn:aws:healthlake:eu-west-1:{}:datastore/fhir/{real}",
-            parts[4]
+        (
+            "arn:aws:healthlake:us-east-1:000000000000:datastore/fhir/00000000000000000000000000000000"
+                .to_string(),
+            NOT_FOUND,
         ),
-        format!("arn:aws:healthlake:{}:210987654321:datastore/fhir/{real}", parts[3]),
-        format!(
-            "arn:aws-us-gov:healthlake:{}:{}:datastore/fhir/{real}",
-            parts[3], parts[4]
+        (
+            format!(
+                "arn:aws:healthlake:eu-west-1:{}:datastore/fhir/{real}",
+                parts[4]
+            ),
+            NOT_FOUND,
+        ),
+        (
+            format!("arn:aws:healthlake:{}:210987654321:datastore/fhir/{real}", parts[3]),
+            NOT_FOUND,
+        ),
+        (
+            format!(
+                "arn:aws-us-gov:healthlake:{}:{}:datastore/fhir/{real}",
+                parts[3], parts[4]
+            ),
+            NOT_FOUND,
         ),
     ];
-    for arn in &arn_cases {
+    for (arn, expected) in &arn_cases {
         for operation in ["ListTagsForResource", "TagResource"] {
             let mut request = json!({ "ResourceARN": arn });
             if operation == "TagResource" {
@@ -170,6 +203,7 @@ async fn the_not_found_text_is_fixed_and_quotes_no_requested_identifier() {
                 status,
                 &payload,
                 arn,
+                expected,
             );
         }
     }

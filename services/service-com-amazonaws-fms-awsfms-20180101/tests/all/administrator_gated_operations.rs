@@ -62,6 +62,9 @@ fn error_message(body: &Value) -> String {
 
 /// Make this account the Firewall Manager default administrator, which is what
 /// opens the gate.
+///
+/// `pub(crate)` so a sibling suite in this test target opens the gate the same
+/// way rather than growing a second copy of it.
 pub(crate) async fn associate_admin(router: &MultiServiceRouter) {
     let (status, body) = call(
         router,
@@ -79,6 +82,9 @@ pub(crate) async fn associate_admin(router: &MultiServiceRouter) {
 /// resources whose own writers (`PutAppsList`, `AssociateThirdPartyFirewall`,
 /// resource discovery) are still stubs tracked by their own issues, and the
 /// managed lists no API creates.
+///
+/// `pub(crate)` so a sibling suite in this test target reaches the store through
+/// the same seam.
 pub(crate) fn with_store<R>(
     engine: &Arc<engine::InMemoryEngine>,
     body: impl FnOnce(&mut state::ComAmazonawsFmsAwsfms20180101State) -> R,
@@ -225,6 +231,10 @@ fn gated_calls() -> Vec<Gated> {
         },
         Gated {
             operation: "GetResourceSet",
+            body: json!({ "Identifier": UNKNOWN_RESOURCE_SET_ID }),
+        },
+        Gated {
+            operation: "DeleteResourceSet",
             body: json!({ "Identifier": UNKNOWN_RESOURCE_SET_ID }),
         },
     ]

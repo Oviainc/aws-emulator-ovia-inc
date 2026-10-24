@@ -584,8 +584,10 @@ async fn a_resource_name_is_folded_to_lower_case() {
 }
 
 /// `CreateUser` stores the CANONICAL access string: the rules one space apart, with the
-/// pub/sub channel permission always stated — the engine's `resetchannels` default when
-/// the request named none.
+/// pub/sub channel permission and the command baseline always stated — the engine's
+/// `resetchannels` / `-@all` defaults when the request named neither. The whole rule is
+/// tabled in `canonical_access_string`; these rows are the name-and-folding suite's own
+/// check that a create stores it.
 #[tokio::test]
 async fn an_access_string_is_stored_in_its_canonical_form() {
     let router = router();
@@ -600,15 +602,15 @@ async fn an_access_string_is_stored_in_its_canonical_form() {
             "on ~* resetchannels +@all",
         ),
         ("on ~* allchannels +@all", "on ~* allchannels +@all"),
-        ("on ~app:* &news:* -@admin", "on ~app:* &news:* -@admin"),
+        ("on ~app:* &news:* -@admin", "on ~app:* &news:* -@all -@admin"),
         (
             "off ~key1 ~key2 +get +set",
-            "off ~key1 ~key2 resetchannels +get +set",
+            "off ~key1 ~key2 resetchannels -@all +get +set",
         ),
-        // No command rule at all: the channel default goes at the end.
-        ("on ~*", "on ~* resetchannels"),
+        // No command rule at all: both defaults go at the end.
+        ("on ~*", "on ~* resetchannels -@all"),
         // Extra whitespace is not part of a rule list.
-        ("on   ~*    +@read", "on ~* resetchannels +@read"),
+        ("on   ~*    +@read", "on ~* resetchannels -@all +@read"),
     ];
     for (index, (sent, expected)) in cases.iter().enumerate() {
         let name = format!("access-user-{index}");

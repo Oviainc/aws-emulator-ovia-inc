@@ -68,10 +68,13 @@ const AFTER_SETTLE: Duration = Duration::from_millis(600);
 /// that contains [`antenna_uplink_config_data`]'s center frequency.
 const UPLINK_APPROVAL_MHZ: (f64, f64) = (2025.0, 2120.0);
 
-/// The bucket the table's `s3RecordingConfig` records to, made locatable in the store
-/// before that row runs: Ground Station reads a recording bucket's location before it
-/// will create the config.
-const RECORDING_BUCKET: &str = "ground-station-downlink";
+/// The bucket the table's `s3RecordingConfig` records to.
+///
+/// Ground Station resolves a recording bucket against S3 before it will create the
+/// config, and this router mounts no S3: nothing is then known about the bucket, so the
+/// create proceeds. The suite that asserts what a bucket S3 DOES answer for means is
+/// `tests/all/s3_recording_buckets.rs`, which mounts S3 beside this service.
+pub(crate) const RECORDING_BUCKET: &str = "ground-station-downlink";
 
 /// One HTTP answer, reduced to what these tests assert on.
 ///
@@ -115,8 +118,8 @@ impl Reply {
 /// too, so a test can read the store directly where that is the only way to observe a
 /// state transition without racing the clock.
 ///
-/// The account is as a fresh one is: no uplink approval, and no bucket to record to.
-/// Call [`provision_uplink_and_recording`] for a suite that needs either.
+/// The account is as a fresh one is: no uplink approval. Call
+/// [`provision_uplink_approval`] for a suite that needs one.
 pub(crate) fn harness_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -125,29 +128,26 @@ pub(crate) fn harness_with_engine() -> (MultiServiceRouter, Arc<engine::InMemory
     (router, engine)
 }
 
-/// Grant the account the uplink band [`UPLINK_APPROVAL_MHZ`] and make
-/// [`RECORDING_BUCKET`] a bucket this service can read the location of — the two things
-/// that happen OUTSIDE this API before Ground Station will create an antenna-uplink
-/// config or an s3-recording config (`state::approved_uplink_bands_mhz` and
-/// `state::readable_recording_buckets`, which an operator sets through the environment
-/// variables the crate README documents).
+/// Grant the account the uplink band [`UPLINK_APPROVAL_MHZ`] — what happens OUTSIDE this
+/// API before Ground Station will create an antenna-uplink config
+/// (`state::approved_uplink_bands_mhz`, which an operator sets through the environment
+/// variable the crate README documents).
 ///
 /// The suites here assert what a provisioned account can do; what an unprovisioned one
 /// is answered instead is `tests/all/request_validation.rs`'s subject.
-pub(crate) fn provision_uplink_and_recording(engine: &engine::InMemoryEngine) {
-    let state = service_state(engine).expect("this service's state store");
-    let mut guard = state.lock();
-    guard.approved_uplink_bands_mhz.push(UPLINK_APPROVAL_MHZ);
-    guard
-        .readable_recording_buckets
-        .push(RECORDING_BUCKET.to_string());
+pub(crate) fn provision_uplink_approval(engine: &engine::InMemoryEngine) {
+    service_state(engine)
+        .expect("this service's state store")
+        .lock()
+        .approved_uplink_bands_mhz
+        .push(UPLINK_APPROVAL_MHZ);
 }
 
 /// A router holding only this service, over one shared engine, on an account provisioned
-/// by [`provision_uplink_and_recording`].
+/// by [`provision_uplink_approval`].
 pub(crate) fn harness() -> MultiServiceRouter {
     let (router, engine) = harness_with_engine();
-    provision_uplink_and_recording(&engine);
+    provision_uplink_approval(&engine);
     router
 }
 
@@ -249,7 +249,7 @@ pub(crate) fn config_data_table(antenna_uplink_arn: &str) -> Vec<(&'static str, 
         (
             "s3-recording",
             json!({"s3RecordingConfig": {
-                "bucketArn": "arn:aws:s3:::ground-station-downlink",
+                "bucketArn": format!("arn:aws:s3:::{RECORDING_BUCKET}"),
                 "roleArn": "arn:aws:iam::000000000000:role/GroundStationS3Role",
                 "prefix": "data/{satellite_id}/{year}/{month}/{day}",
             }}),
@@ -757,9 +757,10 @@ async fn a_mission_profile_refuses_a_config_reference_that_resolves_to_nothing()
         echo.body
     );
 
-    // ... and so is one pointing at a config that EXISTS but is of another type: the
-    // member names the antenna-uplink config it echoes, so a tracking config's ARN
-    // resolves to no antenna-uplink config.
+    // ... while one pointing at a config that EXISTS but is of another type is NOT a
+    // not-found: the ARN resolved, and what is wrong with it is the capability type it
+    // names, which is a bad parameter. The whole class of those rows, and the text,
+    // is `tests/all/config_defaults_and_references.rs`'s subject.
     let wrong_type = send(
         &router,
         "POST",
@@ -774,13 +775,13 @@ async fn a_mission_profile_refuses_a_config_reference_that_resolves_to_nothing()
     )
     .await;
     assert_eq!(
-        wrong_type.status, 434,
-        "case antennaUplinkConfigArn-of-another-type: expected 434, got {} {}",
+        wrong_type.status, 431,
+        "case antennaUplinkConfigArn-of-another-type: expected 431, got {} {}",
         wrong_type.status, wrong_type.body
     );
     assert_eq!(
         wrong_type.error_code(),
-        "ResourceNotFoundException",
+        "InvalidParameterException",
         "case antennaUplinkConfigArn-of-another-type: wrong error shape, got {}",
         wrong_type.body
     );

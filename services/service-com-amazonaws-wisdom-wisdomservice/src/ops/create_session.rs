@@ -214,6 +214,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             tags,
             created_at: ::std::time::SystemTime::now(),
+            // A new session has nothing available yet: `GetRecommendations`
+            // reports this feed, and only a publish fills it.
+            recommendations: crate::state::RecommendationFeed::default(),
         }) {
             crate::state::SessionInsert::Stored => {}
             crate::state::SessionInsert::UnknownAssistant => {

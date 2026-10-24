@@ -23,6 +23,8 @@ mod error_responses;
 mod packaging_configuration_deletion;
 #[path = "all/packaging_configuration_listing.rs"]
 mod packaging_configuration_listing;
+#[path = "all/packaging_group_deletion.rs"]
+mod packaging_group_deletion;
 #[path = "all/packaging_group_update.rs"]
 mod packaging_group_update;
 #[path = "all/packaging_lifecycle.rs"]

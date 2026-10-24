@@ -180,7 +180,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
-        let now = ::std::time::Instant::now();
         let region = st::request_region(ctx.parts());
         let created_by = st::caller_principal_arn(ctx.parts());
 
@@ -229,7 +228,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let mut store = state.lock();
-        store.apply_due_target_activations(now);
 
         if let Some(token) = input.client_request_token.as_deref() {
             if let Some(previous) = store.idempotent_request(Self::NAME, token) {
@@ -276,6 +274,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // And a bound that is keyed on nothing the request chooses: the region a rule
+        // lands in comes from the caller's own credential scope, so the per-region cap
+        // above cannot bound the store by itself.
+        if store.rule_count() >= st::MAX_RULES_TOTAL {
+            return Err(
+                CreateNotificationRuleErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} notification rules",
+                            st::MAX_RULES_TOTAL
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let sequence = store.take_sequence();
         let id = st::new_rule_id(sequence);
         let arn = st::notification_rule_arn(&region, &id);
@@ -297,7 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sequence,
         };
         for target in &targets {
-            store.register_target(&arn, target, now);
+            store.register_target(&arn, target);
         }
         store
             .rule_names

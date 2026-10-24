@@ -215,6 +215,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             user_names.push(name);
         }
+        // The built-in `default` user belongs to the built-in `open-access` ACL and to
+        // no other, so a create naming it as a member of the ACL it is making is refused
+        // before anything is persisted — the same rule `UpdateACL` reads for the members
+        // it adds.
+        if let Some(message) = crate::state::default_user_membership_rejection(
+            &acl_name,
+            user_names.iter().map(String::as_str),
+        ) {
+            return Err(CreateACLErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let now = std::time::Instant::now();
         let mut state = state.lock();
         state.settle(now);

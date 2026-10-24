@@ -142,6 +142,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let region = crate::state::request_region(ctx.parts());
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateConfigErrorModeled::DependencyException(DependencyException {
                 message: Some("this service's state store is unavailable".to_string()),
@@ -149,18 +151,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let mut guard = state.lock();
-
         // What the service will accept in a `configData` — the ranges the model
-        // documents for its numeric members, the uplink frequencies this account is
-        // authorised to transmit on, and a recording bucket whose location the service
-        // can read — is a rule of the service, not of the wire format, so the boundary
-        // validator let this request through. A `configData` outside those is refused
-        // HERE, before an id and an ARN are minted and before anything is written, so a
-        // caller never holds an ARN for a config the service would not have created.
-        guard
+        // documents for its numeric members and the uplink frequencies this account is
+        // authorised to transmit on — is a rule of the service, not of the wire format,
+        // so the boundary validator let this request through. A `configData` outside
+        // those is refused HERE, before an id and an ARN are minted and before anything
+        // is written, so a caller never holds an ARN for a config the service would not
+        // have created. Judged from this service's own store FIRST, so a local fault is
+        // never reported behind a cross-service call.
+        state
+            .lock()
             .validate_config_data(&input.config_data)
             .map_err(CreateConfigErrorModeled::InvalidParameterException)?;
+
+        // An `s3RecordingConfig` records to a bucket this account has to actually hold:
+        // Ground Station resolves it against S3 — another service — before it will store
+        // the config, and only a bucket S3 reports absent is refused. The store is
+        // UNLOCKED here, since the call crosses an await.
+        if let Some(refusal) =
+            crate::state::unresolvable_recording_bucket(ctx, &region, &input.config_data).await
+        {
+            return Err(CreateConfigErrorModeled::InvalidParameterException(refusal).into());
+        }
+
+        let mut guard = state.lock();
 
         // The config's type is not a request member: it is whichever member of the
         // `ConfigTypeData` union the caller set.
@@ -168,47 +182,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let config_id = crate::state::new_uuid();
         let config_arn = ::engine::emulator_arn(
             crate::state::ARN_SERVICE,
-            &crate::state::request_region(ctx.parts()),
+            &region,
             &format!("config/{config_type}/{config_id}"),
         );
+
+        // A member the model gives a `default` is one the service always has a value
+        // for, so the default is materialised on the way IN — the stored config carries
+        // it and every later read answers it populated, rather than the member going
+        // missing because the request left it out.
+        let mut config_data = input.config_data;
+        crate::state::apply_modelled_defaults(&mut config_data);
 
         let stored = crate::state::Config {
             config_id: config_id.clone(),
             config_arn: config_arn.clone(),
             name: input.name,
             config_type: config_type.clone(),
-            config_data: input.config_data,
+            config_data,
             tags: input.tags.unwrap_or_default(),
         };
 
         // An `uplinkEchoConfig` echoes a specific ANTENNA UPLINK config, named by ARN:
         // like every ARN-valued reference it must resolve to a config that exists, and
         // the config it names must be of the type the member is for — the member's own
-        // name and the `antenna-uplink` segment of a `ConfigArn` are what say so.
-        // Checked before the store bound below, so what the caller hears is what is
-        // wrong with the request.
+        // name and the `antenna-uplink` segment of a `ConfigArn` are what say so. The two
+        // ways that fails are different answers: nothing there is a missing resource,
+        // while a config of another type is a bad parameter. Checked before the store
+        // bound below, so what the caller hears is what is wrong with the request.
         if let ConfigTypeData::uplinkEchoConfig(echo) = &stored.config_data {
             // The one capability type an `uplinkEchoConfig`'s reference may name — the
             // member's own name and the `antenna-uplink` segment of a `ConfigArn` are
             // what say so.
             const ECHOED_TYPE: &str = "antenna-uplink";
 
-            if !guard.resolves_config(&echo.antenna_uplink_config_arn, Some(ECHOED_TYPE)) {
-                return Err(CreateConfigErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        // This service's `CreateConfig` text names the capability the
-                        // reference required, spelled as the model spells that
-                        // capability's shape, and the ARN the request gave — not the
-                        // wire enum token, which is an on-the-wire spelling rather than
-                        // a user-facing one.
-                        message: Some(format!(
-                            "Unable to find {} Config with ARN: {}",
-                            crate::state::capability_display_name(ECHOED_TYPE),
-                            echo.antenna_uplink_config_arn
-                        )),
-                    },
-                )
-                .into());
+            match guard.typed_reference_fault(&echo.antenna_uplink_config_arn, ECHOED_TYPE) {
+                None => {}
+                Some(crate::state::TypedReferenceFault::Absent) => {
+                    return Err(CreateConfigErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            // This service's `CreateConfig` text names the capability the
+                            // reference required, spelled as the model spells that
+                            // capability's shape, and the ARN the request gave — not the
+                            // wire enum token, which is an on-the-wire spelling rather
+                            // than a user-facing one.
+                            message: Some(crate::state::typed_reference_absent_message(
+                                ECHOED_TYPE,
+                                &echo.antenna_uplink_config_arn,
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                Some(crate::state::TypedReferenceFault::WrongType) => {
+                    return Err(CreateConfigErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(crate::state::typed_reference_wrong_type_message(
+                                ECHOED_TYPE,
+                            )),
+                            parameter_name: Some(
+                                "configData.uplinkEchoConfig.antennaUplinkConfigArn".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
             }
         }
 

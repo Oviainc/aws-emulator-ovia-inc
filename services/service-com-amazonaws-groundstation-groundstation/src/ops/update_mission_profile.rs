@@ -170,10 +170,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .mission_profiles
             .contains_key(&input.mission_profile_id)
         {
+            // This MUTATION path composes its own text: the id the request addressed
+            // plus the account the write was scoped to, where a READ of the same dead id
+            // answers the service's bare mission-profile literal.
             return Err(
                 UpdateMissionProfileErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::MISSION_PROFILE_NOT_FOUND.to_string()),
+                        message: Some(
+                            crate::state::mission_profile_mutation_not_found_message(
+                                &input.mission_profile_id,
+                            ),
+                        ),
                     },
                 )
                 .into(),

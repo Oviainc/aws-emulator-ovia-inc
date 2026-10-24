@@ -152,7 +152,7 @@ fn seeded_users() -> Vec<Seeded> {
         Seeded {
             name: "a",
             status: "active",
-            access_string: "on ~app::* resetchannels +@read",
+            access_string: "on ~app::* resetchannels -@all +@read",
             authentication_type: "password",
             // `Authentication$PasswordCount`: "The number of passwords belonging to
             // the user. The maximum is two."
@@ -175,7 +175,7 @@ fn seeded_users() -> Vec<Seeded> {
         Seeded {
             name: "zeta-service-account",
             status: "active",
-            access_string: "on ~metrics:* resetchannels +get +mget",
+            access_string: "on ~metrics:* resetchannels -@all +get +mget",
             authentication_type: "no-password",
             password_count: None,
         },
@@ -348,11 +348,13 @@ async fn acl_names_are_derived_from_the_acls_that_list_the_user() {
         "no acls"
     );
 
-    // One row per ACL: the users it lists, in the order the request named them.
+    // One row per ACL: the users it lists, in the order the request named them. The
+    // built-in user is NOT among them: it belongs to the built-in ACL alone, and a
+    // create naming it in another ACL is refused (see `canonical_access_string`).
     let acls: &[(&str, &[&str])] = &[
         ("shared-acl", &["a", "app"]),
         ("solo-acl", &["app"]),
-        ("default-acl", &[DEFAULT_USER]),
+        ("zeta-acl", &["data-reader-1"]),
     ];
     for (acl_name, user_names) in acls {
         harness
@@ -368,8 +370,8 @@ async fn acl_names_are_derived_from_the_acls_that_list_the_user() {
     let expected: &[(&str, &[&str])] = &[
         ("a", &["shared-acl"]),
         ("app", &["shared-acl", "solo-acl"]),
-        ("data-reader-1", &[]),
-        (DEFAULT_USER, &["default-acl", OPEN_ACCESS_ACL]),
+        ("data-reader-1", &["zeta-acl"]),
+        (DEFAULT_USER, &[OPEN_ACCESS_ACL]),
     ];
     for (name, acl_names) in expected {
         let case = format!("ACLNames of {name}");
@@ -480,7 +482,7 @@ async fn users_page_over_the_whole_set_for_any_page_size() {
                 _ => "page-g",
             },
             status: "active",
-            access_string: "on ~* +@read",
+            access_string: "on ~* resetchannels -@all +@read",
             authentication_type: "iam",
             password_count: None,
         })

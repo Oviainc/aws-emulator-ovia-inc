@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDomainName
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDomainName`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDomainName::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -162,18 +152,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDomainName` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDomainNameErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDomainName"))
+        // The domain name IS the resource's identifier: every other operation on it
+        // addresses it by this value (`/v2/domainnames/{DomainName}`), so the length
+        // bound its target shape documents is checked before anything is keyed on it.
+        let character_count = input.domain_name.chars().count();
+        if character_count == 0 || character_count > crate::state::DOMAIN_NAME_MAX_LENGTH {
+            return Err(bad_request(&format!(
+                "Invalid value for DomainName: it must be between 1 and {} characters long, \
+                 got {character_count}.",
+                crate::state::DOMAIN_NAME_MAX_LENGTH
+            )));
+        }
+
+        // The catalog check and its wording live in `state`, so this operation and the
+        // update cannot drift; the DEFAULT is this operation's, a create being the only
+        // place a default belongs.
+        let routing_mode = match crate::state::resolve_routing_mode(input.routing_mode.as_deref()) {
+            Ok(mode) => mode.unwrap_or_else(|| crate::state::DEFAULT_ROUTING_MODE.to_string()),
+            Err(message) => return Err(bad_request(&message)),
+        };
+
+        // Each configuration's defaults and enum checks live in one place, so a create
+        // and a later update resolve an entry identically.
+        let mut configurations = ::std::vec::Vec::new();
+        for (index, requested) in input
+            .domain_name_configurations
+            .iter()
+            .flatten()
+            .enumerate()
+        {
+            match crate::state::resolve_domain_name_endpoint(index, requested) {
+                Ok(endpoint) => configurations.push(endpoint),
+                Err(message) => return Err(bad_request(&message)),
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateDomainName",
+            ));
+        };
+        let mut store = state.lock();
+
+        // The name identifies the resource, so a second create under a name the account
+        // already holds would have to replace a domain name a caller can still reach.
+        if store.domain_names.contains_key(&input.domain_name) {
+            return Err(CreateDomainNameErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "The domain name {} already exists.",
+                        input.domain_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Bound the growth a caller drives: AWS's published quota is 120 custom domain
+        // names per account per Region, and `TooManyRequestsException` is the modelled
+        // error for "a limit has been exceeded" (it carries the limit's name).
+        if store.domain_names.len() >= crate::state::MAX_DOMAIN_NAMES {
+            return Err(CreateDomainNameErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("DomainName".to_string()),
+                    message: Some(format!(
+                        "The maximum number of custom domain names ({}) for this account has \
+                         been reached.",
+                        crate::state::MAX_DOMAIN_NAMES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let domain_id = store.mint_domain_name_id();
+        let record = crate::state::DomainName {
+            domain_name_arn: crate::state::domain_name_arn(&input.domain_name, &region),
+            api_gateway_domain_name: crate::state::api_gateway_domain_host(&domain_id, &region),
+            domain_name: input.domain_name.clone(),
+            configurations,
+            mutual_tls_authentication: input.mutual_tls_authentication,
+            routing_mode,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // A domain name this service mints serves the endpoints the request named
+            // from the moment it exists, so no migration is in flight and the resource
+            // is reported `AVAILABLE` — the status under which
+            // `DomainNameConfiguration$DomainNameStatus` says "the domain can be
+            // updated".
+            migration_due_at: None,
+        };
+
+        // Taking the entry back gives the STORED record, so what the caller is told is
+        // what a later GetDomainName will report.
+        let stored = store
+            .domain_names
+            .entry(input.domain_name)
+            .or_insert(record)
+            .to_wire(::std::time::SystemTime::now());
+        Ok(CreateDomainNameOutput {
+            api_mapping_selection_expression: stored.api_mapping_selection_expression,
+            domain_name: Some(stored.domain_name),
+            domain_name_arn: stored.domain_name_arn,
+            domain_name_configurations: stored.domain_name_configurations,
+            mutual_tls_authentication: stored.mutual_tls_authentication,
+            routing_mode: stored.routing_mode,
+            tags: stored.tags,
+        })
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the member and the constraint.
+fn bad_request(message: &str) -> CreateDomainNameError {
+    CreateDomainNameErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

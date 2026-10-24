@@ -162,7 +162,11 @@ pub struct Cluster {
     pub creation_time: SystemTime,
     /// Whether the cluster currently refuses deletion.
     pub deletion_protection_enabled: bool,
-    /// The `kmsEncryptionKey` the caller supplied, verbatim, if any.
+    /// The customer-managed `kmsEncryptionKey` the caller supplied, verbatim, if
+    /// the cluster has one. `None` when the cluster is on the key owned by Amazon
+    /// Web Services — whether because no key was ever supplied or because the
+    /// reserved `AWS_OWNED_KMS_KEY` switched it back (see
+    /// [`customer_managed_key`]).
     pub kms_encryption_key: Option<String>,
     /// The encryption configuration derived from `kms_encryption_key`.
     pub encryption_details: Option<EncryptionDetails>,
@@ -824,14 +828,30 @@ pub fn vpc_endpoint_service_name(region: &str, identifier: &str) -> String {
     format!("com.amazonaws.{region}.dsql-{identifier}")
 }
 
+/// The customer-managed key a `kmsEncryptionKey` names, if it names one at all.
+///
+/// `AWS_OWNED_KMS_KEY` is a RESERVED value, not a key identifier: it is the
+/// `EncryptionType` member that stands for the key owned by Amazon Web Services,
+/// and `UpdateCluster`'s `kmsEncryptionKey` documentation
+/// (`smithy_query(query="doc", shape="UpdateClusterInput",
+/// member="kmsEncryptionKey")`) spells out that supplying it switches the cluster
+/// TO that key. So it selects Amazon-owned encryption and names no customer key —
+/// the same answer as a request that carries no `kmsEncryptionKey` at all. Every
+/// caller resolves a supplied key through here, so neither the stored key nor the
+/// reported [`EncryptionDetails`] can ever hold the sentinel as if it were a key.
+pub fn customer_managed_key(kms_encryption_key: Option<&str>) -> Option<&str> {
+    kms_encryption_key.filter(|key| *key != ENCRYPTION_AWS_OWNED)
+}
+
 /// The `EncryptionDetails` of a cluster, derived from the `kmsEncryptionKey` the
 /// caller supplied: a customer-managed key when there is one, the
-/// Amazon-owned key when there is not.
+/// Amazon-owned key when there is not — including when the supplied value is the
+/// reserved `AWS_OWNED_KMS_KEY` (see [`customer_managed_key`]).
 ///
 /// `kmsKeyArn` is modelled as an ARN, so a key id or an alias is expanded into
 /// one in the request's own region.
 pub fn encryption_details(region: &str, kms_encryption_key: Option<&str>) -> EncryptionDetails {
-    match kms_encryption_key {
+    match customer_managed_key(kms_encryption_key) {
         Some(key) => EncryptionDetails {
             encryption_type: ENCRYPTION_CUSTOMER_MANAGED.to_string(),
             kms_key_arn: Some(kms_key_arn(region, key)),

@@ -228,10 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(secret) = store.get_mut(&input.secret_id) else {
             return Err(RotateSecretErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Secrets Manager can't find the specified secret: {}",
-                        input.secret_id
-                    )),
+                    message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -256,10 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // parameter in this call. The secret is managed by another service, and
         // you must use that service to update it."
         if secret.scheduled_for_deletion() {
-            return Err(invalid_request(
-                "You can't perform this operation on the secret because it was marked for \
-                 deletion.",
-            ));
+            return Err(invalid_request(crate::state::MARKED_FOR_DELETION_MESSAGE));
         }
         if let Some(owner) = secret.owning_service.clone() {
             return Err(invalid_request(format!(

@@ -7,9 +7,7 @@
 //! resolved through the event-type catalog, and its targets with the account-wide
 //! status the target registry holds for each address.
 //!
-//! This is a reporting operation. The ONE write it makes is to materialise the target
-//! activations the clock has already made due — a change that was owed at this instant
-//! whether or not anybody called.
+//! This is a reporting operation: it writes nothing.
 //!
 //! ---
 //!
@@ -142,7 +140,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
-        let now = ::std::time::Instant::now();
         let region = st::request_region(ctx.parts());
 
         let Some(state) = st::service_state(&*self.engine) else {
@@ -153,8 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "DescribeNotificationRule (no state store on this engine)",
             ));
         };
-        let mut store = state.lock();
-        store.apply_due_target_activations(now);
+        let store = state.lock();
 
         let Some(rule) = store.rule_in_region(&region, &input.arn).cloned() else {
             return Err(
@@ -204,9 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: Some(rule.status),
             created_timestamp: Some(rule.created_timestamp),
             last_modified_timestamp: Some(rule.last_modified_timestamp),
-            // A rule with no tags reports no `Tags` member rather than an empty map.
-            tags: (!rule.tags.is_empty())
-                .then(|| rule.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            // `Tags` reports the rule's own tag map: a rule with no tags carries zero
+            // entries, which is an EMPTY MAP on the wire, not an absent member.
+            tags: Some(rule.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
         })
     }
 }

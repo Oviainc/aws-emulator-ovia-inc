@@ -2,8 +2,10 @@
 
 //! @op ListTagsForResource
 //!
-//! Reports exactly the tags stored on the data store its `ResourceARN` names —
-//! those given to `CreateFHIRDatastore` and those merged in by `TagResource`.
+//! Reports exactly the tags stored on the resource its `ResourceARN` names — a
+//! FHIR data store or a data transformation profile, the two resource forms the
+//! modelled `AmazonResourceName` admits: those given to the resource's create
+//! call and those merged in by `TagResource`.
 //!
 //! ## Shape of an operation
 //!
@@ -147,42 +149,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The modelled `AmazonResourceName` pattern also admits a
-        // `dataTransformationProfile` ARN, which names a different resource;
-        // anything that is not a data store ARN resolves to no data store, and
-        // this service's not-found text names no identifier.
-        let Some(id) = crate::state::datastore_id_from_arn(&input.resource_arn) else {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        };
+        // The modelled `AmazonResourceName` pattern admits BOTH of this
+        // service's resource forms, and both carry tags, so the ARN is resolved
+        // to whichever resource it names; an ARN of neither form names nothing,
+        // and this service's not-found texts name no identifier.
+        let resolved = crate::state::tagged_resource_from_arn(&input.resource_arn);
 
         let mut store = state.lock();
         // Settle first, so this reader agrees with Describe/List/Delete about
         // which records still exist: a record whose retention has run out is
         // reaped at the same instant for every one of them.
         store.settle_lifecycle();
-        // The stored record's own ARN must equal the one the caller handed in,
-        // so an ARN naming another partition, region or account resolves to no
-        // data store even when its id segment happens to match a local one.
-        let Some(datastore) = store
-            .datastores
-            .get(id)
-            .filter(|datastore| datastore.arn == input.resource_arn)
-        else {
+        // Whichever resource it is, the stored record's own ARN must equal the
+        // one the caller handed in, so an ARN naming another partition, region
+        // or account resolves to nothing even when its id segment happens to
+        // match a local one.
+        let (tags, not_found) = match resolved {
+            Some(crate::state::TaggedResource::Datastore(id)) => (
+                store
+                    .datastores
+                    .get(id)
+                    .filter(|datastore| datastore.arn == input.resource_arn)
+                    .map(crate::state::Datastore::tag_list),
+                crate::state::DATASTORE_NOT_FOUND_MESSAGE,
+            ),
+            Some(crate::state::TaggedResource::Profile(id)) => (
+                store
+                    .profiles
+                    .get(id)
+                    .filter(|profile| profile.arn == input.resource_arn)
+                    .map(crate::state::DataTransformationProfile::tag_list),
+                crate::state::PROFILE_NOT_FOUND_MESSAGE,
+            ),
+            // Unreachable through the wire — the modelled pattern is enforced
+            // before this handler runs — but an ARN of neither form names no
+            // resource, so it is answered the same way a missing one is.
+            None => (None, crate::state::DATASTORE_NOT_FOUND_MESSAGE),
+        };
+        let Some(tags) = tags else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string()),
+                    message: Some(not_found.to_string()),
                 },
             )
             .into());
         };
 
-        Ok(ListTagsForResourceOutput {
-            tags: Some(datastore.tag_list()),
-        })
+        Ok(ListTagsForResourceOutput { tags: Some(tags) })
     }
 }
