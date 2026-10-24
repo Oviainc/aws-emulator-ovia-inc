@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePrimaryRegion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePrimaryRegion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePrimaryRegion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: moves the primary-key designation of a multi-Region key set to a Region
+//! that already holds a replica of it, and makes the former primary key a replica. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -215,18 +209,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePrimaryRegion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePrimaryRegionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePrimaryRegion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdatePrimaryRegionErrorModeled::KMSInternalException(
+                KMSInternalException {
+                    message: Some("the KMS state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        let key = match state.resolve_mut(&region, &input.key_id) {
+            crate::state::KeyRefMut::Found(key) => key,
+            crate::state::KeyRefMut::MalformedArn => {
+                return Err(UpdatePrimaryRegionErrorModeled::InvalidArnException(
+                    InvalidArnException {
+                        message: Some(crate::state::invalid_arn_message(&input.key_id)),
+                    },
+                )
+                .into());
+            }
+            crate::state::KeyRefMut::NotFound => {
+                return Err(UpdatePrimaryRegionErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // Only a multi-Region key HAS a primary Region to move: this operation
+        // "changes the primary key of a multi-Region key"
+        // (`smithy_query(query="doc",shape="UpdatePrimaryRegion")`), so a
+        // single-Region key is "a specified resource [that] is not valid for this
+        // operation" — the modelled `UnsupportedOperationException`. The message
+        // names the key the request resolved to, by its ARN, and says what about it
+        // refuses the call, which is the wording recorded on the wire.
+        if !key.is_multi_region() {
+            return Err(UpdatePrimaryRegionErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(format!("{} is not a multi-region key.", key.arn)),
+                },
+            )
+            .into());
+        }
+
+        // A disabled key has its own modelled refusal here — "the specified KMS key
+        // is not enabled" — and any other key state outside `Enabled` (a key
+        // awaiting deletion, or one awaiting imported key material) is a key state
+        // this management operation is not compatible with.
+        if key.key_state == crate::state::KEY_STATE_DISABLED {
+            return Err(UpdatePrimaryRegionErrorModeled::DisabledException(DisabledException {
+                message: Some(crate::state::invalid_state_message(key)),
+            })
+            .into());
+        }
+        if !key.is_usable() {
+            return Err(UpdatePrimaryRegionErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    message: Some(crate::state::invalid_state_message(key)),
+                },
+            )
+            .into());
+        }
+
+        // "The key ID and primary Region that you specify uniquely identify the
+        // replica key that will become the primary key. The primary Region must
+        // already have a replica key. This operation does not create a KMS key in
+        // the specified Region" (same doc) — so a `PrimaryRegion` that holds no
+        // replica of this key set identifies no key this call can promote. It is a
+        // bad value for that parameter rather than a missing resource, and this
+        // operation models no error for one, so it is refused as a validation
+        // failure naming the member and what is wrong with it; nothing is
+        // persisted. The Region that already holds the primary key holds no replica
+        // of the set either, so it is refused the same way.
+        let promoted = key
+            .multi_region_topology
+            .as_mut()
+            .is_some_and(|topology| topology.promote(&input.primary_region));
+        if !promoted {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "PrimaryRegion {} has no replica key of {}. The primary Region must already \
+                 have a replica key.",
+                input.primary_region, key.arn
+            )));
+        }
+
+        // "This operation does not return any output. To verify that primary key is
+        // changed, use the DescribeKey operation" (same doc), which reports the
+        // moved designation out of the topology this call just wrote.
+        Ok(UpdatePrimaryRegionOutput)
     }
 }
