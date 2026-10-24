@@ -170,20 +170,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `MonitorStatus` targets a plain `String` in the model, not the
         // `MonitorConfigState` enum, so the boundary validator does not constrain it and
-        // this operation has to.
-        let status_filter = input.monitor_status.as_deref();
-        if let Some(filter) = status_filter {
-            if !MONITOR_CONFIG_STATE_VALUES.contains(&filter) {
-                return Err(ListMonitorsErrorModeled::ValidationException(ValidationException {
-                    message: Some(format!(
-                        "MonitorStatus {} is not one of: {}.",
-                        filter,
-                        MONITOR_CONFIG_STATE_VALUES.join(", ")
-                    )),
-                })
-                .into());
-            }
-        }
+        // this operation has to. The rule lives in `crate::state` because three listings
+        // share it.
+        let status_filter = crate::state::enum_filter(
+            "MonitorStatus",
+            input.monitor_status.as_deref(),
+            MONITOR_CONFIG_STATE_VALUES,
+        )
+        .map_err(ListMonitorsErrorModeled::ValidationException)?;
 
         // The token is opaque to the caller, so one this service did not mint is a bad
         // request rather than an empty page.

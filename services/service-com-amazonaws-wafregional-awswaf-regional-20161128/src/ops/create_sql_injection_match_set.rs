@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             CreateSqlInjectionMatchSetErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {
                     message: Some(
-                        "the AWS WAF SqlInjectionMatchSet store is unavailable".to_string(),
+                        crate::state::MESSAGE_INTERNAL_ERROR.to_string(),
                     ),
                 },
             )
@@ -186,11 +186,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateSqlInjectionMatchSetErrorModeled::WAFLimitsExceededException(
                     WAFLimitsExceededException {
-                        message: Some(format!(
-                            "The request would exceed the maximum number of \
-                             SqlInjectionMatchSet objects ({}) allowed for this account",
-                            crate::state::MAX_SQL_INJECTION_MATCH_SETS
-                        )),
+                        message: Some(
+                            crate::state::MESSAGE_LIMITS_EXCEEDED.to_string(),
+                        ),
                     },
                 )
                 .into(),
@@ -205,11 +203,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateSqlInjectionMatchSetErrorModeled::WAFStaleDataException(
                     WAFStaleDataException {
-                        message: Some(format!(
-                            "The change token {} is not a change token this request can use; \
-                             call GetChangeToken for a new one",
-                            input.change_token
-                        )),
+                        // This exception type's own fixed sentence: the token the caller
+                        // submitted is never reflected back into the error body.
+                        message: Some(
+                            crate::state::MESSAGE_STALE_DATA.to_string(),
+                        ),
                     },
                 )
                 .into(),

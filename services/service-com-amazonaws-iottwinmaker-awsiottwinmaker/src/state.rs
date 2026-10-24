@@ -785,6 +785,49 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     )
 }
 
+/// The opaque `nextToken` every paginated operation of this service mints.
+///
+/// One shape, shared by all of them so a token means the same thing wherever it
+/// is read: hex (so the token is opaque to a caller and safe in a JSON body)
+/// over an `envelope` naming the LISTING it belongs to, the resume `key` it
+/// resumes at, and the `scope` the listing was taken in — the parent resource
+/// whose page it is, which makes a token minted for another resource, by another
+/// listing, or by hand recognisably not this listing's.
+///
+/// The parts are separated by newlines, which the ids, ARNs and tag keys this
+/// service's listings resume at all exclude; the LAST scope part keeps any
+/// newline it carries (see [`decode_page_token`]), so a scope part that is free
+/// text — a query statement — goes last.
+pub fn encode_page_token(envelope: &str, scope: &[&str], key: &str) -> String {
+    let mut body = format!("{envelope}{key}");
+    for part in scope {
+        body.push('\n');
+        body.push_str(part);
+    }
+    ::hex::encode(body)
+}
+
+/// The resume key inside a `nextToken` [`encode_page_token`] minted for this
+/// `envelope` and `scope`, or `None` when the token is not one of them.
+///
+/// The key is split off first and each scope part is compared in turn, so a
+/// token whose envelope, arity or scope disagrees is rejected rather than
+/// resumed; the final part absorbs the remainder, so the last scope part may
+/// itself contain newlines. A token carrying an EMPTY key is rejected too: a
+/// listing never mints one, since a page is only resumed at a row that exists.
+pub fn decode_page_token(envelope: &str, scope: &[&str], token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let body = decoded.strip_prefix(envelope)?;
+    let mut parts = body.splitn(scope.len() + 1, '\n');
+    let key = parts.next()?;
+    for expected in scope {
+        if parts.next()? != *expected {
+            return None;
+        }
+    }
+    (!key.is_empty()).then(|| key.to_string())
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

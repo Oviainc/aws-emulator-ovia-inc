@@ -20,7 +20,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    create_cluster, identity_document, ok, refusal, service, string, ACCOUNT, SIGNED_REGION,
+    create_cluster, identity_document, ok, refusal, register_capacity, service, string, ACCOUNT,
+    SIGNED_REGION,
 };
 use crate::task_lifecycle::container;
 
@@ -364,6 +365,9 @@ async fn deleting_a_cluster_that_still_holds_work_is_refused_with_one_fixed_sent
     // The fixture's cluster holds a service, and a second cluster holds a bare task, so
     // each of the two state refusals is reached once.
     create_cluster(&router, "tasks-only", "delete").await;
+    // The EC2 launch type places a task on an instance registered to the cluster, so the
+    // cluster needs one before `RunTask` will place anything in it.
+    register_capacity(&router, "tasks-only", "delete").await;
     ok(
         &router,
         "RunTask",

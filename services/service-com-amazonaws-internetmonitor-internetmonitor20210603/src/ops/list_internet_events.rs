@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInternetEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInternetEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInternetEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `InternetEventSummary` per internet event stored in [`crate::state`], in
+//! `EventId` order, bounded by the `StartTime`/`EndTime` time frame, filtered by
+//! `EventStatus` and `EventType` when given, and paged with `MaxResults` plus an opaque
+//! `NextToken`.
+//!
+//! Internet events are observations Internet Monitor makes of the public internet, not
+//! resources a caller creates: the model declares no operation that mints one and this
+//! operation is `@readonly`, so it reports exactly the records the store holds (see
+//! [`crate::state::InternetEventRecord`]) — an empty list while it holds none — and writes
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +92,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page `MaxResults` allows, from its modelled range 1..100 (see
+/// `smithy_query(query="operation",operation="ListInternetEvents")`). An absent
+/// `MaxResults` takes a full page.
+const MAX_PAGE_SIZE: i32 = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,20 +166,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInternetEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInternetEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInternetEvents"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListInternetEventsError::from(ListInternetEventsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("internet event store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // `EventStatus` and `EventType` target a plain `String` in the model, not their
+        // enums, so the boundary validator does not constrain them and this operation has
+        // to. The rule itself lives in `crate::state` because three listings share it.
+        let status_filter = crate::state::enum_filter(
+            "EventStatus",
+            input.event_status.as_deref(),
+            INTERNET_EVENT_STATUS_VALUES,
+        )
+        .map_err(ListInternetEventsErrorModeled::ValidationException)?;
+        let type_filter = crate::state::enum_filter(
+            "EventType",
+            input.event_type.as_deref(),
+            INTERNET_EVENT_TYPE_VALUES,
+        )
+        .map_err(ListInternetEventsErrorModeled::ValidationException)?;
+
+        // The time frame bounds when an event STARTED, at both ends: "Both start time and
+        // end time specify the time when an event started. End time is optional. If you
+        // don't include it, the default end time is the current time."
+        let now = ::std::time::SystemTime::now();
+        let start_bound = input.start_time.as_ref().map(::aws_smithy_types::DateTime::as_secs_f64);
+        let end_bound = input
+            .end_time
+            .as_ref()
+            .map(::aws_smithy_types::DateTime::as_secs_f64)
+            .unwrap_or_else(|| crate::state::epoch_seconds(now));
+        if start_bound.is_some_and(|start| start > end_bound) {
+            return Err(ListInternetEventsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "StartTime must not be later than EndTime: the time frame holds no instant."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The token is opaque to the caller, so one this service did not mint is a bad
+        // request rather than an empty page.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(event_id) => Some(event_id),
+                None => {
+                    return Err(ListInternetEventsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "NextToken is not a token this service issued.".to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // `MaxResults` is modelled 1..100, so the boundary validator has already refused
+        // anything outside that; an absent one takes the maximum page. The clamp is a real
+        // bound rather than a fallback for an impossible value: it keeps the page size
+        // inside the modelled range even if the request ever reaches here unvalidated.
+        let page_size = usize::try_from(
+            input.max_results.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE),
+        )
+        .unwrap_or(1);
+
+        // A reporting operation: the store is read and never written, so what a later
+        // caller sees is unchanged by this call.
+        let store = state.lock();
+
+        // One past the page, so the presence of a further event is what decides whether
+        // there is a `NextToken` — never a token that pages to nothing.
+        let mut page: Vec<&crate::state::InternetEventRecord> = store
+            .internet_events
+            .values()
+            .filter(|event| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| event.event_id.as_str() > after)
+            })
+            .filter(|event| {
+                let started_at = crate::state::epoch_seconds(event.started_at);
+                start_bound.is_none_or(|start| started_at >= start) && started_at <= end_bound
+            })
+            .filter(|event| status_filter.is_none_or(|filter| event.status() == filter))
+            .filter(|event| type_filter.is_none_or(|filter| event.event_type == filter))
+            .take(page_size.saturating_add(1))
+            .collect();
+
+        let next_token = if page.len() > page_size {
+            page.truncate(page_size);
+            page.last()
+                .map(|event| crate::state::encode_page_token(&event.event_id))
+        } else {
+            None
+        };
+
+        Ok(ListInternetEventsOutput {
+            internet_events: page
+                .into_iter()
+                .map(|event| InternetEventSummary {
+                    event_id: event.event_id.clone(),
+                    event_arn: event.event_arn.clone(),
+                    started_at: crate::state::wire_timestamp(event.started_at),
+                    ended_at: event.ended_at.map(crate::state::wire_timestamp),
+                    client_location: event.client_location.clone(),
+                    event_type: event.event_type.clone(),
+                    event_status: event.status().to_string(),
+                })
+                .collect(),
+            next_token,
+        })
     }
 }

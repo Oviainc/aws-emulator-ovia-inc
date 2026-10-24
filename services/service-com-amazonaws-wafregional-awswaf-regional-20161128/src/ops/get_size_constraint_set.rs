@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetSizeConstraintSetErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {
-                    message: Some("The operation failed because of a system problem.".to_string()),
+                    message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
                 },
             )
         })?;
@@ -167,7 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     WAFNonexistentItemException {
                         // One fixed sentence per exception type, carrying nothing the
                         // request supplied — in particular not the id asked for.
-                        message: Some("The referenced item does not exist.".to_string()),
+                        message: Some(crate::state::MESSAGE_NONEXISTENT_ITEM.to_string()),
                     },
                 )
             })?;

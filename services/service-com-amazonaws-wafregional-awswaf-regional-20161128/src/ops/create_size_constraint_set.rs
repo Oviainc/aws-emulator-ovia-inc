@@ -182,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateSizeConstraintSetErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {
-                    message: Some("The operation failed because of a system problem.".to_string()),
+                    message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
                 },
             )
         })?;
@@ -197,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // One fixed sentence per exception type, carrying nothing the
                         // request supplied: AWS WAF Classic's error text does not vary
                         // with the call that provoked it.
-                        message: Some("The operation exceeds a resource limit.".to_string()),
+                        message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
                     },
                 )
                 .into(),
@@ -213,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 WAFStaleDataException {
                     // Fixed again — in particular the caller's change token is never
                     // echoed back into the error body.
-                    message: Some("The input token is no longer current.".to_string()),
+                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
                 },
             )
             .into());

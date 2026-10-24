@@ -38,7 +38,7 @@
 //! nothing in the terms commits the acceptor to an amount, and that is the case
 //! this emulator reports.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -1425,6 +1425,122 @@ pub fn payment_request_scope(
         counted(catalog.unwrap_or_default()),
         counted(status.unwrap_or_default())
     )
+}
+
+// ---------------------------------------------------------------------------
+// Purchase orders
+// ---------------------------------------------------------------------------
+
+/// The request member every operation carrying purchase-order associations
+/// names the list with (`AcceptAgreementRequestInput$purchaseOrders`,
+/// `UpdatePurchaseOrdersInput$purchaseOrders`).
+const PURCHASE_ORDERS_MEMBER: &str = "purchaseOrders";
+
+/// The `ValidationExceptionReason` for a list that associates one charge twice
+/// (`smithy_query(query="shape", shape="ValidationExceptionReason")` lists
+/// `DUPLICATE_CHARGES`).
+///
+/// Spelled out rather than resolved from a member the way [`member_reason`]
+/// resolves the rest: no single element of such a list is the wrong one, so the
+/// reason is about the list.
+pub const REASON_DUPLICATE_CHARGES: &str = "DUPLICATE_CHARGES";
+
+/// Why one purchase-order association was refused: the `ValidationException`
+/// `reason` to report, and the dotted request path of the member it is about —
+/// which element of the request's `purchaseOrders` list carried it, and which
+/// member of that element.
+#[derive(Debug)]
+pub struct PurchaseOrderRefusal {
+    pub reason: String,
+    pub path: String,
+}
+
+/// The dotted request path of one member of the `index`-th element of a
+/// request's `purchaseOrders` list — `purchaseOrders.1.member.chargeId` for the
+/// FIRST order's `chargeId`.
+///
+/// Spelled through the framework's own path rule
+/// ([`::aws_smithy_schema_server::constraints::path`]), exactly as
+/// [`filter_member_path`] is, so a path this service builds for a rule the model
+/// cannot express reads like one the boundary validator builds for a modelled
+/// constraint.
+fn purchase_order_member_path(index: usize, member: &str) -> String {
+    use ::aws_smithy_schema_server::constraints::path;
+    path::join(&[
+        path::member(PURCHASE_ORDERS_MEMBER),
+        path::element(index + 1),
+        path::member(member),
+    ])
+}
+
+/// The ids of the charges a quote minted, which is the set a purchase order's
+/// `chargeId` has to name.
+///
+/// `ChargeSummary$expectedCharges` carries one `ExpectedCharge` per charge the
+/// requested terms imply, and `ExpectedCharge$id` is the "Unique identifier of
+/// the charge for a given agreement" — so these ids, and no others, are the
+/// charges of the agreement that summary belongs to.
+pub fn expected_charge_ids(summary: &ChargeSummary) -> BTreeSet<&str> {
+    summary
+        .expected_charges
+        .iter()
+        .flatten()
+        .filter_map(|charge| charge.id.as_deref())
+        .collect()
+}
+
+/// Refuse a purchase-order association list that cannot be resolved against
+/// `charges`, BEFORE anything is stored — so a list naming a charge that does
+/// not exist associates nothing.
+///
+/// `PurchaseOrder` is "information about a purchase order association to a
+/// charge within an agreement": `chargeId` is "the unique identifier of the
+/// charge to associate the purchase order with" and `purchaseOrderReference` is
+/// "the purchase order reference to associate with the charge". An association
+/// therefore resolves only when
+///
+/// * the charge it names is one of the agreement's own charges — otherwise
+///   there is nothing to associate with (`INVALID_CHARGE_ID`);
+/// * no earlier element of the same list named that charge already — a charge
+///   carries ONE purchase order reference, so two elements naming it ask for two
+///   ([`REASON_DUPLICATE_CHARGES`]);
+/// * it carries the reference the association exists to record — an element
+///   without one associates nothing (`MISSING_PURCHASE_ORDER_REFERENCE`).
+///
+/// Each refusal names the element that carried the offending member and the
+/// member of it that failed ([`purchase_order_member_path`]), so a caller with
+/// several orders can tell WHICH one was rejected, and the member-derived
+/// reasons come from that member through [`member_reason`] — so a rule this
+/// service enforces is reported under the same reason the boundary validator
+/// reports a modelled constraint on the same member under.
+pub fn validate_purchase_orders(
+    orders: &[PurchaseOrder],
+    charges: &BTreeSet<&str>,
+) -> Result<(), PurchaseOrderRefusal> {
+    let mut associated: BTreeSet<&str> = BTreeSet::new();
+    for (index, order) in orders.iter().enumerate() {
+        let charge_path = purchase_order_member_path(index, "chargeId");
+        if !charges.contains(order.charge_id.as_str()) {
+            return Err(PurchaseOrderRefusal {
+                reason: member_reason(&charge_path, RefusalKind::Invalid),
+                path: charge_path,
+            });
+        }
+        if !associated.insert(order.charge_id.as_str()) {
+            return Err(PurchaseOrderRefusal {
+                reason: REASON_DUPLICATE_CHARGES.to_string(),
+                path: charge_path,
+            });
+        }
+        if order.purchase_order_reference.is_none() {
+            let reference_path = purchase_order_member_path(index, "purchaseOrderReference");
+            return Err(PurchaseOrderRefusal {
+                reason: member_reason(&reference_path, RefusalKind::Missing),
+                path: reference_path,
+            });
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

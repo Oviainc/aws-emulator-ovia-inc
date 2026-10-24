@@ -172,16 +172,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteIPSetErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
-                message: Some("the AWS WAF IPSet store is unavailable".to_string()),
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
             })
         })?;
         let mut state = state.lock();
 
-        match state.ip_sets.get(&input.ip_set_id) {
-            None => {
+        // Both refusals carry their exception type's own fixed sentence: neither names
+        // the id that was asked for, nor how many addresses the IPSet still holds.
+        match state.ip_set_deletable(&input.ip_set_id) {
+            Err(crate::state::IPSetDeleteRefusal::NoSuchIPSet) => {
                 return Err(DeleteIPSetErrorModeled::WAFNonexistentItemException(
                     WAFNonexistentItemException {
-                        message: Some(format!("IPSet {} does not exist", input.ip_set_id)),
+                        message: Some(
+                            crate::state::MESSAGE_NONEXISTENT_ITEM.to_string(),
+                        ),
                     },
                 )
                 .into())
@@ -189,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "You can't delete an IPSet if it's still used in any Rules …" — a Rule
             // uses it while one of its predicates points at this id, which is what
             // `UpdateRule` writes.
-            Some(_) if state.is_referenced_by_a_rule(&input.ip_set_id) => {
+            Err(crate::state::IPSetDeleteRefusal::Referenced) => {
                 return Err(DeleteIPSetErrorModeled::WAFReferencedItemException(
                     WAFReferencedItemException {
                         message: Some(crate::state::MESSAGE_REFERENCED_ITEM.to_string()),
@@ -198,37 +202,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
             // "… or if it still includes any IP addresses."
-            Some(entry) if !entry.descriptors.is_empty() => {
+            Err(crate::state::IPSetDeleteRefusal::NotEmpty) => {
                 return Err(DeleteIPSetErrorModeled::WAFNonEmptyEntityException(
                     WAFNonEmptyEntityException {
-                        message: Some(format!(
-                            "IPSet {} still includes {} IP address range(s); remove them with \
-                             UpdateIPSet before deleting it",
-                            input.ip_set_id,
-                            entry.descriptors.len()
-                        )),
+                        message: Some(
+                            crate::state::MESSAGE_NON_EMPTY_ENTITY.to_string(),
+                        ),
                     },
                 )
                 .into())
             }
-            Some(_) => {}
+            Ok(()) => {}
         }
 
         // Only a request that will be applied consumes the caller's change token.
         if !state.consume_change_token(&input.change_token) {
             return Err(DeleteIPSetErrorModeled::WAFStaleDataException(
                 WAFStaleDataException {
-                    message: Some(format!(
-                        "The change token {} is not a change token this request can use; \
-                         call GetChangeToken for a new one",
-                        input.change_token
-                    )),
+                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
                 },
             )
             .into());
         }
 
-        state.ip_sets.remove(&input.ip_set_id);
+        state.remove_ip_set(&input.ip_set_id);
 
         Ok(DeleteIPSetOutput {
             change_token: Some(input.change_token),

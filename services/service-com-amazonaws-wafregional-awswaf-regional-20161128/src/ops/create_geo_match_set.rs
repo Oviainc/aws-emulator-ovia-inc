@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateGeoMatchSetErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
-                message: Some("the AWS WAF GeoMatchSet store is unavailable".to_string()),
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
             })
         })?;
         let mut state = state.lock();
@@ -186,11 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.geo_match_sets.len() >= crate::state::MAX_GEO_MATCH_SETS {
             return Err(CreateGeoMatchSetErrorModeled::WAFLimitsExceededException(
                 WAFLimitsExceededException {
-                    message: Some(format!(
-                        "The request would exceed the maximum number of GeoMatchSet objects \
-                         ({}) allowed for this account",
-                        crate::state::MAX_GEO_MATCH_SETS
-                    )),
+                    message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
                 },
             )
             .into());
@@ -203,11 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.consume_change_token(&input.change_token) {
             return Err(CreateGeoMatchSetErrorModeled::WAFStaleDataException(
                 WAFStaleDataException {
-                    message: Some(format!(
-                        "The change token {} is not a change token this request can use; \
-                         call GetChangeToken for a new one",
-                        input.change_token
-                    )),
+                    // This exception type's own fixed sentence: the token the caller
+                    // submitted is never reflected back into the error body.
+                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
                 },
             )
             .into());

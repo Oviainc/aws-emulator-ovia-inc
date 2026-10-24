@@ -426,6 +426,14 @@ pub const MESSAGE_INTERNAL_ERROR: &str =
      valid. Retry your request.";
 /// The fixed sentence for `WAFNonexistentContainerException`, the refusal of an update
 /// whose container resource does not exist — see [`MESSAGE_DISALLOWED_NAME`].
+///
+/// Its provenance is this emulator's own choice, not a recording: the corpus carries no
+/// answer of this type, and the shape's documentation ("you tried to add an object to or
+/// delete an object from another object that doesn't exist") is prose about the cause
+/// rather than a wire sentence. What the message rule requires is that the type answer
+/// ONE request-independent sentence, so the nonexistent-container refusal reuses the
+/// sentence the nonexistent-item class is recorded with — the two say the same thing about
+/// the same missing record — and carries nothing from the request either way.
 pub const MESSAGE_NONEXISTENT_CONTAINER: &str = "The referenced item does not exist.";
 /// The fixed sentence for `WAFNonEmptyEntityException`, the refusal of a delete of a
 /// resource that still holds filters or addresses — see [`MESSAGE_DISALLOWED_NAME`].
@@ -681,6 +689,22 @@ impl IPSetEntry {
         self.descriptors.retain(|stored| &stored.cidr != cidr);
         true
     }
+}
+
+/// Why `DeleteIPSet` cannot delete an IPSet, as [`ComAmazonawsWafregionalAwswafRegional20161128State::ip_set_deletable`]
+/// reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IPSetDeleteRefusal {
+    /// This service holds no IPSet under that id: the modelled
+    /// `WAFNonexistentItemException`.
+    NoSuchIPSet,
+    /// A stored `Rule` or `RateBasedRule` still points a predicate at it. "You can't
+    /// delete an IPSet if it's still used in any Rules": the modelled
+    /// `WAFReferencedItemException`.
+    Referenced,
+    /// The IPSet still holds `IPSetDescriptor`s. "… or if it still includes any IP
+    /// addresses": the modelled `WAFNonEmptyEntityException`.
+    NotEmpty,
 }
 
 /// One stored `RegexPatternSet`.
@@ -1538,6 +1562,50 @@ impl ComAmazonawsWafregionalAwswafRegional20161128State {
             record.insync_at = None;
         }
         Some(record.status.clone())
+    }
+
+    /// Whether the account's `IPSet` quota ([`MAX_IP_SETS`]) is exhausted, which is
+    /// when `CreateIPSet` answers its modelled `WAFLimitsExceededException`.
+    pub fn ip_set_quota_exhausted(&self) -> bool {
+        self.ip_sets.len() >= MAX_IP_SETS
+    }
+
+    /// Store a new, empty `IPSet` named `name` under a freshly minted `IPSetId`, exactly
+    /// as `CreateIPSet` does, and answer the record that was STORED.
+    ///
+    /// A new IPSet holds no addresses: they arrive through `UpdateIPSet`. `ResourceName`
+    /// carries no uniqueness constraint, so two IPSets created with the same `Name` are
+    /// two distinct resources, each under its own id. Callers check
+    /// [`Self::ip_set_quota_exhausted`] first — this stores unconditionally.
+    pub fn insert_new_ip_set(&mut self, name: String) -> IPSetEntry {
+        let ip_set_id = self.mint_id();
+        let entry = IPSetEntry::new(ip_set_id.clone(), name);
+        self.ip_sets.insert(ip_set_id, entry.clone());
+        entry
+    }
+
+    /// Whether the IPSet `ip_set_id` names can be deleted, and why not when it cannot.
+    ///
+    /// Shared by `DeleteIPSet` and by any other caller that deletes an IPSet it owns, so
+    /// one rule decides the refusal: "You can't delete an IPSet if it's still used in any
+    /// Rules or if it still includes any IP addresses."
+    pub fn ip_set_deletable(&self, ip_set_id: &str) -> Result<(), IPSetDeleteRefusal> {
+        match self.ip_sets.get(ip_set_id) {
+            None => Err(IPSetDeleteRefusal::NoSuchIPSet),
+            // A Rule uses it while one of its predicates points at this id, which is what
+            // `UpdateRule` writes.
+            Some(_) if self.is_referenced_by_a_rule(ip_set_id) => {
+                Err(IPSetDeleteRefusal::Referenced)
+            }
+            Some(entry) if !entry.descriptors.is_empty() => Err(IPSetDeleteRefusal::NotEmpty),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Remove the IPSet `ip_set_id` names, answering the record that was removed (and
+    /// `None` when this service held none).
+    pub fn remove_ip_set(&mut self, ip_set_id: &str) -> Option<IPSetEntry> {
+        self.ip_sets.remove(ip_set_id)
     }
 
     /// The tag set of the resource `arn` names, or `None` when this store holds no
