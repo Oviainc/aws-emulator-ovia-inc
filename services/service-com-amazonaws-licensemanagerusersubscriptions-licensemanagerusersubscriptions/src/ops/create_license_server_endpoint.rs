@@ -167,10 +167,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The ARN is resolved as part of validating the request: an identity provider
         // reference that does not resolve is an invalid parameter rather than a missing
-        // resource, so it is refused before anything is minted.
-        if !state
-            .identity_providers
-            .contains_key(&input.identity_provider_arn)
+        // resource, so it is refused before anything is minted. A registration whose
+        // deregistration was accepted does not resolve: it is being torn down, so nothing
+        // new is provisioned for it.
+        if state
+            .live_identity_provider(&input.identity_provider_arn)
+            .is_none()
         {
             return Err(identity_provider_not_valid());
         }
