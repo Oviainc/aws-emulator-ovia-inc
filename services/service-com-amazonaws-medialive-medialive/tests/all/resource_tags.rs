@@ -33,7 +33,7 @@ const TAGS: &str = "/prod/tags";
 /// exactly the set an ARN can name here; each is created by
 /// [`create_resource`]. The rule under test holds for a resource, so the rows of
 /// every table below span this list rather than one chosen type.
-const KINDS: [&str; 10] = [
+const KINDS: [&str; 12] = [
     "channel",
     "input",
     "inputSecurityGroup",
@@ -44,6 +44,8 @@ const KINDS: [&str; 10] = [
     "node",
     "cloudwatch-alarm-template-group",
     "eventbridge-rule-template-group",
+    "cloudwatch-alarm-template",
+    "eventbridge-rule-template",
 ];
 
 /// A case name as a resource name: `Name` targets `__stringMin1Max255PatternS`
@@ -276,6 +278,83 @@ async fn create_resource(
             201,
             vec!["arn"],
         ),
+        "cloudwatch-alarm-template" => {
+            // A template lives IN a template group, so its create names the
+            // group it belongs to and the group is created right here — inline
+            // rather than through this function, which an `async fn` may not
+            // call recursively.
+            let (status, response) = call(
+                router,
+                "POST",
+                "/prod/cloudwatch-alarm-template-groups",
+                Some(json!({ "name": format!("{name}-group") })),
+            )
+            .await;
+            assert_eq!(
+                status, 201,
+                "kind {kind:?} ({label}): the template's group got {status}: {response}"
+            );
+            let group = response["id"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("kind {kind:?} ({label}): the template's group has no id: {response}")
+                })
+                .to_string();
+            (
+                "/prod/cloudwatch-alarm-templates".to_string(),
+                // Every REQUIRED member of `CreateCloudWatchAlarmTemplate`,
+                // each enum value one the model declares (see the alarm
+                // template suite, which reads them off
+                // `smithy_query(query="shape", shape="CloudWatchAlarmTemplate*")`).
+                with_tags(json!({
+                    "groupIdentifier": group,
+                    "name": name,
+                    "comparisonOperator": "GreaterThanThreshold",
+                    "evaluationPeriods": 1,
+                    "metricName": "InputVideoFrameRate",
+                    "period": 60,
+                    "statistic": "Average",
+                    "targetResourceType": "MEDIALIVE_CHANNEL",
+                    "threshold": 29.97,
+                    "treatMissingData": "notBreaching",
+                })),
+                201,
+                vec!["arn"],
+            )
+        }
+        "eventbridge-rule-template" => {
+            // Same as the alarm template above: the group this template belongs
+            // to is created inline first.
+            let (status, response) = call(
+                router,
+                "POST",
+                "/prod/eventbridge-rule-template-groups",
+                Some(json!({ "name": format!("{name}-group") })),
+            )
+            .await;
+            assert_eq!(
+                status, 201,
+                "kind {kind:?} ({label}): the template's group got {status}: {response}"
+            );
+            let group = response["id"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("kind {kind:?} ({label}): the template's group has no id: {response}")
+                })
+                .to_string();
+            (
+                "/prod/eventbridge-rule-templates".to_string(),
+                // `EventType` is one of the values
+                // `EventBridgeRuleTemplateEventType` declares.
+                with_tags(json!({
+                    "groupIdentifier": group,
+                    "name": name,
+                    "eventType": "MEDIALIVE_CHANNEL_ALERT",
+                })),
+                201,
+                vec!["arn"],
+            )
+        }
         other => panic!("no create is wired up for resource kind {other:?}"),
     };
 
@@ -446,7 +525,8 @@ async fn a_stored_tag_set_is_reported_verbatim() {
             "a long key and a long value",
             KINDS[4],
             vec![(long_key.as_str(), long_value.as_str())],
-        ),        (
+        ),
+        (
             "non-ascii key and value",
             KINDS[5],
             vec![("所有者", "ライブ"), ("ключ", "значение")],
@@ -456,6 +536,16 @@ async fn a_stored_tag_set_is_reported_verbatim() {
             "values that need escaping",
             KINDS[0],
             vec![("path", "a/b c:d"), ("json", "{\"nested\": true}")],
+        ),
+        (
+            "a single tag on a monitor template",
+            KINDS[10],
+            vec![("env", "prod")],
+        ),
+        (
+            "two tags on a rule template",
+            KINDS[11],
+            vec![("owner", "video"), ("env", "prod")],
         ),
     ];
 
@@ -507,7 +597,7 @@ async fn a_stored_tag_set_is_reported_verbatim() {
 #[tokio::test]
 async fn the_resource_and_the_tag_operations_report_one_tag_set() {
     // (kind, the reader's URI prefix, the reader's response path to `Tags`)
-    let rows: [(&str, &str, &[&str]); 4] = [
+    let rows: [(&str, &str, &[&str]); 6] = [
         ("channel", "/prod/channels", &["tags"]),
         ("input", "/prod/inputs", &["tags"]),
         (
@@ -516,6 +606,16 @@ async fn the_resource_and_the_tag_operations_report_one_tag_set() {
             &["tags"],
         ),
         ("signal-map", "/prod/signal-maps", &["tags"]),
+        (
+            "cloudwatch-alarm-template",
+            "/prod/cloudwatch-alarm-templates",
+            &["tags"],
+        ),
+        (
+            "eventbridge-rule-template",
+            "/prod/eventbridge-rule-templates",
+            &["tags"],
+        ),
     ];
 
     for (kind, prefix, path) in rows {
@@ -846,4 +946,69 @@ async fn a_resource_tag_set_is_bounded() {
         MAX_RESOURCE_TAGS,
         "expected the resource to be full again, got {listed:?}"
     );
+}
+
+/// Rule: the tag operations resolve a `ResourceArn` against the resources the
+/// store HOLDS, so a resource whose delete removed its record is no longer
+/// resolvable and the tag operations answer their modelled 404 for its ARN.
+///
+/// The rows are the kinds whose delete removes the record outright (the monitor
+/// templates), which is the other half of the resolution rule: an ARN resolves
+/// while, and only while, the resource it names exists.
+#[tokio::test]
+async fn the_arn_of_a_deleted_resource_resolves_to_nothing() {
+    // (kind, the collection its delete is addressed to)
+    let rows: [(&str, &str); 2] = [
+        (
+            "cloudwatch-alarm-template",
+            "/prod/cloudwatch-alarm-templates",
+        ),
+        (
+            "eventbridge-rule-template",
+            "/prod/eventbridge-rule-templates",
+        ),
+    ];
+
+    for (kind, prefix) in rows {
+        let router = medialive();
+        let case = format!("{kind} deleted");
+        let arn = create_resource(&router, kind, "deleted", Some(tags(&[("env", "prod")]))).await;
+        assert_eq!(
+            listed_tags(&router, &case, &arn).await,
+            expected(&[("env", "prod")]),
+            "case {case:?}: expected a live resource's tags to be listed"
+        );
+
+        let id = arn_id(&arn);
+        let (status, body) = call(
+            &router,
+            "DELETE",
+            &format!("{prefix}/{}", percent_encoded(&id)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 204,
+            "case {case:?}: deleting {prefix}/{id}: expected 204, got {status}: {body}"
+        );
+
+        for (operation, (got, body)) in [
+            (
+                "CreateTags",
+                create_tags(&router, &arn, json!({ "tags": tags(&[("a", "b")]) })).await,
+            ),
+            ("ListTagsForResource", list_tags(&router, &arn).await),
+            ("DeleteTags", delete_tags(&router, &arn, &["env"]).await),
+        ] {
+            assert_eq!(
+                got, 404,
+                "case {case:?} ({operation}): expected 404, got {got}: {body}"
+            );
+            assert_eq!(
+                error_code(got, &body),
+                "NotFoundException",
+                "case {case:?} ({operation}): expected NotFoundException, got {body}"
+            );
+        }
+    }
 }

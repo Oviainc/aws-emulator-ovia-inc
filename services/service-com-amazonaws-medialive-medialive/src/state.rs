@@ -3036,6 +3036,21 @@ impl ComAmazonawsMedialiveMedialiveState {
                 record.id.clone(),
             ));
         }
+        // The monitor TEMPLATES, each a taggable resource of its own with its
+        // own ARN and its own stored tag map, exactly like the GROUPS above:
+        // the tags a template create supplied are readable, writable and
+        // removable through the generic tag operations, not only through the
+        // template's own reader.
+        if let Some(record) = self.alarm_templates.values().find(|record| record.arn == arn) {
+            return Some(TaggedResource::AlarmTemplate(record.id.clone()));
+        }
+        if let Some(record) = self
+            .event_bridge_rule_templates
+            .values()
+            .find(|record| record.arn == arn)
+        {
+            return Some(TaggedResource::EventBridgeRuleTemplate(record.id.clone()));
+        }
         if let Some(record) = self.clusters.values().find(|record| record.arn == arn) {
             return Some(TaggedResource::Cluster(record.id.clone()));
         }
@@ -3073,6 +3088,13 @@ impl ComAmazonawsMedialiveMedialiveState {
                 .map(|record| &record.tags),
             TaggedResource::EventBridgeRuleTemplateGroup(id) => self
                 .event_bridge_rule_template_groups
+                .get(&id)
+                .map(|record| &record.tags),
+            TaggedResource::AlarmTemplate(id) => {
+                self.alarm_templates.get(&id).map(|record| &record.tags)
+            }
+            TaggedResource::EventBridgeRuleTemplate(id) => self
+                .event_bridge_rule_templates
                 .get(&id)
                 .map(|record| &record.tags),
             TaggedResource::Cluster(id) => self.clusters.get(&id).map(|record| &record.tags),
@@ -3153,6 +3175,17 @@ impl ComAmazonawsMedialiveMedialiveState {
                 .map(|record| &mut record.tags),
             TaggedResource::EventBridgeRuleTemplateGroup(id) => self
                 .event_bridge_rule_template_groups
+                .get_mut(&id)
+                .map(|record| &mut record.tags),
+            // No delete filter on either template: a deleted template is
+            // REMOVED from its store, so its ARN resolves to nothing at all and
+            // never reaches this match.
+            TaggedResource::AlarmTemplate(id) => self
+                .alarm_templates
+                .get_mut(&id)
+                .map(|record| &mut record.tags),
+            TaggedResource::EventBridgeRuleTemplate(id) => self
+                .event_bridge_rule_templates
                 .get_mut(&id)
                 .map(|record| &mut record.tags),
             TaggedResource::Cluster(id) => self
@@ -3272,6 +3305,8 @@ enum TaggedResource {
     InputDevice(String),
     AlarmTemplateGroup(String),
     EventBridgeRuleTemplateGroup(String),
+    AlarmTemplate(String),
+    EventBridgeRuleTemplate(String),
     Cluster(String),
     ChannelPlacementGroup(String),
 }
