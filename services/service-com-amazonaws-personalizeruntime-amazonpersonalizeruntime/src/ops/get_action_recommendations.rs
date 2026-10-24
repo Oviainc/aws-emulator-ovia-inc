@@ -14,12 +14,13 @@
 //!    [`crate::state::Denied::unresolvable`]) and the
 //!    campaign must deploy a `PERSONALIZED_ACTIONS` solution version — otherwise 400.
 //! 2. `filterArn` is resolved the same way (400 when unknown) and its expression, bound to
-//!    `filterValues`, decides which stored Actions-catalog entries are candidates.
-//! 3. Each candidate's score is [`crate::state::scoring::relevance`] of its STORED
+//!    `filterValues`, decides which stored Actions-catalog entries come back — not
+//!    what any of them scores.
+//! 3. Each action's score is [`crate::state::scoring::relevance`] of its STORED
 //!    `base_score` and the request's `userId`, so an identical request returns an
 //!    identical ordering (the operation is `@idempotent`), and the list is reported
-//!    descending by score. The scores are normalized across the whole
-//!    filter-surviving action set BEFORE `numResults` decides how many of them come
+//!    descending by score. The scores are normalized across the whole stored Actions
+//!    catalog BEFORE the request's filter and `numResults` decide which of them come
 //!    back, so one action's score is the same whatever the request asked for.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
@@ -82,7 +83,7 @@ use super::types::*;
 
 use std::time::SystemTime;
 
-use crate::state::{self as registry, scoring, Denied, Entity, RecipeType};
+use crate::state::{self as registry, scoring, Action, Denied, Entity, RecipeType};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -199,37 +200,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .map_err(deny)?;
 
-        // 3. Score every stored action the filter keeps, descending, then take the
-        //    requested number of results.
-        let mut ranked: Vec<(&str, f64)> = campaign
+        // 3. Score every stored action, settle each one's share of the certainty over
+        //    the whole stored Actions catalog, then let the request's filter and
+        //    `numResults` decide which of them come back.
+        let mut ranked: Vec<(&Action, f64)> = campaign
             .actions
             .iter()
-            .filter(|action| {
-                request_filter
-                    .as_ref()
-                    .is_none_or(|filter| filter.retains(&action.attributes))
-            })
             .map(|action| {
                 let score = scoring::relevance(
                     action.base_score,
                     &[&campaign.arn, user_id, &action.action_id],
                 );
-                (action.action_id.as_str(), score)
+                (action, score)
             })
             .collect();
-        // The reported score of an action is a property of the (campaign, userId,
-        // action) triple, so the denominator is the WHOLE filter-surviving candidate
-        // set and is settled before `numResults` selects which of them come back. A
-        // response that reports fewer actions reports each of them with the same score
-        // a larger one would, and sums to at most 1.0.
+        // The reported score of an action is the model's certainty for the (campaign,
+        // userId, action) triple, so the denominator is the WHOLE scored catalog and is
+        // settled before any member that only selects which actions come back — the
+        // request's filter and `numResults`. A response that reports fewer actions
+        // reports each of them with the same score a larger one would, and sums to at
+        // most 1.0.
         scoring::normalize_by(&mut ranked, |(_, score)| score);
-        ranked.sort_by(|left, right| scoring::by_score_desc(*left, *right));
+        // "the filter to apply to the returned recommendations" — it decides WHICH
+        // actions come back, never what one of them scores.
+        ranked.retain(|(action, _)| {
+            request_filter
+                .as_ref()
+                .is_none_or(|filter| filter.retains(&action.attributes))
+        });
+        ranked.sort_by(|(left, left_score), (right, right_score)| {
+            scoring::by_score_desc(
+                (left.action_id.as_str(), *left_score),
+                (right.action_id.as_str(), *right_score),
+            )
+        });
         ranked.truncate(num_results);
 
         let action_list: Vec<PredictedAction> = ranked
             .iter()
-            .map(|(action_id, score)| PredictedAction {
-                action_id: Some((*action_id).to_string()),
+            .map(|(action, score)| PredictedAction {
+                action_id: Some(action.action_id.clone()),
                 score: Some(*score),
             })
             .collect();

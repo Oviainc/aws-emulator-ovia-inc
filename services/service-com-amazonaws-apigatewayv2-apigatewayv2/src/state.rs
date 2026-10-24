@@ -193,6 +193,13 @@ pub const DOMAIN_NAME_STATUS_UPDATING: &str = "UPDATING";
 /// clock on every read.
 pub const DOMAIN_NAME_MIGRATION: Duration = Duration::from_millis(500);
 
+/// The refusal a request carries when its `DomainNameConfigurations` names no endpoint:
+/// the message of the `BadRequestException` both domain-name writers answer with (see
+/// [`resolve_domain_name_endpoints`]). It names the member's constraint — one
+/// configuration is expected — and quotes nothing from the request.
+pub const EMPTY_DOMAIN_NAME_CONFIGURATIONS: &str =
+    "Invalid input. Expected one domain name configuration";
+
 /// The most authorizers one api may hold, after which CreateAuthorizer is refused.
 ///
 /// API Gateway publishes a quota of 10 authorizers per API, so this is the faithful
@@ -1992,6 +1999,28 @@ pub fn domain_name_arn(domain_name: &str, region: &str) -> String {
 /// endpoint host `CreateApiResponse$ApiEndpoint` documents.
 pub fn api_gateway_domain_host(domain_id: &str, region: &str) -> String {
     format!("d-{domain_id}.execute-api.{region}.amazonaws.com")
+}
+
+/// Resolve a request's whole `DomainNameConfigurations` list into the records to store.
+///
+/// A custom domain name is reached only through the endpoints this list describes — each
+/// entry names the certificate the endpoint presents, its endpoint type, its security
+/// policy and its address family — so a list with no entry at all describes a domain name
+/// nothing can serve. A request that would leave the resource in that shape is refused
+/// instead of stored: `Err` carries the message for the operation's `BadRequestException`
+/// ("the input is incomplete or incorrect"). Each entry is resolved by
+/// [`resolve_domain_name_endpoint`], so a create and an update cannot drift.
+pub fn resolve_domain_name_endpoints(
+    requested: &[wire::DomainNameConfiguration],
+) -> Result<Vec<DomainNameEndpoint>, String> {
+    if requested.is_empty() {
+        return Err(EMPTY_DOMAIN_NAME_CONFIGURATIONS.to_string());
+    }
+    requested
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| resolve_domain_name_endpoint(index, entry))
+        .collect()
 }
 
 /// Resolve one `DomainNameConfigurations` entry of a request into the record to store.
