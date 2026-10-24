@@ -88,7 +88,11 @@ async fn started_run(harness: &Harness, name: &str) -> (String, String) {
 
 /// Edit the stored run in place. The clock fields are what the schedule is driven from, so
 /// setting them is how a row puts a deadline in the past without sleeping for it.
-fn with_run<R>(
+///
+/// `pub(crate)` so another suite that needs a run in a DETERMINISTIC state — one whose
+/// next change is not due, so the status it reports cannot move mid-test — seeds it
+/// through the same store rather than building a second seam onto the engine.
+pub(crate) fn with_run<R>(
     harness: &Harness,
     workflow_arn: &str,
     run_id: &str,

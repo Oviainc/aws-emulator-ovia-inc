@@ -932,6 +932,12 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
             "ListTagsForResource",
             serde_json::json!({"ResourceArn": arn.clone()}),
         ),
+        // A paginated listing resolves its parent workflow the same way: an absent one
+        // is a lookup miss, not an empty page.
+        (
+            "ListWorkflowRuns",
+            serde_json::json!({"WorkflowArn": arn.clone()}),
+        ),
     ];
     for (operation, body) in implemented_cases {
         let (status, answered) = harness.call(operation, body).await;
@@ -945,10 +951,6 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
 
     // Still-scaffolded operations keep their 501 for a well-formed request.
     let stub_cases: Vec<(&str, serde_json::Value)> = vec![
-        (
-            "ListWorkflowRuns",
-            serde_json::json!({"WorkflowArn": arn.clone()}),
-        ),
         (
             "ListWorkflowVersions",
             serde_json::json!({"WorkflowArn": arn.clone()}),

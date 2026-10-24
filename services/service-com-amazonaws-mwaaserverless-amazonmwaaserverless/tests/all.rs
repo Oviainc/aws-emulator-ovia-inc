@@ -29,5 +29,7 @@ mod validation_errors;
 mod workflow_deletion_teardown;
 #[path = "all/workflow_lifecycle.rs"]
 mod workflow_lifecycle;
+#[path = "all/workflow_run_listing.rs"]
+mod workflow_run_listing;
 #[path = "all/workflow_update_versions.rs"]
 mod workflow_update_versions;

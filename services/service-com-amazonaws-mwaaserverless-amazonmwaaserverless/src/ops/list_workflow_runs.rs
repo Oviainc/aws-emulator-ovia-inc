@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkflowRuns
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkflowRuns`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkflowRuns::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: one `WorkflowRunSummary` per run the named workflow holds in this
+//! service's store (`crate::state`), in `RunId` order, at most `MaxResults` per page,
+//! optionally narrowed to one `WorkflowVersion`. A workflow the store does not hold is
+//! the service's lookup miss, not an empty page. The only writes are the changes the
+//! clock already owed — the teardown of a workflow past its `DELETING` span and each
+//! run's own status schedule — so a read never changes what a later caller sees. The
+//! `NextToken` this operation returns is the only one it accepts back; anything else is
+//! refused as a `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +96,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+/// The list this operation's pagination cursors belong to, so a cursor issued for
+/// another paginated list of this service is refused here.
+const PAGE_KIND: &str = "WorkflowRuns";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -108,12 +113,27 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mwaaserverless-amazonmw
 // here — hence the `ListWorkflowRunsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mwaaserverless#ListWorkflowRuns")]
+//
+// Widened with `ResourceNotFoundException`: `WorkflowArn` is this operation's
+// `@httpLabel` — the parent resource the listing walks, `GET
+// /workflows/{WorkflowArn}/runs` — and every sibling operation that resolves that
+// same ARN (`GetWorkflow`, `DeleteWorkflow`, `StartWorkflowRun`, `GetWorkflowRun`,
+// `ListTagsForResource`) declares `ResourceNotFoundException` for a workflow the
+// store does not hold. This operation's own `errors` list omits it, so it is widened
+// in here through `extra_errors` rather than answered as an empty page, which would
+// report "this workflow has no runs" for a workflow that does not exist. The shape is
+// this service's own (`com.amazonaws.mwaaserverless#ResourceNotFoundException`),
+// served at `crate::state::LOOKUP_MISS_STATUS` like every other lookup miss here.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mwaaserverless#ListWorkflowRuns",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum ListWorkflowRunsErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     OperationTimeoutException(OperationTimeoutException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -169,30 +189,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (ctx, &self.engine);
+        // `ctx` carries only request metadata; the listing is identified by its input.
+        let _ = ctx;
 
         // A member value that fails the constraint its model declares is refused
         // first, with the modelled `ValidationException` — `Message`,
         // `Reason: fieldValidationFailed` and a `FieldList` entry naming each
-        // offending member. A well-formed request still reaches the 501 below:
-        // the operation itself is not implemented yet.
+        // offending member.
         validate_input(&input).map_err(|refusal| {
             ListWorkflowRunsError::from(ListWorkflowRunsErrorModeled::ValidationException(refusal))
         })?;
 
-        // Implement `ListWorkflowRuns` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkflowRunsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". The members listed in `skip_validation` on
-        // `ListWorkflowRunsInput` are checked by `validate_input` below; every other
-        // modeled constraint is refused BEFORE this handler runs.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkflowRuns"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListWorkflowRunsErrorModeled::InternalServerException(InternalServerException {
+                message: "the com.amazonaws.mwaaserverless workflow store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+
+        // The first write a read may make: every workflow teardown whose removal the
+        // clock has already made due, so a run of a workflow past its `DELETING` span is
+        // gone with it — the same step every handler that touches `workflows` takes.
+        store.reap_deleted_workflows(now);
+
+        // The cursor is the `RunId` of the last item on the previous page, so a run
+        // started or removed between pages cannot restart or skip the walk. Decoded
+        // BEFORE the workflow lookup so a foreign token is one refusal whatever the ARN
+        // resolves to.
+        let after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(PAGE_KIND, token).ok_or_else(|| {
+                    ListWorkflowRunsErrorModeled::ValidationException(
+                        crate::state::invalid_page_token("ListWorkflowRuns"),
+                    )
+                })?,
+            ),
+        };
+
+        // The entity this listing walks is the workflow its `@httpLabel` names: one the
+        // store does not hold has no runs to page over, and an empty page for it would
+        // claim the workflow exists.
+        let workflow = store.workflows.get_mut(&input.workflow_arn).ok_or_else(|| {
+            crate::state::lookup_miss(ListWorkflowRunsErrorModeled::ResourceNotFoundException(
+                crate::state::unresolved(
+                    crate::state::UnresolvedEntity::Workflow,
+                    &input.workflow_arn,
+                ),
+            ))
+        })?;
+
+        // The ONE further write a read may make: every status change the clock already
+        // owed, applied to each run so this listing reports what `GetWorkflowRun` would.
+        for run in workflow.runs.values_mut() {
+            run.settle(now);
+        }
+
+        // `MaxResults` carries `@default: 20` and `@range(1..100)`, both applied before
+        // this handler runs, so the value is already a usable page size.
+        let page_size = usize::try_from(input.max_results).unwrap_or(0);
+
+        let lower = match after.as_deref() {
+            Some(last) => std::ops::Bound::Excluded(last),
+            None => std::ops::Bound::Unbounded,
+        };
+        // `WorkflowVersion` is a FILTER, not a resolution: "If not specified, runs for
+        // all versions are returned" (`smithy_query(query="operation",
+        // operation="ListWorkflowRuns")`, `WorkflowVersion`). A version no run carries
+        // therefore yields an empty page rather than a refusal.
+        let wanted_version = input.workflow_version.as_deref();
+        let mut matching = workflow
+            .runs
+            .range::<str, _>((lower, std::ops::Bound::Unbounded))
+            .map(|(_, run)| run)
+            .filter(|run| wanted_version.is_none_or(|version| run.workflow_version == version));
+
+        let workflow_runs: Vec<WorkflowRunSummary> =
+            matching.by_ref().take(page_size).map(summarize).collect();
+
+        // A token only when a further MATCHING page exists, so a client stops without an
+        // extra empty round trip.
+        let next_token = match workflow_runs.last() {
+            Some(last) if matching.next().is_some() => last
+                .run_id
+                .as_deref()
+                .map(|run_id| crate::state::encode_page_token(PAGE_KIND, run_id)),
+            _ => None,
+        };
+
+        Ok(ListWorkflowRunsOutput {
+            // The page itself — the `@paginated` `items` member — so "no runs on this
+            // page" is the empty list rather than an absent member.
+            workflow_runs: Some(workflow_runs),
+            next_token,
+        })
+    }
+}
+
+/// One stored run as the `WorkflowRunSummary` this listing reports.
+///
+/// Every member comes from the stored record, and the summary's `RunDetailSummary`
+/// reports the same status and instants `GetWorkflowRun` serves from it: `EndedAt`
+/// stays absent "if the run is not complete" (`smithy_query(query="shape",
+/// shape="RunDetailSummary")`, `EndedAt`).
+fn summarize(run: &crate::state::WorkflowRun) -> WorkflowRunSummary {
+    WorkflowRunSummary {
+        run_id: Some(run.run_id.clone()),
+        workflow_arn: Some(run.workflow_arn.clone()),
+        workflow_version: Some(run.workflow_version.clone()),
+        run_type: Some(run.run_type.clone()),
+        run_detail_summary: Some(RunDetailSummary {
+            status: Some(run.status.clone()),
+            created_on: Some(crate::state::timestamp(run.created_at)),
+            started_at: Some(crate::state::timestamp(run.started_on)),
+            ended_at: run.completed_on.map(crate::state::timestamp),
+        }),
     }
 }
 

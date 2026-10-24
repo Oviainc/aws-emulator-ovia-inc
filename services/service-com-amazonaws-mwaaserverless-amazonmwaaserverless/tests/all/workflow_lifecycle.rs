@@ -89,8 +89,8 @@ impl Harness {
         (status, parsed)
     }
 
-    /// How many runs the STORE holds for a workflow — the only way to show that a
-    /// repeated `ClientToken` created nothing while `ListWorkflowRuns` is still a stub.
+    /// How many runs the STORE holds for a workflow — the direct way to show that a
+    /// repeated `ClientToken` created nothing, independent of what any listing reports.
     pub(crate) fn stored_run_count(&self, workflow_arn: &str) -> usize {
         self.engine
             .state::<ComAmazonawsMwaaserverlessAmazonmwaaserverlessState>()
