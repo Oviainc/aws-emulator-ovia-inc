@@ -971,6 +971,7 @@ fn settled_run(run_id: &str, now: i64) -> ScanRun {
         created_at_millis: now,
         updated_at_millis: Some(now),
         error_message: Some("seeded".to_string()),
+        resource_uploaded: false,
         settle_due_millis: now,
     }
 }
@@ -989,10 +990,11 @@ async fn each_caller_driven_store_refuses_growth_past_its_quota() {
                 guard.record_artifact(UploadArtifact {
                     code_artifact_id: format!("seed-{index}"),
                     scan_name: "seeded".to_string(),
-                    s3_url: "https://seeded.emulator.invalid/seed".to_string(),
+                    s3_url: cgs_state::upload_url(REGION, "seeded", &format!("seed-{index}")),
                     request_headers: BTreeMap::new(),
                     created_at_millis: now,
                     expires_at_millis: now + UPLOAD_ARTIFACT_TTL_MILLIS,
+                    upload: None,
                 });
             }
         }
@@ -1094,10 +1096,11 @@ async fn each_caller_driven_store_refuses_growth_past_its_quota() {
             guard.record_artifact(UploadArtifact {
                 code_artifact_id: expired.to_string(),
                 scan_name: scan_name.to_string(),
-                s3_url: "https://seeded.emulator.invalid/expired".to_string(),
+                s3_url: cgs_state::upload_url(REGION, scan_name, expired),
                 request_headers: BTreeMap::new(),
                 created_at_millis: now - UPLOAD_ARTIFACT_TTL_MILLIS - 1,
                 expires_at_millis: now - 1,
+                upload: None,
             });
         }
         let refused = create_scan(&router, json!({ "scanName": scan_name }), expired).await;

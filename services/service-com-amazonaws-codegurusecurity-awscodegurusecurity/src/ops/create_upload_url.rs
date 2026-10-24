@@ -3,9 +3,9 @@
 //! @op CreateUploadUrl
 //!
 //! Mints an upload target for a code resource and RECORDS it, so `CreateScan` can
-//! resolve the `codeArtifactId` it hands back. The emulator has no S3 data plane, so
-//! the `s3Url` is minted (deterministically, from the recorded artifact) rather than
-//! served; see `crate::state::SCAN_NOT_ANALYSED_MESSAGE`.
+//! resolve the `codeArtifactId` it hands back. The minted `s3Url` is a target this
+//! emulator SERVES (`crate::service`): the upload the response documents is performed
+//! against it, and the bytes are then held against the recorded artifact.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +171,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The upload target, derived from the recorded artifact (never echoed from the
         // request alone) and stable for that artifact's lifetime.
         //
-        // Deliberately NOT a real `s3.<region>.amazonaws.com` host: this emulator has no
-        // S3 data plane to receive the resource (see
-        // `crate::state::SCAN_NOT_ANALYSED_MESSAGE`), and a developer following the
-        // documented CreateUploadUrl workflow against an AWS-shaped target would PUT
-        // their source archive to real AWS. `.invalid` is reserved by RFC 2606 and never
-        // resolves, so the minted target is unmistakably the emulator's own and cannot
-        // send anything off the machine.
-        let s3_url = format!(
-            "https://codeguru-security-upload.{region}.emulator.invalid/{account}/{scan_name}/{code_artifact_id}",
-            account = ::engine::emulator_account_id(),
-            scan_name = input.scan_name,
-        );
+        // `s3Url` is documented as a URL "you can upload the code file you want to scan
+        // with the required requestHeaders using any HTTP client" to, so the published
+        // target is one this emulator itself serves: the host is the upload host this
+        // service claims and the path names this artifact, and the `PUT` a client makes
+        // to it is received by `crate::service`'s upload plane, which holds the bytes
+        // against this artifact. A target on a real `s3.<region>.amazonaws.com` host
+        // would send a developer's source archive off the machine to AWS instead.
+        let s3_url = crate::state::upload_url(&region, &input.scan_name, &code_artifact_id);
         // ONE lock for this call: the configured encryption key is read, the quota is
         // measured and the artifact is recorded under the same guard, so two concurrent
         // CreateUploadUrl calls cannot both pass a quota only one of them has room for.
@@ -216,6 +212,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             request_headers,
             created_at_millis: now,
             expires_at_millis: now.saturating_add(crate::state::UPLOAD_ARTIFACT_TTL_MILLIS),
+            // Nothing is uploaded yet: the resource arrives when the caller performs the
+            // documented upload to the target minted above.
+            upload: None,
         };
         {
             // Release the targets whose lifetime the clock has already ended before the
