@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDeploymentStrategy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDeploymentStrategy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDeploymentStrategy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Patches the stored deployment-strategy record this account created: every member the
+//! request carries overwrites the stored one, every member it omits leaves the stored one
+//! alone, and the answer is read back out of the patched record. Because the one record in
+//! [`crate::state::ComAmazonawsAppconfigAmazonappconfigState`] is what is mutated, every
+//! later reader of that strategy — `GetDeploymentStrategy`, `ListDeploymentStrategies`
+//! and any `StartDeployment` naming it — reports the patched criteria rather than the
+//! creation-time ones.
 //!
 //! ## Shape of an operation
 //!
@@ -170,20 +169,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDeploymentStrategy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDeploymentStrategyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateDeploymentStrategyErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "AppConfig state is not reachable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // Decided BEFORE anything is written, so a refused request patches nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDeploymentStrategy"))
+        // Only a strategy this account created has a stored record to patch. An
+        // `AppConfig.*` strategy — the second branch of this member's own pattern, which
+        // `GetDeploymentStrategy` does answer for — is AppConfig's published catalogue
+        // entry: refusing it with the modelled 400 is what the delete of one answers too,
+        // and is honest both ways, where a 200 would claim a mutation of a catalogue this
+        // account does not own and a 404 would deny a strategy a reader still reports.
+        if store
+            .created_strategy_mut(&input.deployment_strategy_id)
+            .is_none()
+        {
+            if store.resolve_strategy(&input.deployment_strategy_id).is_some() {
+                return Err(UpdateDeploymentStrategyErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!(
+                            "Deployment strategy {} is an AppConfig predefined deployment \
+                             strategy and cannot be updated.",
+                            input.deployment_strategy_id
+                        )),
+                        reason: None,
+                        details: None,
+                    },
+                )
+                .into());
+            }
+            // Nothing answers to this id — including a strategy a delete already removed.
+            return Err(
+                UpdateDeploymentStrategyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::deployment_strategy_not_found(
+                            &input.deployment_strategy_id,
+                        )),
+                        resource_name: Some(input.deployment_strategy_id),
+                    },
+                )
+                .into(),
+            );
+        }
+        let Some(strategy) = store.created_strategy_mut(&input.deployment_strategy_id) else {
+            // Unreachable: the check above answered for this very id under the same lock.
+            return Err(
+                UpdateDeploymentStrategyErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The deployment strategy could not be re-read for the update"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A PATCH over the stored record: a member the request carries replaces the stored
+        // one, a member it omits leaves the stored one alone. Every bound the model
+        // declares on these members — the 0..1440 minutes, the 1..100 growth factor, the
+        // description's length and the growth-type enum — is refused by the schema walk
+        // before this handler runs, so reaching here means each value present is storable
+        // as it stands. The empty string is a value the caller sent rather than an omission
+        // (`Description` is len 0..1024), so it replaces the stored text. `Id`, `Name`,
+        // `ReplicateTo` and the strategy's tags are not members of this request, so none
+        // of them moves.
+        if let Some(description) = input.description {
+            strategy.description = Some(description);
+        }
+        if let Some(duration) = input.deployment_duration_in_minutes {
+            strategy.deployment_duration_in_minutes = duration;
+        }
+        if let Some(bake_time) = input.final_bake_time_in_minutes {
+            strategy.final_bake_time_in_minutes = bake_time;
+        }
+        if let Some(growth_factor) = input.growth_factor {
+            strategy.growth_factor = growth_factor;
+        }
+        if let Some(growth_type) = input.growth_type {
+            strategy.growth_type = growth_type;
+        }
+
+        // Answered out of the patched record — the same record `GetDeploymentStrategy` and
+        // `ListDeploymentStrategies` read — so this response reports nothing a later read
+        // of the strategy does not.
+        Ok(UpdateDeploymentStrategyOutput {
+            id: Some(strategy.id.clone()),
+            name: Some(strategy.name.clone()),
+            description: strategy.description.clone(),
+            deployment_duration_in_minutes: strategy.deployment_duration_in_minutes,
+            growth_type: Some(strategy.growth_type.clone()),
+            growth_factor: Some(strategy.growth_factor),
+            final_bake_time_in_minutes: strategy.final_bake_time_in_minutes,
+            replicate_to: Some(strategy.replicate_to.clone()),
+        })
     }
 }

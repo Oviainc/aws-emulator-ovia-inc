@@ -1807,6 +1807,22 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
             .map(DeploymentStrategy::from)
     }
 
+    /// The stored record of a deployment strategy this account CREATED, for the caller
+    /// that patches it in place: `UpdateDeploymentStrategy`. Mutating what this hands
+    /// back is what makes every later reader — `GetDeploymentStrategy`,
+    /// `ListDeploymentStrategies`, `StartDeployment` — report the patched record, since
+    /// they all read this one map.
+    ///
+    /// Answers `None` for an id no `CreateDeploymentStrategy` minted, including
+    /// AppConfig's predefined `AppConfig.*` strategies: [`Self::resolve_strategy`]
+    /// answers for those, but they are AppConfig's rather than this account's and no
+    /// record of them is stored here to patch. Handing out a `&mut` to an EXISTING entry
+    /// cannot grow the map, so the [`MAX_DEPLOYMENT_STRATEGIES`] bound
+    /// [`Self::try_insert_strategy`] guards is untouched by it.
+    pub fn created_strategy_mut(&mut self, id: &str) -> Option<&mut DeploymentStrategy> {
+        self.deployment_strategies.get_mut(id)
+    }
+
     /// Store a deployment strategy this account created.
     ///
     /// Answers `false`, having stored nothing, when this service already holds
