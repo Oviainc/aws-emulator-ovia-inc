@@ -5,6 +5,11 @@
 //! Creates or updates a Firewall Manager policy and persists it in
 //! [`crate::state::ComAmazonawsFmsAwsfms20180101State::policies`].
 //!
+//! Policy management is organisation-scoped, so with no Firewall Manager
+//! administrator association in the account/Region the call is refused by
+//! [`crate::state::require_administrator`] BEFORE the payload is examined, the
+//! `PolicyId` resolved or anything written.
+//!
 //! * CREATE (`Policy.PolicyId` absent) — the service mints the `PolicyId` and the
 //!   first `PolicyUpdateToken`, builds the policy ARN, and stores the whole
 //!   modelled `Policy` plus the request's `TagList`.
@@ -470,6 +475,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The authorization gate, BEFORE any member of the payload is examined,
+        // before the `PolicyId` is resolved and before anything is written, so an
+        // unauthorized caller learns nothing about what the organisation holds
+        // and a refused call leaves the store exactly as it was.
+        crate::state::require_administrator(&store, &region)?;
 
         // Everything the caller sent is stored verbatim; the only member filled
         // in here is the `PolicyStatus` default.
@@ -492,8 +504,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a document the service would not have created is never persisted —
         // on an UPDATE as much as on a create: both write the same `Policy`.
         validate_policy_document(&policy)?;
-
-        let mut store = state.lock();
 
         // The rule that needs the store, decided before either branch writes.
         validate_resource_set_ids(&policy, &store)?;
@@ -551,7 +561,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into());
                 }
                 let policy_id = crate::state::mint_identifier();
-                let region = crate::state::request_region(ctx.parts());
                 crate::state::PolicyRecord {
                     policy_arn: crate::state::policy_arn(&region, &policy_id),
                     policy_id,
