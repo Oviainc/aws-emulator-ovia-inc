@@ -21,6 +21,8 @@ mod bridge_output_admission;
 mod create_flow_stored_formats;
 #[path = "all/create_router_network_interface_rules.rs"]
 mod create_router_network_interface_rules;
+#[path = "all/entitlement_listing.rs"]
+mod entitlement_listing;
 #[path = "all/error_envelopes.rs"]
 mod error_envelopes;
 #[path = "all/flow_entitlements.rs"]

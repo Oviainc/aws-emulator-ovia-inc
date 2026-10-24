@@ -172,7 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Signer is regional: the removal lands on the policy of the profile held
+        // by the region whose endpoint it was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 RemoveProfilePermissionErrorModeled::InternalServiceErrorException(
@@ -186,11 +188,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        if !store.profiles.contains_key(&input.profile_name) {
+        if store.profile(&region, &input.profile_name).is_none() {
             return Err(profile_not_found(&input.profile_name));
         }
 
-        let Some(policy) = store.profile_permissions.get(&input.profile_name) else {
+        let Some(policy) = store.profile_policy(&region, &input.profile_name) else {
             return Err(statement_not_found(
                 &input.profile_name,
                 &input.statement_id,
@@ -227,8 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what a later add has to name.
         let revision_id = store.mint_permission_revision_id();
         let policy = store
-            .profile_permissions
-            .get_mut(&input.profile_name)
+            .profile_policy_mut(&region, &input.profile_name)
             .expect("the policy resolved above is still in the store");
         policy.statements.remove(&input.statement_id);
         policy.revision_id = revision_id;

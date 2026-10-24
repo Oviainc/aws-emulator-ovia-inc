@@ -169,7 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Signer is regional: the policy reported is that of the profile held by
+        // the region whose endpoint was addressed.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 ListProfilePermissionsErrorModeled::InternalServiceErrorException(
@@ -183,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
-        let Some(profile) = store.profiles.get(&input.profile_name) else {
+        let Some(profile) = store.profile(&region, &input.profile_name) else {
             return Err(profile_not_found(&input.profile_name));
         };
 
@@ -191,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // report, no statements, and `policySizeBytes` at the modelled default of
         // 0 — there is no document to measure. A page of it can only be the first
         // one, so a token against it is a token this service never handed out.
-        let Some(policy) = store.profile_permissions.get(&input.profile_name) else {
+        let Some(policy) = store.profile_policy(&region, &input.profile_name) else {
             if let Some(token) = input.next_token.as_deref() {
                 return Err(invalid_next_token(token));
             }

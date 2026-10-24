@@ -185,7 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Signer is regional: this call moves the status of the profile held by
+        // the region whose endpoint it was signed for, and of no other region's.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 CancelSigningProfileErrorModeled::InternalServiceErrorException(
@@ -199,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        let Some(profile) = store.profiles.get_mut(&input.profile_name) else {
+        let Some(profile) = store.profile_mut(&region, &input.profile_name) else {
             return Err(
                 CancelSigningProfileErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

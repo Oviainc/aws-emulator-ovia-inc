@@ -232,18 +232,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let requested_by = crate::state::request_principal(ctx.parts());
+        // Signer is regional: a job signs with a profile of the region whose
+        // endpoint started it, and the job belongs to that region too.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
         // `@idempotencyToken`: "All calls after the first that use this token
         // return the same response as the first call." So a repeated token
         // answers with the job it already started rather than starting a second.
-        if let Some(job_id) = store.job_tokens.get(&input.client_request_token).cloned() {
-            if let Some(job) = store.jobs.get(&job_id) {
-                return Ok(StartSigningJobOutput {
-                    job_id: Some(job.job_id.clone()),
-                    job_owner: Some(job.job_owner.clone()),
-                });
-            }
+        if let Some(job) = store.job_for_token(&region, &input.client_request_token) {
+            return Ok(StartSigningJobOutput {
+                job_id: Some(job.job_id.clone()),
+                job_owner: Some(job.job_owner.clone()),
+            });
         }
 
         // `profileOwner` names the account that owns the profile. This emulator
@@ -258,7 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let Some(profile) = store.profiles.get(&input.profile_name).cloned() else {
+        let Some(profile) = store.profile(&region, &input.profile_name).cloned() else {
             return Err(profile_not_found(format!(
                 "Signing profile {} not found",
                 input.profile_name
@@ -280,6 +281,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let job_id = store.mint_job_id();
         let job = crate::state::SigningJobRecord {
             job_id: job_id.clone(),
+            region: region.clone(),
             profile_name: profile.profile_name,
             profile_version: profile.profile_version,
             platform_id: profile.platform_id,
@@ -307,9 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         store.jobs.insert(job_id.clone(), job);
-        store
-            .job_tokens
-            .insert(input.client_request_token, job_id.clone());
+        store.record_job_token(&region, &input.client_request_token, job_id.clone());
 
         // Reported out of the stored record, so this answer is what
         // `DescribeSigningJob` resolves.

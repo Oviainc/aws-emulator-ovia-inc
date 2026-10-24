@@ -221,9 +221,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reported in the IAM principal ARN form AWS names a caller by (`None`
         // for an unsigned request).
         let revoked_by = crate::state::request_principal_arn(ctx.parts());
+        // Signer is regional: the revocation lands on the profile held by the
+        // region whose endpoint it was signed for, and on no other region's.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
-        let Some(profile) = store.profiles.get_mut(&input.profile_name) else {
+        let Some(profile) = store.profile_mut(&region, &input.profile_name) else {
             return Err(not_found(format!(
                 "profile with name {} does not exists",
                 input.profile_name
