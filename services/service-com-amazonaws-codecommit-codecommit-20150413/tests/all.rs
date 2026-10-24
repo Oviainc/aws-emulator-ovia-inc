@@ -19,6 +19,8 @@ mod approval_rule_template_content_update;
 mod approval_rule_template_deletion;
 #[path = "all/approval_rule_template_description.rs"]
 mod approval_rule_template_description;
+#[path = "all/approval_rule_template_disassociation.rs"]
+mod approval_rule_template_disassociation;
 #[path = "all/approval_rule_templates.rs"]
 mod approval_rule_templates;
 #[path = "all/approval_rules_and_commits.rs"]
