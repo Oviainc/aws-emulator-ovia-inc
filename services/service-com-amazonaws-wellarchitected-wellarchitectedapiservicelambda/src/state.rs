@@ -9,8 +9,9 @@
 //! reviews (`ListAnswers`) and the answers of a review template's lens reviews
 //! (`ListReviewTemplateAnswers`) are backed entirely by the maps below, so a create is
 //! visible to the next request on the same engine. The custom lenses `ImportLens`
-//! imports, the versions `CreateLensVersion` publishes from them and the content
-//! `ExportLens` reads back are backed the same way, and `ListLenses` pages over those
+//! imports, the versions `CreateLensVersion` publishes from them, the content
+//! `ExportLens` reads back and the versions `GetLensVersionDifference` compares are backed
+//! the same way, and `ListLenses` pages over those
 //! lenses beside the AWS-official lens this emulator ships. The agent profiles
 //! (`CreateAgentProfile`, `GetAgentProfile`) and the optimization goals recorded against
 //! one (`CreateAgentGoal`, `GetAgentGoal`, `DeleteAgentGoal`) are backed the same way,
@@ -1960,6 +1961,26 @@ impl LensRecord {
             // `LensVersion` is caller-chosen, so the version NAMES do not order the
             // versions; when more than one carries this content, the one published last is
             // the version the lens reports.
+            .max_by(|(left_name, left), (right_name, right)| {
+                left.published_at
+                    .cmp(&right.published_at)
+                    .then_with(|| left_name.cmp(right_name))
+            })
+            .map(|(version, published)| (version.as_str(), published))
+    }
+
+    /// This lens's LATEST published version, as `(LensVersion, that published version)`,
+    /// or `None` while no version has been published from it.
+    ///
+    /// Distinct from [`Self::published_version`], which answers the version the lens's
+    /// CURRENT content is published as (and nothing while that content is a draft): the
+    /// latest version is the one published most recently, whatever the lens's draft now
+    /// holds. `LensVersion` is caller-chosen (`CreateLensVersion`'s `LensVersion` is an
+    /// input), so the version NAMES do not order the versions — the publication instant
+    /// does, with the name breaking a tie between two publishes the clock cannot separate.
+    pub fn latest_version(&self) -> Option<(&str, &PublishedLensVersion)> {
+        self.versions
+            .iter()
             .max_by(|(left_name, left), (right_name, right)| {
                 left.published_at
                     .cmp(&right.published_at)
@@ -4200,13 +4221,28 @@ pub fn unknown_lens_not_found(alias: &str) -> ResourceNotFoundException {
     )
 }
 
-/// [`resource_not_found`] for a `LensVersion` of a stored lens that has not been
-/// published. A version exists only once `CreateLensVersion` publishes it.
+/// [`resource_not_found`] for a `LensVersion` of a lens that has not been published under
+/// that name. A custom lens carries a version only once `CreateLensVersion` publishes it,
+/// and an Amazon Web Services official lens carries the versions this emulator ships
+/// content for — so the wording speaks about the lens rather than about how it is owned.
 pub fn lens_version_not_found(alias: &str, version: &str) -> ResourceNotFoundException {
     resource_not_found(
         LENS_RESOURCE_TYPE,
         alias.to_string(),
-        &format!("version {version} of the custom lens with alias {alias}"),
+        &format!("version {version} of the lens with alias {alias}"),
+    )
+}
+
+/// [`resource_not_found`] for a lens no version has been published from, which therefore
+/// has no version a caller could read or compare: "The lens cannot be applied to
+/// workloads or shared with other Amazon Web Services accounts until it's published with
+/// CreateLensVersion" (`ImportLens` doc). The `ResourceId` is the alias AS SENT, as the
+/// lookup failures above report it.
+pub fn lens_without_published_version(alias: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        LENS_RESOURCE_TYPE,
+        alias.to_string(),
+        &format!("a published version of the lens with alias {alias}"),
     )
 }
 

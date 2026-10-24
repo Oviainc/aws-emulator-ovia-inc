@@ -35,6 +35,9 @@ mod lens_review_answers;
 #[path = "all/lens_review_rollup.rs"]
 mod lens_review_rollup;
 
+#[path = "all/lens_version_difference.rs"]
+mod lens_version_difference;
+
 #[path = "all/lookup_error_envelopes.rs"]
 mod lookup_error_envelopes;
 

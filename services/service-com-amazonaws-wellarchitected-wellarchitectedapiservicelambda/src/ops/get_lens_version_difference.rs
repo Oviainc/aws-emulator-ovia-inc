@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLensVersionDifference
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLensVersionDifference`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLensVersionDifference::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: compares the question set of two PUBLISHED versions of one lens — the
+//! versions `CreateLensVersion` recorded on a stored custom lens
+//! ([`crate::state::LensRecord::versions`]), or the one version of an AWS-official lens
+//! whose question content this emulator ships ([`crate::state::lens_questions`]) — and
+//! reports each pillar and question that differs between them. A pure read: it writes
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +162,342 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLensVersionDifference` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLensVersionDifferenceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLensVersionDifference"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetLensVersionDifferenceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Well-Architected Tool lens store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+
+        // Which lens's versions this difference is over. An AWS-official lens's versions
+        // are the content this emulator ships for it; a custom lens's are the ones
+        // `CreateLensVersion` published from its imported content. A name that can only be
+        // an official lens's and is not one of the published aliases names no lens at all.
+        let source = if crate::state::is_aws_official_lens(&input.lens_alias) {
+            if !crate::state::is_published_official_lens(&input.lens_alias) {
+                return Err(not_found(crate::state::unknown_lens_not_found(
+                    &input.lens_alias,
+                )));
+            }
+            VersionedLens::Official(&input.lens_alias)
+        } else {
+            VersionedLens::Custom(store.lens_by_alias(&input.lens_alias).ok_or_else(|| {
+                not_found(crate::state::lens_not_found(&input.lens_alias))
+            })?)
+        };
+
+        // "The latest version of the lens" (`LatestLensVersion` doc) is also the version
+        // an unnamed side of the comparison resolves to: the output reports it, so a
+        // caller can see what its request was differenced against. A lens this emulator
+        // knows no published version of has no version to compare at all — a custom lens
+        // nothing has been published from ("The lens cannot be applied to workloads …
+        // until it's published with CreateLensVersion", `ImportLens` doc), and an official
+        // lens whose question content this emulator does not ship
+        // (`crate::state::AWS_OFFICIAL_LENS_ALIASES`).
+        let latest = source.latest_version().ok_or_else(|| {
+            not_found(crate::state::lens_without_published_version(
+                &input.lens_alias,
+            ))
+        })?;
+        let base_version = input.base_lens_version.clone().unwrap_or(latest.clone());
+        let target_version = input.target_lens_version.clone().unwrap_or(latest.clone());
+
+        // A version exists only once it has been published, so a name the lens does not
+        // carry names no resource this difference could be taken over.
+        let base = source.pillars(&base_version).ok_or_else(|| {
+            not_found(crate::state::lens_version_not_found(
+                &input.lens_alias,
+                &base_version,
+            ))
+        })?;
+        let target = source.pillars(&target_version).ok_or_else(|| {
+            not_found(crate::state::lens_version_not_found(
+                &input.lens_alias,
+                &target_version,
+            ))
+        })?;
+
+        Ok(GetLensVersionDifferenceOutput {
+            // The lens AS THE REQUEST NAMED it — an alias or an ARN both name the same
+            // lens — beside the ARN it is reported by.
+            lens_alias: Some(input.lens_alias.clone()),
+            lens_arn: Some(store.lens_arn_of(&input.lens_alias, &region)),
+            base_lens_version: Some(base_version),
+            target_lens_version: Some(target_version),
+            latest_lens_version: Some(latest),
+            version_differences: Some(VersionDifferences {
+                pillar_differences: Some(pillar_differences(&base, &target)),
+            }),
+        })
     }
 }
+
+/// Lift a modelled `ResourceNotFoundException` (HTTP 404) into this operation's error
+/// channel. Every lookup miss here is the same failure, so it is worded in one place.
+fn not_found(
+    exception: ResourceNotFoundException,
+) -> GetLensVersionDifferenceError {
+    GetLensVersionDifferenceErrorModeled::ResourceNotFoundException(exception).into()
+}
+
+/// The lens the request named, as the versioned content this emulator holds for it.
+///
+/// The two sources differ only in where a version's question set comes from: an AWS
+/// official lens's is the content this emulator ships for it, and a custom lens's is the
+/// document each of its published versions captured. Everything after resolution — the
+/// latest version, the lookup of one version, the difference walk — is the same for both.
+enum VersionedLens<'store> {
+    /// A lens Amazon Web Services publishes, by the alias the request named it with. This
+    /// emulator ships the question content of one of them
+    /// ([`crate::state::FRAMEWORK_LENS_ALIAS`]), at exactly one version.
+    Official(&'store str),
+    /// A stored custom lens, with the versions `CreateLensVersion` published from it.
+    Custom(&'store crate::state::LensRecord),
+}
+
+impl VersionedLens<'_> {
+    /// This lens's latest published version, or `None` when this emulator knows no
+    /// published version of it.
+    fn latest_version(&self) -> Option<String> {
+        match self {
+            // AWS publishes its own lenses: the content this emulator ships for one IS its
+            // latest version, the one every other read of that lens reports
+            // (`crate::state::lens_metadata`), and there is none for an official lens this
+            // emulator ships no content for.
+            Self::Official(alias) => {
+                crate::state::lens_metadata(alias).map(|metadata| metadata.version.to_string())
+            }
+            Self::Custom(record) => record
+                .latest_version()
+                .map(|(version, _)| version.to_string()),
+        }
+    }
+
+    /// The pillars of the named version of this lens, in the lens's own order, or `None`
+    /// when the lens carries no version of that name.
+    fn pillars(&self, version: &str) -> Option<Vec<PillarView>> {
+        match self {
+            Self::Official(alias) => (version == crate::state::lens_metadata(alias)?.version)
+                .then(|| official_pillars(alias)),
+            Self::Custom(record) => record
+                .versions
+                .get(version)
+                .map(|published| definition_pillars(&published.content.definition)),
+        }
+    }
+}
+
+/// One pillar of one version of a lens, reduced to what a difference is taken over: the
+/// pillar's identity, its name and the questions it asks.
+#[derive(Debug)]
+struct PillarView {
+    /// `PillarDifference$PillarId` — a pillar's identity, so the same id in both versions
+    /// is the same pillar.
+    id: String,
+    /// `PillarDifference$PillarName`.
+    name: String,
+    questions: Vec<QuestionView>,
+}
+
+/// One question of one version of a lens, reduced the same way as [`PillarView`].
+#[derive(Debug)]
+struct QuestionView {
+    /// `QuestionDifference$QuestionId` — a question's identity across versions.
+    id: String,
+    /// `QuestionDifference$QuestionTitle`.
+    title: String,
+    /// Everything this version of the lens says about the question, as a canonical
+    /// string: what has to be equal for the question to be UNCHANGED between two
+    /// versions. Its title is part of it, because a re-worded question changed.
+    content: String,
+}
+
+/// An AWS-official lens's pillars, from the question content this emulator ships for it
+/// ([`crate::state::lens_pillars`] / [`crate::state::lens_questions`], the one projection
+/// of that content, so this difference cannot disagree with the lens reviews that report
+/// the same questions).
+fn official_pillars(lens: &str) -> Vec<PillarView> {
+    crate::state::lens_pillars(lens)
+        .iter()
+        .map(|(pillar_id, pillar_name, _)| PillarView {
+            id: (*pillar_id).to_string(),
+            name: (*pillar_name).to_string(),
+            questions: crate::state::lens_questions(lens)
+                .iter()
+                .filter(|question| question.pillar_id == *pillar_id)
+                .map(|question| QuestionView {
+                    id: question.question_id.to_string(),
+                    title: question.title.to_string(),
+                    content: serde_json::json!({
+                        "title": question.title,
+                        "choices": question
+                            .best_practices
+                            .iter()
+                            .enumerate()
+                            .map(|(index, practice)| {
+                                serde_json::json!([question.choice_id(index), practice])
+                            })
+                            .collect::<Vec<_>>(),
+                    })
+                    .to_string(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// A custom lens version's pillars, from the lens document that version captured.
+fn definition_pillars(definition: &crate::state::LensDefinition) -> Vec<PillarView> {
+    definition
+        .pillars
+        .iter()
+        .map(|pillar| PillarView {
+            id: pillar.id.clone(),
+            name: pillar.name.clone(),
+            questions: pillar
+                .questions
+                .iter()
+                .map(|question| QuestionView {
+                    id: question.id.clone(),
+                    title: question.title.clone(),
+                    // A custom lens's question is its title, the choices it offers and
+                    // the rules that map those choices to a risk — the whole of what the
+                    // lens JSON format specification defines for it.
+                    content: serde_json::json!({
+                        "title": question.title,
+                        "choices": question
+                            .choices
+                            .iter()
+                            .map(|choice| serde_json::json!([choice.id, choice.title]))
+                            .collect::<Vec<_>>(),
+                        "riskRules": question
+                            .risk_rules
+                            .iter()
+                            .map(|rule| serde_json::json!([rule.condition, rule.risk]))
+                            .collect::<Vec<_>>(),
+                    })
+                    .to_string(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// The differences from `base` to `target`: one `PillarDifference` per pillar that is not
+/// identical in the two versions, and nothing for a pillar that is.
+///
+/// A pillar or question present only in `target` is `NEW`, one present only in `base` is
+/// `DELETED`, and one present in both whose content changed is `UPDATED`
+/// (`DifferenceStatus` publishes exactly those three —
+/// `crate::ops::types::DIFFERENCE_STATUS_VALUES`). The target's order is reported first,
+/// so the differences read in the order the newer version of the lens presents them, with
+/// what the newer version dropped after it.
+fn pillar_differences(base: &[PillarView], target: &[PillarView]) -> Vec<PillarDifference> {
+    let mut differences = Vec::new();
+
+    for pillar in target {
+        match base.iter().find(|candidate| candidate.id == pillar.id) {
+            None => differences.push(PillarDifference {
+                pillar_id: Some(pillar.id.clone()),
+                pillar_name: Some(pillar.name.clone()),
+                difference_status: Some(DIFFERENCE_STATUS_NEW.to_string()),
+                // A pillar the target added asks every one of its questions for the
+                // first time.
+                question_differences: Some(
+                    pillar
+                        .questions
+                        .iter()
+                        .map(|question| question_difference(question, DIFFERENCE_STATUS_NEW))
+                        .collect(),
+                ),
+            }),
+            Some(previous) => {
+                let questions = question_differences(&previous.questions, &pillar.questions);
+                // A pillar is reported only when something about it differs: its name, or
+                // one of its questions.
+                if questions.is_empty() && previous.name == pillar.name {
+                    continue;
+                }
+                differences.push(PillarDifference {
+                    pillar_id: Some(pillar.id.clone()),
+                    pillar_name: Some(pillar.name.clone()),
+                    difference_status: Some(DIFFERENCE_STATUS_UPDATED.to_string()),
+                    question_differences: Some(questions),
+                });
+            }
+        }
+    }
+
+    for pillar in base {
+        if target.iter().any(|candidate| candidate.id == pillar.id) {
+            continue;
+        }
+        differences.push(PillarDifference {
+            pillar_id: Some(pillar.id.clone()),
+            pillar_name: Some(pillar.name.clone()),
+            difference_status: Some(DIFFERENCE_STATUS_DELETED.to_string()),
+            // A pillar the target dropped takes every question it asked with it.
+            question_differences: Some(
+                pillar
+                    .questions
+                    .iter()
+                    .map(|question| question_difference(question, DIFFERENCE_STATUS_DELETED))
+                    .collect(),
+            ),
+        });
+    }
+
+    differences
+}
+
+/// The differences from `base` to `target` within ONE pillar, classified exactly as
+/// [`pillar_differences`] classifies pillars: the target's questions in its own order,
+/// then the questions only the base asked.
+fn question_differences(base: &[QuestionView], target: &[QuestionView]) -> Vec<QuestionDifference> {
+    let mut differences = Vec::new();
+
+    for question in target {
+        match base.iter().find(|candidate| candidate.id == question.id) {
+            None => differences.push(question_difference(question, DIFFERENCE_STATUS_NEW)),
+            Some(previous) if previous.content != question.content => {
+                differences.push(question_difference(question, DIFFERENCE_STATUS_UPDATED));
+            }
+            Some(_) => {}
+        }
+    }
+
+    for question in base {
+        if target.iter().any(|candidate| candidate.id == question.id) {
+            continue;
+        }
+        differences.push(question_difference(question, DIFFERENCE_STATUS_DELETED));
+    }
+
+    differences
+}
+
+/// The `QuestionDifference` projection of one question under one `DifferenceStatus`.
+fn question_difference(question: &QuestionView, status: &str) -> QuestionDifference {
+    QuestionDifference {
+        question_id: Some(question.id.clone()),
+        question_title: Some(question.title.clone()),
+        difference_status: Some(status.to_string()),
+    }
+}
+
+/// `DifferenceStatus$NEW`: the pillar or question exists in the target version and not in
+/// the base one. `DifferenceStatus` publishes exactly `UPDATED`, `NEW` and `DELETED`
+/// (`crate::ops::types::DIFFERENCE_STATUS_VALUES`).
+const DIFFERENCE_STATUS_NEW: &str = "NEW";
+
+/// `DifferenceStatus$DELETED`: the pillar or question exists in the base version and not
+/// in the target one. See [`DIFFERENCE_STATUS_NEW`].
+const DIFFERENCE_STATUS_DELETED: &str = "DELETED";
+
+/// `DifferenceStatus$UPDATED`: the pillar or question exists in both versions and its
+/// content changed. See [`DIFFERENCE_STATUS_NEW`].
+const DIFFERENCE_STATUS_UPDATED: &str = "UPDATED";
