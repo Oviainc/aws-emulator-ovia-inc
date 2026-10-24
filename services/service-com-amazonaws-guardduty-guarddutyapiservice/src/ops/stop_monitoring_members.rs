@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopMonitoringMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopMonitoringMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: stops GuardDuty monitoring for the member accounts named by
+//! `AccountIds` under the administrator that owns `DetectorId`, moving each one's
+//! `RelationshipStatus` to `Disabled` and RETAINING its record — "stops GuardDuty
+//! monitoring for the specified member accounts. Use the StartMonitoringMembers
+//! operation to restart monitoring for those accounts" (the modelled contract
+//! below), so the relationship moves and nothing else about the member does.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopMonitoringMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stopping is a DESIRED STATE, not a transition: a member whose monitoring is
+//! already stopped is processed again with nothing changed (its `UpdatedAt` does not
+//! move), so a retried call is indistinguishable from the first.
+//!
+//! An account id the administrator is not ASSOCIATED with — one it holds no member
+//! record for, and one a disassociation already moved to `Removed` — is reported in
+//! `UnprocessedAccounts` with the reason it was not processed, which is what that
+//! member is for; the call still succeeds with HTTP 200. A value that cannot be an
+//! account id at all, or a `DetectorId` this account/Region does not own, is a
+//! request the service does not understand and is refused with HTTP 400 under the
+//! `InvalidInputException` class.
+//!
+//! The contract below also refuses a stop "with autoEnableOrganizationMembers
+//! configuration for your organization set to ALL". That configuration is not
+//! modelled yet — `UpdateOrganizationConfiguration` and
+//! `DescribeOrganizationConfiguration` are still scaffolds — so no request can set
+//! it and no call can be refused for it; when they are implemented, that refusal
+//! belongs here.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +165,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopMonitoringMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopMonitoringMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopMonitoringMembers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                StopMonitoringMembersErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+        let administrator = crate::state::administrator_account_id();
+
+        // Parameter failures first, before anything is looked up or written: a value
+        // that cannot be a value of its member at all is refused whatever the store
+        // holds. `UnprocessedAccounts` reports accounts that were not PROCESSED,
+        // never a request that was not understood, so a malformed account id refuses
+        // the whole call rather than landing in that list.
+        if !crate::state::is_detector_id(&input.detector_id) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::DETECTOR_ID_MEMBER),
+            ));
+        }
+        if input
+            .account_ids
+            .iter()
+            .any(|account_id| !crate::state::is_account_id(account_id))
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::ACCOUNT_ID_MEMBER),
+            ));
+        }
+
+        let mut state = state.lock();
+        // Only the Region's endpoint that serves the detector administers its
+        // members, and only the account that owns it can stop monitoring them.
+        if state.detector_in(&region, &input.detector_id).is_none() {
+            return Err(not_owned(&input.detector_id));
+        }
+        // The relationship changes now, so the clock advances once for the whole
+        // call: every member this call moves carries the same `UpdatedAt`.
+        let now = state.tick_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // Unreachable: the detector was resolved above and the lock has not been
+            // released since. Answered rather than panicked, because a handler owes
+            // the caller a modelled response on every path.
+            return Err(not_owned(&input.detector_id));
+        };
+
+        let mut unprocessed = Vec::new();
+        let mut seen = ::std::collections::BTreeSet::new();
+        for account_id in &input.account_ids {
+            // `AccountIds` names a SET of accounts: a repeated id is processed once,
+            // so it cannot be reported twice either.
+            if !seen.insert(account_id.as_str()) {
+                continue;
+            }
+            match detector.members.get_mut(account_id) {
+                Some(member) if member.is_associated() => {
+                    // The record is RETAINED and the association is untouched: only
+                    // monitoring stops, so a later `GetMembers` still reports the
+                    // account and its email. Stopping is a desired state, so a
+                    // member already stopped moves neither its status nor its
+                    // `UpdatedAt`.
+                    if member.relationship_status != crate::state::RELATIONSHIP_DISABLED {
+                        member.relationship_status =
+                            crate::state::RELATIONSHIP_DISABLED.to_string();
+                        member.updated_at_millis = now;
+                    }
+                }
+                // Only an account ASSOCIATED with this administrator is monitored
+                // under it, so only that account's monitoring can be stopped: an
+                // account it never recorded, and one a disassociation already moved,
+                // are both reported rather than refused — and neither changes any
+                // stored member.
+                _ => unprocessed.push(UnprocessedAccount {
+                    account_id: account_id.clone(),
+                    result: crate::state::not_a_member_message(&administrator),
+                }),
+            }
+        }
+
+        Ok(StopMonitoringMembersOutput {
+            unprocessed_accounts: unprocessed,
+        })
     }
+}
+
+/// Refuse a well-formed `DetectorId` this account/Region does not own.
+///
+/// GuardDuty does not distinguish "never existed" from "belongs to someone else",
+/// which is also what keeps one account from probing another's detector ids.
+fn not_owned(detector_id: &str) -> StopMonitoringMembersError {
+    crate::scaffolded::Scaffolded::invalid_input(crate::state::detector_id_rejection(detector_id))
 }
