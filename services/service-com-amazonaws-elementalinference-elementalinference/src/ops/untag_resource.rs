@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes tags from a feed or a dictionary: the keys are removed from the ONE stored
+//! record every other handler of this service reads, so a tag deleted here is a tag
+//! `GetFeed`/`GetDictionary` stop reporting, exactly as `TagResource` writes onto that
+//! same record.
+//!
+//! The delete is KEY-WISE and partial: each key the request names is removed and every
+//! other key the resource holds is left as it was ("Deletes specified tags from the
+//! specified resource"). A key the resource does not carry is nothing to remove, so the
+//! request still succeeds — which is also what makes the operation `@idempotent`: the
+//! same request twice leaves the same tag set, and so does a request naming the same key
+//! twice.
+//!
+//! Three things it refuses, each with one of the operation's own modelled errors: an ARN
+//! that is not the ARN a stored resource carries (`ResourceNotFoundException`), a
+//! resource whose deletion has already been accepted (`ConflictException`, as every
+//! other mutation of a record on its way out is refused), and a key in the reserved
+//! `aws:` namespace, whose tags a request may neither set nor delete
+//! (`ValidationException`; the shared rule lives in `crate::state::is_reserved_tag_key`).
+//! A key outside the modelled `TagKey` bounds needs no check here: `tagKeys` is a LIST,
+//! so the framework's boundary walk reaches each key as a constrained leaf and refuses
+//! it before this handler runs.
 //!
 //! ## Shape of an operation
 //!
@@ -176,17 +189,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the com.amazonaws.elementalinference state store is unavailable"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The request's own validity is decided before any resource is looked up, so a
+        // key this service would not let a request touch is refused whatever the ARN
+        // names. The reserved namespace is the one such rule a tag KEY on its own can
+        // break — AWS's tag restrictions reserve that prefix for AWS-generated tags,
+        // which a request may neither set nor delete — and the key's modelled `@length`
+        // is already refused by the boundary walk, which reaches a LIST's elements as
+        // constrained leaves. Several keys can be at fault at once and one request earns
+        // one answer, so the key reported is chosen in key order rather than in the
+        // order the query string happened to carry.
+        let mut reserved: Vec<&str> = input
+            .tag_keys
+            .iter()
+            .map(String::as_str)
+            .filter(|key| crate::state::is_reserved_tag_key(key))
+            .collect();
+        reserved.sort_unstable();
+        if let Some(key) = reserved.first() {
+            return Err(UntagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::reserved_tag_key_message(key),
+                },
+            )
+            .into());
+        }
+
+        let mut state = state.lock();
+        state.settle_due_transitions(std::time::Instant::now());
+
+        // The ARN names the resource WHOLE — kind, id, region and account — so anything
+        // that is not the ARN a stored record carries names no resource of this store.
+        let Some(mut resource) = state.tagged_resource_mut(&input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A resource whose deletion has been accepted is on its way out, and a record
+        // being deleted takes no mutation: refused with the modelled ConflictException
+        // (HTTP 409), exactly as `TagResource`, `UpdateFeed` and `UpdateDictionary`
+        // refuse a mutation of a record being deleted. The rule is a property of the
+        // stored resource, so the message is that rule's invariant sentence and reports
+        // no value.
+        if resource.is_being_deleted() {
+            return Err(UntagResourceErrorModeled::ConflictException(ConflictException {
+                message: resource.being_deleted_message().to_string(),
+            })
+            .into());
+        }
+
+        // The delete itself: every key the request names goes, and every other key the
+        // resource holds is left as it was. A key the resource does not carry is nothing
+        // to remove, so it is not an error — which is what makes repeating the request
+        // leave the same tag set.
+        let tags = resource.tags_mut();
+        for key in &input.tag_keys {
+            tags.remove(key);
+        }
+
+        Ok(UntagResourceOutput)
     }
 }

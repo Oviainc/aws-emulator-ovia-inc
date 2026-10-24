@@ -11,7 +11,13 @@ use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::TRANSITION_SPAN;
 use service_com_amazonaws_elementalinference_elementalinference::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// The two kinds of resource this service mints and tags, as the modelled `resourceArn`
+/// pattern spells them (`…:(feed|dictionary)/[a-zA-Z0-9]{1,19}$`). A rule about a
+/// RESOURCE is asserted on both.
+pub const TAGGABLE_KINDS: [&str; 2] = ["feed", "dictionary"];
 
 /// The region every request below is signed for. The service reads it out of the SigV4
 /// credential scope, so the ARNs it mints must carry exactly this region.
@@ -38,13 +44,15 @@ pub fn expected_dictionary_arn(id: &str) -> String {
     )
 }
 
-/// The path a tagging request goes to, with the `resourceArn` percent-encoded.
+/// Percent-encode `value` for one component of a request URI — a path segment or a
+/// query-parameter value.
 ///
-/// `resourceArn` is an `@httpLabel` bound to one path segment, so a client encodes
-/// every character that is not unreserved (RFC 3986) — notably the `/` before the
-/// resource id, which would otherwise read as a further path segment.
-pub fn tags_path(resource_arn: &str) -> String {
-    let encoded: String = resource_arn
+/// Every byte outside RFC 3986's unreserved set is escaped, which is what a client does
+/// for a value it binds to one component: notably the `/` and `:` of an ARN, which would
+/// otherwise read as further path segments, and the `&` and `=` of a query value, which
+/// would otherwise read as further parameters.
+pub fn percent_encode(value: &str) -> String {
+    value
         .bytes()
         .map(|byte| match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
@@ -52,8 +60,15 @@ pub fn tags_path(resource_arn: &str) -> String {
             }
             other => format!("%{other:02X}"),
         })
-        .collect();
-    format!("/v1/tags/{encoded}")
+        .collect()
+}
+
+/// The path a tagging request goes to, with the `resourceArn` percent-encoded.
+///
+/// `resourceArn` is an `@httpLabel` bound to one path segment, so a client encodes it
+/// ([`percent_encode`]) exactly as this does.
+pub fn tags_path(resource_arn: &str) -> String {
+    format!("/v1/tags/{}", percent_encode(resource_arn))
 }
 
 /// A router serving this service alone over one shared engine.
@@ -191,4 +206,131 @@ pub async fn create_feed(router: &MultiServiceRouter, name: &str) -> String {
         .as_str()
         .expect("the created feed carries an id")
         .to_string()
+}
+
+/// A tag pair, from two `&str`s.
+pub fn pair(key: &str, value: &str) -> (String, String) {
+    (key.to_string(), value.to_string())
+}
+
+/// A `TagMap` body member built from a list of pairs.
+pub fn tag_object(tags: &[(String, String)]) -> Value {
+    Value::Object(
+        tags.iter()
+            .map(|(key, value)| (key.clone(), json!(value)))
+            .collect(),
+    )
+}
+
+/// The `tags` member of a resource response, as a map so a comparison does not depend
+/// on key order.
+pub fn tags_of(resource: &Value) -> BTreeMap<String, String> {
+    resource["tags"]
+        .as_object()
+        .unwrap_or_else(|| panic!("a resource response carries a tags map, got {resource}"))
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                value
+                    .as_str()
+                    .unwrap_or_else(|| panic!("a tag value is a string, got {value}"))
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// A tag set as a map, for comparing against what a read reports.
+pub fn expected_tags(tags: &[(String, String)]) -> BTreeMap<String, String> {
+    tags.iter().cloned().collect()
+}
+
+/// The create body of `kind`, named `name` and carrying `tags` — the smallest resource of
+/// either kind, so a suite about TAGS states nothing else about the resource.
+pub fn tagged_create_body(kind: &str, name: &str, tags: &[(String, String)]) -> Value {
+    match kind {
+        "feed" => json!({
+            "name": name,
+            "outputs": [
+                {"name": "crop1", "outputConfig": output_config("cropping"), "status": "ENABLED"}
+            ],
+            "tags": tag_object(tags),
+        }),
+        "dictionary" => json!({"name": name, "language": "eng", "tags": tag_object(tags)}),
+        other => panic!("no such resource kind: {other}"),
+    }
+}
+
+/// Create one resource of `kind` carrying `tags`, and return its id and its ARN.
+pub async fn create_tagged_resource(
+    router: &MultiServiceRouter,
+    kind: &str,
+    name: &str,
+    tags: &[(String, String)],
+) -> (String, String) {
+    let body = tagged_create_body(kind, name, tags);
+    let (status, created) = call(router, "POST", &format!("/v1/{kind}"), Some(body)).await;
+    assert_eq!(
+        status, 202,
+        "creating a {kind} named {name:?} answers 202, got {status} with {created}"
+    );
+    let id = created["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a created {kind} carries an id, got {created}"))
+        .to_string();
+    let arn = created["arn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a created {kind} carries an arn, got {created}"))
+        .to_string();
+    (id, arn)
+}
+
+/// Read one resource of `kind` back through its own implemented reader (`GetFeed` /
+/// `GetDictionary`), which is where a tag write or delete has to show up.
+pub async fn read_resource(router: &MultiServiceRouter, kind: &str, id: &str) -> (u16, Value) {
+    call(router, "GET", &format!("/v1/{kind}/{id}"), None).await
+}
+
+/// One row of the unresolvable-ARN table: how the ARN differs from the one the resource
+/// carries.
+pub struct ArnCase {
+    pub label: &'static str,
+    pub arn: String,
+}
+
+/// ARNs that satisfy the modelled `resourceArn` pattern but name no resource of this
+/// store, built by moving each field of a real resource's ARN in turn: the resource
+/// kind, the id, the region and the account.
+pub fn unresolvable_arns(kind: &str, arn: &str) -> Vec<ArnCase> {
+    let other_kind = if kind == "feed" { "dictionary" } else { "feed" };
+    let fields: Vec<&str> = arn.split(':').collect();
+    let (region, account, resource) = (fields[3], fields[4], fields[5]);
+    let id = resource.split('/').next_back().expect("the ARN carries an id");
+    let rebuilt = |region: &str, account: &str, resource: &str| {
+        format!(
+            "{}:{}:{}:{region}:{account}:{resource}",
+            fields[0], fields[1], fields[2]
+        )
+    };
+    vec![
+        ArnCase {
+            label: "an id no resource of this kind holds",
+            arn: rebuilt(region, account, &format!("{kind}/aaaaaaaaaaaaaaaaaaa")),
+        },
+        ArnCase {
+            label: "this resource's id under the other resource kind",
+            arn: rebuilt(region, account, &format!("{other_kind}/{id}")),
+        },
+        ArnCase {
+            label: "the right resource in another region",
+            arn: rebuilt("eu-west-1", account, resource),
+        },
+        ArnCase {
+            label: "the right resource in another account",
+            // Any 12-digit account that is not the one this emulator serves
+            // (`engine::EMULATOR_ACCOUNT_ID`), which the stored ARN carries.
+            arn: rebuilt(region, "123456789012", resource),
+        },
+    ]
 }
