@@ -184,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // the reason, rather than being invented as a member.
                 None => unprocessed_accounts.push(crate::state::unprocessed(
                     account_id,
-                    "The account is not a member account in the behavior graph.".to_string(),
+                    crate::state::NOT_A_MEMBER_REASON.to_string(),
                 )),
             }
         }

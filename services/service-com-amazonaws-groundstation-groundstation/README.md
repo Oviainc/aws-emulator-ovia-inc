@@ -114,8 +114,8 @@ service's operations.
 | `GROUNDSTATION_RESERVED_MINUTES` | The reserved-minutes pricing plan this account holds, as comma-separated entries: a bare minute count is a standing monthly commitment (`500`) and `<year>-<month>=<minutes>` is one calendar month's own allocation (`500,2026-02=750`). Read once, with the same timing. |
 | `GROUNDSTATION_SATELLITES` | The satellites this account is on-boarded to, as comma-separated entries: a bare NORAD catalogue number (`25994`) or `<norad>=<ground station>+<ground station>…` naming the ground stations the satellite is on-boarded to (`25994=Ohio 1+Oregon 1,27424`). Read once, with the same timing. |
 
-All three settings stand for something that happens OUTSIDE the Ground Station API, which
-is why they are settings rather than operations:
+Both settings stand for something that happens OUTSIDE the Ground Station API, which is
+why they are settings rather than operations:
 
 - Uplink approval is granted by AWS after spectrum coordination — the model has no
   operation that grants one and none that reports one — so an account starts with none

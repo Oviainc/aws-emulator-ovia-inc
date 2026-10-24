@@ -942,6 +942,121 @@ pub fn response_tags(tags: &HashMap<String, String>) -> Option<HashMap<String, S
     Some(tags.clone())
 }
 
+/// The request member every tag map of this service arrives in, and the member a refusal
+/// of one names — `tags` on each operation that takes a `TagsMap`
+/// (`smithy_query(query="operation", operation="CreateConfig,CreateMissionProfile,\
+/// CreateDataflowEndpointGroup,ReserveContact")`).
+pub const TAGS_PARAMETER: &str = "tags";
+
+/// The tag-key prefix AWS reserves for itself: a caller may neither set nor remove a key
+/// that starts with it, on any AWS resource.
+///
+/// Source: the AWS tagging rules every taggable service shares ("the `aws:` prefix is
+/// reserved for AWS use … you can't edit or delete a tag with the `aws:` prefix"). The
+/// model cannot express it — `TagsMap` is a bare `map<String,String>` with no `length`
+/// or `pattern` trait (`smithy_query(query="shape", shape="TagsMap")`) — so the rule
+/// lives here, where every create of this service reaches it.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` is in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace, matched in
+/// ANY letter case: the namespace is AWS's whichever way a caller spells it, so
+/// `AWS:owner` is as reserved as `aws:owner`. The same reading the other services of
+/// this emulator enforce, so one tag map is judged alike wherever it is sent.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    // `str::get` answers `None` rather than panicking when the key's first four bytes
+    // are not a character boundary, so a key that cannot carry the prefix is simply
+    // not one.
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The inclusive length bounds of a tag KEY, in characters, from the same AWS tagging
+/// rules: a key is 1 to 128 characters.
+pub const TAG_KEY_CHARS: (usize, usize) = (1, 128);
+
+/// The largest tag VALUE, in characters, from the same rules. A value may be empty, so
+/// only the ceiling is a bound.
+pub const MAX_TAG_VALUE_CHARS: usize = 256;
+
+/// The most tags one resource may carry, from the same rules.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// Refuse a `tags` map AWS's platform-wide tagging rules do not allow, with the modelled
+/// `InvalidParameterException` (HTTP 431) naming the [`TAGS_PARAMETER`] member.
+///
+/// `TagsMap` carries no constraint in the model, so the boundary validator lets every map
+/// through and this is the only gate: a tag map is checked HERE, before any id, ARN or
+/// record is minted, so a caller never holds a resource AWS would have refused to tag
+/// that way. Every create of this service that accepts tags calls it, so one illegal map
+/// is refused identically whichever resource it was sent to.
+///
+/// The conditions, each from a constant above: more than [`MAX_TAGS_PER_RESOURCE`]
+/// entries (a property of the map as a whole, so it is judged first — the request is
+/// refused however legal each entry is), a key in the reserved
+/// [`RESERVED_TAG_KEY_PREFIX`] namespace in any letter case ([`is_reserved_tag_key`]),
+/// a key outside [`TAG_KEY_CHARS`], or a value
+/// longer than [`MAX_TAG_VALUE_CHARS`]. Lengths are counted in CHARACTERS rather than
+/// bytes, because that is the unit the rules are written in, and the entries are walked
+/// in key order so the same bad map is always refused for the same reason.
+///
+/// The status (431) and the error code are the contract; the text names the member and
+/// the constraint it failed, built from the request.
+pub fn validate_tags(
+    tags: Option<&HashMap<String, String>>,
+) -> Result<(), InvalidParameterException> {
+    let Some(tags) = tags else {
+        return Ok(());
+    };
+
+    if tags.len() > MAX_TAGS_PER_RESOURCE {
+        return Err(invalid_parameter(
+            TAGS_PARAMETER,
+            format!(
+                "Value at '{TAGS_PARAMETER}' carries {} tags; a resource may carry at most \
+                 {MAX_TAGS_PER_RESOURCE} tags.",
+                tags.len()
+            ),
+        ));
+    }
+
+    let (min_key, max_key) = TAG_KEY_CHARS;
+    let mut entries: Vec<(&String, &String)> = tags.iter().collect();
+    entries.sort_by_key(|(key, _)| *key);
+    for (key, value) in entries {
+        if is_reserved_tag_key(key) {
+            return Err(invalid_parameter(
+                TAGS_PARAMETER,
+                format!(
+                    "Tag key '{key}' at '{TAGS_PARAMETER}' uses the reserved \
+                     '{RESERVED_TAG_KEY_PREFIX}' prefix, which only AWS may set."
+                ),
+            ));
+        }
+        let key_chars = key.chars().count();
+        if key_chars < min_key || key_chars > max_key {
+            return Err(invalid_parameter(
+                TAGS_PARAMETER,
+                format!(
+                    "Tag key '{key}' at '{TAGS_PARAMETER}' is {key_chars} characters long; a \
+                     tag key must be {min_key} to {max_key} characters."
+                ),
+            ));
+        }
+        let value_chars = value.chars().count();
+        if value_chars > MAX_TAG_VALUE_CHARS {
+            return Err(invalid_parameter(
+                TAGS_PARAMETER,
+                format!(
+                    "Tag value at '{TAGS_PARAMETER}.{key}' is {value_chars} characters long; a \
+                     tag value must be at most {MAX_TAG_VALUE_CHARS} characters."
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// The message every operation addressed at a config by its `(configType, configId)`
 /// pair carries when that pair names no config — built from the two `@httpLabel`
 /// members of the request, id before type, which is the rule the recorded corpus shows

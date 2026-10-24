@@ -18,10 +18,11 @@ use ::aws_smithy_schema_server::constraints::{validate, LengthTrait, PatternTrai
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    AutoParticipantRecordingConfiguration, IngestConfiguration, InternalServerException,
-    ParticipantRecordingHlsConfiguration, ParticipantThumbnailConfiguration, ParticipantToken,
-    RedundantIngestCredential, ResourceNotFoundException, ServiceQuotaExceededException, Stage,
-    StageEndpoints, StageSummary, ValidationException,
+    AutoParticipantRecordingConfiguration, ConflictException, IngestConfiguration,
+    InternalServerException, ParticipantRecordingHlsConfiguration, ParticipantReplica,
+    ParticipantThumbnailConfiguration, ParticipantToken, RedundantIngestCredential,
+    ResourceNotFoundException, ServiceQuotaExceededException, Stage, StageEndpoints, StageSummary,
+    ValidationException,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -255,10 +256,11 @@ pub fn stage_endpoints(stage_arn: &str) -> StageEndpoints {
 /// constraint-checked.)
 pub const NO_ACTIVE_SESSION_ID: &str = "";
 
-/// Page size `ListStages` uses when the request omits `maxResults`.
+/// Page size a listing uses when the request omits `maxResults`.
 ///
-/// The model documents it on `ListStagesRequest$maxResults`: "Maximum number of
-/// results to return. Default: 50."
+/// The model documents it on `ListStagesRequest$maxResults` ("Maximum number of
+/// results to return. Default: 50.") and states the same default on
+/// `ListParticipantReplicasRequest$maxResults`, so both listings page by it.
 pub const DEFAULT_LIST_PAGE_SIZE: usize = 50;
 
 /// Total size an `attributes` map may reach, on every shape of this service that
@@ -354,9 +356,54 @@ pub const NO_ASSOCIATED_STAGE_ARN: &str = "";
 /// ingest key.
 pub const REDUNDANT_INGEST_CREDENTIALS: usize = 1;
 
+// ---------------------------------------------------------------------------
+// Participant replication
+//
+// `StartParticipantReplication` replicates a PUBLISHING participant of one stage into
+// another, and `ListParticipantReplicas` reports the replicas a participant has. The
+// values neither request supplies — the replication state, the reconnect window a
+// request leaves out, the capability that makes a participant a publisher — are fixed
+// here, each from the model's own doc or value list.
+// ---------------------------------------------------------------------------
+
+/// The replication state of a replica that has been started and not stopped.
+///
+/// `ReplicationState`'s value list is `ACTIVE` | `STOPPED`
+/// (`smithy_query(query="shape",shape="ReplicationState")`), and the model's
+/// `StartParticipantReplicationRequest$reconnectWindowSeconds` doc names the running
+/// state: "replication will continue to be `ACTIVE`".
+pub const REPLICATION_STATE_ACTIVE: &str = "ACTIVE";
+
+/// The capability a participant token must grant for its participant to publish.
+///
+/// From `ParticipantTokenCapability`'s value list (`PUBLISH` | `SUBSCRIBE`), the same
+/// value [`DEFAULT_TOKEN_CAPABILITIES`] grants by default. Replication is of a
+/// *publishing* participant, so a participant that cannot publish has nothing to
+/// replicate.
+pub const PUBLISH_CAPABILITY: &str = "PUBLISH";
+
+/// Reconnect window a replication gets when the request omits `reconnectWindowSeconds`.
+///
+/// The model documents it on `StartParticipantReplicationRequest$reconnectWindowSeconds`:
+/// "If the participant disconnects and then reconnects within the specified interval,
+/// replication will continue to be `ACTIVE`. Default: 0."
+pub const DEFAULT_REPLICATION_RECONNECT_WINDOW_SECONDS: i32 = 0;
+
+/// Participant replicas this emulator keeps per source stage. Not an AWS quota — this
+/// emulator's own resource guard on the one store `StartParticipantReplication` grows,
+/// set the same way [`MAX_STAGES`] is and answered with the same modelled
+/// `ServiceQuotaExceededException` (HTTP 402). The records are reclaimed when either
+/// stage of a replica is deleted.
+pub const MAX_PARTICIPANT_REPLICAS_PER_STAGE: usize = 1_000;
+
 /// Marks a `ListStages` page token as this service's, so a token from elsewhere is
 /// refused rather than silently read as a position.
 const PAGE_TOKEN_PREFIX: &str = "ivs-realtime-stage-after:";
+
+/// The same marker for a `ListParticipantReplicas` page, kept distinct from
+/// [`PAGE_TOKEN_PREFIX`] so a token issued by one listing names no position in the
+/// other and is refused there.
+const REPLICA_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-replica-after:";
 
 /// One stage, as `CreateStage` persisted it and `GetStage` / `ListStages` report it.
 #[derive(Debug, Clone)]
@@ -536,6 +583,59 @@ impl IngestConfigurationRecord {
     }
 }
 
+/// One started replication of one publishing participant into one destination stage, as
+/// `StartParticipantReplication` persisted it and `ListParticipantReplicas` reports it.
+#[derive(Debug, Clone)]
+pub struct ParticipantReplicaRecord {
+    /// The stage the replicated participant publishes in.
+    pub source_stage_arn: String,
+    /// The session of [`Self::source_stage_arn`] the publisher is in.
+    pub source_session_id: String,
+    /// The stage the participant is replicated into.
+    pub destination_stage_arn: String,
+    /// The session of [`Self::destination_stage_arn`] the replica joined.
+    pub destination_session_id: String,
+    /// The publisher being replicated — a participant of the source stage.
+    pub participant_id: String,
+    /// [`REPLICATION_STATE_ACTIVE`] while the replication is running.
+    pub replication_state: String,
+    /// The window a disconnected publisher may reconnect in before replication ends,
+    /// or [`DEFAULT_REPLICATION_RECONNECT_WINDOW_SECONDS`] when the request omitted it.
+    /// Nothing disconnects an emulated publisher, so no clock reads it yet; it is
+    /// recorded because it is what the caller asked replication to do.
+    pub reconnect_window_seconds: i32,
+    /// The attributes the replica participant carries in the destination stage: the
+    /// source participant's own, with the starting request's merged over them — the rule
+    /// `StartParticipantReplicationRequest$attributes` states ("These attributes are
+    /// merged with any attributes set for this participant when creating the token. If
+    /// there is overlap in keys, the values in these attributes are replaced."). No
+    /// member of `ParticipantReplica` reports them; the participant operations
+    /// (`GetParticipant` / `ListParticipants`, each its own gap issue) are what report a
+    /// replica participant's attributes.
+    pub attributes: HashMap<String, String>,
+    /// When replication started. Reported by no member of `ParticipantReplica`, and
+    /// recorded for the same reason [`StageRecord::created_at`] is.
+    pub started_at: SystemTime,
+    /// Start order, and the stable key `ListParticipantReplicas` pages over — the same
+    /// role [`StageRecord::sequence`] plays for `ListStages`.
+    pub sequence: u64,
+}
+
+impl ParticipantReplicaRecord {
+    /// The modelled `ParticipantReplica` this record reports. Every member of the shape
+    /// is `@required`, so each one is reported from the record and none is optional.
+    pub fn to_participant_replica(&self) -> ParticipantReplica {
+        ParticipantReplica {
+            source_stage_arn: self.source_stage_arn.clone(),
+            participant_id: self.participant_id.clone(),
+            source_session_id: self.source_session_id.clone(),
+            destination_stage_arn: self.destination_stage_arn.clone(),
+            destination_session_id: self.destination_session_id.clone(),
+            replication_state: self.replication_state.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-ivsrealtime-amazoninteractivevideoservicerealtime. A handler reaches it through [`service_state`].
 ///
 /// ONE store per engine, not one per region: the minted ARN names the region the
@@ -553,6 +653,10 @@ pub struct ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
     pub participant_tokens: HashMap<String, Vec<ParticipantTokenRecord>>,
     /// Every live ingest configuration, keyed by its ARN.
     pub ingest_configurations: HashMap<String, IngestConfigurationRecord>,
+    /// The started replications of a stage's participants, keyed by that SOURCE stage's
+    /// ARN and held in start order — the order `ListParticipantReplicas` pages over.
+    /// Removed when either stage a replica names is deleted.
+    pub participant_replicas: HashMap<String, Vec<ParticipantReplicaRecord>>,
     /// Monotonic counter behind every id this service mints, so two stages created
     /// in the same instant still get distinct ids and a distinct page position.
     next_id: u64,
@@ -650,6 +754,12 @@ pub const PARTICIPANT_ID_LEN: usize = 12;
 /// `ingest-configuration/`, and caps the whole ARN at 128 characters.
 pub const INGEST_CONFIGURATION_ID_LEN: usize = 12;
 
+/// Characters a minted stage session id carries after its `st-` prefix.
+///
+/// The model's `StageSessionId` is `@length 16..16` with `@pattern ^st-[a-zA-Z0-9]+$`,
+/// so a session id is `st-` followed by exactly thirteen id characters.
+pub const STAGE_SESSION_ID_LEN: usize = 13;
+
 /// A fresh id for a resource this service mints: `len` lowercase-hex characters, which
 /// stays inside the `[a-zA-Z0-9-]` / `[a-zA-Z0-9-_]` id charsets the model's `StageArn`
 /// and `ParticipantTokenId` patterns allow.
@@ -691,6 +801,103 @@ pub fn ingest_configuration_arn(region: &str, ingest_configuration_id: &str) -> 
 pub fn expiration_time(duration_minutes: i32) -> SystemTime {
     let minutes = u64::try_from(duration_minutes).unwrap_or(0);
     SystemTime::now() + Duration::from_secs(minutes.saturating_mul(60))
+}
+
+/// A fresh stage session id, in the form the model's `StageSessionId` requires:
+/// `st-` plus [`STAGE_SESSION_ID_LEN`] id characters, sixteen in total.
+pub fn stage_session_id(sequence: u64) -> String {
+    format!("st-{}", mint_id(sequence, STAGE_SESSION_ID_LEN))
+}
+
+/// The id of the session active in the stage `stage_arn`, opening one if the stage has
+/// none, or `None` when this store holds no such stage.
+///
+/// A stage session is the span a stage has participants in: the model's `StageSession`
+/// doc describes it as beginning "when the first participant joins" and the stage
+/// reporting it as `activeSessionId` until it ends. Nothing joins an emulated stage over
+/// the API, so the one call that does put a participant into a stage —
+/// `StartParticipantReplication`, which puts a publisher's replica into the destination
+/// stage and names the session its publisher is in on the source side — is what opens the
+/// session each of those two stages needs. A stage that already has one keeps it, so
+/// every replica of one stage names the same session and a caller that read
+/// `activeSessionId` off the stage reads the same value again.
+pub fn ensure_active_session(
+    state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+) -> Option<String> {
+    let active = state
+        .stages
+        .get(stage_arn)?
+        .active_session_id
+        .clone();
+    if let Some(session_id) = active {
+        return Some(session_id);
+    }
+    let session_id = stage_session_id(state.next_sequence());
+    state.stages.get_mut(stage_arn)?.active_session_id = Some(session_id.clone());
+    Some(session_id)
+}
+
+/// What this service holds about one participant of one stage.
+#[derive(Debug, Clone)]
+pub struct StageParticipant {
+    /// Whether the participant may publish to the stage. Only a publisher can be
+    /// replicated, and only an identity that carries [`PUBLISH_CAPABILITY`] — or an
+    /// ingest credential, which exists to broadcast — may publish.
+    pub publishes: bool,
+    /// The attributes the participant's identity carries, which a replica's attributes
+    /// are merged over.
+    pub attributes: HashMap<String, String>,
+}
+
+/// The participant `participant_id` of the stage `stage_arn`, or `None` when this
+/// service issued no identity for that participant in that stage.
+///
+/// A participant id is "assigned by IVS and returned by `CreateParticipantToken`" (the
+/// model's doc for the member, on every operation that takes one) or minted with an
+/// ingest configuration's credentials, so the identities this store holds for a stage are
+/// exactly its token records and the credentials of the ingest configurations associated
+/// with it. The ONE lookup for "does this stage have this participant, and may it
+/// publish", so no two operations can disagree about it.
+pub fn stage_participant(
+    state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    participant_id: &str,
+) -> Option<StageParticipant> {
+    if let Some(record) = state
+        .participant_tokens
+        .get(stage_arn)
+        .and_then(|records| {
+            records
+                .iter()
+                .find(|record| record.participant_id == participant_id)
+        })
+    {
+        return Some(StageParticipant {
+            publishes: record
+                .capabilities
+                .iter()
+                .any(|capability| capability == PUBLISH_CAPABILITY),
+            attributes: record.attributes.clone(),
+        });
+    }
+    state
+        .ingest_configurations
+        .values()
+        .find(|configuration| {
+            configuration.stage_arn == stage_arn
+                && (configuration.participant_id == participant_id
+                    || configuration
+                        .redundant_ingest_credentials
+                        .iter()
+                        .any(|credential| credential.participant_id == participant_id))
+        })
+        .map(|configuration| StageParticipant {
+            // An ingest configuration is a publisher's credential: it carries the ingest
+            // key a broadcast is published with, so its participant publishes.
+            publishes: true,
+            attributes: configuration.attributes.clone(),
+        })
 }
 
 /// The region a minted ARN names: the one the request was signed for, so a caller
@@ -888,14 +1095,37 @@ pub fn mint_stream_key(
 /// serializer already uses for every blob, and its output stays inside the model's
 /// `PaginationToken` pattern `^[a-zA-Z0-9+/=_-]*$`.
 pub fn encode_page_token(after_sequence: u64) -> String {
-    ::aws_smithy_types::base64::encode(format!("{PAGE_TOKEN_PREFIX}{after_sequence}"))
+    encode_after(PAGE_TOKEN_PREFIX, after_sequence)
 }
 
 /// The creation sequence a `nextToken` resumes after, or `None` when the token was
 /// not issued by [`encode_page_token`].
 pub fn decode_page_token(token: &str) -> Option<u64> {
+    decode_after(PAGE_TOKEN_PREFIX, token)
+}
+
+/// [`encode_page_token`] for a `ListParticipantReplicas` page: the start sequence the
+/// next page of replicas resumes after, under that listing's own marker.
+pub fn encode_replica_page_token(after_sequence: u64) -> String {
+    encode_after(REPLICA_PAGE_TOKEN_PREFIX, after_sequence)
+}
+
+/// The start sequence a replica `nextToken` resumes after, or `None` when the token was
+/// not issued by [`encode_replica_page_token`] — a token from the other listing
+/// included.
+pub fn decode_replica_page_token(token: &str) -> Option<u64> {
+    decode_after(REPLICA_PAGE_TOKEN_PREFIX, token)
+}
+
+/// The one page-token codec, so the two listings cannot encode a position two ways.
+fn encode_after(prefix: &str, after_sequence: u64) -> String {
+    ::aws_smithy_types::base64::encode(format!("{prefix}{after_sequence}"))
+}
+
+/// The position `token` names under `prefix`, or `None` when it names none.
+fn decode_after(prefix: &str, token: &str) -> Option<u64> {
     let decoded = String::from_utf8(::aws_smithy_types::base64::decode(token).ok()?).ok()?;
-    decoded.strip_prefix(PAGE_TOKEN_PREFIX)?.parse().ok()
+    decoded.strip_prefix(prefix)?.parse().ok()
 }
 
 // =============================================================================
@@ -981,6 +1211,41 @@ pub fn quota_exceeded<E>(
             ..Default::default()
         }),
         message,
+    )
+}
+
+/// The `ConflictException` (HTTP 409) a handler answers when the request would put the
+/// store in a state contradicting one it already holds. The caller supplies the
+/// sentence, built from the request by the rule beside the failure it states.
+pub fn conflict<E>(
+    variant: fn(ConflictException) -> E,
+    message: impl Into<String>,
+) -> Scaffolded<E> {
+    let message = message.into();
+    Scaffolded::stated(
+        variant(ConflictException {
+            exception_message: Some(message.clone()),
+            ..Default::default()
+        }),
+        message,
+    )
+}
+
+/// How this service states a request to replicate a participant that is already
+/// replicated into the stage it names: it names the participant and both stages, so the
+/// caller can see which replication already holds.
+///
+/// AWS documents no text for `ConflictException` beyond what it means ("Updating or
+/// deleting a resource can cause an inconsistent state"), so the sentence is built from
+/// the request, the way every other refusal of this service is.
+pub fn replication_already_active_message(
+    participant_id: &str,
+    source_stage_arn: &str,
+    destination_stage_arn: &str,
+) -> String {
+    format!(
+        "Resource: participant {participant_id} of {source_stage_arn} is already \
+         replicated to {destination_stage_arn}"
     )
 }
 

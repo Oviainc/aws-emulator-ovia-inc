@@ -24,6 +24,10 @@ aws-smithy-types = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
+# The `Serialize` derive the resource-based policy document is rendered through: the
+# document's member ORDER is fixed by the structures in `state.rs`, which a
+# `serde_json::Map` would not fix.
+serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # SHA-256 and hex, which `state::revision_id` derives a policy `RevisionId` with from

@@ -241,9 +241,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
             // Unreachable: `put_permission` writes the statement it was asked for, so
-            // it never reports a policy that is missing that action group. Answered as
-            // a server fault rather than invented into a success.
-            crate::state::PolicyWrite::NoPolicy => {
+            // it never reports a policy or a statement that is missing, and it never
+            // clears one. Answered as a server fault rather than invented into a
+            // success.
+            crate::state::PolicyWrite::NoPolicy
+            | crate::state::PolicyWrite::NoStatement
+            | crate::state::PolicyWrite::Cleared => {
                 Err(PutPermissionErrorModeled::InternalServerException(
                     InternalServerException {
                         message: "the resource-based policy could not be written".to_string(),

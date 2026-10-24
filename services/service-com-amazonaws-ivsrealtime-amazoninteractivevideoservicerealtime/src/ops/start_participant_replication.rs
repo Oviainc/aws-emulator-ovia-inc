@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartParticipantReplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartParticipantReplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartParticipantReplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts replicating a publishing participant of one stage into another, and persists
+//! the replica `ListParticipantReplicas` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -104,6 +98,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The resource a participant-replica quota refusal names, as
+/// `crate::state::quota_exceeded_message` states it.
+const PARTICIPANT_REPLICA_QUOTA_RESOURCE: &str = "participant-replica";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -178,18 +176,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartParticipantReplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartParticipantReplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(
+                StartParticipantReplicationErrorModeled::InternalServerException,
+            )
+        })?;
+
+        // The 1 KB `attributes` limit is documented on this operation's own `attributes`
+        // member and carried by no modelled trait, so it is refused here rather than
+        // persisted — the same check, against the same measure, that every operation of
+        // this service taking an `attributes` map applies.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartParticipantReplication"))
+        // Checked BEFORE any lookup, because the limit is a property of the request
+        // alone: a request that is both oversized and names no stage is answered as
+        // malformed, exactly as the modelled constraints the framework checks ahead of
+        // this handler are.
+        let requested_attributes = input.attributes.unwrap_or_default();
+        let size = crate::state::attributes_size(&requested_attributes);
+        if size > crate::state::MAX_ATTRIBUTES_BYTES {
+            return Err(crate::state::validation_failed(
+                StartParticipantReplicationErrorModeled::ValidationException,
+                format!(
+                    "{}.attributes is required to have a maximum size of {} bytes, found {size}",
+                    Self::NAME,
+                    crate::state::MAX_ATTRIBUTES_BYTES,
+                ),
+            ));
+        }
+
+        // Replication is INTO another stage: the destination holds a replica of a
+        // participant publishing somewhere else, so a request naming one stage twice
+        // describes no replication at all. The model cannot say "these two members
+        // differ", so it is refused here.
+        if input.source_stage_arn == input.destination_stage_arn {
+            return Err(crate::state::validation_failed(
+                StartParticipantReplicationErrorModeled::ValidationException,
+                format!(
+                    "{}.destinationStageArn is required to name a stage other than \
+                     sourceStageArn, found {}",
+                    Self::NAME,
+                    input.destination_stage_arn,
+                ),
+            ));
+        }
+
+        let mut store = state.lock();
+        // Both stages have to exist: one to publish in, one to replicate into.
+        for stage_arn in [&input.source_stage_arn, &input.destination_stage_arn] {
+            if !store.stages.contains_key(stage_arn) {
+                return Err(crate::state::resource_not_found(
+                    StartParticipantReplicationErrorModeled::ResourceNotFoundException,
+                    stage_arn,
+                ));
+            }
+        }
+
+        // The participant has to be one of the SOURCE stage's, and it has to be a
+        // publisher: this operation replicates "a publishing participant" (the model's
+        // own doc for it), and a participant with no publish capability publishes
+        // nothing that could be replicated.
+        let Some(participant) =
+            crate::state::stage_participant(&store, &input.source_stage_arn, &input.participant_id)
+        else {
+            return Err(crate::state::resource_not_found(
+                StartParticipantReplicationErrorModeled::ResourceNotFoundException,
+                &input.participant_id,
+            ));
+        };
+        if !participant.publishes {
+            return Err(crate::state::validation_failed(
+                StartParticipantReplicationErrorModeled::ValidationException,
+                format!(
+                    "{}.participantId is required to name a participant publishing in {}, \
+                     found {} which holds no {} capability",
+                    Self::NAME,
+                    input.source_stage_arn,
+                    input.participant_id,
+                    crate::state::PUBLISH_CAPABILITY,
+                ),
+            ));
+        }
+
+        // One participant is replicated into one destination stage once: a second
+        // replication of the same participant into the same stage would be a second
+        // replica of one publisher in one stage, which is the inconsistent state this
+        // operation's `ConflictException` (HTTP 409) names. Another destination is a
+        // different replica and is accepted.
+        let already_replicated = store
+            .participant_replicas
+            .get(&input.source_stage_arn)
+            .is_some_and(|replicas| {
+                replicas.iter().any(|replica| {
+                    replica.participant_id == input.participant_id
+                        && replica.destination_stage_arn == input.destination_stage_arn
+                        && replica.replication_state == crate::state::REPLICATION_STATE_ACTIVE
+                })
+            });
+        if already_replicated {
+            return Err(crate::state::conflict(
+                StartParticipantReplicationErrorModeled::ConflictException,
+                crate::state::replication_already_active_message(
+                    &input.participant_id,
+                    &input.source_stage_arn,
+                    &input.destination_stage_arn,
+                ),
+            ));
+        }
+
+        // Bound the one store this operation grows, before any session is opened: the
+        // records are reclaimed only when a stage they name is deleted.
+        let held = store
+            .participant_replicas
+            .get(&input.source_stage_arn)
+            .map_or(0, Vec::len);
+        if held >= crate::state::MAX_PARTICIPANT_REPLICAS_PER_STAGE {
+            return Err(crate::state::quota_exceeded(
+                StartParticipantReplicationErrorModeled::ServiceQuotaExceededException,
+                PARTICIPANT_REPLICA_QUOTA_RESOURCE,
+                crate::state::MAX_PARTICIPANT_REPLICAS_PER_STAGE,
+            ));
+        }
+
+        // A replica names the session it is replicated FROM and the one it is replicated
+        // INTO, both `@required` on `ParticipantReplica`. Replication is what puts a
+        // participant into the destination stage, so it opens the session each stage
+        // needs and reuses the one a stage already has; see
+        // `crate::state::ensure_active_session`.
+        let source_session_id =
+            crate::state::ensure_active_session(&mut store, &input.source_stage_arn).ok_or_else(
+                || {
+                    crate::state::resource_not_found(
+                        StartParticipantReplicationErrorModeled::ResourceNotFoundException,
+                        &input.source_stage_arn,
+                    )
+                },
+            )?;
+        let destination_session_id =
+            crate::state::ensure_active_session(&mut store, &input.destination_stage_arn)
+                .ok_or_else(|| {
+                    crate::state::resource_not_found(
+                        StartParticipantReplicationErrorModeled::ResourceNotFoundException,
+                        &input.destination_stage_arn,
+                    )
+                })?;
+
+        // "These attributes are merged with any attributes set for this participant when
+        // creating the token. If there is overlap in keys, the values in these attributes
+        // are replaced" — so the source participant's own attributes first, then the
+        // request's over them.
+        let mut attributes = participant.attributes;
+        attributes.extend(requested_attributes);
+
+        let sequence = store.next_sequence();
+        let record = crate::state::ParticipantReplicaRecord {
+            source_stage_arn: input.source_stage_arn.clone(),
+            source_session_id,
+            destination_stage_arn: input.destination_stage_arn,
+            destination_session_id,
+            participant_id: input.participant_id,
+            replication_state: crate::state::REPLICATION_STATE_ACTIVE.to_string(),
+            reconnect_window_seconds: input
+                .reconnect_window_seconds
+                .unwrap_or(crate::state::DEFAULT_REPLICATION_RECONNECT_WINDOW_SECONDS),
+            attributes,
+            started_at: ::std::time::SystemTime::now(),
+            sequence,
+        };
+        store
+            .participant_replicas
+            .entry(input.source_stage_arn)
+            .or_default()
+            .push(record);
+
+        // Every member of `StartParticipantReplicationResponse` is an `@httpHeader`
+        // binding for a CORS or security response header, and none is a fact about the
+        // replication: this emulator sets no CORS policy, so each stays absent and the
+        // operation's whole answer is its modelled 200 plus the state above.
+        Ok(StartParticipantReplicationOutput::default())
     }
 }
