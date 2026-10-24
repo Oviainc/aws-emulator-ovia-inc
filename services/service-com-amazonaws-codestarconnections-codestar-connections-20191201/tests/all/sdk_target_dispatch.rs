@@ -34,7 +34,10 @@ use super::connection_lifecycle::{ACCOUNT_ID, Emulator, REGION, error_code};
 /// (`smithy_query(query="service_info")`), so its local name
 /// `CodeStar_connections_20191201` is the last label of every row; the rows differ only in
 /// what stands in front of it, which is all the rule generalises over.
-const PREFIXES: &[(&str, &str)] = &[
+///
+/// `pub(crate)` because this is the crate's ONE statement of the prefix forms a client may
+/// write: `wire_target_routing.rs` drives the host read over the same rows.
+pub(crate) const PREFIXES: &[(&str, &str)] = &[
     ("the bare service shape name", "CodeStar_connections_20191201"),
     (
         // The form an AWS SDK sends for this service: the fully qualified Coral service
