@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeBudgetActionsForBudget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeBudgetActionsForBudget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeBudgetActionsForBudget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every budget action held on one budget of one account, oldest first — the
+//! order they were created in — one page at a time. A pure read, except for the one
+//! change the CLOCK already owed on each action: one whose `*_IN_PROGRESS` work has
+//! reached its settle instant is reported in its settled status
+//! ([`crate::state::StoredAction::settle_due`]), which was due at that instant whether
+//! or not anybody called. A budget this account does not hold is a `NotFoundException`;
+//! a `NextToken` this list never minted is an `InvalidNextTokenException`.
 //!
 //! ## Shape of an operation
 //!
@@ -142,6 +141,13 @@ impl<Eng> DescribeBudgetActionsForBudget<Eng> {
     }
 }
 
+/// The biggest page this operation can report: `Actions` is `@length(max: 100)`, so a
+/// caller that named no `MaxResults` still gets at most that many actions and a
+/// `NextToken` for the rest, and no page can exceed what the output shape holds. (It is
+/// also `MaxResults`' own `@range(max: 100)`, which the boundary validator enforces
+/// before this handler runs.)
+const ACTIONS_MAX_PAGE: i32 = 100;
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for DescribeBudgetActionsForBudget<Eng>
 {
@@ -159,18 +165,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeBudgetActionsForBudget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeBudgetActionsForBudgetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeBudgetActionsForBudget"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeBudgetActionsForBudgetErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some(
+                        "budgets is mounted on an engine that holds no state for it".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        // The modelled `BudgetName` `@pattern` the boundary validator cannot compile —
+        // refused as the request-validation failure it is (HTTP 400
+        // `ValidationException`), naming the member path and the constraint.
+        if let Some(message) =
+            crate::state::budget_name_violation(&["BudgetName"], &input.budget_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An action is a resource OF the budget it names (`Action$BudgetName`), so a
+        // budget this account does not hold holds no actions either — which is the
+        // resource `NotFoundException` says cannot be located, not an empty list.
+        let stored = store
+            .budgets
+            .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
+            .ok_or_else(|| {
+                DescribeBudgetActionsForBudgetErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!(
+                        "Unable to get budget actions: {} - the budget doesn't exist.",
+                        input.budget_name
+                    )),
+                })
+            })?;
+
+        // The ONLY write this read makes: each action's settle the clock had already
+        // made due, so the statuses listed here are the ones `DescribeBudgetAction`
+        // reports for the same actions.
+        let actions = crate::state::actions_for_budget(stored, now);
+        let (page, next_token) = crate::state::page(
+            &actions,
+            Some(
+                input
+                    .max_results
+                    .unwrap_or(ACTIONS_MAX_PAGE)
+                    .clamp(1, ACTIONS_MAX_PAGE),
+            ),
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(|| {
+            DescribeBudgetActionsForBudgetErrorModeled::InvalidNextTokenException(
+                InvalidNextTokenException {
+                    message: Some("The pagination token is invalid.".to_string()),
+                },
+            )
+        })?;
+
+        Ok(DescribeBudgetActionsForBudgetOutput {
+            actions: page,
+            next_token,
+        })
     }
 }
