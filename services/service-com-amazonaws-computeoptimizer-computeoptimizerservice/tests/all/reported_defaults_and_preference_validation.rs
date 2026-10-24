@@ -283,8 +283,10 @@ async fn put_refuses_a_preference_the_resource_type_does_not_support_and_stores_
 
     // (case, accepted, the member the row sets, the request)
     let rows: Vec<(&str, bool, &str, Value)> = vec![
-        // `enhancedInfrastructureMetrics`: the EC2 instance and Auto Scaling group
-        // recommendations are the ones that carry it.
+        // `enhancedInfrastructureMetrics` documents NO resource-type restriction, so it is
+        // settable for every `ResourceType` the enum admits — see
+        // `enhanced_metrics_is_settable_for_every_resource_type` in
+        // `tests/all/unrestricted_preference_resource_types.rs` for the whole enum.
         (
             "enhanced metrics on Ec2Instance",
             true,
@@ -302,26 +304,32 @@ async fn put_refuses_a_preference_the_resource_type_does_not_support_and_stores_
             }),
         ),
         (
+            "enhanced metrics on RdsDBInstance",
+            true,
+            "enhancedInfrastructureMetrics",
+            json!({"resourceType": "RdsDBInstance", "enhancedInfrastructureMetrics": "Inactive"}),
+        ),
+        (
             "enhanced metrics on EcsService",
-            false,
+            true,
             "enhancedInfrastructureMetrics",
             json!({"resourceType": "EcsService", "enhancedInfrastructureMetrics": "Active"}),
         ),
         (
             "enhanced metrics on EbsVolume",
-            false,
+            true,
             "enhancedInfrastructureMetrics",
             json!({"resourceType": "EbsVolume", "enhancedInfrastructureMetrics": "Inactive"}),
         ),
         (
             "enhanced metrics on LambdaFunction",
-            false,
+            true,
             "enhancedInfrastructureMetrics",
             json!({"resourceType": "LambdaFunction", "enhancedInfrastructureMetrics": "Active"}),
         ),
         (
             "enhanced metrics on Idle",
-            false,
+            true,
             "enhancedInfrastructureMetrics",
             json!({"resourceType": "Idle", "enhancedInfrastructureMetrics": "Active"}),
         ),
