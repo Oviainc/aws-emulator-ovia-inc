@@ -13,7 +13,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AccountScope, AdminAccountSummary, AdminScope, AppsListData, ComplianceViolator,
+    AccountScope, AdminAccountSummary, AdminScope, AppsListData, AppsListDataSummary,
+    ComplianceViolator,
     DiscoveredResource, EvaluationResult, OrganizationalUnitScope, Policy, PolicyComplianceStatus,
     PolicySummary, PolicyTypeScope, ProtocolsListData, ProtocolsListDataSummary, RegionScope,
     ResourceNotFoundException, ResourceSet, ResourceSetSummary, Tag,
@@ -423,6 +424,19 @@ impl AppsListRecord {
         list.create_time = Some(::aws_smithy_types::DateTime::from(self.created_at));
         list.last_update_time = Some(::aws_smithy_types::DateTime::from(self.updated_at));
         list
+    }
+
+    /// The `AppsListDataSummary` projection `ListAppsLists` reports: the four
+    /// members that shape declares, every one of them read off this record, so
+    /// an enumeration and a `GetAppsList` of the same list can never disagree
+    /// about its ARN, its name or its applications.
+    pub fn summary(&self) -> AppsListDataSummary {
+        AppsListDataSummary {
+            list_arn: Some(self.list_arn.clone()),
+            list_id: Some(self.list_id.clone()),
+            list_name: Some(self.list.list_name.clone()),
+            apps_list: Some(self.list.apps_list.clone()),
+        }
     }
 }
 
