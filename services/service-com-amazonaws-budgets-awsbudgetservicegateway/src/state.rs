@@ -16,7 +16,8 @@
 //! a new file under `src/ops/` would be picked up by `build.rs` as an operation.
 
 use crate::ops::types::{
-    Budget, CostTypes, HealthStatus, Notification, ResourceTag, Spend, Subscriber, TimePeriod,
+    Action, Budget, CostTypes, Definition, HealthStatus, Notification, ResourceTag, Spend,
+    Subscriber, TimePeriod,
 };
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -42,6 +43,10 @@ pub struct StoredBudget {
     pub budget: Budget,
     /// The notifications created with this budget, in the order they were supplied.
     pub notifications: Vec<StoredNotification>,
+    /// The budget actions created on this budget, in the order they were created. An
+    /// action "is a budget action resource" of the budget it names
+    /// (`Action$BudgetName`), so it is held inside that budget and goes away with it.
+    pub actions: Vec<StoredAction>,
     /// `ResourceTags` supplied at creation.
     pub tags: Vec<ResourceTag>,
 }
@@ -53,6 +58,282 @@ pub struct StoredBudget {
 pub struct StoredNotification {
     pub notification: Notification,
     pub subscribers: Vec<Subscriber>,
+}
+
+/// One persisted budget action: the modelled `Action` a read reports, the tags created
+/// with it, and the settle the clock owes while the action is mid-flight.
+///
+/// Nothing in this emulator applies an action's `Definition` to IAM, Organizations or
+/// Systems Manager — that work belongs to other services and no request here runs it.
+/// What is modelled is the budget control plane's own record of the action: the
+/// resource, and the `Action$Status` state machine `ExecuteBudgetAction` drives.
+#[derive(Debug, Clone)]
+pub struct StoredAction {
+    /// The action as `DescribeBudgetAction` reads it back.
+    pub action: Action,
+    /// `ResourceTags` supplied at creation.
+    pub tags: Vec<ResourceTag>,
+    /// The settle owed while `action.status` is one of the `*_IN_PROGRESS` statuses,
+    /// or `None` for an action whose status is settled.
+    pub pending: Option<PendingSettle>,
+}
+
+/// The status an in-flight action moves to, and the instant the clock owes that move.
+#[derive(Debug, Clone)]
+pub struct PendingSettle {
+    /// When the move falls due — set by the call that started the work, never slept on.
+    pub settles_at: SystemTime,
+    /// The `ActionStatus` the action carries once the move is made.
+    pub settles_to: String,
+}
+
+impl StoredAction {
+    /// A newly created action: [`ACTION_STATUS_STANDBY`], with nothing owed.
+    pub fn new(action: Action, tags: Vec<ResourceTag>) -> Self {
+        Self {
+            action,
+            tags,
+            pending: None,
+        }
+    }
+
+    /// Materialise the settle the clock has already made due, and answer whether the
+    /// action is still mid-flight.
+    ///
+    /// A reporting operation may call this: the move was owed at
+    /// [`PendingSettle::settles_at`] whether or not anybody called, so making it here
+    /// reports the status the action already had rather than changing it.
+    pub fn settle_due(&mut self, now: SystemTime) {
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        if now < pending.settles_at {
+            return;
+        }
+        self.action.status = pending.settles_to.clone();
+        self.pending = None;
+    }
+
+    /// Start `execution`'s work: the action takes its `*_IN_PROGRESS` status now, and
+    /// the clock owes the settled status [`ACTION_SETTLES_AFTER`] later.
+    pub fn start(&mut self, execution: ActionExecution, now: SystemTime) {
+        self.action.status = execution.in_progress.to_string();
+        self.pending = Some(PendingSettle {
+            // `checked_add` rather than `SystemTime`'s own `Add`, which is an expect on
+            // overflow — the same reason [`instant_at`] uses it. An unrepresentable
+            // instant leaves the settle owed from `now`, which is the nearest instant
+            // this clock can name.
+            settles_at: now.checked_add(ACTION_SETTLES_AFTER).unwrap_or(now),
+            settles_to: execution.settles_to.to_string(),
+        });
+    }
+}
+
+/// `ActionStatus$STANDBY` — the status a created action carries, and the one a reset
+/// action returns to: the action is armed and waiting for its threshold.
+pub const ACTION_STATUS_STANDBY: &str = "STANDBY";
+
+/// `ActionStatus$PENDING` — a triggered action waiting for the manual approval its
+/// `ApprovalModel` requires.
+pub const ACTION_STATUS_PENDING: &str = "PENDING";
+
+/// `ActionStatus$EXECUTION_IN_PROGRESS` — the action's execution is under way.
+pub const ACTION_STATUS_EXECUTION_IN_PROGRESS: &str = "EXECUTION_IN_PROGRESS";
+
+/// `ActionStatus$EXECUTION_SUCCESS` — the action's definition is in place.
+pub const ACTION_STATUS_EXECUTION_SUCCESS: &str = "EXECUTION_SUCCESS";
+
+/// `ActionStatus$EXECUTION_FAILURE` — an execution that did not complete.
+pub const ACTION_STATUS_EXECUTION_FAILURE: &str = "EXECUTION_FAILURE";
+
+/// `ActionStatus$REVERSE_IN_PROGRESS` — the reversal of an executed action is under way.
+pub const ACTION_STATUS_REVERSE_IN_PROGRESS: &str = "REVERSE_IN_PROGRESS";
+
+/// `ActionStatus$REVERSE_SUCCESS` — the action's definition has been taken back off.
+pub const ACTION_STATUS_REVERSE_SUCCESS: &str = "REVERSE_SUCCESS";
+
+/// `ActionStatus$REVERSE_FAILURE` — a reversal that did not complete.
+pub const ACTION_STATUS_REVERSE_FAILURE: &str = "REVERSE_FAILURE";
+
+/// `ActionStatus$RESET_IN_PROGRESS` — the re-arming of a settled action is under way.
+pub const ACTION_STATUS_RESET_IN_PROGRESS: &str = "RESET_IN_PROGRESS";
+
+/// `ActionStatus$RESET_FAILURE` — a reset that did not complete.
+pub const ACTION_STATUS_RESET_FAILURE: &str = "RESET_FAILURE";
+
+/// `ExecutionType$APPROVE_BUDGET_ACTION` — execute the action.
+pub const EXECUTION_TYPE_APPROVE: &str = "APPROVE_BUDGET_ACTION";
+
+/// `ExecutionType$RETRY_BUDGET_ACTION` — run the work that failed again.
+pub const EXECUTION_TYPE_RETRY: &str = "RETRY_BUDGET_ACTION";
+
+/// `ExecutionType$REVERSE_BUDGET_ACTION` — take an executed action back off.
+pub const EXECUTION_TYPE_REVERSE: &str = "REVERSE_BUDGET_ACTION";
+
+/// `ExecutionType$RESET_BUDGET_ACTION` — re-arm a settled action.
+pub const EXECUTION_TYPE_RESET: &str = "RESET_BUDGET_ACTION";
+
+/// How long an action's work stays in flight before the clock settles it.
+///
+/// `ExecuteBudgetAction` answers while the work is still running — that is what the
+/// `*_IN_PROGRESS` statuses are for — so the settled status is owed a short span later.
+/// AWS documents no duration for it, so this is the emulator's own: long enough that a
+/// caller reading straight after the call still sees `*_IN_PROGRESS` and the refusals
+/// that status carries, short enough not to make a test wait.
+pub const ACTION_SETTLES_AFTER: Duration = Duration::from_millis(500);
+
+/// The status move one `ExecuteBudgetAction` call makes: the `*_IN_PROGRESS` status the
+/// action takes immediately, and the status the clock settles it to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionExecution {
+    /// The `ActionStatus` the action carries while the work runs.
+    pub in_progress: &'static str,
+    /// The `ActionStatus` it carries once [`ACTION_SETTLES_AFTER`] has passed.
+    pub settles_to: &'static str,
+}
+
+/// Whether `status` is one of the `*_IN_PROGRESS` statuses — work this service has
+/// already started and has not settled yet.
+///
+/// An action in one of them is the locked resource `ResourceLockedException` ("the
+/// server rejected that particular method for the requested resource") names: a second
+/// execution cannot be started over work that is still running.
+pub fn action_is_in_progress(status: &str) -> bool {
+    matches!(
+        status,
+        ACTION_STATUS_EXECUTION_IN_PROGRESS
+            | ACTION_STATUS_REVERSE_IN_PROGRESS
+            | ACTION_STATUS_RESET_IN_PROGRESS
+    )
+}
+
+/// The move `execution_type` makes on an action whose settled status is `status`, or
+/// `None` when that execution type has nothing to do from that status.
+///
+/// Each execution type names the work it performs, and the statuses it is accepted from
+/// are the ones in which that work is left to do:
+///
+/// * `APPROVE_BUDGET_ACTION` executes the action, so it is accepted while the action
+///   has not been applied: armed ([`ACTION_STATUS_STANDBY`]) or waiting for the manual
+///   approval its `ApprovalModel` requires ([`ACTION_STATUS_PENDING`]).
+/// * `REVERSE_BUDGET_ACTION` takes an applied action back off, so it is accepted once
+///   the definition is in place ([`ACTION_STATUS_EXECUTION_SUCCESS`]) or a previous
+///   reversal left it there ([`ACTION_STATUS_REVERSE_FAILURE`]).
+/// * `RESET_BUDGET_ACTION` re-arms the action, so it is accepted from every settled
+///   status in which it has already run — and not from `STANDBY`, which is already
+///   armed, or `PENDING`, which has not run. `ActionStatus` has no `RESET_SUCCESS`,
+///   and `STANDBY` is the status an armed action carries, so that is what a completed
+///   reset leaves behind.
+/// * `RETRY_BUDGET_ACTION` runs the work that failed again, so it is accepted from each
+///   `*_FAILURE` status and repeats the operation that produced it.
+///
+/// Nothing in this emulator ever fails an action's work, so no call here mints a
+/// `*_FAILURE` status; those rows are the rule stated over the whole `ActionStatus`
+/// enum, not a status this service invents for work nothing ran.
+pub fn action_execution(execution_type: &str, status: &str) -> Option<ActionExecution> {
+    let execute = ActionExecution {
+        in_progress: ACTION_STATUS_EXECUTION_IN_PROGRESS,
+        settles_to: ACTION_STATUS_EXECUTION_SUCCESS,
+    };
+    let reverse = ActionExecution {
+        in_progress: ACTION_STATUS_REVERSE_IN_PROGRESS,
+        settles_to: ACTION_STATUS_REVERSE_SUCCESS,
+    };
+    let reset = ActionExecution {
+        in_progress: ACTION_STATUS_RESET_IN_PROGRESS,
+        settles_to: ACTION_STATUS_STANDBY,
+    };
+    match (execution_type, status) {
+        (EXECUTION_TYPE_APPROVE, ACTION_STATUS_STANDBY | ACTION_STATUS_PENDING) => Some(execute),
+        (
+            EXECUTION_TYPE_REVERSE,
+            ACTION_STATUS_EXECUTION_SUCCESS | ACTION_STATUS_REVERSE_FAILURE,
+        ) => Some(reverse),
+        (
+            EXECUTION_TYPE_RESET,
+            ACTION_STATUS_EXECUTION_SUCCESS
+            | ACTION_STATUS_EXECUTION_FAILURE
+            | ACTION_STATUS_REVERSE_SUCCESS
+            | ACTION_STATUS_REVERSE_FAILURE
+            | ACTION_STATUS_RESET_FAILURE,
+        ) => Some(reset),
+        (EXECUTION_TYPE_RETRY, ACTION_STATUS_EXECUTION_FAILURE) => Some(execute),
+        (EXECUTION_TYPE_RETRY, ACTION_STATUS_REVERSE_FAILURE) => Some(reverse),
+        (EXECUTION_TYPE_RETRY, ACTION_STATUS_RESET_FAILURE) => Some(reset),
+        _ => None,
+    }
+}
+
+/// The action of `stored` that `action_id` names, with any settle the clock has already
+/// made due materialised ([`StoredAction::settle_due`]), or `None` when the budget
+/// holds no such action — which the caller answers with `NotFoundException`.
+pub fn find_action_mut<'a>(
+    stored: &'a mut StoredBudget,
+    action_id: &str,
+    now: SystemTime,
+) -> Option<&'a mut StoredAction> {
+    let found = stored
+        .actions
+        .iter_mut()
+        .find(|held| held.action.action_id == action_id)?;
+    found.settle_due(now);
+    Some(found)
+}
+
+/// The number of actions one budget will hold.
+///
+/// Not an AWS quota reproduced here: it is this emulator's own ceiling, so a caller
+/// cannot grow the process without limit by creating actions on one budget (the number
+/// of BUDGETS is already bounded by [`MAX_BUDGETS_PER_ACCOUNT`] /
+/// [`MAX_BUDGETS_TOTAL`]). `CreateBudgetAction` answers the modelled
+/// `ServiceQuotaExceededException` ("You've reached a Service Quota limit on this
+/// resource") once a budget holds this many.
+pub const MAX_ACTIONS_PER_BUDGET: usize = 10;
+
+/// The `Definition` member an `ActionType` is written with: "The type of action. This
+/// defines the type of tasks that can be carried out by this action. This field also
+/// determines the format for definition" (`Action$ActionType`), over a `Definition`
+/// whose three members — `IamActionDefinition`, `ScpActionDefinition`,
+/// `SsmActionDefinition` — are each optional in the model, so no constraint trait can
+/// tie them to the action type.
+///
+/// `None` for an `ActionType` this emulator does not know, which the modelled
+/// `ActionType` enum already refuses at the boundary.
+fn definition_member_for(action_type: &str) -> Option<&'static str> {
+    match action_type {
+        "APPLY_IAM_POLICY" => Some("IamActionDefinition"),
+        "APPLY_SCP_POLICY" => Some("ScpActionDefinition"),
+        "RUN_SSM_DOCUMENTS" => Some("SsmActionDefinition"),
+        _ => None,
+    }
+}
+
+/// The cross-member rule `Action$ActionType` documents, checked over the `Definition`
+/// supplied with an action: the action type determines which member of `Definition`
+/// describes the work, so exactly that one must be present and the other two must not.
+///
+/// `Err` carries the sentence that goes in `InvalidParameterException$Message` ("An
+/// error on the client occurred. Typically, the cause is an invalid input value.").
+pub fn validate_action_definition(action_type: &str, definition: &Definition) -> Result<(), String> {
+    let Some(wanted) = definition_member_for(action_type) else {
+        return Ok(());
+    };
+    let supplied: Vec<&'static str> = [
+        ("IamActionDefinition", definition.iam_action_definition.is_some()),
+        ("ScpActionDefinition", definition.scp_action_definition.is_some()),
+        ("SsmActionDefinition", definition.ssm_action_definition.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, present)| *present)
+    .map(|(member, _)| member)
+    .collect();
+    if supplied == [wanted] {
+        return Ok(());
+    }
+    Err(format!(
+        "Unable to create/update budget action: an {action_type} action is defined by \
+         Definition.{wanted} alone."
+    ))
 }
 
 /// `HealthStatusValue$HEALTHY` — the only state a budget in this emulator can be in:
