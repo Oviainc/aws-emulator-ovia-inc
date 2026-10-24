@@ -19,6 +19,8 @@ mod assistant_lifecycle;
 mod content_upload;
 #[path = "all/knowledge_base_lifecycle.rs"]
 mod knowledge_base_lifecycle;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/session_recommendations.rs"]
 mod session_recommendations;
 #[path = "all/shared_signing_name_routing.rs"]
