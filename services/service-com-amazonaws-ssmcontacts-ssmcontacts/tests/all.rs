@@ -29,6 +29,8 @@ mod engagement_lifecycle;
 mod onboarding;
 #[path = "all/page_acknowledgement.rs"]
 mod page_acknowledgement;
+#[path = "all/page_resolution.rs"]
+mod page_resolution;
 #[path = "all/replication_set_precondition.rs"]
 mod replication_set_precondition;
 #[path = "all/rotation_deletes.rs"]
