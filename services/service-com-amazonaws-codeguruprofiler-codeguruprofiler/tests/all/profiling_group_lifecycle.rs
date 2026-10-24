@@ -66,6 +66,17 @@ impl Answer {
             .unwrap_or_default()
             .to_string()
     }
+
+    /// The modelled error's `message` — the `@required` member every error shape of this
+    /// service declares. `pub(crate)` so every suite in this target reads a refusal's
+    /// text one way.
+    pub(crate) fn error_message(&self) -> String {
+        self.json()
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
 }
 
 /// The emulator, assembled exactly as the router assembles it: one shared engine

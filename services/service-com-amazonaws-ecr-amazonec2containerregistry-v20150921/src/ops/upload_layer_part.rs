@@ -287,8 +287,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // What the upload held before this part: the last byte a client may still rely
-        // on, which is what a refused part reports back as `lastValidByteReceived`.
+        // on, which is what a refused part reports back as `lastValidByteReceived`, and
+        // the offset the next part has to begin at — the byte after it, or byte 0 while
+        // the upload has received nothing. A client resuming an interrupted upload reads
+        // that offset out of the refusal, so it is stated rather than left to be derived.
         let last_valid_byte_received = upload.last_byte_received();
+        let expected_part_first_byte = upload.next_part_first_byte();
         let outcome = upload.receive_part(
             input.part_first_byte,
             input.part_last_byte,
@@ -328,14 +332,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 repository_name: Some(repository_name),
                                 upload_id: Some(input.upload_id.clone()),
                                 last_valid_byte_received,
+                                // ECR names the byte the part DID begin at and the byte
+                                // it had to begin at, which is where the upload's
+                                // received bytes end — the offset a resuming client
+                                // continues from.
                                 message: Some(format!(
-                                    "Invalid layer part: partFirstByte {} is not consecutive \
-                                     to the last byte received by this upload ({})",
-                                    input.part_first_byte,
-                                    last_valid_byte_received.map_or_else(
-                                        || "no part received yet".to_string(),
-                                        |last| last.to_string()
-                                    )
+                                    "First byte of the layer part is {} instead of {}",
+                                    input.part_first_byte, expected_part_first_byte
                                 )),
                             },
                         ),

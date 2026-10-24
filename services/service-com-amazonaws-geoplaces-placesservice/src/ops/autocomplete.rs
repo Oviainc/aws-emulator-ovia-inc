@@ -417,20 +417,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The modeled `Highlight` list for one piece of a result's text, or `None` when
-/// the query named none of it: every `HighlightList` member is optional, so "the
-/// query matched nothing here" is an ABSENT member rather than an empty list.
+/// the query named none of it: [`crate::state::modeled_highlights`], which Suggest
+/// marks its own suggestions with too.
 fn highlight_list(text: &str, query_tokens: &[String]) -> Option<Vec<Highlight>> {
-    let found = crate::state::highlight_matches(text, query_tokens);
-    (!found.is_empty()).then(|| {
-        found
-            .into_iter()
-            .map(|section| Highlight {
-                start_index: Some(section.start_index),
-                end_index: Some(section.end_index),
-                value: Some(section.value),
-            })
-            .collect()
-    })
+    crate::state::modeled_highlights(text, query_tokens)
 }
 
 /// `Highlights`: "how the parts of the response element matched the input query by
