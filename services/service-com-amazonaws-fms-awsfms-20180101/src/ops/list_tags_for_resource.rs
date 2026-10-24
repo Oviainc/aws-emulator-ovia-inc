@@ -2,6 +2,19 @@
 
 //! @op ListTagsForResource
 //!
+//! Reports the tags one Firewall Manager resource carries, named by a generic
+//! `ResourceArn`. A REPORTING operation: it writes nothing.
+//!
+//! Administrator-gated, like every organisation-scoped Firewall Manager
+//! operation: with no Firewall Manager default administrator association for the
+//! organisation the read is refused by
+//! [`crate::state::require_administrator`] BEFORE the ARN's form is checked and
+//! before the ARN is resolved, so the refusal discloses neither the tags nor
+//! whether the named resource exists. The association is organisation-wide (one
+//! default administrator, whose `AdminScope` is the whole organisation), so the
+//! gate answers the same in every Region and the request's Region only composes
+//! the refusal's message.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -140,7 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalErrorException(
                 InternalErrorException {
@@ -150,7 +162,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The ARN's FORM first, ahead of any lookup: a string that is not an ARN
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        // The authorization gate FIRST, on the ordering
+        // [`crate::state::require_administrator`]'s own documentation states:
+        // the decision is taken before the ARN's form is checked and before the
+        // ARN is resolved — hence the lock is held across the check below rather
+        // than taken after it.
+        crate::state::require_administrator(&store, &region)?;
+
+        // The ARN's FORM next, ahead of any lookup: a string that is not an ARN
         // at all is a caller programming error, which is a different answer from
         // "that ARN names nothing". The modelled `ResourceArn` pattern accepts
         // such a string, so the service-level check is what refuses it — with a
@@ -159,7 +180,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(reason));
         }
 
-        let store = state.lock();
         // A read: it resolves the ARN and reports the tags the resource carries,
         // and writes nothing — so two reads in a row answer identically.
         //

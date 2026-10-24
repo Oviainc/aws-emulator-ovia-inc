@@ -19,9 +19,16 @@
 //! * `ListAdminsManagingAccount` enumerates the administrator accounts managing
 //!   the caller, and is `ResourceNotFoundException` — not an empty page — when
 //!   none does.
+//!
+//! The tagging operations are organisation-scoped, so each tagging test opens
+//! the administrator gate with [`associate_admin`] first: what the gate itself
+//! answers with no association is asserted by the sibling
+//! `tagging_administrator_gate` suite, and what an AUTHORISED caller gets is
+//! what this suite is about.
 
 use serde_json::{json, Value};
 
+use crate::administrator_gated_operations::associate_admin;
 use crate::policy_lifecycle::{call, emulator, error_code, ACCOUNT, REGION};
 
 /// A minimal policy document: every required `Policy` member and nothing else.
@@ -220,6 +227,7 @@ fn tag_cases() -> Vec<TagCase> {
 async fn tags_written_by_tag_resource_are_read_back_by_list_tags_for_resource() {
     for case in tag_cases() {
         let router = emulator();
+        associate_admin(&router).await;
         let name = &case.name;
         let arn = put_policy(&router, "tagged.policy", &case.initial).await;
 
@@ -353,6 +361,7 @@ fn unknown_arns() -> Vec<(&'static str, String)> {
 #[tokio::test]
 async fn a_resource_arn_that_is_not_an_arn_is_refused_as_a_validation_error() {
     let router = emulator();
+    associate_admin(&router).await;
     let held = tag_list(&[("stage", "test")]);
     let arn = put_policy(&router, "untouched.policy", &held).await;
 
@@ -404,6 +413,7 @@ async fn a_well_formed_arn_naming_no_resource_is_not_found_and_stores_nothing() 
     // found" cannot be an artefact of an empty store.
     for with_a_stored_policy in [false, true] {
         let router = emulator();
+        associate_admin(&router).await;
         if with_a_stored_policy {
             put_policy(&router, "stored.policy", &tag_list(&[("stage", "test")])).await;
         }
@@ -464,6 +474,7 @@ async fn a_tag_list_repeating_a_key_is_refused() {
 
     for (case, duplicate) in rows {
         let router = emulator();
+        associate_admin(&router).await;
         let held = tag_list(&[("stage", "test")]);
         let arn = put_policy(&router, "duplicate.policy", &held).await;
 
@@ -500,6 +511,7 @@ async fn the_tag_set_is_bounded_by_the_modelled_tag_list_length() {
     const MAX_TAGS: usize = 200;
 
     let router = emulator();
+    associate_admin(&router).await;
     let arn = put_policy(&router, "bounded.policy", &tag_list(&[])).await;
 
     let keys: Vec<String> = (0..MAX_TAGS).map(|index| format!("key{index}")).collect();

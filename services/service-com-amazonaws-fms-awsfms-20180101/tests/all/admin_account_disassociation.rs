@@ -63,13 +63,15 @@ fn role_status(name: &str) -> &'static str {
 }
 
 /// How long a requested disassociation stays pending, from the handler's own
-/// constant, plus a margin so a waiting test is not racing it.
+/// constant, plus a margin so a waiting test is not racing it. `pub(crate)` so
+/// the sibling `tagging_administrator_gate` suite waits out the SAME span
+/// rather than keeping a second copy of the wait rule.
 ///
 /// A blocking `std::thread::sleep` on purpose: this workspace's `tokio` is built
 /// without the `time` feature (root `Cargo.toml` enables only `macros`, `rt` and
 /// `rt-multi-thread`), so `tokio::time::sleep` is not available here, and a test
 /// that waits out one chosen 500 ms span has nothing else to do meanwhile.
-fn wait_out_the_disassociation() {
+pub(crate) fn wait_out_the_disassociation() {
     sleep(
         service_com_amazonaws_fms_awsfms_20180101::state::DISASSOCIATION_SPAN
             + Duration::from_millis(250),
