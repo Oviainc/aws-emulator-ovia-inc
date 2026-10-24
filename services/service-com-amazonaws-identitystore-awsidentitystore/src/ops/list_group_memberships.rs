@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ..Default::default()
             })
         })?;
-        // A read: it looks the store up rather than vivifying one, so listing a group's
+        // A read: the store is RESOLVED and nothing is written, so listing a group's
         // memberships can never change what a later caller sees.
         let state = state.lock();
         let not_found = || {
@@ -184,8 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.group_id,
             ))
         };
-        // The identity store the request names must exist; one that does not is the
-        // missing resource, reported as `IDENTITY_STORE`.
+        // Any well-formed `IdentityStoreId` of this account names the store the caller
+        // has; one with no record yet holds no group, so the GROUP is then what is
+        // missing. An identifier naming no store this emulator serves is reported as
+        // `IDENTITY_STORE`.
         let store = state
             .resolve_store(&input.identity_store_id)
             .map_err(ListGroupMembershipsErrorModeled::ResourceNotFoundException)?;

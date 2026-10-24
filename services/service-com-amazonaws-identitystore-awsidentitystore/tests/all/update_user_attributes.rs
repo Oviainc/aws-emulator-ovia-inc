@@ -25,7 +25,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{emulator, ok, refused, string, STORE};
+use crate::harness::{emulator, ok, refused, string, MISSING_STORE, STORE};
 
 /// The emulator's account id, as it appears in an identity store's ARN — the other
 /// form the modelled `IdentityStoreId` pattern admits.
@@ -865,7 +865,8 @@ async fn an_invalid_operation_is_refused_and_changes_nothing() {
     }
 }
 
-/// An update naming a user or a store that does not exist is not found.
+/// An update naming a user that store does not hold, or an identifier naming no store
+/// this emulator serves, is not found.
 #[tokio::test]
 async fn an_update_of_a_user_that_does_not_exist_is_not_found() {
     let router = emulator();
@@ -887,10 +888,10 @@ async fn an_update_of_a_user_that_does_not_exist_is_not_found() {
             "USER",
         ),
         (
-            // The identity store itself is what is missing here, so THAT is the
-            // resource the refusal names.
-            "an identity store that does not exist",
-            "d-0000000001".to_string(),
+            // The identifier names a store of ANOTHER account, which is no store this
+            // emulator serves, so THAT is the resource the refusal names.
+            "a store of another account",
+            MISSING_STORE.to_string(),
             user.clone(),
             "IDENTITY_STORE",
         ),
@@ -918,14 +919,15 @@ async fn an_update_of_a_user_that_does_not_exist_is_not_found() {
         );
     }
 
-    // The store the refused update named is still not there: a refusal creates nothing.
+    // The store the refused update named is still no store this emulator serves: a
+    // refusal creates nothing.
     refused(
         &router,
         "DescribeUser",
-        json!({ "IdentityStoreId": "d-0000000001", "UserId": user }),
+        json!({ "IdentityStoreId": MISSING_STORE, "UserId": user }),
         404,
         "ResourceNotFoundException",
-        "the store was not vivified",
+        "the store is still not served",
     )
     .await;
 }

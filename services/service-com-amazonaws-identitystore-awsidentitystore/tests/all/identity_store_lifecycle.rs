@@ -1285,8 +1285,9 @@ async fn a_created_membership_is_described_exactly_as_it_was_stored() {
             body["CreatedAt"], body["UpdatedAt"]
         );
         // The membership records the principal that created it, so the describe reports
-        // a populated `CreatedBy`; nothing has updated the membership (the API models no
-        // membership update), so `UpdatedBy` is absent rather than invented.
+        // a populated `CreatedBy`; `UpdatedBy` reports the LAST write, which for a
+        // membership (the API models no membership update) is that same create — just as
+        // its `UpdatedAt` is its `CreatedAt`.
         assert!(
             body.get("CreatedBy")
                 .and_then(Value::as_str)
@@ -1295,9 +1296,11 @@ async fn a_created_membership_is_described_exactly_as_it_was_stored() {
              created, got {}",
             body.get("CreatedBy").unwrap_or(&Value::Null)
         );
-        assert!(
-            body.get("UpdatedBy").unwrap_or(&Value::Null).is_null(),
-            "case {case:?}: expected no UpdatedBy on a membership nothing updated, got {}",
+        assert_eq!(
+            body.get("UpdatedBy"),
+            body.get("CreatedBy"),
+            "case {case:?}: expected UpdatedBy to report the create as the last write, \
+             got {}",
             body["UpdatedBy"]
         );
 

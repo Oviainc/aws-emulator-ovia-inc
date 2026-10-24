@@ -177,8 +177,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ..Default::default()
             })
         })?;
-        // `@readonly`: it looks the store up rather than vivifying one, so listing users
-        // can never change what a later caller sees.
+        // `@readonly`: the store is RESOLVED and nothing is written, so listing users
+        // can never change what a later caller sees — a store with no record yet reports
+        // the nothing it holds.
         let state = state.lock();
         let store = state
             .resolve_store(&input.identity_store_id)

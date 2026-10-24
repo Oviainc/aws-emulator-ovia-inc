@@ -173,16 +173,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ..Default::default()
             })
         })?;
-        // A read: the store is looked up rather than vivified, so resolving a user id
+        // A read: the store is RESOLVED and nothing is written, so resolving a user id
         // can never change what a later caller sees.
         let state = state.lock();
-        // The identity store the request names must exist; one that does not is the
-        // missing resource, reported as `IDENTITY_STORE` rather than as a missing user
-        // of a store that is not there either.
+        // The identity store the request names: every well-formed `IdentityStoreId` of
+        // this account names a store this emulator serves — one with no record yet holds
+        // no user, so the USER is then what is missing — while an identifier naming no
+        // store it can serve (another account's) is reported as `IDENTITY_STORE`.
         let store = state
             .resolve_store(&input.identity_store_id)
             .map_err(GetUserIdErrorModeled::ResourceNotFoundException)?;
-        let user = selector.find(store).ok_or_else(|| selector.not_found())?;
+        let user = selector.find(&store).ok_or_else(|| selector.not_found())?;
 
         Ok(GetUserIdOutput {
             identity_store_id: store.identity_store_id.clone(),

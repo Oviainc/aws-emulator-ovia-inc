@@ -444,14 +444,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.group_id,
             ))
         };
-        // The identity store must EXIST: an update addressed to one that does not is
-        // refused with the modelled `ResourceNotFoundException` naming THAT resource,
-        // and naming a store never brings one into being. Both identifiers go through
-        // the crate's own key normalisation, so the ARN form and either letter case of
-        // each name the same resource the create used.
+        // The identity store the request names is the store the caller has: any
+        // well-formed `IdentityStoreId` of this account resolves, while an identifier
+        // naming no store this emulator serves is refused with the modelled
+        // `ResourceNotFoundException` naming THAT resource. An update stores no new
+        // resource, so a store this emulator holds no record of holds no such group and
+        // the GROUP is what is missing. Both identifiers go through the crate's own key
+        // normalisation, so the ARN form and either letter case of each name the same
+        // resource the create used.
         let store = state
-            .resolve_store_mut(&input.identity_store_id)
-            .map_err(UpdateGroupErrorModeled::ResourceNotFoundException)?;
+            .resolve_recorded_store_mut(&input.identity_store_id)
+            .map_err(UpdateGroupErrorModeled::ResourceNotFoundException)?
+            .ok_or_else(group_not_found)?;
         let group_key = crate::state::resource_key(&input.group_id);
         let stored = store.groups.get(&group_key).ok_or_else(group_not_found)?;
 
