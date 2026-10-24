@@ -161,14 +161,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Deletes an existing site. The site cannot be associated with any device or
         // link." (`smithy_query query="doc" shape="DeleteSite"`) — so a site that still
-        // holds links is a conflict, never a delete that orphans them.
+        // holds either is a conflict, never a delete that orphans them.
         let links = store.link_ids_of_site(&input.site_id);
-        if !links.is_empty() {
+        let devices = store.device_ids_of_site(&input.site_id);
+        if !links.is_empty() || !devices.is_empty() {
             return Err(DeleteSiteErrorModeled::ConflictException(ConflictException {
                 message: format!(
-                    "site {} is still associated with {} link(s)",
+                    "site {} is still associated with {} link(s) and {} device(s)",
                     input.site_id,
-                    links.len()
+                    links.len(),
+                    devices.len()
                 ),
                 resource_id: input.site_id.clone(),
                 resource_type: crate::state::SITE_KIND.to_string(),

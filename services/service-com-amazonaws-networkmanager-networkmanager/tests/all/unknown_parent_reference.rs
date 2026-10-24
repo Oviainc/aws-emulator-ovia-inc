@@ -21,8 +21,10 @@
 //! Which member a create reports is its IMMEDIATE parent reference: `CreateLink` creates
 //! "a new link for a specified site" and addresses that site inside a global network, so
 //! a chain that does not resolve is reported on `siteId` even when the global network is
-//! unknown too (the recorded case), while `CreateSite` and `CreateCoreNetwork` hang
-//! straight off the global network and report `globalNetworkId`.
+//! unknown too (the recorded case), while `CreateSite`, `CreateDevice` and
+//! `CreateCoreNetwork` hang straight off the global network and report `globalNetworkId`.
+//! `CreateDevice`'s `SiteId` is an OPTIONAL extra reference, so it is reported on `siteId`
+//! only once the global network it is addressed inside resolves.
 
 use serde_json::{json, Value};
 
@@ -197,6 +199,57 @@ async fn every_create_refuses_a_reference_that_names_nothing_as_a_field_validati
             message: SITE_NOT_FOUND,
         },
         BadReference {
+            case: "CreateDevice under a global network that never existed",
+            uri: format!("/global-networks/{unknown_network}/devices"),
+            body: json!({ "Description": "orphan" }),
+            field: FIELD_GLOBAL_NETWORK_ID,
+            message: GLOBAL_NETWORK_NOT_FOUND,
+        },
+        BadReference {
+            case: "CreateDevice under a deleted global network",
+            uri: format!("/global-networks/{gone_network}/devices"),
+            body: json!({}),
+            field: FIELD_GLOBAL_NETWORK_ID,
+            message: GLOBAL_NETWORK_NOT_FOUND,
+        },
+        BadReference {
+            // The device hangs off the global network, so an unknown global network is
+            // reported there even when the `SiteId` the body carries is live.
+            case: "CreateDevice under an unknown global network naming a live site",
+            uri: format!("/global-networks/{unknown_network}/devices"),
+            body: json!({ "SiteId": live_site.clone() }),
+            field: FIELD_GLOBAL_NETWORK_ID,
+            message: GLOBAL_NETWORK_NOT_FOUND,
+        },
+        BadReference {
+            case: "CreateDevice naming a site that never existed",
+            uri: format!("/global-networks/{live_network}/devices"),
+            body: json!({ "SiteId": unknown_site }),
+            field: FIELD_SITE_ID,
+            message: SITE_NOT_FOUND,
+        },
+        BadReference {
+            case: "CreateDevice naming a deleted site",
+            uri: format!("/global-networks/{live_network}/devices"),
+            body: json!({ "SiteId": gone_site.clone() }),
+            field: FIELD_SITE_ID,
+            message: SITE_NOT_FOUND,
+        },
+        BadReference {
+            case: "CreateDevice naming a site id that is not a Network Manager id",
+            uri: format!("/global-networks/{live_network}/devices"),
+            body: json!({ "SiteId": not_an_id }),
+            field: FIELD_SITE_ID,
+            message: SITE_NOT_FOUND,
+        },
+        BadReference {
+            case: "CreateDevice naming a site of another global network",
+            uri: format!("/global-networks/{live_network}/devices"),
+            body: json!({ "SiteId": other_site.clone() }),
+            field: FIELD_SITE_ID,
+            message: SITE_NOT_FOUND,
+        },
+        BadReference {
             case: "CreateCoreNetwork under a global network that never existed",
             uri: "/core-networks".to_string(),
             body: json!({ "GlobalNetworkId": unknown_network }),
@@ -249,6 +302,18 @@ async fn every_create_refuses_a_reference_that_names_nothing_as_a_field_validati
         Vec::<String>::new(),
         "a refused create must not have stored a link, got {links}"
     );
+    let (status, devices) = emulator
+        .get(&format!("/global-networks/{live_network}/devices"))
+        .await;
+    assert_eq!(
+        status, 200,
+        "GetDevices: expected 200, got {status} with {devices}"
+    );
+    assert_eq!(
+        ids_of(&devices, "Devices", "DeviceId"),
+        Vec::<String>::new(),
+        "a refused create must not have stored a device, got {devices}"
+    );
 
     // And the references that DO resolve are still accepted, so the refusals above are the
     // reference check and nothing wider.
@@ -261,6 +326,16 @@ async fn every_create_refuses_a_reference_that_names_nothing_as_a_field_validati
     assert_eq!(
         status, 200,
         "CreateLink with both references live: expected 200, got {status} with {created}"
+    );
+    let (status, created) = emulator
+        .post(
+            &format!("/global-networks/{live_network}/devices"),
+            json!({ "SiteId": live_site.clone() }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "CreateDevice with both references live: expected 200, got {status} with {created}"
     );
     let (status, created) = emulator
         .post(
