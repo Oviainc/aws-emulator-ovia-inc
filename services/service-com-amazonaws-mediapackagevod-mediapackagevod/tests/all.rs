@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_documented_members.rs"]
 mod arn_documented_members;
+#[path = "all/arn_member_validation.rs"]
+mod arn_member_validation;
 #[path = "all/asset_listing.rs"]
 mod asset_listing;
 #[path = "all/configure_logs.rs"]
@@ -25,6 +27,8 @@ mod error_responses;
 mod packaging_configuration_deletion;
 #[path = "all/packaging_configuration_listing.rs"]
 mod packaging_configuration_listing;
+#[path = "all/packaging_group_authorization_arns.rs"]
+mod packaging_group_authorization_arns;
 #[path = "all/packaging_group_deletion.rs"]
 mod packaging_group_deletion;
 #[path = "all/packaging_group_update.rs"]

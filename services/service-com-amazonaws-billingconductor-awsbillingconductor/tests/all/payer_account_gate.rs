@@ -761,7 +761,10 @@ async fn the_gate_precedes_semantic_validation_resource_lookup_and_the_scaffold(
             method: "POST",
             uri: "/list-custom-line-items",
             body: json!({ "MaxResults": 5 }),
-            payer_status: 501,
+            // Served for the payer account: an authorized caller gets the page (empty
+            // over this store), which is what makes "authorized, zero custom line
+            // items" and "not authorized" two different answers again.
+            payer_status: 200,
         },
         Row {
             case: "a ListCustomLineItemVersions naming a bare custom line item",

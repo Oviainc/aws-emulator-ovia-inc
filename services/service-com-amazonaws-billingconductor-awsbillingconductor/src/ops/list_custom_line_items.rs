@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCustomLineItems
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCustomLineItems`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! REPORTS the custom line items `CreateCustomLineItem` persisted, one page at a time.
+//! A pure read: it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCustomLineItems::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Two things decide which stored items a call reports:
+//!
+//! * the BILLING PERIOD — "a list of all custom line items (FFLIs) for the given billing
+//!   period. If you don't provide a billing period, the current billing period is used" —
+//!   so an item is reported for a period its own half-open `BillingPeriodRange` covers
+//!   (`crate::state::billing_period_range_covers`), and the request's absent
+//!   `BillingPeriod` means `crate::state::current_billing_period`;
+//! * the FILTERS — each member of `ListCustomLineItemsFilter` names the values of ONE
+//!   attribute of an item, so each is an independent membership test and an absent one
+//!   filters nothing.
+//!
+//! Every reported member is derived from the stored record: `AssociationSize` from the
+//! item's associations, the charge details from the flat/percentage value it was created
+//! with, and `CurrencyCode` from the partition of its ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +94,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::CustomLineItemRecord;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -119,6 +129,97 @@ pub type ListCustomLineItemsError = crate::scaffolded::Scaffolded<ListCustomLine
 impl From<ListCustomLineItemsErrorModeled> for ListCustomLineItemsError {
     fn from(modeled: ListCustomLineItemsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// Does `item` pass every filter the request set?
+///
+/// Each member of `ListCustomLineItemsFilter` lists the values of ONE attribute of a
+/// custom line item (its name, its billing group, its own ARN, the account it applies
+/// to), so an item passes when its value for that attribute is one of the listed ones.
+/// An absent member — and a member that lists no value at all, which only `AccountIds`
+/// can be (`@length(min: 0)`, every other list is `min: 1`) — names no values to
+/// restrict to and so filters nothing.
+///
+/// The ARN-valued members are compared NORMALISED, because the `BillingGroupArn` /
+/// `CustomLineItemArn` patterns admit the full ARN and the bare resource id and both
+/// spellings name one resource.
+fn passes_filters(item: &CustomLineItemRecord, filters: &ListCustomLineItemsFilter) -> bool {
+    if let Some(names) = non_empty(filters.names.as_deref()) {
+        if !names.contains(&item.name) {
+            return false;
+        }
+    }
+    if let Some(billing_groups) = non_empty(filters.billing_groups.as_deref()) {
+        if !billing_groups
+            .iter()
+            .any(|arn| crate::state::normalize_billing_group_arn(arn) == item.billing_group_arn)
+        {
+            return false;
+        }
+    }
+    if let Some(arns) = non_empty(filters.arns.as_deref()) {
+        if !arns
+            .iter()
+            .any(|arn| crate::state::normalize_custom_line_item_arn(arn) == item.arn)
+        {
+            return false;
+        }
+    }
+    if let Some(account_ids) = non_empty(filters.account_ids.as_deref()) {
+        // An item created without an `AccountId` applies to no single account, so no
+        // account id names it.
+        match &item.account_id {
+            Some(account_id) if account_ids.contains(account_id) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The values a filter member lists, or `None` when it restricts nothing (the member is
+/// absent, or present and empty).
+fn non_empty(values: Option<&[String]>) -> Option<&[String]> {
+    values.filter(|values| !values.is_empty())
+}
+
+/// The modelled view of a stored custom line item.
+///
+/// `ChargeDetails`, `AssociationSize` and `CurrencyCode` are DERIVED from the record
+/// rather than stored beside it, so none of them can drift from the item.
+fn element(item: &CustomLineItemRecord) -> CustomLineItemListElement {
+    CustomLineItemListElement {
+        arn: Some(item.arn.clone()),
+        name: Some(item.name.clone()),
+        charge_details: Some(ListCustomLineItemChargeDetails {
+            // "It should contain only one of `Flat` or `Percentage`": the create stored
+            // exactly one of the two values, and this reports the one it stored.
+            flat: item
+                .flat_charge_value
+                .map(|charge_value| ListCustomLineItemFlatChargeDetails { charge_value }),
+            percentage: item.percentage_value.map(|percentage_value| {
+                ListCustomLineItemPercentageChargeDetails { percentage_value }
+            }),
+            r#type: item.charge_type.clone(),
+            line_item_filters: (!item.line_item_filters.is_empty())
+                .then(|| item.line_item_filters.clone()),
+        }),
+        currency_code: Some(crate::state::custom_line_item_currency_code(&item.arn).to_string()),
+        description: Some(item.description.clone()),
+        // Nothing in this service's surface sets a product code — neither
+        // `CreateCustomLineItem` nor `UpdateCustomLineItem` models a `ProductCode`
+        // member — so it is reported absent rather than invented.
+        product_code: None,
+        billing_group_arn: Some(item.billing_group_arn.clone()),
+        creation_time: item.creation_time_millis,
+        last_modified_time: item.last_modified_time_millis,
+        association_size: item.association_size(),
+        account_id: item.account_id.clone(),
+        computation_rule: item.computation_rule.clone(),
+        presentation_details: item
+            .presentation_service
+            .clone()
+            .map(|service| PresentationObject { service }),
     }
 }
 
@@ -158,18 +259,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCustomLineItems` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCustomLineItemsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCustomLineItems"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListCustomLineItemsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // "If you don't provide a billing period, the current billing period is used."
+        // The modelled `@pattern` on the member is enforced before this handler runs.
+        let billing_period = input
+            .billing_period
+            .unwrap_or_else(crate::state::current_billing_period);
+        let filters = input.filters.unwrap_or_default();
+
+        let mut selected: Vec<(String, CustomLineItemListElement)> = Vec::new();
+        // `custom_line_items` is ordered by ARN, and an ARN carries the zero-padded
+        // monotonic id this service mints, so the sequence is creation order and a
+        // `NextToken` names the same cut point on the next call.
+        for (arn, item) in &state.custom_line_items {
+            if item.covers(&billing_period) && passes_filters(item, &filters) {
+                selected.push((arn.clone(), element(item)));
+            }
+        }
+
+        let (custom_line_items, next_token) =
+            crate::state::paginate(selected, input.next_token.as_deref(), input.max_results);
+
+        Ok(ListCustomLineItemsOutput {
+            custom_line_items: Some(custom_line_items),
+            next_token,
+        })
     }
 }

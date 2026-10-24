@@ -34,7 +34,7 @@ use service_com_amazonaws_freetier_awsfreetierservice::ops::types::{
 /// A router with only this service mounted, over one shared engine — the same
 /// assembly `core/router` performs, minus the other services. The engine comes
 /// back too, so a test can age the stored plan the way the clock would.
-fn harness() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn harness() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // In-process tests sign with a placeholder key; signature verification is a
@@ -77,7 +77,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// Call one operation, requiring success.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let (status, payload) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -118,7 +118,7 @@ async fn refused(
 }
 
 /// The string at `member`, required to be present.
-fn text(payload: &Value, member: &str) -> String {
+pub(crate) fn text(payload: &Value, member: &str) -> String {
     payload[member]
         .as_str()
         .unwrap_or_else(|| panic!("expected a string at {member}, got {payload}"))
@@ -230,8 +230,10 @@ async fn account_plan_state_reports_the_stored_plan_and_repeats_it() {
             .is_some_and(|amount| amount >= 0.0),
         "case first read: remaining credits carry an amount, got {first}"
     );
+    // `accountPlanExpirationDate` is `@timestampFormat("date-time")`, so the instant is
+    // a string on the wire; `date_time_wire_form.rs` pins the form itself.
     assert!(
-        first["accountPlanExpirationDate"].as_f64().is_some(),
+        first["accountPlanExpirationDate"].as_str().is_some(),
         "case first read: a free plan expires, so it reports the instant, got {first}"
     );
 
@@ -298,7 +300,7 @@ async fn upgrade_account_plan_persists_the_target_plan() {
              got {after}"
         );
         assert_eq!(
-            after["accountPlanExpirationDate"].as_f64().is_some(),
+            after["accountPlanExpirationDate"].as_str().is_some(),
             expects_expiry,
             "case upgrade to {requested}: only a free plan expires, got {after}"
         );
@@ -665,7 +667,7 @@ async fn activity_detail_agrees_with_its_summary() {
         );
         if status == ACTIVITY_STATUS_COMPLETED {
             assert!(
-                detail["completedAt"].as_f64().is_some() && detail["startedAt"].as_f64().is_some(),
+                detail["completedAt"].as_str().is_some() && detail["startedAt"].as_str().is_some(),
                 "case {id}: a completed activity reports when it started and finished, got \
                  {detail}"
             );

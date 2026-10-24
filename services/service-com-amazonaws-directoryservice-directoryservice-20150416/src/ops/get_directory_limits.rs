@@ -4,11 +4,12 @@
 //! Reports this Region's directory limits, computed from the directories persisted in
 //! [`crate::state`]: for each counter the modelled `DirectoryLimits` structure carries —
 //! cloud-only directories, cloud-only Managed Microsoft AD directories and connected
-//! directories — the Region's directory allowance ([`crate::state::MAX_DIRECTORIES`]),
-//! how many stored directories fall in that category, and whether that allowance is
-//! used up. Every create in this service counts against the one allowance whatever the
-//! directory's type, so all three counters report it and the flag is on exactly when a
-//! further create would be refused.
+//! directories — that category's own published Region quota
+//! ([`crate::state::DirectoryLimitCategory::quota`]), how many stored directories fall
+//! in the category, and whether that quota is used up. Each category carries its OWN
+//! allowance (Simple AD 10, Managed Microsoft AD 20, AD Connector 10), so each counter
+//! is reported from the directories of its own type alone and its flag is on exactly
+//! when a further create of that type would be refused.
 //!
 //! A reporting operation: the only write it performs is
 //! [`crate::state::ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`],

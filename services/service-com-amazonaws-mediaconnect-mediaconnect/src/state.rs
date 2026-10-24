@@ -82,8 +82,8 @@ pub const GATEWAY_STATE_DELETED: &str = "DELETED";
 /// DEPLOYING | ACTIVE | STOPPING | DELETING | DELETED | START_FAILED | START_PENDING |
 /// STOP_FAILED | UPDATING). The two a bridge's creation reaches are named first; the
 /// states a STARTED bridge moves through follow, because DeleteBridge's documented
-/// precondition is stated against them (see [`is_stopped_bridge_state`]). Reaching any of
-/// them is UpdateBridgeState's business, which is still scaffolded.
+/// precondition is stated against them (see [`is_stopped_bridge_state`]). UpdateBridgeState
+/// is what moves a bridge between the settled ones (see [`bridge_transition_to`]).
 pub const BRIDGE_STATE_CREATING: &str = "CREATING";
 /// See [`BRIDGE_STATE_CREATING`]. A bridge that finished being created is not running
 /// yet: it waits in `STANDBY` until UpdateBridgeState asks for a desired state
@@ -107,6 +107,40 @@ pub const BRIDGE_STATE_STOP_FAILED: &str = "STOP_FAILED";
 pub const BRIDGE_STATE_START_FAILED: &str = "START_FAILED";
 /// See [`BRIDGE_STATE_CREATING`].
 pub const BRIDGE_STATE_UPDATING: &str = "UPDATING";
+/// See [`BRIDGE_STATE_CREATING`]. The transient state a bridge enters when
+/// UpdateBridgeState asks it to reach [`BRIDGE_STATE_DELETED`]; the clock settles it into
+/// that state one [`TRANSITION_SPAN`] later.
+pub const BRIDGE_STATE_DELETING: &str = "DELETING";
+/// See [`BRIDGE_STATE_CREATING`]. The TERMINAL state of a bridge asked to reach the
+/// `DELETED` member of `DesiredState`: its presence in the `BridgeState` enum is the
+/// model's own statement that such a bridge stays a readable resource, exactly as
+/// [`GATEWAY_STATE_DELETED`] is for a gateway, so UpdateBridgeState retires the record in
+/// this state rather than evicting it. DeleteBridge is the other thing: it deletes the
+/// RESOURCE and its answer carries only the ARN of the record it removed, so it drops the
+/// record — and a bridge sitting in `DELETED` is stopped
+/// ([`is_stopped_bridge_state`]), so that delete is admitted whenever a caller wants the
+/// record gone.
+pub const BRIDGE_STATE_DELETED: &str = "DELETED";
+
+/// The pair of `BridgeState` values a bridge passes through to reach the `DesiredState`
+/// `desired_state` names — the transient state it enters at once, and the settled state
+/// the clock owes it one [`TRANSITION_SPAN`] later — or `None` when the value is not one
+/// the `DesiredState` enum declares.
+///
+/// `DesiredState` (`smithy_query(query="shape",shape="DesiredState")`: ACTIVE | DELETED |
+/// STANDBY) names the state a bridge is to END UP in, and each of its three values is
+/// also a value of `BridgeState`, so the settled state is the desired state itself; the
+/// transient one is the `BridgeState` value that reports that move being in progress
+/// (STARTING toward ACTIVE, STOPPING toward STANDBY, DELETING toward DELETED). This is the
+/// one mapping, so UpdateBridgeState cannot word a transition two ways.
+pub fn bridge_transition_to(desired_state: &str) -> Option<(&'static str, &'static str)> {
+    match desired_state {
+        BRIDGE_STATE_ACTIVE => Some((BRIDGE_STATE_STARTING, BRIDGE_STATE_ACTIVE)),
+        BRIDGE_STATE_STANDBY => Some((BRIDGE_STATE_STOPPING, BRIDGE_STATE_STANDBY)),
+        BRIDGE_STATE_DELETED => Some((BRIDGE_STATE_DELETING, BRIDGE_STATE_DELETED)),
+        _ => None,
+    }
+}
 
 /// Whether a bridge in `bridge_state` is STOPPED — the precondition DeleteBridge
 /// documents ("before you can delete a bridge, you must stop the bridge").
@@ -1785,6 +1819,32 @@ impl StoredBridge {
             } else {
                 self.pending = Some(pending);
             }
+        }
+    }
+
+    /// Enter `transient` now and owe `settled` once [`TRANSITION_SPAN`] has passed — the
+    /// bridge counterpart of [`StoredFlow::begin_transition`], so every state a bridge is
+    /// answered in while the clock still owes a change is started one way.
+    pub fn begin_transition(&mut self, transient: &str, settled: &str, now: SystemTime) {
+        self.bridge_state = transient.to_string();
+        self.pending = Some(PendingStatus {
+            status: settled.to_string(),
+            due_at: now + TRANSITION_SPAN,
+        });
+    }
+
+    /// The state this bridge ends up in once the clock has settled everything it owes it:
+    /// the pending state while a transition is in flight, and the current state otherwise.
+    ///
+    /// This is what `UpdateBridgeStateResponse$DesiredState` ("the new state of the
+    /// bridge") reports — the state the bridge is HEADED for, read off the stored record
+    /// rather than echoed from the request — and what makes a repeated UpdateBridgeState
+    /// idempotent: a bridge already settling into the state a request asks for needs no
+    /// new transition.
+    pub fn settling_state(&self) -> &str {
+        match self.pending.as_ref() {
+            Some(pending) => &pending.status,
+            None => &self.bridge_state,
         }
     }
 

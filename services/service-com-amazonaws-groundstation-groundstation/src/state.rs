@@ -1110,6 +1110,20 @@ impl Contact {
         }
     }
 
+    /// This contact's whole version HISTORY, as `ListContactVersions` reports it: every
+    /// version the store holds, oldest first.
+    ///
+    /// The stored sequence is append-only and each appended version takes the next
+    /// `versionId` ([`Contact::append_version`]), so its own order IS ascending
+    /// `versionId` — which is the order the listing pages over, and the order a version
+    /// history reads in.
+    pub fn version_history(&self) -> Vec<ContactVersion> {
+        self.versions
+            .iter()
+            .map(|record| self.version_record(record))
+            .collect()
+    }
+
     /// Append a version carrying `satellite_arn` and `tracking_overrides`, and answer
     /// its `versionId`.
     ///

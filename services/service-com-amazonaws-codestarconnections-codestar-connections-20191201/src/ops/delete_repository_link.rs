@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRepositoryLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRepositoryLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRepositoryLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation removes a repository link from this service's state.
+//! This is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +147,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRepositoryLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRepositoryLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteRepositoryLinkErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "CodeStar connections state is unavailable on this engine".to_string(),
+                ),
+            })
+        })?;
+
+        // Removing the row is the whole delete: the id is minted from a counter the
+        // store never rewinds, so nothing is left behind to resolve it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRepositoryLink"))
+        // The delete is IDEMPOTENT — an id this account holds no link for is answered
+        // 200 with an empty body, exactly as removing a stored one is. A delete states
+        // the POST-STATE ("this link is not there"), which already holds for an id that
+        // names nothing, so there is nothing to refuse. That is what the recorded wire
+        // behaviour of this API requires: the sibling CodeConnections service, the same
+        // API under its current name, has its `DeleteRepositoryLink` of a
+        // `RepositoryLinkId` naming no link recorded as an empty 200 (see
+        // `service-com-amazonaws-codeconnections-codeconnections-20231201`'s handler,
+        // where replay refused both the modelled 404 and a 400 before the empty 200
+        // satisfied it). The modelled `ResourceNotFoundException` stays for a resource
+        // REFERENCE that is not the link id itself.
+        //
+        // The modelled `SyncConfigurationStillExistsException` (409) guards a link a
+        // sync configuration still references. This service persists no sync
+        // configurations yet — `CreateSyncConfiguration` is still a scaffold stub, so
+        // the store holds nothing that could reference a link — and the guard belongs
+        // with the operation that creates those references, which will resolve them
+        // against the same store this handler reads.
+        let mut store = state.lock();
+        let removed = store.repository_links.remove(&input.repository_link_id);
+        if let Some(link) = removed.as_ref() {
+            // The ARN is never reused, so the tags keyed by it go with the link — the
+            // same rule `DeleteConnection` applies to a connection's tags.
+            store.tags.remove(&link.repository_link_arn);
+        }
+        drop(store);
+
+        // Audit record for a destructive operation: who presented which access key id,
+        // what was removed, and the outcome — "absent" when the id named no link, so the
+        // log distinguishes the two cases the one 200 cannot. No secret is logged: the
+        // access key id is the public half the request already carries in its SigV4
+        // credential scope.
+        ::tracing::info!(
+            operation = "DeleteRepositoryLink",
+            access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+            repository_link_id = %input.repository_link_id,
+            repository_link_arn = removed
+                .as_ref()
+                .map(|link| link.repository_link_arn.as_str())
+                .unwrap_or_default(),
+            outcome = if removed.is_some() { "deleted" } else { "absent" },
+            "codestar-connections state change"
+        );
+
+        Ok(DeleteRepositoryLinkOutput::default())
     }
 }

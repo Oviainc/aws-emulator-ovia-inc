@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUserPoolDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUserPoolDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates the user pool domain that hosts this pool's managed login pages: a
+//! prefix domain when the request carries no `CustomDomainConfig`, a custom
+//! domain when it does. The domain is stored on the pool it names, so
+//! `DescribeUserPoolDomain` and `DescribeUserPool` render the STORED domain.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUserPoolDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A domain comes up `CREATING` and the clock owes its `ACTIVE`
+//! ([`crate::state::DOMAIN_ACTIVATION_SPAN`]), because "Your prefix domain might
+//! take up to one minute to take effect".
 //!
 //! ## Shape of an operation
 //!
@@ -209,20 +208,166 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUserPoolDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserPoolDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUserPoolDomain"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        // The pool the domain attaches to is resolved FIRST: a request naming a
+        // pool that does not exist names no resource to configure, whatever else
+        // it carries.
+        if guard.pool(&input.user_pool_id).is_none() {
+            return Err(user_pool_not_found(&input.user_pool_id));
+        }
+
+        // "A value of `1` indicates hosted UI (classic) and a version of `2`
+        // indicates managed login" (`ManagedLoginVersion`): those are the only
+        // branding versions there are, so any other value names none.
+        let managed_login_version = input
+            .managed_login_version
+            .unwrap_or(crate::state::DEFAULT_MANAGED_LOGIN_VERSION);
+        if !crate::state::MANAGED_LOGIN_VERSIONS.contains(&managed_login_version) {
+            return Err(invalid_parameter(format!(
+                "ManagedLoginVersion must be one of {:?}, not {managed_login_version}.",
+                crate::state::MANAGED_LOGIN_VERSIONS
+            )));
+        }
+
+        // A custom domain's certificate is stored and rendered back exactly as
+        // the request submitted it. The documented "you must provide an SSL
+        // certificate in the US East (N. Virginia) Amazon Web Services Region"
+        // refusal is NOT enforced here: reading an ARN's Region field is the
+        // shared `service_common::arn` reader's job, and taking that path
+        // dependency edits Cargo.lock, which this repository's landing step
+        // cannot squash against a mainline that edits the same file; a second,
+        // crate-local ARN parser was rightly refused in review. The emulator
+        // therefore accepts the certificate ARN the model admits and invents
+        // nothing about it.
+
+        // "The routing configuration is currently only supported for custom
+        // domains" (`CreateUserPoolDomain.Routing`).
+        if input.routing.is_some() && input.custom_domain_config.is_none() {
+            return Err(invalid_parameter(
+                "Routing is supported only for a custom domain, so CustomDomainConfig is required with it."
+                    .to_string(),
+            ));
+        }
+
+        // A domain string resolves to one pool (`DescribeUserPoolDomain` takes
+        // `Domain` alone), so a name any pool already holds is not free. This
+        // spans the whole store, so it is checked before the pool this create
+        // writes to is borrowed mutably.
+        if let Some(taken) = guard.domain(&input.domain) {
+            return Err(invalid_parameter(format!(
+                "Domain {} is already associated with user pool {}.",
+                input.domain, taken.user_pool_id
+            )));
+        }
+
+        // The record to store, built before the pool is borrowed mutably; it is
+        // also what says which of the pool's two domain slots this create fills.
+        let record = crate::state::UserPoolDomain::new(
+            input.domain.clone(),
+            input.user_pool_id.clone(),
+            input.custom_domain_config.clone(),
+            managed_login_version,
+            input.routing.clone(),
+            now,
+        );
+        let custom = record.is_custom();
+        let Some(pool) = guard.pool_mut(&input.user_pool_id) else {
+            return Err(user_pool_not_found(&input.user_pool_id));
+        };
+
+        // "Managed login requires that your user pool be configured for any
+        // feature plan other than `Lite`" (`ManagedLoginVersion`).
+        if managed_login_version == crate::state::MANAGED_LOGIN_BRANDING
+            && pool.user_pool_tier == crate::state::LITE_USER_POOL_TIER
+        {
+            return Err(feature_unavailable_in_tier(format!(
+                "Managed login branding version {} is not included in the {} feature plan.",
+                crate::state::MANAGED_LOGIN_BRANDING,
+                crate::state::LITE_USER_POOL_TIER
+            )));
+        }
+
+        // `UserPoolType.Domain` and `UserPoolType.CustomDomain` are single
+        // values, so a pool holds at most one prefix domain and at most one
+        // custom domain, and a second of either kind is refused.
+        let occupied = if custom {
+            pool.custom_domain.as_ref()
+        } else {
+            pool.domain.as_ref()
+        };
+        if let Some(occupied) = occupied {
+            return Err(invalid_parameter(format!(
+                "User pool {} already has the {} domain {}.",
+                pool.id,
+                if custom { "custom" } else { "prefix" },
+                occupied.domain
+            )));
+        }
+
+        if custom {
+            pool.custom_domain = Some(record);
+        } else {
+            pool.domain = Some(record);
+        }
+        pool.last_modified_date = now;
+
+        // Rendered from the STORED domain, so the response is what a later read
+        // of that domain sees.
+        let stored = pool.domain_named(&input.domain).ok_or_else(internal_error)?;
+        Ok(CreateUserPoolDomainOutput {
+            managed_login_version: Some(stored.managed_login_version),
+            // "Amazon Cognito returns this value if you set a custom domain with
+            // `CustomDomainConfig`. If you set an Amazon Cognito prefix domain,
+            // this parameter returns null."
+            cloud_front_domain: stored.cloud_front_distribution.clone(),
+            routing: stored.routing.clone(),
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> CreateUserPoolDomainError {
+    CreateUserPoolDomainErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, which names the member the
+/// request has to fix.
+fn invalid_parameter(message: String) -> CreateUserPoolDomainError {
+    CreateUserPoolDomainErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // `ReasonCode` is an optional machine code AWS fills in for a few
+        // specific refusals only, so none is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's `FeatureUnavailableInTierException` for a feature the pool's
+/// feature plan does not include.
+fn feature_unavailable_in_tier(message: String) -> CreateUserPoolDomainError {
+    CreateUserPoolDomainErrorModeled::FeatureUnavailableInTierException(
+        FeatureUnavailableInTierException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> CreateUserPoolDomainError {
+    CreateUserPoolDomainErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

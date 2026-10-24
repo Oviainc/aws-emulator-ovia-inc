@@ -20,13 +20,13 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_codestarconnections_codestar_connections_20191201 as codestar;
 
 /// The region the test signs for; the ARNs the service mints must carry it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The canonical emulator account id (`engine::emulator_account_id`).
-const ACCOUNT_ID: &str = "000000000000";
+pub(crate) const ACCOUNT_ID: &str = "000000000000";
 
 /// awsJson1_0 target prefix, from `OPERATIONS.md` ("Wire protocol").
-const TARGET_PREFIX: &str = "CodeStar_connections_20191201";
+pub(crate) const TARGET_PREFIX: &str = "CodeStar_connections_20191201";
 
 /// Every value the model's `ProviderType` enum accepts.
 ///
@@ -44,12 +44,12 @@ fn host_arn(name: &str) -> String {
 
 /// One emulator: the router the production front door builds, with this service mounted
 /// on a single shared engine.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The tests sign nothing, so no authenticator may be registered.
@@ -58,13 +58,21 @@ impl Emulator {
         Self { router }
     }
 
-    /// Dispatch one awsJson1_0 call and return `(status, parsed body)`.
-    async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
+    /// Dispatch one awsJson1_0 call under this service's short target prefix and return
+    /// `(status, parsed body)`.
+    pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.call_target(&format!("{TARGET_PREFIX}.{operation}"), body)
+            .await
+    }
+
+    /// Dispatch one awsJson1_0 call naming `target` verbatim in `X-Amz-Target`, so a
+    /// suite can drive the prefix forms a client writes as well as the operation.
+    pub(crate) async fn call_target(&self, target: &str, body: Value) -> (u16, Value) {
         let request = ::http::Request::builder()
             .method("POST")
             .uri("https://codestar-connections.us-west-2.amazonaws.com/")
             .header("content-type", "application/x-amz-json-1.0")
-            .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
+            .header("x-amz-target", target)
             // The SigV4 credential scope is what routes the request to this service and
             // what tells it which region to mint ARNs in.
             .header(
@@ -92,7 +100,7 @@ impl Emulator {
     }
 
     /// `CreateConnection`, asserting success, and return the minted ARN.
-    async fn create(&self, case: &str, body: Value) -> String {
+    pub(crate) async fn create(&self, case: &str, body: Value) -> String {
         let (status, response) = self.call("CreateConnection", body).await;
         assert_eq!(
             status, 200,
@@ -106,7 +114,7 @@ impl Emulator {
 }
 
 /// The error code an awsJson error envelope carries (`__type`).
-fn error_code(response: &Value) -> String {
+pub(crate) fn error_code(response: &Value) -> String {
     response["__type"].as_str().unwrap_or_default().to_string()
 }
 

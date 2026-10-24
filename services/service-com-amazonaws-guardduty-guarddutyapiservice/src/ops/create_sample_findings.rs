@@ -534,21 +534,15 @@ fn threat_purpose(finding_type: &str) -> &str {
     finding_type.split(':').next().unwrap_or(finding_type)
 }
 
-/// The second segment of a finding type: between the `:` and the `/`.
-fn resource_type_affected(finding_type: &str) -> &str {
-    finding_type
-        .split_once(':')
-        .map_or("", |(_, rest)| rest.split('/').next().unwrap_or(""))
-}
-
 /// The `Resource.ResourceType` a finding of this type is about.
 ///
 /// The finding type's second segment names the AFFECTED RESOURCE TYPE in
-/// GuardDuty's own abbreviations; this maps each one onto the value the `Resource`
-/// shape reports. An abbreviation this emulator does not know is reported verbatim
-/// rather than guessed at.
+/// GuardDuty's own abbreviations (read through the shared parser in
+/// `crate::state`, which every operation that reads the convention uses); this
+/// maps each one onto the value the `Resource` shape reports. An abbreviation this
+/// emulator does not know is reported verbatim rather than guessed at.
 fn resource_type_for(finding_type: &str) -> String {
-    match resource_type_affected(finding_type) {
+    match crate::state::finding_type_affected_resource(finding_type) {
         "EC2" | "Runtime" => "Instance",
         // An IAM principal is reported through its credential, which is the
         // `AccessKey` resource.

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRepositoryLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRepositoryLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRepositoryLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation registers a repository link in this service's state and
+//! answers out of that record. This is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +159,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRepositoryLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRepositoryLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateRepositoryLinkErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "CodeStar connections state is unavailable on this engine".to_string(),
+                ),
+            })
+        })?;
+
+        // The ARN carries the region the caller signed for, so an ARN this service mints
+        // resolves against the endpoint the client addressed.
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+
+        // A repository link is an association with a connection this account holds, so
+        // the `ConnectionArn` is RESOLVED against the connection store rather than
+        // judged by its syntax: a link must never name a connection that is not there.
+        // This operation models no `ResourceNotFoundException`, so the refusal is the
+        // modeled `InvalidInputException` (400), naming the member whose value could not
+        // be resolved.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRepositoryLink"))
+        // The connection's STATUS is deliberately not a condition: a connection minted
+        // through the API stays `PENDING` until a console handshake this emulator cannot
+        // perform (see `state::CONNECTION_STATUS_PENDING`), so refusing a pending
+        // connection would make every repository link unreachable.
+        let provider_type = match store.connections.get(&input.connection_arn) {
+            None => {
+                return Err(CreateRepositoryLinkErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "The input is not valid. ConnectionArn names no connection in this account: {}",
+                            input.connection_arn
+                        )),
+                    },
+                )
+                .into());
+            }
+            // `RepositoryLinkInfo.ProviderType` is required and documents itself as the
+            // provider type of the CONNECTION the link is associated with, so it is
+            // derived from that connection and never taken from the request. A
+            // connection created without a provider type names no provider, so it cannot
+            // back a link.
+            Some(connection) => match connection.provider_type.clone() {
+                Some(provider_type) => provider_type,
+                None => {
+                    return Err(CreateRepositoryLinkErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(format!(
+                                "The input is not valid. The connection {} has no ProviderType, so it cannot back a repository link.",
+                                input.connection_arn
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // A repository link IS the (connection, owner, repository) triple, so the same
+        // triple cannot be registered twice: the second request names a resource that is
+        // already there. The message carries the STORED ARN, so a caller can adopt the
+        // link that already holds the triple.
+        //
+        // ANSWERED 400, not the `@httpError 409` the shape declares: this service's
+        // recorded wire answers this refusal with the awsJson1_0 client-error status and
+        // `__type ResourceAlreadyExistsException` (the recorded
+        // `codestar-connections-repository-link-error-paths#task#3` expectation), which
+        // is what `crate::scaffolded::Scaffolded::modeled_with_status` is for — the body
+        // and the error code stay the modelled error's own.
+        if let Some(existing) = store.repository_link_for(
+            &input.connection_arn,
+            &input.owner_id,
+            &input.repository_name,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                CreateRepositoryLinkErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(crate::state::repository_link_already_exists_message(
+                            &existing.repository_link_arn,
+                        )),
+                    },
+                ),
+                crate::state::REPOSITORY_LINK_ALREADY_EXISTS_STATUS,
+            ));
+        }
+
+        // Then the capacity of the store, refused with the error the operation models
+        // for it; see `state::MAX_REPOSITORY_LINKS`.
+        if store.repository_links.len() >= crate::state::MAX_REPOSITORY_LINKS {
+            return Err(CreateRepositoryLinkErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Exceeded the maximum limit of {} repository links",
+                        crate::state::MAX_REPOSITORY_LINKS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The id is minted from the store's own monotonic sequence, so it is unique by
+        // construction and a deleted link's id never comes back; nothing is minted for a
+        // request one of the refusals above answered.
+        let sequence = store.take_sequence();
+        let repository_link_id = crate::state::mint_resource_uuid(sequence);
+        let repository_link_arn = crate::state::repository_link_arn(&region, &repository_link_id);
+        let record = crate::state::StoredRepositoryLink {
+            repository_link_id: repository_link_id.clone(),
+            repository_link_arn: repository_link_arn.clone(),
+            connection_arn: input.connection_arn,
+            encryption_key_arn: input.encryption_key_arn,
+            owner_id: input.owner_id,
+            provider_type,
+            repository_name: input.repository_name,
+            sequence,
+        };
+        // Report the row that is STORED, projected by the store's own single projection
+        // onto the wire shape, so this response and what a later reader answers are the
+        // same record rather than two renderings of the request.
+        let repository_link_info = record.to_repository_link_info();
+        store.repository_links.insert(repository_link_id, record);
+        // Tags live in the one tag map, keyed by the tagged resource's ARN, so the
+        // tagging operations read a link's tags out of the same place a connection's
+        // come from.
+        if let Some(tags) = input.tags.as_deref() {
+            store.merge_tags(&repository_link_arn, tags);
+        }
+        drop(store);
+
+        Ok(CreateRepositoryLinkOutput {
+            repository_link_info,
+        })
     }
 }
