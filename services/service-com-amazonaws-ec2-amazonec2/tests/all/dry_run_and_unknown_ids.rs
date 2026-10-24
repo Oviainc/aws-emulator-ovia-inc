@@ -412,8 +412,9 @@ type OmittedMemberCase = (&'static str, Vec<(String, String)>, &'static str);
 /// A request that omits a member the operation needs is refused, not answered with an empty
 /// success: the result of an acceptance names one domain, one attachment and its subnets, so
 /// there is no answer to give when the request names neither resource. A member the MODEL
-/// marks `@required` is refused by the boundary validator before the handler runs; one the
-/// model leaves optional and the operation still needs is EC2's own `MissingParameter`.
+/// marks `@required` is refused by the boundary validator before the handler runs, with the
+/// boundary's own code; one the model leaves optional and the operation still needs is
+/// refused by the handler with EC2's own `MissingParameter`.
 #[tokio::test]
 async fn a_member_the_operation_needs_and_the_request_omits_is_refused() {
     let (router, _engine) = super::ec2_query::emulator();
@@ -433,7 +434,9 @@ async fn a_member_the_operation_needs_and_the_request_omits_is_refused() {
             ec2::state::MISSING_PARAMETER,
         ),
         // `VpcEndpointIds` is `@required`, so the boundary validator is what refuses a
-        // request that carries none — before this operation's handler is reached at all.
+        // request that carries none — before this operation's handler is reached at all, and
+        // with the boundary's own code rather than the one a handler answers for a parameter
+        // the request left out.
         (
             "AcceptVpcEndpointConnections",
             vec![member("ServiceId", &service)],

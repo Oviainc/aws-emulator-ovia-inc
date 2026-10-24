@@ -265,10 +265,11 @@ async fn reading_the_setting_never_changes_it() {
 /// the enum DOES hold, so the handler is what refuses it, with EC2's
 /// `InvalidParameterValue` — an enable asking for a word the catalog does not hold, for
 /// the empty string, and for a catalog member in the wrong case, all three refused by the
-/// modelled enum constraint before the handler runs and so carrying the boundary's
-/// `ValidationError`, plus a dry run of each of the three operations, which "would have
-/// succeeded" and so is refused with `DryRunOperation`. Every one of them is a 400 or a
-/// 412 — never a 501, which would say the operation is unimplemented.
+/// modelled enum constraint before the handler runs and so carrying the BOUNDARY's own code,
+/// plus a dry run of each of the three
+/// operations, which "would have succeeded" and so is refused with `DryRunOperation`. Every
+/// one of them is a 400 or a 412 — never a 501, which would say the operation is
+/// unimplemented.
 #[tokio::test]
 async fn a_bad_request_is_refused_with_the_ec2_error_code_for_it() {
     let router = emulator();

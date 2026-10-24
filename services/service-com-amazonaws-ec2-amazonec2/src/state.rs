@@ -763,6 +763,22 @@
 //! offering it merely reported. [`capacity_block_upfront_fee`] is the one definition of what
 //! such a window costs.
 //!
+//! ## Capacity Reservation billing requests
+//!
+//! [`ComAmazonawsEc2Amazonec2State::capacity_reservation_billing_requests`] holds the
+//! requests to assign the billing of a Capacity Reservation's unused capacity to another
+//! account, as the modelled [`CapacityReservationBillingRequest`] shape itself, keyed by
+//! `CapacityReservationId` in a [`BTreeMap`] — one reservation's billing is assigned to at
+//! most one account, and that key order is the stable order the describe reports and a
+//! pagination token can name a position in. Both sides of one assignment are on the record
+//! (`RequestedBy`, the Capacity Reservation owner that initiated it, and
+//! `UnusedReservationBillingOwnerId`, the consumer account it was sent to), because which of
+//! the two the CALLER is is what `DescribeCapacityReservationBillingRequests`'s `Role`
+//! selects on. The `Status` is STORED rather than derived: `pending` moves to `accepted` or
+//! `rejected` when the consumer account accepts or rejects the request, and to `cancelled`
+//! or `revoked` when a party withdraws it — none of which is a fact of where a clock stands,
+//! so no read may move it.
+//!
 //! ## Application status is DERIVED, never stored
 //!
 //! [`ComAmazonawsEc2Amazonec2State::application_status`] holds, per `InstanceId`, the
@@ -881,7 +897,8 @@ use crate::ops::types::{
     AvailabilityZone, AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
     ByoipCidr,
     DhcpConfiguration, DhcpOptions,
-    CapacityBlock, CapacityReservation, ExportTask, FpgaImage, FpgaImageState, ImageUsageReport,
+    CapacityBlock, CapacityReservation, CapacityReservationBillingRequest,
+    CapacityReservationInfo, ExportTask, FpgaImage, FpgaImageState, ImageUsageReport,
     LoadPermission,
     CapacityReservationFleet, FleetCapacityReservation,
     StorageLocation, VolumeRecycleBinInfo,
@@ -2212,6 +2229,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`SecondarySubnet`] shape itself — see the module docs. Ordered by id, which is the
     /// order `DescribeSecondarySubnets` reports and pages over.
     pub secondary_subnets: BTreeMap<String, SecondarySubnet>,
+    /// Every request to assign the billing of a Capacity Reservation's unused capacity, by
+    /// `CapacityReservationId`, as the modelled [`CapacityReservationBillingRequest`] shape
+    /// itself — see the module docs. Ordered by that id, which is the order
+    /// `DescribeCapacityReservationBillingRequests` reports and pages over.
+    pub capacity_reservation_billing_requests: BTreeMap<String, CapacityReservationBillingRequest>,
     /// The state move an acceptance owes a VPC endpoint connection, by `VpcEndpointId` —
     /// the connection counterpart of [`Self::vpc_available_at`], beside the connection
     /// store rather than inside it because that store holds the modelled shape itself.
@@ -2514,6 +2536,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             image_usage_reports: BTreeMap::new(),
             export_tasks: BTreeMap::new(),
             secondary_subnets: BTreeMap::new(),
+            capacity_reservation_billing_requests: BTreeMap::new(),
             vpc_endpoint_connection_moves: BTreeMap::new(),
             vpc_endpoint_services: BTreeMap::new(),
             vpc_endpoints: BTreeMap::new(),
@@ -17683,6 +17706,14 @@ impl ComAmazonawsEc2Amazonec2State {
             payer_responsibilities: Some(spec.payer_responsibilities),
         };
         let vpc_endpoint_id = connection.vpc_endpoint_id.clone().unwrap_or_default();
+        // A replacement gives the displaced record's bytes back before the new record is
+        // charged, so rewriting one endpoint's connection cannot inflate the byte budget —
+        // "a removal path must give back the same number"
+        // ([`vpc_endpoint_connection_payload_bytes`]).
+        if let Some(displaced) = self.vpc_endpoint_connections.get(&vpc_endpoint_id) {
+            let displaced_bytes = vpc_endpoint_connection_payload_bytes(displaced);
+            self.release_stored_bytes(displaced_bytes);
+        }
         self.add_stored_bytes(vpc_endpoint_connection_payload_bytes(&connection));
         self.vpc_endpoint_connections
             .insert(vpc_endpoint_id, connection);
@@ -19220,6 +19251,222 @@ impl ComAmazonawsEc2Amazonec2State {
         self.instance_event_tag_registrations
             .insert(region.to_string(), registration);
     }
+}
+
+// =============================================================================
+// Capacity Reservation billing requests
+// =============================================================================
+
+/// `CallerRole`'s `odcr-owner` member: the caller is asking as the Capacity Reservation
+/// owner — "If you are the Capacity Reservation owner, specify this value to view requests
+/// that you have initiated"
+/// (`DescribeCapacityReservationBillingRequestsRequest$Role`).
+pub const CALLER_ROLE_ODCR_OWNER: &str = "odcr-owner";
+
+/// `CallerRole`'s `unused-reservation-billing-owner` member: the caller is asking as the
+/// consumer account — "If you are the consumer account, specify this value to view requests
+/// that have been sent to you" (that same member's doc).
+pub const CALLER_ROLE_UNUSED_RESERVATION_BILLING_OWNER: &str = "unused-reservation-billing-owner";
+
+/// Is `allowed` the `CallerRole` catalog — the value set the model declares for the `Role`
+/// member a billing-request caller states its side of the assignment with?
+///
+/// The boundary's constraint walk reports a refused enum value as the value set it failed
+/// rather than as the shape that declared it, so the catalog IS how that type is recognised —
+/// a model fact, the same one codegen wrote into
+/// [`crate::ops::types::CALLER_ROLE_VALUES`]. EC2 words a refused value per PARAMETER TYPE
+/// ("not a valid value for RoleType"), which is why the wording is keyed to the type's
+/// catalog and not to the operation that happened to carry it.
+pub fn is_caller_role_catalog(allowed: &[String]) -> bool {
+    allowed.len() == crate::ops::types::CALLER_ROLE_VALUES.len()
+        && allowed
+            .iter()
+            .zip(crate::ops::types::CALLER_ROLE_VALUES)
+            .all(|(held, member)| held == member)
+}
+
+/// How EC2 states a `Role` the `CallerRole` catalog does not hold: HTTP 400
+/// `InvalidParameterValue` with the submitted value, the parameter type that refused it and
+/// the values it accepts — "`<value>` is not a valid value for RoleType. Specify either
+/// odcr-owner or unused-reservation-billing-owner." EC2 does not state a modelled refusal as
+/// the generic validation clause; it names the type and what to send instead, and the only
+/// part built from the request is the value echoed back.
+///
+/// The accepted values are read off the catalog itself, so a member the model adds later is
+/// offered too rather than silently left out of the sentence.
+pub fn caller_role_refusal_message(value: &str) -> String {
+    format!(
+        "{value} is not a valid value for RoleType. Specify either {}.",
+        either_of(crate::ops::types::CALLER_ROLE_VALUES)
+    )
+}
+
+/// The members of a catalog as a sentence offers them: `a`, `a or b`, `a, b or c`.
+fn either_of(values: &[&str]) -> String {
+    match values.split_last() {
+        None => String::new(),
+        Some((last, [])) => (*last).to_string(),
+        Some((last, leading)) => format!("{} or {last}", leading.join(", ")),
+    }
+}
+
+/// `CapacityReservationBillingRequestStatus`'s `pending` member: a request that has been
+/// sent and neither accepted nor rejected yet, which is the status a newly made billing
+/// assignment request carries. The whole catalog is the generated
+/// [`crate::ops::types::CAPACITY_RESERVATION_BILLING_REQUEST_STATUS_VALUES`].
+pub const CAPACITY_RESERVATION_BILLING_REQUEST_STATUS_PENDING: &str = "pending";
+
+/// How many Capacity Reservation billing requests this emulator stores before a writer must
+/// refuse.
+///
+/// CHOSEN, like [`MAX_STORED_CAPACITY_BLOCKS`] and for the same reason: nothing in this
+/// emulator reclaims a stored request — a rejected or revoked one is still reported — so the
+/// store needs a ceiling that is not the process's memory. A count ceiling is no bound on the
+/// caller-chosen bytes each record holds, so those are charged against [`MAX_STORED_BYTES`]
+/// too ([`capacity_reservation_billing_request_payload_bytes`]).
+pub const MAX_STORED_CAPACITY_RESERVATION_BILLING_REQUESTS: usize = 4096;
+
+/// The fixed overhead one stored Capacity Reservation billing request costs whatever it
+/// carries: the modelled record itself and the map entry holding it, as a CHOSEN constant in
+/// the same spirit as [`VPC_ENDPOINT_CONNECTION_RECORD_BYTES`] — the point is that a request
+/// carrying no status message and no reservation details is not free against
+/// [`MAX_STORED_BYTES`], not that it is byte-exact.
+pub const CAPACITY_RESERVATION_BILLING_REQUEST_RECORD_BYTES: usize = 512;
+
+/// What one stored Capacity Reservation billing request is created with.
+///
+/// The spec of the resource, in the same shape [`VpcEndpointConnectionSpec`] has for a
+/// connection: an operation that assigns the billing of a reservation's unused capacity fills
+/// this in and
+/// [`ComAmazonawsEc2Amazonec2State::insert_capacity_reservation_billing_request`] turns it
+/// into the modelled [`CapacityReservationBillingRequest`] the describe reports, so the
+/// stored key and the byte charge are decided in exactly one place.
+#[derive(Debug, Clone)]
+pub struct CapacityReservationBillingRequestSpec {
+    /// The Capacity Reservation whose unused capacity the request is about
+    /// (`CapacityReservationBillingRequest$CapacityReservationId`), which is also the key the
+    /// request is stored under.
+    pub capacity_reservation_id: String,
+    /// "The ID of the Amazon Web Services account that initiated the request"
+    /// (`CapacityReservationBillingRequest$RequestedBy`) — the Capacity Reservation owner.
+    pub requested_by: String,
+    /// "The ID of the Amazon Web Services account to which the request was sent"
+    /// (`CapacityReservationBillingRequest$UnusedReservationBillingOwnerId`) — the consumer
+    /// account.
+    pub unused_reservation_billing_owner_id: String,
+    /// When the request was last updated.
+    pub last_update_time: SystemTime,
+    /// The request's status, as a member of the modelled
+    /// `CapacityReservationBillingRequestStatus` catalog. A `&'static str` so only a catalog
+    /// member can ever be stored here: the word comes from this module's own constants or
+    /// from [`crate::ops::types::CAPACITY_RESERVATION_BILLING_REQUEST_STATUS_VALUES`], never
+    /// from a request.
+    pub status: &'static str,
+    /// "Information about the status" (`CapacityReservationBillingRequest$StatusMessage`), or
+    /// `None` for a status that carries none.
+    pub status_message: Option<String>,
+    /// "Information about the Capacity Reservation" the request is about
+    /// (`CapacityReservationBillingRequest$CapacityReservationInfo`), or `None` for a request
+    /// whose reservation this store knows nothing more about.
+    pub capacity_reservation_info: Option<CapacityReservationInfo>,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another `count` Capacity Reservation billing requests fit inside the store's
+    /// ceiling ([`MAX_STORED_CAPACITY_RESERVATION_BILLING_REQUESTS`]).
+    ///
+    /// A writer asks this BEFORE storing anything and refuses the request with EC2's own
+    /// quota code when it answers `false`, the way
+    /// [`Self::has_vpc_endpoint_connection_capacity`] gates its own store.
+    /// [`Self::insert_capacity_reservation_billing_request`] asks it again for itself, so no
+    /// path can get past the ceiling by forgetting to.
+    pub fn has_capacity_reservation_billing_request_capacity(&self, count: usize) -> bool {
+        self.capacity_reservation_billing_requests
+            .len()
+            .saturating_add(count)
+            <= MAX_STORED_CAPACITY_RESERVATION_BILLING_REQUESTS
+    }
+
+    /// Store one request to assign the billing of a Capacity Reservation's unused capacity,
+    /// and answer whether it was stored.
+    ///
+    /// The one place such a request enters this store, so every writer of one — and
+    /// `DescribeCapacityReservationBillingRequests`, which reports what this wrote — agrees on
+    /// the stored shape, the key and which members a request carries. A second request for the
+    /// same `CapacityReservationId` REPLACES the first: one reservation's unused capacity is
+    /// assigned to at most one account at a time. The bytes the record retains are charged
+    /// here, so no path can store them uncharged.
+    ///
+    /// `false` means the store is at [`MAX_STORED_CAPACITY_RESERVATION_BILLING_REQUESTS`] and
+    /// NOTHING was stored: the ceiling is enforced here as well as by
+    /// [`Self::has_capacity_reservation_billing_request_capacity`], so a writer that forgets
+    /// the gate cannot grow the store without bound either. A writer that sees `false`
+    /// refuses the request with EC2's own quota code rather than reporting an assignment it
+    /// does not hold. A replacement gives the displaced record's bytes back before charging
+    /// the new one, so one reservation's request can be rewritten any number of times without
+    /// inflating the byte budget.
+    pub fn insert_capacity_reservation_billing_request(
+        &mut self,
+        spec: CapacityReservationBillingRequestSpec,
+    ) -> bool {
+        // A write that REPLACES the request of a reservation already stored adds no record,
+        // so only a new key has to fit inside the ceiling — and the bytes the displaced
+        // record held are given back before the new one is charged, so repeatedly replacing
+        // one reservation's request cannot inflate the byte budget.
+        let displaced = self
+            .capacity_reservation_billing_requests
+            .get(&spec.capacity_reservation_id)
+            .map(capacity_reservation_billing_request_payload_bytes);
+        if displaced.is_none() && !self.has_capacity_reservation_billing_request_capacity(1) {
+            return false;
+        }
+        let request = CapacityReservationBillingRequest {
+            capacity_reservation_id: Some(spec.capacity_reservation_id.clone()),
+            requested_by: Some(spec.requested_by),
+            unused_reservation_billing_owner_id: Some(spec.unused_reservation_billing_owner_id),
+            last_update_time: Some(system_time_to_date_time(spec.last_update_time)),
+            status: Some(spec.status.to_string()),
+            status_message: spec.status_message,
+            capacity_reservation_info: spec.capacity_reservation_info,
+        };
+        if let Some(bytes) = displaced {
+            self.release_stored_bytes(bytes);
+        }
+        self.add_stored_bytes(capacity_reservation_billing_request_payload_bytes(&request));
+        self.capacity_reservation_billing_requests
+            .insert(spec.capacity_reservation_id, request);
+        true
+    }
+}
+
+/// What one stored Capacity Reservation billing request costs the store: the fixed overhead
+/// of the record ([`CAPACITY_RESERVATION_BILLING_REQUEST_RECORD_BYTES`]) plus the
+/// caller-chosen bytes it holds — the reservation id it is keyed by, its status message, and
+/// the instance type and zone of the reservation it reports. The two account ids are bounded
+/// by the model's own `@length(12, 12)` on `AccountID`, and the status and the instant are
+/// derived by this module, so those are covered by the fixed part.
+///
+/// The ONE definition of that charge, the way [`vpc_endpoint_connection_payload_bytes`] is
+/// for a connection: a writer charges exactly it, and a removal path must give back the same
+/// number.
+pub fn capacity_reservation_billing_request_payload_bytes(
+    request: &CapacityReservationBillingRequest,
+) -> usize {
+    let text = |value: Option<&String>| -> usize { value.map(String::len).unwrap_or_default() };
+    let info_bytes = request
+        .capacity_reservation_info
+        .as_ref()
+        .map(|info| {
+            text(info.instance_type.as_ref())
+                + text(info.availability_zone.as_ref())
+                + text(info.availability_zone_id.as_ref())
+                + text(info.tenancy.as_ref())
+        })
+        .unwrap_or_default();
+    CAPACITY_RESERVATION_BILLING_REQUEST_RECORD_BYTES
+        .saturating_add(text(request.capacity_reservation_id.as_ref()))
+        .saturating_add(text(request.status_message.as_ref()))
+        .saturating_add(info_bytes)
 }
 
 // =============================================================================

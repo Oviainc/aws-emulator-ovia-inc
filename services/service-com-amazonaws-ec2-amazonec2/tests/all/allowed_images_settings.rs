@@ -821,8 +821,8 @@ async fn a_value_the_docs_do_not_allow_is_refused_and_stores_nothing() {
 
     let rows: Vec<RefusalRow> = vec![
         // `AllowedImagesSettingsEnabledState` is a modelled enum, so the request walk
-        // refuses a value outside it BEFORE the handler runs and the refusal is the
-        // boundary validator's `ValidationError`. The handler keeps its own
+        // refuses a value outside it BEFORE the handler runs — with the boundary's own code
+        // for a value outside a declared constraint. The handler keeps its own
         // `InvalidParameterValue` path for the same case, so no unknown state can ever be
         // stored even if the boundary stops checking.
         (
@@ -914,10 +914,9 @@ async fn a_value_the_docs_do_not_allow_is_refused_and_stores_nothing() {
         ),
         // The 128-character ceiling is also modelled, as a `@length` on the member of
         // `ImageNameCriteriaRequestList`, so the request walk refuses an over-long name
-        // before the handler runs and the refusal is the boundary validator's
-        // `ValidationError`. The handler keeps its own `InvalidParameterValue` ceiling for
-        // the same case, so no caller-sized name can ever be stored even if the boundary
-        // stops checking.
+        // before the handler runs — with the boundary's own code rather than the handler's.
+        // The handler keeps its own ceiling for the same case, so no caller-sized name can
+        // ever be stored even if the boundary stops checking.
         (
             "an image name one character past the documented maximum",
             replace_action,

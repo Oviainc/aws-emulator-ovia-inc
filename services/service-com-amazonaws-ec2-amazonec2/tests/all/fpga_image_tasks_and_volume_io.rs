@@ -688,7 +688,8 @@ async fn an_afi_round_trips_through_reset_and_delete() {
     }
 
     // A reset with no attribute names nothing to reset, and one naming an attribute that
-    // cannot be reset is refused by the modelled enum before the handler runs.
+    // cannot be reset is refused by the modelled enum before the handler runs — with the
+    // boundary's own code for a value outside a declared constraint.
     let attribute_rows: [(&str, Params, &str); 2] = [
         (
             "no attribute at all",

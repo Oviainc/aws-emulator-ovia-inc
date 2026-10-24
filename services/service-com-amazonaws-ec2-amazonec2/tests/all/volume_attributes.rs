@@ -48,8 +48,9 @@ const MALFORMED_VOLUME: &str = "vol-not-an-id";
 
 /// The error code the centralized request walk answers for an input that breaks a
 /// MODELLED constraint — here an `Attribute` outside the `VolumeAttributeName` enum, which
-/// is refused before any handler runs.
-const VALIDATION_ERROR: &str = "ValidationError";
+/// is refused before any handler runs, and so carries the boundary's own code rather than
+/// one a handler chose.
+const BOUNDARY_CONSTRAINT_CODE: &str = "ValidationError";
 
 /// The error code the request walk answers for a form field it cannot read as the member's
 /// type — here an `AutoEnableIO.Value` that carries no boolean. ec2Query has no way to
@@ -437,8 +438,8 @@ async fn a_bad_request_is_refused_with_the_ec2_error_code_for_it() {
     // (case, the action, its form fields, the HTTP status, the EC2 error code)
     //
     // The two rows that name an attribute outside the model's `VolumeAttributeName` enum
-    // expect `ValidationError`: a modelled constraint is refused by the centralized
-    // request walk (deserialize -> validate -> handle), before the handler runs.
+    // expect [`BOUNDARY_CONSTRAINT_CODE`]: a modelled constraint is refused by the
+    // centralized request walk (deserialize -> validate -> handle), before the handler runs.
     let cases: [(&str, &str, Vec<Param>, u16, &str); 13] = [
         (
             "an attribute the model does not declare",
@@ -448,7 +449,7 @@ async fn a_bad_request_is_refused_with_the_ec2_error_code_for_it() {
                 param("Attribute", "autoEnableIo"),
             ],
             400,
-            VALIDATION_ERROR,
+            BOUNDARY_CONSTRAINT_CODE,
         ),
         (
             "an attribute of another resource",
@@ -458,7 +459,7 @@ async fn a_bad_request_is_refused_with_the_ec2_error_code_for_it() {
                 param("Attribute", ec2::state::VPC_ATTRIBUTE_ENABLE_DNS_SUPPORT),
             ],
             400,
-            VALIDATION_ERROR,
+            BOUNDARY_CONSTRAINT_CODE,
         ),
         (
             "a describe of a volume id that is not shaped like one",
