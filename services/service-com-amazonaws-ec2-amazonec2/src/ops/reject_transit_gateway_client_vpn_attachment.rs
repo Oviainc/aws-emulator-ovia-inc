@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RejectTransitGatewayClientVpnAttachment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RejectTransitGatewayClientVpnAttachment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RejectTransitGatewayClientVpnAttachment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: rejects the stored Client VPN attachment the request names, taking it out
+//! of `pending-acceptance` towards `rejected`, and answers with the attachment as it now
+//! stands. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +131,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RejectTransitGatewayClientVpnAttachment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RejectTransitGatewayClientVpnAttachmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RejectTransitGatewayClientVpnAttachment"))
+        // `ctx` carries request metadata only; this operation reads none of it — an
+        // attachment is named by id, which is unique across Regions in this store. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // The request's own form first: an id that is not a transit gateway attachment id
+        // at all is refused as malformed, so "not an id of this kind" never reads as "no
+        // such attachment" and is never answered by the DryRun arm below either.
+        state::require_well_formed_id(
+            state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
+            &input.transit_gateway_attachment_id,
+            state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
+        )?;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`RejectTransitGatewayClientVpnAttachmentRequest$DryRun`):
+        // the flag asks about PERMISSION, not about the named resource, so it is answered
+        // before anything is resolved and every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "The Transit Gateway owner can reject the attachment request to prevent the
+        // Client VPN endpoint from routing traffic through the Transit Gateway": the
+        // attachment waits for that decision in `pending-acceptance`, which is the rule
+        // every accepting and rejecting operation of this family shares, so it lives in
+        // `crate::state`. This kind spells those states with the hyphenated members of
+        // `TransitGatewayAttachmentStatusType` rather than the camel-cased ones of
+        // `TransitGatewayAttachmentState`, which the record itself knows.
+        let rejected = state::decide_transit_gateway_attachment(
+            &mut store,
+            &input.transit_gateway_attachment_id,
+            state::TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_CLIENT_VPN,
+            state::AttachmentDecision::Reject,
+        )?;
+        let state::TransitGatewayAttachmentView::ClientVpn(attachment) = rejected else {
+            return Err(state::unexpected_attachment_kind(
+                &input.transit_gateway_attachment_id,
+            ));
+        };
+
+        Ok(RejectTransitGatewayClientVpnAttachmentOutput {
+            transit_gateway_client_vpn_attachment: Some(attachment),
+        })
     }
 }
