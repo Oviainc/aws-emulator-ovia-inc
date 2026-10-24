@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateKeyspace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateKeyspace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateKeyspace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds Amazon Web Services Regions to a keyspace: the request's
+//! `replicationSpecification.regionList` becomes the keyspace's replication Region list,
+//! the keyspace is `UPDATING` until the clock owes it `ACTIVE` again, and every table in
+//! it is replicated to the added Regions — which is why a table that does not use
+//! client-side timestamps is refused unless this call enables them.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +184,210 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateKeyspace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateKeyspaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateKeyspace"))
+        // `keyspaceName`'s length and pattern, `replicationSpecification`'s presence, its
+        // `replicationStrategy` value set and its `regionList`'s minimum length are all
+        // modelled, so the boundary validator has already refused a request that breaks
+        // one with 400 `ValidationException`. What is left here is what the model cannot
+        // state.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateKeyspaceErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach its state store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+
+        let invalid = |message: String| -> UpdateKeyspaceError {
+            UpdateKeyspaceErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // The same replication rules a create is held to — a `MULTI_REGION` specification
+        // carries a `regionList`, and that list contains the current Region — in the one
+        // place this crate states them.
+        let (replication_strategy, requested_regions) =
+            crate::state::resolve_replication(Some(&input.replication_specification), &region)
+                .map_err(invalid)?;
+
+        // "Adds a new Amazon Web Services Region to the keyspace": this operation only
+        // ever widens a keyspace's replication, so the specification it takes is the
+        // multi-Region one. A `SINGLE_REGION` specification would have to narrow it.
+        if replication_strategy != crate::state::MULTI_REGION_STRATEGY {
+            return Err(invalid(format!(
+                "UpdateKeyspace adds an Amazon Web Services Region to a keyspace, so \
+                 replicationSpecification.replicationStrategy must be '{}', not '{}'",
+                crate::state::MULTI_REGION_STRATEGY,
+                replication_strategy
+            )));
+        }
+
+        // A Region list is a SET of Regions: a repeated entry names the same Region twice,
+        // so it is kept once, in the order the request first named it — the set beside the
+        // list is what keeps that one pass linear, as `UpdateTable`'s and `CreateType`'s
+        // duplicate-name checks do. The count is already capped by
+        // `crate::state::MAX_REPLICATION_REGIONS`, which `resolve_replication` refused
+        // above. The modelled minimum length of 2 is on the list, not on the set it
+        // denotes, so a list that only repeats one Region is what breaks the documented
+        // "the `regionList` requires the current Region and at least one additional Amazon
+        // Web Services Region".
+        let mut seen: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
+        let mut regions: Vec<String> = Vec::with_capacity(requested_regions.len());
+        for requested in requested_regions {
+            if seen.insert(requested.clone()) {
+                regions.push(requested);
+            }
+        }
+        if regions.len() < 2 {
+            return Err(invalid(format!(
+                "replicationSpecification.regionList names only Region '{}': a {} keyspace \
+                 requires the current Region and at least one additional Amazon Web \
+                 Services Region",
+                regions.join(", "),
+                crate::state::MULTI_REGION_STRATEGY
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The service-managed keyspaces are part of the account before any call, so one of
+        // them resolves here instead of 404-ing — and is then refused below.
+        store.ensure_service_managed_catalog(&region);
+        store.settle(now);
+
+        // A service-managed keyspace carries the replication the SERVICE chose, and
+        // Cassandra refuses DDL against a system keyspace as an invalid query ("system
+        // keyspace is not user-modifiable"), which is this operation's
+        // `ValidationException` — the same refusal every other write in this crate gives.
+        if crate::state::is_service_managed_keyspace(&input.keyspace_name) {
+            return Err(invalid(crate::state::service_managed_rejection(
+                &input.keyspace_name,
+            )));
+        }
+
+        let Some(keyspace) = store.keyspaces.get_mut(&input.keyspace_name) else {
+            return Err(UpdateKeyspaceErrorModeled::ResourceNotFoundException(
+                crate::state::keyspace_not_found(&region, &input.keyspace_name),
+            )
+            .into());
+        };
+
+        // A keyspace is updatable only from `ACTIVE`: "The operation tried to access a
+        // keyspace, table, or type that doesn't exist. The resource might not be specified
+        // correctly, or its status might not be ACTIVE." While another change is still
+        // settling, this is the modelled conflict — "you try to perform an action and the
+        // same or a different action is already in progress".
+        if keyspace.status != crate::state::KEYSPACE_STATUS_ACTIVE {
+            return Err(UpdateKeyspaceErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Keyspace '{}' is in status {} and cannot be updated until it is {}.",
+                    input.keyspace_name,
+                    keyspace.status,
+                    crate::state::KEYSPACE_STATUS_ACTIVE
+                )),
+            })
+            .into());
+        }
+
+        // The list is the keyspace's replication Regions AFTER the addition, so it has to
+        // keep the Regions the keyspace is already replicated in: this operation adds a
+        // Region and has no power to drop one.
+        let dropped: Vec<&str> = keyspace
+            .replication_regions
+            .iter()
+            .filter(|existing| !seen.contains(existing.as_str()))
+            .map(String::as_str)
+            .collect();
+        if !dropped.is_empty() {
+            return Err(invalid(format!(
+                "replicationSpecification.regionList omits Region(s) {} the keyspace is \
+                 already replicated in: UpdateKeyspace adds Regions to a keyspace and \
+                 cannot remove one",
+                dropped.join(", ")
+            )));
+        }
+
+        // ... and it has to add at least one, for the same reason `UpdateTable` refuses a
+        // request that names no setting: a request that changes nothing is not an update.
+        if regions.len() == keyspace.replication_regions.len() {
+            return Err(invalid(format!(
+                "replicationSpecification.regionList adds no Amazon Web Services Region: \
+                 the keyspace is already replicated in {}",
+                keyspace.replication_regions.join(", ")
+            )));
+        }
+
+        // Every table of the keyspace is replicated to the added Region(s), so a table
+        // that is itself mid-change makes this the modelled conflict, exactly as a
+        // keyspace that is not `ACTIVE` does above.
+        if let Some(busy) = keyspace
+            .tables
+            .values()
+            .find(|table| table.status != crate::state::TABLE_STATUS_ACTIVE)
+        {
+            return Err(UpdateKeyspaceErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Table '{}.{}' is in status {} and the keyspace cannot be replicated \
+                     to another Region until every table is {}.",
+                    input.keyspace_name,
+                    busy.table_name,
+                    busy.status,
+                    crate::state::TABLE_STATUS_ACTIVE
+                )),
+            })
+            .into());
+        }
+
+        // "To successfully replicate all tables to the new Region, they must use
+        // client-side timestamps for conflict resolution. To enable client-side
+        // timestamps, specify clientSideTimestamps.status = enabled when invoking the
+        // API." So a keyspace holding a table without them is replicable only when THIS
+        // call turns them on; otherwise the request is refused naming the tables that
+        // block it, before anything is stored. `ClientSideTimestampsStatus` models exactly
+        // one value, `ENABLED` (`crate::ops::types::CLIENT_SIDE_TIMESTAMPS_STATUS_VALUES`),
+        // so a supplied setting can only be that enable.
+        if input.client_side_timestamps.is_none() {
+            let without: Vec<&str> = keyspace
+                .tables
+                .values()
+                .filter(|table| table.client_side_timestamps.is_none())
+                .map(|table| table.table_name.as_str())
+                .collect();
+            if !without.is_empty() {
+                return Err(invalid(format!(
+                    "table(s) {} of keyspace '{}' do not use client-side timestamps, which \
+                     every table must for Amazon Keyspaces to replicate it to another \
+                     Region: specify clientSideTimestamps.status = ENABLED",
+                    without.join(", "),
+                    input.keyspace_name
+                )));
+            }
+        }
+
+        // Accepted. The keyspace is `UPDATING`, and so is every table in it while Amazon
+        // Keyspaces replicates it to the added Region(s), until the clock owes them
+        // `ACTIVE` one span from here; `settle` materialises that, and nothing sleeps for
+        // it. Until then `GetKeyspace` reports the tables' replication progress.
+        let settles_at = now + crate::state::TRANSIENT_STATUS_SPAN;
+        keyspace.replication_strategy = crate::state::MULTI_REGION_STRATEGY.to_string();
+        keyspace.replication_regions = regions;
+        keyspace.status = crate::state::KEYSPACE_STATUS_UPDATING.to_string();
+        keyspace.status_due_at = Some(settles_at);
+        for table in keyspace.tables.values_mut() {
+            if let Some(client_side_timestamps) = input.client_side_timestamps.clone() {
+                table.client_side_timestamps = Some(client_side_timestamps);
+            }
+            table.status = crate::state::TABLE_STATUS_UPDATING.to_string();
+            table.status_due_at = Some(settles_at);
+        }
+        let resource_arn = keyspace.resource_arn.clone();
+        // The clock now owes the keyspace and its tables their `ACTIVE` transition; tell
+        // the store the earliest instant at which `settle` has to look at it again.
+        store.note_transition_due(settles_at);
+
+        Ok(UpdateKeyspaceOutput { resource_arn })
     }
 }

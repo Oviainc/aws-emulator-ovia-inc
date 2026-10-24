@@ -45,6 +45,16 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 pub const KEYSPACE_STATUS_CREATING: &str = "CREATING";
 /// `KeyspaceStatus` = `ACTIVE`: the status a created keyspace settles into.
 pub const KEYSPACE_STATUS_ACTIVE: &str = "ACTIVE";
+/// `KeyspaceStatus` = `UPDATING`: what `UpdateKeyspace` puts a keyspace in until the
+/// replication change it accepted completes.
+///
+/// `UpdateKeyspace` "adds a new Amazon Web Services Region to the keyspace. ... Amazon
+/// Keyspaces is going to replicate all tables in the keyspace to the new Region", and
+/// `GetKeyspace` reports the result as "the summary status of the keyspace after a new
+/// Amazon Web Services Region was added" — so the addition is not instantaneous, and
+/// `UPDATING` is the member of the model's `KeyspaceStatus` value set
+/// (`crate::ops::types::KEYSPACE_STATUS_VALUES`) that names it.
+pub const KEYSPACE_STATUS_UPDATING: &str = "UPDATING";
 
 /// `TableStatus` = `CREATING`: what `CreateTable` puts a new table in.
 ///
@@ -77,8 +87,8 @@ pub const TYPE_STATUS_ACTIVE: &str = "ACTIVE";
 
 /// How long a resource stays in a transient status before the clock owes it the
 /// next one: `CREATING` -> `ACTIVE` after `CreateTable`, `CreateKeyspace` or
-/// `CreateType`, `UPDATING` -> `ACTIVE` after `UpdateTable`, and `DELETING` ->
-/// gone after `DeleteTable`.
+/// `CreateType`, `UPDATING` -> `ACTIVE` after `UpdateTable` or `UpdateKeyspace`,
+/// and `DELETING` -> gone after `DeleteTable`.
 ///
 /// CHOSEN, not documented: Amazon Keyspaces publishes no duration for any of
 /// these transitions, only that they happen (`CreateTable`: "the status of the
@@ -258,6 +268,22 @@ pub const MAX_KEYSPACES: usize = 256;
 
 /// The most tables one keyspace holds. See [`MAX_KEYSPACES`].
 pub const MAX_TABLES_PER_KEYSPACE: usize = 256;
+
+/// The most Amazon Web Services Regions one keyspace is replicated in.
+///
+/// `RegionList` is modelled `len 2..` with NO maximum, so the caller alone picks how long
+/// a `replicationSpecification.regionList` is — and that count is both stored on the
+/// keyspace and scanned by every operation that compares the list against another
+/// ([`resolve_replication`], the add/drop comparison `UpdateKeyspace` runs). Capping it
+/// here bounds both, so one request can neither retain nor spend an unbounded amount on a
+/// Region count of its own choosing. [`resolve_replication`] refuses a longer list, so
+/// `CreateKeyspace` and `UpdateKeyspace` share the one cap.
+///
+/// Like [`MAX_KEYSPACES`], the number is the emulator's own bound rather than a contract:
+/// Amazon Keyspaces publishes multi-Region replication across the Amazon Web Services
+/// Regions the service runs in, which is of this order, and no ordinary workflow replicates
+/// a keyspace more widely.
+pub const MAX_REPLICATION_REGIONS: usize = 32;
 
 /// The most user-defined types one keyspace holds. See [`MAX_KEYSPACES`]: `CreateType`
 /// is another operation that grows the store, and it refuses past this cap with the
@@ -1006,7 +1032,7 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
     }
 
     /// Materialise every status transition the clock already owes at `now`: a keyspace
-    /// whose `CREATING` span has elapsed becomes `ACTIVE`, a table whose `CREATING` or
+    /// whose `CREATING` or `UPDATING` span has elapsed becomes `ACTIVE`, a table whose `CREATING` or
     /// `UPDATING` span has elapsed becomes `ACTIVE`, a type whose `CREATING` span has
     /// elapsed becomes `ACTIVE`, and a table whose
     /// `DELETING` span has elapsed is gone.
@@ -1030,7 +1056,12 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
                 Some(due) if now < due => earliest = earlier_of(earliest, due),
                 Some(_) => {
                     keyspace.status_due_at = None;
-                    if keyspace.status == KEYSPACE_STATUS_CREATING {
+                    // The creation `CreateKeyspace` started, or the replication change
+                    // `UpdateKeyspace` started, has completed, so the keyspace is usable
+                    // again.
+                    if keyspace.status == KEYSPACE_STATUS_CREATING
+                        || keyspace.status == KEYSPACE_STATUS_UPDATING
+                    {
                         keyspace.status = KEYSPACE_STATUS_ACTIVE.to_string();
                     }
                 }
@@ -1445,6 +1476,19 @@ pub fn resolve_replication(
             vec![region.to_string()],
         ));
     };
+    // The ONE cap on a caller-chosen Region count, applied before the list is cloned,
+    // stored or compared against another: see [`MAX_REPLICATION_REGIONS`] for why the
+    // model's `len 2..` leaves it to be stated here.
+    if let Some(regions) = specification.region_list.as_ref() {
+        if regions.len() > MAX_REPLICATION_REGIONS {
+            return Err(format!(
+                "replicationSpecification.regionList names {} Amazon Web Services Regions, \
+                 which exceeds the limit of {MAX_REPLICATION_REGIONS} replication Regions \
+                 per keyspace",
+                regions.len()
+            ));
+        }
+    }
     if specification.replication_strategy != MULTI_REGION_STRATEGY {
         return Ok((
             specification.replication_strategy.clone(),
