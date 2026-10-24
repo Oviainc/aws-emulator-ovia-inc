@@ -185,10 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
             let key = pool
                 .user_storage_key(&input.username)
-                .ok_or_else(|| user_not_found(&input.username))?;
+                .ok_or_else(user_not_found)?;
             pool.users
                 .remove(&key)
-                .ok_or_else(|| user_not_found(&input.username))?
+                .ok_or_else(user_not_found)?
                 .username
         };
         // A deleted user authenticates nothing, so its sessions and tokens go
@@ -206,10 +206,12 @@ fn user_pool_not_found(user_pool_id: &str) -> AdminDeleteUserError {
     .into()
 }
 
-/// This operation's `UserNotFoundException` for an absent user.
-fn user_not_found(username: &str) -> AdminDeleteUserError {
+/// This operation's `UserNotFoundException` for an absent user. Carries the
+/// fixed message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no
+/// username.
+fn user_not_found() -> AdminDeleteUserError {
     AdminDeleteUserErrorModeled::UserNotFoundException(UserNotFoundException {
-        message: Some(format!("User {username} does not exist.")),
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }
