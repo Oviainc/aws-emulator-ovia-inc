@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AdminRespondToAuthChallenge
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AdminRespondToAuthChallenge`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AdminRespondToAuthChallenge::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers the challenge a stored `AdminInitiateAuth` session is waiting on.
+//! The `Session` token resolves to the STORED challenge session for the same
+//! user pool and app client; the response parameters that challenge requires
+//! are checked against stored state, the state change the challenge owes is
+//! applied, the session is ended (it answers its challenge once) and the token
+//! triple is issued from stored state. A `NEW_PASSWORD_REQUIRED` response
+//! stores the `NEW_PASSWORD` as the user's permanent password and moves it to
+//! `CONFIRMED`; a challenge this emulator never issues has no session to
+//! resume, so it is refused rather than signed in.
 //!
 //! ## Shape of an operation
 //!
@@ -305,18 +305,264 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AdminRespondToAuthChallenge` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AdminRespondToAuthChallengeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AdminRespondToAuthChallenge"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // `Session` is "the session identifier that maintains the state of
+        // authentication requests and challenge responses": without it there is
+        // no outstanding challenge to answer.
+        let session_token = input
+            .session
+            .clone()
+            .ok_or_else(|| missing_parameter("Session"))?;
+        let responses = input.challenge_responses.clone().unwrap_or_default();
+
+        let mut guard = state.lock();
+
+        // The pool and the app client the request names have to exist before the
+        // session it carries can mean anything.
+        {
+            let pool = guard
+                .pool(&input.user_pool_id)
+                .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+            if !pool.clients.contains_key(&input.client_id) {
+                return Err(client_not_found(&input.client_id));
+            }
+        }
+
+        // The STORED session says which challenge is outstanding and for whom.
+        // A token this emulator never handed out, one the clock has already
+        // expired, or one started for another pool or app client authorizes
+        // nothing.
+        let session = match guard.session(&session_token, now) {
+            crate::state::SessionLookup::Found(session) => session,
+            crate::state::SessionLookup::Expired => return Err(expired_session()),
+            crate::state::SessionLookup::Unknown => return Err(invalid_session()),
+        };
+        if session.user_pool_id != input.user_pool_id || session.client_id != input.client_id {
+            return Err(invalid_session());
+        }
+        // `ChallengeName` is "the name of the challenge that you are responding
+        // to", so it has to name the challenge this session is waiting on.
+        if input.challenge_name != session.challenge_name {
+            return Err(invalid_parameter(format!(
+                "Invalid challenge name provided, this session is waiting for a response to {}",
+                session.challenge_name
+            )));
+        }
+        if session.challenge_name != NEW_PASSWORD_REQUIRED {
+            // No other challenge is started with a session yet, so no stored
+            // state could decide whether a response to it is right.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "AdminRespondToAuthChallenge with ChallengeName={}",
+                session.challenge_name
+            )));
+        }
+
+        // `NEW_PASSWORD_REQUIRED`: "ChallengeResponses": {"NEW_PASSWORD":
+        // "[new_password]", "USERNAME": "[username]"}, plus
+        // `"userAttributes.[attribute_name]": "[attribute_value]"` for the
+        // attributes the challenge asked for (`ChallengeResponses` in this
+        // service's model).
+        let new_password = responses
+            .get(NEW_PASSWORD)
+            .cloned()
+            .ok_or_else(|| missing_challenge_response(NEW_PASSWORD, &session.challenge_name))?;
+        let requested: ::std::collections::BTreeMap<String, String> = responses
+            .iter()
+            .filter_map(|(key, value)| {
+                key.strip_prefix(USER_ATTRIBUTES_PREFIX)
+                    .map(|name| (name.to_string(), value.clone()))
+            })
+            .collect();
+
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        // A response that names a user is answered only for the user its own
+        // session was started for.
+        if let Some(named) = responses.get(USERNAME) {
+            let session_key = pool.user_storage_key(&session.username);
+            if pool.user_storage_key(named) != session_key {
+                return Err(invalid_session());
+            }
+        }
+        if let Some(message) = pool.check_password(&new_password) {
+            return Err(invalid_password(message));
+        }
+        let requested_names: Vec<String> = requested.keys().cloned().collect();
+        if let Some(unknown) = pool.unknown_attribute(&requested_names) {
+            return Err(invalid_parameter(format!(
+                "Invalid attributes given, {unknown} is not a valid attribute of this user pool"
+            )));
+        }
+
+        // Everything the response would leave behind is computed from the stored
+        // user FIRST, so a response that does not satisfy the challenge writes
+        // nothing at all.
+        let stored = pool.user(&session.username).ok_or_else(user_not_found)?;
+        if !stored.enabled {
+            return Err(not_authorized("User is disabled."));
+        }
+        // The challenge stands only while the stored user still owes a password
+        // change; a password set in the meantime leaves the session stale.
+        if !matches!(
+            stored.status,
+            crate::state::UserStatus::ForceChangePassword | crate::state::UserStatus::ResetRequired
+        ) {
+            return Err(invalid_session());
+        }
+        let username = stored.username.clone();
+        let mut attributes = stored.attributes.clone();
+        for (name, value) in requested {
+            // "In a NEW_PASSWORD_REQUIRED challenge response, you can't modify a
+            // required attribute that already has a value", and
+            // `SchemaAttributeType.Mutable` decides whether any other stored
+            // value may change at all — so an entry for either writes only the
+            // value the user does not have yet.
+            if attributes.contains_key(&name)
+                && (pool.attribute_required(&name) || !pool.attribute_mutable(&name))
+            {
+                continue;
+            }
+            attributes.insert(name, value);
+        }
+        // The challenge asks for every required attribute the user has no value
+        // for, so one still unset leaves it unanswered.
+        if let Some(missing) = pool.unset_required_attributes(&attributes).first() {
+            return Err(invalid_parameter(format!(
+                "Invalid attributes given, {missing} is missing"
+            )));
+        }
+
+        let user = pool.user_mut(&username).ok_or_else(user_not_found)?;
+        user.attributes = attributes;
+        // The challenge is answered, so the password the user signs in with from
+        // now on is the one it just chose, and it owes no further change.
+        user.password = Some(new_password);
+        user.password_permanent = true;
+        user.password_set_at = Some(now);
+        user.status = crate::state::UserStatus::Confirmed;
+        user.user_last_modified_date = now;
+
+        // The session answered its challenge, so it is spent.
+        guard.end_session(&session_token);
+        let authentication_result = guard
+            .issue_tokens(&input.user_pool_id, &input.client_id, &username, now)
+            .ok_or_else(internal_error)?;
+        Ok(AdminRespondToAuthChallengeOutput {
+            // Authentication is complete, so there is no next challenge and no
+            // session to carry into one.
+            challenge_name: None,
+            session: None,
+            challenge_parameters: None,
+            authentication_result: Some(authentication_result),
+            available_challenges: None,
+        })
     }
+}
+
+/// The challenge a user that must change its password answers
+/// (`ChallengeNameType` in this service's model).
+const NEW_PASSWORD_REQUIRED: &str = "NEW_PASSWORD_REQUIRED";
+
+/// The `ChallengeResponses` entry a `NEW_PASSWORD_REQUIRED` response carries the
+/// chosen password in.
+const NEW_PASSWORD: &str = "NEW_PASSWORD";
+
+/// The `ChallengeResponses` entry naming the user a response is for.
+const USERNAME: &str = "USERNAME";
+
+/// The `ChallengeResponses` key prefix an attribute value is submitted under:
+/// `"userAttributes.[attribute_name]": "[attribute_value]"`.
+const USER_ATTRIBUTES_PREFIX: &str = "userAttributes.";
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> AdminRespondToAuthChallengeError {
+    AdminRespondToAuthChallengeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for an absent app client.
+fn client_not_found(client_id: &str) -> AdminRespondToAuthChallengeError {
+    AdminRespondToAuthChallengeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `UserNotFoundException` for a user that is gone. Carries the
+/// fixed message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no
+/// username.
+fn user_not_found() -> AdminRespondToAuthChallengeError {
+    AdminRespondToAuthChallengeErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The refusal for a `Session` no stored challenge answers.
+fn invalid_session() -> AdminRespondToAuthChallengeError {
+    not_authorized("Invalid session for the user.")
+}
+
+/// The refusal for a `Session` whose validity window has closed.
+fn expired_session() -> AdminRespondToAuthChallengeError {
+    not_authorized("Invalid session for the user, session is expired.")
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> AdminRespondToAuthChallengeError {
+    AdminRespondToAuthChallengeErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The refusal for an input member this challenge response requires and the
+/// request did not carry.
+fn missing_parameter(parameter: &str) -> AdminRespondToAuthChallengeError {
+    invalid_parameter(format!("Missing required parameter {parameter}"))
+}
+
+/// The refusal for a `ChallengeResponses` entry the challenge requires and the
+/// request did not carry.
+fn missing_challenge_response(
+    parameter: &str,
+    challenge_name: &str,
+) -> AdminRespondToAuthChallengeError {
+    invalid_parameter(format!(
+        "Missing required parameter {parameter} in ChallengeResponses for ChallengeName \
+         {challenge_name}"
+    ))
+}
+
+/// This operation's `InvalidPasswordException`, carrying `message`.
+fn invalid_password(message: String) -> AdminRespondToAuthChallengeError {
+    AdminRespondToAuthChallengeErrorModeled::InvalidPasswordException(InvalidPasswordException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> AdminRespondToAuthChallengeError {
+    AdminRespondToAuthChallengeErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> AdminRespondToAuthChallengeError {
+    AdminRespondToAuthChallengeErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }
