@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts the installation connection of one Outpost server and persists it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The connection is the tunnel between the Outpost server being installed and this
+//! service: the caller sends the client end's public key and the asset being
+//! installed, and the store numbers the connection's own point-to-point link and
+//! keys it against the one tunnel server it reports. `GetConnection` then answers
+//! that record.
+//!
+//! The asset has to be one an Outpost of the store holds, as it does at AWS. No
+//! operation in this API records hardware on an Outpost yet — hardware arrives with
+//! a fulfilled order, and `CreateOrder` / `GetOrder` are still scaffold stubs with
+//! issues of their own — so today that precondition is reachable only for an
+//! Outpost whose assets were recorded through the store.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +160,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartConnection"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartConnectionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // A connection installs one Outpost SERVER, named by the `AssetId` of that
+        // unit of hardware, so an asset no Outpost of this store holds has no
+        // connection to start: the not-found error this call models, worded by the
+        // identifier echo of the value as supplied.
+        if store.outpost_with_asset(&input.asset_id).is_none() {
+            return Err(StartConnectionErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::ASSET_ID_MEMBER,
+                    &input.asset_id,
+                )),
+            })
+            .into());
+        }
+        // The store grows by one connection per call and lives for the life of the
+        // process, so the growth is capped. This operation models no quota error and
+        // the ceiling is the emulator's own rather than anything about the request,
+        // so past it the server error it does model is what the caller is told.
+        if store.connections.len() >= crate::state::MAX_RESOURCES {
+            return Err(StartConnectionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::store_full("connections")),
+                },
+            )
+            .into());
+        }
+
+        let (connection_id, sequence) = store.mint_connection_id();
+        let server_public_key = store.server_public_key();
+        // The client end's key is the caller's own, stored as sent, so every read of
+        // the connection answers the key this call was started with.
+        let details = crate::state::connection_details(
+            sequence,
+            input.client_public_key,
+            server_public_key,
+        );
+        let underlay_ip_address = crate::state::underlay_ip_address(sequence);
+        // Nothing in this API models a second start as a conflict, and a device that
+        // re-registers brings a new client key, so each call mints its OWN
+        // connection: the earlier one stays readable under the id it was given.
+        store.connections.insert(
+            connection_id.clone(),
+            crate::state::ConnectionRecord {
+                sequence,
+                connection_id: connection_id.clone(),
+                asset_id: input.asset_id,
+                device_serial_number: crate::state::non_empty(input.device_serial_number),
+                network_interface_device_index: input.network_interface_device_index,
+                underlay_ip_address: underlay_ip_address.clone(),
+                details,
+            },
+        );
+
+        Ok(StartConnectionOutput {
+            connection_id: Some(connection_id),
+            underlay_ip_address: Some(underlay_ip_address),
+        })
     }
 }

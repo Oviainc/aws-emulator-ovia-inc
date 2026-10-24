@@ -57,7 +57,7 @@ fn route(identifier: &str, query: &str) -> String {
 ///
 /// `elevation` becomes the asset's `AssetLocation$RackElevation`; an asset whose
 /// location was never recorded passes `None` and must be reported without one.
-fn asset(
+pub(crate) fn asset(
     id: &str,
     rack: &str,
     asset_type: Option<&str>,
@@ -194,7 +194,7 @@ async fn an_outpost(outposts: &Outposts, name: &str) -> String {
 
 /// Record `assets` as the hardware installed on the stored Outpost. See this module's
 /// header for why a row records them through the store.
-fn record(outposts: &Outposts, outpost_id: &str, assets: &[AssetInfo], case: &str) {
+pub(crate) fn record(outposts: &Outposts, outpost_id: &str, assets: &[AssetInfo], case: &str) {
     let store = outposts.store();
     let mut store = store.lock();
     let record = store

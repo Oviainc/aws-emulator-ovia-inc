@@ -30,10 +30,12 @@ use crate::wire::{call, error_code, medialive, ACCOUNT};
 /// `POST /prod/clusters`).
 const CLUSTERS: &str = "/prod/clusters";
 
-/// The collection URI `CreateChannelPlacementGroup` is bound to
-/// (`smithy_query(query="operation", operation="CreateChannelPlacementGroup")`:
-/// `POST /prod/clusters/{ClusterId}/channelplacementgroups`).
-fn groups_uri(cluster: &str) -> String {
+/// The collection URI `CreateChannelPlacementGroup` and
+/// `ListChannelPlacementGroups` are bound to
+/// (`smithy_query(query="operation",
+/// operation="CreateChannelPlacementGroup,ListChannelPlacementGroups")`:
+/// `POST` / `GET /prod/clusters/{ClusterId}/channelplacementgroups`).
+pub(crate) fn groups_uri(cluster: &str) -> String {
     format!("{CLUSTERS}/{cluster}/channelplacementgroups")
 }
 
@@ -138,8 +140,10 @@ fn channels_of(group: &Value) -> Vec<String> {
 }
 
 /// Create a channel, optionally placed in a cluster's channel placement group,
-/// and answer its id.
-async fn create_channel(
+/// and answer its id. `pub(crate)` for the same reason as the group helpers
+/// above: the LISTING suite ([`crate::channel_placement_group_listing`]) asserts
+/// the same derived `Channels` member from the same kind of channel.
+pub(crate) async fn create_channel(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,

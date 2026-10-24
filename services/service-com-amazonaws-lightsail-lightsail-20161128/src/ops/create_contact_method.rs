@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateContactMethod
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateContactMethod`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stores the ONE contact method of the request's protocol in the Region the
+//! request was made in, and answers the operation-log entry the create appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateContactMethod::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +176,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateContactMethod` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateContactMethodErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateContactMethod"))
+        // A contact method belongs to ONE Region — "you can add one email address
+        // and one mobile phone number contact method in each Amazon Web Services
+        // Region" — and the request names none, so the Region it is created in is
+        // the Region the request was made in, which is what `ctx` carries.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `protocol` and `contactEndpoint` are modelled `@required` members, the
+        // protocol is a modelled enum and the endpoint's length is a modelled
+        // constraint, so the centralized walk refused anything outside them
+        // before this body ran. What is left is what the model cannot express:
+        // the endpoint has to be a destination the protocol can reach, the SMS
+        // protocol is served in some Regions only, and the caller-sized tag list
+        // has to be within the store's bound. Each is checked BEFORE the first
+        // write, so a refused request stores nothing.
+        let protocol = input.protocol;
+        let contact_endpoint = input.contact_endpoint;
+        if let Some(message) =
+            crate::state::contact_endpoint_rejection(&protocol, &contact_endpoint)
+        {
+            return Err(invalid(message));
+        }
+        if protocol == crate::state::CONTACT_PROTOCOL_SMS
+            && !crate::state::sms_supported_in(&region)
+        {
+            return Err(invalid(format!(
+                "the {} protocol is not supported in {region}: the Regions that serve it are [{}]",
+                crate::state::CONTACT_PROTOCOL_SMS,
+                crate::state::SMS_SUPPORTED_REGIONS.join(", ")
+            )));
+        }
+        let tags = input.tags.unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                tags.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // One Region holds ONE contact method per protocol, and the model
+            // declares no operation that updates one, so creating under a
+            // protocol this Region already has a contact method for REPLACES
+            // that record: the destination is what a contact method IS, so the
+            // new one is minted with its own identity and its own verification
+            // status rather than inheriting the replaced record's.
+            let id = store.mint_uuid();
+            let name = crate::state::contact_method_name(&protocol, &id);
+            let location = crate::state::StoredLocation::regional(&region);
+            store.insert_contact_method(
+                &region,
+                crate::state::StoredContactMethod {
+                    status: crate::state::contact_method_initial_status(&protocol).to_string(),
+                    protocol,
+                    contact_endpoint,
+                    name: name.clone(),
+                    arn: crate::state::contact_method_arn(&region, &id),
+                    support_code: crate::state::support_code(&id),
+                    created_at_ms: now,
+                    location: location.clone(),
+                    tags,
+                },
+            );
+            // The contact method exists, as asked, as this call returns, so the
+            // work this operation describes is already done and the operation is
+            // terminal. Whether an email address has been VERIFIED is the
+            // contact method's own status, not this operation's outcome.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_CONTACT_METHOD,
+                crate::state::RESOURCE_TYPE_CONTACT_METHOD,
+                &name,
+                &location,
+                None,
+            );
+            CreateContactMethodOutput {
+                operations: Some(vec![operation.view()]),
+            }
+        })
+        .ok_or_else(unavailable)
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateContactMethodError {
+    CreateContactMethodErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateContactMethodError {
+    CreateContactMethodErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail contact method store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

@@ -7,7 +7,8 @@
 //! two Availability Zone identities, selecting a site's two addresses by the
 //! modelled `AddressType` and keeping the `Site` projection of the operating one in
 //! step with it, materialising the Outpost lifecycle transition,
-//! the quote expiry and the capacity-task progression the clock owes, cutting an
+//! the quote expiry and the capacity-task progression the clock owes, allocating the
+//! tunnel an Outpost-server installation connection is reported as, cutting an
 //! ordered list into pages with the modelled `Token` the next page resumes from, the
 //! orderable-instance-type catalog this service publishes, and
 //! the two rules this service words its refusals by — the `NotFoundException`
@@ -19,9 +20,9 @@ use sha2::{Digest, Sha256};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    Address, AssetInfo, AssetInstance, CapacityTaskFailure, DetailedInstanceTypeItem,
-    FormFactorConfig, InstanceTypeCapacity, InstancesToExclude, Outpost, PricingOption,
-    PrivateConnectivityConfig, Quote, Site,
+    Address, AssetInfo, AssetInstance, CapacityTaskFailure, ConnectionDetails,
+    DetailedInstanceTypeItem, FormFactorConfig, InstanceTypeCapacity, InstancesToExclude, Outpost,
+    PricingOption, PrivateConnectivityConfig, Quote, Site,
 };
 
 /// The region every minted ARN falls back to when the request carries no SigV4
@@ -559,6 +560,137 @@ pub struct QuoteRecord {
     pub quote: Quote,
 }
 
+/// A persisted Outpost-server installation connection: the tunnel
+/// `StartConnection` handed out, as `GetConnection` reports it, beside the hardware
+/// it was started for.
+#[derive(Debug, Clone)]
+pub struct ConnectionRecord {
+    /// See [`SiteRecord::sequence`]. It is also what this connection's tunnel
+    /// addresses and underlay address are allocated from, so no two connections of
+    /// one store are handed the same address.
+    pub sequence: u64,
+    /// The minted `ConnectionId` this record is keyed by.
+    pub connection_id: String,
+    /// The `AssetId` of the Outpost server being installed — the asset the start
+    /// resolved, so the record names the hardware the tunnel belongs to.
+    pub asset_id: String,
+    /// The serial number of the dongle the caller named, absent when it named none.
+    pub device_serial_number: Option<String>,
+    /// The device index of the Outpost server's network interface the caller named.
+    pub network_interface_device_index: i32,
+    /// The `UnderlayIpAddress` the start reported for that network interface.
+    pub underlay_ip_address: String,
+    /// The connection as `GetConnection` reports it, computed once when the
+    /// connection was started: every read answers the tunnel the start handed out,
+    /// rather than one recomputed per call.
+    pub details: ConnectionDetails,
+}
+
+/// The UDP port a connection's `ServerEndpoint` names.
+///
+/// The tunnel a connection describes is a WireGuard tunnel — both of its keys are
+/// modelled `WireGuardPublicKey`s — and 51820 is WireGuard's default listen port.
+pub const CONNECTION_SERVER_PORT: u16 = 51820;
+
+/// The host part of every connection's `ServerEndpoint`: the address this store's
+/// one tunnel server is reported on (see
+/// [`ComAmazonawsOutpostsOutpostsolafserviceState::server_public_key`]).
+///
+/// It is taken from the block RFC 5737 reserves for documentation and examples
+/// (`192.0.2.0/24`), so the endpoint this emulator reports cannot name a host on
+/// anybody's real network.
+pub const CONNECTION_SERVER_HOST: &str = "192.0.2.1";
+
+/// The first octet of the block a connection's point-to-point tunnel link is cut
+/// from: RFC 1918's private `10.0.0.0/8`, where both ends of a tunnel can be
+/// numbered without naming a public host.
+const TUNNEL_BLOCK: u8 = 10;
+
+/// The prefix length both of a connection's tunnel `CIDR` members report: a /30,
+/// the smallest IPv4 prefix that carries two usable host addresses — one for each
+/// end of a point-to-point link.
+const TUNNEL_PREFIX: u32 = 30;
+
+/// How many addresses that /30 holds, which is the stride from one connection's
+/// link to the next.
+const TUNNEL_LINK_SIZE: u64 = 1 << (32 - TUNNEL_PREFIX);
+
+/// The first octet of the block a connection's `UnderlayIpAddress` is allocated
+/// from, with [`UNDERLAY_BLOCK_SECOND_OCTET`]: RFC 6598's shared address space
+/// `100.64.0.0/10`, which holds the addresses a service numbers its own devices in
+/// rather than addresses of the caller's network.
+const UNDERLAY_BLOCK: u8 = 100;
+
+/// See [`UNDERLAY_BLOCK`]: the base of the `/10`'s second octet, whose low six bits
+/// are part of the host number.
+const UNDERLAY_BLOCK_SECOND_OCTET: u8 = 64;
+
+/// The dotted quad whose first octet is `first` and whose other three carry `host`:
+/// how every address allocated out of a `/8`-shaped block here is rendered, so each
+/// one satisfies the dotted-quad patterns the model declares.
+///
+/// `host` is masked to the 24 bits those three octets hold, so an allocation that
+/// runs past the end of the block wraps inside it instead of rendering an octet
+/// above 255.
+fn dotted_quad(first: u8, host: u64) -> String {
+    let host = host & 0x00ff_ffff;
+    format!(
+        "{first}.{}.{}.{}",
+        (host >> 16) & 0xff,
+        (host >> 8) & 0xff,
+        host & 0xff
+    )
+}
+
+/// The `UnderlayIpAddress` of the `sequence`-th connection a store created: one
+/// address of [`UNDERLAY_BLOCK`]'s shared address space per connection, so two
+/// connections are never reported on the same underlay address — for as many
+/// connections as the block's 22 host bits number, past which the allocation wraps
+/// inside the block (far beyond [`MAX_RESOURCES`], the number of connections one
+/// store will take).
+pub fn underlay_ip_address(sequence: u64) -> String {
+    // The /10 leaves 22 bits of host: the low six of the second octet and the last
+    // two octets.
+    let host = sequence & 0x003f_ffff;
+    dotted_quad(
+        UNDERLAY_BLOCK,
+        (u64::from(UNDERLAY_BLOCK_SECOND_OCTET) << 16) | host,
+    )
+}
+
+/// The tunnel [`ConnectionDetails`] of the `sequence`-th connection a store created:
+/// between the client whose public key the caller sent and that store's own tunnel
+/// server.
+///
+/// Each connection is numbered on its OWN point-to-point link — the `sequence`-th
+/// /30 of [`TUNNEL_BLOCK`], with the server on its first usable address and the
+/// client on the second, so two connections of one store never share a tunnel
+/// address, for as many connections as the block numbers (see
+/// [`underlay_ip_address`]) — while the server endpoint and server key are the
+/// store's, the same in every connection it reports.
+pub fn connection_details(
+    sequence: u64,
+    client_public_key: String,
+    server_public_key: String,
+) -> ConnectionDetails {
+    // Wrapping throughout: the link number is an internal counter and the rendering
+    // masks it into the block either way, so a count past the block's end wraps
+    // inside it rather than failing.
+    let link = sequence.wrapping_mul(TUNNEL_LINK_SIZE);
+    let server = dotted_quad(TUNNEL_BLOCK, link.wrapping_add(1));
+    let client = dotted_quad(TUNNEL_BLOCK, link.wrapping_add(2));
+    ConnectionDetails {
+        client_public_key: Some(client_public_key),
+        server_public_key: Some(server_public_key),
+        server_endpoint: Some(format!("{CONNECTION_SERVER_HOST}:{CONNECTION_SERVER_PORT}")),
+        client_tunnel_address: Some(format!("{client}/{TUNNEL_PREFIX}")),
+        server_tunnel_address: Some(format!("{server}/{TUNNEL_PREFIX}")),
+        // What this client may route into the tunnel: the one address at the other
+        // end of its own link, as a host prefix.
+        allowed_ips: Some(vec![format!("{server}/32")]),
+    }
+}
+
 /// How many MiB of memory one GiB is, which turns a family's documented
 /// GiB-per-vCPU ratio into the `MemoryInMib` the model reports.
 const MIB_PER_GIB: i32 = 1024;
@@ -871,6 +1003,13 @@ pub struct ComAmazonawsOutpostsOutpostsolafserviceState {
     /// Every persisted quote, keyed by its bare `QuoteId` (`oq-…`), which is how
     /// `GetQuote` resolves one.
     pub quotes: BTreeMap<String, QuoteRecord>,
+    /// Every persisted Outpost-server installation connection, keyed by the
+    /// `ConnectionId` `StartConnection` minted for it, which is how `GetConnection`
+    /// resolves one.
+    pub connections: BTreeMap<String, ConnectionRecord>,
+    /// This store's own tunnel-server public key, or `None` until the first
+    /// connection mints it. See [`Self::server_public_key`].
+    pub connection_server_public_key: Option<String>,
     /// The orderable-instance-type catalog `ListOrderableInstanceTypes` reports, in
     /// its stable order.
     ///
@@ -895,6 +1034,8 @@ impl Default for ComAmazonawsOutpostsOutpostsolafserviceState {
             outposts: BTreeMap::new(),
             capacity_tasks: BTreeMap::new(),
             quotes: BTreeMap::new(),
+            connections: BTreeMap::new(),
+            connection_server_public_key: None,
             orderable_instance_types: orderable_instance_type_catalog(),
             created: 0,
         }
@@ -1117,17 +1258,86 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// into the seed with the wall clock and the process id, so repeated calls never
     /// return the same id.
     pub fn mint_id(&mut self, prefix: &str) -> (String, u64) {
-        self.created = self.created.wrapping_add(1);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos());
-        let seed = format!("{prefix}|{}|{}|{nanos}", self.created, std::process::id());
-        let digest = Sha256::digest(seed.as_bytes());
+        let (digest, sequence) = self.mint_digest(prefix);
         let mut hex = hex::encode(&digest[..9]);
         // 9 bytes encode to 18 characters; the patterns want exactly 17.
         hex.truncate(17);
-        (format!("{prefix}-{hex}"), self.created)
+        (format!("{prefix}-{hex}"), sequence)
     }
+
+    /// Mint a fresh `ConnectionId`, and return it with the creation sequence to
+    /// record on the new connection.
+    ///
+    /// A `ConnectionId` is not a `<prefix>-<17 hex>` identifier like the rest of
+    /// this service's: its pattern is base64-shaped
+    /// (`^[a-zA-Z0-9+/=]{1,1024}$`), so the id is the padded base64 of the minted
+    /// digest — 44 characters of that alphabet. See [`Self::mint_id`].
+    pub fn mint_connection_id(&mut self) -> (String, u64) {
+        let (digest, sequence) = self.mint_digest("connection");
+        (::aws_smithy_types::base64::encode(&digest[..]), sequence)
+    }
+
+    /// This store's own tunnel-server public key, minted on first use and then
+    /// stable for the life of the store.
+    ///
+    /// Every connection of one emulator terminates on the SAME tunnel server, so
+    /// the key — like the endpoint beside it ([`CONNECTION_SERVER_HOST`]) — is a
+    /// property of the store and not of a connection: a caller that starts two
+    /// connections is told one server key twice. It is the padded base64 of a
+    /// 32-byte digest, which is exactly the form the modelled `WireGuardPublicKey`
+    /// declares: 43 characters of the base64 alphabet and the `=` that pads 32
+    /// bytes.
+    pub fn server_public_key(&mut self) -> String {
+        self.connection_server_public_key
+            .get_or_insert_with(|| {
+                let seed = format!("wireguard-server|{}|{}", std::process::id(), seed_nanos());
+                ::aws_smithy_types::base64::encode(&Sha256::digest(seed.as_bytes())[..])
+            })
+            .clone()
+    }
+
+    /// The Outpost holding the hardware asset `asset_id`, if this store holds one.
+    ///
+    /// An `AssetId` names one physical unit of hardware, installed in one rack of
+    /// one Outpost, so at most one Outpost holds it: an operation that acts on an
+    /// asset resolves it here rather than walking the store itself.
+    pub fn outpost_with_asset(&self, asset_id: &str) -> Option<&OutpostRecord> {
+        self.outposts.values().find(|record| {
+            record
+                .assets
+                .iter()
+                .any(|asset| asset.asset_id.as_deref() == Some(asset_id))
+        })
+    }
+
+    /// Mint a fresh 32-byte digest for a resource of kind `kind`, with the creation
+    /// sequence to record on it.
+    ///
+    /// `created` advances on every call and is hashed into the seed with the wall
+    /// clock and the process id, so repeated calls never return the same digest.
+    /// The two id forms this service mints ([`Self::mint_id`] and
+    /// [`Self::mint_connection_id`]) are two renderings of this one digest.
+    fn mint_digest(&mut self, kind: &str) -> ([u8; 32], u64) {
+        self.created = self.created.wrapping_add(1);
+        let seed = format!(
+            "{kind}|{}|{}|{}",
+            self.created,
+            std::process::id(),
+            seed_nanos()
+        );
+        let digest = Sha256::digest(seed.as_bytes());
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&digest);
+        (bytes, self.created)
+    }
+}
+
+/// Nanoseconds since the Unix epoch: the wall-clock part of every seed this store
+/// hashes, so two mints of one process never agree.
+fn seed_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -1662,6 +1872,10 @@ pub const ASSET_ID_MEMBER: &str = "assetId";
 /// The validation-path name of the `OrderId` input member an operation names an
 /// Amazon Web Services Outposts order by. See [`SITE_ID_MEMBER`].
 pub const ORDER_ID_MEMBER: &str = "orderId";
+
+/// The validation-path name of the `ConnectionId` input member an operation names
+/// an Outpost-server installation connection by. See [`SITE_ID_MEMBER`].
+pub const CONNECTION_ID_MEMBER: &str = "connectionId";
 
 /// How many entries the modelled `TagMap` holds (`@length(min: 1, max: 50)`).
 ///

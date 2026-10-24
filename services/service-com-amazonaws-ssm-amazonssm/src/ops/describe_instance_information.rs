@@ -16,18 +16,29 @@
 //! ## Which requests are refused, and with which modelled error
 //!
 //! * A filter key the operation does not document — anything outside
-//!   [`crate::state::INSTANCE_INFORMATION_FILTER_KEYS`] and the two tag forms — is
-//!   `InvalidFilterKey` ("The specified key isn't valid"). The shape models no `message`
-//!   member, so the refusal is bare; that is the model's choice, not a lost message.
-//! * A tag filter combined with a filter of any other type is the same
-//!   `InvalidFilterKey`: "Tag filters can't be combined with other filter types"
-//!   (`DescribeInstanceInformationRequest$Filters`), so in that combination the key is
-//!   not one the operation accepts.
+//!   [`crate::state::INSTANCE_INFORMATION_FILTER_KEYS`] and the two tag forms — is a
+//!   `ValidationException` naming the key the caller submitted
+//!   ([`crate::state::filter_key_rejection`]), the same refusal the sibling
+//!   `DescribeInstanceProperties` gives an unknown key: whether a filter key is one the
+//!   operation knows is decided as a validation of the request, so the modelled
+//!   `InvalidFilterKey` — which models no `message` member and so could not name the key —
+//!   is not what a filter of this operation is refused with. The behavioural check this
+//!   emulator is replayed against asserts exactly that for an unrecognised `Filters` key
+//!   (the unknown-filter-key step of the managed-node filter check, recorded alongside the
+//!   malformed-node-id one); the issue report that asked for the combination rule below
+//!   assumed the modelled error instead, and the recording is what this follows.
+//! * A tag filter combined with a filter on a property of a node is a
+//!   `ValidationException` too: "Tag filters can't be combined with other filter types"
+//!   (`DescribeInstanceInformationRequest$Filters`). BOTH keys are keys the operation
+//!   accepts, so what is refused is their COMBINATION, not either key — two tag filters,
+//!   and two property filters, are accepted
+//!   ([`crate::state::tag_filter_combination_rejection`]).
 //! * A value that could not be a value of the node attribute its key filters is
 //!   `InvalidInstanceInformationFilterValue` ("The specified filter value isn't valid"),
 //!   except for a node id, where the operation documents its own error: "If you specify
-//!   a node ID that isn't valid … you receive an error" → `InvalidInstanceId`. A node id
-//!   that is well formed but names no registered node is NOT a refusal: it simply
+//!   a node ID that isn't valid … you receive an error" → `InvalidInstanceId`, carrying
+//!   the constraint the value violated ([`crate::state::MANAGED_NODE_ID_PATTERN`]). A
+//!   node id that is well formed but names no registered node is NOT a refusal: it simply
 //!   matches nothing, which is how a caller asks whether an instance is managed.
 //! * `Filters` and `InstanceInformationFilterList` together are a `ValidationException`:
 //!   "Attempting to use InstanceInformationFilterList and Filters leads to an exception
@@ -220,9 +231,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            is_instance_information_filter_key, is_legacy_node_filter_key, is_tag_filter_key,
-            managed_node_id_is_well_formed, node_page_size, request_region, INVALID_NEXT_TOKEN,
-            OPERATOR_EQUAL,
+            filter_key_rejection, is_instance_information_filter_key, is_legacy_node_filter_key,
+            managed_node_id_is_well_formed, node_page_size, request_region,
+            tag_filter_combination_rejection, INVALID_NEXT_TOKEN, OPERATOR_EQUAL,
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -251,19 +262,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // "Tag filters can't be combined with other filter types."
-        let tag_filters = string_filters
-            .iter()
-            .filter(|filter| is_tag_filter_key(&filter.key))
-            .count();
-        if tag_filters != 0 && tag_filters != string_filters.len() {
-            return Err(invalid_filter_key());
+        // A key outside the documented catalog names no attribute of a node, so the
+        // filter cannot be served at all: the key is validated — and the request refused,
+        // naming it — before anything is asked about the nodes.
+        for filter in string_filters {
+            if !is_instance_information_filter_key(&filter.key) {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    filter_key_rejection(&filter.key),
+                ));
+            }
+        }
+
+        // "Tag filters can't be combined with other filter types." Every key above is one
+        // the operation accepts, so a tag filter beside a filter on a property of a node
+        // is a combination the request may not express — a validation of the request,
+        // rather than a key the operation does not know.
+        if let Some(why) = tag_filter_combination_rejection(
+            string_filters.iter().map(|filter| filter.key.as_str()),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
         }
 
         for filter in string_filters {
-            if !is_instance_information_filter_key(&filter.key) {
-                return Err(invalid_filter_key());
-            }
             check_filter_values(&filter.key, &filter.values)?;
         }
         for filter in legacy_filters {
@@ -272,7 +292,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // legacy method and doesn't support tags". The boundary validator refuses a
             // key outside that enum before this handler runs, so this is a backstop.
             if !is_legacy_node_filter_key(&filter.key) {
-                return Err(invalid_filter_key());
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    filter_key_rejection(&filter.key),
+                ));
             }
             check_filter_values(&filter.key, &filter.value_set)?;
         }
@@ -338,27 +360,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled refusal for a filter key this operation does not accept: "The specified
-/// key isn't valid". The shape declares no members, so it carries no message.
-fn invalid_filter_key() -> DescribeInstanceInformationError {
-    DescribeInstanceInformationErrorModeled::InvalidFilterKey(InvalidFilterKey {}).into()
-}
-
 /// Refuse every value of one filter that could not be a value of the node attribute its
 /// key filters.
 ///
 /// A node id has its own modelled error — "If you specify a node ID that isn't valid …
 /// you receive an error" — and every other key's bad value is the filter-value error.
+///
+/// The node-id refusal REPORTS THE CONSTRAINT the value violated, built from the member
+/// the id fills and its modelled pattern
+/// ([`crate::state::managed_node_id_constraint_violation`]), so the refusal says which
+/// input to fix and what it has to satisfy rather than describing it in prose.
 fn check_filter_values(key: &str, values: &[String]) -> Result<(), DescribeInstanceInformationError> {
     for value in values {
         if key == "InstanceIds" {
             if !crate::state::managed_node_id_is_well_formed(value) {
                 return Err(DescribeInstanceInformationErrorModeled::InvalidInstanceId(
                     InvalidInstanceId {
-                        message: Some(format!(
-                            "Value '{value}' for filter key '{key}' is not a managed node ID: a \
-                             node ID is 'i-' and 8 or 17 characters, or 'mi-' and 17 characters"
-                        )),
+                        message: Some(crate::state::managed_node_id_constraint_violation()),
                     },
                 )
                 .into());

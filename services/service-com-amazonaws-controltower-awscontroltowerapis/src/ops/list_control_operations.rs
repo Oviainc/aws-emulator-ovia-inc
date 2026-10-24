@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListControlOperations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListControlOperations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListControlOperations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the control operation log: the records every call that acts on an
+//! `EnabledControl` appends, narrowed by `filter` and paginated by
+//! `maxResults`/`nextToken`. Modelled `@readonly`: the only state it writes is the
+//! transitions the state's `settle` finds the clock already owed.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +110,49 @@ impl From<ListControlOperationsErrorModeled> for ListControlOperationsError {
     }
 }
 
+/// A filter list the caller sent, as the handler matches it: the values as a SET, so
+/// testing one record against it costs `O(log k)` rather than a scan, and the whole
+/// per-request scan is bounded by the log's own [`MAX_CONTROL_OPERATIONS`] cap.
+///
+/// Every enum-typed member of `ControlOperationFilter` deserializes to a plain string,
+/// but the schema front door has already refused a value the model's value set does not
+/// declare, so reaching this handler means each value is one of the modelled ones — and
+/// each of these lists is modelled `@length min 1, max 1`, so the front door has bounded
+/// their length too.
+///
+/// [`MAX_CONTROL_OPERATIONS`]: crate::state::MAX_CONTROL_OPERATIONS
+type Filter<'a> = Option<::std::collections::BTreeSet<&'a str>>;
+
+/// The values of one filter member as a [`Filter`], or `None` when the caller sent that
+/// member no list at all. Built BEFORE the state lock is taken, so no caller-sized work
+/// happens while the lock is held.
+fn filter_set(values: Option<&Vec<String>>) -> Filter<'_> {
+    values.map(|values| values.iter().map(String::as_str).collect())
+}
+
+/// Whether `actual` is selected by a filter: a member the caller did not send selects
+/// every record, and one they did selects the records whose value its set holds.
+fn selected(filter: &Filter<'_>, actual: &str) -> bool {
+    filter.as_ref().is_none_or(|values| values.contains(actual))
+}
+
+/// The summary one log record reports.
+fn summary(record: &crate::state::ControlOperationRecord) -> ControlOperationSummary {
+    ControlOperationSummary {
+        operation_identifier: Some(record.operation_identifier.clone()),
+        operation_type: Some(record.operation_type.as_wire().to_string()),
+        status: Some(record.status.as_wire().to_string()),
+        start_time: Some(::aws_smithy_types::DateTime::from(record.start_time)),
+        end_time: record.end_time.map(::aws_smithy_types::DateTime::from),
+        // Reported "as part of the control status" on a failure only, so it is whatever
+        // the record carries.
+        status_message: record.status_message.clone(),
+        control_identifier: Some(record.control_identifier.clone()),
+        target_identifier: Some(record.target_identifier.clone()),
+        enabled_control_identifier: Some(record.enabled_control_arn.clone()),
+    }
+}
+
 /// The `ListControlOperations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -150,18 +189,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListControlOperations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListControlOperationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListControlOperations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListControlOperationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Every member of `filter` narrows the listing; a member the caller omitted
+        // narrows nothing. The sets are built here, BEFORE the state lock below, so the
+        // only work done under the lock is one pass over the log.
+        let filter = input.filter.unwrap_or_default();
+        let control_identifiers = filter_set(filter.control_identifiers.as_ref());
+        let target_identifiers = filter_set(filter.target_identifiers.as_ref());
+        let enabled_control_identifiers = filter_set(filter.enabled_control_identifiers.as_ref());
+        let statuses = filter_set(filter.statuses.as_ref());
+        let operation_types = filter_set(filter.control_operation_types.as_ref());
+
+        let mut store = state.lock();
+        // Only materialises transitions the clock already owed; this operation is
+        // `@readonly` and writes nothing else.
+        store.settle(::std::time::SystemTime::now());
+
+        // Most recently started first, and the identifier breaks a tie so the order is
+        // TOTAL: a `nextToken` then resumes exactly where the previous page stopped
+        // whatever order the map iterates in. The records are BORROWED, not cloned: only
+        // the page this call returns is materialised.
+        let mut records: Vec<&crate::state::ControlOperationRecord> = store
+            .control_operations
+            .values()
+            .filter(|record| {
+                selected(&control_identifiers, &record.control_identifier)
+                    && selected(&target_identifiers, &record.target_identifier)
+                    && selected(&enabled_control_identifiers, &record.enabled_control_arn)
+                    && selected(&statuses, record.status.as_wire())
+                    && selected(&operation_types, record.operation_type.as_wire())
+            })
+            .collect();
+        records.sort_by(|left, right| {
+            right
+                .start_time
+                .cmp(&left.start_time)
+                .then_with(|| left.operation_identifier.cmp(&right.operation_identifier))
+        });
+
+        // The token this operation hands out is the index of the next unreturned record,
+        // so it is only meaningful against a call carrying the same filter, which is what
+        // `nextToken` is documented to require.
+        let start = match input.next_token.as_deref() {
+            None | Some("") => 0usize,
+            Some(token) => match token.parse::<usize>() {
+                Ok(index) if index <= records.len() => index,
+                _ => {
+                    return Err(ListControlOperationsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "nextToken {token} was not returned by a previous \
+                                 ListControlOperations call with these parameters"
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // `maxResults` is modelled `range 1..100`, so the front door has already refused
+        // anything outside it; absent, every remaining record is returned.
+        let limit = input
+            .max_results
+            .map_or(records.len(), |max| max.max(1) as usize);
+        let end = start.saturating_add(limit).min(records.len());
+
+        Ok(ListControlOperationsOutput {
+            control_operations: records[start..end]
+                .iter()
+                .map(|record| summary(record))
+                .collect(),
+            next_token: (end < records.len()).then(|| end.to_string()),
+        })
     }
 }

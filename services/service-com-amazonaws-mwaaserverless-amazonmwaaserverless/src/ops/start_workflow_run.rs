@@ -324,6 +324,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let nonce = store.next_nonce(now);
+        // The creation sequence this run keeps: the mint counter the nonce above just
+        // advanced. It is what separates two runs the clock reports at the same
+        // instant, so a run listing has a TOTAL creation order to walk.
+        let sequence = store.mint_seq;
         let run_id = crate::state::mint_run_id(&input.workflow_arn, &nonce);
         let run = crate::state::WorkflowRun {
             run_id: run_id.clone(),
@@ -353,6 +357,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `STARTING` this call reported (`crate::state::WorkflowRun::settle`
             // carries it on through the rest of the lifecycle).
             next_status_at: now + crate::state::RUN_ADMITTED_AFTER,
+            sequence,
         };
 
         let workflow = store

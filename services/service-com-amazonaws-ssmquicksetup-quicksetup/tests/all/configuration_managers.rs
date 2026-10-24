@@ -1450,12 +1450,14 @@ async fn the_operations_this_slice_does_not_cover_still_answer_501() {
     // `GET /serviceSettings` and `GET /listQuickSetupTypes` are no longer here: both
     // are implemented, and `tests/all/service_settings_and_types.rs` covers them.
     // `GET /getConfiguration/{ConfigurationId}` is no longer here either — it is
-    // implemented, and the `GetConfiguration` section below covers it.
+    // implemented, and the `GetConfiguration` section below covers it. Nor is
+    // `GET /tags/{ResourceArn}` (`ListTagsForResource`): it is implemented, and
+    // `tests/all/list_tags_for_resource.rs` covers it.
     let cases: [(&str, &str, Option<Value>); 1] = [
         (
-            "GET",
+            "PUT",
             "/tags/arn%3Aaws%3Assm-quicksetup%3Aus-west-2%3A000000000000%3Aconfiguration-manager%2F00000000-0000-4000-8000-000000000000",
-            None,
+            Some(json!({ "Tags": { "Env": "prod" } })),
         ),
     ];
     for (method, uri, body) in cases {

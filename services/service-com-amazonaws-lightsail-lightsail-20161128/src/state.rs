@@ -61,6 +61,7 @@ use crate::ops::types::{
     ContainerImage,
     ContainerService, ContainerServiceDeployment, ContainerServiceDeploymentRequest,
     ContainerServiceECRImagePullerRole, ContainerServiceEndpoint,
+    ContactMethod,
     ContainerServiceHealthCheckConfig, ContainerServiceStateDetail, DestinationInfo,
     DistributionBundle, DistributionCustomErrorResponse,
     Domain, DomainEntry, ExportSnapshotRecord, ExportSnapshotRecordSourceInfo,
@@ -224,6 +225,12 @@ pub const RESOURCE_TYPE_STATIC_IP: &str = "StaticIp";
 /// carries ("The Lightsail resource type of the alarm").
 pub const RESOURCE_TYPE_ALARM: &str = "Alarm";
 
+/// The `resourceType` a contact method and its operations report, from the same
+/// modelled `ResourceType` enum — the value the modelled
+/// `ContactMethod$resourceType` member carries ("The Lightsail resource type of
+/// the contact method").
+pub const RESOURCE_TYPE_CONTACT_METHOD: &str = "ContactMethod";
+
 /// The `resourceType` the peering of a Region's Lightsail VPC with the account's
 /// default VPC reports, from the same modelled `ResourceType` enum — its
 /// `PeeredVpc` member, the only one that names a VPC peering.
@@ -254,6 +261,11 @@ pub const LOAD_BALANCER_ARN_RESOURCE_PREFIX: &str = "LoadBalancer/";
 /// `Instance/<uuid>` form the modelled `Instance$arn` documentation shows, with
 /// this resource's own `ResourceType` value.
 pub const ALARM_ARN_RESOURCE_PREFIX: &str = "Alarm/";
+
+/// The resource portion a contact method ARN carries before its id. Mirrors the
+/// `Instance/<uuid>` form the modelled `Instance$arn` documentation shows, with
+/// this resource's own `ResourceType` value.
+pub const CONTACT_METHOD_ARN_RESOURCE_PREFIX: &str = "ContactMethod/";
 
 /// Applied when `CreateInstances` omits `ipAddressType`.
 ///
@@ -536,6 +548,10 @@ pub const OPERATION_TYPE_ALLOCATE_STATIC_IP: &str = "AllocateStaticIp";
 pub const OPERATION_TYPE_PUT_ALARM: &str = "PutAlarm";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_ALARM: &str = "DeleteAlarm";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_CREATE_CONTACT_METHOD: &str = "CreateContactMethod";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_DELETE_CONTACT_METHOD: &str = "DeleteContactMethod";
 /// The `operationType` the log entry of a change to a zone's recordsets carries.
 ///
 /// The modelled `OperationType` enum has `UpdateDomainEntry` and
@@ -7381,6 +7397,168 @@ impl StoredAlarm {
 }
 
 // ---------------------------------------------------------------------------
+// Contact methods
+// ---------------------------------------------------------------------------
+
+/// The `ContactProtocol` values a contact method is created under, from the
+/// modelled enum: an email address, or the mobile phone number SMS text messages
+/// are sent to.
+pub const CONTACT_PROTOCOL_EMAIL: &str = "Email";
+/// See [`CONTACT_PROTOCOL_EMAIL`].
+pub const CONTACT_PROTOCOL_SMS: &str = "SMS";
+
+/// `ContactMethodStatus` values this slice uses, from the modelled enum's own
+/// documentation: a contact method whose verification has not been completed yet
+/// is `PendingVerification`, and one notifications can be sent through is
+/// `Valid`.
+///
+/// The enum's `Invalid` member describes a contact method whose verification
+/// EXPIRED ("an attempt was made to verify the contact method, but the
+/// verification has expired"), which this store never produces: that expiry is
+/// owed to a verification nobody completed, and nothing here completes or
+/// abandons one.
+pub const CONTACT_METHOD_STATUS_PENDING_VERIFICATION: &str = "PendingVerification";
+/// See [`CONTACT_METHOD_STATUS_PENDING_VERIFICATION`].
+pub const CONTACT_METHOD_STATUS_VALID: &str = "Valid";
+
+/// The status a contact method of `protocol` is created in.
+///
+/// Only an EMAIL contact method has a verification to wait on: the modelled
+/// `ContactMethodVerificationProtocol` enum — the one
+/// `SendContactMethodVerification` takes — declares `Email` and nothing else, so
+/// no other protocol has a verification to send, and a contact method of one is
+/// usable as created.
+pub fn contact_method_initial_status(protocol: &str) -> &'static str {
+    if protocol == CONTACT_PROTOCOL_EMAIL {
+        CONTACT_METHOD_STATUS_PENDING_VERIFICATION
+    } else {
+        CONTACT_METHOD_STATUS_VALID
+    }
+}
+
+/// The Regions that serve the `SMS` contact protocol, from the modelled
+/// `CreateContactMethodRequest$protocol` documentation: "The SMS protocol is
+/// supported only in the following Amazon Web Services Regions", which then
+/// lists exactly these six.
+pub const SMS_SUPPORTED_REGIONS: &[&str] = &[
+    "us-east-1",
+    "us-west-2",
+    "eu-west-1",
+    "ap-northeast-1",
+    "ap-southeast-1",
+    "ap-southeast-2",
+];
+
+/// Whether `region` serves the `SMS` contact protocol; see
+/// [`SMS_SUPPORTED_REGIONS`].
+pub fn sms_supported_in(region: &str) -> bool {
+    SMS_SUPPORTED_REGIONS.contains(&region)
+}
+
+/// The most digits a mobile phone number carries, from the modelled
+/// `CreateContactMethodRequest$contactEndpoint` documentation: "Phone numbers
+/// that follow this format can have a maximum of 15 digits, and they are
+/// prefixed with the plus character (+) and the country code."
+pub const MAX_E164_DIGITS: usize = 15;
+
+/// Why `contact_endpoint` is not a destination of `protocol`, or `None` when it
+/// is one.
+///
+/// The model constrains that member's LENGTH alone (1 to 256 characters), so the
+/// form each protocol's destination takes is checked here: an `Email` endpoint is
+/// an email address, and an `SMS` endpoint is the E.164 phone number that
+/// member's own documentation requires.
+pub fn contact_endpoint_rejection(protocol: &str, contact_endpoint: &str) -> Option<String> {
+    if protocol == CONTACT_PROTOCOL_SMS {
+        let digits = contact_endpoint.strip_prefix('+').unwrap_or_default();
+        if digits.is_empty()
+            || digits.len() > MAX_E164_DIGITS
+            || !digits.chars().all(|c| c.is_ascii_digit())
+        {
+            return Some(format!(
+                "contactEndpoint '{contact_endpoint}' is not a mobile phone number in E.164 \
+                 format: the plus character and the country code, then at most \
+                 {MAX_E164_DIGITS} digits in all"
+            ));
+        }
+        return None;
+    }
+    if !is_email_address(contact_endpoint) {
+        return Some(format!(
+            "contactEndpoint '{contact_endpoint}' is not an email address: a local part, an @, \
+             and a domain of at least two labels"
+        ));
+    }
+    None
+}
+
+/// Whether `value` is an email address: one `@`, a non-empty local part, and a
+/// domain of at least two non-empty labels, with no whitespace anywhere.
+fn is_email_address(value: &str) -> bool {
+    if value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let mut parts = value.split('@');
+    let local = parts.next().unwrap_or_default();
+    let domain = parts.next().unwrap_or_default();
+    if parts.next().is_some() || local.is_empty() || domain.is_empty() {
+        return false;
+    }
+    let labels: Vec<&str> = domain.split('.').collect();
+    labels.len() >= 2 && labels.iter().all(|label| !label.is_empty())
+}
+
+/// The name a contact method is created under: the protocol it sends through and
+/// a minted id.
+///
+/// The caller names no contact method, so the service assigns the name. It
+/// satisfies the modelled `ContactMethod$name` pattern `^\w[\w\-]*\w$` and is
+/// unique among the account's contact methods, because the id is.
+pub fn contact_method_name(protocol: &str, id: &str) -> String {
+    format!("{protocol}-{id}")
+}
+
+/// One stored contact method: the destination `CreateContactMethod` accepted,
+/// the members the service assigned, and the verification status it is in.
+#[derive(Debug, Clone)]
+pub struct StoredContactMethod {
+    /// The `ContactProtocol` this contact method sends through — with the Region
+    /// it was created in, this record's store key.
+    pub protocol: String,
+    /// The destination the request named, kept verbatim.
+    pub contact_endpoint: String,
+    /// The name this store minted for the contact method; see
+    /// [`contact_method_name`].
+    pub name: String,
+    pub arn: String,
+    pub support_code: String,
+    pub created_at_ms: i64,
+    pub location: StoredLocation,
+    /// The current `ContactMethodStatus`; see
+    /// [`contact_method_initial_status`].
+    pub status: String,
+    pub tags: Vec<Tag>,
+}
+
+impl StoredContactMethod {
+    /// This record as the modelled `ContactMethod`.
+    pub fn view(&self) -> ContactMethod {
+        ContactMethod {
+            contact_endpoint: Some(self.contact_endpoint.clone()),
+            status: Some(self.status.clone()),
+            protocol: Some(self.protocol.clone()),
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            location: Some(self.location.view()),
+            resource_type: Some(RESOURCE_TYPE_CONTACT_METHOD.to_string()),
+            support_code: Some(self.support_code.clone()),
+            tags: Some(self.tags.clone()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Load balancers
 // ---------------------------------------------------------------------------
 
@@ -8229,6 +8407,19 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// `BTreeMap` so `GetAlarms` walks a stable, total order and a page token can
     /// name the next alarm.
     pub alarms: BTreeMap<String, StoredAlarm>,
+    /// Every contact method, keyed by the Region it was created in and the
+    /// `ContactProtocol` it sends through — the pair that identifies it, because
+    /// "you can add one email address and one mobile phone number contact method
+    /// in each Amazon Web Services Region" (`CreateContactMethod`), and every
+    /// contact-method operation is scoped to the Region the request is made in.
+    ///
+    /// Unbounded by any `MAX_` of its own, and it needs none: both halves of the
+    /// key come from a modelled enum — the Region from [`request_region`], which
+    /// only ever answers a `RegionName` value, and the protocol from
+    /// `ContactProtocol` — so the map holds at most one entry per Region and
+    /// protocol however many calls a caller makes. A `BTreeMap` so
+    /// `GetContactMethods` walks a stable, total order.
+    pub contact_methods: BTreeMap<(String, String), StoredContactMethod>,
     /// Every load balancer, keyed by the region it was created in and its name.
     ///
     /// A load balancer is a REGIONAL resource — the modelled
@@ -8766,6 +8957,42 @@ impl ComAmazonawsLightsailLightsail20161128State {
                     && alarm.metric.name == metric_name
             })
             .count()
+    }
+
+    /// The contact method of `protocol` in `region`, for a reporting operation.
+    pub fn contact_method(&self, region: &str, protocol: &str) -> Option<&StoredContactMethod> {
+        self.contact_methods
+            .get(&(region.to_string(), protocol.to_string()))
+    }
+
+    /// Every contact method of `region`, in the store's own total order.
+    pub fn contact_methods_in(&self, region: &str) -> Vec<&StoredContactMethod> {
+        self.contact_methods
+            .iter()
+            .filter(|((method_region, _), _)| method_region == region)
+            .map(|(_, method)| method)
+            .collect()
+    }
+
+    /// Store the contact method `CreateContactMethod` just created in `region`.
+    ///
+    /// One Region holds one contact method per protocol, and the model declares
+    /// no operation that updates one, so creating under a protocol that already
+    /// has a contact method REPLACES that record rather than adding a second.
+    pub fn insert_contact_method(&mut self, region: &str, method: StoredContactMethod) {
+        self.contact_methods
+            .insert((region.to_string(), method.protocol.clone()), method);
+    }
+
+    /// Remove the contact method of `protocol` in `region`, answering it. `None`
+    /// when nothing matched.
+    pub fn remove_contact_method(
+        &mut self,
+        region: &str,
+        protocol: &str,
+    ) -> Option<StoredContactMethod> {
+        self.contact_methods
+            .remove(&(region.to_string(), protocol.to_string()))
     }
 
     /// The resource an alarm would monitor under `name`, or `None` when this
@@ -9716,6 +9943,15 @@ pub fn alarm_arn(region: &str, id: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("{ALARM_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The ARN of the contact method `id` in `region`.
+pub fn contact_method_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{CONTACT_METHOD_ARN_RESOURCE_PREFIX}{id}"),
     )
 }
 

@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSampledRequests
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSampledRequests`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports a sample of the web requests a stored web ACL inspected, over the time
+//! range WAF actually sampled.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSampledRequests::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Two things the call reports are computed here:
+//!
+//! * the WINDOW. The requested range is intersected with the sampling horizon that
+//!   ends at the call instant — "You can specify any time range in the previous three
+//!   hours. If you specify a start time that's earlier than three hours ago, WAF sets
+//!   it to three hours ago" — so the reported `TimeWindow` is the range WAF sampled
+//!   over, never a range outside the horizon ([`SAMPLING_HORIZON`]).
+//! * the SAMPLE. WAF draws it "from among the first 5,000 requests that your Amazon
+//!   Web Services resource received during the time range", capped at `MaxItems`, and
+//!   `PopulationSize` is the size of the population it drew from. The population is
+//!   the requests this service inspected for the named rule dimension inside the
+//!   reported window: this emulator serves WAF's CONTROL plane only — no web request
+//!   is ever routed through a web ACL here — so no window has a request in it, and
+//!   both the sample and the population it is drawn from are empty. Synthesising web
+//!   requests nothing ever sent would be fabrication, not emulation.
+//!
+//! The web ACL is resolved from the store, so a `WebAclArn` that is malformed is
+//! `WAFInvalidParameterException` and one that names no web ACL in the requested
+//! `Scope` is `WAFNonexistentItemException` (both HTTP 400) — the same split
+//! `GetWebACL` makes. Nothing here writes to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +129,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How far back a sample can reach, measured from the call instant.
+///
+/// The operation's own doc fixes it: "you can specify any time range in the previous
+/// three hours", and "If you specify a start time that's earlier than three hours
+/// ago, WAF sets it to three hours ago" (`GetSampledRequests$TimeWindow`). A
+/// documented duration, so it keeps the value AWS documents.
+pub const SAMPLING_HORIZON: ::std::time::Duration = ::std::time::Duration::from_secs(3 * 60 * 60);
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -146,6 +168,39 @@ pub type GetSampledRequestsError = crate::scaffolded::Scaffolded<GetSampledReque
 impl From<GetSampledRequestsErrorModeled> for GetSampledRequestsError {
     fn from(modeled: GetSampledRequestsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// Seconds since the Unix epoch, now — the instant a sampling window ends at.
+fn now_epoch_seconds() -> f64 {
+    ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0.0, |since| since.as_secs_f64())
+}
+
+/// The range WAF actually sampled over: the requested range intersected with the
+/// sampling horizon that ends at `now_secs` (seconds since the Unix epoch).
+///
+/// A response's `TimeWindow` is "the time range for which WAF actually returned a
+/// sample of web requests" (`TimeWindow`'s own doc), and that range lies inside the
+/// horizon at both ends: a start earlier than [`SAMPLING_HORIZON`] ago becomes that
+/// instant ("if you specify a start time that's earlier than three hours ago, WAF
+/// sets it to three hours ago"), and an end after the call instant becomes the call
+/// instant, because no request later than that has been received yet. A requested
+/// range that already lies inside the horizon is reported unchanged, which is the
+/// usual case: "GetSampledRequests returns a time range, which is usually the time
+/// range that you specified".
+fn sampled_window(requested: &TimeWindow, now_secs: f64) -> TimeWindow {
+    let horizon_start = now_secs - SAMPLING_HORIZON.as_secs_f64();
+    let start = requested
+        .start_time
+        .as_secs_f64()
+        .clamp(horizon_start, now_secs);
+    // The end never precedes the start WAF settled on: the pair is a range.
+    let end = requested.end_time.as_secs_f64().clamp(start, now_secs);
+    TimeWindow {
+        start_time: ::aws_smithy_types::DateTime::from_secs_f64(start),
+        end_time: ::aws_smithy_types::DateTime::from_secs_f64(end),
     }
 }
 
@@ -185,18 +240,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSampledRequests` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSampledRequestsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSampledRequests"))
+        // A report: it reads the stored web ACL and the clock, and writes nothing a
+        // later caller could see. `ctx` carries only request metadata, which this
+        // operation does not need.
+        let _ = ctx;
+
+        // `Scope` "specifies whether this is for a global resource type" and is the
+        // namespace the web ACL is resolved in, so it is judged first.
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(GetSampledRequestsErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_SCOPE_VALUE,
+                    &input.scope,
+                    "the scope names the namespace the web ACL is resolved in, \
+                     and is one of CLOUDFRONT or REGIONAL",
+                ),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetSampledRequestsErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // `WebAclArn` is "the Amazon resource name (ARN) of the WebACL for which you
+        // want a sample of requests", so the two ARN failures the model names are told
+        // apart the way `GetWebACL` tells them apart: an ARN that is malformed is
+        // `WAFInvalidParameterException` ("your request references an ARN that is
+        // malformed"), and a well-formed one naming no web ACL in this scope is
+        // `WAFNonexistentItemException`.
+        let arn = input.web_acl_arn.as_str();
+        if !crate::state::is_wafv2_resource_arn(arn) {
+            return Err(GetSampledRequestsErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_arn_exception(arn),
+            )
+            .into());
+        }
+        let holds_web_acl = match state.arn_index.get(arn) {
+            Some(crate::state::ResourceRef::WebAcl { scope, id }) => {
+                *scope == input.scope && state.web_acls.contains_key(&(scope.clone(), id.clone()))
+            }
+            // An ARN that resolves to another resource kind is not a web ACL ARN, and
+            // a web ACL of the other scope is a different resource.
+            Some(crate::state::ResourceRef::IpSet { .. })
+            | Some(crate::state::ResourceRef::RegexPatternSet { .. })
+            | Some(crate::state::ResourceRef::RuleGroup { .. })
+            | None => false,
+        };
+        if !holds_web_acl {
+            return Err(GetSampledRequestsErrorModeled::WAFNonexistentItemException(
+                crate::state::nonexistent_item_exception(),
+            )
+            .into());
+        }
+
+        // The window WAF sampled over, which is what the response reports.
+        let window = sampled_window(&input.time_window, now_epoch_seconds());
+
+        // WAF draws the sample from the web requests it INSPECTED for the
+        // `RuleMetricName` dimension inside that window — "the first 5,000 requests
+        // that your Amazon Web Services resource received during the time range" —
+        // and answers at most `MaxItems` of them beside the size of that population.
+        // This emulator serves WAF's CONTROL plane: no web request is ever routed
+        // through a web ACL here, so no window holds one. The population is therefore
+        // zero and the sample drawn from it is empty, which is also what WAF answers
+        // for a window in which the web ACL received nothing. Synthesising web
+        // requests nothing ever sent would be fabrication, not emulation.
+        Ok(GetSampledRequestsOutput {
+            sampled_requests: Some(Vec::new()),
+            population_size: 0,
+            time_window: Some(window),
+        })
     }
 }

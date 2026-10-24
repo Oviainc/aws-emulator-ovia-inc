@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDeliverySources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDeliverySources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDeliverySources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's delivery sources from [`crate::state`]: every source representing
+//! one of the resources the request names (or all of them, when it names none), in
+//! source-name order, one `limit`-sized page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +107,49 @@ impl From<DescribeDeliverySourcesErrorModeled> for DescribeDeliverySourcesError 
     }
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by another
+/// paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "DescribeDeliverySources";
+
+/// Where the next page resumes: the `name` of the last delivery source returned, plus the
+/// filter of the enumeration it belongs to. A continuation that changes the filter is refused,
+/// because the token is only a position within one filtered enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    resource_arns: Option<Vec<String>>,
+    after: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "resourceArns": self.resource_arns,
+            "after": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        let resource_arns = match value.get("resourceArns") {
+            None | Some(::serde_json::Value::Null) => None,
+            Some(arns) => Some(
+                arns.as_array()?
+                    .iter()
+                    .map(|arn| arn.as_str().map(ToString::to_string))
+                    .collect::<Option<Vec<String>>>()?,
+            ),
+        };
+        Some(Self {
+            resource_arns,
+            after: value.get("after")?.as_str()?.to_string(),
+        })
+    }
+}
+
 /// The `DescribeDeliverySources` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -148,18 +186,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDeliverySources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDeliverySourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDeliverySources"))
+        // `ctx` carries only request metadata; this operation reports on stored delivery
+        // sources and needs none of it.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeDeliverySourcesError::from(
+                DescribeDeliverySourcesErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let store = state.lock();
+
+        let invalid = |message: &str| {
+            DescribeDeliverySourcesError::from(
+                DescribeDeliverySourcesErrorModeled::ValidationException(ValidationException {
+                    message: Some(message.to_string()),
+                }),
+            )
+        };
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token"));
+                };
+                if cursor.resource_arns != input.resource_arns {
+                    return Err(invalid(
+                        "nextToken was issued for a different DescribeDeliverySources request",
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // One enumeration, in the order the store holds it (by source name), of the sources
+        // the request's filter selects: `resourceArns` is "An array of Amazon Resource Names
+        // (ARNs) that filters the results to delivery sources associated with ANY specified
+        // ARN", so a source is selected when one of its `resourceArns` is among them, and
+        // every source is selected when the request names no ARN at all.
+        let matching: Vec<&crate::state::DeliverySourceRecord> = store
+            .delivery_sources
+            .values()
+            .filter(|source| {
+                input.resource_arns.as_ref().is_none_or(|arns| {
+                    source
+                        .resource_arns
+                        .iter()
+                        .any(|resource_arn| arns.contains(resource_arn))
+                })
+            })
+            .collect();
+
+        let first = match &cursor {
+            Some(cursor) => matching.partition_point(|source| source.name <= cursor.after),
+            None => 0,
+        };
+        // "Optionally specify the maximum number of delivery sources to return in the
+        // response." `limit` is modelled `range 1..50`, so the boundary validator has already
+        // refused a value outside it; `max(1)` only keeps the page bounds sane.
+        let limit = usize::try_from(input.limit.unwrap_or(crate::state::DEFAULT_DESCRIBE_LIMIT))
+            .unwrap_or(0)
+            .max(1);
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        // A token is "The token for the next set of items to return": there is a next set only
+        // while sources remain beyond this page.
+        let next_token = page.last().filter(|_| last < matching.len()).map(|source| {
+            Cursor {
+                resource_arns: input.resource_arns.clone(),
+                after: source.name.clone(),
+            }
+            .encode()
+        });
+
+        Ok(DescribeDeliverySourcesOutput {
+            delivery_sources: Some(
+                page.iter()
+                    .map(|source| source.reported())
+                    .collect::<Vec<DeliverySource>>(),
+            ),
+            next_token,
+        })
     }
 }

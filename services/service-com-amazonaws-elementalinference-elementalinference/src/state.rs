@@ -21,6 +21,21 @@
 //! one copy of that fact backs the dictionary's `references` list, its `REFERENCED`
 //! status and `DeleteDictionary`'s refusal alike.
 //!
+//! Both of those resources are REGIONAL: this service is reached through a Region's
+//! endpoint and each endpoint owns the resources created through it. So every record
+//! carries the Region it was created in ([`Feed::region`], [`Dictionary::region`]), and
+//! every operation that reaches one resolves it WITHIN the Region the request was signed
+//! for ([`ComAmazonawsElementalinferenceElementalinferenceState::feed`],
+//! [`ComAmazonawsElementalinferenceElementalinferenceState::dictionary`],
+//! [`ComAmazonawsElementalinferenceElementalinferenceState::feeds_in`],
+//! [`ComAmazonawsElementalinferenceElementalinferenceState::dictionaries_in`]): a
+//! resource is listed, read and mutated through the endpoint that created it alone, an
+//! id presented to any other Region names nothing there, and the quotas below are each
+//! Region's own. It is the same whole-ARN rule
+//! [`ComAmazonawsElementalinferenceElementalinferenceState::tagged_resource_mut`] holds
+//! the tagging path to, so the id-based and the ARN-based paths cannot disagree about
+//! which resources a Region holds.
+//!
 //! A FIXTURE is not one of those resources: no operation of this service creates,
 //! updates or deletes one. A fixture is a sports event "as provided by the data
 //! source" (`GetFixtureResponse$name`/`$status`), an external feed of sports data that
@@ -93,27 +108,40 @@ const DICTIONARY_ID_ALPHABET: &[u8; 62] =
 /// succeeds — so a feed is stored settled and this span never applies to it.
 pub const TRANSITION_SPAN: Duration = Duration::from_millis(400);
 
-/// The most feeds this emulator keeps at once.
+/// The most feeds this emulator keeps in ONE Region at once.
 ///
 /// Elemental Inference limits how many feeds an account may hold (the model declares
 /// `ServiceQuotaExceededException` for `CreateFeed` precisely for that), but it does
-/// not state the figure, so this one is the emulator's own: it is the BOUND on the
-/// feed store, which would otherwise grow by one record per request forever. Past it
-/// `CreateFeed` refuses with the modelled `ServiceQuotaExceededException` (HTTP 402),
-/// which is both the bound and the answer the real service gives when the quota is
-/// exhausted, and it caps the work every settle pass and every page can do.
+/// not state the figure, so this one is the emulator's own. A service quota is a
+/// per-Region figure, so this is what one Region's endpoint holds: past it `CreateFeed`
+/// refuses with the modelled `ServiceQuotaExceededException` (HTTP 402), which is the
+/// answer the real service gives when the quota is exhausted, and together with
+/// [`MAX_REGIONS`] it is what bounds a store that would otherwise grow by one record
+/// per request forever, and caps the work every settle pass and every page can do.
 pub const MAX_FEEDS: usize = 100;
 
-/// The most dictionaries this emulator keeps at once.
+/// The most dictionaries this emulator keeps in ONE Region at once.
 ///
 /// As with [`MAX_FEEDS`], Elemental Inference limits how many dictionaries an account
 /// may hold (the model declares `ServiceQuotaExceededException` for
-/// `CreateDictionary`) without stating the figure, so this one is the emulator's own:
-/// it BOUNDS the dictionary store, which would otherwise grow by one record per
-/// request forever. Past it `CreateDictionary` refuses with the modelled
-/// `ServiceQuotaExceededException` (HTTP 402), which is also the answer the real
-/// service gives once the quota is exhausted.
+/// `CreateDictionary`) without stating the figure, so this one is the emulator's own,
+/// and it is per Region because a service quota is. Past it `CreateDictionary` refuses
+/// with the modelled `ServiceQuotaExceededException` (HTTP 402), which is also the
+/// answer the real service gives once the quota is exhausted.
 pub const MAX_DICTIONARIES: usize = 100;
+
+/// The most Regions this store keeps resources of one kind in at once.
+///
+/// The Region a record belongs to comes from the request's own SigV4 credential scope
+/// ([`request_region`]), so a caller chooses it: without a bound on how many distinct
+/// Regions the store partitions across, a per-Region quota would bound nothing and a
+/// run of requests could grow the store without limit. With it the store holds at most
+/// [`MAX_REGIONS`] * [`MAX_FEEDS`] feeds and as many dictionaries, and a create signed
+/// for one Region past that earns the same modelled `ServiceQuotaExceededException`
+/// (HTTP 402) a create past a Region's own quota does. The figure is comfortably more
+/// than the Regions this service is offered in, so no caller using it as a client of
+/// the real service's Regions meets it.
+pub const MAX_REGIONS: usize = 32;
 
 /// The `FeedStatus` values this slice of the service produces.
 ///
@@ -385,6 +413,10 @@ pub struct Dictionary {
     pub id: String,
     pub name: String,
     pub arn: String,
+    /// The Region whose endpoint this dictionary was created through, and so the only
+    /// one it exists for: the Region of the request that minted it
+    /// ([`request_region`]), which is also the Region field of [`Self::arn`].
+    pub region: String,
     /// An ISO 639-2/T code from the modelled `DictionaryLanguage` enum.
     pub language: String,
     /// The entries payload as submitted; empty when the request carried none.
@@ -519,6 +551,10 @@ pub struct Feed {
     pub id: String,
     pub name: String,
     pub arn: String,
+    /// The Region whose endpoint this feed was created through, and so the only one it
+    /// exists for: the Region of the request that minted it ([`request_region`]), which
+    /// is also the Region field of [`Self::arn`].
+    pub region: String,
     pub data_endpoints: Vec<String>,
     pub outputs: Vec<Output>,
     pub access_role_arn: Option<String>,
@@ -607,16 +643,22 @@ impl Feed {
 #[derive(Debug)]
 pub struct ComAmazonawsElementalinferenceElementalinferenceState {
     /// Every live feed, keyed by its `FeedId`. `BTreeMap` so `ListFeeds` has one
-    /// stable order to paginate over. BOUNDED at [`MAX_FEEDS`] entries: `CreateFeed`
-    /// refuses past that with the modelled `ServiceQuotaExceededException`, so this
-    /// map cannot grow without limit however many requests arrive.
+    /// stable order to paginate over. PARTITIONED BY REGION: each record carries the
+    /// Region it was created in ([`Feed::region`]) and is reachable only through that
+    /// Region ([`Self::feed`], [`Self::feeds_in`]), so this one map holds every
+    /// Region's feeds without any of them seeing another's. BOUNDED at [`MAX_FEEDS`]
+    /// entries per Region across at most [`MAX_REGIONS`] Regions: `CreateFeed` refuses
+    /// past either with the modelled `ServiceQuotaExceededException`, so this map
+    /// cannot grow without limit however many requests arrive.
     pub feeds: BTreeMap<String, Feed>,
     /// Monotonic source for minted feed ids: one more per feed this emulator mints.
     pub next_feed_seq: u64,
     /// Every live dictionary, keyed by its `DictionaryId`. `BTreeMap` so
-    /// `ListDictionaries` has one stable order to paginate over. BOUNDED at
-    /// [`MAX_DICTIONARIES`] entries: `CreateDictionary` refuses past that with the
-    /// modelled `ServiceQuotaExceededException`.
+    /// `ListDictionaries` has one stable order to paginate over. Partitioned by Region
+    /// exactly as [`Self::feeds`] is ([`Dictionary::region`], [`Self::dictionary`],
+    /// [`Self::dictionaries_in`]), and BOUNDED at [`MAX_DICTIONARIES`] entries per
+    /// Region across at most [`MAX_REGIONS`] Regions: `CreateDictionary` refuses past
+    /// either with the modelled `ServiceQuotaExceededException`.
     pub dictionaries: BTreeMap<String, Dictionary>,
     /// Monotonic source for minted dictionary ids: one more per dictionary this
     /// emulator mints.
@@ -767,6 +809,122 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
         self.earliest_due = Some(self.earliest_due.map_or(due, |earliest| earliest.min(due)));
     }
 
+    /// The one feed `id` names IN `region`, or `None` when that Region holds no such
+    /// feed.
+    ///
+    /// This service is regional: a feed exists for the Region whose endpoint created it
+    /// and for no other, so a lookup is a (Region, id) lookup and an id that names a
+    /// feed of a different Region names nothing. Every reporting operation that reaches
+    /// a feed by its `FeedId` goes through this (and every mutating one through
+    /// [`Self::feed_mut`]), so none of them can disagree about which feeds a Region
+    /// holds, or answer for another Region's.
+    pub fn feed(&self, region: &str, id: &str) -> Option<&Feed> {
+        self.feeds.get(id).filter(|feed| feed.region == region)
+    }
+
+    /// The one feed `id` names in `region`, for a caller that writes it — the mutating
+    /// half of [`Self::feed`], with the same Region rule.
+    pub fn feed_mut(&mut self, region: &str, id: &str) -> Option<&mut Feed> {
+        self.feeds.get_mut(id).filter(|feed| feed.region == region)
+    }
+
+    /// Every feed of `region`, in `FeedId` order — what `ListFeeds` pages over, since
+    /// a list reports the feeds of the endpoint it was sent to and nothing else.
+    pub fn feeds_in<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a Feed> + 'a {
+        self.feeds.values().filter(move |feed| feed.region == region)
+    }
+
+    /// The one dictionary `id` names in `region`, or `None` when that Region holds no
+    /// such dictionary — the dictionary's counterpart of [`Self::feed`].
+    pub fn dictionary(&self, region: &str, id: &str) -> Option<&Dictionary> {
+        self.dictionaries
+            .get(id)
+            .filter(|dictionary| dictionary.region == region)
+    }
+
+    /// The one dictionary `id` names in `region`, for a caller that writes it.
+    pub fn dictionary_mut(&mut self, region: &str, id: &str) -> Option<&mut Dictionary> {
+        self.dictionaries
+            .get_mut(id)
+            .filter(|dictionary| dictionary.region == region)
+    }
+
+    /// Every dictionary of `region`, in `DictionaryId` order — what `ListDictionaries`
+    /// pages over.
+    pub fn dictionaries_in<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a Dictionary> + 'a {
+        self.dictionaries
+            .values()
+            .filter(move |dictionary| dictionary.region == region)
+    }
+
+    /// The refusal `CreateFeed` answers in `region`, or `None` while that Region may
+    /// take one more feed.
+    ///
+    /// A service quota is a PER-REGION figure, so what the Region already holds is what
+    /// decides it: another Region's feeds neither consume it nor are consumed by it.
+    /// The second clause is the STORE's own bound rather than a quota of the service
+    /// (see [`MAX_REGIONS`]): a Region this store holds no feed of is a new partition,
+    /// and there are at most that many. Each refusal states the bound it was decided
+    /// from and reports nothing else about what the account holds.
+    pub fn feed_quota_refusal(&self, region: &str) -> Option<String> {
+        let held = self.feeds_in(region).count();
+        if held >= MAX_FEEDS {
+            return Some(format!(
+                "This account already holds the maximum of {MAX_FEEDS} feeds in this Region. \
+                 Delete unused feeds or request a quota increase."
+            ));
+        }
+        if held == 0 && self.feed_region_count() >= MAX_REGIONS {
+            return Some(format!(
+                "This account already holds feeds in the maximum of {MAX_REGIONS} Regions. \
+                 Delete the feeds of a Region you no longer use or request a quota increase."
+            ));
+        }
+        None
+    }
+
+    /// The refusal `CreateDictionary` answers in `region`, or `None` while that Region
+    /// may take one more dictionary — the dictionary's counterpart of
+    /// [`Self::feed_quota_refusal`], against [`MAX_DICTIONARIES`].
+    pub fn dictionary_quota_refusal(&self, region: &str) -> Option<String> {
+        let held = self.dictionaries_in(region).count();
+        if held >= MAX_DICTIONARIES {
+            return Some(format!(
+                "This account already holds the maximum of {MAX_DICTIONARIES} dictionaries in \
+                 this Region. Delete unused dictionaries or request a quota increase."
+            ));
+        }
+        if held == 0 && self.dictionary_region_count() >= MAX_REGIONS {
+            return Some(format!(
+                "This account already holds dictionaries in the maximum of {MAX_REGIONS} \
+                 Regions. Delete the dictionaries of a Region you no longer use or request a \
+                 quota increase."
+            ));
+        }
+        None
+    }
+
+    /// How many distinct Regions this store holds a feed in.
+    fn feed_region_count(&self) -> usize {
+        self.feeds
+            .values()
+            .map(|feed| feed.region.as_str())
+            .collect::<std::collections::BTreeSet<&str>>()
+            .len()
+    }
+
+    /// How many distinct Regions this store holds a dictionary in.
+    fn dictionary_region_count(&self) -> usize {
+        self.dictionaries
+            .values()
+            .map(|dictionary| dictionary.region.as_str())
+            .collect::<std::collections::BTreeSet<&str>>()
+            .len()
+    }
+
     /// The resource a `resourceArn` names, if this store holds it.
     ///
     /// An ARN identifies a resource WHOLE: the kind of resource (`feed` or
@@ -813,9 +971,12 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
     ///
     /// Scans at most [`MAX_FEEDS`] feeds, each with at most [`MAX_OUTPUTS_PER_FEED`]
     /// outputs.
-    pub fn feeds_referencing(&self, dictionary_id: &str) -> Vec<String> {
-        self.feeds
-            .values()
+    ///
+    /// Scoped to `region`: an output names a dictionary by its bare `DictionaryId`, and
+    /// an id resolves within the Region that holds it, so only the feeds of a
+    /// dictionary's OWN Region can reference it.
+    pub fn feeds_referencing(&self, region: &str, dictionary_id: &str) -> Vec<String> {
+        self.feeds_in(region)
             .filter(|feed| feed.references_dictionary(dictionary_id))
             .map(|feed| feed.id.clone())
             .collect()
@@ -833,9 +994,8 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
     /// deletion is accepted, which is what lets a caller tear down a feed and then its
     /// dictionary without waiting for the feed's removal to fall due. It is still a
     /// live record until then, so it stays in [`Self::feeds_referencing`].
-    pub fn feeds_blocking_delete(&self, dictionary_id: &str) -> Vec<String> {
-        self.feeds
-            .values()
+    pub fn feeds_blocking_delete(&self, region: &str, dictionary_id: &str) -> Vec<String> {
+        self.feeds_in(region)
             .filter(|feed| {
                 feed.status != FeedStatus::Deleting && feed.references_dictionary(dictionary_id)
             })

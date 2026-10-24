@@ -1139,6 +1139,23 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             .filter(|existing| *existing != group_arn)
     }
 
+    /// The ARNs of the stored billing groups OTHER than `group_arn` that have
+    /// automatic account association enabled — what the
+    /// [`MAX_AUTO_ASSOCIATE_BILLING_GROUPS`] cap is decided against.
+    ///
+    /// `group_arn` is the group the request is about, and the empty string for a group
+    /// that does not exist yet, so a request that leaves the flag where the addressed
+    /// group already has it is never refused by the group's own enablement.
+    pub fn other_auto_associate_billing_groups(&self, group_arn: &str) -> Vec<String> {
+        self.billing_groups
+            .iter()
+            .filter(|(arn, group)| {
+                group.auto_associate.unwrap_or(false) && arn.as_str() != group_arn
+            })
+            .map(|(arn, _)| arn.clone())
+            .collect()
+    }
+
     /// The group an account is already associated with, when it is not `group_arn`.
     pub fn conflicting_association(&self, account_id: &str, group_arn: &str) -> Option<&str> {
         self.account_associations
@@ -1366,6 +1383,21 @@ pub const MAX_PRICING_PLANS: usize = 1000;
 /// see [`MAX_PRICING_PLANS`] for why it exists and how it is enforced.
 pub const MAX_BILLING_GROUPS: usize = 1000;
 
+/// How many of a consolidated billing family's billing groups may have automatic
+/// account association enabled at once.
+///
+/// NOT a chosen bound: `AccountGrouping.AutoAssociate` elects the ONE group that
+/// "will automatically associate newly added Amazon Web Services accounts that join
+/// your consolidated billing family" (the member's own documentation), and an account
+/// belongs to at most one billing group — so two enabled groups would both claim the
+/// same joining account and the election would not decide anything. The model names
+/// the refusal a request past the cap earns:
+/// `ValidationExceptionReason` enumerates `TOO_MANY_AUTO_ASSOCIATE_BILLING_GROUPS`
+/// (`smithy_query(query="shape",shape="ValidationExceptionReason")`). The cap is on
+/// STATE, so every operation that can turn the flag on enforces it, and a group that
+/// already has it on may restate it.
+pub const MAX_AUTO_ASSOCIATE_BILLING_GROUPS: usize = 1;
+
 /// How many custom line items this emulator stores for the account. A CHOSEN bound;
 /// see [`MAX_PRICING_PLANS`] for why it exists and how it is enforced.
 pub const MAX_CUSTOM_LINE_ITEMS: usize = 1000;
@@ -1574,6 +1606,29 @@ pub fn accounts_already_associated(
         field,
         format!(
             "account {account_id} is already associated with billing group {owner_group_arn}"
+        ),
+    )
+}
+
+/// The modelled refusal a request earns when enabling automatic account association
+/// would take the consolidated billing family past
+/// [`MAX_AUTO_ASSOCIATE_BILLING_GROUPS`] groups that have it enabled.
+///
+/// Built here so every operation that can turn `AccountGrouping.AutoAssociate` on
+/// answers it the same way; `field` names the input member that carried the flag, and
+/// `holders` the groups that already have it, which is what the message is built from.
+pub fn too_many_auto_associate_billing_groups(
+    field: &str,
+    holders: &[String],
+) -> crate::ops::types::ValidationException {
+    validation_exception(
+        "TOO_MANY_AUTO_ASSOCIATE_BILLING_GROUPS",
+        field,
+        format!(
+            "at most {MAX_AUTO_ASSOCIATE_BILLING_GROUPS} billing group of a consolidated \
+             billing family may automatically associate newly added accounts; it is already \
+             enabled on {}",
+            holders.join(", ")
         ),
     )
 }

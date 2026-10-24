@@ -3,7 +3,8 @@
 //! End-to-end tests for `ListWorkflowRuns`.
 //!
 //! The rule under test: `ListWorkflowRuns` reports one `WorkflowRunSummary` per run the
-//! STORE holds under the workflow its `WorkflowArn` names — in `RunId` order, at most
+//! STORE holds under the workflow its `WorkflowArn` names — oldest first by the instant
+//! each run was created, at most
 //! `MaxResults` per page, continued through the opaque `NextToken` this service itself
 //! issued, and narrowed to a single `WorkflowVersion` when the request names one, since
 //! "If not specified, runs for all versions are returned"
@@ -42,7 +43,7 @@ fn ghost_version() -> String {
 }
 
 /// Create a workflow and report its ARN.
-async fn created_workflow(harness: &Harness, name: &str) -> String {
+pub(crate) async fn created_workflow(harness: &Harness, name: &str) -> String {
     let (status, created) = harness
         .call(
             "CreateWorkflow",
@@ -86,7 +87,7 @@ async fn appended_version(harness: &Harness, arn: &str, object_key: &str) -> Str
 }
 
 /// Start one run, optionally on a named version, and report its `RunId`.
-async fn started_run(harness: &Harness, arn: &str, version: Option<&str>) -> String {
+pub(crate) async fn started_run(harness: &Harness, arn: &str, version: Option<&str>) -> String {
     let mut body = serde_json::json!({"WorkflowArn": arn});
     if let Some(version) = version {
         body["WorkflowVersion"] = serde_json::Value::String(version.to_string());
@@ -126,7 +127,7 @@ fn pinned(harness: &Harness, arn: &str, run_id: &str, status: &str, age_millis: 
 }
 
 /// Call `ListWorkflowRuns` and return its status and body.
-async fn list(
+pub(crate) async fn list(
     harness: &Harness,
     arn: &str,
     max_results: Option<i64>,
@@ -148,7 +149,7 @@ async fn list(
 
 /// Page through the whole listing at `page_size` and report every `RunId` in the order
 /// the pages reported them.
-async fn paged_run_ids(
+pub(crate) async fn paged_run_ids(
     harness: &Harness,
     arn: &str,
     page_size: i64,
@@ -205,27 +206,33 @@ async fn paged_run_ids(
 }
 
 #[tokio::test]
-async fn every_persisted_run_is_listed_exactly_once_across_pages_in_run_id_order() {
+async fn every_persisted_run_is_listed_exactly_once_across_pages_in_chronological_order() {
     let harness = Harness::new("us-east-1");
     let arn = created_workflow(&harness, "pagedRuns").await;
 
     // The statuses the rows cycle through, so a page mixes working and terminal runs.
     let statuses = [RUN_STATUS_STARTING, RUN_STATUS_QUEUED, RUN_STATUS_FAILED];
 
-    // Seven runs, so the page sizes below divide the set evenly and unevenly.
-    let mut expected: Vec<String> = Vec::new();
+    // Seven runs, so the page sizes below divide the set evenly and unevenly. Each run
+    // is seeded OLDER than the one started before it, so the chronological order the
+    // listing must report is neither the order the runs were started nor the order of
+    // the identifiers they are stored under.
+    let mut seeded: Vec<(u64, String)> = Vec::new();
     for index in 0..7_u64 {
         let run_id = started_run(&harness, &arn, None).await;
+        let age_millis = 1_000 + index * 250;
         pinned(
             &harness,
             &arn,
             &run_id,
             statuses[usize::try_from(index).expect("a small index") % statuses.len()],
-            1_000 + index * 250,
+            age_millis,
         );
-        expected.push(run_id);
+        seeded.push((age_millis, run_id));
     }
-    expected.sort();
+    // Oldest first: the largest age is the earliest creation instant.
+    seeded.sort_by_key(|(age_millis, _)| std::cmp::Reverse(*age_millis));
+    let expected: Vec<String> = seeded.iter().map(|(_, run_id)| run_id.clone()).collect();
 
     // `MaxResults` is modelled `@range(min: 1, max: 100)`: both published bounds plus
     // sizes smaller than, equal to and larger than the set.
@@ -234,7 +241,7 @@ async fn every_persisted_run_is_listed_exactly_once_across_pages_in_run_id_order
         let seen = paged_run_ids(&harness, &arn, page_size, None, &case).await;
         assert_eq!(
             seen, expected,
-            "case {case:?}: paging must yield every run exactly once, in RunId order, got \
+            "case {case:?}: paging must yield every run exactly once, oldest first, got \
              {seen:?}"
         );
     }
@@ -446,20 +453,19 @@ async fn the_workflow_version_filter_narrows_the_listing_to_the_runs_that_carry_
     let second = appended_version(&harness, &arn, "dags/v2.yaml").await;
     let third = appended_version(&harness, &arn, "dags/v3.yaml").await;
 
+    // Nothing rewrites these runs' clocks, so the order the listing must report is the
+    // order they were started in.
     let mut by_version: Vec<(String, Vec<String>)> = Vec::new();
+    let mut all: Vec<String> = Vec::new();
     for (version, count) in [(&first, 2_usize), (&second, 1), (&third, 3)] {
         let mut ids = Vec::new();
         for _ in 0..count {
-            ids.push(started_run(&harness, &arn, Some(version)).await);
+            let run_id = started_run(&harness, &arn, Some(version)).await;
+            all.push(run_id.clone());
+            ids.push(run_id);
         }
-        ids.sort();
         by_version.push((version.clone(), ids));
     }
-    let mut all: Vec<String> = by_version
-        .iter()
-        .flat_map(|(_, ids)| ids.iter().cloned())
-        .collect();
-    all.sort();
 
     // The rows: no filter (every version), each stored version, and a pattern-valid
     // version no run carries.
@@ -487,8 +493,8 @@ async fn the_workflow_version_filter_narrows_the_listing_to_the_runs_that_carry_
                 paged_run_ids(&harness, &arn, page_size, version.as_deref(), &label).await;
             assert_eq!(
                 seen, expected,
-                "case {label:?}: expected exactly the runs carrying that version, in RunId \
-                 order, got {seen:?}"
+                "case {label:?}: expected exactly the runs carrying that version, oldest \
+                 first, got {seen:?}"
             );
         }
 
