@@ -17,6 +17,8 @@ mod arn_validation_errors;
 mod missing_resource_lookups;
 #[path = "all/resource_tag_listing.rs"]
 mod resource_tag_listing;
+#[path = "all/run_lifecycle_progression.rs"]
+mod run_lifecycle_progression;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/task_instance_reads.rs"]

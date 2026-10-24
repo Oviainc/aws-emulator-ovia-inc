@@ -26,8 +26,15 @@
 //! Two more things the store holds, each read by a layer rather than by one handler:
 //!
 //! * the recorded EXECUTIONS of an export ([`StoredExecution`]), which `GetExecution`
-//!   reports one of and `ListExecutions` pages over. Nothing in this emulator creates
-//!   one — see that type's own note.
+//!   reports one of and `ListExecutions` pages over. The service OWES each export a
+//!   delivery — one when `CreateExport` persists a definition and one whenever
+//!   `UpdateExport` replaces it — and records an execution of it on the clock, without
+//!   any caller call: the delivery is held on the export as a
+//!   [`PendingDelivery`] until its instant falls due, and
+//!   [`ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState::materialize_due`]
+//!   turns whatever the clock already owes into execution records. See
+//!   [`StoredExecution`] for why the delivery this emulator cannot perform ends in the
+//!   service's own modelled failure state.
 //!
 //! [`authorization`] is beside them: who a request speaks for and whether IAM lets it do
 //! what it asks, for the operations whose model declares `AccessDeniedException`. It holds
@@ -39,6 +46,7 @@ use crate::ops::types::{
     ValidationException, ValidationExceptionField,
 };
 use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
 
 pub mod authorization;
 pub mod catalog;
@@ -113,14 +121,93 @@ pub const SERVICE_CODE: &str = SIGNING_NAME;
 /// The quota a `ServiceQuotaExceededException` from `CreateExport` names.
 pub const EXPORTS_PER_ACCOUNT_QUOTA_CODE: &str = "ExportsPerAccount";
 
+/// The `ExecutionStatusCode` of a delivery the service has STARTED but not finished: the
+/// first status an execution carries. One of the modelled values (see
+/// `crate::ops::types::EXECUTION_STATUS_CODE_VALUES`).
+pub const EXECUTION_STATUS_INITIATION_IN_PROCESS: &str = "INITIATION_IN_PROCESS";
+
+/// The terminal `ExecutionStatusCode` of a delivery whose QUERY did not run: the step a
+/// delivery fails at when the data this service exports cannot be queried at all, before
+/// anything is written to the destination bucket. One of the modelled values.
+pub const EXECUTION_STATUS_QUERY_FAILURE: &str = "QUERY_FAILURE";
+
+/// The `ExecutionStatusReason` of a delivery that failed on the SERVICE's own side rather
+/// than on anything about the caller's export: one of the modelled values (smithy_query
+/// shape `ExecutionStatusReason`: `INSUFFICIENT_PERMISSION`, `BILL_OWNER_CHANGED`,
+/// `INTERNAL_FAILURE`, `DEPRECATED`), and the only one of the four that does not make a
+/// claim about the caller's permissions, bill ownership or query.
+pub const EXECUTION_STATUS_REASON_INTERNAL_FAILURE: &str = "INTERNAL_FAILURE";
+
+/// How long after the call that owes an export a delivery the service INITIATES it.
+///
+/// CHOSEN, not documented: AWS publishes no latency for a data-export delivery (it
+/// promises only that the export refreshes when the source data updates), so this is the
+/// emulator's own span. It is never zero — a caller listing executions straight after
+/// `CreateExport` still sees the export before its first delivery exists — and it is short
+/// enough that no test has to wait long for one. The instant is STORED on the export
+/// ([`PendingDelivery::initiate_at`]) and materialised by whichever request next reaches
+/// the store; nothing sleeps for it.
+pub const DELIVERY_INITIATION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long after a delivery is initiated it reaches its terminal status.
+///
+/// CHOSEN for the same reason, and bounded the same way: a caller that reads an execution
+/// as soon as it appears sees it in its non-terminal `INITIATION_IN_PROCESS` status, and
+/// the terminal status is due a short span later. Stored on the execution
+/// ([`StoredExecution::completion_due_at`]), never slept on.
+pub const DELIVERY_SETTLES_AFTER: Duration = Duration::from_millis(500);
+
+/// How many executions one export keeps.
+///
+/// EMULATOR resource guard, not an AWS retention: AWS publishes no window for
+/// execution history, so this value bounds
+/// [`ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState::executions`],
+/// which lives for the life of the process and grows by one delivery per `CreateExport`
+/// and per `UpdateExport`. The OLDEST execution of the export is dropped first, so the
+/// deliveries a caller is most likely to read are the ones kept.
+pub const MAX_EXECUTIONS_PER_EXPORT: usize = 100;
+
+/// The delivery the service owes an export and has not initiated yet.
+///
+/// AWS delivers a data export without being asked — "The cadence for Amazon Web Services
+/// to update the data export in your S3 bucket" (smithy_query shape `RefreshCadence`) —
+/// so the delivery is owed by the CLOCK rather than by any operation a caller can call,
+/// and what is stored here is the two instants it moves at plus the definition it runs.
+/// All three are fixed by the call that owed it ([`DELIVERY_INITIATION_DELAY`] after it),
+/// so WHICH later request materialises it cannot change the execution anybody reads.
+#[derive(Debug, Clone)]
+pub struct PendingDelivery {
+    /// The instant the service initiates this delivery, and the instant the execution it
+    /// records is created at.
+    pub initiate_at: SystemTime,
+    /// Which delivery of its export this is: the count of deliveries that export had been
+    /// owed before it. No later delivery of the same export carries the same number, which
+    /// is what makes the `ExecutionId` minted for it unique within the export (see
+    /// [`execution_id`]).
+    pub sequence: u64,
+    /// The instant that execution reaches its terminal status, [`DELIVERY_SETTLES_AFTER`]
+    /// later. Fixed here, with the initiation, rather than recomputed when the delivery is
+    /// initiated, so neither instant depends on when a request happened to materialise it.
+    pub complete_at: SystemTime,
+    /// The definition this delivery runs, as it stood when the delivery was owed —
+    /// "This export data is a snapshot from when the execution was generated"
+    /// (smithy_query shape `GetExecutionResponse`, member `Export`).
+    pub export: Export,
+}
+
 /// One recorded execution of an export: the delivery AWS runs for it, as
 /// `GetExecution`/`ListExecutions` report it.
 ///
-/// NOTHING in this emulator creates one: an execution is the record of a data-plane
-/// delivery (a query run against the billing data and a file written to the caller's S3
-/// bucket), and this emulator runs no such delivery — so it reports no execution rather
-/// than a status for work nothing performed. The store is here, and `GetExecution` reads
-/// it, so an execution a delivery records is the one every reader answers from.
+/// The service RECORDS the delivery, and does not perform it. An execution is the record
+/// of a data-plane delivery — a query run against this account's billing data and a file
+/// written to the caller's S3 bucket — and this emulator holds no billing data and writes
+/// no such file, so the delivery it records cannot succeed. It therefore ends in the
+/// service's OWN modelled failure state ([`EXECUTION_STATUS_QUERY_FAILURE`]) carrying the
+/// modelled reason for a failure on the service's side
+/// ([`EXECUTION_STATUS_REASON_INTERNAL_FAILURE`]), rather than reporting a
+/// `DELIVERY_SUCCESS` for a file nothing wrote. Nothing is claimed for work nothing ran:
+/// the export's `ExportStatus.LastRefreshedAt` stays absent, because no export file was
+/// ever generated (see [`fresh_status`]).
 #[derive(Debug, Clone)]
 pub struct StoredExecution {
     /// The id this execution is addressed by, unique within its export.
@@ -133,6 +220,14 @@ pub struct StoredExecution {
     /// (smithy_query shape `GetExecutionResponse`, member `Export`): the definition as it
     /// stood then, which a later `UpdateExport` does not change.
     pub export: Export,
+    /// The instant this delivery was initiated at. Orders the executions of one export in
+    /// time, which is how the oldest is the one [`MAX_EXECUTIONS_PER_EXPORT`] drops.
+    pub initiated_at: SystemTime,
+    /// The instant this execution reaches its terminal status, while it has not reached it
+    /// yet; `None` once it has. A transition the CLOCK owes, materialised from this stored
+    /// instant rather than by sleeping — see
+    /// [`ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState::materialize_due`].
+    pub completion_due_at: Option<SystemTime>,
 }
 
 /// One persisted data export: the submitted definition, the server-owned status, and
@@ -148,6 +243,14 @@ pub struct StoredExport {
     pub status: ExportStatus,
     /// The tags associated with this export, keyed by tag key so a key is unique.
     pub tags: BTreeMap<String, String>,
+    /// The delivery the service owes this export and has not initiated yet, if any: set
+    /// by the call that owed it (`CreateExport`, and each `UpdateExport`) and cleared when
+    /// the clock makes it due and it is recorded as an execution.
+    pub pending_delivery: Option<PendingDelivery>,
+    /// How many deliveries this export has been owed, including the one still pending and
+    /// any an update superseded. The next delivery's [`PendingDelivery::sequence`], and
+    /// never reused, so no two deliveries of this export mint the same `ExecutionId`.
+    pub deliveries_owed: u64,
 }
 
 /// Per-service state for com-amazonaws-bcmdataexports-awsbillingandcostmanagementdataexports. A handler reaches it through [`service_state`].
@@ -199,6 +302,88 @@ impl ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState {
         self.executions.insert(key, execution);
     }
 
+    /// Apply everything the CLOCK already owes, as of `now`: initiate each delivery whose
+    /// instant has passed and move each initiated execution that is due its terminal
+    /// status onto it.
+    ///
+    /// Every handler of this service calls this before it answers, so no caller has to
+    /// poll a particular operation for a delivery to happen. This is a write a REPORTING
+    /// operation may make: each change it applies was owed at `now` whether or not anybody
+    /// called — the instants are stored on the export and on the execution by the earlier
+    /// call that owed them ([`PendingDelivery::initiate_at`],
+    /// [`StoredExecution::completion_due_at`]) and every value written is derived from
+    /// those stored instants, so a pass that runs late writes exactly what a pass that ran
+    /// on time would have written, and running it twice changes nothing.
+    pub fn materialize_due(&mut self, now: SystemTime) {
+        let initiated: Vec<(String, PendingDelivery)> = self
+            .exports
+            .iter_mut()
+            .filter_map(|(arn, export)| {
+                // Taken only when it is DUE: one predicate decides both whether this
+                // delivery leaves the export and whether it is initiated below.
+                export
+                    .pending_delivery
+                    .take_if(|delivery| delivery.initiate_at <= now)
+                    .map(|delivery| (arn.clone(), delivery))
+            })
+            .collect();
+        for (export_arn, delivery) in initiated {
+            self.initiate_delivery(&export_arn, delivery);
+        }
+
+        for execution in self.executions.values_mut() {
+            if execution
+                .completion_due_at
+                .is_some_and(|due_at| due_at <= now)
+            {
+                complete_delivery(execution);
+            }
+        }
+    }
+
+    /// Record `delivery` of the export `export_arn` as a started execution.
+    fn initiate_delivery(&mut self, export_arn: &str, delivery: PendingDelivery) {
+        let initiated_at = timestamp(delivery.initiate_at);
+        self.insert_execution(StoredExecution {
+            execution_id: execution_id(export_arn, delivery.sequence, delivery.initiate_at),
+            export_arn: export_arn.to_string(),
+            status: ExecutionStatus {
+                status_code: Some(EXECUTION_STATUS_INITIATION_IN_PROCESS.to_string()),
+                // A delivery that has not finished has nothing to report a reason for.
+                status_reason: None,
+                created_at: Some(initiated_at),
+                completed_at: None,
+                last_updated_at: Some(initiated_at),
+            },
+            export: delivery.export,
+            initiated_at: delivery.initiate_at,
+            completion_due_at: Some(delivery.complete_at),
+        });
+        self.trim_executions_of(export_arn);
+    }
+
+    /// Drop the oldest executions of `export_arn` until it holds at most
+    /// [`MAX_EXECUTIONS_PER_EXPORT`].
+    fn trim_executions_of(&mut self, export_arn: &str) {
+        // The common path is an export inside the bound, which costs a count and no
+        // allocation.
+        if self.executions_of(export_arn).count() <= MAX_EXECUTIONS_PER_EXPORT {
+            return;
+        }
+        let mut held: Vec<(SystemTime, String)> = self
+            .executions_of(export_arn)
+            .map(|execution| (execution.initiated_at, execution.execution_id.clone()))
+            .collect();
+        // Oldest first, and by id where two deliveries share an instant, so the walk is
+        // the same on every pass.
+        held.sort_unstable();
+        let doomed = held.len() - MAX_EXECUTIONS_PER_EXPORT;
+        for (_, execution_id) in held.into_iter().take(doomed) {
+            self.executions
+                .remove(&(export_arn.to_string(), execution_id));
+        }
+    }
+
     /// Forget every recorded execution of the export `export_arn`.
     ///
     /// An execution is addressed by `(ExportArn, ExecutionId)`, so an execution of an
@@ -214,6 +399,71 @@ impl ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState {
         for key in doomed {
             self.executions.remove(&key);
         }
+    }
+}
+
+/// Domain separator for a minted `ExecutionId`, so the digest of a delivery cannot be read
+/// as any other value this service derives with the same hash.
+const EXECUTION_ID_DOMAIN: &[u8] = b"bcm-data-exports/execution-id/v1\0";
+
+/// Bytes of digest an `ExecutionId` carries, hex-encoded — wide enough that two deliveries
+/// cannot be confused for one another.
+const EXECUTION_ID_BYTES: usize = 16;
+
+/// The `ExecutionId` of the `sequence`-th delivery of `export_arn`, initiated at `at`.
+///
+/// An execution id is an opaque `GenericString` a caller only ever hands back (smithy_query
+/// operation `GetExecution`, member `ExecutionId`), so it is DERIVED rather than drawn at
+/// random: the digest of this service's domain separator, the export's ARN, the delivery's
+/// sequence within that export and the instant it was initiated at. The sequence is what
+/// makes it unique within the export — no later delivery of the same export reuses a
+/// number — and the digest is the one this crate already mints its opaque page tokens with,
+/// rather than a second mechanism beside it.
+fn execution_id(export_arn: &str, sequence: u64, at: SystemTime) -> String {
+    use ::sha2::Digest;
+    let nanos = at
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_nanos());
+    let mut hasher = ::sha2::Sha256::new();
+    hasher.update(EXECUTION_ID_DOMAIN);
+    hasher.update(export_arn.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(sequence.to_be_bytes());
+    hasher.update(nanos.to_be_bytes());
+    ::hex::encode(&hasher.finalize()[..EXECUTION_ID_BYTES])
+}
+
+/// Move `execution` onto the terminal status of a delivery this emulator cannot perform.
+///
+/// A delivery queries this account's billing data and writes a file to the caller's S3
+/// bucket. This emulator holds no billing data and writes no such file, so the delivery
+/// fails at the step that would have run the query, with the modelled reason for a failure
+/// on the SERVICE's side: the caller's permissions, bill ownership and query are not what
+/// stopped it. The instants come from the stored due instant, not from the clock this pass
+/// reads, so a pass that runs late records what one that ran on time would have recorded.
+fn complete_delivery(execution: &mut StoredExecution) {
+    let Some(completed_at) = execution.completion_due_at.take().map(timestamp) else {
+        return;
+    };
+    execution.status.status_code = Some(EXECUTION_STATUS_QUERY_FAILURE.to_string());
+    execution.status.status_reason = Some(EXECUTION_STATUS_REASON_INTERNAL_FAILURE.to_string());
+    execution.status.completed_at = Some(completed_at);
+    execution.status.last_updated_at = Some(completed_at);
+}
+
+/// The delivery the service owes an export whose definition `export` was persisted at
+/// `at`, as that export's `sequence`-th: due [`DELIVERY_INITIATION_DELAY`] later, of exactly
+/// that definition.
+///
+/// Both operations that persist a definition — `CreateExport` and `UpdateExport` — owe the
+/// export a delivery of what they persisted, so they schedule it through this one place.
+pub fn delivery_owed_at(at: SystemTime, export: &Export, sequence: u64) -> PendingDelivery {
+    let initiate_at = at + DELIVERY_INITIATION_DELAY;
+    PendingDelivery {
+        initiate_at,
+        sequence,
+        complete_at: initiate_at + DELIVERY_SETTLES_AFTER,
+        export: export.clone(),
     }
 }
 
@@ -241,7 +491,16 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// The instant itself is wall-clock, so it is a per-run value: what is pinned is its
 /// type, its units and its precision, not the number.
 pub fn now() -> ::aws_smithy_types::DateTime {
-    let seconds = ::std::time::SystemTime::now()
+    timestamp(SystemTime::now())
+}
+
+/// `at` as the modelled `Timestamp` type, at the WHOLE-SECOND precision [`now`] explains.
+///
+/// Every instant this service reports goes through here, including the ones taken from a
+/// stored due instant rather than from the clock, so no path reports a fraction the others
+/// drop.
+pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    let seconds = at
         .duration_since(::std::time::UNIX_EPOCH)
         .map_or(0, |since_epoch| since_epoch.as_secs() as i64);
     ::aws_smithy_types::DateTime::from_secs(seconds)
@@ -457,14 +716,23 @@ pub fn validate_taggable_resource_arn(arn: &str) -> Result<(), ValidationExcepti
 const ARN_ACCOUNT_SEGMENT: usize = 4;
 
 /// The status a freshly created export carries.
+///
+/// `LastRefreshedAt` is "The timestamp of when the export was last generated"
+/// (smithy_query shape `ExportStatus`, member `LastRefreshedAt`), and it stays absent for
+/// the life of the export in this emulator: a delivery here never writes an export file
+/// (see [`StoredExecution`]), so there is no instant at which one was generated and none
+/// is reported. The failure of a delivery is reported where the model puts an execution's
+/// own outcome — on the execution, in its `ExecutionStatus` — and not as a verdict on the
+/// definition: the two modelled `ExportStatusCode` values say whether the EXPORT is
+/// healthy, and an export whose only failure is this emulator's missing data plane
+/// ([`EXECUTION_STATUS_REASON_INTERNAL_FAILURE`], a failure on the service's side) is not
+/// a misconfigured export.
 pub fn fresh_status(at: ::aws_smithy_types::DateTime) -> ExportStatus {
     ExportStatus {
         status_code: Some(EXPORT_STATUS_HEALTHY.to_string()),
         status_reason: None,
         created_at: Some(at),
         last_updated_at: Some(at),
-        // No export file has been generated yet: there is nothing to report a
-        // last-refresh instant for until an execution delivers one.
         last_refreshed_at: None,
     }
 }

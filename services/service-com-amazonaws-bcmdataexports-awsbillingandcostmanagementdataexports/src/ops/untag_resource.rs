@@ -176,6 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(UntagResourceErrorModeled::ValidationException)?;
 
         let mut store = state.lock();
+        // Every handler of this service applies what the clock already owes before it
+        // answers, so a delivery falls due at its stored instant whichever operation a
+        // caller happens to use. Untagging an export neither owes a delivery nor cancels
+        // one: it does not change the definition that gets delivered.
+        store.materialize_due(::std::time::SystemTime::now());
         let stored = store.exports.get_mut(&input.resource_arn).ok_or_else(|| {
             crate::state::tagged_resource_not_found_error(
                 &input.resource_arn,

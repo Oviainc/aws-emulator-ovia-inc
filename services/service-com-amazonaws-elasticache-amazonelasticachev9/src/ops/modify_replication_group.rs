@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyReplicationGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyReplicationGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`ModifyReplicationGroup::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -293,18 +289,921 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyReplicationGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyReplicationGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // As in `ModifyCacheCluster`, every member of this request is either
+        // applied to the stored group, recorded as pending, or refused with a
+        // modelled error. Nothing is accepted and dropped.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyReplicationGroup"))
+        // `ReplicationGroupId` "is stored as a lowercase string", so the group a
+        // request names is resolved under the lowercased identity.
+        let key = input.replication_group_id.to_ascii_lowercase();
+        // "If false, changes to the nodes in the replication group are applied
+        // on the next maintenance reboot … Default: false." A deferred change is
+        // reported under `PendingModifiedValues`, so only the members that shape
+        // CARRIES can be deferred; see `crate::state::ReplicationGroupPendingValues`.
+        let deferred = !input.apply_immediately.unwrap_or(false);
+
+        // Every check that reads nothing but this request runs FIRST, so a
+        // malformed value is reported as the bad parameter it is whatever status
+        // the group happens to be in — a client told "wrong state" retries
+        // forever instead of fixing its input.
+        if let Some(description) = input.replication_group_description.as_deref() {
+            let length = description.chars().count();
+            if length > crate::state::MAX_REPLICATION_GROUP_DESCRIPTION_LENGTH {
+                return Err(invalid_value(format!(
+                    "Invalid value for ReplicationGroupDescription: a description is at most {} \
+                     characters, and {length} were given.",
+                    crate::state::MAX_REPLICATION_GROUP_DESCRIPTION_LENGTH
+                )));
+            }
+        }
+
+        // Cache security groups are the EC2-Classic mechanism, and the whole
+        // surface is closed for this account — see
+        // `crate::state::CACHE_SECURITY_GROUPS_UNSUPPORTED`, which
+        // `CreateReplicationGroup` and `ModifyCacheCluster` refuse the same way:
+        // no such group can exist for any name, so a caller told "that group
+        // does not exist" would retry a path that can never work.
+        if !input
+            .cache_security_group_names
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+        {
+            return Err(invalid_value(
+                crate::state::CACHE_SECURITY_GROUPS_UNSUPPORTED.to_string(),
+            ));
+        }
+
+        // `PreferredMaintenanceWindow` is the same documented range here as on a
+        // cache cluster, refused through the one helper.
+        if let Some(message) = input
+            .preferred_maintenance_window
+            .as_deref()
+            .and_then(crate::state::maintenance_window_refusal)
+        {
+            return Err(invalid_value(message));
+        }
+
+        // The engine the group would end up running: a replication group runs
+        // Valkey or Redis OSS ("This operation is valid for Valkey or Redis OSS
+        // only"), which is what the one helper enforces.
+        let requested_engine = match input.engine.as_deref() {
+            Some(engine) => match crate::state::normalize_replication_group_engine(engine) {
+                Ok(engine) => Some(engine),
+                Err(message) => return Err(invalid_value(message)),
+            },
+            None => None,
+        };
+
+        // The node type a modify scales the group onto must be one the service
+        // publishes — the same catalogue `CreateReplicationGroup` checks against.
+        if let Some(node_type) = input.cache_node_type.as_deref() {
+            if let Err(message) =
+                crate::ops::list_allowed_node_type_modifications::validate_node_type(node_type)
+            {
+                return Err(invalid_value(message));
+            }
+        }
+
+        // "The number of days for which ElastiCache retains automatic node group
+        // (shard) snapshots … If the value of SnapshotRetentionLimit is set to
+        // zero (0), backups are turned off": zero is the floor, so a negative
+        // number of days names no retention this service could keep.
+        if let Some(limit) = input.snapshot_retention_limit {
+            if limit < 0 {
+                return Err(invalid_value(format!(
+                    "Invalid value {limit} for SnapshotRetentionLimit: the retention is a number \
+                     of days, and zero turns automatic backups off."
+                )));
+            }
+        }
+
+        // "The status of the Amazon SNS notification topic … Valid values:
+        // active | inactive." The member is a plain `String`, so the two
+        // documented values are enforced here.
+        if let Some(status) = input.notification_topic_status.as_deref() {
+            if status != crate::state::NOTIFICATION_STATUS_ACTIVE
+                && status != crate::state::NOTIFICATION_STATUS_INACTIVE
+            {
+                return Err(invalid_value(format!(
+                    "Invalid value {status} for NotificationTopicStatus: valid values are {} | {}.",
+                    crate::state::NOTIFICATION_STATUS_ACTIVE,
+                    crate::state::NOTIFICATION_STATUS_INACTIVE
+                )));
+            }
+        }
+
+        // The user-group membership change this request asks for.
+        // `RemoveUserGroups` "removes the user group associated with this
+        // replication group", so it and the two id lists are three ways to set
+        // the same membership and cannot be combined; and one id cannot be both
+        // added and removed by one call.
+        let user_groups_to_add = input.user_group_ids_to_add.clone().unwrap_or_default();
+        let user_groups_to_remove = input.user_group_ids_to_remove.clone().unwrap_or_default();
+        let remove_all_user_groups = input.remove_user_groups.unwrap_or(false);
+        if remove_all_user_groups
+            && !(user_groups_to_add.is_empty() && user_groups_to_remove.is_empty())
+        {
+            return Err(invalid_combination(
+                "RemoveUserGroups removes every user group of the replication group and cannot be \
+                 combined with UserGroupIdsToAdd or UserGroupIdsToRemove."
+                    .to_string(),
+            ));
+        }
+        if let Some(id) = user_groups_to_add
+            .iter()
+            .find(|id| user_groups_to_remove.contains(id))
+        {
+            return Err(invalid_combination(format!(
+                "User group {id} is named by both UserGroupIdsToAdd and UserGroupIdsToRemove."
+            )));
+        }
+
+        // The auth-token update: "ROTATE - default, if no update strategy is
+        // provided", and a strategy that sets a password "must be specified with
+        // the auth-token parameter". `DELETE` is the one strategy that carries no
+        // password, because it takes the password away.
+        let auth_token_strategy = input.auth_token_update_strategy.clone().or_else(|| {
+            input
+                .auth_token
+                .as_ref()
+                .map(|_| crate::state::AUTH_TOKEN_ROTATE.to_string())
+        });
+        if let Some(token) = input.auth_token.as_deref() {
+            if let Some(message) = crate::state::auth_token_refusal(token) {
+                return Err(invalid_value(message));
+            }
+        }
+        match auth_token_strategy.as_deref() {
+            Some(strategy)
+                if strategy != crate::state::AUTH_TOKEN_DELETE && input.auth_token.is_none() =>
+            {
+                return Err(invalid_combination(format!(
+                    "AuthTokenUpdateStrategy {strategy} must be specified with the AuthToken \
+                     parameter."
+                )))
+            }
+            Some(strategy)
+                if strategy == crate::state::AUTH_TOKEN_DELETE && input.auth_token.is_some() =>
+            {
+                return Err(invalid_combination(format!(
+                    "AuthTokenUpdateStrategy {strategy} removes the password and cannot be \
+                     combined with an AuthToken."
+                )))
+            }
+            _ => {}
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Whether the group and the clusters below are `available` depends on the
+        // status changes the clock may already owe them, so those are
+        // materialised before anything is read or written. A user group this
+        // request names is settled too: `settle_all` reports on the cache
+        // resources, and whether a user group can take a change is read off the
+        // status the clock owes it at this instant.
+        store.settle_all(now);
+        store.settle_user_groups(now);
+
+        // The parameter group the group's clusters move to has to be one this
+        // account holds, resolved through the one stored map, and the STORED name
+        // is what the group carries afterwards.
+        let requested_parameter_group = match input.cache_parameter_group_name.as_deref() {
+            Some(name) => match store.parameter_group(name) {
+                Some(group) => Some(group.name.clone()),
+                None => {
+                    return Err(
+                        ModifyReplicationGroupErrorModeled::CacheParameterGroupNotFoundFault(
+                            CacheParameterGroupNotFoundFault {
+                                message: Some(format!("CacheParameterGroup {name} not found.")),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        let Some(group) = store.replication_groups.get(&key) else {
+            return Err(
+                ModifyReplicationGroupErrorModeled::ReplicationGroupNotFoundFault(
+                    ReplicationGroupNotFoundFault {
+                        message: Some(format!(
+                            "Replication group {} not found.",
+                            input.replication_group_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The group as it stands, settled, read once so the checks below all see
+        // the same configuration; the change is written back through the store.
+        let group = group.clone();
+
+        // A group has to be provisioned before it can be reconfigured, so one
+        // still `creating`, going away, or busy with work of its own (a snapshot)
+        // is refused with the modelled state fault. A group already `modifying`
+        // is NOT: `ApplyImmediately` documents that this request applies "the
+        // modifications in this request and any pending modifications", so a
+        // second change arriving while the first is still being worked through is
+        // the documented way to supersede it — which is also the shape of every
+        // converge loop that reapplies its desired configuration.
+        if group.status != crate::state::STATUS_AVAILABLE
+            && group.status != crate::state::STATUS_MODIFYING
+        {
+            return Err(
+                ModifyReplicationGroupErrorModeled::InvalidReplicationGroupStateFault(
+                    InvalidReplicationGroupStateFault {
+                        message: Some(format!(
+                            "Replication group {key} is in {} state, not {}.",
+                            group.status,
+                            crate::state::STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every user group this request names has to be one this account holds,
+        // and one that can take a change: `InvalidUserGroupStateFault` is "the
+        // user group is not in an active state".
+        for user_group_id in user_groups_to_add.iter().chain(user_groups_to_remove.iter()) {
+            let Some(user_group) = store.user_groups.get(user_group_id) else {
+                return Err(ModifyReplicationGroupErrorModeled::UserGroupNotFoundFault(
+                    UserGroupNotFoundFault {
+                        message: Some(format!("User group {user_group_id} not found.")),
+                    },
+                )
+                .into());
+            };
+            if let Some(message) = crate::state::user_group_state_refusal(user_group) {
+                return Err(
+                    ModifyReplicationGroupErrorModeled::InvalidUserGroupStateFault(
+                        InvalidUserGroupStateFault {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        // A group can only be disassociated from the replication group it is
+        // associated with: "the users in the group no longer can access the
+        // replication group".
+        if let Some(user_group_id) = user_groups_to_remove
+            .iter()
+            .find(|id| !group.user_group_ids.contains(id))
+        {
+            return Err(invalid_value(format!(
+                "Invalid value {user_group_id} for UserGroupIdsToRemove: it is not associated \
+                 with replication group {key}."
+            )));
+        }
+        // The membership the group ends up with, which the auth-token rules
+        // below read: a deferred change leaves today's membership in place.
+        let user_group_ids_after = if deferred {
+            group.user_group_ids.clone()
+        } else {
+            apply_user_groups(
+                group.user_group_ids.clone(),
+                &user_groups_to_add,
+                &user_groups_to_remove,
+                remove_all_user_groups,
+            )
+        };
+
+        // `PrimaryClusterId` "promotes the specified cluster in the specified
+        // replication group to the primary role", and only "for replication
+        // groups with a single primary" — a cluster mode enabled group has one
+        // primary per shard, so there is no group-wide primary to name.
+        if let Some(primary_cluster_id) = input.primary_cluster_id.as_deref() {
+            let member = primary_cluster_id.to_ascii_lowercase();
+            if group.cluster_enabled {
+                return Err(invalid_combination(
+                    "PrimaryClusterId names the single primary of a replication group, which a \
+                     cluster mode enabled group does not have: each of its node groups (shards) \
+                     has its own primary."
+                        .to_string(),
+                ));
+            }
+            if !store.cache_clusters.contains_key(&member) {
+                return Err(ModifyReplicationGroupErrorModeled::CacheClusterNotFoundFault(
+                    CacheClusterNotFoundFault {
+                        message: Some(crate::state::cache_cluster_not_found_message(
+                            primary_cluster_id,
+                        )),
+                    },
+                )
+                .into());
+            }
+            if !group.is_member_cluster(&member) {
+                return Err(invalid_value(format!(
+                    "Invalid value {primary_cluster_id} for PrimaryClusterId: it is not a member \
+                     of replication group {key}."
+                )));
+            }
+        }
+
+        // `SnapshottingClusterId` is "the cluster ID that is used as the daily
+        // snapshot source for the replication group. This parameter cannot be set
+        // for Valkey or Redis OSS (cluster mode enabled) replication groups" —
+        // a sharded group's data lives in every shard, so no single member is the
+        // source.
+        if let Some(snapshotting_cluster_id) = input.snapshotting_cluster_id.as_deref() {
+            let member = snapshotting_cluster_id.to_ascii_lowercase();
+            if group.cluster_enabled {
+                return Err(invalid_combination(
+                    "SnapshottingClusterId cannot be set for a cluster mode enabled replication \
+                     group: its keyspace is partitioned across node groups (shards)."
+                        .to_string(),
+                ));
+            }
+            if !store.cache_clusters.contains_key(&member) {
+                return Err(ModifyReplicationGroupErrorModeled::CacheClusterNotFoundFault(
+                    CacheClusterNotFoundFault {
+                        message: Some(crate::state::cache_cluster_not_found_message(
+                            snapshotting_cluster_id,
+                        )),
+                    },
+                )
+                .into());
+            }
+            if !group.is_member_cluster(&member) {
+                return Err(invalid_value(format!(
+                    "Invalid value {snapshotting_cluster_id} for SnapshottingClusterId: it is not \
+                     a member of replication group {key}."
+                )));
+            }
+        }
+
+        // "Determines whether a read replica is automatically promoted to
+        // read/write primary if the existing primary encounters a failure":
+        // promotion needs a replica to promote, the same rule
+        // `CreateReplicationGroup` enforces, and automatic failover "must be
+        // enabled for Valkey or Redis OSS (cluster mode enabled) replication
+        // groups".
+        let every_shard_has_replica = !group.node_groups.is_empty()
+            && group.node_groups.iter().all(|shard| {
+                group
+                    .shard_replica_count(&shard.node_group_id)
+                    .unwrap_or_default()
+                    >= 1
+            });
+        match input.automatic_failover_enabled {
+            Some(true) if !every_shard_has_replica => {
+                return Err(invalid_combination(
+                    "AutomaticFailoverEnabled requires at least one replica in every node group \
+                     (shard) to promote."
+                        .to_string(),
+                ))
+            }
+            Some(false) if group.cluster_enabled && every_shard_has_replica => {
+                return Err(invalid_combination(
+                    "AutomaticFailoverEnabled must be enabled for a cluster mode enabled \
+                     replication group."
+                        .to_string(),
+                ))
+            }
+            _ => {}
+        }
+        // The failover setting the group ends up with: a deferred change is
+        // reported under `PendingModifiedValues` and leaves today's in place.
+        let automatic_failover_after = match input.automatic_failover_enabled {
+            Some(enabled) if !deferred => setting(enabled).to_string(),
+            _ => group.automatic_failover.clone(),
+        };
+        // "A flag indicating if you have Multi-AZ enabled to enhance fault
+        // tolerance": that tolerance IS the promotion of a replica in another
+        // zone, so Multi-AZ cannot be on while automatic failover is off.
+        if input.multi_az_enabled == Some(true)
+            && automatic_failover_after != crate::state::SETTING_ENABLED
+        {
+            return Err(invalid_combination(
+                "MultiAZEnabled requires AutomaticFailoverEnabled: Multi-AZ fault tolerance is \
+                 the promotion of a replica in another Availability Zone."
+                    .to_string(),
+            ));
+        }
+
+        // "You can upgrade to a newer engine version … but you cannot downgrade
+        // to an earlier engine version", and the version has to be one a
+        // published cache parameter group family covers — the same catalogue
+        // `CreateReplicationGroup` resolves a version against.
+        let engine_after = requested_engine
+            .clone()
+            .unwrap_or_else(|| group.engine.clone());
+        let engine_version_after = input
+            .engine_version
+            .clone()
+            .unwrap_or_else(|| group.engine_version.clone());
+        if crate::state::parameter_group_family(&engine_after, &engine_version_after).is_none() {
+            return Err(invalid_combination(format!(
+                "No cache parameter group family supports {engine_after} {engine_version_after}."
+            )));
+        }
+        if let Some(version) = input.engine_version.as_deref() {
+            if crate::state::version_sort_key(version)
+                < crate::state::version_sort_key(&group.engine_version)
+            {
+                return Err(invalid_combination(format!(
+                    "Invalid value {version} for EngineVersion: replication group {key} runs {}, \
+                     and an engine version cannot be downgraded.",
+                    group.engine_version
+                )));
+            }
+        }
+
+        // "Data tiering is only supported for replication groups using the r6gd
+        // node type. This parameter must be set to true when using r6gd nodes":
+        // the group's data tiering is fixed at create, so a node type that
+        // contradicts it is refused rather than stored.
+        if let Some(node_type) = input.cache_node_type.as_deref() {
+            let r6gd = node_type.contains(crate::state::DATA_TIERING_NODE_TYPE);
+            if r6gd != (group.data_tiering == crate::state::SETTING_ENABLED) {
+                return Err(invalid_combination(format!(
+                    "Replication group {key} has data tiering {} and cannot be scaled to \
+                     {node_type}: data tiering is supported only on the {} node type, and must be \
+                     enabled on it.",
+                    group.data_tiering,
+                    crate::state::DATA_TIERING_NODE_TYPE
+                )));
+            }
+        }
+
+        // In-transit encryption, which has two documented steps of its own: "If
+        // you are enabling in-transit encryption for an existing cluster, you
+        // must also set TransitEncryptionMode to preferred", and "setting
+        // TransitEncryptionMode to required is a two-step process that requires
+        // you to first set the TransitEncryptionMode to preferred".
+        if input.transit_encryption_enabled == Some(true)
+            && !group.transit_encryption_enabled
+            && input.transit_encryption_mode.as_deref()
+                != Some(crate::state::TRANSIT_ENCRYPTION_PREFERRED)
+        {
+            return Err(invalid_combination(format!(
+                "Enabling in-transit encryption on an existing replication group requires \
+                 TransitEncryptionMode {} in the same request.",
+                crate::state::TRANSIT_ENCRYPTION_PREFERRED
+            )));
+        }
+        if input.transit_encryption_mode.as_deref()
+            == Some(crate::state::TRANSIT_ENCRYPTION_REQUIRED)
+            && group.transit_encryption_mode.as_deref()
+                != Some(crate::state::TRANSIT_ENCRYPTION_PREFERRED)
+        {
+            return Err(invalid_combination(format!(
+                "Setting TransitEncryptionMode to {} is a two-step process: replication group \
+                 {key} must be running {} first.",
+                crate::state::TRANSIT_ENCRYPTION_REQUIRED,
+                crate::state::TRANSIT_ENCRYPTION_PREFERRED
+            )));
+        }
+
+        // "AuthToken can be specified only on replication groups where
+        // TransitEncryptionEnabled is true", read against the setting the group
+        // ends up with, so enabling encryption and setting a password in one
+        // request is accepted.
+        let transit_encryption_after = input
+            .transit_encryption_enabled
+            .unwrap_or(group.transit_encryption_enabled);
+        if input.auth_token.is_some() && !transit_encryption_after {
+            return Err(invalid_combination(
+                "AuthToken can be specified only on a replication group where \
+                 TransitEncryptionEnabled is true."
+                    .to_string(),
+            ));
+        }
+        // "SET - allowed only after ROTATE", and "DELETE - allowed only when
+        // transitioning to RBAC" — RBAC is the user group that replaces the
+        // password, so a DELETE needs the group to have one.
+        if auth_token_strategy.as_deref() == Some(crate::state::AUTH_TOKEN_SET)
+            && group.auth_token_last_strategy.as_deref() != Some(crate::state::AUTH_TOKEN_ROTATE)
+        {
+            return Err(invalid_combination(format!(
+                "AuthTokenUpdateStrategy {} is allowed only after {}.",
+                crate::state::AUTH_TOKEN_SET,
+                crate::state::AUTH_TOKEN_ROTATE
+            )));
+        }
+        if auth_token_strategy.as_deref() == Some(crate::state::AUTH_TOKEN_DELETE)
+            && user_group_ids_after.is_empty()
+        {
+            return Err(invalid_combination(format!(
+                "AuthTokenUpdateStrategy {} is allowed only when transitioning to RBAC, which \
+                 needs a user group associated with the replication group.",
+                crate::state::AUTH_TOKEN_DELETE
+            )));
+        }
+
+        // "To modify cluster mode from Disabled to Enabled, you must first set
+        // the cluster mode to Compatible."
+        if input.cluster_mode.as_deref() == Some(crate::state::SETTING_ENABLED)
+            && group.cluster_mode == crate::state::SETTING_DISABLED
+        {
+            return Err(invalid_combination(format!(
+                "ClusterMode cannot go from {} straight to {}: it must be set to {} first.",
+                crate::state::SETTING_DISABLED,
+                crate::state::SETTING_ENABLED,
+                crate::state::CLUSTER_MODE_COMPATIBLE
+            )));
+        }
+
+        // Nothing is refused from here on, so the change can be written.
+        //
+        // Whether this request asks for work ElastiCache performs
+        // ASYNCHRONOUSLY: the members the modelled
+        // `ReplicationGroupPendingModifiedValues` carries (which is what makes
+        // them deferrable at all) plus the scaling and upgrade members the member
+        // clusters' own `PendingModifiedValues` carries. A request confined to
+        // the settings neither shape holds is applied synchronously and leaves
+        // the group `available`, so a caller that confirms the modify by reading
+        // the setting back is not then refused by the next state-gated call.
+        let log_delivery_requested = input
+            .log_delivery_configurations
+            .as_deref()
+            .is_some_and(|requests| !requests.is_empty());
+        let deferrable_change = input.primary_cluster_id.is_some()
+            || input.automatic_failover_enabled.is_some()
+            || auth_token_strategy.is_some()
+            || !user_groups_to_add.is_empty()
+            || !user_groups_to_remove.is_empty()
+            || remove_all_user_groups
+            || log_delivery_requested
+            || input.transit_encryption_enabled.is_some()
+            || input.transit_encryption_mode.is_some()
+            || input.cluster_mode.is_some();
+        let applies_async_change = input.cache_node_type.is_some()
+            || input.engine_version.is_some()
+            || input.engine.is_some()
+            || (!deferred && deferrable_change);
+
+        let Some(group) = store.replication_groups.get_mut(&key) else {
+            // Unreachable: resolved under this same lock above.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The members the pending shape does NOT carry have nowhere to be
+        // reported as pending, so they are applied at once, exactly as
+        // `ModifyCacheCluster` applies its own.
+        if let Some(description) = input.replication_group_description.clone() {
+            group.description = description;
+        }
+        if let Some(window) = input.preferred_maintenance_window.clone() {
+            group.preferred_maintenance_window = window;
+        }
+        if let Some(limit) = input.snapshot_retention_limit {
+            group.snapshot_retention_limit = Some(limit);
+        }
+        if let Some(window) = input.snapshot_window.clone() {
+            group.snapshot_window = Some(window);
+        }
+        if let Some(upgrade) = input.auto_minor_version_upgrade {
+            group.auto_minor_version_upgrade = Some(upgrade);
+        }
+        if let Some(discovery) = input.ip_discovery.clone() {
+            group.ip_discovery = Some(discovery);
+        }
+        if let Some(name) = requested_parameter_group.clone() {
+            group.cache_parameter_group_name = name;
+        }
+        if let Some(enabled) = input.multi_az_enabled {
+            group.multi_az = setting(enabled).to_string();
+        }
+        if let Some(engine) = requested_engine.clone() {
+            group.engine = engine;
+        }
+        if let Some(version) = input.engine_version.clone() {
+            group.engine_version = version;
+        }
+        if let Some(node_type) = input.cache_node_type.clone() {
+            group.cache_node_type = Some(node_type);
+        }
+        // `SnapshottingClusterId` is stored under the member cluster's own
+        // (lowercased) identity, which is what `DescribeReplicationGroups`
+        // reports it as.
+        if let Some(cluster_id) = input.snapshotting_cluster_id.as_deref() {
+            group.snapshotting_cluster_id = Some(cluster_id.to_ascii_lowercase());
+        }
+        // `Durability` reports the setting the request asked for, and
+        // `EffectiveDurability` what it resolves to; see
+        // `crate::state::EFFECTIVE_DURABILITY_ASYNC`.
+        if let Some(durability) = input.durability.clone() {
+            group.effective_durability = if durability == crate::state::DURABILITY_DEFAULT {
+                crate::state::EFFECTIVE_DURABILITY_ASYNC.to_string()
+            } else {
+                durability.clone()
+            };
+            group.durability = durability;
+        }
+
+        if deferred {
+            // The group keeps running its current values and reports the
+            // requested ones under `PendingModifiedValues`.
+            let pending = &mut group.pending_modified_values;
+            if let Some(cluster_id) = input.primary_cluster_id.as_deref() {
+                pending.primary_cluster_id = Some(cluster_id.to_ascii_lowercase());
+            }
+            if let Some(enabled) = input.automatic_failover_enabled {
+                pending.automatic_failover_status = Some(setting(enabled).to_string());
+            }
+            // `AuthTokenUpdateStatus` is `SETTING | ROTATING`: a DELETE has no
+            // value in that enum, so it has nowhere to be reported as pending
+            // and is applied at once, below.
+            match auth_token_strategy.as_deref() {
+                Some(crate::state::AUTH_TOKEN_ROTATE) => {
+                    pending.auth_token_status =
+                        Some(crate::state::AUTH_TOKEN_STATUS_ROTATING.to_string());
+                }
+                Some(crate::state::AUTH_TOKEN_SET) => {
+                    pending.auth_token_status =
+                        Some(crate::state::AUTH_TOKEN_STATUS_SETTING.to_string());
+                }
+                _ => {}
+            }
+            if remove_all_user_groups {
+                pending.user_group_ids_to_remove = group.user_group_ids.clone();
+            } else {
+                if !user_groups_to_add.is_empty() {
+                    pending.user_group_ids_to_add = user_groups_to_add.clone();
+                }
+                if !user_groups_to_remove.is_empty() {
+                    pending.user_group_ids_to_remove = user_groups_to_remove.clone();
+                }
+            }
+            if let Some(requests) = input.log_delivery_configurations.clone() {
+                crate::state::apply_log_delivery(&mut pending.log_delivery_configurations, requests);
+            }
+            if let Some(enabled) = input.transit_encryption_enabled {
+                pending.transit_encryption_enabled = Some(enabled);
+            }
+            if let Some(mode) = input.transit_encryption_mode.clone() {
+                pending.transit_encryption_mode = Some(mode);
+            }
+            if let Some(mode) = input.cluster_mode.clone() {
+                pending.cluster_mode = Some(mode);
+            }
+        } else {
+            // An applied change clears only what it applied: a value an earlier
+            // deferred modify recorded and this request did not touch stays
+            // pending rather than being dropped by an unrelated call.
+            let pending = &mut group.pending_modified_values;
+            if input.primary_cluster_id.is_some() {
+                pending.primary_cluster_id = None;
+            }
+            if input.automatic_failover_enabled.is_some() {
+                pending.automatic_failover_status = None;
+            }
+            if auth_token_strategy.is_some() {
+                pending.auth_token_status = None;
+            }
+            if remove_all_user_groups
+                || !user_groups_to_add.is_empty()
+                || !user_groups_to_remove.is_empty()
+            {
+                pending.user_group_ids_to_add.clear();
+                pending.user_group_ids_to_remove.clear();
+            }
+            if log_delivery_requested {
+                pending.log_delivery_configurations.clear();
+            }
+            if input.transit_encryption_enabled.is_some() {
+                pending.transit_encryption_enabled = None;
+            }
+            if input.transit_encryption_mode.is_some() {
+                pending.transit_encryption_mode = None;
+            }
+            if input.cluster_mode.is_some() {
+                pending.cluster_mode = None;
+            }
+
+            if let Some(cluster_id) = input.primary_cluster_id.as_deref() {
+                group.promote_primary(&cluster_id.to_ascii_lowercase());
+            }
+            if let Some(enabled) = input.automatic_failover_enabled {
+                group.automatic_failover = setting(enabled).to_string();
+            }
+            if let Some(requests) = input.log_delivery_configurations.clone() {
+                crate::state::apply_log_delivery(&mut group.log_delivery_configurations, requests);
+            }
+            if let Some(enabled) = input.transit_encryption_enabled {
+                group.transit_encryption_enabled = enabled;
+            }
+            if let Some(mode) = input.transit_encryption_mode.clone() {
+                group.transit_encryption_mode = Some(mode);
+            }
+            // `ClusterEnabled` is "whether its data can be partitioned across
+            // multiple shards", which is what the `enabled` cluster mode asks
+            // for; `compatible` is the step on the way there, where clients may
+            // still connect either way.
+            if let Some(mode) = input.cluster_mode.clone() {
+                group.cluster_enabled = mode == crate::state::SETTING_ENABLED;
+                group.cluster_mode = mode;
+            }
+            group.user_group_ids = user_group_ids_after.clone();
+        }
+
+        // The token itself is never stored; a `DELETE` strategy clears the flag,
+        // anything else sets it and stamps the modification. A DELETE is applied
+        // whatever `ApplyImmediately` says, for the reason given above: the
+        // pending shape has no status to report it under.
+        let auth_token_applied = match auth_token_strategy.as_deref() {
+            Some(crate::state::AUTH_TOKEN_DELETE) => Some(false),
+            Some(_) if !deferred => Some(true),
+            _ => None,
+        };
+        if let Some(enabled) = auth_token_applied {
+            group.auth_token_enabled = enabled;
+            group.auth_token_last_modified = Some(now);
+        }
+        // The strategy is remembered on acceptance, because the documented order
+        // between the strategies ("SET - allowed only after ROTATE") is about the
+        // calls a caller has made, not about when their work lands.
+        if let Some(strategy) = auth_token_strategy.clone() {
+            group.auth_token_last_strategy = Some(strategy);
+        }
+
+        // A change the shapes above carry is work ElastiCache does
+        // asynchronously, so the group answers `modifying` until the clock owes
+        // it `available` again — a caller acting straight after the call still
+        // sees the transient status.
+        if applies_async_change {
+            group.begin_transition(crate::state::STATUS_MODIFYING, now);
+        }
+
+        // A replication group's settings ARE the settings of its member
+        // clusters, which `DescribeCacheClusters` reports from the same store, so
+        // every applied change is carried into them too.
+        let member_engine = requested_engine.clone();
+        let member_version = input.engine_version.clone();
+        let member_node_type = input.cache_node_type.clone();
+        let member_window = input.preferred_maintenance_window.clone();
+        let member_parameter_group = requested_parameter_group.clone();
+        let member_security_groups = input.security_group_ids.clone();
+        let member_topic = input.notification_topic_arn.clone();
+        let member_topic_status = input.notification_topic_status.clone();
+        let member_log_delivery = (!deferred)
+            .then(|| input.log_delivery_configurations.clone())
+            .flatten();
+        store.for_each_member_cluster(&key, |cluster| {
+            if let Some(engine) = member_engine.clone() {
+                cluster.engine = engine;
+            }
+            if let Some(version) = member_version.clone() {
+                cluster.engine_version = version;
+            }
+            if let Some(node_type) = member_node_type.clone() {
+                cluster.cache_node_type = Some(node_type);
+            }
+            if let Some(window) = member_window.clone() {
+                cluster.preferred_maintenance_window = window;
+            }
+            if let Some(name) = member_parameter_group.clone() {
+                cluster.cache_parameter_group_name = name;
+            }
+            if let Some(ids) = member_security_groups.clone() {
+                cluster.security_group_ids = ids;
+            }
+            if let Some(limit) = input.snapshot_retention_limit {
+                cluster.snapshot_retention_limit = Some(limit);
+            }
+            if let Some(window) = input.snapshot_window.clone() {
+                cluster.snapshot_window = Some(window);
+            }
+            if let Some(upgrade) = input.auto_minor_version_upgrade {
+                cluster.auto_minor_version_upgrade = Some(upgrade);
+            }
+            if let Some(discovery) = input.ip_discovery.clone() {
+                cluster.ip_discovery = Some(discovery);
+            }
+            if let Some(arn) = member_topic.clone() {
+                cluster.notification_topic_arn = Some(arn);
+            }
+            // `NotificationTopicStatus` is how a topic is detached: the status is
+            // set to `inactive` to stop publishing.
+            if member_topic_status.as_deref() == Some(crate::state::NOTIFICATION_STATUS_INACTIVE) {
+                cluster.notification_topic_arn = None;
+            }
+            if let Some(enabled) = auth_token_applied {
+                cluster.auth_token_enabled = enabled;
+                cluster.auth_token_last_modified = Some(now);
+            }
+            if !deferred {
+                if let Some(enabled) = input.transit_encryption_enabled {
+                    cluster.transit_encryption_enabled = Some(enabled);
+                }
+                if let Some(mode) = input.transit_encryption_mode.clone() {
+                    cluster.transit_encryption_mode = Some(mode);
+                }
+            }
+            if let Some(requests) = member_log_delivery.clone() {
+                crate::state::apply_log_delivery(&mut cluster.log_delivery_configurations, requests);
+                cluster.replication_group_log_delivery_enabled =
+                    Some(!cluster.log_delivery_configurations.is_empty());
+            }
+            if applies_async_change {
+                cluster.begin_transition(crate::state::STATUS_MODIFYING, now);
+            }
+        });
+
+        // A user group reports "the replication groups that the user group is
+        // associated to" (`UserGroup$ReplicationGroups`), which is the other end
+        // of the membership just applied — held once, on the user group, so the
+        // two reads cannot disagree.
+        if !deferred {
+            for user_group in store.user_groups.values_mut() {
+                let associated = user_group_ids_after.contains(&user_group.user_group_id);
+                user_group
+                    .replication_group_ids
+                    .retain(|group_id| group_id != &key);
+                if associated {
+                    user_group.replication_group_ids.push(key.clone());
+                }
+            }
+        }
+
+        // Modifying a replication group is one of the events this service
+        // records; see `crate::state::EventRecord`.
+        store.record_event(
+            crate::state::SOURCE_TYPE_REPLICATION_GROUP,
+            &key,
+            "Replication group modified",
+            now,
+        );
+        // The answer is read back out of the store, so it reports what was
+        // persisted rather than what was asked for.
+        let Some(replication_group) = store.modeled_replication_group(&key) else {
+            // Unreachable, for the same reason.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+        Ok(ModifyReplicationGroupOutput {
+            replication_group: Some(replication_group),
+        })
     }
+}
+
+/// The modelled refusal for a member whose VALUE this service does not accept:
+/// "The value for a parameter is invalid."
+fn invalid_value(message: String) -> ModifyReplicationGroupError {
+    ModifyReplicationGroupErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled refusal for members that cannot hold together: "Two or more
+/// incompatible parameters were specified."
+fn invalid_combination(message: String) -> ModifyReplicationGroupError {
+    ModifyReplicationGroupErrorModeled::InvalidParameterCombinationException(
+        InvalidParameterCombinationException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The `enabled` / `disabled` token a boolean request member settles at, as
+/// `AutomaticFailoverStatus` and `MultiAZStatus` spell it.
+fn setting(enabled: bool) -> &'static str {
+    if enabled {
+        crate::state::SETTING_ENABLED
+    } else {
+        crate::state::SETTING_DISABLED
+    }
+}
+
+/// The user-group membership `current` ends up with after this request: every
+/// group removed, or the named ones added and removed, with no id held twice.
+fn apply_user_groups(
+    current: Vec<String>,
+    to_add: &[String],
+    to_remove: &[String],
+    remove_all: bool,
+) -> Vec<String> {
+    if remove_all {
+        return Vec::new();
+    }
+    let mut membership = current;
+    membership.retain(|id| !to_remove.contains(id));
+    for id in to_add {
+        if !membership.contains(id) {
+            membership.push(id.clone());
+        }
+    }
+    membership
 }
