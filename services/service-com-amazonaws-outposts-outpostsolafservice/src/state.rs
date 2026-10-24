@@ -5,17 +5,20 @@
 //! and ARN minting, resolving the `id OR ARN` identifier forms the modelled
 //! `@httpLabel` patterns accept, projecting a resource's tag map and an Outpost's
 //! two Availability Zone identities, materialising the Outpost lifecycle transition
-//! and the quote expiry the clock owes, cutting an ordered list into pages with the modelled `Token` the
-//! next page resumes from, and the two rules this service words its refusals by —
-//! the `NotFoundException` identifier echo and the value-omitting
-//! `ValidationException` report.
+//! two Availability Zone identities, materialising the Outpost lifecycle transition,
+//! the quote expiry and the capacity-task progression the clock owes, cutting an
+//! ordered list into pages with the modelled `Token` the next page resumes from, and
+//! the two rules this service words its refusals by — the `NotFoundException`
+//! identifier echo and the value-omitting `ValidationException` report.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use sha2::{Digest, Sha256};
 use smithy_server_runtime::{Violation, ViolationKind};
 
-use crate::ops::types::{Address, Outpost, Quote, Site};
+use crate::ops::types::{
+    Address, CapacityTaskFailure, InstanceTypeCapacity, InstancesToExclude, Outpost, Quote, Site,
+};
 
 /// The region every minted ARN falls back to when the request carries no SigV4
 /// credential scope to read one from (an unsigned, anonymous call).
@@ -110,6 +113,178 @@ pub struct OutpostRecord {
     pub active_at: Option<std::time::Instant>,
 }
 
+/// The `CapacityTaskStatus` a capacity task carries the moment `StartCapacityTask`
+/// accepts it: "the capacity task was created and is awaiting the next step by
+/// Amazon Web Services Outposts", as the model documents the value.
+pub const CAPACITY_TASK_REQUESTED: &str = "REQUESTED";
+
+/// The `CapacityTaskStatus` a capacity task carries while it runs — the model's
+/// "the capacity task is running and cannot be cancelled".
+pub const CAPACITY_TASK_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The terminal `CapacityTaskStatus` of a capacity task that ran: the model's "the
+/// capacity task has completed successfully". No later call moves a task out of it.
+pub const CAPACITY_TASK_COMPLETED: &str = "COMPLETED";
+
+/// The terminal `CapacityTaskStatus` of a task that could not be completed.
+pub const CAPACITY_TASK_FAILED: &str = "FAILED";
+
+/// The terminal `CapacityTaskStatus` of a cancelled task.
+pub const CAPACITY_TASK_CANCELLED: &str = "CANCELLED";
+
+/// Every TERMINAL `CapacityTaskStatus` the model declares: a task in one of these
+/// is done, and the Outpost and order it belongs to can take another task. The
+/// other three modelled values (`REQUESTED`, `IN_PROGRESS`,
+/// `WAITING_FOR_EVACUATION`) are statuses Amazon Web Services Outposts is still
+/// working through, so a task in one of them is ACTIVE.
+pub const CAPACITY_TASK_TERMINAL: &[&str] = &[
+    CAPACITY_TASK_COMPLETED,
+    CAPACITY_TASK_FAILED,
+    CAPACITY_TASK_CANCELLED,
+];
+
+// The `CapacityTaskStatus` values a task this emulator started never reaches, and
+// why, stated once so no handler invents one:
+//
+// * `WAITING_FOR_EVACUATION` and the `CapacityTaskFailure` type
+//   `BLOCKING_INSTANCES_NOT_EVACUATED` describe a task held up by running EC2
+//   instances. This emulator runs no instances on an Outpost, so no task is ever
+//   blocked by one and none waits.
+// * `FAILED` needs a failure something produced; nothing in this slice can fail a
+//   task, so `Failed` stays absent rather than carrying an invented reason.
+// * `CANCELLATION_IN_PROGRESS` and `CANCELLED` belong to `CancelCapacityTask`,
+//   which is still a scaffold stub.
+
+/// How long after the call that started it each step of a capacity task's
+/// `REQUESTED` -> `IN_PROGRESS` -> `COMPLETED` progression falls due.
+///
+/// AWS publishes no duration for running a capacity task, so — exactly as
+/// [`OUTPOST_PROVISIONING`] — this span is the emulator's own: short enough that a
+/// workflow polling for a finished task finishes at once, and never zero, so a
+/// caller reading straight after `StartCapacityTask` still observes the
+/// `REQUESTED` status the start reported.
+pub const CAPACITY_TASK_STEP: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// One status transition a capacity task owes the clock.
+#[derive(Debug, Clone)]
+pub struct CapacityTaskTransition {
+    /// When the transition falls due, as a monotonic instant: nothing ever sleeps
+    /// for it, the first call made at or after it materialises it.
+    pub due: std::time::Instant,
+    /// The wall clock the transition is owed AT, which is what the task's
+    /// `LastModifiedDate` (and, for the terminal step, `CompletionDate`) reports —
+    /// so a late poll reports when the task really changed, not when it was polled.
+    pub at: std::time::SystemTime,
+    /// The `CapacityTaskStatus` the task holds from that instant on.
+    pub status: String,
+}
+
+/// A persisted capacity task: every member `StartCapacityTask` / `GetCapacityTask`
+/// report, plus its creation order and the transitions the clock still owes it.
+#[derive(Debug, Clone)]
+pub struct CapacityTaskRecord {
+    /// See [`SiteRecord::sequence`].
+    pub sequence: u64,
+    /// The minted `CapacityTaskId` (`cap-…`) this record is keyed by.
+    pub capacity_task_id: String,
+    /// The bare `OutpostId` of the Outpost the task runs on — the parent the
+    /// task's route nests it under.
+    pub outpost_id: String,
+    /// The `OrderId` the caller associated the task with, if any.
+    pub order_id: Option<String>,
+    /// The `AssetId` the caller named, if any.
+    pub asset_id: Option<String>,
+    /// The instance pools the caller requested, reported back as
+    /// `RequestedInstancePools`.
+    pub requested_instance_pools: Vec<InstanceTypeCapacity>,
+    /// The instances the caller said must not be stopped.
+    pub instances_to_exclude: Option<InstancesToExclude>,
+    /// Whether the task was requested as a dry run.
+    pub dry_run: bool,
+    /// What the caller asked for when an instance blocks the task.
+    pub task_action_on_blocking_instances: Option<String>,
+    /// The `CapacityTaskStatus` the task holds now, as of the last settle.
+    pub status: String,
+    /// Why the task failed. See [`CAPACITY_TASK_FAILED`].
+    pub failed: Option<CapacityTaskFailure>,
+    /// When `StartCapacityTask` created the task (`CreationDate`).
+    pub created_at: std::time::SystemTime,
+    /// When the task last changed (`LastModifiedDate`).
+    pub last_modified_at: std::time::SystemTime,
+    /// When the task completed (`CompletionDate`), absent until it does.
+    pub completed_at: Option<std::time::SystemTime>,
+    /// The transitions still owed, in the order they fall due. Empty once the task
+    /// has settled in a terminal status.
+    pub pending: VecDeque<CapacityTaskTransition>,
+}
+
+impl CapacityTaskRecord {
+    /// Whether this task is ACTIVE: it is in a status Amazon Web Services Outposts
+    /// is still working through, so the Outpost (and the order) it belongs to
+    /// cannot take another one. A task in a terminal status is not active.
+    pub fn is_active(&self) -> bool {
+        !CAPACITY_TASK_TERMINAL.contains(&self.status.as_str())
+    }
+}
+
+/// The transitions a capacity task started at `now` owes the clock: one
+/// [`CAPACITY_TASK_STEP`] to `IN_PROGRESS`, and another to `COMPLETED`.
+///
+/// Both instants are fixed when the task starts, so the status a read reports is
+/// the one the task holds at the instant it is asked for — the same answer whether
+/// or not anybody polled in between.
+pub fn capacity_task_progression(now: std::time::SystemTime) -> VecDeque<CapacityTaskTransition> {
+    let started = std::time::Instant::now();
+    [CAPACITY_TASK_IN_PROGRESS, CAPACITY_TASK_COMPLETED]
+        .into_iter()
+        .enumerate()
+        .map(|(step, status)| {
+            let elapsed = CAPACITY_TASK_STEP * (u32::try_from(step).unwrap_or(0) + 1);
+            CapacityTaskTransition {
+                due: started + elapsed,
+                at: now + elapsed,
+                status: status.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Project a stored [`CapacityTaskRecord`] onto an operation's output shape.
+///
+/// `StartCapacityTask` and `GetCapacityTask` declare the SAME thirteen members for
+/// a capacity task, as two distinct generated structures. Stating the projection
+/// once, as a macro over the output type, is what keeps the two from drifting
+/// apart on what a capacity task reports, the way [`page`] keeps the two lists from
+/// drifting apart on how they page.
+///
+/// `RequestedInstancePools` is always reported, empty list and all, because the
+/// pools are part of the task the caller asked for; `OrderId`, `AssetId`,
+/// `InstancesToExclude` and `TaskActionOnBlockingInstances` are reported only when
+/// the caller named them, and `Failed` only when the task failed.
+#[macro_export]
+macro_rules! capacity_task_projection {
+    ($output:ident, $record:expr) => {{
+        let record: &$crate::state::CapacityTaskRecord = $record;
+        $output {
+            capacity_task_id: Some(record.capacity_task_id.clone()),
+            outpost_id: Some(record.outpost_id.clone()),
+            order_id: record.order_id.clone(),
+            asset_id: record.asset_id.clone(),
+            requested_instance_pools: Some(record.requested_instance_pools.clone()),
+            instances_to_exclude: record.instances_to_exclude.clone(),
+            dry_run: record.dry_run,
+            capacity_task_status: Some(record.status.clone()),
+            failed: record.failed.clone(),
+            creation_date: Some(::aws_smithy_types::DateTime::from(record.created_at)),
+            completion_date: record
+                .completed_at
+                .map(::aws_smithy_types::DateTime::from),
+            last_modified_date: Some(::aws_smithy_types::DateTime::from(record.last_modified_at)),
+            task_action_on_blocking_instances: record.task_action_on_blocking_instances.clone(),
+        }
+    }};
+}
+
 /// A persisted quote: the modelled [`Quote`] plus its creation order.
 ///
 /// A quote carries its own `CreatedDate` and `ExpirationDate`, so the instant its
@@ -131,6 +306,9 @@ pub struct ComAmazonawsOutpostsOutpostsolafserviceState {
     pub sites: BTreeMap<String, SiteRecord>,
     /// Every persisted Outpost, keyed by its bare `OutpostId` (`op-…`).
     pub outposts: BTreeMap<String, OutpostRecord>,
+    /// Every persisted capacity task, keyed by its `CapacityTaskId` (`cap-…`),
+    /// which is how `GetCapacityTask` resolves one.
+    pub capacity_tasks: BTreeMap<String, CapacityTaskRecord>,
     /// Every persisted quote, keyed by its bare `QuoteId` (`oq-…`), which is how
     /// `GetQuote` resolves one.
     pub quotes: BTreeMap<String, QuoteRecord>,
@@ -155,6 +333,31 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             if record.active_at.is_some_and(|due| now >= due) {
                 record.outpost.life_cycle_status = Some(LIFE_CYCLE_STATUS_ACTIVE.to_string());
                 record.active_at = None;
+            }
+        }
+    }
+
+    /// Materialise every capacity-task transition the clock has already made due.
+    ///
+    /// Every operation that reports a capacity task calls this FIRST, for the same
+    /// reason [`Self::settle_outposts`] exists: a read answers the status the task
+    /// holds at the instant it is asked for. It applies only what the clock already
+    /// owed at that instant — every step whose due instant has passed, so a caller
+    /// that polls late sees the same terminal status, with the same
+    /// `LastModifiedDate` and `CompletionDate`, as one that polled all along — and a
+    /// task that has settled in a terminal status is left alone.
+    pub fn settle_capacity_tasks(&mut self) {
+        let now = std::time::Instant::now();
+        for record in self.capacity_tasks.values_mut() {
+            while record.pending.front().is_some_and(|next| now >= next.due) {
+                let Some(next) = record.pending.pop_front() else {
+                    break;
+                };
+                record.last_modified_at = next.at;
+                if next.status == CAPACITY_TASK_COMPLETED {
+                    record.completed_at = Some(next.at);
+                }
+                record.status = next.status;
             }
         }
     }
@@ -185,15 +388,35 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         }
     }
 
+    /// The capacity task that is still ACTIVE on `outpost_id`, if any.
+    ///
+    /// "You can have one active capacity task for each order and each Outpost", so
+    /// this is what `StartCapacityTask` refuses a second one against. Callers settle
+    /// first: a task the clock has already completed holds nothing up.
+    pub fn active_capacity_task_on_outpost(&self, outpost_id: &str) -> Option<&CapacityTaskRecord> {
+        self.capacity_tasks
+            .values()
+            .find(|task| task.outpost_id == outpost_id && task.is_active())
+    }
+
+    /// The capacity task that is still ACTIVE on `order_id`, if any. See
+    /// [`Self::active_capacity_task_on_outpost`] — the same rule, stated for the
+    /// other resource a task is one-at-a-time per.
+    pub fn active_capacity_task_on_order(&self, order_id: &str) -> Option<&CapacityTaskRecord> {
+        self.capacity_tasks
+            .values()
+            .find(|task| task.order_id.as_deref() == Some(order_id) && task.is_active())
+    }
+
     /// Mint a fresh resource id of the form `<prefix>-<17 lowercase hex chars>`,
     /// and return it with the creation sequence to record on the new resource.
     ///
-    /// `OutpostId` (`^op-[a-f0-9]{17}$`), `SiteId` (`^os-[a-f0-9]{17}$`) and
-    /// `QuoteId` (`^oq-[a-f0-9]{17}$`) are each a two-letter prefix and exactly 17
-    /// lowercase hex characters, so one helper serves them all.
-    /// `created` advances on every call and is hashed into the
-    /// seed with the wall clock and the process id, so repeated calls never return
-    /// the same id.
+    /// `OutpostId` (`^op-[a-f0-9]{17}$`), `SiteId` (`^os-[a-f0-9]{17}$`),
+    /// `QuoteId` (`^oq-[a-f0-9]{17}$`) and `CapacityTaskId` (`^cap-[a-f0-9]{17}$`)
+    /// are each a short literal prefix and exactly 17 lowercase hex characters, so
+    /// one helper serves them all. `created` advances on every call and is hashed
+    /// into the seed with the wall clock and the process id, so repeated calls never
+    /// return the same id.
     pub fn mint_id(&mut self, prefix: &str) -> (String, u64) {
         self.created = self.created.wrapping_add(1);
         let nanos = std::time::SystemTime::now()
@@ -633,6 +856,10 @@ pub const SITE_ID_MEMBER: &str = "siteId";
 /// The validation-path name of the `OutpostId` input member. See [`SITE_ID_MEMBER`].
 pub const OUTPOST_ID_MEMBER: &str = "outpostId";
 
+/// The validation-path name of the `CapacityTaskId` input member. See
+/// [`SITE_ID_MEMBER`].
+pub const CAPACITY_TASK_ID_MEMBER: &str = "capacityTaskId";
+
 /// The validation-path name of the `NextToken` input member every list takes.
 /// See [`SITE_ID_MEMBER`].
 pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
@@ -641,10 +868,10 @@ pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
 /// operations bind. See [`SITE_ID_MEMBER`].
 pub const QUOTE_IDENTIFIER_MEMBER: &str = "quoteIdentifier";
 
-/// The validation-path name of the `OutpostIdentifier` input member the quote
-/// operations take \u2014 a DIFFERENT member from the `OutpostId` the Outpost
-/// operations bind, so a refusal about it names it as the request spelled it.
-/// See [`SITE_ID_MEMBER`].
+/// The validation-path name of the `OutpostIdentifier` input member the quote and
+/// capacity-task operations take: a DIFFERENT member from the `OutpostId` the
+/// Outpost operations bind, so a refusal about it names it as the request spelled
+/// it. See [`SITE_ID_MEMBER`].
 pub const OUTPOST_IDENTIFIER_MEMBER: &str = "outpostIdentifier";
 
 /// The `@pattern` the model declares on `SiteId`, verbatim: a report names a
@@ -662,7 +889,7 @@ pub const QUOTE_IDENTIFIER_PATTERN: &str =
     r"^(arn:aws([a-z-]+)?:outposts:[a-z\d-]+:\d{12}:quote/)?oq-[a-f0-9]{17}$";
 
 /// The `@pattern` the model declares on `OutpostIdentifier`, the member the quote
-/// operations name an Outpost by. See [`SITE_ID_PATTERN`].
+/// and capacity-task operations name an Outpost by. See [`SITE_ID_PATTERN`].
 pub const OUTPOST_IDENTIFIER_PATTERN: &str =
     r"^(arn:aws([a-z-]+)?:outposts:[a-z\d-]+:\d{12}:outpost/)?op-[a-f0-9]{17}$";
 
@@ -759,6 +986,26 @@ pub fn outpost_id_pattern_report() -> String {
     )
 }
 
+/// How this service states that an Outpost (or an order) already has an active
+/// capacity task, and so cannot take another.
+///
+/// AWS publishes no wording for this refusal, so the sentence is the emulator's
+/// own; what the caller branches on is the `ConflictException` code (HTTP 409) and
+/// the `ResourceId` / `ResourceType` members the model puts on it, which name the
+/// resource the conflict is about. The message names the task already holding it,
+/// so the caller can poll exactly that one.
+pub fn capacity_task_conflict(resource_type: &str, resource_id: &str, active: &str) -> String {
+    format!("{resource_type} {resource_id} already has an active capacity task: {active}")
+}
+
+/// The `ResourceType` a capacity-task conflict on an Outpost names, from the
+/// modelled `ResourceType` enum (`ORDER | OUTPOST`).
+pub const RESOURCE_TYPE_OUTPOST: &str = "OUTPOST";
+
+/// The `ResourceType` a capacity-task conflict on an order names. See
+/// [`RESOURCE_TYPE_OUTPOST`].
+pub const RESOURCE_TYPE_ORDER: &str = "ORDER";
+
 /// The report a `QuoteIdentifier` that is neither a quote id nor a quote ARN
 /// states. See [`site_id_pattern_report`].
 pub fn quote_identifier_pattern_report() -> String {
@@ -801,22 +1048,39 @@ pub const SITE_PAGE: &str = "sites";
 /// the ceiling the model declares for it (`MaxResults1000`, `range(1..1000)`).
 pub const MAX_RESULTS: i32 = 1000;
 
-/// The ceiling on how many sites, how many Outposts, and how many quotes this
-/// store holds.
+/// The ceiling on how many sites, how many Outposts, how many quotes, and how many
+/// capacity tasks this store holds.
 ///
 /// A generated emulator keeps its resources in memory for the life of the process
 /// and a create is the only thing that adds one, so the store needs a maximum entry
 /// count: neither a TTL nor an eviction policy is available to it, because `GetSite`
-/// must still answer what `CreateSite` created. Past the cap the two creating
-/// operations that model `ServiceQuotaExceededException` (HTTP 402) answer it — it
-/// is modelled on exactly them and on no read — and `CreateQuote`, whose model
-/// declares no quota error, refuses the create as a bad request (400
-/// `ValidationException`) rather than inventing an error the model does not carry.
-/// The number is the emulator's own bound,
-/// not a published AWS default — AWS publishes both quotas as adjustable, so no
-/// single value is the contract — and is set high enough that no ordinary workflow
-/// meets it.
+/// must still answer what `CreateSite` created, and `GetCapacityTask` must still
+/// answer a task that has long since completed. Past the cap the creating operation
+/// refuses the request rather than growing: the two creates that model
+/// `ServiceQuotaExceededException` (HTTP 402) answer it (it is modelled on exactly
+/// them and on no read), `CreateQuote`, whose model declares no quota error, refuses
+/// the create as a bad request (400 `ValidationException`) rather than inventing an
+/// error the model does not carry, and `StartCapacityTask`, which models no quota
+/// error either, answers the `ConflictException` (HTTP 409) it does model, worded by
+/// [`store_full`] so the caller can tell it from the one-active-task refusal. The
+/// number is the emulator's own bound, not a published AWS default (AWS publishes
+/// these quotas as adjustable, so no single value is the contract), and is set high
+/// enough that no ordinary workflow meets it.
 pub const MAX_RESOURCES: usize = 5_000;
+
+/// How this service states that a store has reached [`MAX_RESOURCES`] and cannot
+/// take another resource of that kind.
+///
+/// The ceiling is the emulator's own, so no AWS rule fixes this wording; what the
+/// caller branches on is the modelled code and status. The message names the
+/// emulator, the kind of resource and the bound, so the refusal cannot be mistaken
+/// for a statement about the caller's request or about a real AWS quota.
+pub fn store_full(resource: &str) -> String {
+    format!(
+        "this emulator holds the maximum of {MAX_RESOURCES} {resource} it can keep in \
+         memory, so it cannot take another"
+    )
+}
 
 /// Encode a page boundary as an opaque `Token`.
 ///
