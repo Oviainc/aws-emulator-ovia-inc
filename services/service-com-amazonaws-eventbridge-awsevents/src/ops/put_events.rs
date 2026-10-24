@@ -8,9 +8,19 @@
 //! as a match, together with the `Arn` of each of its targets, in
 //! [`crate::state::ComAmazonawsEventbridgeAwseventsState::delivered`] — so a
 //! published event reaching a rule's targets is observable state, not a
-//! discarded side effect — and then DELIVERED to each of those targets that is
-//! an SQS queue, whose message body is the whole event envelope (see
-//! [`deliver`]). `FailedEntryCount` is the number of entries that were
+//! discarded side effect — and then DELIVERED to each of those targets:
+//! EventBridge makes the API call that target's service is invoked by
+//! (`sqs:SendMessage` for a queue, `lambda:InvokeFunction` for a function,
+//! `sns:Publish` for a topic, `states:StartExecution` for a state machine),
+//! carrying the whole event envelope. For the kinds AWS invokes under the
+//! target's `RoleArn` it acts as that role, so a role it cannot assume or whose
+//! policies withhold the call is a delivery that fails: the event is sent to the
+//! target's dead-letter queue and counted on `FailedInvocations`. What came of
+//! every handover is recorded in
+//! [`crate::state::ComAmazonawsEventbridgeAwseventsState::invocations`] (see
+//! [`deliver`]).
+//!
+//! `FailedEntryCount` is the number of entries that were
 //! NOT accepted, computed from those per-entry outcomes. An entry that does not
 //! provide each of `Detail`, `DetailType` and `Source` names no event, so it
 //! fails on its own — and a request in which NO entry provides all three is
@@ -215,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What routing decided to deliver, and the envelope to deliver: the event
         // text a target receives is the whole envelope, so it is kept beside the
         // targets rather than rebuilt per target.
-        let mut dispatches: Vec<(::serde_json::Value, Vec<CompiledTarget>)> = Vec::new();
+        let mut dispatches: Vec<Dispatch> = Vec::new();
         let mut failed = 0usize;
         for slot in screened {
             let accepted = match slot {
@@ -244,20 +254,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 accepted.time,
             );
             match route(&envelope, rules) {
-                Some((matched_rules, targets)) => {
+                Some(matched) => {
                     deliveries.push(crate::state::DeliveredEvent {
                         event_id: accepted.event_id.clone(),
-                        bus: accepted.bus,
+                        bus: accepted.bus.clone(),
                         source: accepted.source,
                         detail_type: accepted.detail_type,
                         detail: accepted.detail,
                         resources: accepted.resources,
                         time: accepted.time,
-                        matched_rules,
-                        target_arns: targets.iter().map(|target| target.arn.clone()).collect(),
+                        matched_rules: matched.iter().map(|rule| rule.name.clone()).collect(),
+                        target_arns: matched
+                            .iter()
+                            .flat_map(|rule| rule.targets.iter().map(|target| target.arn.clone()))
+                            .collect(),
                     });
-                    if !targets.is_empty() {
-                        dispatches.push((envelope, targets));
+                    if matched.iter().any(|rule| !rule.targets.is_empty()) {
+                        dispatches.push(Dispatch {
+                            event_id: accepted.event_id.clone(),
+                            bus: accepted.bus,
+                            envelope,
+                            matched,
+                        });
                     }
                     entries.push(PutEventsResultEntry {
                         event_id: Some(accepted.event_id),
@@ -294,10 +312,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rule"), so it happens here rather than being left as a recorded
         // intention. ONE budget for the whole request caps the fan-out's
         // (entries x rules x targets x bytes) product.
+        let iam = crate::state::iam_state(&*self.engine);
+        let cloudwatch = crate::state::cloudwatch_state(&*self.engine);
         let mut budget = DeliveryBudget::new();
-        for (envelope, targets) in dispatches {
-            if !deliver(ctx, &region, &envelope, &targets, &mut budget).await {
-                break;
+        let mut clients = Clients::default();
+        let mut invocations: Vec<crate::state::TargetInvocation> = Vec::new();
+        'dispatch: for dispatch in dispatches {
+            let rendered = dispatch.envelope.to_string();
+            for rule in &dispatch.matched {
+                let rule_arn = crate::state::rule_arn(&region, &dispatch.bus, &rule.name);
+                for target in &rule.targets {
+                    let Some(outcome) = deliver(
+                        ctx,
+                        &region,
+                        &mut clients,
+                        iam.as_ref(),
+                        cloudwatch.as_ref(),
+                        &Handover {
+                            event_id: &dispatch.event_id,
+                            rule: &rule.name,
+                            rule_arn: &rule_arn,
+                            target,
+                            rendered: &rendered,
+                        },
+                        &mut budget,
+                    )
+                    .await
+                    else {
+                        // The request's delivery budget is spent: the remaining
+                        // targets are not handed anything, and nothing is
+                        // recorded for them either.
+                        break 'dispatch;
+                    };
+                    invocations.push(crate::state::TargetInvocation {
+                        event_id: dispatch.event_id.clone(),
+                        rule: rule.name.clone(),
+                        target_id: target.id.clone(),
+                        target_arn: target.arn.clone(),
+                        outcome,
+                    });
+                }
+            }
+        }
+
+        // PASS 6 — under the lock once more, to append what came of each
+        // handover: the invocation log is how a client observes a delivery that
+        // happened outside the target's own service.
+        if !invocations.is_empty() {
+            let mut store = state.lock();
+            for invocation in invocations {
+                store.record_invocation(invocation);
             }
         }
 
@@ -569,33 +633,62 @@ fn screen(
     })
 }
 
-/// Route one accepted entry's envelope: the names of the rules whose
-/// `EventPattern` matches it, and the targets of those rules — in rule then
-/// target order, which is the order the event is delivered in.
+/// Route one accepted entry's envelope: the rules whose `EventPattern` matches
+/// it, each with the targets the event is delivered to — in rule then target
+/// order, which is the order the event is delivered in.
+///
+/// The rule a target belongs to is kept rather than flattened away: the rule is
+/// what a delivery failure is accounted against
+/// (`crate::state::FAILED_INVOCATIONS_METRIC` is dimensioned by
+/// `crate::state::RULE_NAME_DIMENSION`) and what a dead-letter message names.
 ///
 /// `None` when the entry exhausted its matching budget, so the caller reports
 /// that instead of passing a half-evaluated verdict off as a real one.
-fn route(
-    envelope: &::serde_json::Value,
-    rules: &[CompiledRule],
-) -> Option<(Vec<String>, Vec<CompiledTarget>)> {
+fn route(envelope: &::serde_json::Value, rules: &[CompiledRule]) -> Option<Vec<MatchedRule>> {
     // ONE budget for the whole entry, spent across every rule it is matched
     // against: that is what caps the (entries x rules x bytes) product rather
     // than each factor on its own.
     let mut budget =
         crate::state::event_pattern::Budget::new(crate::state::MAX_MATCH_BYTES_PER_ENTRY);
-    let mut matched_rules: Vec<String> = Vec::new();
-    let mut targets: Vec<CompiledTarget> = Vec::new();
+    let mut matched: Vec<MatchedRule> = Vec::new();
     for rule in rules {
         if crate::state::event_pattern::matches_parsed(&rule.pattern, envelope, &mut budget) {
-            matched_rules.push(rule.name.clone());
-            targets.extend(rule.targets.iter().cloned());
+            matched.push(MatchedRule {
+                name: rule.name.clone(),
+                targets: rule.targets.clone(),
+            });
         }
         if budget.spent() {
             return None;
         }
     }
-    Some((matched_rules, targets))
+    Some(matched)
+}
+
+/// One rule that matched a published event, and the targets that event is to be
+/// delivered to.
+struct MatchedRule {
+    name: String,
+    targets: Vec<CompiledTarget>,
+}
+
+/// One routed event and everything the delivery pass needs to hand it over.
+struct Dispatch {
+    event_id: String,
+    bus: String,
+    envelope: ::serde_json::Value,
+    matched: Vec<MatchedRule>,
+}
+
+/// One handover about to be made: which event, under which rule, to which
+/// target, carrying which text.
+struct Handover<'a> {
+    event_id: &'a str,
+    rule: &'a str,
+    rule_arn: &'a str,
+    target: &'a CompiledTarget,
+    /// The whole event envelope, rendered ONCE per event rather than per target.
+    rendered: &'a str,
 }
 
 /// One rule of a bus, ready to route: its name, its parsed `EventPattern`, and
@@ -609,10 +702,15 @@ struct CompiledRule {
     targets: Vec<CompiledTarget>,
 }
 
-/// One target of a matched rule, with what decides WHAT it receives.
+/// One target of a matched rule, with what decides WHAT it receives, who it is
+/// invoked AS, and where the event goes when the invocation fails.
 #[derive(Clone)]
 struct CompiledTarget {
+    id: String,
     arn: String,
+    /// `Target$RoleArn`: "the ARN of the IAM role to be used for this target
+    /// when the rule is triggered" — the role EventBridge acts as to invoke it.
+    role_arn: Option<String>,
     /// `Target$Input`: "Valid JSON text passed to the target", which replaces
     /// the event entirely when it is set.
     input: Option<String>,
@@ -620,6 +718,9 @@ struct CompiledTarget {
     /// (`Target$InputPath` or `Target$InputTransformer`). See [`deliver`] for why
     /// such a target is not delivered to here.
     transforms_input: bool,
+    /// `Target$DeadLetterConfig`: "the queue to use as the dead-letter queue",
+    /// where an event that could not be delivered to this target is sent.
+    dead_letter_arn: Option<String>,
 }
 
 impl CompiledRule {
@@ -639,19 +740,22 @@ impl CompiledRule {
                 .targets
                 .iter()
                 .map(|target| CompiledTarget {
+                    id: target.id.clone(),
                     arn: target.arn.clone(),
+                    role_arn: target.role_arn.clone(),
                     input: target.input.clone(),
                     transforms_input: target.input_path.is_some()
                         || target.raw.input_transformer.is_some(),
+                    dead_letter_arn: target
+                        .raw
+                        .dead_letter_config
+                        .as_ref()
+                        .and_then(|config| config.arn.clone()),
                 })
                 .collect(),
         })
     }
 }
-
-/// The ARN namespace of Amazon SQS, whose queues are the target kind this
-/// operation delivers to.
-const SQS_ARN_NAMESPACE: &str = "sqs";
 
 /// How many target deliveries ONE `PutEvents` request may make, across every
 /// entry and every rule that matched.
@@ -712,83 +816,412 @@ impl DeliveryBudget {
     }
 }
 
-/// Deliver one routed event to every target of the rules that matched it, within
-/// what the request's [`DeliveryBudget`] has left.
+/// Hand ONE routed event to ONE target of a matched rule, within what the
+/// request's [`DeliveryBudget`] has left, and answer what came of it.
+///
+/// The rule AWS follows: for every target of a rule whose `EventPattern`
+/// matched, EventBridge makes the API call that target's service is invoked by,
+/// carrying the whole event envelope, and an invocation it cannot make is sent to
+/// the target's dead-letter queue and counted on `FailedInvocations`. WHICH
+/// identity it makes that call as depends on the target kind, and so does whether
+/// the target's `RoleArn` governs it at all: "for EC2 instances, Kinesis data
+/// streams, Step Functions state machines and API Gateway APIs, EventBridge
+/// relies on IAM roles that you specify in the `RoleARN` argument in
+/// `PutTargets`. For Lambda functions, Amazon SNS topics and Amazon SQS queues,
+/// EventBridge relies on resource-based policies" — so the role gate below is
+/// asked only of the kinds AWS invokes under the role
+/// ([`TargetKind::invoked_under_target_role`]).
 ///
 /// A target is reached the way any emulated service reaches another: through the
 /// in-process callback ([`smithy_server_runtime::OperationContext::callback`]),
 /// so this crate names no other service crate. Delivery is asynchronous in AWS
 /// and its outcome is not part of this operation's answer ("`PutEvents` returns
-/// an `EventId` per accepted entry"), so a target that cannot be reached is
-/// logged and never changes what the caller is told.
+/// an `EventId` per accepted entry"), so what came of it goes into the
+/// invocation log and never changes what the caller is told.
 ///
-/// Answers `false` once the budget is spent, so the caller stops delivering the
-/// rest of the request instead of dispatching past the cap.
+/// `None` once the budget is spent, so the caller stops delivering the rest of
+/// the request instead of dispatching past the cap.
 async fn deliver(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
-    envelope: &::serde_json::Value,
-    targets: &[CompiledTarget],
+    clients: &mut Clients,
+    iam: Option<&::engine::ServiceState<crate::state::IamState>>,
+    cloudwatch: Option<&::engine::ServiceState<crate::state::CloudWatchState>>,
+    handover: &Handover<'_>,
     budget: &mut DeliveryBudget,
-) -> bool {
-    let mut client: Option<::aws_sdk_sqs::Client> = None;
-    // The envelope is rendered ONCE per event, not once per target: a fan-out must
-    // not re-serialize the whole event for every target it reaches.
-    let rendered = envelope.to_string();
-    for target in targets {
-        // Only an SQS queue is delivered to here. Every other target kind a rule
-        // may carry (a Lambda function, a topic, a state machine, …) needs its
-        // own invocation path, which is the subject of the EventBridge
-        // target-dispatch issue rather than of this one: an event routed to one
-        // is recorded in the routing log and nothing is invented for it.
-        let Some(queue) = sqs_queue(&target.arn) else {
-            continue;
-        };
-        if target.transforms_input {
-            // `InputPath` and `InputTransformer` reshape the event before it is
-            // delivered. That transformation is not implemented here, and a
-            // target asking for one must NOT be handed the untransformed event
-            // instead — that would deliver something the target never asked for
-            // — so the delivery does not happen and says so.
-            ::tracing::warn!(
-                target = %target.arn,
-                "an EventBridge target asking for an input transformation is not delivered to"
-            );
-            continue;
-        }
-        // "Input: valid JSON text passed to the target. In this case, nothing
-        // from the event itself is passed to the target" — so the target's own
-        // constant replaces the envelope when it carries one.
-        let body: &str = target.input.as_deref().unwrap_or(&rendered);
-        if !budget.charge(body.len()) {
-            ::tracing::warn!(
-                target = %target.arn,
-                deliveries = MAX_DELIVERIES_PER_REQUEST,
-                bytes = MAX_DELIVERED_BYTES_PER_REQUEST,
-                "this request reached the emulator's delivery budget; the remaining targets \
-                 of the matched rules are not delivered to"
-            );
-            return false;
-        }
-        let client = client.get_or_insert_with(|| sqs_client(ctx, region));
-        let answer = client
-            .send_message()
-            .queue_url(&queue)
-            .message_body(body)
-            .send()
-            .await;
-        if let Err(error) = answer {
-            ::tracing::warn!(
-                target = %target.arn,
-                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "an EventBridge target could not be delivered to"
-            );
-        }
+) -> Option<crate::state::InvocationOutcome> {
+    let target = handover.target;
+    // Which API call this target is invoked by. A target kind this emulator has
+    // no invocation path for is recorded as NOT ATTEMPTED and nothing is
+    // invented for it.
+    let Some(kind) = TargetKind::of(&target.arn) else {
+        return Some(crate::state::InvocationOutcome::NotAttempted(format!(
+            "no invocation is implemented for a target of {}",
+            ::service_common::arn::vendor(&target.arn).unwrap_or("an unknown service")
+        )));
+    };
+    if target.transforms_input {
+        // `InputPath` and `InputTransformer` reshape the event before it is
+        // delivered. That transformation is not implemented here, and a target
+        // asking for one must NOT be handed the untransformed event instead —
+        // that would deliver something the target never asked for — so the
+        // delivery does not happen and says so.
+        return Some(crate::state::InvocationOutcome::NotAttempted(
+            "the target asks for an input transformation, which this emulator does not apply"
+                .to_string(),
+        ));
     }
-    true
+    // "Input: valid JSON text passed to the target. In this case, nothing from
+    // the event itself is passed to the target" — so the target's own constant
+    // replaces the envelope when it carries one.
+    let body: &str = target.input.as_deref().unwrap_or(handover.rendered);
+    if !budget.charge(body.len()) {
+        ::tracing::warn!(
+            target = %target.arn,
+            deliveries = MAX_DELIVERIES_PER_REQUEST,
+            bytes = MAX_DELIVERED_BYTES_PER_REQUEST,
+            "this request reached the emulator's delivery budget; the remaining targets \
+             of the matched rules are not delivered to"
+        );
+        return None;
+    }
+
+    // EventBridge acts AS the target's role for the kinds AWS invokes under one,
+    // so a role it cannot assume, or one whose policies withhold the target's API
+    // call, is a delivery that fails before the call is made. The decision is
+    // taken with the IAM guard held only for as long as reading the role takes,
+    // never across the invocation. For a kind whose invocation is governed by the
+    // target's own resource policy instead, the `RoleArn` is not what decides it,
+    // and nothing here refuses the delivery: this emulator does not evaluate a
+    // resource-based policy, so it has nothing to show against such a target.
+    let role_arn = target
+        .role_arn
+        .as_deref()
+        .filter(|_| kind.invoked_under_target_role());
+    let outcome = match role_refusal(iam, role_arn, &target.arn, kind.action()) {
+        Some((code, message)) => crate::state::InvocationOutcome::Failed { code, message },
+        None => kind.invoke(ctx, clients, region, &target.arn, body).await,
+    };
+
+    // "If EventBridge can't deliver an event to a target, it sends the event to
+    // the dead-letter queue configured for that target" and counts it on
+    // `FailedInvocations`. Both follow from the SAME outcome, so they happen in
+    // one place.
+    if let crate::state::InvocationOutcome::Failed { code, message } = &outcome {
+        ::tracing::warn!(
+            target = %target.arn,
+            rule = %handover.rule,
+            %code,
+            "an EventBridge target could not be invoked"
+        );
+        if let Some(dead_letter_arn) = target.dead_letter_arn.as_deref() {
+            if let Some(queue) = sqs_queue(dead_letter_arn) {
+                // The dead-letter queue is reached in ITS OWN Region, which is
+                // not necessarily the target's or the request's.
+                let dlq_region = ::service_common::arn::region_of(
+                    dead_letter_arn,
+                    SQS_ARN_NAMESPACE,
+                )
+                .unwrap_or(region);
+                dead_letter(ctx, clients, dlq_region, &queue, handover, body, code, message).await;
+            }
+        }
+        count_failed_invocation(cloudwatch, handover.rule);
+    }
+    Some(outcome)
 }
 
-/// The queue url of an SQS target, or `None` when the ARN names something else.
+/// Why EventBridge may not invoke the target `arn` names under `role_arn`, as the
+/// account's IAM records show it — the shared decision in
+/// [`crate::state::delivery_refusal`], asked here with the IAM guard held for the
+/// read alone.
+fn role_refusal(
+    iam: Option<&::engine::ServiceState<crate::state::IamState>>,
+    role_arn: Option<&str>,
+    arn: &str,
+    action: &str,
+) -> Option<(String, String)> {
+    let iam = iam?;
+    crate::state::delivery_refusal(role_arn, action, arn, &iam.lock())
+}
+
+/// The kind of target an ARN names: which service is invoked, and how.
+///
+/// The vendor field of the ARN is what says it (`service_common::arn`, the ONE
+/// parse of a resource ARN), and the resource TYPE narrows it to a resource the
+/// invocation can actually address — an `arn:aws:states:…:activity/…` is not a
+/// state machine, so it is not started as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetKind {
+    /// An Amazon SQS queue: `sqs:SendMessage` with the event as the body.
+    Queue,
+    /// A Lambda function: `lambda:InvokeFunction` with the event as the payload.
+    Function,
+    /// An Amazon SNS topic: `sns:Publish` with the event as the message.
+    Topic,
+    /// A Step Functions state machine: `states:StartExecution` with the event as
+    /// the execution input.
+    StateMachine,
+}
+
+/// The ARN namespace of Amazon SQS, whose queues a rule delivers to.
+const SQS_ARN_NAMESPACE: &str = "sqs";
+/// The ARN namespace of AWS Lambda, whose functions a rule invokes.
+const LAMBDA_ARN_NAMESPACE: &str = "lambda";
+/// The ARN namespace of Amazon SNS, whose topics a rule publishes to.
+const SNS_ARN_NAMESPACE: &str = "sns";
+/// The ARN namespace of AWS Step Functions, whose state machines a rule starts.
+const STATES_ARN_NAMESPACE: &str = "states";
+
+/// The resource type a Lambda function ARN names.
+const FUNCTION_RESOURCE_TYPE: &str = "function";
+/// The resource type a Step Functions state machine ARN names.
+const STATE_MACHINE_RESOURCE_TYPE: &str = "stateMachine";
+
+impl TargetKind {
+    /// The kind `arn` names, or `None` when this emulator has no invocation for
+    /// the resource it names — in which case nothing is handed over and nothing
+    /// is invented in its place.
+    fn of(arn: &str) -> Option<Self> {
+        let parsed = ::service_common::arn::parse(arn)?;
+        match parsed.vendor {
+            // A queue's ARN names the queue directly: a resource field carrying
+            // a type separator is not one, so it addresses no queue.
+            SQS_ARN_NAMESPACE
+                if !parsed.resource.contains('/') && !parsed.resource.contains(':') =>
+            {
+                Some(Self::Queue)
+            }
+            LAMBDA_ARN_NAMESPACE if parsed.resource_type() == FUNCTION_RESOURCE_TYPE => {
+                Some(Self::Function)
+            }
+            // A topic's ARN, like a queue's, names the topic directly.
+            SNS_ARN_NAMESPACE
+                if !parsed.resource.contains('/') && !parsed.resource.contains(':') =>
+            {
+                Some(Self::Topic)
+            }
+            STATES_ARN_NAMESPACE if parsed.resource_type() == STATE_MACHINE_RESOURCE_TYPE => {
+                Some(Self::StateMachine)
+            }
+            _ => None,
+        }
+    }
+
+    /// The IAM action the invocation of this target kind performs, which is what
+    /// the target's role has to be allowed to do.
+    fn action(self) -> &'static str {
+        match self {
+            Self::Queue => "sqs:SendMessage",
+            Self::Function => "lambda:InvokeFunction",
+            Self::Topic => "sns:Publish",
+            Self::StateMachine => "states:StartExecution",
+        }
+    }
+
+    /// Make the invocation, and answer what came of it.
+    ///
+    /// A target service that answers `NotImplemented` has not refused the
+    /// delivery — nobody has written that operation in this emulator yet — so it
+    /// is recorded as NOT ATTEMPTED rather than counted as a failed invocation:
+    /// dead-lettering an event for a gap in the emulator would report a failure
+    /// that AWS never produces.
+    async fn invoke(
+        self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        clients: &mut Clients,
+        region: &str,
+        arn: &str,
+        body: &str,
+    ) -> crate::state::InvocationOutcome {
+        // The target's OWN Region — the ARN's — which is not necessarily the one
+        // this request was signed for, falling back to it when the ARN names no
+        // Region label.
+        let region = ::service_common::arn::region_of(arn, self.vendor()).unwrap_or(region);
+        match self {
+            Self::Queue => {
+                let Some(queue) = sqs_queue(arn) else {
+                    return crate::state::InvocationOutcome::NotAttempted(
+                        "the target ARN names no queue".to_string(),
+                    );
+                };
+                outcome(
+                    clients
+                        .sqs(ctx, region)
+                        .send_message()
+                        .queue_url(queue)
+                        .message_body(body)
+                        .send()
+                        .await,
+                )
+            }
+            Self::Function => outcome(
+                clients
+                    .lambda(ctx, region)
+                    // "Event: invoke the function asynchronously" — which is how
+                    // EventBridge invokes a function target: the rule does not
+                    // wait for the function's answer.
+                    .invoke()
+                    .function_name(arn)
+                    .invocation_type(::aws_sdk_lambda::types::InvocationType::Event)
+                    .payload(::aws_sdk_lambda::primitives::Blob::new(body.as_bytes()))
+                    .send()
+                    .await,
+            ),
+            Self::Topic => outcome(
+                clients
+                    .sns(ctx, region)
+                    .publish()
+                    .topic_arn(arn)
+                    .message(body)
+                    .send()
+                    .await,
+            ),
+            Self::StateMachine => outcome(
+                clients
+                    .sfn(ctx, region)
+                    .start_execution()
+                    .state_machine_arn(arn)
+                    // The execution's input is the whole event envelope; the
+                    // execution's NAME is left to Step Functions, which mints
+                    // one when the request names none.
+                    .input(body)
+                    .send()
+                    .await,
+            ),
+        }
+    }
+
+    /// The ARN namespace of the service this kind of target lives in.
+    fn vendor(self) -> &'static str {
+        match self {
+            Self::Queue => SQS_ARN_NAMESPACE,
+            Self::Function => LAMBDA_ARN_NAMESPACE,
+            Self::Topic => SNS_ARN_NAMESPACE,
+            Self::StateMachine => STATES_ARN_NAMESPACE,
+        }
+    }
+
+    /// Whether EventBridge invokes this kind of target AS the role the target
+    /// names, which is what makes that role's trust and permissions decide the
+    /// delivery.
+    ///
+    /// "For EC2 instances, Kinesis data streams, Step Functions state machines
+    /// and API Gateway APIs, EventBridge relies on IAM roles that you specify in
+    /// the `RoleARN` argument in `PutTargets`. For Lambda functions, Amazon SNS
+    /// topics and Amazon SQS queues, EventBridge relies on resource-based
+    /// policies" — so a `RoleArn` on a queue, topic or function target is not
+    /// what governs its invocation, and withholding a permission there does not
+    /// stop the delivery.
+    fn invoked_under_target_role(self) -> bool {
+        match self {
+            Self::StateMachine => true,
+            Self::Queue | Self::Function | Self::Topic => false,
+        }
+    }
+}
+
+/// The wire error code an emulated service answers with for an operation nobody
+/// has implemented yet (`crate::scaffolded`).
+const NOT_IMPLEMENTED_CODE: &str = "NotImplemented";
+
+/// What one invocation's answer means for the delivery.
+///
+/// An `Ok` is a delivery the target accepted. An error is read through the
+/// SDK's own error metadata: a `NotImplemented` is this emulator's gap rather
+/// than a refusal of the event (see [`TargetKind::invoke`]), and anything else
+/// is a failed invocation carrying the code and message the target gave.
+fn outcome<T, E>(answer: Result<T, E>) -> crate::state::InvocationOutcome
+where
+    E: ::aws_smithy_types::error::metadata::ProvideErrorMetadata + ::std::error::Error + 'static,
+{
+    let error = match answer {
+        Ok(_) => return crate::state::InvocationOutcome::Invoked,
+        Err(error) => error,
+    };
+    let rendered = ::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string();
+    match error.code() {
+        Some(NOT_IMPLEMENTED_CODE) => crate::state::InvocationOutcome::NotAttempted(rendered),
+        Some(code) => crate::state::InvocationOutcome::Failed {
+            code: code.to_string(),
+            message: rendered,
+        },
+        // No code at all: the call did not reach the target's service, which is
+        // this emulator failing to ask rather than the target refusing.
+        None => crate::state::InvocationOutcome::NotAttempted(rendered),
+    }
+}
+
+/// Send one undeliverable event to the target's dead-letter queue.
+///
+/// "EventBridge adds the following custom attributes to the dead-letter
+/// message": the rule and target the event could not be delivered to, and the
+/// error code and message of the refusal — so a consumer of the queue can tell
+/// which delivery failed and why without parsing the event.
+#[allow(clippy::too_many_arguments)]
+async fn dead_letter(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    clients: &mut Clients,
+    region: &str,
+    queue: &str,
+    handover: &Handover<'_>,
+    body: &str,
+    code: &str,
+    message: &str,
+) {
+    let attributes = [
+        ("RULE_ARN", handover.rule_arn),
+        ("TARGET_ARN", handover.target.arn.as_str()),
+        ("ERROR_CODE", code),
+        ("ERROR_MESSAGE", message),
+    ];
+    let mut request = clients
+        .sqs(ctx, region)
+        .send_message()
+        .queue_url(queue)
+        .message_body(body);
+    for (name, value) in attributes {
+        match ::aws_sdk_sqs::types::MessageAttributeValue::builder()
+            .data_type("String")
+            .string_value(value)
+            .build()
+        {
+            Ok(attribute) => request = request.message_attributes(name, attribute),
+            Err(error) => ::tracing::warn!(
+                %name,
+                error = %error,
+                "a dead-letter attribute could not be built"
+            ),
+        }
+    }
+    if let Err(error) = request.send().await {
+        ::tracing::warn!(
+            event_id = %handover.event_id,
+            target = %handover.target.arn,
+            error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+            "an undeliverable EventBridge event could not be sent to the dead-letter queue"
+        );
+    }
+}
+
+/// Count one undeliverable event on the rule's `FailedInvocations` metric.
+///
+/// The decision is EventBridge's; where the metric LIVES and how it is appended
+/// is CloudWatch's, so the write itself is
+/// [`crate::state::count_failed_invocation`] over the CloudWatch store in this
+/// same engine. `None` is a deployment with no CloudWatch mounted, which is
+/// nothing to count on.
+fn count_failed_invocation(
+    cloudwatch: Option<&::engine::ServiceState<crate::state::CloudWatchState>>,
+    rule: &str,
+) {
+    let Some(cloudwatch) = cloudwatch else {
+        return;
+    };
+    crate::state::count_failed_invocation(&mut cloudwatch.lock(), rule);
+}
+
+/// The queue url of an SQS queue ARN, or `None` when the ARN names something else.
 ///
 /// An SQS queue ARN is `arn:<partition>:sqs:<region>:<account>:<QueueName>`, and the
 /// url SQS addresses that queue by is `<endpoint>/<account>/<QueueName>` — the form
@@ -812,27 +1245,235 @@ fn sqs_queue(arn: &str) -> Option<String> {
     ))
 }
 
-/// An SQS client over the in-process callback into this same emulator.
-fn sqs_client(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    region: &str,
-) -> ::aws_sdk_sqs::Client {
-    let config = ::aws_sdk_sqs::Config::builder()
-        .behavior_version(::aws_sdk_sqs::config::BehaviorVersion::latest())
-        .http_client(ctx.callback().http_client())
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .region(::aws_sdk_sqs::config::Region::new(region.to_string()))
-        .endpoint_url(format!("https://sqs.{region}.amazonaws.com"))
-        // The transport is in-process: there is nothing to retry, time out or
-        // watch for a stalled stream, and each of those would need a sleep
-        // implementation this client is not given. The same goes for caching the
-        // identity: the credentials are handed over directly.
-        .retry_config(::aws_sdk_sqs::config::retry::RetryConfig::disabled())
-        .timeout_config(::aws_sdk_sqs::config::timeout::TimeoutConfig::disabled())
-        .identity_cache(::aws_sdk_sqs::config::IdentityCache::no_cache())
-        .stalled_stream_protection(
-            ::aws_sdk_sqs::config::StalledStreamProtectionConfig::disabled(),
-        )
-        .build();
-    ::aws_sdk_sqs::Client::from_conf(config)
+/// The clients one `PutEvents` request reaches its targets through, built on
+/// first use and then reused: a fan-out to several targets of one service must
+/// not construct a client per target.
+///
+/// Each slot remembers the Region its client was built for, because a target is
+/// reached in the Region ITS OWN ARN names: a fan-out spanning two Regions of
+/// one service rebuilds the client rather than sending the second delivery to the
+/// first Region's endpoint.
+#[derive(Default)]
+struct Clients {
+    sqs: Option<(String, ::aws_sdk_sqs::Client)>,
+    lambda: Option<(String, ::aws_sdk_lambda::Client)>,
+    sns: Option<(String, ::aws_sdk_sns::Client)>,
+    sfn: Option<(String, ::aws_sdk_sfn::Client)>,
+}
+
+/// Build the four clients the same way: over the in-process callback into this
+/// same emulator, against the target service's endpoint in `region`.
+///
+/// The transport is in-process, so each client disables what a network client
+/// needs and this one cannot have: retries, timeouts, stalled-stream protection
+/// and identity caching each need a sleep implementation the callback transport
+/// is not given, and there is nothing to retry behind it anyway.
+macro_rules! callback_client {
+    ($field:ident, $sdk:ident, $endpoint:literal) => {
+        fn $field(
+            &mut self,
+            ctx: &smithy_server_runtime::OperationContext<'_>,
+            region: &str,
+        ) -> &::$sdk::Client {
+            if self
+                .$field
+                .as_ref()
+                .is_none_or(|(held, _)| held != region)
+            {
+                let config = ::$sdk::Config::builder()
+                    .behavior_version(::$sdk::config::BehaviorVersion::latest())
+                    .http_client(ctx.callback().http_client())
+                    .credentials_provider(ctx.callback().aws_credentials_provider())
+                    .region(::$sdk::config::Region::new(region.to_string()))
+                    .endpoint_url(format!("https://{}.{region}.amazonaws.com", $endpoint))
+                    .retry_config(::$sdk::config::retry::RetryConfig::disabled())
+                    .timeout_config(::$sdk::config::timeout::TimeoutConfig::disabled())
+                    .identity_cache(::$sdk::config::IdentityCache::no_cache())
+                    .stalled_stream_protection(
+                        ::$sdk::config::StalledStreamProtectionConfig::disabled(),
+                    )
+                    .build();
+                self.$field = Some((region.to_string(), ::$sdk::Client::from_conf(config)));
+            }
+            &self
+                .$field
+                .as_ref()
+                .expect("the client for this region was just built")
+                .1
+        }
+    };
+}
+
+impl Clients {
+    callback_client!(sqs, aws_sdk_sqs, "sqs");
+    callback_client!(lambda, aws_sdk_lambda, "lambda");
+    callback_client!(sns, aws_sdk_sns, "sns");
+    // Step Functions publishes its endpoint and signs under `states`.
+    callback_client!(sfn, aws_sdk_sfn, "states");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sqs_queue, TargetKind};
+
+    /// One row of the table below: the case, the target's ARN, the kind that ARN
+    /// names, the IAM action its invocation performs, and whether that
+    /// invocation is made under the target's own role.
+    type Row = (&'static str, String, Option<TargetKind>, Option<&'static str>, bool);
+
+    /// Which invocation a target ARN names, the IAM action that invocation
+    /// performs, and whether the target's `RoleArn` is what governs it — over a
+    /// TABLE of ARNs rather than one target: the rows differ along the service,
+    /// along the resource type within a service, and along the forms that name no
+    /// invocable resource at all.
+    ///
+    /// The four kinds, and the action each needs, are the ones the EventBridge
+    /// targets reference states for them: `sqs:SendMessage` for a queue,
+    /// `lambda:InvokeFunction` for a function, `sns:Publish` for a topic and
+    /// `states:StartExecution` for a state machine. Which of them is invoked
+    /// under the target's role is that reference's other sentence: a role for a
+    /// state machine, a resource-based policy for a queue, a topic and a
+    /// function.
+    #[test]
+    fn a_target_arn_names_the_invocation_its_service_is_reached_by() {
+        let account = ::engine::emulator_account_id();
+        // (case, the target's ARN, the kind it names, the action it performs,
+        //  whether its invocation is made under the target's role)
+        let rows: Vec<Row> = vec![
+            (
+                "an SQS queue",
+                format!("arn:aws:sqs:eu-west-2:{account}:orders"),
+                Some(TargetKind::Queue),
+                Some("sqs:SendMessage"),
+                false,
+            ),
+            (
+                "a FIFO queue, whose name carries a suffix",
+                format!("arn:aws:sqs:eu-west-2:{account}:orders.fifo"),
+                Some(TargetKind::Queue),
+                Some("sqs:SendMessage"),
+                false,
+            ),
+            (
+                "a Lambda function",
+                format!("arn:aws:lambda:eu-west-2:{account}:function:handler"),
+                Some(TargetKind::Function),
+                Some("lambda:InvokeFunction"),
+                false,
+            ),
+            (
+                "a Lambda function alias, which is still a function",
+                format!("arn:aws:lambda:eu-west-2:{account}:function:handler:live"),
+                Some(TargetKind::Function),
+                Some("lambda:InvokeFunction"),
+                false,
+            ),
+            (
+                "an SNS topic",
+                format!("arn:aws:sns:eu-west-2:{account}:fanout"),
+                Some(TargetKind::Topic),
+                Some("sns:Publish"),
+                false,
+            ),
+            (
+                "a Step Functions state machine",
+                format!("arn:aws:states:eu-west-2:{account}:stateMachine:flow"),
+                Some(TargetKind::StateMachine),
+                Some("states:StartExecution"),
+                true,
+            ),
+            // A resource of a service this invokes, but not one it can invoke.
+            (
+                "a Step Functions activity",
+                format!("arn:aws:states:eu-west-2:{account}:activity:worker"),
+                None,
+                None,
+                false,
+            ),
+            (
+                "a Lambda layer",
+                format!("arn:aws:lambda:eu-west-2:{account}:layer:shared"),
+                None,
+                None,
+                false,
+            ),
+            // Services with no invocation here at all.
+            (
+                "a CloudWatch log group",
+                format!("arn:aws:logs:eu-west-2:{account}:log-group:/demo:*"),
+                None,
+                None,
+                false,
+            ),
+            (
+                "an ECS task definition",
+                format!("arn:aws:ecs:eu-west-2:{account}:task-definition/batch:1"),
+                None,
+                None,
+                false,
+            ),
+            (
+                "a value that is not an ARN",
+                "orders".to_string(),
+                None,
+                None,
+                false,
+            ),
+        ];
+
+        for (case, arn, expected, action, under_role) in rows {
+            let kind = TargetKind::of(&arn);
+            assert_eq!(
+                kind, expected,
+                "case {case:?}: expected {expected:?}, got {kind:?}"
+            );
+            assert_eq!(
+                kind.map(TargetKind::action),
+                action,
+                "case {case:?}: expected the action {action:?}, got {:?}",
+                kind.map(TargetKind::action)
+            );
+            let governed = kind.is_some_and(TargetKind::invoked_under_target_role);
+            assert_eq!(
+                governed, under_role,
+                "case {case:?}: expected invoked-under-role {under_role}, got {governed}"
+            );
+        }
+    }
+
+    /// The url a queue ARN is addressed by, and the forms that address none.
+    #[test]
+    fn a_queue_arn_resolves_to_the_url_sqs_addresses_it_by() {
+        let account = ::engine::emulator_account_id();
+        let rows: Vec<(&str, String, Option<String>)> = vec![
+            (
+                "a queue of this account",
+                format!("arn:aws:sqs:eu-west-2:{account}:orders"),
+                Some(format!("https://sqs.eu-west-2.amazonaws.com/{account}/orders")),
+            ),
+            (
+                "a queue in another Region",
+                format!("arn:aws:sqs:us-east-1:{account}:orders"),
+                Some(format!("https://sqs.us-east-1.amazonaws.com/{account}/orders")),
+            ),
+            (
+                "an ARN of another service",
+                format!("arn:aws:sns:eu-west-2:{account}:orders"),
+                None,
+            ),
+            (
+                "an SQS ARN whose resource carries a separator",
+                format!("arn:aws:sqs:eu-west-2:{account}:orders/dead"),
+                None,
+            ),
+            ("a value that is not an ARN", "orders".to_string(), None),
+        ];
+        for (case, arn, expected) in rows {
+            let url = sqs_queue(&arn);
+            assert_eq!(
+                url, expected,
+                "case {case:?}: expected {expected:?}, got {url:?}"
+            );
+        }
+    }
 }
