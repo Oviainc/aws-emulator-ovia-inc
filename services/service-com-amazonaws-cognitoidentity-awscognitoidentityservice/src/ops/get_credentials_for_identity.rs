@@ -215,6 +215,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let identity_pool_id = identity.identity_pool_id.clone();
 
+        // "Any provided logins will be validated against supported login providers"
+        // (this operation's own doc): a `Logins` entry that names an Amazon Cognito user
+        // pool carries its issuer in the provider name, so the stored configuration of
+        // the identity's OWN pool decides it — a token minted by a user pool that is
+        // none of that pool's `CognitoIdentityProviders` authorizes nobody here.
+        let logins = input.logins.clone().unwrap_or_default();
+        if !logins.is_empty() {
+            let Some(pool) = store.identity_pools.get(&identity_pool_id) else {
+                return Err(GetCredentialsForIdentityErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("IdentityPool '{identity_pool_id}' not found.")),
+                    },
+                )
+                .into());
+            };
+            if logins
+                .keys()
+                .any(|provider| !pool.accepts_login_provider(provider))
+            {
+                return Err(GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
+                    NotAuthorizedException {
+                        message: Some(
+                            crate::state::UNSUPPORTED_LOGIN_PROVIDER_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
         // A custom role can only be honoured against the roles the pool has stored, so a
         // role the pool does not name is refused with the error the real service raises
         // for a pool that has no role for the request, rather than answered with a session
