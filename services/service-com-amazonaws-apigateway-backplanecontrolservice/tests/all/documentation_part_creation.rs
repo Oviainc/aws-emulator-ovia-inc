@@ -474,9 +474,11 @@ async fn a_locations_status_code_spans_the_modelled_patterns_range() {
 
     // Each row is a `statusCode` the pattern REFUSES: one past each bound, too few and
     // too many digits, and a value that is not a number at all. The pattern is enforced
-    // at the boundary, before the handler runs, so the refusal is the service's
-    // `ValidationException` rather than the operation's own 400 — see the
-    // `validation_message_rules` suite for that rule.
+    // at the boundary, before the handler runs, and this service names a broken modelled
+    // constraint `BadRequestException` (HTTP 400) — the client-input error its own model
+    // declares, which is the code AWS's recorded refusals carry — rather than the
+    // framework's generic `ValidationException`. See the `validation_message_rules` suite
+    // for that rule.
     let refused: &[&str] = &["099", "600", "99", "1000", "2xx", "0", "-1", "1 0"];
     for (index, sent) in refused.iter().enumerate() {
         let case = format!("statusCode={sent:?}");
@@ -492,7 +494,7 @@ async fn a_locations_status_code_spans_the_modelled_patterns_range() {
             &content_map(&case),
         )
         .await;
-        assert_failure(&answer, 400, "ValidationException", &case);
+        assert_failure(&answer, 400, "BadRequestException", &case);
     }
 
     // Only the admitted rows reached the store.

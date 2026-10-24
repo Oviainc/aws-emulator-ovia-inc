@@ -39,9 +39,11 @@ const CATALOG: &str = "AWSMarketplace";
 /// `smithy_query(query="shape", shape="PaymentRequestStatus")`. A new payment
 /// request carries the first one; `SendAgreementPaymentRequest` documents it as
 /// "created in `PENDING_APPROVAL` status".
-const PENDING_APPROVAL: &str = "PENDING_APPROVAL";
-/// See [`PENDING_APPROVAL`]: the statuses no stored payment request carries
-/// yet, because the operations that would move one there are still stubs.
+pub(crate) const PENDING_APPROVAL: &str = "PENDING_APPROVAL";
+/// See [`PENDING_APPROVAL`]: the statuses no payment request stored by THIS
+/// suite carries, because nothing here moves one out of `PENDING_APPROVAL` —
+/// `payment_request_cancellation` is where the `CANCELLED` transition is
+/// asserted.
 const OTHER_STATUSES: &[&str] = &[
     "VALIDATING",
     "VALIDATION_FAILED",
@@ -52,23 +54,23 @@ const OTHER_STATUSES: &[&str] = &[
 
 /// `PaymentRequestId`'s `^pr-[a-zA-Z0-9]+$`, checked here rather than through
 /// the crate's own code so a wrong minter cannot make this test pass.
-fn is_payment_request_id(value: &str) -> bool {
+pub(crate) fn is_payment_request_id(value: &str) -> bool {
     value
         .strip_prefix("pr-")
         .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
-async fn send(router: &MultiServiceRouter, request: Value) -> Answer {
+pub(crate) async fn send(router: &MultiServiceRouter, request: Value) -> Answer {
     call(router, "SendAgreementPaymentRequest", request).await
 }
 
-async fn list(router: &MultiServiceRouter, request: Value) -> Answer {
+pub(crate) async fn list(router: &MultiServiceRouter, request: Value) -> Answer {
     call(router, "ListAgreementPaymentRequests", request).await
 }
 
 /// One agreement whose accepted terms carry the `VariablePaymentTerm`
 /// `term_id`, which is the term a payment request is sent under.
-async fn agreement_with_variable_term(
+pub(crate) async fn agreement_with_variable_term(
     router: &MultiServiceRouter,
     proposal: &str,
     term_id: &str,
@@ -77,7 +79,7 @@ async fn agreement_with_variable_term(
 }
 
 /// Send one payment request and answer the `paymentRequestId` it minted.
-async fn sent(
+pub(crate) async fn sent(
     router: &MultiServiceRouter,
     agreement_id: &str,
     term_id: &str,
@@ -103,7 +105,7 @@ async fn sent(
 }
 
 /// The `items` one list answered, which the model declares required.
-fn items(answer: &Answer) -> Vec<Value> {
+pub(crate) fn items(answer: &Answer) -> Vec<Value> {
     assert_eq!(
         answer.status, 200,
         "listing must succeed, got {} with {:?}",
@@ -598,8 +600,8 @@ async fn each_optional_parameter_selects_the_stored_payment_requests_it_names() 
             expected: &[],
         },
     ];
-    // No operation that moves a payment request out of PENDING_APPROVAL is
-    // implemented yet, so every other status selects nothing.
+    // Nothing in this suite moves a payment request out of PENDING_APPROVAL, so
+    // every other status selects nothing from this store.
     for status in OTHER_STATUSES {
         cases.push(Selector {
             case: "a status no stored request carries selects nothing",
@@ -1049,7 +1051,11 @@ const AGREEMENT: &str = "Agreement";
 /// See [`AGREEMENT`].
 const PAYMENT_REQUEST: &str = "PaymentRequest";
 
-async fn get(router: &MultiServiceRouter, agreement_id: &str, payment_request_id: &str) -> Answer {
+pub(crate) async fn get(
+    router: &MultiServiceRouter,
+    agreement_id: &str,
+    payment_request_id: &str,
+) -> Answer {
     call(
         router,
         "GetAgreementPaymentRequest",

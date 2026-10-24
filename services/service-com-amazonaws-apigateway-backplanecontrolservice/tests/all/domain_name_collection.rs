@@ -60,7 +60,10 @@ async fn create_domain(gateway: &Gateway, body: Value) -> Answer {
 
 /// `CreateDomainName` for `domain_name`, asserting it was accepted, and the record it
 /// reported.
-async fn created_domain(gateway: &Gateway, domain_name: &str, body: Value) -> Value {
+///
+/// Shared with the `domain_name_access_association_reject` suite, which needs a STORED
+/// domain name to show that a rejection resolves the domain name before the association.
+pub(crate) async fn created_domain(gateway: &Gateway, domain_name: &str, body: Value) -> Value {
     let mut request = body;
     request["domainName"] = json!(domain_name);
     let answer = create_domain(gateway, request).await;
@@ -644,13 +647,14 @@ async fn the_resource_owner_filter_selects_whose_domain_names_a_page_reports() {
     }
 
     // A value outside the enum is refused by the modelled constraint, not served as if it
-    // had named an owner: `ValidationException` is what the framework answers for a value
-    // that was read and then broke a modelled constraint.
+    // had named an owner: the boundary validator answers this service's own
+    // `BadRequestException` (see `src/service/validation.rs`), the code AWS names a
+    // refused control-plane request by.
     let answer = list_domains(&gateway, "resourceOwner=NOBODY").await;
     assert_failure(
         &answer,
         400,
-        "ValidationException",
+        "BadRequestException",
         "GetDomainNames(resourceOwner=NOBODY)",
     );
 }

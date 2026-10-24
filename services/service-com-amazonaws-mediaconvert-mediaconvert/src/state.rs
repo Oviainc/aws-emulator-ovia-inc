@@ -24,9 +24,11 @@
 //!   refused with the modelled `ServiceQuotaExceededException` (HTTP 402) instead of
 //!   growing the store, and a create whose `Name` the store already holds stores nothing
 //!   at all (see [`CreateOutcome`]), so a client repeating a create cannot grow it
-//!   either. The built-in system templates `job_templates` is seeded with are
-//!   inside that cap, and no request path removes or re-seeds them: `UpdateJobTemplate`
-//!   and `DeleteJobTemplate` refuse a `SYSTEM` template with the modelled
+//!   either. The built-in system templates `job_templates` is seeded with, and the
+//!   built-in system presets `presets` is seeded with, are
+//!   inside those caps, and no request path removes or re-seeds them: `UpdateJobTemplate`
+//!   and `DeleteJobTemplate` refuse a `SYSTEM` template, and `UpdatePreset` and
+//!   `DeletePreset` a `SYSTEM` preset, with the modelled
 //!   `ForbiddenException`. `idempotency` holds at most one entry per stored job, so it is
 //!   bounded by `MAX_JOBS` too, and `endpoints` (one account endpoint per region a request
 //!   was signed for) is capped at [`MAX_ENDPOINTS`] the same way.
@@ -84,9 +86,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AccelerationSettings, HopDestination, Input, InputTemplate, Job, JobEngineVersion, JobMessages,
-    JobSettings, JobTemplate, JobTemplateSettings, Output, Policy, Preset, PresetSettings, Queue,
-    QueueTransition, ReservationPlan, ReservationPlanSettings, Timing,
+    AacSettings, AccelerationSettings, AudioCodecSettings, AudioDescription, ContainerSettings,
+    H264Settings, H265Settings, HopDestination, Input, InputTemplate, Job, JobEngineVersion,
+    JobMessages, JobSettings, JobTemplate, JobTemplateSettings, Output, Policy, Preset,
+    PresetSettings, Queue, QueueTransition, ReservationPlan, ReservationPlanSettings, Timing,
+    VideoCodecSettings, VideoDescription,
 };
 
 /// The built-in queue a job with no `Queue` member is sent to.
@@ -1152,6 +1156,24 @@ pub struct PresetRecord {
 }
 
 impl PresetRecord {
+    /// A built-in preset, as [`SYSTEM_PRESETS`] ships it: the encoder settings its
+    /// published name states, under [`TYPE_SYSTEM`].
+    fn system(spec: &SystemPreset, at: SystemTime) -> Self {
+        Self {
+            name: spec.name.to_string(),
+            // `Category` is "an optional category YOU create to organize your presets", so
+            // a preset no caller created carries none, exactly as a seeded built-in job
+            // template carries no category or description.
+            category: None,
+            description: None,
+            settings: spec.settings(),
+            preset_type: TYPE_SYSTEM.to_string(),
+            created_at: at,
+            last_updated: at,
+            tags: BTreeMap::new(),
+        }
+    }
+
     /// The modelled `Preset`.
     pub fn view(&self, region: &str) -> Preset {
         Preset {
@@ -1166,6 +1188,281 @@ impl PresetRecord {
         }
     }
 }
+
+/// `ContainerType` values a built-in preset's name names
+/// (`smithy_query(query="shape",shape="ContainerType")`): the MP4 file container, the
+/// MPEG-2 transport stream of an HLS output, and the fragmented MP4 of a DASH output.
+const CONTAINER_MP4: &str = "MP4";
+/// See [`CONTAINER_MP4`]. `M3u8Settings`: "These settings relate to the MPEG-2 transport
+/// stream (MPEG2-TS) container for the MPEG2-TS segments in your HLS outputs."
+const CONTAINER_M3U8: &str = "M3U8";
+/// See [`CONTAINER_MP4`]. `MpdSettings`: "These settings relate to the fragmented MP4
+/// container for the segments in your DASH outputs."
+const CONTAINER_MPD: &str = "MPD";
+
+/// `VideoCodec` values (`smithy_query(query="shape",shape="VideoCodec")`): MPEG-4 AVC and
+/// HEVC, which a preset name abbreviates `Avc` and `Hevc`.
+const VIDEO_CODEC_AVC: &str = "H_264";
+/// See [`VIDEO_CODEC_AVC`].
+const VIDEO_CODEC_HEVC: &str = "H_265";
+
+/// The `AudioCodec` value every entry of the built-in catalogue names (`Aac`)
+/// (`smithy_query(query="shape",shape="AudioCodec")`).
+const AUDIO_CODEC_AAC: &str = "AAC";
+
+/// `H264FramerateControl`/`H265FramerateControl`'s `SPECIFIED`: the output's frame rate is
+/// the stated `FramerateNumerator`/`FramerateDenominator` ratio rather than the input's.
+const FRAMERATE_SPECIFIED: &str = "SPECIFIED";
+
+/// `H264RateControlMode`/`H265RateControlMode`/`AacRateControlMode`'s `CBR` — "constant
+/// bitrate" — the mode under which `Bitrate` is the rate the stated Mbps names.
+const RATE_CONTROL_CBR: &str = "CBR";
+
+/// `AacCodingMode`'s stereo mode, the channel layout of the AAC track a built-in preset
+/// carries (`smithy_query(query="shape",shape="AacCodingMode")`).
+const AAC_CODING_MODE_STEREO: &str = "CODING_MODE_2_0";
+
+/// `AacSettings$SampleRate`, "the AAC sample rate in samples per second (Hz)", for that
+/// track: 48 kHz, the rate inside the member's published 8000..96000 range that every
+/// container in this catalogue carries.
+const AAC_SAMPLE_RATE: i32 = 48_000;
+
+/// One built-in ([`TYPE_SYSTEM`]) output preset: the encoder settings its published name
+/// states, as a row of parameters.
+///
+/// A MediaConvert system preset is named after the output it produces — family, container,
+/// video codec, audio codec, display aspect ratio, frame size, frame rate and video
+/// bitrate — so this row is that name read as data, and [`SystemPreset::settings`] builds
+/// the modelled `PresetSettings` graph from it: no member is set that the name does not
+/// state. The display aspect ratio a name carries is the ratio of [`Self::width`] to
+/// [`Self::height`], so it needs no field of its own.
+#[derive(Debug, Clone, Copy)]
+struct SystemPreset {
+    /// The published `Name`, which is this preset's identity.
+    name: &'static str,
+    /// A [`CONTAINER_MP4`]-style `ContainerType` value.
+    container: &'static str,
+    /// A [`VIDEO_CODEC_AVC`]-style `VideoCodec` value.
+    video_codec: &'static str,
+    /// `VideoDescription$Width`, "the video resolution width, in pixels, for this output".
+    width: i32,
+    /// `VideoDescription$Height`, the matching resolution height.
+    height: i32,
+    /// The `Hz` the name states, as the numerator of the
+    /// `FramerateNumerator`/`FramerateDenominator` fraction the codec settings carry.
+    framerate_numerator: i32,
+    /// The denominator of that fraction.
+    framerate_denominator: i32,
+    /// The `Mbps` the name states, as the codec's `Bitrate`: "the average bitrate in bits
+    /// per second".
+    video_bitrate: i32,
+    /// `AacSettings$Bitrate` for the output's audio track, in bits per second.
+    audio_bitrate: i32,
+}
+
+impl SystemPreset {
+    /// The modelled `PresetSettings` this row states: the container, the video
+    /// description with its codec settings, and the one AAC audio description.
+    fn settings(&self) -> PresetSettings {
+        PresetSettings {
+            container_settings: Some(ContainerSettings {
+                container: Some(self.container.to_string()),
+                ..ContainerSettings::default()
+            }),
+            video_description: Some(VideoDescription {
+                width: Some(self.width),
+                height: Some(self.height),
+                codec_settings: Some(self.video_codec_settings()),
+                ..VideoDescription::default()
+            }),
+            audio_descriptions: Some(vec![AudioDescription {
+                codec_settings: Some(AudioCodecSettings {
+                    codec: Some(AUDIO_CODEC_AAC.to_string()),
+                    aac_settings: Some(AacSettings {
+                        bitrate: Some(self.audio_bitrate),
+                        coding_mode: Some(AAC_CODING_MODE_STEREO.to_string()),
+                        rate_control_mode: Some(RATE_CONTROL_CBR.to_string()),
+                        sample_rate: Some(AAC_SAMPLE_RATE),
+                        ..AacSettings::default()
+                    }),
+                    ..AudioCodecSettings::default()
+                }),
+                ..AudioDescription::default()
+            }]),
+            // "For each output that has captions, include one instance of
+            // CaptionDescriptions": a built-in video preset names none.
+            caption_descriptions: None,
+        }
+    }
+
+    /// `VideoCodecSettings` for this row: the codec the name states, and — as
+    /// `VideoCodecSettings` requires, "for each codec enum that you choose, define the
+    /// corresponding settings object" — that codec's own settings object.
+    fn video_codec_settings(&self) -> VideoCodecSettings {
+        let mut settings = VideoCodecSettings {
+            codec: Some(self.video_codec.to_string()),
+            ..VideoCodecSettings::default()
+        };
+        if self.video_codec == VIDEO_CODEC_HEVC {
+            settings.h265_settings = Some(H265Settings {
+                bitrate: Some(self.video_bitrate),
+                framerate_control: Some(FRAMERATE_SPECIFIED.to_string()),
+                framerate_numerator: Some(self.framerate_numerator),
+                framerate_denominator: Some(self.framerate_denominator),
+                rate_control_mode: Some(RATE_CONTROL_CBR.to_string()),
+                ..H265Settings::default()
+            });
+        } else {
+            settings.h264_settings = Some(H264Settings {
+                bitrate: Some(self.video_bitrate),
+                framerate_control: Some(FRAMERATE_SPECIFIED.to_string()),
+                framerate_numerator: Some(self.framerate_numerator),
+                framerate_denominator: Some(self.framerate_denominator),
+                rate_control_mode: Some(RATE_CONTROL_CBR.to_string()),
+                ..H264Settings::default()
+            });
+        }
+        settings
+    }
+}
+
+/// The built-in ([`TYPE_SYSTEM`]) output presets this store is seeded with.
+///
+/// That an account holds presets it did not create is what `Preset$Type` ("A preset can be
+/// of two types: system or custom. System or built-in preset can't be modified or deleted
+/// by the user.") and `PresetListBy`'s `SYSTEM` value say: a caller builds a job from them
+/// without creating anything. The model carries no catalogue of them, so this SET is the
+/// emulator's own, named after the system presets AWS Elemental MediaConvert publishes, and
+/// its size is well inside [`MAX_PRESETS`]; nothing in the emulator keys on a particular
+/// entry, because a built-in preset is recognised by its `Type` and never by its name.
+///
+/// Unlike [`SYSTEM_JOB_TEMPLATES`], each entry DOES carry encoder settings, because a
+/// preset's published name states them — the container, the codecs, the frame size, the
+/// frame rate and the bitrate are all in the name — so the settings here are that name
+/// read as data rather than a graph invented for it.
+const SYSTEM_PRESETS: [SystemPreset; 11] = [
+    SystemPreset {
+        name: "System-Generic_Hd_Mp4_Avc_Aac_16x9_1920x1080p_24Hz_6Mbps",
+        container: CONTAINER_MP4,
+        video_codec: VIDEO_CODEC_AVC,
+        width: 1920,
+        height: 1080,
+        framerate_numerator: 24,
+        framerate_denominator: 1,
+        video_bitrate: 6_000_000,
+        audio_bitrate: 128_000,
+    },
+    SystemPreset {
+        name: "System-Generic_Hd_Mp4_Avc_Aac_16x9_1280x720p_24Hz_4.5Mbps",
+        container: CONTAINER_MP4,
+        video_codec: VIDEO_CODEC_AVC,
+        width: 1280,
+        height: 720,
+        framerate_numerator: 24,
+        framerate_denominator: 1,
+        video_bitrate: 4_500_000,
+        audio_bitrate: 96_000,
+    },
+    SystemPreset {
+        name: "System-Generic_Sd_Mp4_Avc_Aac_4x3_640x480p_30Hz_1.5Mbps",
+        container: CONTAINER_MP4,
+        video_codec: VIDEO_CODEC_AVC,
+        width: 640,
+        height: 480,
+        framerate_numerator: 30,
+        framerate_denominator: 1,
+        video_bitrate: 1_500_000,
+        audio_bitrate: 96_000,
+    },
+    SystemPreset {
+        name: "System-Generic_Sd_Mp4_Avc_Aac_16x9_640x360p_30Hz_0.6Mbps",
+        container: CONTAINER_MP4,
+        video_codec: VIDEO_CODEC_AVC,
+        width: 640,
+        height: 360,
+        framerate_numerator: 30,
+        framerate_denominator: 1,
+        video_bitrate: 600_000,
+        audio_bitrate: 64_000,
+    },
+    SystemPreset {
+        name: "System-Generic_Uhd_Mp4_Hevc_Aac_16x9_3840x2160p_24Hz_20Mbps",
+        container: CONTAINER_MP4,
+        video_codec: VIDEO_CODEC_HEVC,
+        width: 3840,
+        height: 2160,
+        framerate_numerator: 24,
+        framerate_denominator: 1,
+        video_bitrate: 20_000_000,
+        audio_bitrate: 128_000,
+    },
+    SystemPreset {
+        name: "System-Ott_Hls_Ts_Avc_Aac_16x9_1920x1080p_30Hz_8.5Mbps",
+        container: CONTAINER_M3U8,
+        video_codec: VIDEO_CODEC_AVC,
+        width: 1920,
+        height: 1080,
+        framerate_numerator: 30,
+        framerate_denominator: 1,
+        video_bitrate: 8_500_000,
+        audio_bitrate: 128_000,
+    },
+    SystemPreset {
+        name: "System-Ott_Hls_Ts_Avc_Aac_16x9_1280x720p_30Hz_3.5Mbps",
+        container: CONTAINER_M3U8,
+        video_codec: VIDEO_CODEC_AVC,
+        width: 1280,
+        height: 720,
+        framerate_numerator: 30,
+        framerate_denominator: 1,
+        video_bitrate: 3_500_000,
+        audio_bitrate: 96_000,
+    },
+    SystemPreset {
+        name: "System-Ott_Hls_Ts_Avc_Aac_16x9_960x540p_30Hz_1.5Mbps",
+        container: CONTAINER_M3U8,
+        video_codec: VIDEO_CODEC_AVC,
+        width: 960,
+        height: 540,
+        framerate_numerator: 30,
+        framerate_denominator: 1,
+        video_bitrate: 1_500_000,
+        audio_bitrate: 96_000,
+    },
+    SystemPreset {
+        name: "System-Ott_Hls_Ts_Avc_Aac_16x9_640x360p_30Hz_0.6Mbps",
+        container: CONTAINER_M3U8,
+        video_codec: VIDEO_CODEC_AVC,
+        width: 640,
+        height: 360,
+        framerate_numerator: 30,
+        framerate_denominator: 1,
+        video_bitrate: 600_000,
+        audio_bitrate: 64_000,
+    },
+    SystemPreset {
+        name: "System-Ott_Dash_Mp4_Avc_Aac_16x9_1280x720p_30Hz_3.5Mbps",
+        container: CONTAINER_MPD,
+        video_codec: VIDEO_CODEC_AVC,
+        width: 1280,
+        height: 720,
+        framerate_numerator: 30,
+        framerate_denominator: 1,
+        video_bitrate: 3_500_000,
+        audio_bitrate: 96_000,
+    },
+    SystemPreset {
+        name: "System-Ott_Dash_Mp4_Avc_Aac_16x9_640x360p_30Hz_0.6Mbps",
+        container: CONTAINER_MPD,
+        video_codec: VIDEO_CODEC_AVC,
+        width: 640,
+        height: 360,
+        framerate_numerator: 30,
+        framerate_denominator: 1,
+        video_bitrate: 600_000,
+        audio_bitrate: 64_000,
+    },
+];
 
 /// A reserved queue's pricing plan, built from the settings the caller purchased it with.
 pub fn reservation_plan(
@@ -2515,8 +2812,9 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     pub queues: BTreeMap<String, QueueRecord>,
     /// Jobs by `Id`. At most [`MAX_JOBS`] entries.
     pub jobs: BTreeMap<String, JobRecord>,
-    /// Presets by `Name`; "Each name must be unique within your account". At most
-    /// [`MAX_PRESETS`] entries.
+    /// Presets by `Name`; "Each name must be unique within your account". Seeded with
+    /// the built-in [`SYSTEM_PRESETS`]; a caller's own presets join them through
+    /// `CreatePreset`, which holds the total to [`MAX_PRESETS`].
     pub presets: BTreeMap<String, PresetRecord>,
     /// The account's input policy, once `PutPolicy` has stored one. `None` until then
     /// and again after `DeletePolicy`, when the account carries no policy and
@@ -2590,10 +2888,10 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
 
 impl Default for ComAmazonawsMediaconvertMediaconvertState {
     /// A store holding the built-in `Default` queue, as every MediaConvert account does
-    /// before any call is made, and the built-in system job templates, which an account
-    /// likewise has without creating them. Seeded here, at state construction, so no
-    /// request ever has to create them and no reporting operation writes to put them
-    /// there.
+    /// before any call is made, and the built-in system job templates and output presets,
+    /// which an account likewise has without creating them. Seeded here, at state
+    /// construction, so no request ever has to create them and no reporting operation
+    /// writes to put them there.
     fn default() -> Self {
         let now = SystemTime::now();
         let mut queues = BTreeMap::new();
@@ -2616,7 +2914,10 @@ impl Default for ComAmazonawsMediaconvertMediaconvertState {
         Self {
             queues,
             jobs: BTreeMap::new(),
-            presets: BTreeMap::new(),
+            presets: SYSTEM_PRESETS
+                .iter()
+                .map(|spec| (spec.name.to_string(), PresetRecord::system(spec, now)))
+                .collect(),
             // No policy until a caller puts one; an account carrying no policy is the
             // state `GetPolicy` reports as an absent `Policy`, so nothing is seeded.
             policy: None,

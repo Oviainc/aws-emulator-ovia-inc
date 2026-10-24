@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBillingGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBillingGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBillingGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +174,209 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBillingGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBillingGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBillingGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateBillingGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // The `BillingGroupArn` pattern accepts the full ARN or the bare id, and both
+        // name the same stored group.
+        let group_arn = crate::state::normalize_billing_group_arn(&input.arn);
+        let Some(stored) = state.billing_groups.get(&group_arn).cloned() else {
+            return Err(UpdateBillingGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: "the billing group does not exist".to_string(),
+                    resource_id: group_arn,
+                    resource_type: "billinggroup".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // "The names must be unique to each billing group." Renaming a group to the
+        // name it already carries is not a conflict: what the request asks for already
+        // holds. Decided through the same index `CreateBillingGroup` consults.
+        if let Some(name) = input.name.as_deref() {
+            if let Some(owner) = state
+                .conflicting_billing_group_name(name, &group_arn)
+                .map(str::to_string)
+            {
+                return Err(UpdateBillingGroupErrorModeled::ConflictException(
+                    ConflictException {
+                        message: "a billing group with this name already exists".to_string(),
+                        resource_id: owner,
+                        resource_type: "billinggroup".to_string(),
+                        reason: Some("RESOURCE_NAME_CONFLICT".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The computation preference must name a pricing plan that exists — the same
+        // rule, through the same state method, `CreateBillingGroup` applies. This
+        // operation models no `ResourceNotFoundException` for the PLAN (its 404 is the
+        // group's), so the modelled answer is the `MISSING_PRICINGPLAN`
+        // `ValidationException` the model enumerates.
+        let pricing_plan_arn = match &input.computation_preference {
+            Some(preference) => {
+                let plan_arn =
+                    crate::state::normalize_pricing_plan_arn(&preference.pricing_plan_arn);
+                if !state.pricing_plan_exists(&plan_arn) {
+                    return Err(validation(
+                        "MISSING_PRICINGPLAN",
+                        "ComputationPreference.PricingPlanArn",
+                        format!("the pricing plan {plan_arn} does not exist"),
+                    ));
+                }
+                Some(plan_arn)
+            }
+            None => None,
+        };
+
+        // "Modifications to the ResponsibilityTransferArn are not permitted for
+        // existing billing groups" — the transfer relationship a group bills through is
+        // fixed when the group is created. A request naming the value the group already
+        // holds modifies nothing and is served; any other value is refused. No
+        // `ValidationExceptionReason` names an immutable member, so the refusal carries
+        // the enumerated catch-all and says which member and which rule.
+        let requested_transfer = input
+            .account_grouping
+            .as_ref()
+            .and_then(|grouping| grouping.responsibility_transfer_arn.as_deref());
+        if let Some(requested) = requested_transfer {
+            if stored.responsibility_transfer_arn.as_deref() != Some(requested) {
+                return Err(validation(
+                    "OTHER",
+                    "AccountGrouping.ResponsibilityTransferArn",
+                    "the responsibility transfer ARN of an existing billing group cannot be \
+                     modified"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // `Status` is the group's OPERATIONAL status, so a caller may only ask for one
+        // the group's own condition admits: `PRIMARY_ACCOUNT_MISSING` reports an absent
+        // billing owner, which the service derives, and a group that has no billing
+        // owner holds that status and no other.
+        if let Some(status) = input.status.as_deref() {
+            if !crate::state::CALLER_SETTABLE_BILLING_GROUP_STATUSES.contains(&status) {
+                return Err(validation(
+                    "INVALID_BILLING_GROUP_STATUS",
+                    "Status",
+                    format!(
+                        "the billing group status {status} reports the state of the group rather \
+                         than a request and cannot be set"
+                    ),
+                ));
+            }
+            if !stored.has_billing_owner() {
+                return Err(validation(
+                    "INVALID_BILLING_GROUP_STATUS",
+                    "Status",
+                    format!(
+                        "the billing group cannot be {status} while it has no primary account and \
+                         no responsibility transfer ARN"
+                    ),
+                ));
+            }
+        }
+
+        // A member the request carries replaces the stored one; a member it omits keeps
+        // what state holds. Nothing else about the group — its membership, its primary
+        // account, its tags, its creation time — is this operation's to change.
+        let mut updated = stored.clone();
+        if let Some(name) = input.name.clone() {
+            updated.name = name;
+        }
+        if let Some(description) = input.description.clone() {
+            updated.description = Some(description);
+        }
+        if let Some(plan_arn) = pricing_plan_arn {
+            updated.pricing_plan_arn = plan_arn;
+        }
+        if let Some(status) = input.status.clone() {
+            updated.requested_status = Some(status);
+        }
+        if let Some(auto_associate) = input
+            .account_grouping
+            .as_ref()
+            .and_then(|grouping| grouping.auto_associate)
+        {
+            updated.auto_associate = Some(auto_associate);
+        }
+
+        // `LastModifiedTime` is "the most recent time when the billing group was
+        // modified", so it moves only when this call actually modified the group: a
+        // request that names no member, or names the values the group already holds,
+        // leaves it where it was.
+        let changed = updated.name != stored.name
+            || updated.description != stored.description
+            || updated.pricing_plan_arn != stored.pricing_plan_arn
+            || updated.requested_status != stored.requested_status
+            || updated.auto_associate != stored.auto_associate;
+        if changed {
+            updated.last_modified_time_millis = crate::state::now_millis();
+            // The name index follows the rename, so the old name frees up and the new
+            // one is taken by exactly this group.
+            if updated.name != stored.name {
+                state.billing_group_names.remove(&stored.name);
+                state
+                    .billing_group_names
+                    .insert(updated.name.clone(), group_arn.clone());
+            }
+            state
+                .billing_groups
+                .insert(group_arn.clone(), updated.clone());
+        }
+
+        // The audit record for a state-changing call: who asked, what changed and that
+        // it succeeded. Never a `@sensitive` member (the group's name and description) —
+        // only the access key id the caller presented and the ARN it addressed.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            billing_group_arn = %group_arn,
+            outcome = if changed { "updated" } else { "unchanged" },
+            "billing group update served"
+        );
+        Ok(render(&updated))
     }
+}
+
+/// The stored group as this operation reports it. `Size`, `Status` and `StatusReason`
+/// are derived from the record by the same methods every other reader of a group uses
+/// (`ListBillingGroups`), so the two views cannot drift.
+fn render(group: &crate::state::BillingGroupRecord) -> UpdateBillingGroupOutput {
+    UpdateBillingGroupOutput {
+        arn: Some(group.arn.clone()),
+        name: Some(group.name.clone()),
+        description: group.description.clone(),
+        primary_account_id: group.primary_account_id.clone(),
+        pricing_plan_arn: Some(group.pricing_plan_arn.clone()),
+        size: group.size(),
+        last_modified_time: group.last_modified_time_millis,
+        status: Some(group.status().to_string()),
+        status_reason: group.status_reason(),
+        account_grouping: Some(UpdateBillingGroupAccountGrouping {
+            auto_associate: group.auto_associate,
+            responsibility_transfer_arn: group.responsibility_transfer_arn.clone(),
+        }),
+    }
+}
+
+/// Refuse the request with this operation's modelled 400 `ValidationException`, naming
+/// the `ValidationExceptionReason` the model enumerates and the member at fault.
+fn validation(reason: &str, field: &str, message: String) -> UpdateBillingGroupError {
+    UpdateBillingGroupErrorModeled::ValidationException(crate::state::validation_exception(
+        reason, field, message,
+    ))
+    .into()
 }
