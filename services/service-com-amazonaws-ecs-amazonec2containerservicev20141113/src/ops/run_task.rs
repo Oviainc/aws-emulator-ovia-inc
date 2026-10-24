@@ -356,10 +356,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::parse_task_definition_reference(&input.task_definition)
         else {
             return Err(RunTaskErrorModeled::ClientException(ClientException {
-                message: Some(format!(
-                    "taskDefinition must be a family, family:revision or task-definition \
-                     ARN; got {:?}",
-                    input.task_definition
+                message: Some(crate::state::task_definition_reference_message(
+                    &input.task_definition,
                 )),
             })
             .into());
@@ -383,16 +381,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cluster_arn = cluster.arn.clone();
         let cluster_default_strategy = cluster.default_capacity_provider_strategy.clone();
 
-        // "If a revision isn't specified, the latest ACTIVE revision is used."
-        let definition = match requested_revision {
-            Some(revision) => guard.task_definitions.get(&(family.clone(), revision)),
-            None => guard.latest_active_revision(&family),
-        };
-        let Some(definition) = definition.cloned() else {
-            return Err(RunTaskErrorModeled::ClientException(ClientException {
-                message: Some(crate::state::TASK_DEFINITION_NOT_FOUND_MESSAGE.to_string()),
-            })
-            .into());
+        // "If a revision isn't specified, the latest ACTIVE revision is used", and a
+        // revision this run NAMES has to be one it may use: "You can't use an INACTIVE
+        // task definition to run new tasks."
+        let definition = match guard.usable_revision(&family, requested_revision) {
+            Ok(definition) => definition.clone(),
+            Err(message) => {
+                return Err(RunTaskErrorModeled::ClientException(ClientException {
+                    message: Some(message.to_string()),
+                })
+                .into());
+            }
         };
 
         // Both rules below are cross-field: each is keyed on the REGISTERED task

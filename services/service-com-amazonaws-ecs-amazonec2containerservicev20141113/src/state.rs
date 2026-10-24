@@ -444,6 +444,14 @@ pub const MAX_CONTAINER_INSTANCES: usize = 512;
 /// `TaskDefinition$status` for a registered revision.
 pub const TASK_DEFINITION_ACTIVE: &str = "ACTIVE";
 
+/// `TaskDefinition$status` for a revision that has been deregistered — the
+/// `DeregisterTaskDefinition` doc: "Upon deregistration, the task definition is marked
+/// as `INACTIVE`." One of the `TaskDefinitionStatus` values
+/// (`smithy_query(query="shape", shape="TaskDefinitionStatus")`), and the status a
+/// revision keeps: "INACTIVE task definitions remain discoverable in your account
+/// indefinitely."
+pub const TASK_DEFINITION_INACTIVE: &str = "INACTIVE";
+
 /// `Failure$reason` for an id that names nothing in this account. The ECS "API failure
 /// reasons" list: `MISSING` — "the described resource could not be found".
 pub const FAILURE_MISSING: &str = "MISSING";
@@ -758,6 +766,31 @@ pub const TASK_NOT_FOUND_MESSAGE: &str = "The referenced task was not found";
 /// `ClientException$message` for a `taskDefinition` that names no stored revision — the
 /// refusal every operation that resolves a task-definition reference answers with.
 pub const TASK_DEFINITION_NOT_FOUND_MESSAGE: &str = "Unable to describe task definition.";
+
+/// `ClientException$message` for a `taskDefinition` that names a revision this store
+/// holds in a status that cannot run new work — the `DeregisterTaskDefinition` doc: "You
+/// can't use an `INACTIVE` task definition to run new tasks or create new services, and
+/// you can't update an existing service to reference an `INACTIVE` task definition."
+///
+/// A condition that names no resource, so like its neighbours above it is ONE sentence
+/// whatever family and revision the request named.
+pub const TASK_DEFINITION_INACTIVE_MESSAGE: &str = "TaskDefinition is inactive.";
+
+/// `ClientException$message` for a `taskDefinition` that is not a task-definition
+/// reference at all — the condition [`parse_task_definition_reference`] answers `None`
+/// for. DERIVED from the request: it names the member, the forms the member documents
+/// ("The family and revision (family:revision) or full ARN of the task definition") and
+/// the value that is none of them, so a caller sees which value was rejected.
+///
+/// Every operation that resolves a `taskDefinition` reference reports this ONE sentence,
+/// so the refusal cannot drift between the operation that reads a revision and the ones
+/// that use it.
+pub fn task_definition_reference_message(reference: &str) -> String {
+    format!(
+        "taskDefinition must be a family, family:revision or task-definition ARN; \
+         got {reference:?}"
+    )
+}
 
 /// The container instance ID a `containerInstance`/`containerInstances` entry names: the
 /// last segment of the value when it is an ARN
@@ -1974,6 +2007,43 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .values()
             .filter(|record| record.family == family && record.status == TASK_DEFINITION_ACTIVE)
             .max_by_key(|record| record.revision)
+    }
+
+    /// The revision a `taskDefinition` reference names for a call that would put it to
+    /// WORK — run a task of it, or point a service at it — or the `ClientException`
+    /// message that refuses the reference.
+    ///
+    /// Two conditions, one per message constant. A reference that resolves to no stored
+    /// revision is [`TASK_DEFINITION_NOT_FOUND_MESSAGE`]; one that resolves to a revision
+    /// whose status is not [`TASK_DEFINITION_ACTIVE`] is
+    /// [`TASK_DEFINITION_INACTIVE_MESSAGE`], because "you can't use an `INACTIVE` task
+    /// definition to run new tasks or create new services, and you can't update an
+    /// existing service to reference an `INACTIVE` task definition" — a deregistered
+    /// revision stays readable (`DescribeTaskDefinition` keeps describing it) but is no
+    /// longer usable. A reference that names no revision takes "the latest `ACTIVE`
+    /// revision", so it can only ever resolve to a usable one.
+    ///
+    /// A service ALREADY pointed at a revision is untouched by this: it keeps the key it
+    /// stored ("Existing services that reference an `INACTIVE` task definition ... can
+    /// still scale up or down by modifying the service's desired count"), which is why
+    /// this answers only a reference the REQUEST carries.
+    pub fn usable_revision(
+        &self,
+        family: &str,
+        revision: Option<i32>,
+    ) -> Result<&TaskDefinitionRecord, &'static str> {
+        match revision {
+            None => self
+                .latest_active_revision(family)
+                .ok_or(TASK_DEFINITION_NOT_FOUND_MESSAGE),
+            Some(revision) => match self.task_definitions.get(&(family.to_string(), revision)) {
+                None => Err(TASK_DEFINITION_NOT_FOUND_MESSAGE),
+                Some(record) if record.status != TASK_DEFINITION_ACTIVE => {
+                    Err(TASK_DEFINITION_INACTIVE_MESSAGE)
+                }
+                Some(record) => Ok(record),
+            },
+        }
     }
 
     /// What the task map counts for ONE service: the tasks its scheduler placed and

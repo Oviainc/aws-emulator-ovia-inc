@@ -43,6 +43,8 @@ mod service_projection;
 mod service_validation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/task_definition_deregistration.rs"]
+mod task_definition_deregistration;
 #[path = "all/task_definition_projection.rs"]
 mod task_definition_projection;
 #[path = "all/task_definition_rendering.rs"]
