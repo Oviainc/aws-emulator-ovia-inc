@@ -17,14 +17,94 @@ pub struct BatchGetTargetDomainsInput {
     pub target_domain_ids: Vec<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#BatchGetTargetDomainsOutput")]
+/// `BatchGetTargetDomainsOutput`, with its schema and serializer written out so that
+/// BOTH partition lists are always present.
+///
+/// A batch read answers every requested id in exactly one of the two lists, so a caller
+/// iterates both unconditionally and a strict deserializer faults on an absent one. The
+/// fields are therefore plain `Vec`s, not `Option`s: there is no state of this response
+/// in which a list is absent — a batch that matched nothing answers two empty arrays.
+/// (The same rule, and the same reason, as `BatchGetAgentSpacesOutput`; that one also
+/// carries the recorded wire NAMES, which this one does not need — the model's
+/// `targetDomains`/`notFound` are what the recorded 200 carries.)
 #[derive(Debug, Clone, Default)]
 pub struct BatchGetTargetDomainsOutput {
-    pub target_domains: Option<Vec<TargetDomain>>,
-    pub not_found: Option<Vec<String>>,
+    pub target_domains: Vec<TargetDomain>,
+    pub not_found: Vec<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#TargetDomain")]
+#[allow(non_upper_case_globals)]
+impl BatchGetTargetDomainsOutput {
+    const M_TARGET_DOMAINS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.securityagent#BatchGetTargetDomainsOutput$targetDomains",
+            "com.amazonaws.securityagent",
+            "targetDomains",
+        ),
+        ::aws_smithy_schema::ShapeType::List,
+        "targetDomains",
+        0,
+    );
+
+    const M_NOT_FOUND: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.securityagent#BatchGetTargetDomainsOutput$notFound",
+            "com.amazonaws.securityagent",
+            "notFound",
+        ),
+        ::aws_smithy_schema::ShapeType::List,
+        "notFound",
+        1,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.securityagent#BatchGetTargetDomainsOutput",
+            "com.amazonaws.securityagent",
+            "BatchGetTargetDomainsOutput",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_TARGET_DOMAINS, &Self::M_NOT_FOUND],
+    );
+}
+
+pub static BATCH_GET_TARGET_DOMAINS_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &BatchGetTargetDomainsOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for BatchGetTargetDomainsOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        serializer.write_list(&Self::M_TARGET_DOMAINS, &|elements| {
+            for target_domain in self.target_domains.iter() {
+                elements.write_struct(&TargetDomain::SCHEMA, target_domain)?;
+            }
+            Ok(())
+        })?;
+        serializer.write_list(&Self::M_NOT_FOUND, &|elements| {
+            for id in self.not_found.iter() {
+                elements.write_string(&Self::M_NOT_FOUND, id.as_str())?;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+
+/// `TargetDomain`, with its schema and serializer written out instead of derived — the
+/// machinery and the general reason live in `super::wire_shape`:
+///
+/// 1. `createdAt` and `verifiedAt` carry `@timestampFormat("date-time")`
+///    (`smithy_query(query="shape", shape="TargetDomain",
+///    model_path="services/service-com-amazonaws-securityagent-securityagent/smithy-model/com-amazonaws-securityagent-securityagent.json")`),
+///    which the derive drops, so they would go out as epoch-second numbers.
+/// 2. The recorded wire carries a `status` member beside the modelled
+///    `verificationStatus`, holding the same `TargetDomainStatus` value. It is not in
+///    the model, so a derived struct cannot carry it.
+///
+/// This is the ONE projection every target domain read answers from, so the create
+/// response and a later `BatchGetTargetDomains` of the same record cannot disagree.
 #[derive(Debug, Clone, Default)]
 pub struct TargetDomain {
     pub target_domain_id: String,
@@ -34,5 +114,40 @@ pub struct TargetDomain {
     pub verification_details: Option<VerificationDetails>,
     pub created_at: Option<::aws_smithy_types::DateTime>,
     pub verified_at: Option<::aws_smithy_types::DateTime>,
+    /// Recorded, not modelled: the domain's status, the same value the modelled
+    /// `verificationStatus` carries.
+    pub status: Option<String>,
 }
+
+sa_schema_and_codec!(
+    TargetDomain,
+    TARGET_DOMAIN_SCHEMA,
+    "com.amazonaws.securityagent#TargetDomain",
+    "com.amazonaws.securityagent",
+    "TargetDomain",
+    modelled: [
+        (M_TARGET_DOMAIN_ID, target_domain_id, "targetDomainId", 0, req, string),
+        (M_DOMAIN_NAME, domain_name, "domainName", 1, req, string),
+        (M_VERIFICATION_STATUS, verification_status, "verificationStatus", 2, opt, string),
+        (
+            M_VERIFICATION_STATUS_REASON,
+            verification_status_reason,
+            "verificationStatusReason",
+            3,
+            opt,
+            string
+        ),
+        (
+            M_VERIFICATION_DETAILS,
+            verification_details,
+            "verificationDetails",
+            4,
+            opt,
+            struct_of(VerificationDetails)
+        ),
+        (M_CREATED_AT, created_at, "createdAt", 5, opt, date_time),
+        (M_VERIFIED_AT, verified_at, "verifiedAt", 6, opt, date_time),
+    ],
+    recorded: [(M_STATUS, status, "status", 7, opt, string)],
+);
 

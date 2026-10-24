@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePublicKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePublicKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePublicKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Uploads one public key: the call MINTS the key's identity (an id and a version token),
+//! records the instant it was uploaded and PERSISTS the configuration as submitted, so
+//! `GetPublicKey` and every `ListPublicKeys` page answer from that record rather than from
+//! the request being served.
+//!
+//! A mutating operation — "Uploads a public key to CloudFront" — and the only path by
+//! which a public key enters this service's store.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +143,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePublicKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePublicKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePublicKey"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let config = input.public_key_config;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Materialise whatever the clock owes the rest of the store before this call reads
+        // it, as every handler here does. A public key itself has no transition owed: the
+        // model gives it no status, so one this service accepts is usable at once.
+        store.settle(now);
+
+        // "A comment to describe the public key. The comment cannot be longer than 128
+        // characters." The member carries no `@length` in the model, so the documented
+        // bound is refused here — with the refusal this operation models for an unusable
+        // argument — BEFORE anything is minted.
+        let comment_length = config.comment.as_deref().unwrap_or_default().chars().count();
+        if comment_length > crate::state::MAX_PUBLIC_KEY_COMMENT {
+            return Err(CreatePublicKeyErrorModeled::InvalidArgument(
+                crate::state::comment_too_long(comment_length),
+            )
+            .into());
+        }
+
+        // A caller reference identifies ONE public key for its whole life: it is "a string
+        // included in the request to help make sure that the request can't be replayed", so
+        // a repeat under a reference the store already holds is either the SAME request
+        // again or a second key under a taken reference. What separates the two is the
+        // content of the configuration — the rule this service's distribution and origin
+        // access identity creates follow for their own references: a repeat whose
+        // configuration is the one that reference already names is answered with that key,
+        // its version and its location (creating nothing), and a repeat that changes the
+        // configuration is refused.
+        if let Some(existing) = store.public_key_by_caller_reference(&config.caller_reference) {
+            if crate::state::same_public_key_config(&existing.config, &config) {
+                // The same request again: the record the first create left behind, at its
+                // current version. Nothing is minted and nothing is stored.
+                return Ok(CreatePublicKeyOutput {
+                    public_key: Some(existing.to_public_key()),
+                    location: Some(crate::state::location_uri(&crate::state::public_key_path(
+                        &existing.id,
+                    ))),
+                    e_tag: Some(existing.etag.clone()),
+                });
+            }
+            let message = crate::state::public_key_already_exists_message(&existing.id);
+            return Err(CreatePublicKeyErrorModeled::PublicKeyAlreadyExists(
+                PublicKeyAlreadyExists {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // "The maximum number of public keys for field-level encryption have been created.
+        // To create a new public key, delete one of the existing keys." A key record is
+        // what a later read answers from, so it cannot be evicted: the bound is an entry
+        // count refused BEFORE anything is minted.
+        if store.public_keys.len() >= crate::state::MAX_PUBLIC_KEYS {
+            return Err(CreatePublicKeyErrorModeled::TooManyPublicKeys(
+                crate::state::too_many_public_keys(),
+            )
+            .into());
+        }
+
+        let id = store.allocate_public_key_id();
+        let etag = store.next_etag();
+        let stored = crate::state::StoredPublicKey {
+            id: id.clone(),
+            // "The date and time when the public key was uploaded": the instant this call
+            // stored it, written once so every later read reports the same one.
+            created_time: now,
+            // Stored whole: a later read answers from this record, never from the request
+            // that was served.
+            config,
+            etag: etag.clone(),
+        };
+        // Read from the record just built, never from the request.
+        let public_key = stored.to_public_key();
+        let location = crate::state::location_uri(&crate::state::public_key_path(&id));
+        store.public_keys.insert(id, stored);
+
+        Ok(CreatePublicKeyOutput {
+            // "The public key."
+            public_key: Some(public_key),
+            // "The URL of the public key."
+            location: Some(location),
+            // "The identifier for this version of the public key" — the token an `If-Match`
+            // against this key is checked against.
+            e_tag: Some(etag),
+        })
     }
 }

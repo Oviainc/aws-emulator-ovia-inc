@@ -364,28 +364,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The manifest is stored once per digest: re-pushing the same content under a
-        // new tag keeps the record, and therefore the instant it was first pushed.
-        repo.images
-            .entry(digest.clone())
-            .or_insert_with(|| crate::state::ImageRecord {
-                digest: digest.clone(),
-                tags: ::std::collections::BTreeSet::new(),
-                manifest_media_type: input
+        // new tag keeps the record, and therefore the instant it was first pushed. What
+        // the manifest states about itself — its media type, the artifact type its config
+        // descriptor names and the content it references — is read out of the document
+        // here, once, so no read re-parses it.
+        repo.images.entry(digest.clone()).or_insert_with(|| {
+            crate::state::ImageRecord::pushed(
+                digest.clone(),
+                input.image_manifest.clone(),
+                input
                     .image_manifest_media_type
                     .clone()
                     .or_else(|| crate::state::manifest_media_type(&input.image_manifest)),
-                size_in_bytes: i64::try_from(input.image_manifest.len()).unwrap_or(i64::MAX),
-                manifest: input.image_manifest.clone(),
-                // Set by pushing a referrer artifact, which this slice does not serve.
-                artifact_media_type: None,
-                pushed_at: now,
-            });
+                now,
+            )
+        });
 
         // Attaching the tag detaches it from whatever held it: the image it was taken
         // from stays addressable by its digest, now untagged.
         if let Some(tag) = input.image_tag.as_deref() {
             repo.move_tag(tag, &digest);
         }
+
+        // The repository's image set changed, and a manifest list's size is a statement
+        // about the images stored beside it, so every image's reported size is recomputed
+        // here rather than frozen when its own manifest arrived.
+        repo.refresh_image_sizes();
 
         let Some(stored) = repo.images.get(&digest) else {
             return Err(PutImageErrorModeled::ServerException(ServerException {
@@ -404,6 +408,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
                 image_manifest: Some(stored.manifest.clone()),
                 image_manifest_media_type: stored.manifest_media_type.clone(),
+                // The byte length of the manifest this response carries, so a client that
+                // streams or verifies the document knows how much of it there is.
+                image_manifest_size: Some(stored.manifest_size()),
             }),
         })
     }

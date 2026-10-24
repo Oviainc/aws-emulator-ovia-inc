@@ -234,7 +234,11 @@ pub struct SelfManagedInput {
     pub certificate: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#CreatePrivateConnectionOutput")]
+/// `CreatePrivateConnectionOutput`, with its schema and serializer written out instead
+/// of derived: `certificateExpiryTime` carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="CreatePrivateConnection",
+/// model_path="services/service-com-amazonaws-securityagent-securityagent/smithy-model/com-amazonaws-securityagent-securityagent.json")`),
+/// which the derive drops. See `super::wire_shape`.
 #[derive(Debug, Clone, Default)]
 pub struct CreatePrivateConnectionOutput {
     pub name: String,
@@ -249,4 +253,40 @@ pub struct CreatePrivateConnectionOutput {
     pub failure_message: Option<String>,
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
+
+sa_schema_and_codec!(
+    CreatePrivateConnectionOutput,
+    CREATE_PRIVATE_CONNECTION_OUTPUT_SCHEMA,
+    "com.amazonaws.securityagent#CreatePrivateConnectionOutput",
+    "com.amazonaws.securityagent",
+    "CreatePrivateConnectionOutput",
+    modelled: [
+        (M_NAME, name, "name", 0, req, string),
+        (M_TYPE, r#type, "type", 1, req, string),
+        (M_STATUS, status, "status", 2, req, string),
+        (M_RESOURCE_GATEWAY_ID, resource_gateway_id, "resourceGatewayId", 3, opt, string),
+        (M_HOST_ADDRESS, host_address, "hostAddress", 4, opt, string),
+        (M_VPC_ID, vpc_id, "vpcId", 5, opt, string),
+        (
+            M_RESOURCE_CONFIGURATION_ID,
+            resource_configuration_id,
+            "resourceConfigurationId",
+            6,
+            opt,
+            string
+        ),
+        (
+            M_CERTIFICATE_EXPIRY_TIME,
+            certificate_expiry_time,
+            "certificateExpiryTime",
+            7,
+            opt,
+            date_time
+        ),
+        (M_DNS_RESOLUTION, dns_resolution, "dnsResolution", 8, opt, string),
+        (M_FAILURE_MESSAGE, failure_message, "failureMessage", 9, opt, string),
+        (M_TAGS, tags, "tags", 10, opt, map_of_string),
+    ],
+    recorded: [],
+);
 

@@ -11,10 +11,14 @@
 //! immediately still sees it initiating; see [`crate::state::ExperimentRecord::settle`].
 //! What this call decides about the run is what the account's IAM store SHOWS about it:
 //! whether the template's role lets FIS assume it (a start it could never carry out is
-//! refused), and whether that role is allowed to perform the API calls the template's
-//! actions make — an action it is not allowed to perform does not refuse the start, it
+//! refused), and whether that role is allowed to perform the API calls the actions this run
+//! CARRIES OUT make — an action it is not allowed to perform does not refuse the start, it
 //! makes the run end `failed` with an insufficient-privileges reason, which is what AWS
-//! reports for it. A template id naming no record answers `ResourceNotFoundException`
+//! reports for it. WHICH actions the run carries out is what the experiment options decide
+//! ([`crate::state::plan_run`]): `experimentOptions.actionsMode` `skip-all` carries out
+//! none of them, and the template's `emptyTargetResolutionMode` decides what an empty
+//! target resolution does — skip the actions that name such a target, or fail the run.
+//! A template id naming no record answers `ResourceNotFoundException`
 //! (HTTP 404); a template whose role does not let FIS assume it answers
 //! `ValidationException` (HTTP 400); a start beyond the published active-experiments quota
 //! answers `ServiceQuotaExceededException` (HTTP 402); and the `@idempotencyToken` either
@@ -277,10 +281,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // under-privileged role is accepted and then FAILS, which is the attribution a
         // client reads off its state — so it is carried onto the record and spent when the
         // run reaches its end.
+        //
+        // The question is asked about the actions this run CARRIES OUT and no others: an
+        // action the experiment options skip is never run under the role, so nothing the
+        // role may not do can be attributed to it. Under `actionsMode: skip-all` that is
+        // every action, so no permission failure is possible at all.
+        let plan = crate::state::plan_run(&template, &actions_mode);
         let permission_failure = role_documents.and_then(|documents| {
             crate::state::action_permissions::permission_failure(
                 &template.role_arn,
-                &template.actions,
+                &plan.carried_out,
                 &template.targets,
                 &documents,
             )

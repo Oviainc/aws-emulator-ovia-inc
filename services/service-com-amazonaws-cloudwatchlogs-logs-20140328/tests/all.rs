@@ -59,6 +59,8 @@ mod resource_tags;
 mod retention_policy;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/storage_tier_policy.rs"]
+mod storage_tier_policy;
 #[path = "all/subscription_filters.rs"]
 mod subscription_filters;
 #[path = "all/syslog_configurations.rs"]

@@ -95,6 +95,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `ImageStatusFilter` value that matches an image of any status, and what a request
+/// naming no image status asks for. The model's `ListImagesFilter$imageStatus` doc says
+/// "If not specified, only images with ACTIVE status are returned", but the recorded AWS
+/// responses show an archived image reported to a read that named no `imageStatus` at all
+/// (see `describe_images`, whose filter this mirrors), so an absent filter filters on
+/// nothing.
+const ANY_IMAGE_STATUS_FILTER: &str = "ANY";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -195,44 +203,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A value outside `TagStatus` / `ImageStatusFilter` was already refused at the
         // boundary, so what arrives here is one of the modelled values.
         let tag_status = filter.tag_status.unwrap_or_else(|| "ANY".to_string());
-        // "If not specified, only images with ACTIVE status are returned" — which every
-        // image in standard storage is.
+        // A status NAMED in the filter selects on each image's own stored status; an
+        // absent one filters on nothing (see [`ANY_IMAGE_STATUS_FILTER`]).
         let image_status = filter
             .image_status
-            .unwrap_or_else(|| crate::state::ACTIVE_IMAGE_STATUS.to_string());
-        let status_matches =
-            image_status == "ANY" || image_status == crate::state::ACTIVE_IMAGE_STATUS;
+            .unwrap_or_else(|| ANY_IMAGE_STATUS_FILTER.to_string());
 
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
         let repo = store
-            .repository(&input.repository_name)
+            .repository_mut(&input.repository_name)
             .map_err(fault_error)?;
+        // A restore the clock has already made due is written down before the images are
+        // listed, so this read reports the status the image was already in.
+        repo.settle_image_storage_classes(now);
+        let repo = &*repo;
 
         // Keyed by digest and then tag, so a page boundary is a point in one total
         // order the next call resolves against the live store.
-        let candidates: Vec<(String, ImageIdentifier)> = if status_matches {
-            repo.images
-                .values()
-                .flat_map(crate::state::ImageRecord::identifiers)
-                .filter(|id| match tag_status.as_str() {
-                    "TAGGED" => id.image_tag.is_some(),
-                    "UNTAGGED" => id.image_tag.is_none(),
-                    _ => true,
-                })
-                .map(|id| {
-                    let key = format!(
-                        "{}\u{1}{}",
-                        id.image_digest.clone().unwrap_or_default(),
-                        id.image_tag.clone().unwrap_or_default()
-                    );
-                    (key, id)
-                })
-                .collect()
-        } else {
-            // Nothing stored here is archived or activating, so no stored image
-            // matches a filter asking for one.
-            Vec::new()
-        };
+        let candidates: Vec<(String, ImageIdentifier)> = repo
+            .images
+            .values()
+            .filter(|image| image_status == ANY_IMAGE_STATUS_FILTER || image_status == image.status)
+            .flat_map(crate::state::ImageRecord::identifiers)
+            .filter(|id| match tag_status.as_str() {
+                "TAGGED" => id.image_tag.is_some(),
+                "UNTAGGED" => id.image_tag.is_none(),
+                _ => true,
+            })
+            .map(|id| {
+                let key = format!(
+                    "{}\u{1}{}",
+                    id.image_digest.clone().unwrap_or_default(),
+                    id.image_tag.clone().unwrap_or_default()
+                );
+                (key, id)
+            })
+            .collect();
 
         let (image_ids, next_token) =
             crate::state::paginate(candidates, input.next_token.as_ref(), input.max_results)

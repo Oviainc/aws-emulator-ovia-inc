@@ -157,6 +157,13 @@ fn assert_pending_projection(
         "case {case:?}: expected verificationStatus {TARGET_DOMAIN_STATUS_PENDING:?}, got \
          {payload}"
     );
+    // The recorded wire reports the one stored status under `status` as well; the two
+    // read the same value (`crate::recorded_wire_form` pins the rule).
+    assert_eq!(
+        member(payload, "status"),
+        member(payload, "verificationStatus"),
+        "case {case:?}: status and verificationStatus report one stored status: {payload}"
+    );
     assert!(
         payload.get("verifiedAt").is_none_or(Value::is_null),
         "case {case:?}: a domain whose ownership is not proven carries no verifiedAt: {payload}"
@@ -237,14 +244,17 @@ fn assert_pending_projection(
             let path = member(http, "routePath").unwrap_or_else(|| {
                 panic!("case {case:?}: the challenge names the route to serve: {http}")
             });
+            // The route is ONE fixed, token-free path for every domain, with the token
+            // carried beside it; `crate::recorded_wire_form` pins the path itself.
             assert!(
-                path.starts_with('/'),
-                "case {case:?}: the route path {path:?} must be absolute"
+                path.contains(".well-known/"),
+                "case {case:?}: the route path {path:?} must sit under the /.well-known/ \
+                 prefix reserved for this kind of challenge (RFC 8615)"
             );
             assert!(
-                path.contains(&token),
-                "case {case:?}: the route path {path:?} must carry the token {token:?}, so two \
-                 domains never share one path"
+                !path.contains(&token),
+                "case {case:?}: the token travels beside the route path, not inside it: \
+                 {http}"
             );
             Some(token)
         }
@@ -267,20 +277,18 @@ fn assert_pending_projection(
 
 /// The instant a timestamp member reports, in seconds since the epoch.
 ///
-/// restJson1 encodes a `Timestamp` as epoch seconds by default, so a number is the
-/// form this service's timestamps take; a `@timestampFormat`-bearing member would
-/// arrive as an RFC 3339 string instead, and both are accepted here.
+/// A target domain's `createdAt`/`verifiedAt` are `@timestampFormat("date-time")`
+/// members, so the wire form is an RFC 3339 instant STRING;
+/// `crate::recorded_wire_form` owns that rule. What this case needs is the VALUE, read
+/// back out of the rendered string.
 fn timestamp_secs(value: &Value, case: &str) -> f64 {
     match value {
-        Value::Number(seconds) => seconds.as_f64().unwrap_or_else(|| {
-            panic!("case {case:?}: {seconds} is not a number of seconds")
-        }),
         Value::String(text) => DateTime::from_str(text, Format::DateTime)
             .unwrap_or_else(|error| {
                 panic!("case {case:?}: {text:?} is not a date-time: {error}")
             })
             .as_secs_f64(),
-        other => panic!("case {case:?}: {other} is not a timestamp"),
+        other => panic!("case {case:?}: {other} is not a date-time timestamp string"),
     }
 }
 

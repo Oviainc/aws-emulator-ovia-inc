@@ -45,6 +45,10 @@
 //! reports — live in [`ComAmazonawsCloudwatchlogsLogs20140328State::deliveries`], each one
 //! a [`DeliveryRecord`].
 //!
+//! The account's storage tier policy lives here too
+//! ([`ComAmazonawsCloudwatchlogsLogs20140328State::storage_tier_policy`]): it is "the
+//! storage tier policy for the account", so there is one of it and no log group owns it.
+//!
 //! The account's delivery destinations — each "a logical object that represents the actual
 //! delivery destination", which `PutDeliveryDestination` creates or updates and
 //! `GetDeliveryDestination` reports — live in
@@ -68,6 +72,14 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// The log group class `CreateLogGroup` applies when the request omits
 /// `logGroupClass` ("If you omit this parameter, the default of STANDARD is used").
 pub const DEFAULT_LOG_GROUP_CLASS: &str = "STANDARD";
+
+/// The storage tier `GetStorageTierPolicy` reports for an account no `PutStorageTierPolicy`
+/// has ever set: the tier log data is stored in until the account opts into
+/// `INTELLIGENT_TIERING`, which is what `PutStorageTierPolicy` documents as the opt-in
+/// ("When you set the storage tier to INTELLIGENT_TIERING, the service automatically moves
+/// log data to the most cost-effective storage tier based on access frequency"). Spelled
+/// as the model's `StorageTier` enum spells it (`STORAGE_TIER_VALUES`).
+pub const DEFAULT_STORAGE_TIER: &str = "STANDARD";
 
 /// The one log group class a log-group-level transformer may be created on, from
 /// `PutTransformer`: "You can create transformers only for the log groups in the
@@ -539,6 +551,12 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// its destination are both named by their own resources, so it lives here and not on
     /// [`LogGroupRecord`].
     pub deliveries: BTreeMap<String, DeliveryRecord>,
+    /// The account's storage tier policy — what `PutStorageTierPolicy` sets and
+    /// `GetStorageTierPolicy` reports. `None` until a put sets one, which is why
+    /// `GetStorageTierPolicy` reports [`DEFAULT_STORAGE_TIER`] with no
+    /// `lastUpdatedTime`: the policy is "for the account", so there is exactly one of it
+    /// and reading it before any put is not a missing resource.
+    pub storage_tier_policy: Option<StorageTierPolicyRecord>,
     /// Every delivery destination of this account — the resource `PutDeliveryDestination`
     /// creates or updates and `GetDeliveryDestination` / `DescribeDeliveryDestinations`
     /// report — keyed by `DeliveryDestination$name`, which is the only thing that
@@ -1946,6 +1964,19 @@ pub struct DataProtectionPolicyRecord {
     /// `policyDocument`, byte-for-byte as the put carried it.
     pub policy_document: String,
     /// "The date and time that this policy was most recently updated."
+    pub last_updated_time_ms: i64,
+}
+
+/// The account's storage tier policy — what `PutStorageTierPolicy` stores and
+/// `GetStorageTierPolicy` reports — as it is stored. One per account: the policy is named
+/// by nothing, so a later put replaces this record rather than adding another.
+#[derive(Debug, Clone)]
+pub struct StorageTierPolicyRecord {
+    /// `storageTier`, one of [`crate::ops::types::STORAGE_TIER_VALUES`].
+    pub storage_tier: String,
+    /// "The time when the storage tier policy was last updated, expressed as the number of
+    /// milliseconds after January 1, 1970 00:00:00 UTC" — the instant of the put that
+    /// stored this tier.
     pub last_updated_time_ms: i64,
 }
 

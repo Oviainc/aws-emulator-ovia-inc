@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
+#[path = "all/host_deletion.rs"]
+mod host_deletion;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -17,7 +17,8 @@ pub struct GetSecurityRequirementPackInput {
     pub pack_id: String,
 }
 
-/// `GetSecurityRequirementPackOutput`, with its schema written out instead of derived.
+/// `GetSecurityRequirementPackOutput`, with its schema and serializer written out
+/// instead of derived.
 ///
 /// WHY it is not `#[smithy_macros::smithy(shape = ...)]` like the input beside it:
 /// `createdAt` and `updatedAt` are marked `@timestampFormat("date-time")` on the member
@@ -28,18 +29,16 @@ pub struct GetSecurityRequirementPackInput {
 /// (`vendor/smithy-schema-server/src/json.rs`, `write_timestamp`) and otherwise falls
 /// back to the restJson1 default, epoch seconds — so a pack's timestamps would go out as
 /// `1792694515.42` where the model (and every SDK's generated deserializer for a
-/// `date-time` member) requires an RFC 3339 string. The ten member schemas below are the
-/// model's, member for member: same shape ids, same wire names, same order, same shape
-/// types, plus the `date-time` format the model declares.
+/// `date-time` member) requires an RFC 3339 string.
 ///
-/// This is a PER-SHAPE workaround and has to be kept in step with the model by hand. The
-/// generator gap it works around is filed as
-/// `issues/things-that-do-not-work/20261022T000000Z-smithy-macros-drops-timestampformat-from-member-schemas.md`
-/// — the real fix is in `vendor/smithy-macros` (chain `.with_timestamp_format(..)` when
-/// building a member schema), which is read-only from a service crate. REMOVE this block
-/// and put the derive back once the generator learns `smithy.api#timestampFormat`;
-/// `tests/all/security_requirement_pack.rs` pins the wire form, so it fails if the derive
-/// still drops it.
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types, plus the `date-time` format the model declares,
+/// which `super::wire_shape`'s macros attach — ONE mechanism for every shape of this
+/// crate that needs it, so there is one thing to delete when the generator gap
+/// (`issues/things-that-do-not-work/20261022T000000Z-smithy-macros-drops-timestampformat-from-member-schemas.md`)
+/// is closed in `vendor/smithy-macros`. `tests/all/security_requirement_pack.rs` and
+/// `tests/all/recorded_wire_form.rs` pin the wire form, so they fail if the derive still
+/// drops it.
 ///
 /// The derive's `DeserializableStruct` impl is deliberately not reproduced: this shape is
 /// an operation OUTPUT, which the server only ever serializes (`Operation::Output`
@@ -59,169 +58,23 @@ pub struct GetSecurityRequirementPackOutput {
     pub kms_key_id: Option<String>,
 }
 
-#[allow(non_upper_case_globals)]
-impl GetSecurityRequirementPackOutput {
-    const M_PACK_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.securityagent#GetSecurityRequirementPackOutput$packId",
-            "com.amazonaws.securityagent",
-            "packId",
-        ),
-        ::aws_smithy_schema::ShapeType::String,
-        "packId",
-        0,
-    );
-
-    const M_NAME: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.securityagent#GetSecurityRequirementPackOutput$name",
-            "com.amazonaws.securityagent",
-            "name",
-        ),
-        ::aws_smithy_schema::ShapeType::String,
-        "name",
-        1,
-    );
-
-    const M_DESCRIPTION: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.securityagent#GetSecurityRequirementPackOutput$description",
-            "com.amazonaws.securityagent",
-            "description",
-        ),
-        ::aws_smithy_schema::ShapeType::String,
-        "description",
-        2,
-    );
-
-    const M_VENDOR_NAME: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.securityagent#GetSecurityRequirementPackOutput$vendorName",
-            "com.amazonaws.securityagent",
-            "vendorName",
-        ),
-        ::aws_smithy_schema::ShapeType::String,
-        "vendorName",
-        3,
-    );
-
-    const M_MANAGEMENT_TYPE: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.securityagent#GetSecurityRequirementPackOutput$managementType",
-            "com.amazonaws.securityagent",
-            "managementType",
-        ),
-        ::aws_smithy_schema::ShapeType::String,
-        "managementType",
-        4,
-    );
-
-    const M_STATUS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.securityagent#GetSecurityRequirementPackOutput$status",
-            "com.amazonaws.securityagent",
-            "status",
-        ),
-        ::aws_smithy_schema::ShapeType::String,
-        "status",
-        5,
-    );
-
-    const M_IMPORT_STATUS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.securityagent#GetSecurityRequirementPackOutput$importStatus",
-            "com.amazonaws.securityagent",
-            "importStatus",
-        ),
-        ::aws_smithy_schema::ShapeType::String,
-        "importStatus",
-        6,
-    );
-
-    const M_CREATED_AT: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.securityagent#GetSecurityRequirementPackOutput$createdAt",
-            "com.amazonaws.securityagent",
-            "createdAt",
-        ),
-        ::aws_smithy_schema::ShapeType::Timestamp,
-        "createdAt",
-        7,
-    )
-    // The one chain call the vendored codegen omits; see the note above.
-    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
-
-    const M_UPDATED_AT: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.securityagent#GetSecurityRequirementPackOutput$updatedAt",
-            "com.amazonaws.securityagent",
-            "updatedAt",
-        ),
-        ::aws_smithy_schema::ShapeType::Timestamp,
-        "updatedAt",
-        8,
-    )
-    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
-
-    const M_KMS_KEY_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.securityagent#GetSecurityRequirementPackOutput$kmsKeyId",
-            "com.amazonaws.securityagent",
-            "kmsKeyId",
-        ),
-        ::aws_smithy_schema::ShapeType::String,
-        "kmsKeyId",
-        9,
-    );
-
-    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
-        ::aws_smithy_schema::ShapeId::from_static(
-            "com.amazonaws.securityagent#GetSecurityRequirementPackOutput",
-            "com.amazonaws.securityagent",
-            "GetSecurityRequirementPackOutput",
-        ),
-        ::aws_smithy_schema::ShapeType::Structure,
-        &[
-            &Self::M_PACK_ID,
-            &Self::M_NAME,
-            &Self::M_DESCRIPTION,
-            &Self::M_VENDOR_NAME,
-            &Self::M_MANAGEMENT_TYPE,
-            &Self::M_STATUS,
-            &Self::M_IMPORT_STATUS,
-            &Self::M_CREATED_AT,
-            &Self::M_UPDATED_AT,
-            &Self::M_KMS_KEY_ID,
-        ],
-    );
-}
-
-pub static GET_SECURITY_REQUIREMENT_PACK_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
-    &GetSecurityRequirementPackOutput::SCHEMA;
-
-impl ::aws_smithy_schema::serde::SerializableStruct for GetSecurityRequirementPackOutput {
-    fn serialize_members(
-        &self,
-        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
-    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
-        serializer.write_string(&Self::M_PACK_ID, self.pack_id.as_str())?;
-        serializer.write_string(&Self::M_NAME, self.name.as_str())?;
-        if let Some(value) = self.description.as_ref() {
-            serializer.write_string(&Self::M_DESCRIPTION, value.as_str())?;
-        }
-        if let Some(value) = self.vendor_name.as_ref() {
-            serializer.write_string(&Self::M_VENDOR_NAME, value.as_str())?;
-        }
-        serializer.write_string(&Self::M_MANAGEMENT_TYPE, self.management_type.as_str())?;
-        serializer.write_string(&Self::M_STATUS, self.status.as_str())?;
-        if let Some(value) = self.import_status.as_ref() {
-            serializer.write_string(&Self::M_IMPORT_STATUS, value.as_str())?;
-        }
-        serializer.write_timestamp(&Self::M_CREATED_AT, &self.created_at)?;
-        serializer.write_timestamp(&Self::M_UPDATED_AT, &self.updated_at)?;
-        if let Some(value) = self.kms_key_id.as_ref() {
-            serializer.write_string(&Self::M_KMS_KEY_ID, value.as_str())?;
-        }
-        Ok(())
-    }
-}
+sa_schema_and_codec!(
+    GetSecurityRequirementPackOutput,
+    GET_SECURITY_REQUIREMENT_PACK_OUTPUT_SCHEMA,
+    "com.amazonaws.securityagent#GetSecurityRequirementPackOutput",
+    "com.amazonaws.securityagent",
+    "GetSecurityRequirementPackOutput",
+    modelled: [
+        (M_PACK_ID, pack_id, "packId", 0, req, string),
+        (M_NAME, name, "name", 1, req, string),
+        (M_DESCRIPTION, description, "description", 2, opt, string),
+        (M_VENDOR_NAME, vendor_name, "vendorName", 3, opt, string),
+        (M_MANAGEMENT_TYPE, management_type, "managementType", 4, req, string),
+        (M_STATUS, status, "status", 5, req, string),
+        (M_IMPORT_STATUS, import_status, "importStatus", 6, opt, string),
+        (M_CREATED_AT, created_at, "createdAt", 7, req, date_time),
+        (M_UPDATED_AT, updated_at, "updatedAt", 8, req, date_time),
+        (M_KMS_KEY_ID, kms_key_id, "kmsKeyId", 9, opt, string),
+    ],
+    recorded: [],
+);
