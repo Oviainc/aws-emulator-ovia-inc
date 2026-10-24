@@ -70,7 +70,7 @@ fn identifier_forms(quote_id: &str) -> Vec<String> {
 
 /// A `CreateQuote` request body: the two members the model marks `@required`, with
 /// `overrides` merged in.
-fn request(country_code: &str, capacities: Value, overrides: Value) -> Value {
+pub(crate) fn request(country_code: &str, capacities: Value, overrides: Value) -> Value {
     let mut body = json!({ "CountryCode": country_code, "RequestedCapacities": capacities });
     if let (Some(target), Some(extra)) = (body.as_object_mut(), overrides.as_object()) {
         for (key, value) in extra {
@@ -100,7 +100,7 @@ fn instant(quote: &Value, member: &str, case: &str) -> f64 {
 }
 
 /// `CreateQuote`, returning the `Quote` it answered with.
-async fn create_quote(outposts: &Outposts, body: &Value) -> Value {
+pub(crate) async fn create_quote(outposts: &Outposts, body: &Value) -> Value {
     outposts.ok("POST", "/quotes", Some(body)).await["Quote"].clone()
 }
 
@@ -113,18 +113,8 @@ async fn get_quote(outposts: &Outposts, identifier: &str) -> Value {
 }
 
 /// One Outpost to associate quotes with, as its `OutpostId` and its `OutpostArn`.
-///
-/// An Outpost belongs to a site, so the site comes first — the same order a real
-/// workflow takes.
 async fn an_outpost(outposts: &Outposts) -> (String, String) {
-    let site = outposts.create_site(&json!({ "Name": "quote-site" })).await;
-    let outpost = outposts
-        .create_outpost(&json!({
-            "Name": "quote-outpost",
-            "SiteId": text(&site, "SiteId"),
-        }))
-        .await;
-    (text(&outpost, "OutpostId"), text(&outpost, "OutpostArn"))
+    outposts.site_and_outpost("quote-outpost").await
 }
 
 /// Rules 1 + 2: a `CreateQuote` mints a `QuoteId` of the modelled form, stores what
