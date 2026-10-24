@@ -50,6 +50,9 @@ mod milestone_listing;
 #[path = "all/milestone_name_uniqueness.rs"]
 mod milestone_name_uniqueness;
 
+#[path = "all/profile_lifecycle.rs"]
+mod profile_lifecycle;
+
 #[path = "all/question_choice_catalog.rs"]
 mod question_choice_catalog;
 

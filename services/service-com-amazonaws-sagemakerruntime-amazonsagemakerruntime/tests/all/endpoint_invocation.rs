@@ -35,34 +35,34 @@ use service_com_amazonaws_sagemakerruntime_amazonsagemakerruntime::ComAmazonawsS
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The canonical account id every emulator ARN and message carries.
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// Long enough to pass the control plane's `ENDPOINT_IN_SERVICE_AFTER` (300 ms), after
 /// which the clock owes the endpoint its `InService` status.
-const PAST_IN_SERVICE_DUE: Duration = Duration::from_millis(600);
+pub(crate) const PAST_IN_SERVICE_DUE: Duration = Duration::from_millis(600);
 
 /// A SigV4 `Authorization` header scoped to the signing name both SageMaker services
 /// share (`sagemaker`). Request authentication is off in these tests, so the signature
 /// is not checked; the scope is what the ARN region is read from.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
+pub(crate) const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEMULATOR000000000/20260101/us-east-1/sagemaker/aws4_request, \
      SignedHeaders=host, Signature=0000000000000000000000000000000000000000000000000000000000000000";
 
 /// One HTTP exchange with the data plane.
-struct Call {
-    status: u16,
-    headers: http::HeaderMap,
-    body: bytes::Bytes,
+pub(crate) struct Call {
+    pub(crate) status: u16,
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) body: bytes::Bytes,
 }
 
 impl Call {
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
 
     /// The wire error code: the `x-amzn-errortype` header restJson1 sets, or the body's
     /// `__type` when no header carried it.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         if let Some(value) = self.headers.get("x-amzn-errortype") {
             return value.to_str().unwrap_or_default().to_string();
         }
@@ -73,7 +73,7 @@ impl Call {
             .to_string()
     }
 
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         let rendered = self.json();
         rendered
             .get("message")
@@ -86,13 +86,13 @@ impl Call {
 
 /// One emulator: the shared engine with the SageMaker control plane and this data plane
 /// mounted on the production router.
-struct Emulator {
-    router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -108,7 +108,7 @@ impl Emulator {
     }
 
     /// A control-plane call (`awsJson1_1`), which must succeed.
-    async fn control(&self, target: &str, body: &Value) -> Value {
+    pub(crate) async fn control(&self, target: &str, body: &Value) -> Value {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -129,29 +129,15 @@ impl Emulator {
         parsed
     }
 
-    /// `POST /endpoints/{endpoint}/invocations` with `headers` and the raw `body`.
-    async fn invoke(&self, endpoint: &str, headers: &[(&str, &str)], body: &[u8]) -> Call {
-        let mut request = http::Request::builder()
-            .method("POST")
-            .uri(format!("/endpoints/{endpoint}/invocations"))
-            .header("authorization", AUTHORIZATION);
-        for (name, value) in headers {
-            request = request.header(*name, *value);
-        }
-        let request = request
-            .body(bytes::Bytes::copy_from_slice(body))
-            .expect("a well-formed test request");
-        let response = self.router.dispatch(request).await;
-        let (parts, body) = response.into_parts();
-        Call {
-            status: parts.status.as_u16(),
-            headers: parts.headers,
-            body,
-        }
+    /// `POST /endpoints/{endpoint}/invocations` with `headers` and the raw `body`. The
+    /// request itself is built by the one builder this crate's suites share
+    /// (`crate::harness::post`); only the path is this route's.
+    pub(crate) async fn invoke(&self, endpoint: &str, headers: &[(&str, &str)], body: &[u8]) -> Call {
+        crate::harness::post(self, &crate::harness::invocations(endpoint), headers, body).await
     }
 
     /// The data plane's own invocation log, as the next request would read it.
-    fn invocation_log(&self) -> Vec<EndpointInvocation> {
+    pub(crate) fn invocation_log(&self) -> Vec<EndpointInvocation> {
         self.engine
             .state::<RuntimeState>()
             .lock()
@@ -161,7 +147,7 @@ impl Emulator {
     }
 
     /// The most recently logged invocation.
-    fn last_logged(&self) -> Option<EndpointInvocation> {
+    pub(crate) fn last_logged(&self) -> Option<EndpointInvocation> {
         self.engine
             .state::<RuntimeState>()
             .lock()
@@ -170,7 +156,7 @@ impl Emulator {
     }
 
     /// The logged invocations of one endpoint, oldest first.
-    fn invocations_of(&self, endpoint: &str) -> Vec<EndpointInvocation> {
+    pub(crate) fn invocations_of(&self, endpoint: &str) -> Vec<EndpointInvocation> {
         self.engine
             .state::<RuntimeState>()
             .lock()
@@ -181,7 +167,7 @@ impl Emulator {
 
     /// Create `model` -> `config` (with `extra` merged into the configuration body) ->
     /// `endpoint`, and wait until the clock owes the endpoint its `InService` status.
-    async fn deploy(&self, endpoint: &str, variants: &[&str], extra: Value) {
+    pub(crate) async fn deploy(&self, endpoint: &str, variants: &[&str], extra: Value) {
         self.deploy_without_waiting(endpoint, variants, extra).await;
         tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
         let described = self
@@ -196,7 +182,7 @@ impl Emulator {
 
     /// As [`Emulator::deploy`], but returning as soon as `CreateEndpoint` has answered —
     /// so the endpoint is still in the transient `Creating` status.
-    async fn deploy_without_waiting(&self, endpoint: &str, variants: &[&str], extra: Value) {
+    pub(crate) async fn deploy_without_waiting(&self, endpoint: &str, variants: &[&str], extra: Value) {
         let model = format!("{endpoint}-model");
         let config = format!("{endpoint}-config");
         self.control(
@@ -254,7 +240,7 @@ fn explainer_config() -> Value {
 }
 
 /// The content-type header pair, so a row can vary the request's MIME type.
-fn content_type(value: &str) -> (&str, &str) {
+pub(crate) fn content_type(value: &str) -> (&str, &str) {
     ("content-type", value)
 }
 

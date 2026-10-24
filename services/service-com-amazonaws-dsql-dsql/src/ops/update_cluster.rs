@@ -5,7 +5,9 @@
 //! Mutates the persisted cluster named by the `@httpLabel` `identifier`, applying
 //! only the members the request carries, and moves it to `UPDATING` with the clock
 //! owing it `ACTIVE` again. Unknown identifier -> `ResourceNotFoundException` (404);
-//! a cluster in a status that does not accept a mutation -> `ConflictException` (409).
+//! a cluster in a status that does not accept a mutation -> `ConflictException` (409);
+//! a `multiRegionProperties.witnessRegion` naming the cluster's OWN Region ->
+//! `ValidationException` (400), with the cluster left unchanged.
 //! A repeat of the same `clientToken` with the same parameters is the same request,
 //! so it answers from the cluster the first call acted on — ahead of that status
 //! gate; the same token with different parameters -> `ConflictException` (409).
@@ -215,6 +217,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::cluster_not_found(&region, &input.identifier),
             )
             .into());
+        }
+
+        // A multi-Region configuration's WITNESS Region cannot be the cluster's own
+        // Region (this operation's documented constraint), so a request naming it is
+        // refused with the modelled 400 and the cluster is left exactly as it was —
+        // ahead of the idempotency ledger and the status gate, which decide what to
+        // do with a request whose input is valid in the first place. The cluster's
+        // Region is the one its ARN was minted in, not the request's: it is a
+        // property of the cluster.
+        let cluster_region = state
+            .clusters
+            .get(&input.identifier)
+            .and_then(|cluster| crate::state::arn_region(&cluster.arn))
+            .unwrap_or_else(|| region.clone());
+        if let Err(invalid) = crate::state::validate_witness_region(
+            input.multi_region_properties.as_ref(),
+            &cluster_region,
+        ) {
+            return Err(UpdateClusterErrorModeled::ValidationException(invalid).into());
         }
 
         // `@idempotencyToken`: a repeat of the SAME request is the same request,

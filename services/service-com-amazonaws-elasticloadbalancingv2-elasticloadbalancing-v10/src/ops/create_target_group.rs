@@ -267,6 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.health_check_protocol.as_deref(),
             input.protocol.as_deref(),
         )?;
+        validate_health_check_port(input.health_check_port.as_deref())?;
 
         // "If the target is a Lambda function, this parameter does not apply" —
         // `Protocol`, `Port` and `VpcId` each carry that sentence, and `ProtocolVersion`
@@ -401,6 +402,20 @@ fn validate_name(name: &str) -> Result<(), CreateTargetGroupError> {
     Ok(())
 }
 
+/// Refuse a `HealthCheckPort` whose VALUE is no health-check port, as
+/// [`crate::state::check_health_check_port`] states the rule: the member is a bare
+/// string in the model, so nothing in the model bounds it and this handler is the only
+/// gate. It is a value the service cannot accept rather than a combination that cannot
+/// hold together, so it answers this service's own `ValidationError` — the same refusal
+/// `validate_name` above answers for a name outside its documented rule.
+fn validate_health_check_port(port: Option<&str>) -> Result<(), CreateTargetGroupError> {
+    match port {
+        Some(value) => crate::state::check_health_check_port(value)
+            .map_err(crate::scaffolded::Scaffolded::validation_error),
+        None => Ok(()),
+    }
+}
+
 /// Refuse a health-check protocol the service cannot check with, as
 /// `HealthCheckProtocol`'s own documentation states it: "The TCP protocol is not
 /// supported for health checks if the protocol of the target group is HTTP or HTTPS.
@@ -491,7 +506,7 @@ fn health_check_config(input: &CreateTargetGroupInput, target_type: &str) -> Hea
         } else if geneve {
             Some("80".to_string())
         } else {
-            Some("traffic-port".to_string())
+            Some(crate::state::TRAFFIC_PORT.to_string())
         }
     });
 

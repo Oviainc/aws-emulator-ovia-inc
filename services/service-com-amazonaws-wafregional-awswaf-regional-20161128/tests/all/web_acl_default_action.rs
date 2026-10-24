@@ -12,8 +12,14 @@
 //!
 //! The suite pins that rule twice over: once as a literal (`COUNT` by name must be
 //! refused, and must store nothing), and once as a catalog walk over the GENERATED enum
-//! so a value the model adds later cannot slip past untested. Accepted values are read
-//! back through `GetWebACL`, so what is asserted is the stored record.
+//! so a value the model adds later cannot slip past untested.
+//!
+//! A value the rule ADMITS is not stored either: AWS WAF Classic is past its end of
+//! support, so `CreateWebACL` answers every request whose parameters it accepts with the
+//! modelled `WAFBadRequestException` (`web_acl_end_of_support.rs`). That is what a walk
+//! over the admitted values asserts here — they get PAST this parameter check — while
+//! the default action of a web ACL that already exists is read back through `GetWebACL`,
+//! so what is asserted of a stored action is the stored record.
 
 use std::sync::Arc;
 
@@ -24,7 +30,7 @@ use service_com_amazonaws_wafregional_awswaf_regional_20161128::state::{
     service_state, CHANGE_TOKEN_PROVISIONED,
 };
 
-use crate::harness::{create, create_in_region, created_web_acl, expected_arn};
+use crate::harness::{expected_arn, store_web_acl};
 use crate::wire::{
     change_token, expect_error, ok_call, router, router_on, token_status, DEFAULT_TEST_REGION,
 };
@@ -108,36 +114,34 @@ async fn count_is_refused_as_a_web_acl_default_action() {
 }
 
 /// The whole modelled catalog, walked from the GENERATED enum: every value a default
-/// action may carry is stored and read back; the excluded one is refused. A value the
-/// model adds later becomes a row here without touching this test.
+/// action may carry gets PAST this parameter check — it is answered by the service's
+/// end-of-support refusal (`WAFBadRequestException`) rather than by
+/// `WAFInvalidParameterException` — and the excluded one is refused by the check itself.
+/// A value the model adds later becomes a row here without touching this test.
 #[tokio::test]
-async fn every_other_modelled_action_type_is_accepted_and_reads_back() {
-    let router = router();
+async fn every_other_modelled_action_type_gets_past_the_parameter_check() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(Arc::clone(&engine));
 
     for action in WAF_ACTION_TYPE_VALUES {
-        if *action == COUNT {
-            continue;
-        }
-        let request = request_with_action(&format!("acl-{action}"), action);
-        let (status, body, _) = create(&router, &request).await;
-        let created = created_web_acl(status, &body, action);
-        let web_acl_id = created["WebACLId"].as_str().unwrap_or_default().to_string();
+        let expected = if *action == COUNT {
+            "WAFInvalidParameterException"
+        } else {
+            "WAFBadRequestException"
+        };
+        let token = change_token(&router).await;
+        let mut request = request_with_action(&format!("acl-{action}"), action);
+        request["ChangeToken"] = json!(token);
+        expect_error(&router, "CreateWebACL", &request, expected, action).await;
+
+        let stored = service_state(&*engine)
+            .expect("the service state is reachable from the shared engine")
+            .lock()
+            .web_acls
+            .len();
         assert_eq!(
-            created["DefaultAction"]["Type"].as_str(),
-            Some(*action),
-            "case {action}: the stored default action must be the one created, got {created}"
-        );
-        // The round trip: the reader reports the stored record, not the request.
-        let read = ok_call(&router, "GetWebACL", &json!({"WebACLId": &web_acl_id})).await;
-        assert_eq!(
-            read["WebACL"], created,
-            "case {action}: GetWebACL must read back the created WebACL, got {read}"
-        );
-        assert_eq!(
-            read["WebACL"]["WebACLArn"].as_str(),
-            Some(expected_arn(DEFAULT_TEST_REGION, &web_acl_id).as_str()),
-            "case {action}: the stored ARN must name the region the create was signed \
-             for, got {read}"
+            stored, 0,
+            "case {action}: a refused create must store nothing, got {stored} web ACL(s)"
         );
     }
 }
@@ -174,26 +178,38 @@ async fn a_default_action_outside_the_modelled_enum_is_refused_by_the_constraint
     }
 }
 
-/// The region a create is signed for is the region the stored ARN names, whatever the
-/// default action — the two rules are independent.
+/// The default action of a web ACL that EXISTS is reported as it is stored, beside the
+/// ARN naming the region that web ACL belongs to — the two are properties of the record,
+/// and independent of each other.
 #[tokio::test]
-async fn the_stored_arn_names_the_signed_region_for_every_default_action() {
-    let router = router();
+async fn a_stored_default_action_reads_back_beside_the_stored_arn() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(Arc::clone(&engine));
 
-    for (region, action) in [("eu-west-2", "ALLOW"), ("ap-south-1", "BLOCK")] {
-        let (status, body, _) =
-            create_in_region(&router, region, &request_with_action("regional-acl", action)).await;
-        let created = created_web_acl(status, &body, region);
-        let web_acl_id = created["WebACLId"].as_str().unwrap_or_default().to_string();
-        assert_eq!(
-            created["WebACLArn"].as_str(),
-            Some(expected_arn(region, &web_acl_id).as_str()),
-            "case {region}: expected the ARN for the signed region, got {created}"
+    for (region, action) in [
+        ("eu-west-2", "ALLOW"),
+        ("ap-south-1", "BLOCK"),
+        (DEFAULT_TEST_REGION, "ALLOW"),
+    ] {
+        let web_acl_id = store_web_acl(
+            &engine,
+            region,
+            "regional-acl",
+            "defaultAction",
+            action,
+            &[],
         );
         let read = ok_call(&router, "GetWebACL", &json!({"WebACLId": &web_acl_id})).await;
         assert_eq!(
-            read["WebACL"], created,
-            "case {region}: GetWebACL must read back the created WebACL, got {read}"
+            read["WebACL"]["DefaultAction"]["Type"].as_str(),
+            Some(action),
+            "case {region}/{action}: the reported default action must be the stored one, \
+             got {read}"
+        );
+        assert_eq!(
+            read["WebACL"]["WebACLArn"].as_str(),
+            Some(expected_arn(region, &web_acl_id).as_str()),
+            "case {region}/{action}: expected the ARN of the record's own region, got {read}"
         );
     }
 }

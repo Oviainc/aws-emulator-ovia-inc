@@ -17,6 +17,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+// The expected metric catalogue, and the rendering of one answer's references, come from
+// the suite that owns that rule, so this crate's tests state the catalogue ONCE.
+use super::discovered_metric_references::{metric_set, standard_metrics};
+
 /// The SigV4 credential scope routes the request to this service. Signature verification
 /// is off (see `set_request_authentication`), so the signature bytes are never read.
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
@@ -156,27 +160,6 @@ async fn create_slo(router: &MultiServiceRouter, case: &str, body: Value) {
         status, 200,
         "case {case:?}: expected the SLO create to answer 200, got {status} with {answer:?}"
     );
-}
-
-/// The `Namespace|MetricName|MetricType` of every metric reference in `references`, as a
-/// set, so an assertion names the metrics rather than their order.
-fn metric_set(references: &Value) -> BTreeSet<String> {
-    references
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .map(|reference| {
-                    format!(
-                        "{}|{}|{}",
-                        reference["Namespace"].as_str().unwrap_or_default(),
-                        reference["MetricName"].as_str().unwrap_or_default(),
-                        reference["MetricType"].as_str().unwrap_or_default(),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// A query-bound timestamp binds in EITHER documented form — the epoch-seconds number the
@@ -504,10 +487,12 @@ async fn topology_reads_report_what_the_stored_slos_monitor() {
         "case \"GetService checkout\": expected the entity's key attributes, got {:?}",
         service["Service"]
     );
+    // The entity IS discovered — a stored SLO monitors it — so it carries the standard
+    // metrics Application Signals collects for it.
     assert_eq!(
         metric_set(&service["Service"]["MetricReferences"]),
-        BTreeSet::new(),
-        "case \"GetService checkout\": expected no metric reference, got {:?}",
+        standard_metrics(),
+        "case \"GetService checkout\": expected the standard metric references, got {:?}",
         service["Service"]["MetricReferences"]
     );
 
@@ -582,15 +567,31 @@ async fn topology_reads_report_what_the_stored_slos_monitor() {
         status, 200,
         "case \"ListServiceOperations checkout\": expected HTTP 200, got {status} with {operations:?}"
     );
+    let reported_operations = operations["ServiceOperations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert_eq!(
-        operations["ServiceOperations"],
-        json!([
-            { "Name": "GET /cart", "MetricReferences": [] },
-            { "Name": "POST /checkout", "MetricReferences": [] },
-        ]),
+        reported_operations
+            .iter()
+            .map(|operation| operation["Name"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["GET /cart", "POST /checkout"],
         "case \"ListServiceOperations checkout\": expected both monitored operations once each, in name order, got {:?}",
         operations["ServiceOperations"]
     );
+    for operation in &reported_operations {
+        let case = format!(
+            "ListServiceOperations checkout, {}",
+            operation["Name"].as_str().unwrap_or_default()
+        );
+        assert_eq!(
+            metric_set(&operation["MetricReferences"]),
+            standard_metrics(),
+            "case {case:?}: expected the standard metric references, got {:?}",
+            operation["MetricReferences"]
+        );
+    }
 
     // Another entity's operations are its own: the `orders` SLO names none.
     let (_, orders_operations) = call(
@@ -619,16 +620,35 @@ async fn topology_reads_report_what_the_stored_slos_monitor() {
         status, 200,
         "case \"ListServiceDependencies checkout\": expected HTTP 200, got {status} with {dependencies:?}"
     );
+    let reported_edges = dependencies["ServiceDependencies"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert_eq!(
-        dependencies["ServiceDependencies"],
-        json!([{
+        reported_edges.len(),
+        1,
+        "case \"ListServiceDependencies checkout\": expected the one stored edge, got {:?}",
+        dependencies["ServiceDependencies"]
+    );
+    let reported_edge = &reported_edges[0];
+    assert_eq!(
+        json!({
+            "OperationName": reported_edge["OperationName"],
+            "DependencyKeyAttributes": reported_edge["DependencyKeyAttributes"],
+            "DependencyOperationName": reported_edge["DependencyOperationName"],
+        }),
+        json!({
             "OperationName": "POST /checkout",
             "DependencyKeyAttributes": service_entity("payments"),
             "DependencyOperationName": "Charge",
-            "MetricReferences": []
-        }]),
-        "case \"ListServiceDependencies checkout\": expected the one stored edge, got {:?}",
-        dependencies["ServiceDependencies"]
+        }),
+        "case \"ListServiceDependencies checkout\": expected the one stored edge, got {reported_edge:?}"
+    );
+    assert_eq!(
+        metric_set(&reported_edge["MetricReferences"]),
+        standard_metrics(),
+        "case \"ListServiceDependencies checkout\": expected the standard metric references, got {:?}",
+        reported_edge["MetricReferences"]
     );
 
     // The SAME edge, from the called service's end.
@@ -660,6 +680,12 @@ async fn topology_reads_report_what_the_stored_slos_monitor() {
         Some("POST /checkout"),
         "case \"ListServiceDependents payments\": expected the invoking operation, got {:?}",
         dependents["ServiceDependents"][0]
+    );
+    assert_eq!(
+        metric_set(&dependents["ServiceDependents"][0]["MetricReferences"]),
+        standard_metrics(),
+        "case \"ListServiceDependents payments\": expected the standard metric references, got {:?}",
+        dependents["ServiceDependents"][0]["MetricReferences"]
     );
     // The service the edge points at has no dependency of its own.
     let (_, none) = call(

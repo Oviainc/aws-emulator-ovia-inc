@@ -18,17 +18,24 @@
 //! nothing rather than inventing an insight. An `InsightId` the map does not hold
 //! names no insight, which is what `DescribeInsight` refuses with
 //! `ResourceNotFoundException`.
+//!
+//! The ANOMALIES those insights are derived from have the same provenance, and live
+//! in [`ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::anomalies`], which
+//! `DescribeAnomaly` reads under the same rule: an `AnomalyId` the map does not hold
+//! names no anomaly and is refused with `ResourceNotFoundException`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AccountInsightHealth, CloudFormationCollection, CloudFormationHealth, InsightHealth,
-    InsightTimeRange, ListInsightsStatusFilter, MonitoredResourceIdentifier, PredictionTimeRange,
-    ProactiveInsight, ProactiveInsightSummary, ProactiveOrganizationInsightSummary, ReactiveInsight,
-    ReactiveInsightSummary, ReactiveOrganizationInsightSummary, ResourceCollection,
-    ServiceCollection, ServiceHealth, ServiceInsightHealth, TagCollection, TagHealth,
-    ValidationException, ValidationExceptionField, INSIGHT_TYPE_VALUES,
+    AccountInsightHealth, AnomalyReportedTimeRange, AnomalyResource, AnomalySourceDetails,
+    AnomalySourceMetadata, AnomalyTimeRange, CloudFormationCollection, CloudFormationHealth,
+    InsightHealth, InsightTimeRange, ListInsightsStatusFilter, MonitoredResourceIdentifier,
+    PredictionTimeRange, ProactiveAnomaly, ProactiveInsight, ProactiveInsightSummary,
+    ProactiveOrganizationInsightSummary, ReactiveAnomaly, ReactiveInsight, ReactiveInsightSummary,
+    ReactiveOrganizationInsightSummary, ResourceCollection, ServiceCollection, ServiceHealth,
+    ServiceInsightHealth, TagCollection, TagHealth, ValidationException, ValidationExceptionField,
+    INSIGHT_TYPE_VALUES,
 };
 
 /// Per-service state for com-amazonaws-devopsguru-capstonecontrolplaneservice. A handler reaches it through [`service_state`].
@@ -69,6 +76,21 @@ pub struct ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
     /// writes and what the insight reads walk. A `BTreeMap` because the reads page over
     /// it: the key order is stable, which is what a page cursor needs.
     pub insights: BTreeMap<String, InsightRecord>,
+    /// The anomalies DevOps Guru's analysis detected in the covered resources, keyed
+    /// by `AnomalyId`.
+    ///
+    /// The same provenance as [`Self::insights`]: an anomaly is "anomalous behavior
+    /// DevOps Guru detected", so no modelled operation mints one and this map is what
+    /// that analysis writes and the anomaly reads (`DescribeAnomaly`, and the listings
+    /// that walk the anomalies of an insight) report. It stays empty on an emulator
+    /// over which no analysis has run, so an `AnomalyId` a caller asks for names no
+    /// anomaly rather than resolving to an invented one. A `BTreeMap` for the same
+    /// reason as the insights map: a stable key order is what a page cursor needs.
+    ///
+    /// An anomaly records the insight it belongs to in
+    /// [`AnomalyRecord::associated_insight_id`], which is the link `DeleteInsight`
+    /// follows when it deletes "the insight along with the associated anomalies".
+    pub anomalies: BTreeMap<String, AnomalyRecord>,
     /// The account that administers DevOps Guru for the organization this store
     /// records, if any.
     ///
@@ -192,6 +214,23 @@ impl ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
     /// number of open proactive insights in your Amazon Web Services account".
     pub fn account_insight_tally(&self) -> InsightTally {
         InsightTally::over(self.insights.values(), |_| true)
+    }
+
+    /// Remove the insight `insight_id` names together with the anomalies that belong
+    /// to it, answering the record removed, or `None` when the store held no insight
+    /// under that id and nothing was removed.
+    ///
+    /// The cascade `DeleteInsight` documents — "Deletes the insight along with the
+    /// associated anomalies, events and recommendations" — so an anomaly whose
+    /// [`AnomalyRecord::associated_insight_id`] names the deleted insight goes with
+    /// it and `DescribeAnomaly` then refuses it as not found. Anomalies associated
+    /// with no insight, and those associated with another one, are untouched.
+    pub fn remove_insight(&mut self, insight_id: &str) -> Option<InsightRecord> {
+        let removed = self.insights.remove(insight_id)?;
+        self.anomalies.retain(|_, anomaly| {
+            anomaly.associated_insight_id.as_deref() != Some(insight_id)
+        });
+        Some(removed)
     }
 }
 
@@ -531,25 +570,7 @@ impl InsightRecord {
     fn wire_resource_collection(&self) -> Option<ResourceCollection> {
         self.resource_collection
             .as_ref()
-            .map(|coverage| ResourceCollection {
-                cloud_formation: (!coverage.cloudformation_stack_names.is_empty()).then(|| {
-                    CloudFormationCollection {
-                        stack_names: Some(
-                            coverage.cloudformation_stack_names.iter().cloned().collect(),
-                        ),
-                    }
-                }),
-                tags: (!coverage.tag_collections.is_empty()).then(|| {
-                    coverage
-                        .tag_collections
-                        .iter()
-                        .map(|(app_boundary_key, tag_values)| TagCollection {
-                            app_boundary_key: app_boundary_key.clone(),
-                            tag_values: tag_values.iter().cloned().collect(),
-                        })
-                        .collect()
-                }),
-            })
+            .map(ResourceCoverage::wire_collection)
     }
 
     fn wire_service_collection(&self) -> Option<ServiceCollection> {
@@ -561,6 +582,174 @@ impl InsightRecord {
     fn wire_associated_resource_arns(&self) -> Option<Vec<String>> {
         (!self.associated_resource_arns.is_empty())
             .then(|| self.associated_resource_arns.clone())
+    }
+}
+
+/// One anomaly, as the anomaly reads report it.
+///
+/// Holds every member the DETAIL shapes `ProactiveAnomaly` and `ReactiveAnomaly`
+/// carry between them — the two shapes share most of them, each adds its own — and
+/// [`AnomalyRecord::proactive`] is what decides which of the two a read renders.
+#[derive(Debug, Clone, Default)]
+pub struct AnomalyRecord {
+    /// `AnomalyId` — the map key, repeated here so a record is self-contained.
+    pub id: String,
+    /// Whether this anomaly is reported as a PROACTIVE one (`ProactiveAnomaly`) or a
+    /// REACTIVE one (`ReactiveAnomaly`).
+    ///
+    /// A record rather than a modelled member: the two response members of
+    /// `DescribeAnomaly` are the two kinds of anomaly, and which one an anomaly is is
+    /// decided by DevOps Guru's analysis — nothing on the wire carries it, exactly as
+    /// `InsightRecord::insight_type` decides between the two insight shapes.
+    pub proactive: bool,
+    /// `AnomalySeverity` — see `ANOMALY_SEVERITY_VALUES` in
+    /// `ops/types/shared_types.rs`.
+    pub severity: String,
+    /// `AnomalyStatus`: `ONGOING` while the behaviour continues, `CLOSED` once it
+    /// ended — see `ANOMALY_STATUS_VALUES`.
+    pub status: String,
+    /// `AnomalyTimeRange.StartTime`, in milliseconds since the epoch: when the
+    /// anomalous behaviour started. Required by the modelled shape, so every record
+    /// carries one.
+    pub start_time_millis: i64,
+    /// `AnomalyTimeRange.EndTime`, in milliseconds since the epoch: when the
+    /// anomalous behaviour ended, which only a `CLOSED` anomaly has.
+    pub end_time_millis: Option<i64>,
+    /// `AnomalyReportedTimeRange.OpenTime`, in milliseconds since the epoch: when
+    /// DevOps Guru opened the anomaly. Required by the modelled shape.
+    pub open_time_millis: i64,
+    /// `AnomalyReportedTimeRange.CloseTime`, in milliseconds since the epoch: when
+    /// DevOps Guru closed it, which only a closed anomaly has.
+    pub close_time_millis: Option<i64>,
+    /// `ProactiveAnomaly.UpdateTime`, in milliseconds since the epoch: when the
+    /// anomaly was last updated. `ReactiveAnomaly` models no such member, so a
+    /// reactive record leaves it absent.
+    pub update_time_millis: Option<i64>,
+    /// `ProactiveAnomaly.PredictionTimeRange.StartTime`, in milliseconds since the
+    /// epoch — the window in which the predicted problem is expected. Only a
+    /// proactive anomaly predicts one; `ReactiveAnomaly` models no such member.
+    pub prediction_start_time_millis: Option<i64>,
+    /// `ProactiveAnomaly.PredictionTimeRange.EndTime`, in milliseconds since the epoch.
+    pub prediction_end_time_millis: Option<i64>,
+    /// `ProactiveAnomaly.Limit` — the metric threshold the anomalous behaviour
+    /// crossed. `ReactiveAnomaly` models no such member.
+    pub limit: Option<f64>,
+    /// `AssociatedInsightId` — the insight this anomaly belongs to, absent while the
+    /// analysis has associated it with none. The link `DeleteInsight`'s documented
+    /// cascade follows; see
+    /// [`ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::remove_insight`].
+    pub associated_insight_id: Option<String>,
+    /// `ResourceCollection` — the resources this anomaly is about, in the same
+    /// stack-name / tag-collection shape as the account's coverage and an insight's
+    /// own collection, so it reuses [`ResourceCoverage`]; absent when the anomaly
+    /// names no resources.
+    pub resource_collection: Option<ResourceCoverage>,
+    /// `SourceDetails` — the metrics whose behaviour was anomalous, as the analysis
+    /// attached them. Kept as the modelled shape: it is evidence from DevOps Guru's
+    /// own metric sources, with no store-level identity or instant of its own for a
+    /// record form to normalise.
+    pub source_details: Option<AnomalySourceDetails>,
+    /// `SourceMetadata` — which source raised the anomaly, and over which resource.
+    /// `ReactiveAnomaly` models no such member, so a reactive record leaves it absent.
+    pub source_metadata: Option<AnomalySourceMetadata>,
+    /// `AnomalyResources` — the resources the anomaly's metrics belong to, empty when
+    /// it names none.
+    pub anomaly_resources: Vec<AnomalyResource>,
+    /// `ReactiveAnomaly.Type` (`AnomalyType`: `CAUSAL` or `CONTEXTUAL` — see
+    /// `ANOMALY_TYPE_VALUES`). `ProactiveAnomaly` models no such member, so a
+    /// proactive record leaves it absent.
+    pub anomaly_type: Option<String>,
+    /// `ReactiveAnomaly.Name` — the name of the anomaly. `ProactiveAnomaly` models no
+    /// such member.
+    pub name: Option<String>,
+    /// `ReactiveAnomaly.CausalAnomalyId` — the `CAUSAL` anomaly this one is a
+    /// consequence of. `ProactiveAnomaly` models no such member.
+    pub causal_anomaly_id: Option<String>,
+    /// `Description` — what the anomaly says, carried by both detail shapes.
+    pub description: Option<String>,
+}
+
+impl AnomalyRecord {
+    /// Whether this record is reported as a PROACTIVE anomaly — the response member a
+    /// detail read renders it on.
+    pub fn is_proactive(&self) -> bool {
+        self.proactive
+    }
+
+    /// This record as the modelled `ProactiveAnomaly`, the shape `DescribeAnomaly`
+    /// reports a proactive anomaly on. The members `ProactiveAnomaly` does not model
+    /// (`Type`, `Name`, `CausalAnomalyId`) are not rendered.
+    pub fn to_proactive_anomaly(&self) -> ProactiveAnomaly {
+        ProactiveAnomaly {
+            id: Some(self.id.clone()),
+            severity: Some(self.severity.clone()),
+            status: Some(self.status.clone()),
+            update_time: self.update_time_millis.map(timestamp),
+            anomaly_time_range: Some(self.anomaly_time_range()),
+            anomaly_reported_time_range: Some(self.anomaly_reported_time_range()),
+            prediction_time_range: self.prediction_time_range(),
+            source_details: self.source_details.clone(),
+            associated_insight_id: self.associated_insight_id.clone(),
+            resource_collection: self.wire_resource_collection(),
+            limit: self.limit,
+            source_metadata: self.source_metadata.clone(),
+            anomaly_resources: self.wire_anomaly_resources(),
+            description: self.description.clone(),
+        }
+    }
+
+    /// This record as the modelled `ReactiveAnomaly`, which models neither the
+    /// `UpdateTime`, the `PredictionTimeRange`, the `Limit` nor the `SourceMetadata` a
+    /// proactive anomaly carries, and adds its own `Type`, `Name` and
+    /// `CausalAnomalyId`.
+    pub fn to_reactive_anomaly(&self) -> ReactiveAnomaly {
+        ReactiveAnomaly {
+            id: Some(self.id.clone()),
+            severity: Some(self.severity.clone()),
+            status: Some(self.status.clone()),
+            anomaly_time_range: Some(self.anomaly_time_range()),
+            anomaly_reported_time_range: Some(self.anomaly_reported_time_range()),
+            source_details: self.source_details.clone(),
+            associated_insight_id: self.associated_insight_id.clone(),
+            resource_collection: self.wire_resource_collection(),
+            r#type: self.anomaly_type.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            causal_anomaly_id: self.causal_anomaly_id.clone(),
+            anomaly_resources: self.wire_anomaly_resources(),
+        }
+    }
+
+    fn anomaly_time_range(&self) -> AnomalyTimeRange {
+        AnomalyTimeRange {
+            start_time: timestamp(self.start_time_millis),
+            end_time: self.end_time_millis.map(timestamp),
+        }
+    }
+
+    fn anomaly_reported_time_range(&self) -> AnomalyReportedTimeRange {
+        AnomalyReportedTimeRange {
+            open_time: timestamp(self.open_time_millis),
+            close_time: self.close_time_millis.map(timestamp),
+        }
+    }
+
+    fn prediction_time_range(&self) -> Option<PredictionTimeRange> {
+        self.prediction_start_time_millis
+            .map(|start| PredictionTimeRange {
+                start_time: timestamp(start),
+                end_time: self.prediction_end_time_millis.map(timestamp),
+            })
+    }
+
+    fn wire_resource_collection(&self) -> Option<ResourceCollection> {
+        self.resource_collection
+            .as_ref()
+            .map(ResourceCoverage::wire_collection)
+    }
+
+    fn wire_anomaly_resources(&self) -> Option<Vec<AnomalyResource>> {
+        (!self.anomaly_resources.is_empty()).then(|| self.anomaly_resources.clone())
     }
 }
 
@@ -1045,6 +1234,32 @@ pub struct ResourceCoverage {
 pub const APP_BOUNDARY_KEYS_PER_ACCOUNT: usize = 1;
 
 impl ResourceCoverage {
+    /// This coverage as the modelled `ResourceCollection`.
+    ///
+    /// The one rendering of a stored coverage, used both for the account's own
+    /// coverage and for the collection an insight or an anomaly is ABOUT — the same
+    /// shape in all three places — so two reads of one store cannot disagree about
+    /// which resources a collection names. Each half is omitted while it holds
+    /// nothing: an empty set names no resource, and the modelled members are optional.
+    pub fn wire_collection(&self) -> ResourceCollection {
+        ResourceCollection {
+            cloud_formation: (!self.cloudformation_stack_names.is_empty()).then(|| {
+                CloudFormationCollection {
+                    stack_names: Some(self.cloudformation_stack_names.iter().cloned().collect()),
+                }
+            }),
+            tags: (!self.tag_collections.is_empty()).then(|| {
+                self.tag_collections
+                    .iter()
+                    .map(|(app_boundary_key, tag_values)| TagCollection {
+                        app_boundary_key: app_boundary_key.clone(),
+                        tag_values: tag_values.iter().cloned().collect(),
+                    })
+                    .collect()
+            }),
+        }
+    }
+
     /// How many resources this coverage puts under DevOps Guru analysis.
     ///
     /// The analysed population is the coverage itself: there is no real CloudFormation
@@ -1431,6 +1646,11 @@ pub const VALIDATION_REASON_INVALID_PARAMETER_COMBINATION: &str =
 /// unconstrained string, so this value is what says which kind that is.
 pub const INSIGHT_RESOURCE_TYPE: &str = "INSIGHT";
 
+/// The `ResourceType` an anomaly-shaped `ResourceNotFoundException` reports — the
+/// kind of resource the refused `ResourceId` would have named, for the reason
+/// [`INSIGHT_RESOURCE_TYPE`] gives.
+pub const ANOMALY_RESOURCE_TYPE: &str = "ANOMALY";
+
 /// Before any `UpdateServiceIntegration`, every integration is opted out: a
 /// client that never enabled OpsCenter, log anomaly detection or customer-managed
 /// encryption has none of them.
@@ -1495,7 +1715,9 @@ pub const PAGE_SIZE: usize = 100;
 //
 // `insights` carries no cap because no request can grow it: insights come from DevOps
 // Guru's analysis, which this emulator does not run, so nothing a caller sends adds an
-// entry. An operation that ever mints one brings its own bound.
+// entry. `anomalies` is the same: an anomaly is detected by that analysis too, and no
+// modelled operation mints one. An operation that ever mints either brings its own
+// bound.
 // ---------------------------------------------------------------------------
 
 /// DevOps Guru's own documented ceiling, from `UpdateResourceCollection`'s and

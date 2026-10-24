@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteStage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteStage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteStage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored `Stage` of `restApiId` named by `stageName`, so every
+//! later read of it answers the modelled `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +164,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteStage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteStageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+
+        // Both identifiers are resolved against stored state before anything is removed,
+        // each naming its own record so the refusal says which one was not found — the
+        // same order `GetStage` resolves them in.
+        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+            DeleteStageErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+            })
+        })?;
+        // A stage name names one stage of one API, so removing that key removes the
+        // record — and only it. The deployment the stage pointed at is a record of the
+        // API in its own right: a deployment outlives the stages that serve it, which is
+        // what lets another stage keep serving it and a later `CreateStage` point a new
+        // stage at it, so it stays.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteStage"))
+        // The records of OTHER resources that merely NAME a stage — an `ApiKey`'s
+        // `stageKeys`, a `UsagePlan`'s `apiStages` — are their own operations' to write:
+        // `DeleteStage` models no error for them and the model states no rule for
+        // rewriting them, so this call leaves them exactly as `DeleteRestApi` does, and
+        // dropping an association is `UpdateApiKey`'s / `UpdateUsagePlan`'s job.
+        if api.stages.remove(&input.stage_name).is_none() {
+            return Err(DeleteStageErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_STAGE.to_string()),
+            })
+            .into());
+        }
+        // The store lock is released before the record is formatted: the critical section
+        // covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome —
+        // the one record `crate::state::AUDIT_TARGET` documents, as the sibling
+        // `DeleteApiKey` handler emits it. Metadata only; a stage's variables and tags
+        // are the caller's data and are never fields.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            rest_api_id = ?input.rest_api_id,
+            stage_name = ?input.stage_name,
+            outcome = "deleted",
+            "stage deleted",
+        );
+        Ok(DeleteStageOutput)
     }
 }
