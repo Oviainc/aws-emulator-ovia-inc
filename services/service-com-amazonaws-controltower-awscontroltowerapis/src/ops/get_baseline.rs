@@ -12,9 +12,10 @@
 //! A baseline's identity is the 16-character resource id its ARN ends in; the partition,
 //! region and account segments before it select nothing, because the catalog is published
 //! in all of them. The ARN reported back is the one THIS endpoint serves that baseline
-//! under — the request's region and the emulator's canonical account id — so it is built
-//! through [`crate::state::baseline_arn`] rather than echoed from the request. An id the
-//! catalog does not hold is `ResourceNotFoundException` (404).
+//! under — the request's region, and NO account, because a baseline is AWS-managed
+//! catalog data no account owns (see [`crate::state::baseline_arn`]) — so it is built
+//! rather than echoed from the request. An id the catalog does not hold is
+//! `ResourceNotFoundException` (404).
 //!
 //! AUTHORIZATION and THROTTLING are NOT emulated here, so the modelled
 //! `AccessDeniedException` (403) and `ThrottlingException` (429) are deliberately
@@ -186,8 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetBaselineOutput {
-            // The ARN this endpoint serves the baseline under, in the request's region:
-            // the identifier's own partition, region and account segments are not the
+            // The ARN this endpoint serves the baseline under, in the request's region
+            // and with the empty account segment a service-managed baseline carries: the
+            // identifier's own partition, region and account segments are not the
             // resource's identity, so the answer is built rather than echoed.
             arn: crate::state::baseline_arn(
                 &crate::state::request_region(ctx.parts()),
