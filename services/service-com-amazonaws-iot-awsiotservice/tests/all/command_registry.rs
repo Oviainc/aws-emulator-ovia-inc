@@ -1,38 +1,42 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP coverage of the AWS IoT COMMAND store: `CreateCommand` and the
-//! `GetCommand` reader that proves what it persisted.
+//! End-to-end HTTP coverage of the AWS IoT COMMAND store: `CreateCommand`,
+//! `UpdateCommand` and the `GetCommand` reader that proves what they persisted.
 //!
 //! Every case drives the real wire path — `MultiServiceRouter::dispatch` over a
 //! restJson1 request signed for the `iot` signing name — so what is asserted is what
 //! an AWS SDK client would see, not an internal function's return value.
 //!
-//! The rule under test: `CreateCommand` RECORDS a command under its `commandId`,
+//! The rules under test: `CreateCommand` RECORDS a command under its `commandId`,
 //! mints its ARN (`arn:aws:iot:<region>:<account>:command/<commandId>`) and registers
 //! that ARN in the shared index the IoT Jobs data plane resolves a `commandArn`
-//! against; a later `GetCommand` of that id reports the stored record
-//! member-for-member, with the lifecycle flags a created command has
-//! (`deprecated: false`, `pendingDeletion: false`) and timestamps that are real clock
-//! readings stable across reads. A second create under an id the store already holds
-//! is refused `ConflictException` (409) and changes nothing; an id the store does not
-//! hold is refused `ResourceNotFoundException` (404). `roleArn` belongs to the
-//! `AWS-IoT-FleetWise` namespace alone, so the pairing table below is refused
-//! `ValidationException` (400) exactly where the member's documentation says the
-//! field does not apply.
+//! against, together with the facts that plane decides on — whether the command's
+//! payload is STATIC, and whether it is deprecated; a later `GetCommand` of that id
+//! reports the stored record member-for-member, with the lifecycle flags a created
+//! command has (`deprecated: false`, `pendingDeletion: false`) and timestamps that are
+//! real clock readings stable across reads. `UpdateCommand` writes the members its
+//! request names and leaves every other one as it was, and a deprecation it makes is
+//! recorded in the shared index too, because that is what the other plane reads. A
+//! second create under an id the store already holds is refused `ConflictException`
+//! (409) and changes nothing; an id the store does not hold is refused
+//! `ResourceNotFoundException` (404). `roleArn` belongs to the `AWS-IoT-FleetWise`
+//! namespace alone, so the pairing table below is refused `ValidationException` (400)
+//! exactly where the member's documentation says the field does not apply.
 //!
-//! The table spans what that rule generalises over — the form and length of a command
+//! The tables span what those rules generalise over — the form and length of a command
 //! id, which namespace the command is created in, whether it carries a static payload
 //! or a template plus preprocessor, how many mandatory parameters it carries and of
 //! which parameter types and value forms, which optional members it carries, whether
-//! it carries tags, and the region the call is signed for — rather than one recorded
-//! request.
+//! it carries tags, the region the call is signed for, and which members one update
+//! names — rather than one recorded request.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iot_awsiotservice::state::{
-    command_registry, iot_commands::MAX_REGISTERED_COMMANDS,
+    command_registry,
+    iot_commands::{CommandFacts, MAX_REGISTERED_COMMANDS},
 };
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -146,6 +150,26 @@ impl Emulator {
             .await
     }
 
+    async fn update_command(&self, command_id: &str, body: &Value) -> Reply {
+        self.call(
+            "PATCH",
+            &format!("/commands/{command_id}"),
+            Some(body),
+            REGION,
+        )
+        .await
+    }
+
+    /// The facts the SHARED command index holds for `command_arn` — everything the IoT
+    /// Jobs data plane can know about a command, and therefore everything it decides a
+    /// `StartCommandExecution` on.
+    fn index_facts(&self, command_arn: &str) -> Option<CommandFacts> {
+        command_registry(&*self.engine)
+            .expect("the shared IoT command index")
+            .lock()
+            .facts(command_arn)
+    }
+
     /// Whether the SHARED command index holds `command_arn` — the question
     /// `StartCommandExecution` asks before it enqueues anything.
     fn index_holds(&self, command_arn: &str) -> bool {
@@ -165,7 +189,7 @@ impl Emulator {
                 .register(&expected_arn(
                     REGION,
                     &format!("prefilled-command-{ordinal}"),
-                ))
+                ), CommandFacts::default())
                 .unwrap_or_else(|refusal| panic!("prefilling command {ordinal}: {refusal}"));
         }
     }
@@ -743,4 +767,282 @@ async fn the_command_store_is_bounded() {
         read.status, 200,
         "the recorded command must still be readable, got {read:?}"
     );
+}
+
+/// RULE: the shared index records the facts about a command that a reader OUTSIDE this
+/// service decides on, and `CreateCommand` is what decides them. A command's payload is
+/// STATIC when the create supplies the literal `payload` ("the payload object for the
+/// static command") and nothing that asks for substitution — no `payloadTemplate` ("the
+/// payload template for the dynamic command [...] where the command execution
+/// placeholders are supplied either from mandatoryParameters or when
+/// StartCommandExecution is invoked") and no `mandatoryParameters`. A created command is
+/// never deprecated.
+///
+/// The rows span every combination of the members that decide it, so the recorded fact
+/// follows the rule rather than the presence of one member.
+#[tokio::test]
+async fn the_index_records_the_payload_kind_the_create_decided() {
+    let emulator = Emulator::new();
+
+    // (case, commandId, create body, whether the payload is static)
+    let rows: [(&str, &str, Value, bool); 6] = [
+        (
+            "a literal payload and nothing else",
+            "facts-static",
+            json!({ "payload": { "content": "eyJyZWJvb3QiOiB0cnVlfQ==", "contentType": "application/json" } }),
+            true,
+        ),
+        (
+            "a literal binary payload",
+            "facts-static-binary",
+            json!({ "payload": { "content": "AAEC", "contentType": "application/octet-stream" } }),
+            true,
+        ),
+        (
+            "a payload template, which has placeholders a start fills",
+            "facts-templated",
+            json!({ "payloadTemplate": "{\"target\":\"${target}\"}" }),
+            false,
+        ),
+        (
+            "a literal payload AND a template",
+            "facts-both",
+            json!({
+                "payload": { "content": "AAEC", "contentType": "application/octet-stream" },
+                "payloadTemplate": "{\"target\":\"${target}\"}",
+            }),
+            false,
+        ),
+        (
+            "a literal payload and mandatory parameters a start supplies",
+            "facts-static-with-parameters",
+            json!({
+                "payload": { "content": "AAEC", "contentType": "application/octet-stream" },
+                "mandatoryParameters": [{ "name": "target", "defaultValue": { "S": "all" } }],
+            }),
+            false,
+        ),
+        (
+            "neither a payload nor a template",
+            "facts-neither",
+            json!({}),
+            false,
+        ),
+    ];
+
+    for (case, command_id, body, static_payload) in rows {
+        let created = emulator.create_command(command_id, &body).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: the create must answer 200, got {created:?}"
+        );
+        let command_arn = created
+            .text("commandArn")
+            .unwrap_or_else(|| panic!("case {case:?}: expected a commandArn, got {created:?}"));
+
+        let actual = emulator.index_facts(&command_arn);
+        let expected = CommandFacts {
+            static_payload,
+            deprecated: false,
+        };
+        assert_eq!(
+            actual,
+            Some(expected),
+            "case {case:?}: expected the index to record {expected:?}, got {actual:?}"
+        );
+
+        // Round trip: the record the reader reports carries the very members the facts
+        // were read off, so the two cannot disagree about which kind of command it is.
+        let read = emulator.get_command(command_id).await;
+        assert_eq!(
+            (read.status, read.member("payload"), read.member("payloadTemplate")),
+            (200, body.get("payload"), body.get("payloadTemplate")),
+            "case {case:?}: the stored command must carry the payload the create named, got \
+             {read:?}"
+        );
+    }
+}
+
+/// RULE: `UpdateCommand` writes the members its request NAMES — "update information
+/// about a command or mark a command for deprecation" — and leaves every other one as it
+/// was, so one call changes exactly what it names; it answers the record it just stored,
+/// which is what the next `GetCommand` reads. Because a deprecation decides whether
+/// another plane may start new executions of the command, it is recorded in the shared
+/// index as well. A `commandId` no command exists under is 404
+/// `ResourceNotFoundException`.
+///
+/// The rows span which members one update names (each alone, several together, none at
+/// all), the values they are set to (including the empty string both members' patterns
+/// admit), and both directions of the deprecation flag.
+#[tokio::test]
+async fn an_update_writes_the_members_it_names_and_leaves_the_rest() {
+    let emulator = Emulator::new();
+
+    const COMMAND_ID: &str = "updatable-reboot";
+    let created = emulator
+        .create_command(
+            COMMAND_ID,
+            &json!({
+                "displayName": "Reboot the laser",
+                "description": "Power-cycles the controller",
+                "payload": { "content": "eyJyZWJvb3QiOiB0cnVlfQ==", "contentType": "application/json" },
+            }),
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "creating the command to update must answer 200, got {created:?}"
+    );
+    let command_arn = created
+        .text("commandArn")
+        .unwrap_or_else(|| panic!("expected a commandArn, got {created:?}"));
+    let created_at = emulator
+        .get_command(COMMAND_ID)
+        .await
+        .instant("createdAt")
+        .unwrap_or_else(|| panic!("expected a createdAt on the created command"));
+
+    // (case, update body, expected displayName, description, deprecated afterwards)
+    let rows: [(&str, Value, &str, &str, bool); 6] = [
+        (
+            "deprecating it alone",
+            json!({ "deprecated": true }),
+            "Reboot the laser",
+            "Power-cycles the controller",
+            true,
+        ),
+        (
+            "a new display name, which leaves the deprecation as it was",
+            json!({ "displayName": "Reboot the laser (legacy)" }),
+            "Reboot the laser (legacy)",
+            "Power-cycles the controller",
+            true,
+        ),
+        (
+            "an empty description and an undeprecation together",
+            json!({ "description": "", "deprecated": false }),
+            "Reboot the laser (legacy)",
+            "",
+            false,
+        ),
+        (
+            "an update that names nothing changes nothing",
+            json!({}),
+            "Reboot the laser (legacy)",
+            "",
+            false,
+        ),
+        (
+            "every member at once",
+            json!({
+                "displayName": "Reboot",
+                "description": "Power-cycles the controller board",
+                "deprecated": true,
+            }),
+            "Reboot",
+            "Power-cycles the controller board",
+            true,
+        ),
+        (
+            "undeprecating it again",
+            json!({ "deprecated": false }),
+            "Reboot",
+            "Power-cycles the controller board",
+            false,
+        ),
+    ];
+
+    let mut last_updated = created_at;
+    for (case, body, display_name, description, deprecated) in rows {
+        let updated = emulator.update_command(COMMAND_ID, &body).await;
+        assert_eq!(
+            (updated.status, updated.error_code.as_deref()),
+            (200, None),
+            "case {case:?}: the update must answer 200, got {updated:?}"
+        );
+        assert_eq!(
+            (
+                updated.text("commandId").as_deref(),
+                updated.text("displayName").as_deref(),
+                updated.text("description").as_deref(),
+                updated.member("deprecated").and_then(Value::as_bool),
+            ),
+            (
+                Some(COMMAND_ID),
+                Some(display_name),
+                Some(description),
+                Some(deprecated),
+            ),
+            "case {case:?}: the update must answer the command it stored, got {updated:?}"
+        );
+
+        // What the update answered is what the reader reports: one value, not two.
+        let read = emulator.get_command(COMMAND_ID).await;
+        assert_eq!(
+            (
+                read.status,
+                read.text("displayName").as_deref(),
+                read.text("description").as_deref(),
+                read.member("deprecated").and_then(Value::as_bool),
+                // Nothing the update did not name moved.
+                read.member("payload").cloned(),
+                read.instant("createdAt"),
+            ),
+            (
+                200,
+                Some(display_name),
+                Some(description),
+                Some(deprecated),
+                Some(json!({
+                    "content": "eyJyZWJvb3QiOiB0cnVlfQ==",
+                    "contentType": "application/json",
+                })),
+                Some(created_at),
+            ),
+            "case {case:?}: the stored command must be the updated one, got {read:?}"
+        );
+
+        // "The date and time when the command was last updated": the write advances it,
+        // never backwards and never before the create.
+        let instant = read
+            .instant("lastUpdatedAt")
+            .unwrap_or_else(|| panic!("case {case:?}: expected a lastUpdatedAt, got {read:?}"));
+        assert!(
+            instant >= last_updated && instant >= created_at,
+            "case {case:?}: lastUpdatedAt must not go backwards, got {instant} after \
+             {last_updated}"
+        );
+        last_updated = instant;
+
+        // The OTHER plane reads the deprecation out of the shared index, so the update
+        // has to have written it there too.
+        let facts = emulator.index_facts(&command_arn);
+        assert_eq!(
+            facts,
+            Some(CommandFacts {
+                static_payload: true,
+                deprecated,
+            }),
+            "case {case:?}: the shared index must carry the deprecation the update made, got \
+             {facts:?}"
+        );
+    }
+
+    // A command that does not exist is not created by an update of it.
+    for command_id in ["never-created", "updatable-rebootx"] {
+        let refused = emulator
+            .update_command(command_id, &json!({ "deprecated": true }))
+            .await;
+        assert_eq!(
+            (refused.status, refused.error_code.as_deref()),
+            (404, Some("ResourceNotFoundException")),
+            "case {command_id:?}: updating a command that does not exist must be refused 404, \
+             got {refused:?}"
+        );
+        let read = emulator.get_command(command_id).await;
+        assert_eq!(
+            read.status, 404,
+            "case {command_id:?}: the refused update must have created nothing, got {read:?}"
+        );
+    }
 }
