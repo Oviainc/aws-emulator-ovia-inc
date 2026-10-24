@@ -8,7 +8,7 @@
 //! of each instead of carrying a copy apiece that can drift apart.
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -89,6 +89,35 @@ pub const MAX_STORED_ADDRESSES: usize = 1_000;
 /// process without limit.
 pub const MAX_STORED_JOBS: usize = 1_000;
 
+/// How long the update file a `GetSoftwareUpdates` call answers with stays available.
+///
+/// `GetSoftwareUpdatesResult$UpdatesURI` publishes the window: "The software update will
+/// be available for 2 days after this request is made. To access an update after the 2
+/// days have passed, you'll have to make another call to GetSoftwareUpdates." So the
+/// grant one call issues expires two days after THAT call, and a caller past the window
+/// asks for another one.
+pub const SOFTWARE_UPDATE_AVAILABILITY: Duration = Duration::from_secs(2 * 24 * 60 * 60);
+
+/// The most software-update grants this store holds at once.
+///
+/// Each `GetSoftwareUpdates` call issues one grant, so without a ceiling a caller could
+/// grow the process by polling. A grant is a job id, a token and two instants — a couple
+/// of hundred bytes — so the ceiling bounds the grant store at a few megabytes. Expired
+/// grants are dropped first (see `issue_software_update_grant`); at the ceiling the
+/// oldest live grant goes, which is the one nearest its own expiry.
+pub const MAX_SOFTWARE_UPDATE_GRANTS: usize = 10_000;
+
+/// The Amazon S3 bucket this emulator publishes Snow device update files under.
+///
+/// `GetSoftwareUpdates` "Returns an Amazon S3 presigned URL for an update file associated
+/// with a specified JobId", so the URL it answers with addresses an S3 bucket; this is the
+/// bucket this emulator names.
+pub const SOFTWARE_UPDATE_BUCKET: &str = "snowball-software-updates";
+
+/// The object name a job's update file is published as, under the job's own key prefix in
+/// [`SOFTWARE_UPDATE_BUCKET`].
+pub const SOFTWARE_UPDATE_OBJECT: &str = "update.tar";
+
 /// The lifecycle states a job can be in: the whole `JobState` enum
 /// (`shared_types::JOB_STATE_VALUES`), so the cancellation rule below is expressed
 /// over the modelled set rather than over the two states this slice can reach.
@@ -147,6 +176,20 @@ impl JobState {
     /// `Cancelled`, which a cancelled job is in and from which no update is available.
     pub fn is_updatable(self) -> bool {
         matches!(self, Self::New)
+    }
+
+    /// Whether a job in this state has a device an update file can be fetched for.
+    ///
+    /// `GetSoftwareUpdates` answers a URL for "an update file associated with a specified
+    /// `JobId`" — the software the Snow device that job ordered is updated with. A
+    /// cancelled job is the one state in which no device is ever prepared for the job:
+    /// "You can only cancel a job before its `JobState` value changes to
+    /// `PreparingAppliance`" (`CancelJob`), so a job in `Cancelled` stopped short of
+    /// appliance preparation and no device of its own will ever be prepared, shipped or
+    /// updated. From every other state the order is still live and its device's update
+    /// file is available.
+    pub fn has_software_update(self) -> bool {
+        !matches!(self, Self::Cancelled)
     }
 }
 
@@ -311,6 +354,83 @@ impl StoredJob {
     }
 }
 
+/// One issued software-update grant: what a `GetSoftwareUpdates` call handed out.
+///
+/// A grant is the service's record of a URL it published — which job's update file the URL
+/// addresses, the token that distinguishes it from every other URL this store issued, and
+/// the window it was issued for. [`Self::updates_uri`] renders it as the `UpdatesURI` the
+/// operation reports, so the URL a caller receives is read out of this record rather than
+/// assembled twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoftwareUpdateGrant {
+    /// The job whose update file this grant covers.
+    pub job_id: String,
+    /// This grant's own token: what makes two URLs issued for one job distinct.
+    pub token: String,
+    /// When the call that issued this grant was served.
+    pub issued_at: SystemTime,
+    /// When the window closes: [`SOFTWARE_UPDATE_AVAILABILITY`] after [`Self::issued_at`].
+    pub expires_at: SystemTime,
+}
+
+impl SoftwareUpdateGrant {
+    /// Whether this grant is still inside its availability window at `now`.
+    pub fn is_active(&self, now: SystemTime) -> bool {
+        now < self.expires_at
+    }
+
+    /// This grant as the `UpdatesURI` `GetSoftwareUpdates` reports: the update file's
+    /// location in [`SOFTWARE_UPDATE_BUCKET`] under the job's own key prefix, carrying the
+    /// grant's token and the instant its window closes.
+    ///
+    /// NO SigV4 signature is attached, and no credential of this emulator's own appears in
+    /// it: a fabricated signature would claim a computation nothing performed, and the
+    /// emulator's own credentials must never travel in a response. The query carries what
+    /// this emulator really holds for the grant — the token it minted and the expiry it
+    /// recorded, as whole epoch seconds.
+    pub fn updates_uri(&self, region: &str) -> String {
+        // The Region label is honoured only when the signed scope carries one with an AWS
+        // Region's SHAPE: it is interpolated into a URL host, so an arbitrary header value
+        // must not be able to shape one. Without such a scope the URL names S3's global
+        // endpoint, which carries no Region at all.
+        let host = if is_region_shaped(region) {
+            format!("{SOFTWARE_UPDATE_BUCKET}.s3.{region}.amazonaws.com")
+        } else {
+            format!("{SOFTWARE_UPDATE_BUCKET}.s3.amazonaws.com")
+        };
+        format!(
+            "https://{host}/{job_id}/{SOFTWARE_UPDATE_OBJECT}\
+             ?updateToken={token}&Expires={expires}",
+            job_id = self.job_id,
+            token = self.token,
+            expires = epoch_seconds(self.expires_at),
+        )
+    }
+}
+
+/// `at` as whole seconds since the UNIX epoch — how a URL's `Expires` parameter spells an
+/// instant.
+fn epoch_seconds(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// True when `value` has an AWS Region's SHAPE: at least two lowercase alphabetic segments
+/// joined by `-`, ending in a digit group (`us-west-2`, `ap-southeast-3`).
+fn is_region_shaped(value: &str) -> bool {
+    let mut segments = value.split('-').rev();
+    let Some(number) = segments.next() else {
+        return false;
+    };
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let words: Vec<&str> = segments.collect();
+    words.len() >= 2
+        && words
+            .iter()
+            .all(|word| !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase()))
+}
+
 /// The region this request was signed for: the SigV4 credential scope is the only region
 /// a request carries.
 ///
@@ -331,15 +451,7 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// service's own, is distinct from every other id this process mints, and is not a count
 /// a caller can read a resource total out of.
 fn mint_id(prefix: &str, seq: u64, now: SystemTime) -> String {
-    let nanos = now
-        .duration_since(::std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let mut hasher = Sha256::new();
-    hasher.update(prefix.as_bytes());
-    hasher.update(seq.to_be_bytes());
-    hasher.update(nanos.to_be_bytes());
-    let digest = ::hex::encode(hasher.finalize());
+    let digest = mint_digest(prefix, seq, now);
     format!(
         "{prefix}{}-{}-{}-{}-{}",
         &digest[0..8],
@@ -348,6 +460,25 @@ fn mint_id(prefix: &str, seq: u64, now: SystemTime) -> String {
         &digest[16..20],
         &digest[20..32]
     )
+}
+
+/// Hex of a SHA-256 over `label`, the store's own monotonic sequence number and the
+/// instant the record is created: the opaque bytes [`mint_id`] cuts an id out of and
+/// [`mint_update_token`] uses whole.
+fn mint_digest(label: &str, seq: u64, now: SystemTime) -> String {
+    let nanos = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let mut hasher = Sha256::new();
+    hasher.update(label.as_bytes());
+    hasher.update(seq.to_be_bytes());
+    hasher.update(nanos.to_be_bytes());
+    ::hex::encode(hasher.finalize())
+}
+
+/// Mint a software-update grant's token: the full 64 hex digits of [`mint_digest`], so a
+/// token is the service's own, is distinct from every other token this process mints, and
+/// is not a count a caller can read a grant total out of.
+fn mint_update_token(seq: u64, now: SystemTime) -> String {
+    mint_digest("software-update", seq, now)
 }
 
 /// One supported version of a Snow on-device service, and what that version runs on.
@@ -459,10 +590,17 @@ pub struct ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     /// first touched: the supported versions of an on-device service are the service's
     /// own catalog, not something a caller creates.
     service_versions: BTreeMap<String, Vec<StoredServiceVersion>>,
+    /// Every software-update grant `GetSoftwareUpdates` has issued and that is still
+    /// inside its availability window, oldest first — this service's record of which
+    /// update URLs it published. Bounded by [`MAX_SOFTWARE_UPDATE_GRANTS`].
+    software_update_grants: Vec<SoftwareUpdateGrant>,
     /// How many addresses this store has ever minted an id for, and how many jobs: the
     /// per-store sequence [`mint_id`] hashes, so two records never share an id.
     next_address_seq: u64,
     next_job_seq: u64,
+    /// How many software-update grants this store has ever issued: the per-store sequence
+    /// [`mint_update_token`] hashes, so two grants never share a token.
+    next_software_update_seq: u64,
 }
 
 impl Default for ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
@@ -474,8 +612,10 @@ impl Default for ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
             jobs: HashMap::new(),
             job_order: Vec::new(),
             service_versions: seed_service_versions(),
+            software_update_grants: Vec::new(),
             next_address_seq: 0,
             next_job_seq: 0,
+            next_software_update_seq: 0,
         }
     }
 }
@@ -577,6 +717,50 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
         self.job_order
             .iter()
             .filter_map(|job_id| self.jobs.get(job_id))
+            .collect()
+    }
+
+    /// Issue a software-update grant for `job_id`, valid from `now` for
+    /// [`SOFTWARE_UPDATE_AVAILABILITY`], and record it.
+    ///
+    /// One call issues one grant: the window `GetSoftwareUpdatesResult$UpdatesURI`
+    /// publishes runs "2 days after this request is made", so each call is its own window
+    /// with its own token rather than a re-report of an earlier one. A grant whose window
+    /// has closed is dropped first — nothing can be fetched under it any more and the
+    /// window was over at that instant whether or not anybody called — and when the store
+    /// is still at [`MAX_SOFTWARE_UPDATE_GRANTS`] live grants the oldest, which is the
+    /// nearest to expiring, makes room.
+    pub fn issue_software_update_grant(
+        &mut self,
+        job_id: &str,
+        now: SystemTime,
+    ) -> SoftwareUpdateGrant {
+        self.software_update_grants
+            .retain(|grant| grant.is_active(now));
+        while self.software_update_grants.len() >= MAX_SOFTWARE_UPDATE_GRANTS {
+            self.software_update_grants.remove(0);
+        }
+        self.next_software_update_seq += 1;
+        let grant = SoftwareUpdateGrant {
+            job_id: job_id.to_string(),
+            token: mint_update_token(self.next_software_update_seq, now),
+            issued_at: now,
+            expires_at: now + SOFTWARE_UPDATE_AVAILABILITY,
+        };
+        self.software_update_grants.push(grant.clone());
+        grant
+    }
+
+    /// The software-update grants issued for `job_id` that are still inside their
+    /// availability window at `now`, oldest first.
+    pub fn active_software_update_grants(
+        &self,
+        job_id: &str,
+        now: SystemTime,
+    ) -> Vec<&SoftwareUpdateGrant> {
+        self.software_update_grants
+            .iter()
+            .filter(|grant| grant.job_id == job_id && grant.is_active(now))
             .collect()
     }
 }

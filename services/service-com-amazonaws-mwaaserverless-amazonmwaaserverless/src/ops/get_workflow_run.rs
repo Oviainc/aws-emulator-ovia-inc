@@ -207,6 +207,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = SystemTime::now();
         let mut store = state.lock();
 
+        // The ONE write a read may make: the transitions the clock already owed —
+        // here, every workflow teardown whose removal has fallen due, so a run of a
+        // workflow past its `DELETING` span is gone with it.
+        store.reap_deleted_workflows(now);
+
         // The run is what this operation resolves: a workflow the store does not hold
         // holds no run either, so both misses are the same failure to the caller.
         let unresolved_run = || {

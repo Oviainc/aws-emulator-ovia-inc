@@ -15,7 +15,7 @@
 //! of the same members: the model already declares them, and two copies of one
 //! shape is how two operations end up reading two different records.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -23,7 +23,8 @@ use crate::ops::types::{
     AdvancedOptionsStatus, AdvancedSecurityOptions, AdvancedSecurityOptionsInput,
     AdvancedSecurityOptionsStatus, AutoTuneOptions, AutoTuneOptionsInput, AutoTuneOptionsOutput,
     AutoTuneOptionsStatus, AutoTuneStatus, AutomatedSnapshotPauseOptions,
-    AutomatedSnapshotPauseOptionsStatus, AutomatedSnapshotPauseRequestOptions, ClusterConfig,
+    AutomatedSnapshotPauseOptionsStatus, AutomatedSnapshotPauseRequestOptions,
+    ChangeProgressDetails, ChangeProgressStatusDetails, ClusterConfig,
     ClusterConfigStatus, CognitoOptions, CognitoOptionsStatus, DeploymentStrategyOptions,
     DeploymentStrategyOptionsStatus, DomainConfig, DomainEndpointOptions,
     DomainEndpointOptionsStatus, DomainInfo, DomainStatus, EBSOptions, EBSOptionsStatus,
@@ -111,6 +112,34 @@ pub const PROCESSING_STATUS_ACTIVE: &str = "Active";
 /// `DomainProcessingStatusType`'s `Deleting`.
 pub const PROCESSING_STATUS_DELETING: &str = "Deleting";
 
+/// `OverallChangeStatus`'s `PROCESSING` value: the configuration change is being
+/// applied to the domain.
+pub const CHANGE_STATUS_PROCESSING: &str = "PROCESSING";
+
+/// `OverallChangeStatus`'s `COMPLETED` value: the configuration change has landed.
+pub const CHANGE_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// `ConfigChangeStatus`'s `ApplyingChanges` value.
+pub const CONFIG_CHANGE_APPLYING_CHANGES: &str = "ApplyingChanges";
+
+/// `ConfigChangeStatus`'s `Completed` value.
+pub const CONFIG_CHANGE_COMPLETED: &str = "Completed";
+
+/// `InitiatedBy`'s `CUSTOMER` value: every change this emulator records was started
+/// by a caller's own `CreateDomain` or `UpdateDomainConfig` request, never by the
+/// service itself (a service software update, which would be `SERVICE`, is still a
+/// stub).
+pub const INITIATED_BY_CUSTOMER: &str = "CUSTOMER";
+
+/// How many configuration changes a domain's history keeps.
+///
+/// This is the emulator's OWN bound on the store, not a published AWS limit: it is
+/// what stops a domain's change history growing without end under a caller that
+/// updates it forever. The oldest change is dropped first, so the most recent
+/// changes — the ones `DescribeDomainChangeProgress` is asked about — are the ones
+/// retained.
+pub const CHANGE_HISTORY: usize = 50;
+
 // ---------------------------------------------------------------------------
 // Option names
 //
@@ -182,6 +211,130 @@ pub struct OptionRevision {
     pub updated_at: SystemTime,
 }
 
+/// One configuration change on a domain: what `DescribeDomainChangeProgress`
+/// reports in full and what `DomainStatus`/`DomainConfig` summarise as a
+/// `ChangeProgressDetails`.
+///
+/// A change is minted by the call that starts it (`CreateDomain`, or an
+/// `UpdateDomainConfig` that changed at least one option) and completes when the
+/// provisioning span the clock owes it has passed — the same instant the domain
+/// itself settles, so the change's status and the domain's `Processing` flag can
+/// never disagree.
+#[derive(Debug, Clone)]
+pub struct ConfigChange {
+    /// `ChangeProgressStatusDetails$ChangeId`: the GUID this change is addressed by.
+    pub change_id: String,
+    /// The `DomainConfig` member names this change sets, as the `OPT_*` constants
+    /// spell them. Reported as `PendingProperties` while the change is in flight and
+    /// as `CompletedProperties` once it has landed.
+    pub properties: Vec<String>,
+    /// `StartTime`: the instant of the call that started the change.
+    pub started_at: SystemTime,
+    /// `LastUpdatedTime`: the instant this change's status last moved.
+    pub last_updated_at: SystemTime,
+    /// When the clock owes this change completion; `None` once it has completed.
+    pub completes_at: Option<SystemTime>,
+    /// One of `InitiatedBy`'s values; see [`INITIATED_BY_CUSTOMER`].
+    pub initiated_by: String,
+}
+
+impl ConfigChange {
+    /// Materialise the completion the clock owes this change, if `now` is past its
+    /// due instant.
+    ///
+    /// The completion is dated at the DUE instant rather than at `now`, so the
+    /// `LastUpdatedTime` a caller reads does not move with the moment it happened to
+    /// look.
+    fn settle(&mut self, now: SystemTime) {
+        let Some(due) = self.completes_at else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.completes_at = None;
+        self.last_updated_at = due;
+    }
+
+    /// Whether this change is still being applied.
+    pub fn in_progress(&self) -> bool {
+        self.completes_at.is_some()
+    }
+
+    /// `ChangeProgressStatusDetails$Status`: one of `OverallChangeStatus`'s values.
+    pub fn status(&self) -> &'static str {
+        if self.in_progress() {
+            CHANGE_STATUS_PROCESSING
+        } else {
+            CHANGE_STATUS_COMPLETED
+        }
+    }
+
+    /// `ConfigChangeStatus` for this change: the emulator applies a change in one
+    /// step, so it is `ApplyingChanges` until the change falls due and `Completed`
+    /// after.
+    pub fn config_change_status(&self) -> &'static str {
+        if self.in_progress() {
+            CONFIG_CHANGE_APPLYING_CHANGES
+        } else {
+            CONFIG_CHANGE_COMPLETED
+        }
+    }
+
+    /// This change as `ChangeProgressStatusDetails` — what
+    /// `DescribeDomainChangeProgress` answers with.
+    pub fn to_progress_status(&self) -> ChangeProgressStatusDetails {
+        // A property of the change in flight is pending; one of a change that has
+        // landed is completed. The two lists partition `properties`, so no property
+        // is ever reported as both.
+        let (pending, completed) = if self.in_progress() {
+            (self.properties.clone(), Vec::new())
+        } else {
+            (Vec::new(), self.properties.clone())
+        };
+        ChangeProgressStatusDetails {
+            change_id: Some(self.change_id.clone()),
+            start_time: Some(datetime(self.started_at)),
+            status: Some(self.status().to_string()),
+            pending_properties: Some(pending),
+            completed_properties: Some(completed),
+            // OpenSearch Service's blue/green deployment stages are not published,
+            // and this emulator applies a configuration change in ONE step rather
+            // than walking a sequence of stages — so no stage list is invented and
+            // the total stays at the member's own modelled default.
+            total_number_of_stages: 0,
+            change_progress_stages: None,
+            last_updated_time: Some(datetime(self.last_updated_at)),
+            config_change_status: Some(self.config_change_status().to_string()),
+            initiated_by: Some(self.initiated_by.clone()),
+            // Validation failures come from the pre-update validation check a verbose
+            // dry run runs (`DescribeDryRunProgress`), which is still a stub, so
+            // there are none to report.
+            validation_failures: None,
+            // Advisory warnings are accepted through the same verbose dry run.
+            accepted_warnings: None,
+        }
+    }
+
+    /// This change as the `ChangeProgressDetails` every full descriptor of the domain
+    /// (`DomainStatus`, `DomainConfig`) carries, so the change a descriptor names is
+    /// the same change `DescribeDomainChangeProgress` reports.
+    pub fn to_details(&self) -> ChangeProgressDetails {
+        ChangeProgressDetails {
+            change_id: Some(self.change_id.clone()),
+            // `Message` is "a message corresponding to the status of the
+            // configuration change"; the service's own wording for one is not
+            // published, and the status itself is reported in
+            // `ConfigChangeStatus`, so none is invented.
+            message: None,
+            config_change_status: Some(self.config_change_status().to_string()),
+            initiated_by: Some(self.initiated_by.clone()),
+            start_time: Some(datetime(self.started_at)),
+            last_updated_time: Some(datetime(self.last_updated_at)),
+        }
+    }
+}
+
 /// One OpenSearch Service domain, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct Domain {
@@ -239,6 +392,11 @@ pub struct Domain {
     /// no entry has no persisted value, and `DomainConfig` reports no container for
     /// it.
     pub option_versions: BTreeMap<String, OptionRevision>,
+    /// This domain's configuration changes, oldest first, bounded by
+    /// [`CHANGE_HISTORY`]: a FIFO, because the cap drops the oldest change and the
+    /// newest is the one `DescribeDomainChangeProgress` reports when the request
+    /// names no `ChangeId`.
+    pub changes: VecDeque<ConfigChange>,
 }
 
 impl Domain {
@@ -261,12 +419,52 @@ impl Domain {
         self.updated_at = now;
     }
 
-    /// Put the domain into `Processing` for the change a call at `now` started, and
-    /// store the instant the clock owes it a settled configuration.
-    pub fn begin_processing(&mut self, status: &str, now: SystemTime) {
+    /// Put the domain into `Processing` for the change a call at `now` started: store
+    /// the instant the clock owes it a settled configuration, and RECORD the change
+    /// — the options it is applying — so `DescribeDomainChangeProgress` can report on
+    /// it.
+    ///
+    /// `properties` are the `OPT_*` names the call set, which are exactly the ones it
+    /// [`Self::touch`]ed; they are taken from the caller rather than inferred from a
+    /// timestamp, so two calls landing on one clock tick still record one change
+    /// each, with its own properties. They are stored sorted and deduplicated, so the
+    /// same change reports the same list twice.
+    pub fn begin_change(&mut self, status: &str, properties: &[&str], now: SystemTime) {
         self.processing = true;
         self.processing_status = status.to_string();
         self.processing_until = Some(now + PROVISIONING);
+        let mut properties: Vec<String> =
+            properties.iter().map(|option| option.to_string()).collect();
+        properties.sort();
+        properties.dedup();
+        self.changes.push_back(ConfigChange {
+            change_id: new_change_id(),
+            properties,
+            started_at: now,
+            last_updated_at: now,
+            completes_at: self.processing_until,
+            initiated_by: INITIATED_BY_CUSTOMER.to_string(),
+        });
+        // The history is bounded: past its cap the oldest change is dropped, so a
+        // domain updated forever holds a fixed number of records.
+        while self.changes.len() > CHANGE_HISTORY {
+            self.changes.pop_front();
+        }
+    }
+
+    /// The most recent configuration change, which every full descriptor summarises
+    /// and `DescribeDomainChangeProgress` reports when the request names no
+    /// `ChangeId`.
+    pub fn latest_change(&self) -> Option<&ConfigChange> {
+        self.changes.back()
+    }
+
+    /// The change `change_id` names, or `None` when this domain's history holds no
+    /// such change.
+    pub fn change(&self, change_id: &str) -> Option<&ConfigChange> {
+        self.changes
+            .iter()
+            .find(|change| change.change_id == change_id)
     }
 
     /// Materialise the configuration change the clock owes this domain, if `now` is
@@ -276,6 +474,9 @@ impl Domain {
     /// This is the only write a reporting operation makes, and it writes only what
     /// was already owed at the same instant had nobody called.
     pub fn settle(&mut self, now: SystemTime) {
+        for change in &mut self.changes {
+            change.settle(now);
+        }
         let Some(due) = self.processing_until else {
             return;
         };
@@ -371,8 +572,10 @@ impl Domain {
                     use_off_peak_window: options.use_off_peak_window,
                 }
             }),
-            // `DescribeDomainChangeProgress` owns change progress; it is a stub.
-            change_progress_details: None,
+            // The change this descriptor reports is the same record
+            // `DescribeDomainChangeProgress` answers about, read through its own
+            // projection.
+            change_progress_details: self.latest_change().map(ConfigChange::to_details),
             off_peak_window_options: self.off_peak_window_options.clone(),
             software_update_options: self.software_update_options.clone(),
             domain_processing_status: Some(self.processing_status.clone()),
@@ -500,8 +703,9 @@ impl Domain {
                 }),
                 options: Some(options),
             }),
-            // `DescribeDomainChangeProgress` owns change progress; it is a stub.
-            change_progress_details: None,
+            // The same record `DomainStatus` and `DescribeDomainChangeProgress`
+            // report, so no two read paths name a different change.
+            change_progress_details: self.latest_change().map(ConfigChange::to_details),
             off_peak_window_options: self.option_status(OPT_OFF_PEAK_WINDOW_OPTIONS).and_then(
                 |status| {
                     self.off_peak_window_options
@@ -777,6 +981,16 @@ pub fn stored_auto_tune_options(input: AutoTuneOptionsInput) -> AutoTuneOptions 
     }
 }
 
+/// The GUID a configuration change is addressed by.
+///
+/// `GUID` is `@length(36, 36)` with pattern
+/// `^\p{XDigit}{8}-\p{XDigit}{4}-\p{XDigit}{4}-\p{XDigit}{4}-\p{XDigit}{12}$` —
+/// exactly a hyphenated UUID — so the id comes from the `uuid` crate's v4 generator
+/// rather than from a hand-rolled layout, and no two changes share one.
+fn new_change_id() -> String {
+    ::uuid::Uuid::new_v4().to_string()
+}
+
 /// `DomainStatus$DomainId`: the account the domain belongs to and its name.
 pub fn domain_id(domain_name: &str) -> String {
     format!("{}/{domain_name}", ::engine::emulator_account_id())
@@ -813,6 +1027,38 @@ pub fn datetime(at: SystemTime) -> ::aws_smithy_types::DateTime {
 pub fn domain_not_found(domain_name: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("Domain not found: {domain_name}")),
+    }
+}
+
+/// The widths of a `GUID`'s five hexadecimal groups.
+const GUID_GROUP_WIDTHS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// Whether `value` is a `GUID`: `@length(min: 36, max: 36)` with pattern
+/// `^\p{XDigit}{8}-\p{XDigit}{4}-\p{XDigit}{4}-\p{XDigit}{4}-\p{XDigit}{12}$`.
+///
+/// The request boundary enforces the length bound but not the pattern, so an
+/// operation that takes a `GUID` checks the shape itself rather than treating a
+/// malformed id as an id that merely names nothing. It is a shape test rather than a
+/// parse: `Uuid::parse_str` would accept the simple and URN forms this pattern
+/// forbids.
+pub fn is_guid(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == GUID_GROUP_WIDTHS.len()
+        && groups.iter().zip(GUID_GROUP_WIDTHS).all(|(group, width)| {
+            group.len() == width && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+/// The `ResourceNotFoundException` payload for a change id a domain's history holds
+/// no change for, and for a domain that has no configuration change to report.
+pub fn change_not_found(domain_name: &str, change_id: Option<&str>) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(match change_id {
+            Some(change_id) => {
+                format!("Change not found for domain {domain_name}: {change_id}")
+            }
+            None => format!("No configuration change found for domain {domain_name}"),
+        }),
     }
 }
 

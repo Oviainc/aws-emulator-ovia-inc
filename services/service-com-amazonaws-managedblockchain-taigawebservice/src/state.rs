@@ -81,6 +81,76 @@ pub fn framework_version_supported(framework: &str, framework_version: &str) -> 
     supported_framework_versions(framework).contains(&framework_version)
 }
 
+/// The `com.amazonaws.managedblockchain#Edition` value whose networks run only the
+/// smallest node sizes (see [`STARTER_EDITION_INSTANCE_TYPES`]); the enum's other value
+/// is [`EDITION_STANDARD`].
+pub const EDITION_STARTER: &str = "STARTER";
+
+/// The `Edition` value whose networks run the whole node catalog.
+pub const EDITION_STANDARD: &str = "STANDARD";
+
+/// The node instance types Amazon Managed Blockchain offers.
+///
+/// `InstanceTypeString` is an unconstrained string, so the catalog is service behavior
+/// this emulator must supply: `NodeConfiguration$InstanceType` is "The Amazon Managed
+/// Blockchain instance type for the node", and the instance types Managed Blockchain
+/// publishes are its own `bc.*` families — burstable `bc.t3`, general-purpose `bc.m5` and
+/// compute-optimised `bc.c5` — in the sizes listed here. An EC2 instance type (`m5.large`)
+/// or a `bc.*` name the service does not offer names no node the service could provision,
+/// so the create naming it is refused; see [`instance_type_supported`].
+pub const INSTANCE_TYPES: &[&str] = &[
+    "bc.t3.small",
+    "bc.t3.medium",
+    "bc.t3.large",
+    "bc.t3.xlarge",
+    "bc.m5.large",
+    "bc.m5.xlarge",
+    "bc.m5.2xlarge",
+    "bc.m5.4xlarge",
+    "bc.c5.large",
+    "bc.c5.xlarge",
+    "bc.c5.2xlarge",
+    "bc.c5.4xlarge",
+];
+
+/// The instance types a Hyperledger Fabric **Starter Edition** network runs.
+///
+/// Starter Edition is the limited edition Managed Blockchain Pricing describes
+/// (`NetworkFabricConfiguration$Edition` points at it): its peer nodes come only in the
+/// two smallest burstable sizes. Every other edition runs the full [`INSTANCE_TYPES`]
+/// catalog.
+pub const STARTER_EDITION_INSTANCE_TYPES: &[&str] = &["bc.t3.small", "bc.t3.medium"];
+
+/// The instance types a node on a network of `framework` with `edition` can be created
+/// with.
+///
+/// The edition only narrows the catalog, and only where the framework has editions at all
+/// (`NetworkFabricAttributes$Edition` "Applies only to Hyperledger Fabric"), so a network
+/// that reports no edition — an AWS-owned public Ethereum network, say — runs the full
+/// catalog.
+pub fn supported_instance_types(framework: &str, edition: Option<&str>) -> &'static [&'static str] {
+    if framework == FRAMEWORK_HYPERLEDGER_FABRIC && edition == Some(EDITION_STARTER) {
+        STARTER_EDITION_INSTANCE_TYPES
+    } else {
+        INSTANCE_TYPES
+    }
+}
+
+/// Whether `instance_type` is one of the instance types a node on a network of
+/// `framework`/`edition` can be created with.
+pub fn instance_type_supported(framework: &str, edition: Option<&str>, instance_type: &str) -> bool {
+    supported_instance_types(framework, edition).contains(&instance_type)
+}
+
+/// Whether a node on a network of `framework` must name an `AvailabilityZone`.
+///
+/// `NodeConfiguration$AvailabilityZone` is "The Availability Zone in which the node
+/// exists. Required for Ethereum nodes.": the member is modelled optional, so which
+/// frameworks require it is service behavior, and only Ethereum does.
+pub fn availability_zone_required(framework: &str) -> bool {
+    framework == FRAMEWORK_ETHEREUM
+}
+
 /// One of AWS's standing, AWS-owned public blockchain networks.
 ///
 /// These are not account resources: no call creates them, every account reads the same

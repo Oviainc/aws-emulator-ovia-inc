@@ -89,6 +89,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -184,7 +185,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 retry_after_seconds: None,
             })
         })?;
-        let store = state.lock();
+        let mut store = state.lock();
+
+        // The ONE write a read may make: finish every workflow teardown the clock
+        // already made due, so a workflow past its `DELETING` span is a lookup miss
+        // here too.
+        store.reap_deleted_workflows(SystemTime::now());
 
         // `TaggableResourceArn` admits exactly one resource kind — a workflow
         // (`^arn:aws…:airflow-serverless:<region>:<account>:workflow/<name>-<10>$`) — so the

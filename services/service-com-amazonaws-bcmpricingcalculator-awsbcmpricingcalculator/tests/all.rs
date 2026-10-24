@@ -21,6 +21,8 @@ mod not_found_message_framing;
 mod preferences;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/response_media_type.rs"]
+mod response_media_type;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_refusal_detail.rs"]

@@ -584,12 +584,6 @@ async fn a_scaffolded_operation_still_answers_501_for_a_valid_request() {
             "/profileSummaries?MaxResults=10".to_string(),
             None,
         ),
-        (
-            "ListReviewTemplates",
-            "GET",
-            "/reviewTemplates?MaxResults=10".to_string(),
-            None,
-        ),
     ] {
         let answer = client.send(method, &path, body).await;
         assert_eq!(

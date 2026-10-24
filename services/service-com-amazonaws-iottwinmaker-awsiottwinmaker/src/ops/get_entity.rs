@@ -9,7 +9,10 @@
 //! (`crate::state::MAX_COMPONENTS_RETURNED` components, and
 //! `crate::state::MAX_PROPERTIES_RETURNED` properties per component), with
 //! `areAllComponentsReturned` / `areAllPropertiesReturned` reporting whether it
-//! had to be. The `status.error` structure and the `description` string are
+//! had to be. A component's `compositeComponents` are the composite components
+//! stored inside it, keyed by their own name and each carrying the
+//! `componentPath` its create addressed it by.
+//! The `status.error` structure and the `description` string are
 //! reported PRESENT-but-empty for an entity that carries no error and no
 //! description, rather than omitted. An unknown workspace or entity is a
 //! `ResourceNotFoundException`.
@@ -263,6 +266,27 @@ fn components_response(
         .iter()
         .take(crate::state::MAX_COMPONENTS_RETURNED)
         .map(|(component_name, component)| {
+            // Keyed by each composite component's own NAME, because
+            // `CompositeComponentResponse`'s key is a `Name`, whose pattern
+            // admits no `/`; the whole path travels on the summary's
+            // `componentPath` instead. The store is keyed by path and walked in
+            // path order, so when two composite components of one component sit
+            // at different depths under the same name only one of them fits the
+            // map — the same one on every read — and the flag below reports
+            // that not all of them were returned.
+            let composite_components: ::std::collections::HashMap<String, ComponentSummary> =
+                component
+                    .composite_components
+                    .values()
+                    .map(|composite| {
+                        (
+                            composite.component_name.clone(),
+                            composite_component_summary(composite, status),
+                        )
+                    })
+                    .collect();
+            let are_all_composite_components_returned =
+                composite_components.len() == component.composite_components.len();
             let response = ComponentResponse {
                 component_name: Some(component.component_name.clone()),
                 description: component.description.clone(),
@@ -297,16 +321,51 @@ fn components_response(
                 are_all_properties_returned: Some(
                     component.properties.len() <= crate::state::MAX_PROPERTIES_RETURNED,
                 ),
-                // Composite components cannot exist on a stored entity:
-                // `CreateEntity` refuses `compositeComponents` while component
-                // types (which declare the component paths they are addressed
-                // by) are a later slice.
-                composite_components: Some(::std::collections::HashMap::new()),
-                are_all_composite_components_returned: Some(true),
+                composite_components: Some(composite_components),
+                // Nothing is truncated here: unlike `areAllComponentsReturned`
+                // ("the maximum number of components returned is 30") and
+                // `areAllPropertiesReturned` (800), this flag's documentation
+                // names no maximum. It is false only where the map above could
+                // not carry every stored composite component, which is a name
+                // collision between two different depths and nothing else.
+                are_all_composite_components_returned: Some(
+                    are_all_composite_components_returned,
+                ),
             };
             (component_name.clone(), response)
         })
         .collect()
+}
+
+/// One stored composite component as the modelled `ComponentSummary`.
+///
+/// `componentPath` is the path the create addressed it by, from the entity's
+/// top-level component down; the map it is reported in is keyed by its own
+/// `Name`, which is why the path travels on the summary. A composite component
+/// has no lifecycle of its own — like the component that holds it, it reports
+/// the entity's status — and `definedIn` is left absent for the same reason the
+/// holding component's is: no inheritance from a component type is resolved
+/// here.
+fn composite_component_summary(
+    composite: &crate::state::CompositeComponentRecord,
+    status: &Status,
+) -> ComponentSummary {
+    ComponentSummary {
+        component_name: composite.component_name.clone(),
+        component_type_id: composite.component_type_id.clone(),
+        defined_in: None,
+        description: composite.description.clone(),
+        property_groups: Some(
+            composite
+                .property_groups
+                .iter()
+                .map(|(group_name, group)| (group_name.clone(), property_group_response(group)))
+                .collect(),
+        ),
+        status: status.clone(),
+        sync_source: None,
+        component_path: Some(composite.component_path.clone()),
+    }
 }
 
 /// One stored property as the modelled `PropertyResponse`.

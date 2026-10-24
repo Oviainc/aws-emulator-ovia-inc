@@ -12,19 +12,25 @@
 //!
 //! * the workspace does not exist;
 //! * `parentEntityId` names an entity that does not exist in the workspace;
-//! * the request carries `compositeComponents` — a composite component is
-//!   addressed by a component *path* inside a component whose component type
-//!   declares it, and component types are a later slice, so no component path
-//!   can resolve and none could be reported back by `GetEntity`.
+//! * a `compositeComponents` key is not the path of a composite component this
+//!   entity has: the path's first segment must name one of the request's
+//!   `components`, and each further segment an entry in the
+//!   `compositeComponentTypes` of the component type the segment before it
+//!   reached (`crate::state::resolve_composite_component_path`). A path that
+//!   resolves is ACCEPTED and stored under the component it hangs off, so
+//!   `GetEntity` reports it as that component's
+//!   `compositeComponents.<name>` with the `componentPath` it was created by.
 //!
 //! An `entityId` that is already taken in the workspace is a `ConflictException`.
 //!
-//! Two deliberate gaps, both consequences of component types being a later
-//! slice: a component's `componentTypeId` is stored WITHOUT checking that the
-//! named component type exists (the real service refuses an unknown one, but
-//! this emulator has no component-type registry — including the built-in types
-//! every real workspace carries — to resolve it against), and authorization is
-//! not emulated, so the modelled `AccessDeniedException` is never returned.
+//! Two deliberate gaps: a component's `componentTypeId` is stored WITHOUT
+//! checking that the named component type exists (the real service refuses an
+//! unknown one, but this emulator holds no registry of the built-in component
+//! types every real workspace carries, so refusing would reject creates the
+//! real service accepts — which is also why a composite component path THROUGH
+//! a component type this workspace does not hold cannot be resolved and is
+//! refused), and authorization is not emulated, so the modelled
+//! `AccessDeniedException` is never returned.
 //!
 //! ## Shape of an operation
 //!
@@ -276,42 +282,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if input
-            .composite_components
-            .as_ref()
-            .is_some_and(|composite| !composite.is_empty())
-        {
-            return Err(CreateEntityErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(
-                        "compositeComponents names a component path that does not exist"
-                            .to_string(),
-                    ),
-                },
-            )
-            .into());
-        }
-
         let components = input.components.unwrap_or_default();
+        let composite_components = input.composite_components.unwrap_or_default();
         // Every property a `CreateEntity` declares is a NEW property, so its
         // definition must carry the `dataType` the modelled
-        // `PropertyDefinitionResponse` requires back.
+        // `PropertyDefinitionResponse` requires back — in a component and in a
+        // composite component alike.
         for (component_name, component) in &components {
-            for (property_name, property) in component.properties.iter().flatten() {
-                if property
-                    .definition
-                    .as_ref()
-                    .is_some_and(|definition| definition.data_type.is_none())
-                {
-                    return Err(CreateEntityErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(format!(
-                                "components.{component_name}.properties.{property_name}.definition.dataType is required"
-                            )),
-                        },
-                    )
-                    .into());
-                }
+            require_data_types(
+                &format!("components.{component_name}"),
+                component.properties.as_ref(),
+            )?;
+        }
+        for (component_path, composite) in &composite_components {
+            require_data_types(
+                &format!("compositeComponents.{component_path}"),
+                composite.properties.as_ref(),
+            )?;
+        }
+
+        let mut component_records = components_from_request(components);
+
+        // A `compositeComponents` entry is accepted exactly when its key
+        // RESOLVES as a composite component path: one of this entity's
+        // components, then one `compositeComponentTypes` declaration of the
+        // component type reached so far per further segment
+        // (`crate::state::resolve_composite_component_path`). Walked in path
+        // order, so which unresolvable path a refusal names does not depend on
+        // the request map's iteration order.
+        let mut composite_components: Vec<(String, CompositeComponentRequest)> =
+            composite_components.into_iter().collect();
+        composite_components.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (component_path, composite) in composite_components {
+            let resolved = crate::state::resolve_composite_component_path(
+                &component_records,
+                &workspace.component_types,
+                &component_path,
+            )
+            .map_err(|message| {
+                CreateEntityErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+            })?;
+            let record = crate::state::CompositeComponentRecord {
+                component_path: component_path.clone(),
+                component_name: resolved.composite_name,
+                component_type_id: resolved.component_type_id,
+                description: composite.description,
+                properties: property_records(composite.properties.unwrap_or_default()),
+                property_groups: property_group_records(
+                    composite.property_groups.unwrap_or_default(),
+                ),
+            };
+            // The holding component is the one the path's first segment was
+            // resolved against, so it is present.
+            if let Some(component) = component_records.get_mut(&resolved.component_name) {
+                component
+                    .composite_components
+                    .insert(resolved.composite_path, record);
             }
         }
 
@@ -328,7 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // names none, and every read reports it.
             description: input.description.unwrap_or_default(),
             parent_entity_id,
-            components: components_from_request(components),
+            components: component_records,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             creation_date_time: now,
             update_date_time: now,
@@ -375,6 +403,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The map key is the component name (`ComponentsMapRequest`'s key is `Name`),
 /// so it is carried onto the record rather than left only in the map, and
 /// `GetEntity` reports it as `ComponentResponse::componentName`.
+///
+/// The records come back with no composite components: those are addressed by a
+/// path that has to be resolved against the workspace's component types, which
+/// the handler does once the components are in hand.
 fn components_from_request(
     components: ::std::collections::HashMap<String, ComponentRequest>,
 ) -> ::std::collections::BTreeMap<String, crate::state::ComponentRecord> {
@@ -385,36 +417,84 @@ fn components_from_request(
                 component_name: component_name.clone(),
                 component_type_id: request.component_type_id,
                 description: request.description,
-                properties: request
-                    .properties
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(property_name, property)| {
-                        (
-                            property_name,
-                            crate::state::PropertyRecord {
-                                definition: property.definition,
-                                value: property.value,
-                            },
-                        )
-                    })
-                    .collect(),
-                property_groups: request
-                    .property_groups
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(group_name, group)| {
-                        (
-                            group_name,
-                            crate::state::PropertyGroupRecord {
-                                group_type: group.group_type,
-                                property_names: group.property_names.unwrap_or_default(),
-                            },
-                        )
-                    })
-                    .collect(),
+                properties: property_records(request.properties.unwrap_or_default()),
+                property_groups: property_group_records(
+                    request.property_groups.unwrap_or_default(),
+                ),
+                composite_components: ::std::collections::BTreeMap::new(),
             };
             (component_name, record)
         })
         .collect()
+}
+
+/// A requested property map as the stored property records.
+///
+/// Shared by a component and a composite component, which carry the same
+/// modelled `PropertyRequests` map, so one shape has one conversion.
+fn property_records(
+    properties: ::std::collections::HashMap<String, PropertyRequest>,
+) -> ::std::collections::BTreeMap<String, crate::state::PropertyRecord> {
+    properties
+        .into_iter()
+        .map(|(property_name, property)| {
+            (
+                property_name,
+                crate::state::PropertyRecord {
+                    definition: property.definition,
+                    value: property.value,
+                },
+            )
+        })
+        .collect()
+}
+
+/// A requested `ComponentPropertyGroupRequests` map as the stored records.
+///
+/// Shared by a component and a composite component for the same reason
+/// [`property_records`] is. `propertyNames` is stored RESOLVED, so an absent
+/// list is an empty one rather than a missing collection every reader has to
+/// guard against.
+fn property_group_records(
+    property_groups: ::std::collections::HashMap<String, ComponentPropertyGroupRequest>,
+) -> ::std::collections::BTreeMap<String, crate::state::PropertyGroupRecord> {
+    property_groups
+        .into_iter()
+        .map(|(group_name, group)| {
+            (
+                group_name,
+                crate::state::PropertyGroupRecord {
+                    group_type: group.group_type,
+                    property_names: group.property_names.unwrap_or_default(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Refuse a requested property whose definition carries no `dataType`.
+///
+/// `member_path` is the request member the map hangs off (`components.<name>`,
+/// `compositeComponents.<path>`), so the refusal names the exact member the
+/// caller has to fix.
+fn require_data_types(
+    member_path: &str,
+    properties: Option<&::std::collections::HashMap<String, PropertyRequest>>,
+) -> Result<(), CreateEntityErrorModeled> {
+    for (property_name, property) in properties.into_iter().flatten() {
+        if property
+            .definition
+            .as_ref()
+            .is_some_and(|definition| definition.data_type.is_none())
+        {
+            return Err(CreateEntityErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "{member_path}.properties.{property_name}.definition.dataType is required"
+                    )),
+                },
+            ));
+        }
+    }
+    Ok(())
 }

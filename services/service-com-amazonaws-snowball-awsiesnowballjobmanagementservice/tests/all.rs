@@ -21,5 +21,7 @@ mod job_lifecycle;
 mod job_updates;
 #[path = "all/service_versions.rs"]
 mod service_versions;
+#[path = "all/software_updates.rs"]
+mod software_updates;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

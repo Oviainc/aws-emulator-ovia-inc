@@ -78,8 +78,8 @@ fn workload_request(name: &str, token: &str, lenses: &[String]) -> Value {
     request
 }
 
-/// How many review templates the store holds. `ListReviewTemplates` is still a stub with
-/// its own issue, so "the create recorded nothing" is read off the shared state; every
+/// How many review templates the store holds, read off the shared state — the assertion
+/// is about what a refused create RECORDED, not about a list projection of it; every
 /// request the test asserts about still crosses the HTTP boundary.
 fn stored_templates(client: &Client) -> usize {
     let state = client.store();

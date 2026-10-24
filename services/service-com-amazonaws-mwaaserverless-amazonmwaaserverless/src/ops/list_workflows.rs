@@ -90,6 +90,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
 
 /// The list this operation's pagination cursors belong to, so a cursor issued for
 /// another paginated list of this service is refused here.
@@ -177,7 +178,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 retry_after_seconds: None,
             })
         })?;
-        let store = state.lock();
+        let mut store = state.lock();
+
+        // The ONE write a read may make: finish every workflow teardown the clock
+        // already made due, so a workflow still in its `DELETING` span is listed and
+        // one past it is not.
+        store.reap_deleted_workflows(SystemTime::now());
 
         // The cursor is the ARN of the last item on the previous page, so a workflow
         // deleted between pages cannot restart or skip the walk.

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDomainChangeProgress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDomainChangeProgress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDomainChangeProgress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the progress of a configuration change on a domain. The record is the
+//! domain's own change history, written by the calls that START a change
+//! (`CreateDomain`, and an `UpdateDomainConfig` that changed at least one option) and
+//! completed by the clock — see [`crate::state::ConfigChange`]. Both the full status
+//! this operation answers with and the `ChangeProgressDetails` every domain
+//! descriptor carries are projections of that ONE record.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +148,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDomainChangeProgress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDomainChangeProgressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDomainChangeProgress"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `GUID`'s own pattern is 8-4-4-4-12 hexadecimal groups. The request boundary
+        // enforces the length bound but not the pattern, so an id of the right length
+        // that is not a GUID is refused here as the modelled `ValidationException` —
+        // it is a malformed request, not a change that happens not to exist.
+        if let Some(change_id) = input.change_id.as_deref() {
+            if !crate::state::is_guid(change_id) {
+                return Err(DescribeDomainChangeProgressErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "ChangeId must be a GUID of the form \
+                             xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx: {change_id}"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Reporting progress materialises only what the clock already owed at `now`:
+        // a change whose provisioning span has passed has completed whether or not
+        // anybody asked. Nothing else about the record changes on a read.
+        let domain = store
+            .settled_mut(&input.domain_name, now)
+            .ok_or_else(|| {
+                DescribeDomainChangeProgressErrorModeled::ResourceNotFoundException(
+                    crate::state::domain_not_found(&input.domain_name),
+                )
+            })?;
+
+        // "The specific change ID for which you want to get progress information. If
+        // omitted, the request returns information about the most recent configuration
+        // change." A change id this domain's history holds no change for names no
+        // resource, so it is the modelled not-found refusal rather than an empty
+        // answer.
+        let change = match input.change_id.as_deref() {
+            Some(change_id) => domain.change(change_id),
+            None => domain.latest_change(),
+        }
+        .ok_or_else(|| {
+            DescribeDomainChangeProgressErrorModeled::ResourceNotFoundException(
+                crate::state::change_not_found(&input.domain_name, input.change_id.as_deref()),
+            )
+        })?;
+
+        Ok(DescribeDomainChangeProgressOutput {
+            change_progress_status: Some(change.to_progress_status()),
+        })
     }
 }

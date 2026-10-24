@@ -31,15 +31,27 @@ pub(crate) struct Emulator {
 
 impl Emulator {
     pub(crate) fn new() -> Self {
+        Self::with_engine().0
+    }
+
+    /// The emulator plus the engine its store lives in.
+    ///
+    /// Only a suite that has to SEED a record no implemented operation writes yet needs
+    /// the engine (`crate::network_telemetry` does: the operations that register a
+    /// telemetry-bearing connection are still scaffold stubs with their own issues). Every
+    /// other suite takes [`Emulator::new`] and reads a resource back through an operation.
+    pub(crate) fn with_engine() -> (Self, Arc<engine::InMemoryEngine>) {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These tests exercise operation behaviour, not SigV4; signing is covered by the
         // framework's own tests.
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_networkmanager_networkmanager::EmulatedService::new(engine),
+            service_com_amazonaws_networkmanager_networkmanager::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
         );
-        Self { router }
+        (Self { router }, engine)
     }
 
     pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {

@@ -37,13 +37,13 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// One row of the enablement table: the case name and the `EnableBaseline` members it
 /// varies. `parameters` and `tags` are `None` when the row omits the member entirely.
-struct Enablement {
-    case: &'static str,
-    baseline_identifier: &'static str,
-    baseline_version: &'static str,
-    target_identifier: &'static str,
-    parameters: Option<serde_json::Value>,
-    tags: Option<serde_json::Value>,
+pub(crate) struct Enablement {
+    pub(crate) case: &'static str,
+    pub(crate) baseline_identifier: &'static str,
+    pub(crate) baseline_version: &'static str,
+    pub(crate) target_identifier: &'static str,
+    pub(crate) parameters: Option<serde_json::Value>,
+    pub(crate) tags: Option<serde_json::Value>,
 }
 
 /// The enablement table: rows differ along what the rule generalises over — the baseline
@@ -52,7 +52,7 @@ struct Enablement {
 /// list (absent, empty, one, several, and every `Document` kind) and the tag map (absent,
 /// empty, several). Every row names a DIFFERENT baseline/target pair, because one pair is
 /// enabled at most once at a time.
-fn enablements() -> Vec<Enablement> {
+pub(crate) fn enablements() -> Vec<Enablement> {
     vec![
         Enablement {
             case: "a single-component version, no parameters and no tags",
@@ -108,7 +108,7 @@ fn enablements() -> Vec<Enablement> {
 
 /// POST `/enable-baseline` with the row's members, omitting the optional ones the row
 /// leaves out.
-async fn enable(router: &MultiServiceRouter, row: &Enablement) -> Answer {
+pub(crate) async fn enable(router: &MultiServiceRouter, row: &Enablement) -> Answer {
     let mut body = serde_json::json!({
         "baselineIdentifier": row.baseline_identifier,
         "baselineVersion": row.baseline_version,
@@ -139,7 +139,7 @@ async fn enable_pair(router: &MultiServiceRouter, baseline: &str, target: &str) 
 }
 
 /// POST `/disable-baseline` for an `EnabledBaseline` identifier.
-async fn disable(router: &MultiServiceRouter, enabled_baseline: &str) -> Answer {
+pub(crate) async fn disable(router: &MultiServiceRouter, enabled_baseline: &str) -> Answer {
     call(
         router,
         "/disable-baseline",
@@ -150,7 +150,7 @@ async fn disable(router: &MultiServiceRouter, enabled_baseline: &str) -> Answer 
 
 /// POST `/get-baseline-operation` and hand back the answer plus its `baselineOperation`
 /// member, which is what every assertion below reads.
-async fn get_operation(
+pub(crate) async fn get_operation(
     router: &MultiServiceRouter,
     operation_identifier: &str,
 ) -> (Answer, serde_json::Value) {
@@ -165,7 +165,7 @@ async fn get_operation(
 }
 
 /// A member of a `baselineOperation`, as a `&str`.
-fn member<'a>(operation: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+pub(crate) fn member<'a>(operation: &'a serde_json::Value, name: &str) -> Option<&'a str> {
     operation.get(name).and_then(serde_json::Value::as_str)
 }
 

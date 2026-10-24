@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-transcribe-transcribe service.
 //!
-//! Five resource families live here: the transcription-job lifecycle — the stored
+//! Several resource families live here: the transcription-job lifecycle — the stored
 //! record, the clock-owed status transitions, and the projections of a record onto
 //! the modelled `TranscriptionJob` / `TranscriptionJobSummary` shapes — the
 //! custom-vocabulary family (vocabularies and vocabulary filters), with its own
@@ -14,7 +14,10 @@
 //! the custom LANGUAGE models ([`LanguageModelRecord`]), each a record of the
 //! base model, language and training data a create named, with its
 //! `IN_PROGRESS` -> `FAILED` transition and its projection onto the modelled
-//! `LanguageModel` shape — and the Medical Scribe (AWS HealthScribe) jobs, each a
+//! `LanguageModel` shape — the Call Analytics jobs ([`CallAnalyticsJobRecord`]), each
+//! a record of the media, output location and settings a start named, with its own
+//! `IN_PROGRESS` -> `COMPLETED` transition and its projections onto `CallAnalyticsJob`
+//! and `CallAnalyticsJobSummary` — and the Medical Scribe (AWS HealthScribe) jobs, each a
 //! record of the media, settings and channel definitions it was started with, with
 //! its own `IN_PROGRESS` -> `COMPLETED` transition and its projection onto
 //! `MedicalScribeJob`.
@@ -48,7 +51,13 @@
 //! `READY`. A Call Analytics category is the same kind of record: its
 //! rules are held here, where a Call Analytics job that applies the category would
 //! read them from, and nothing evaluates a rule against a call, because no audio is
-//! analysed. A custom language model is the MEDICAL vocabulary's case again: its
+//! analysed. A Call Analytics JOB is the job record again
+//! ([`CallAnalyticsJobRecord`]): no call is transcribed, no call characteristic,
+//! sentiment or summary is derived and no category is matched, so the
+//! `Transcript.TranscriptFileUri` a completed one reports names a location nothing
+//! writes to or serves, and the `MediaFormat` and `MediaSampleRateHertz` the real
+//! service DETECTS from the media file stay absent because nothing read one. A custom
+//! language model is the MEDICAL vocabulary's case again: its
 //! training and tuning data can only be read from the Amazon S3 location a create
 //! names ([`LanguageModelRecord`]), so the record is real and the training it cannot
 //! run ends in the service's own modelled `FAILED` state — nothing here reports a
@@ -64,7 +73,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CategoryProperties, ContentRedaction, EncryptionConfiguration, InputDataConfig,
+    CallAnalyticsJob, CallAnalyticsJobSettings, CallAnalyticsJobSummary, CategoryProperties,
+    ChannelDefinition, ContentRedaction, EncryptionConfiguration, InputDataConfig,
     JobExecutionSettings, LanguageIdSettings, LanguageModel, Media,
     MedicalScribeChannelDefinition, MedicalScribeJob, MedicalScribeOutput,
     MedicalScribeSettings, ModelSettings, Rule, Settings, SubtitlesOutput, Tag,
@@ -166,14 +176,15 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// The due instant is stored on the record; nothing ever sleeps for it.
 pub const JOB_TRANSITION_DELAY: Duration = Duration::from_millis(500);
 
-/// The number of transcription jobs `ListTranscriptionJobs` returns when the
-/// request names no `MaxResults`: "If you do not specify a value, a default of 5 is
-/// used" (model doc for `ListTranscriptionJobsRequest$MaxResults`).
+/// The number of jobs `ListTranscriptionJobs` / `ListCallAnalyticsJobs` return when
+/// the request names no `MaxResults`: "If you do not specify a value, a default of 5 is
+/// used" (model doc for `ListTranscriptionJobsRequest$MaxResults` and for
+/// `ListCallAnalyticsJobsRequest$MaxResults`).
 pub const DEFAULT_LIST_MAX_RESULTS: i32 = 5;
 
-/// The largest page `ListTranscriptionJobs` serves: its `MaxResults` is modelled
-/// `@range(min: 1, max: 100)`, so the boundary validator refuses more than this
-/// before a handler runs.
+/// The largest page `ListTranscriptionJobs` / `ListCallAnalyticsJobs` serve: their
+/// `MaxResults` is modelled `@range(min: 1, max: 100)`, so the boundary validator
+/// refuses more than this before a handler runs.
 pub const MAX_LIST_MAX_RESULTS: usize = 100;
 
 /// The most transcription jobs this emulator holds for an account.
@@ -185,6 +196,16 @@ pub const MAX_LIST_MAX_RESULTS: usize = 100;
 /// caller that never deletes cannot grow it without end, and
 /// `DeleteTranscriptionJob` is what makes room again.
 pub const MAX_TRANSCRIPTION_JOBS: usize = 100;
+
+/// The most Call Analytics jobs this emulator holds for an account.
+///
+/// A CHOSEN ceiling, not a published one: the model carries no per-account figure for
+/// Call Analytics jobs. Applying the same figure the other job families use keeps the
+/// store bounded — a caller that never deletes cannot grow it without end — and a
+/// start beyond it answers the `LimitExceededException` the operation models for an
+/// exceeded quota. `DeleteCallAnalyticsJob` is what makes room again, once it is
+/// implemented (it is still a scaffold stub, with an issue of its own).
+pub const MAX_CALL_ANALYTICS_JOBS: usize = MAX_TRANSCRIPTION_JOBS;
 
 /// `VocabularyState` values, from the model's enum
 /// (`smithy_query(query="shape", shape="VocabularyState")`).
@@ -514,6 +535,16 @@ pub struct ComAmazonawsTranscribeTranscribeState {
     /// [`Self::tags_mut`] under [`RESOURCE_TYPE_MEDICAL_SCRIBE_JOB`], like every other
     /// family this state holds records of.
     pub medical_scribe_jobs: BTreeMap<String, MedicalScribeJobRecord>,
+    /// Every Call Analytics job this account has started, keyed by its name ("Job
+    /// names are case sensitive and must be unique within an Amazon Web Services
+    /// account" — model doc for `CallAnalyticsJob$CallAnalyticsJobName`).
+    ///
+    /// A family of its own: a Call Analytics job and a transcription job may share a
+    /// name, and like the Medical Scribe jobs it is absent from [`Self::tags`] /
+    /// [`Self::tags_mut`] because this emulator has no recorded spelling for the ARN
+    /// `<type>` segment of a Call Analytics job. The tags its start request asked for
+    /// are carried on the record and reported by that family's own operations.
+    pub call_analytics_jobs: BTreeMap<String, CallAnalyticsJobRecord>,
     /// Source of [`TranscriptionJobRecord::sequence`]: a monotonic counter, so
     /// creation order is total even when two jobs start in the same clock tick.
     next_sequence: u64,
@@ -551,6 +582,36 @@ impl ComAmazonawsTranscribeTranscribeState {
         let record = self.medical_scribe_jobs.get_mut(name)?;
         record.advance_clock(now);
         Some(record)
+    }
+
+    /// The Call Analytics job named `name`, with every clock-owed transition of it
+    /// already materialised, or `None` when this account has started no such job.
+    ///
+    /// The single lookup for this family, so every operation that reads a Call
+    /// Analytics job sees the same status: the one the clock already owed it.
+    pub fn call_analytics_job_mut(
+        &mut self,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<&mut CallAnalyticsJobRecord> {
+        let record = self.call_analytics_jobs.get_mut(name)?;
+        record.advance_clock(now);
+        Some(record)
+    }
+
+    /// Materialise every clock-owed Call Analytics job transition, then the stored
+    /// jobs newest first — the order `ListCallAnalyticsJobs` documents ("Jobs are
+    /// ordered by creation date, with the newest job first").
+    pub fn call_analytics_jobs_newest_first(
+        &mut self,
+        now: SystemTime,
+    ) -> Vec<&CallAnalyticsJobRecord> {
+        for record in self.call_analytics_jobs.values_mut() {
+            record.advance_clock(now);
+        }
+        let mut records: Vec<&CallAnalyticsJobRecord> = self.call_analytics_jobs.values().collect();
+        records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
+        records
     }
 
     /// The custom vocabulary named `name`, with every clock-owed transition of it
@@ -1615,6 +1676,201 @@ impl MedicalScribeJobRecord {
         }
     }
 }
+
+/// One stored Call Analytics job: exactly what the request asked for, plus the
+/// lifecycle facts the service itself owns (status, timestamps and the location its
+/// transcript would be written to).
+///
+/// `StartCallAnalyticsJob` has no deferred-execution member
+/// (`smithy_query(query="operation", operation="StartCallAnalyticsJob")`) — the queue
+/// it documents is entered only when an account "exceeds your Concurrent Job Limit",
+/// a concurrency ceiling this emulator does not model — so a job of this family is
+/// processing from the moment it is started and has exactly one clock-owed
+/// transition, `IN_PROGRESS` -> `COMPLETED`, like the Medical Scribe family
+/// ([`MedicalScribeJobRecord`]).
+///
+/// WHAT IT EMULATES is the job RECORD (see the module header): no call is
+/// transcribed, no sentiment or call characteristic is derived and no category is
+/// matched, so the `Transcript.TranscriptFileUri` a completed job reports names a
+/// location nothing writes to or serves.
+#[derive(Debug, Clone)]
+pub struct CallAnalyticsJobRecord {
+    /// `CallAnalyticsJobName`, also this record's key in the store.
+    pub name: String,
+    /// Creation order, newest = largest. Also the cursor `ListCallAnalyticsJobs`
+    /// pages with.
+    pub sequence: u64,
+    /// `CallAnalyticsJobStatus`: [`STATUS_IN_PROGRESS`] until the clock owes it
+    /// [`STATUS_COMPLETED`]. The enum's other two values are modelled but unreached —
+    /// nothing queues such a job and nothing this emulator does can fail one.
+    pub status: String,
+    pub media: Media,
+    /// `OutputLocation`, the one output member this operation takes; `None` when the
+    /// request named none, in which case the transcript is reported in a
+    /// service-managed location (see [`call_analytics_output_uri`]).
+    pub output_location: Option<String>,
+    /// `OutputEncryptionKMSKeyId`: the key the output would be encrypted with.
+    /// Recorded as asked for; nothing encrypts anything, because nothing is written.
+    pub output_encryption_kms_key_id: Option<String>,
+    /// `DataAccessRoleArn`, "The Amazon Resource Name (ARN) you included in your
+    /// request" (model doc for `CallAnalyticsJob$DataAccessRoleArn`) — optional on
+    /// this operation, so `None` when the request named none.
+    pub data_access_role_arn: Option<String>,
+    /// The region the start request was signed for; the service-managed transcript
+    /// URI is in that region.
+    pub region: String,
+    pub settings: Option<CallAnalyticsJobSettings>,
+    pub channel_definitions: Option<Vec<ChannelDefinition>>,
+    /// Where the transcript was written; `None` until the job completes.
+    pub transcript: Option<Transcript>,
+    /// `FailureReason`, set only on a `FAILED` job — which none of this emulator's
+    /// are: nothing it does can fail a job it accepted.
+    pub failure_reason: Option<String>,
+    pub creation_time: SystemTime,
+    pub start_time: Option<SystemTime>,
+    pub completion_time: Option<SystemTime>,
+    /// When `IN_PROGRESS` -> `COMPLETED` falls due.
+    pub completion_due: SystemTime,
+    pub tags: Vec<Tag>,
+}
+
+impl CallAnalyticsJobRecord {
+    /// Materialise the status transition the CLOCK already owes this job: it was due
+    /// at the stored instant whether or not anybody called. A reporting operation
+    /// (`Get`, `List`) runs this before projecting the record, and that is the only
+    /// write it performs.
+    ///
+    /// Completing a job records WHERE its transcript would be written (see the module
+    /// header); it does not write anything there.
+    pub fn advance_clock(&mut self, now: SystemTime) {
+        if self.status != STATUS_IN_PROGRESS || now < self.completion_due {
+            return;
+        }
+        self.status = STATUS_COMPLETED.to_string();
+        self.completion_time = Some(self.completion_due);
+        self.transcript = Some(Transcript {
+            transcript_file_uri: Some(call_analytics_output_uri(
+                self.output_location.as_deref(),
+                &self.name,
+                &self.region,
+            )),
+            // Content redaction is recorded as asked for, but nothing redacts a
+            // transcript nothing produced, so no redacted location is reported —
+            // the same projection the transcription-job family makes.
+            redacted_transcript_file_uri: None,
+        });
+    }
+
+    /// The language this job's transcription ran in, when the request left no choice
+    /// of language to make.
+    ///
+    /// `StartCallAnalyticsJob` carries NO language member
+    /// (`smithy_query(query="operation", operation="StartCallAnalyticsJob")`): Amazon
+    /// Transcribe identifies the language of the call itself, optionally narrowed to
+    /// the `Settings.LanguageOptions` the request listed. This emulator analyses no
+    /// audio, so it identifies nothing: a language is reported only where
+    /// `LanguageOptions` names exactly one, leaving identification nothing to choose,
+    /// and is absent otherwise rather than guessed — which is also why
+    /// `IdentifiedLanguageScore` is always absent.
+    fn language_code(&self) -> Option<String> {
+        let options = self.settings.as_ref()?.language_options.as_ref()?;
+        match options.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        }
+    }
+
+    /// This record as the modelled `CallAnalyticsJob` shape, which is the whole answer
+    /// of `StartCallAnalyticsJob` and `GetCallAnalyticsJob`.
+    ///
+    /// `Tags` is left ABSENT for a job carrying none rather than reported as an empty
+    /// list, for the reason [`CallAnalyticsCategoryRecord::to_properties`] gives:
+    /// `TagList` is modelled `length {min 1, max 200}`, so an empty list is not a
+    /// value of that shape.
+    pub fn to_job(&self) -> CallAnalyticsJob {
+        CallAnalyticsJob {
+            call_analytics_job_name: Some(self.name.clone()),
+            call_analytics_job_status: Some(self.status.clone()),
+            // No analytics feature was skipped, because none ran: the member stays
+            // absent rather than reporting an empty list of skipped features.
+            call_analytics_job_details: None,
+            language_code: self.language_code(),
+            // `MediaFormat` and `MediaSampleRateHertz` are NOT members of
+            // `StartCallAnalyticsJob`: the real service detects them from the media
+            // file. This emulator reads no media file, so both stay absent.
+            media_sample_rate_hertz: None,
+            media_format: None,
+            media: Some(self.media.clone()),
+            transcript: self.transcript.clone(),
+            start_time: self.start_time.map(to_date_time),
+            creation_time: Some(to_date_time(self.creation_time)),
+            completion_time: self.completion_time.map(to_date_time),
+            failure_reason: self.failure_reason.clone(),
+            data_access_role_arn: self.data_access_role_arn.clone(),
+            // No language identification was performed, so there is no confidence
+            // score to report (see [`Self::language_code`]).
+            identified_language_score: None,
+            settings: self.settings.clone(),
+            channel_definitions: self.channel_definitions.clone(),
+            tags: (!self.tags.is_empty()).then(|| self.tags.clone()),
+        }
+    }
+
+    /// This record as the modelled `CallAnalyticsJobSummary` shape, which is what
+    /// `ListCallAnalyticsJobs` reports for each result.
+    pub fn to_summary(&self) -> CallAnalyticsJobSummary {
+        CallAnalyticsJobSummary {
+            call_analytics_job_name: Some(self.name.clone()),
+            creation_time: Some(to_date_time(self.creation_time)),
+            start_time: self.start_time.map(to_date_time),
+            completion_time: self.completion_time.map(to_date_time),
+            language_code: self.language_code(),
+            call_analytics_job_status: Some(self.status.clone()),
+            call_analytics_job_details: None,
+            failure_reason: self.failure_reason.clone(),
+        }
+    }
+}
+
+/// Where a Call Analytics job's transcript is reported to live.
+///
+/// `StartCallAnalyticsJob` takes ONE `OutputLocation` URI rather than the
+/// bucket-and-key pair a transcription job takes, and documents three forms —
+/// `s3://BUCKET`, `s3://BUCKET/my-output-folder/` and
+/// `s3://BUCKET/my-output-folder/my-call-analytics-job.json`: "Unless you specify a
+/// file name (option 3), the name of your output file has a default value that
+/// matches the name you specified for your transcription job using the
+/// CallAnalyticsJobName parameter" (model doc for
+/// `StartCallAnalyticsJobRequest$OutputLocation`). A request that names no output
+/// location gets the service-managed location every job family reports
+/// ([`output_uri`]).
+///
+/// Reported, not served: nothing writes an object there (see the module header).
+///
+/// [`output_object_key`] is NOT reused: that rule names an object KEY relative to a
+/// separate `OutputBucketName`, while this member is a whole URI whose bucket is part
+/// of the value, so the two share the documented wording but not an input.
+pub fn call_analytics_output_uri(
+    output_location: Option<&str>,
+    job_name: &str,
+    region: &str,
+) -> String {
+    let Some(location) = output_location else {
+        return output_uri(None, None, job_name, region, CALL_ANALYTICS_OUTPUT_EXTENSION);
+    };
+    match location.strip_suffix(&format!(".{CALL_ANALYTICS_OUTPUT_EXTENSION}")) {
+        // The third documented form: a location naming a file is used as given.
+        Some(_) => location.to_string(),
+        None => format!(
+            "{folder}/{job_name}.{CALL_ANALYTICS_OUTPUT_EXTENSION}",
+            folder = location.trim_end_matches('/')
+        ),
+    }
+}
+
+/// The file extension of a Call Analytics job's transcript, as the `OutputLocation`
+/// doc's own example file name (`my-call-analytics-job.json`) spells it.
+pub const CALL_ANALYTICS_OUTPUT_EXTENSION: &str = "json";
 
 /// The documented `OutputKey` rule, as a free function so `StartTranscriptionJob`
 /// and the completion path agree on one implementation.

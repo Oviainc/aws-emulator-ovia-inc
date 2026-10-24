@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
     TaskInstance, UnresolvedEntity, LOOKUP_MISS_STATUS, RUN_STATUS_STARTING,
-    TASK_INSTANCE_STATUS_NONE,
+    TASK_INSTANCE_STATUS_NONE, WORKFLOW_DELETED_AFTER,
 };
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::ComAmazonawsMwaaserverlessAmazonmwaaserverlessState;
 
@@ -605,7 +605,9 @@ async fn an_unresolvable_task_instance_is_a_lookup_miss_naming_it() {
         "case stored instance: expected GetTaskInstance to succeed, got {status} {answered:?}"
     );
 
-    // And once the workflow holding the run is gone, so is the instance.
+    // And once the workflow holding the run is gone, so is the instance. The delete
+    // starts an asynchronous teardown, so the workflow goes when the removal the clock
+    // owes falls due (`workflow_deletion_teardown` asserts the `DELETING` phase).
     let (status, deleted) = harness
         .call("DeleteWorkflow", serde_json::json!({"WorkflowArn": arn}))
         .await;
@@ -613,6 +615,7 @@ async fn an_unresolvable_task_instance_is_a_lookup_miss_naming_it() {
         status, 200,
         "setup: expected DeleteWorkflow to succeed, got {status} {deleted:?}"
     );
+    tokio::time::sleep(WORKFLOW_DELETED_AFTER + Duration::from_millis(200)).await;
     let (status, answered) = harness
         .call(
             "GetTaskInstance",
