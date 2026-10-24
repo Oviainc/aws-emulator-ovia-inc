@@ -185,6 +185,9 @@ pub mod lex;
 pub mod management_events;
 pub mod network;
 pub mod query_error_envelope;
+/// The media type a service announces on a response, where the recorded wire differs from
+/// the one its protocol trait implies.
+pub mod response_media_type;
 pub mod rfc3339;
 pub mod rpc_target;
 pub mod shared_path;

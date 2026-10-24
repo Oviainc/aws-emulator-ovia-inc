@@ -194,9 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut budget = input.new_budget;
-        // The same service-owned members the create path stamps. The `HealthStatus` the
-        // budget already carried is kept: the operational state of the billing view it
-        // derives from did not change because the caller edited the budget.
+        // The same service-owned members the create path stamps — including the
+        // `calculatedSpend` this operation documents a caller cannot change. The
+        // `HealthStatus` the budget already carried is kept: the operational state of the
+        // billing view it derives from did not change because the caller edited the
+        // budget.
         crate::state::stamp_service_owned(
             &mut budget,
             ::std::time::SystemTime::now(),

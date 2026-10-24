@@ -12,6 +12,9 @@
 //! A core network in turn owns its ATTACHMENTS: each joins one resource to ONE of the
 //! edge locations that policy configures, and a Connect attachment is carried over
 //! another attachment (its transport) rather than over a resource of its own.
+//! Beside that tree a global network holds the CONNECTIONS registered with it (a Connect
+//! peer of either kind, a VPN connection), whose session health is what
+//! `GetNetworkTelemetry` reports.
 //! Everything
 //! the implemented operations answer is computed from the records below — no handler
 //! echoes its input back without storing it.
@@ -21,10 +24,11 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AWSLocation, AccountStatus, Attachment, Bandwidth, ConnectAttachment, ConnectAttachmentOptions,
-    CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup, CoreNetworkPolicyError,
-    CoreNetworkPolicyException, CoreNetworkSegment, Device, GlobalNetwork, Link, LinkAssociation,
-    Location, OrganizationStatus, ResourceNotFoundException, Site, Tag, ValidationException,
-    ValidationExceptionField, VpcAttachment, VpcOptions,
+    ConnectionHealth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
+    CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment, Device, GlobalNetwork,
+    Link, LinkAssociation, Location, NetworkTelemetry, OrganizationStatus,
+    ResourceNotFoundException, Site, Tag, ValidationException, ValidationExceptionField,
+    VpcAttachment, VpcOptions,
 };
 
 /// Members of `GlobalNetworkState` / `SiteState` / `LinkState` this slice uses. All three
@@ -305,6 +309,52 @@ pub const NETWORK_RESOURCE_TYPES: [&str; 17] = [
 pub fn is_network_resource_type(resource_type: &str) -> bool {
     NETWORK_RESOURCE_TYPES.contains(&resource_type)
 }
+
+/// The three resource types TELEMETRY is reported for, each also one of
+/// [`NETWORK_RESOURCE_TYPES`].
+///
+/// Telemetry covers a far narrower set than the network-resource inventory does: only the
+/// CONNECTIONS whose session the service measures. The set is the enumeration in the
+/// member's own documentation (`smithy_query query="doc"
+/// shape="GetNetworkTelemetryRequest" member="ResourceType"`: `connect-peer`,
+/// `transit-gateway-connect-peer`, `vpn-connection`) — a Cloud WAN Connect peer, a transit
+/// gateway Connect peer, and a Site-to-Site VPN connection. The modelled
+/// `ConstrainedString` carries only a length and a permissive pattern, so a value outside
+/// this set is refused by the handler rather than by the schema.
+pub const CONNECT_PEER_TYPE: &str = "connect-peer";
+/// See [`CONNECT_PEER_TYPE`].
+pub const TRANSIT_GATEWAY_CONNECT_PEER_TYPE: &str = "transit-gateway-connect-peer";
+/// See [`CONNECT_PEER_TYPE`].
+pub const VPN_CONNECTION_TYPE: &str = "vpn-connection";
+
+/// The telemetry resource types ([`CONNECT_PEER_TYPE`] and friends) in lexicographic
+/// order, so anything that walks them is stable.
+pub const TELEMETRY_RESOURCE_TYPES: [&str; 3] = [
+    CONNECT_PEER_TYPE,
+    TRANSIT_GATEWAY_CONNECT_PEER_TYPE,
+    VPN_CONNECTION_TYPE,
+];
+
+/// Whether `resource_type` is one of the values [`TELEMETRY_RESOURCE_TYPES`] lists.
+pub fn is_telemetry_resource_type(resource_type: &str) -> bool {
+    TELEMETRY_RESOURCE_TYPES.contains(&resource_type)
+}
+
+/// The two values `ConnectionHealth$Type` carries (`smithy_query shape=ConnectionType`,
+/// mirrored in `ops::types::CONNECTION_TYPE_VALUES`: BGP, IPSEC) — the PROTOCOL whose
+/// session the reported health belongs to, which is a function of the resource kind: a
+/// Connect peer of either kind peers over BGP (its configuration is a list of
+/// `BgpConfigurations`, `smithy_query shape=ConnectPeerConfiguration`), while a
+/// Site-to-Site VPN connection is an IPsec tunnel.
+pub const CONNECTION_TYPE_BGP: &str = "BGP";
+/// See [`CONNECTION_TYPE_BGP`].
+pub const CONNECTION_TYPE_IPSEC: &str = "IPSEC";
+
+/// The two values `ConnectionHealth$Status` carries (`smithy_query shape=ConnectionStatus`,
+/// mirrored in `ops::types::CONNECTION_STATUS_VALUES`: DOWN, UP).
+pub const CONNECTION_STATUS_UP: &str = "UP";
+/// See [`CONNECTION_STATUS_UP`].
+pub const CONNECTION_STATUS_DOWN: &str = "DOWN";
 
 /// The tag-key prefix AWS reserves for its own tags.
 ///
@@ -729,6 +779,107 @@ impl CoreNetworkRecord {
     }
 }
 
+/// A telemetry-bearing network resource of one global network: a connection registered
+/// with the global network whose session health `GetNetworkTelemetry` reports.
+///
+/// Its `resource_type` is one of [`TELEMETRY_RESOURCE_TYPES`] — nothing else has a session
+/// to measure — and its identity is its ARN, which is an ARN of the service that OWNS the
+/// connection (Amazon VPC for a transit gateway Connect peer or a VPN connection, this
+/// service for a Cloud WAN Connect peer), not one this service mints. So the ARN is stored
+/// and `ResourceId` and `AccountId` are DERIVED from it ([`arn_resource_id`],
+/// [`arn_account_id`]) rather than kept a second time.
+///
+/// The Region is stored, because it cannot be derived: a Cloud WAN Connect peer's ARN
+/// carries an EMPTY region segment (this service is partition-scoped, see `ARN_REGION`)
+/// while its telemetry still reports the edge location the peer lives at.
+///
+/// Like every other record in this slice, the health this record reports is a function of
+/// the clock rather than a field ([`Self::health_at`]), so reading telemetry never writes.
+#[derive(Debug, Clone)]
+pub struct TelemetryResourceRecord {
+    /// The global network the connection is registered with: the one whose
+    /// `GetNetworkTelemetry` reports it.
+    pub global_network_id: String,
+    /// One of [`TELEMETRY_RESOURCE_TYPES`].
+    pub resource_type: String,
+    /// The ARN of the connection itself, which is also this record's identity.
+    pub resource_arn: String,
+    /// The Amazon Web Services Region the connection lives in.
+    pub aws_region: String,
+    /// The core network the connection belongs to, for a Cloud WAN Connect peer; `None`
+    /// for a connection reached through a registered gateway instead.
+    pub core_network_id: Option<String>,
+    /// The ARN of the gateway the connection was registered through (a transit gateway or
+    /// a customer gateway), for a connection on the gateway side; `None` for a Cloud WAN
+    /// Connect peer.
+    pub registered_gateway_arn: Option<String>,
+    /// The address of the connection's far end, when the registration recorded one.
+    pub address: Option<String>,
+    /// The instant the connection was registered with the global network: the instant the
+    /// `DOWN` health this record starts out with took effect.
+    pub registered_at: SystemTime,
+    /// The instant the session the registration started comes up — the transition the
+    /// clock owes, [`SETTLE_DELAY`] after the registering call — and so the instant the
+    /// `UP` health takes effect.
+    pub connected_at: SystemTime,
+}
+
+impl TelemetryResourceRecord {
+    /// The protocol whose session this resource's health belongs to: IPsec for a VPN
+    /// connection, BGP for a Connect peer of either kind. See [`CONNECTION_TYPE_BGP`].
+    pub fn connection_type(&self) -> &'static str {
+        match self.resource_type.as_str() {
+            VPN_CONNECTION_TYPE => CONNECTION_TYPE_IPSEC,
+            // `connect-peer` and `transit-gateway-connect-peer`: both peer over BGP.
+            _ => CONNECTION_TYPE_BGP,
+        }
+    }
+
+    /// Whether the session is up as of `now`: the registration starts it, and it comes up
+    /// at [`Self::connected_at`] — the transition the clock owes, never a stored flag, so
+    /// a caller that reads straight after the registration still sees it `DOWN`.
+    pub fn is_up_at(&self, now: SystemTime) -> bool {
+        now >= self.connected_at
+    }
+
+    /// The modelled `ConnectionHealth` for this record as of `now`.
+    ///
+    /// `Timestamp` is "The time the status was last updated"
+    /// (`smithy_query query="doc" shape="ConnectionHealth" member="Timestamp"`), which is
+    /// the instant the status being reported took effect: the registration while the
+    /// session is still down, the instant it came up afterwards. Both are stored instants,
+    /// so repeated reads of one record report the identical health.
+    pub fn health_at(&self, now: SystemTime) -> ConnectionHealth {
+        let up = self.is_up_at(now);
+        let status = if up {
+            CONNECTION_STATUS_UP
+        } else {
+            CONNECTION_STATUS_DOWN
+        };
+        let since = if up { self.connected_at } else { self.registered_at };
+        ConnectionHealth {
+            r#type: Some(self.connection_type().to_string()),
+            status: Some(status.to_string()),
+            timestamp: Some(epoch_seconds(since)),
+        }
+    }
+
+    /// The modelled `NetworkTelemetry` for this record as of `now`.
+    pub fn to_shape(&self, now: SystemTime) -> NetworkTelemetry {
+        NetworkTelemetry {
+            registered_gateway_arn: self.registered_gateway_arn.clone(),
+            core_network_id: self.core_network_id.clone(),
+            aws_region: Some(self.aws_region.clone()),
+            account_id: arn_account_id(&self.resource_arn).map(str::to_string),
+            resource_type: Some(self.resource_type.clone()),
+            resource_id: Some(arn_resource_id(&self.resource_arn).to_string()),
+            resource_arn: Some(self.resource_arn.clone()),
+            address: self.address.clone(),
+            health: Some(self.health_at(now)),
+        }
+    }
+}
+
 /// A stored attachment: what joins one resource to ONE edge location of a core network.
 ///
 /// Every attachment kind shares the modelled `Attachment` envelope (`smithy_query
@@ -1017,6 +1168,39 @@ impl OrganizationServiceAccessRecord {
     }
 }
 
+/// The key the telemetry store holds one registration under: the global network, then the
+/// resource ARN, so the map groups a global network's connections into one contiguous run
+/// ordered by ARN and a pagination token can name an offset into it.
+///
+/// The pair is the identity: one connection is registered with one global network, and the
+/// same ARN may not be registered with it twice.
+pub fn telemetry_key(global_network_id: &str, resource_arn: &str) -> String {
+    format!("{global_network_id}/{resource_arn}")
+}
+
+/// The id of the resource an ARN names: the text after the last `/` of its resource
+/// segment, or the whole segment for an ARN that carries no `/` at all.
+///
+/// Unlike [`parse_resource_arn`] this judges nothing about the ARN and accepts one of ANY
+/// service, because a telemetry resource is owned by whichever service runs the connection
+/// (`arn:aws:ec2:<region>:<account>:vpn-connection/<id>` for a VPN connection,
+/// `arn:aws:networkmanager::<account>:connect-peer/<id>` for a Cloud WAN Connect peer).
+pub fn arn_resource_id(arn: &str) -> &str {
+    let resource = arn.rsplit_once(':').map_or(arn, |(_, tail)| tail);
+    resource.rsplit_once('/').map_or(resource, |(_, id)| id)
+}
+
+/// The account id an ARN carries (its fifth colon-separated field), or `None` when the
+/// string has no such field or carries it empty.
+///
+/// This is the account that OWNS the resource, which is what a telemetry entry reports in
+/// `AccountId` — not the account this emulator runs as, since a connection may be owned by
+/// another account of the organization.
+pub fn arn_account_id(arn: &str) -> Option<&str> {
+    let account = arn.split(':').nth(4)?;
+    (!account.is_empty()).then_some(account)
+}
+
 /// Per-service state for com-amazonaws-networkmanager-networkmanager. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
@@ -1061,6 +1245,18 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// at most [`MAX_RESOURCE_POLICIES`] ARNs hold a policy, each document at most
     /// [`MAX_RESOURCE_POLICY_CHARS`] characters, so no caller can grow it without end.
     pub resource_policies: BTreeMap<String, String>,
+    /// Telemetry-bearing connections by [`telemetry_key`]: the registrations
+    /// `GetNetworkTelemetry` reports the session health of.
+    ///
+    /// A connection is registered here by the operation that ties it to the global network
+    /// — `AssociateTransitGatewayConnectPeer` and `AssociateConnectPeer` for a Connect peer
+    /// of either kind, `RegisterTransitGateway` / `AssociateCustomerGateway` for the VPN
+    /// connections of a gateway — each still a scaffold stub with its own issue, so an
+    /// emulator nobody has registered a connection with reports the empty telemetry it
+    /// really holds rather than a placeholder. No quota of its own bounds the map: a
+    /// registration exists only for a stored global network, which the per-account global
+    /// network quota bounds, and only once per resource ARN.
+    pub telemetry_resources: BTreeMap<String, TelemetryResourceRecord>,
     /// This account's organization service-access record, or `None` while no
     /// `StartOrganizationServiceAccessUpdate` has ever been called: this service then
     /// knows of no organization, so `ListOrganizationServiceAccessStatus` reports no
@@ -1238,6 +1434,16 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             _ => 0,
         };
         i32::try_from(held).unwrap_or(i32::MAX)
+    }
+
+    /// Register `record` as a telemetry-bearing connection of its global network,
+    /// replacing any registration that global network already holds for the same resource
+    /// ARN (see [`telemetry_key`]).
+    pub fn register_telemetry_resource(&mut self, record: TelemetryResourceRecord) {
+        self.telemetry_resources.insert(
+            telemetry_key(&record.global_network_id, &record.resource_arn),
+            record,
+        );
     }
 
     /// How many links `site_id` holds, for the per-site quota.
