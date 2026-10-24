@@ -207,21 +207,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(selected) = selected else {
             // Whether the image itself is unknown or it holds no version matching the
-            // selection, the resource being accessed is not found.
+            // selection, the resource being accessed is not found. An image no store
+            // holds is reported exactly as the image reader reports it; an image that IS
+            // there names what of it could not be resolved.
             let image_arn = crate::state::resource_arn(
                 &crate::state::request_region(ctx),
                 "image",
                 &input.image_name,
             );
-            let selector = match (input.version, input.alias.as_deref()) {
-                (Some(version), _) => format!("version {version}"),
-                (None, Some(alias)) => format!("alias \"{alias}\""),
-                (None, None) => "any version".to_string(),
+            let message = if store.images.contains_key(&input.image_name) {
+                let selector = match (input.version, input.alias.as_deref()) {
+                    (Some(version), _) => format!("version {version}"),
+                    (None, Some(alias)) => format!("alias \"{alias}\""),
+                    (None, None) => "any version".to_string(),
+                };
+                format!("Could not find {selector} of image \"{image_arn}\".")
+            } else {
+                crate::state::image_does_not_exist(&image_arn)
             };
             return Err(DescribeImageVersionErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!(
-                    "Could not find {selector} of image \"{image_arn}\"."
-                )),
+                message: Some(message),
             })
             .into());
         };
