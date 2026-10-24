@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterAgent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterAgent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterAgent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -86,11 +77,24 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-groundstation-groundsta
 // here — hence the `RegisterAgentError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.groundstation#RegisterAgent")]
+//
+// `ResourceLimitExceededException` is widened in with `extra_errors`, DELIBERATELY off
+// this operation's own modelled error set, for the same reason `CreateConfig` and
+// `CreateMissionProfile` answer with it: the SERVICE models the shape and it is what this
+// service answers when a create runs past an account limit, which is how the bounded
+// store below refuses one. Reporting an emulator store bound through one of this
+// operation's three declared errors would misdescribe it — the request is valid, it names
+// resources that exist and nothing downstream failed (see `state::MAX_RECORDS_PER_STORE`,
+// reachable only after 1,000 registrations).
+#[smithy_macros::operation_error(
+    "com.amazonaws.groundstation#RegisterAgent",
+    extra_errors = ["ResourceLimitExceededException"]
+)]
 #[derive(Debug)]
 pub enum RegisterAgentErrorModeled {
     DependencyException(DependencyException),
     InvalidParameterException(InvalidParameterException),
+    ResourceLimitExceededException(ResourceLimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
 
@@ -145,18 +149,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterAgent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterAgentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterAgent"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RegisterAgentErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // The discovery data's addresses are IPv4 addresses (`IpAddressList`'s member is
+        // `IpV4Address` — `smithy_query(query="shape", shape="IpAddressList")`), and that
+        // shape's pattern only holds them to four dot-separated runs of up to three
+        // digits: `256.0.0.1` satisfies the pattern the boundary validator applies and is
+        // still not an address the agent can be reached on, so the value is parsed here.
+        for (member, addresses) in [
+            (
+                "discoveryData.publicIpAddresses",
+                &input.discovery_data.public_ip_addresses,
+            ),
+            (
+                "discoveryData.privateIpAddresses",
+                &input.discovery_data.private_ip_addresses,
+            ),
+        ] {
+            if let Some(address) = addresses.iter().find(|address| !is_ipv4_address(address)) {
+                return Err(invalid_parameter(
+                    member,
+                    format!(
+                        "{address} is not an IPv4 address; each of the four octets of an \
+                         IPv4 address is between 0 and 255"
+                    ),
+                ));
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let agent_id = crate::state::new_uuid();
+        let agent_arn = ::engine::emulator_arn(
+            crate::state::ARN_SERVICE,
+            &region,
+            &format!("agent/{agent_id}"),
+        );
+        let registered = crate::state::now_timestamp();
+
+        let mut guard = state.lock();
+
+        // The store this emulator keeps is bounded, so a caller cannot grow it without
+        // limit; past the bound a create is refused the way the service refuses one that
+        // runs past an account limit. Checked after the request itself, so what the caller
+        // hears is what is wrong with the request.
+        if guard.agents.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(RegisterAgentErrorModeled::ResourceLimitExceededException(
+                ResourceLimitExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} registered agents",
+                        crate::state::MAX_RECORDS_PER_STORE
+                    )),
+                    parameter_name: None,
+                },
+            )
+            .into());
+        }
+
+        // A registered agent has reported no status yet: `AgentStatus` is what the AGENT
+        // reports through `UpdateAgentStatus`, so the service holds the new agent inactive,
+        // with no component status and no task, until the first report arrives.
+        let stored = crate::state::Agent {
+            agent_id: agent_id.clone(),
+            agent_arn: agent_arn.clone(),
+            agent_details: input.agent_details,
+            discovery_data: input.discovery_data,
+            tags: input.tags.unwrap_or_default(),
+            aggregate_status: AggregateStatus {
+                status: crate::state::AGENT_INACTIVE.to_string(),
+                signature_map: None,
+            },
+            component_statuses: Vec::new(),
+            task_id: None,
+            tasking_document: None,
+            registered,
+            last_updated: registered,
+        };
+
+        guard.arn_index.insert(
+            agent_arn,
+            crate::state::ResourceRef::Agent {
+                agent_id: agent_id.clone(),
+            },
+        );
+        guard.agents.insert(agent_id.clone(), stored);
+
+        Ok(RegisterAgentOutput {
+            agent_id: Some(agent_id),
+        })
     }
+}
+
+/// The modelled refusal of a request this operation cannot register an agent from: HTTP
+/// 431 `InvalidParameterException`, naming the member that is wrong and why.
+fn invalid_parameter(parameter: &str, message: String) -> RegisterAgentError {
+    RegisterAgentErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        parameter_name: Some(parameter.to_string()),
+    })
+    .into()
+}
+
+/// Whether `value` is a dotted-quad IPv4 address.
+///
+/// The model's `IpV4Address` pattern already held the value to four dot-separated runs of
+/// one to three digits, so what is left is whether those digits name an address at all,
+/// which `std::net::Ipv4Addr`'s own parser answers (the same check
+/// `service-com-amazonaws-cloudhsm-cloudhsmfrontendservice` makes of an IP it is given).
+fn is_ipv4_address(value: &str) -> bool {
+    value.parse::<::std::net::Ipv4Addr>().is_ok()
 }

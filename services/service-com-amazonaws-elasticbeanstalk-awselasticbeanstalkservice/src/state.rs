@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 use crate::ops::types::{
     ApplicationDescription, ApplicationResourceLifecycleConfig, ApplicationVersionDescription,
     ApplicationVersionLifecycleConfig, ConfigurationOptionSetting, CustomAmi, EnvironmentTier,
-    EventDescription, MaxAgeRule, MaxCountRule, PlatformBranchSummary, PlatformDescription,
-    PlatformFramework, PlatformProgrammingLanguage, PlatformSummary, S3Location, Tag,
+    EventDescription, ManagedActionHistoryItem, MaxAgeRule, MaxCountRule, PlatformBranchSummary,
+    PlatformDescription, PlatformFramework, PlatformProgrammingLanguage, PlatformSummary,
+    S3Location, Tag,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -335,6 +336,14 @@ pub const DEFAULT_EVENT_PAGE_SIZE: usize = 1_000;
 /// second, none of them six weeks old. So the log is also capped by COUNT, with
 /// the oldest records dropped first. The count is chosen, not documented.
 pub const MAX_RETAINED_EVENTS: usize = 10_000;
+
+/// The page size `DescribeEnvironmentManagedActionHistory` answers with when the
+/// request names no `MaxItems`: the modelled maximum of that member
+/// (`ManagedActionHistoryMaxItems`, `range 1..100`), which is also the maximum
+/// length of the `ManagedActionHistoryItems` list one answer can carry
+/// (`len 1..100`), so an unbounded request is answered with as large a page as
+/// the model admits.
+pub const DEFAULT_MANAGED_ACTION_HISTORY_PAGE_SIZE: usize = 100;
 
 /// Where `severity` sits on [`EVENT_SEVERITY_LADDER`], or `None` when it is not
 /// one of the modelled values.
@@ -1867,6 +1876,84 @@ impl Event {
     }
 }
 
+/// One managed action this service has CARRIED OUT on an environment — "the
+/// record of a completed or failed managed action" (the model's
+/// `ManagedActionHistoryItem` doc), which is what
+/// `DescribeEnvironmentManagedActionHistory` reports.
+///
+/// A managed action is work the SERVICE performs on an environment on its own
+/// maintenance schedule (a managed platform update, an instance refresh), not
+/// work a caller asked for: a caller-requested change is reported in the event
+/// log ([`Event`]) instead. An action that has NOT finished is not held here —
+/// an upcoming or in-progress one is the model's `ManagedAction`, which
+/// `DescribeEnvironmentManagedActions` reports — so every record in this log is
+/// terminal and its [`Self::status`] is one of the modelled
+/// `crate::ops::types::ACTION_HISTORY_STATUS_VALUES`.
+///
+/// NOTHING writes a record here: a managed action exists because the service's
+/// maintenance-window scheduler scheduled one, and this emulator runs no such
+/// scheduler — which is also why `ApplyEnvironmentManagedAction` refuses every
+/// `ActionId` it is given, no action ever being `Scheduled`. So no action has
+/// ever executed on an environment this store holds, and
+/// `DescribeEnvironmentManagedActionHistory` pages over THIS log rather than
+/// reporting an action nothing performed.
+#[derive(Debug, Clone)]
+pub struct ManagedActionRecord {
+    /// Append order within this emulator, so "most recent first" is a total
+    /// order even for two actions that finished inside one clock tick, and so a
+    /// `NextToken` names one record unambiguously. Drawn from the store's
+    /// shared counter, as an [`Event`]'s is.
+    pub sequence: u64,
+    /// The environment the action ran on, by `EnvironmentId`: the id identifies
+    /// the record even after its name has been released by a termination and
+    /// taken by a new environment.
+    pub environment_id: String,
+    /// "A unique identifier for the managed action."
+    pub action_id: String,
+    /// "The type of the managed action" — one of the modelled
+    /// `crate::ops::types::ACTION_TYPE_VALUES`.
+    pub action_type: String,
+    /// "A description of the managed action."
+    pub action_description: Option<String>,
+    /// "The status of the action" — one of the modelled
+    /// `crate::ops::types::ACTION_HISTORY_STATUS_VALUES`.
+    pub status: String,
+    /// "If the action failed, the type of failure" — one of the modelled
+    /// `crate::ops::types::FAILURE_TYPE_VALUES`, and absent for an action that
+    /// completed.
+    pub failure_type: Option<String>,
+    /// "If the action failed, a description of the failure."
+    pub failure_description: Option<String>,
+    /// "The date and time that the action started executing."
+    pub executed_time: ::aws_smithy_types::DateTime,
+    /// "The date and time that the action finished executing."
+    pub finished_time: Option<::aws_smithy_types::DateTime>,
+}
+
+impl ManagedActionRecord {
+    /// The instant this record is ORDERED by, as an exact
+    /// (seconds, nanoseconds) key: when the action finished, which is why it is
+    /// in the history at all, falling back to when it started for a record that
+    /// carries no finish instant.
+    pub fn history_instant(&self) -> (i64, u32) {
+        instant_key(self.finished_time.as_ref().unwrap_or(&self.executed_time))
+    }
+
+    /// The modelled `ManagedActionHistoryItem` for this record.
+    pub fn to_history_item(&self) -> ManagedActionHistoryItem {
+        ManagedActionHistoryItem {
+            action_id: Some(self.action_id.clone()),
+            action_type: Some(self.action_type.clone()),
+            action_description: self.action_description.clone(),
+            failure_type: self.failure_type.clone(),
+            status: Some(self.status.clone()),
+            failure_description: self.failure_description.clone(),
+            executed_time: Some(self.executed_time),
+            finished_time: self.finished_time,
+        }
+    }
+}
+
 /// A stored custom platform version.
 #[derive(Debug, Clone)]
 pub struct PlatformVersion {
@@ -3049,6 +3136,12 @@ pub struct ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     /// and `DescribeEvents` reports from it. Append order is the record's
     /// `sequence`, which breaks a tie between two events the clock dated alike.
     pub events: Vec<Event>,
+    /// The managed actions this service has carried out on its environments,
+    /// OLDEST first, in the append order the record's `sequence` records:
+    /// `DescribeEnvironmentManagedActionHistory` reports one environment's
+    /// slice of this log, newest first. See [`ManagedActionRecord`], which also
+    /// says why nothing appends to it.
+    pub managed_action_history: Vec<ManagedActionRecord>,
     /// The Amazon S3 buckets `CreateStorageLocation` has created, by name — one
     /// per region an account has asked for one in. "If the storage location
     /// already exists, `CreateStorageLocation` still returns the bucket name but
@@ -3093,6 +3186,9 @@ impl Default for ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             environments: BTreeMap::new(),
             environment_name_index: BTreeMap::new(),
             events: Vec::new(),
+            // No managed action has executed on any environment: see
+            // `ManagedActionRecord`.
+            managed_action_history: Vec::new(),
             // No storage bucket until `CreateStorageLocation` creates one.
             storage_buckets: BTreeSet::new(),
             platform_branches: managed_platform_branch_catalog(),
@@ -3221,6 +3317,31 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             format!("{operation_name} is starting."),
             subject,
         );
+    }
+
+    /// One environment's completed and failed managed actions, NEWEST first:
+    /// the order `DescribeEnvironmentManagedActionHistory` reports and pages
+    /// through them in.
+    ///
+    /// Newest by the instant the action FINISHED — an action is in the history
+    /// because it finished — with the append `sequence` breaking a tie so the
+    /// order is total even for two actions that finished inside one clock tick,
+    /// and so a page boundary falls in the same place on every call. The
+    /// environment is selected by id, so the history of an environment whose
+    /// name was later taken by another one is never reported for that other.
+    pub fn managed_action_history_of(&self, environment_id: &str) -> Vec<&ManagedActionRecord> {
+        let mut history: Vec<&ManagedActionRecord> = self
+            .managed_action_history
+            .iter()
+            .filter(|record| record.environment_id == environment_id)
+            .collect();
+        history.sort_by(|left, right| {
+            right
+                .history_instant()
+                .cmp(&left.history_instant())
+                .then_with(|| right.sequence.cmp(&left.sequence))
+        });
+        history
     }
 
     /// An application's version labels, newest first.

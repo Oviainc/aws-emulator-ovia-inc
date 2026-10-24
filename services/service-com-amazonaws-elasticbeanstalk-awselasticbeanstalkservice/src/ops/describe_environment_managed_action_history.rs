@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEnvironmentManagedActionHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEnvironmentManagedActionHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: reports ONE environment's completed and failed managed actions out of
+//! the store's managed-action history, newest first, honouring `MaxItems` and resuming
+//! exactly where a previous page ended. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEnvironmentManagedActionHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A reporting operation: the only write it performs is the clock's own — the status
+//! transitions and event expiries that were already due — which every read of this
+//! service materialises through `materialize_due_transitions`.
+//!
+//! NOTE on what this emulator holds: a managed action is work the SERVICE schedules in
+//! an environment's maintenance window (a managed platform update, an instance
+//! refresh), and this emulator runs no such scheduler — which is why
+//! `ApplyEnvironmentManagedAction` refuses every `ActionId`, no action ever being
+//! `Scheduled`. So no action has executed on any environment this store holds, and this
+//! operation pages over `crate::state::ManagedActionRecord` rather than reporting an
+//! action nothing performed: for an environment whose history nothing recorded that is
+//! an empty page with no `NextToken`, which is also what AWS answers for an environment
+//! no managed action has run on yet.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +151,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEnvironmentManagedActionHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEnvironmentManagedActionHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEnvironmentManagedActionHistory"))
+        // Which actions are reported is decided by the request's environment and
+        // paging members alone; nothing about the request's metadata selects them.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeEnvironmentManagedActionHistoryError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        // The only write a report performs: a status change the clock already
+        // made due, the event that completed change owes, and the events the
+        // reporting window has carried out of scope. All of them were owed at
+        // the same instant whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "The environment ID of the target environment" / "The name of the
+        // target environment": a managed action belongs to ONE environment, so
+        // the service needs one of the pair to name it. This operation's model
+        // documents no code for naming neither, so the refusal is the generic
+        // query `MissingParameter` the service's other managed-action and health
+        // reads answer that with.
+        let environment_id = store
+            .environment_id_for(
+                input.environment_id.as_deref(),
+                input.environment_name.as_deref(),
+            )
+            .map_err(|refusal| match refusal {
+                crate::state::EnvironmentRefusal::NoIdentifier => {
+                    DescribeEnvironmentManagedActionHistoryError::missing_parameter(
+                        "Either EnvironmentName or EnvironmentId must be specified.",
+                    )
+                }
+                crate::state::EnvironmentRefusal::NotFound(message) => {
+                    DescribeEnvironmentManagedActionHistoryError::invalid_parameter_value(message)
+                }
+            })?;
+
+        // "Lists an environment's completed and failed managed actions", newest
+        // first; see `managed_action_history_of` for that order and why it is
+        // total.
+        let history = store.managed_action_history_of(&environment_id);
+
+        // "The pagination token returned by a previous request." The token names
+        // the first record of the next page by its `sequence`, which the log
+        // never renumbers, and the page starts at the first record that is NOT
+        // NEWER than that record in the reported order. Resolving it by ORDER
+        // rather than by position in the previous answer is what makes it stable
+        // across a record appended between two page calls. A token that names no
+        // record of THIS environment's history is refused rather than read as
+        // page one, so a cut from another environment's listing cannot resume at
+        // an unrelated offset.
+        let offset = match input.next_token.as_deref() {
+            Some(token) => {
+                let boundary = token
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|sequence| {
+                        history.iter().find(|record| record.sequence == sequence)
+                    })
+                    .map(|record| (record.history_instant(), record.sequence))
+                    .ok_or_else(|| {
+                        DescribeEnvironmentManagedActionHistoryError::invalid_parameter_value(
+                            format!("Invalid NextToken: {token}"),
+                        )
+                    })?;
+                history
+                    .iter()
+                    .position(|record| (record.history_instant(), record.sequence) <= boundary)
+                    // Every record this history holds is newer than the
+                    // boundary, so the next page is empty.
+                    .unwrap_or(history.len())
+            }
+            None => 0,
+        };
+        let page = &history[offset..];
+
+        // "The maximum number of items to return for a single request."
+        // `MaxItems` is modelled `range 1..100`, so the boundary validator has
+        // already refused anything outside that; the guard keeps a future
+        // widening of the range from inventing an empty page with a
+        // continuation token.
+        let max_items = input
+            .max_items
+            .and_then(|max_items| usize::try_from(max_items).ok())
+            .filter(|max_items| *max_items > 0)
+            .unwrap_or(crate::state::DEFAULT_MANAGED_ACTION_HISTORY_PAGE_SIZE);
+        let (page, next_token) = if page.len() > max_items {
+            // "A pagination token that you pass to
+            // DescribeEnvironmentManagedActionHistory to get the next page of
+            // results" — carried only when a next page exists.
+            (
+                &page[..max_items],
+                Some(page[max_items].sequence.to_string()),
+            )
+        } else {
+            (page, None)
+        };
+
+        let items = page.iter().map(|record| record.to_history_item()).collect();
+        Ok(DescribeEnvironmentManagedActionHistoryOutput {
+            managed_action_history_items: Some(items),
+            next_token,
+        })
     }
 }

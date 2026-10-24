@@ -215,7 +215,7 @@ fn policy_cases() -> Vec<PolicyCase> {
 }
 
 /// Create a core network in its own global network, returning the create response.
-async fn create_core_network(emulator: &Emulator, body: Value) -> (u16, Value) {
+pub(crate) async fn create_core_network(emulator: &Emulator, body: Value) -> (u16, Value) {
     emulator.post("/core-networks", body).await
 }
 
@@ -732,13 +732,13 @@ async fn a_core_network_needs_a_parent_and_blocks_its_deletion() {
         .delete(&format!("/global-networks/{network_id}"))
         .await;
     assert_eq!(
-        status, 409,
+        status, 400,
         "deleting a global network that still owns a core network is refused, got {status} with {blocked}"
     );
     assert_eq!(
         error_code(&blocked),
-        "ConflictException",
-        "expected ConflictException, got {blocked}"
+        "ValidationException",
+        "expected ValidationException, got {blocked}"
     );
 
     // And the core network is counted as the network resource it is.

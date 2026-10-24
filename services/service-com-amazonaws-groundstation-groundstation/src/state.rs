@@ -4,8 +4,9 @@
 //!
 //! Every resource this service hands out lives here: configs keyed by their
 //! `(configType, configId)` pair (the two labels `GET /config/{configType}/{configId}`
-//! carries), mission profiles and contacts keyed by their uuid, plus one ARN index so a
-//! `trackingConfigArn` / `missionProfileArn` reference resolves without scanning a map.
+//! carries), mission profiles, contacts and AWS Ground Station Agents keyed by their
+//! uuid, plus one ARN index so a `trackingConfigArn` / `missionProfileArn` reference
+//! resolves without scanning a map.
 //!
 //! The helpers beside the struct are the pieces every handler of this service needs —
 //! the request's region, the union-member-to-`ConfigCapabilityType` mapping, the
@@ -27,8 +28,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    ConfigTypeData, ContactVersion, Eirp, EndpointDetails, EphemerisMetaData, Frequency,
-    FrequencyBandwidth, InvalidParameterException, KmsKey, SpectrumConfig, TrackingOverrides,
+    AgentDetails, AggregateStatus, ComponentStatusData, ConfigTypeData, ContactVersion,
+    DiscoveryData, Eirp, EndpointDetails, EphemerisMetaData, Frequency, FrequencyBandwidth,
+    InvalidParameterException, KmsKey, SpectrumConfig, TrackingOverrides,
 };
 
 /// Region used in minted ARNs when the request carries no usable SigV4 credential
@@ -771,6 +773,8 @@ pub enum ResourceRef {
     Contact { contact_id: String },
     /// A dataflow endpoint group, by `dataflowEndpointGroupId`.
     DataflowEndpointGroup { dataflow_endpoint_group_id: String },
+    /// An AWS Ground Station Agent, by `agentId`.
+    Agent { agent_id: String },
 }
 
 /// A config as `CreateConfig` stored it.
@@ -1141,6 +1145,11 @@ pub const REASON_NO_REGISTERED_AGENT: &str = "NO_REGISTERED_AGENT";
 /// The `AgentStatus` an AWS Ground Station Agent endpoint carries while no agent has
 /// registered itself for that endpoint (`smithy_query(query="shape",
 /// shape="AgentStatus")` — `SUCCESS`, `FAILED`, `ACTIVE`, `INACTIVE`).
+///
+/// It is also the aggregate status a freshly registered [`Agent`] carries: the status of
+/// an agent is what the agent itself reports through `UpdateAgentStatus`, so until it has
+/// reported one the service holds it inactive rather than claiming a status nothing
+/// observed.
 pub const AGENT_INACTIVE: &str = "INACTIVE";
 
 /// A dataflow endpoint group as `CreateDataflowEndpointGroup` stored it.
@@ -1159,6 +1168,57 @@ pub struct DataflowEndpointGroup {
     /// The instant the service owes this group's dataflow endpoints their `creating` ->
     /// `created` move; `None` once the move has been materialised.
     pub endpoints_settle_at: Option<SystemTime>,
+}
+
+/// An AWS Ground Station Agent as `RegisterAgent` registered it, with the status its
+/// last `UpdateAgentStatus` report carried.
+///
+/// The model makes `Agent` a resource of this service with the lifecycle
+/// `RegisterAgent` (create), `GetAgentConfiguration` (read) and `UpdateAgentStatus`
+/// (update), identified by `agentId` and ARN-addressed as `agent/{agentId}`
+/// (`smithy_query(query="shape", shape="Agent")`), so one record per agent carries
+/// everything those three operations read and write.
+#[derive(Debug, Clone)]
+pub struct Agent {
+    pub agent_id: String,
+    pub agent_arn: String,
+    /// What the agent said about itself when it registered: its version, the EC2
+    /// instance it runs on and the versions of its components.
+    pub agent_details: AgentDetails,
+    /// The addresses and capability ARNs the agent registered with — "data for
+    /// associating an agent with the capabilities it is managing".
+    pub discovery_data: DiscoveryData,
+    pub tags: HashMap<String, String>,
+    /// The aggregate status the agent last reported, [`AGENT_INACTIVE`] until it has
+    /// reported one.
+    pub aggregate_status: AggregateStatus,
+    /// The per-component statuses the agent last reported: the whole list of the latest
+    /// report, since each report carries the agent's components as they stand.
+    pub component_statuses: Vec<ComponentStatusData>,
+    /// The agent task the last report was about; `None` before the first report.
+    pub task_id: Option<String>,
+    /// The tasking document `GetAgentConfiguration` hands the agent.
+    ///
+    /// `None` until the service has tasked the agent: the document describes the
+    /// contact the agent is to carry, and no operation this model declares produces one
+    /// (`smithy_query(query="digest")` carries no operation that tasks an agent), so an
+    /// agent that nothing has tasked is reported with no document rather than with an
+    /// invented one.
+    pub tasking_document: Option<String>,
+    /// When the agent registered.
+    pub registered: DateTime,
+    /// When the agent last reported its status, equal to [`Agent::registered`] until it
+    /// has reported once.
+    pub last_updated: DateTime,
+}
+
+/// What this service answers when an `{agentId}` label names no registered agent.
+///
+/// Shared by the two operations that address an agent by that label —
+/// `GetAgentConfiguration` and `UpdateAgentStatus` — so a read and an update of an
+/// agent that is not there answer one text.
+pub fn agent_not_found_message(agent_id: &str) -> String {
+    format!("No agent found with id {agent_id}")
 }
 
 /// A satellite this account is on-boarded to, as [`SATELLITES_ENV`] described it.
@@ -1225,6 +1285,8 @@ pub struct ComAmazonawsGroundstationGroundstationState {
     pub contacts: HashMap<String, Contact>,
     /// Dataflow endpoint groups, keyed by `dataflowEndpointGroupId`.
     pub dataflow_endpoint_groups: HashMap<String, DataflowEndpointGroup>,
+    /// Registered AWS Ground Station Agents, keyed by `agentId`.
+    pub agents: HashMap<String, Agent>,
     /// Every ARN this service minted, and what it points at.
     pub arn_index: HashMap<String, ResourceRef>,
     /// The uplink frequency bands, in MHz, this account has been approved to transmit
@@ -1452,6 +1514,7 @@ impl Default for ComAmazonawsGroundstationGroundstationState {
             mission_profiles: HashMap::new(),
             contacts: HashMap::new(),
             dataflow_endpoint_groups: HashMap::new(),
+            agents: HashMap::new(),
             arn_index: HashMap::new(),
             approved_uplink_bands_mhz: from_env(
                 APPROVED_UPLINK_BANDS_ENV,

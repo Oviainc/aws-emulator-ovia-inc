@@ -778,7 +778,7 @@ async fn a_created_link_reports_pending_until_the_settle_span_the_clock_owes_ela
 }
 
 #[tokio::test]
-async fn deleting_a_site_that_still_holds_links_is_a_conflict() {
+async fn deleting_a_site_that_still_holds_links_is_refused_as_a_validation_failure() {
     let emulator = Emulator::new();
     let network = emulator.create_global_network("conflicts").await;
     let held = emulator.create_site(&network, "held").await;
@@ -791,12 +791,12 @@ async fn deleting_a_site_that_still_holds_links_is_a_conflict() {
         .delete(&format!("/global-networks/{network}/sites/{held}"))
         .await;
     assert_eq!(
-        status, 409,
-        "DeleteSite with a link: expected 409, got {status} with {refused}"
+        status, 400,
+        "DeleteSite with a link: expected 400, got {status} with {refused}"
     );
     assert_eq!(
         error_code(&refused),
-        "ConflictException",
+        "ValidationException",
         "DeleteSite with a link: wrong error code in {refused}"
     );
     let (_, listed) = emulator
