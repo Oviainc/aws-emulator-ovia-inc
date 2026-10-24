@@ -194,6 +194,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // And, by the same rule as at create, the documented domain of a custom
+        // schedule's creation interval: `CreateRule$Interval`'s supported value
+        // set, which its `@range(min: 1)` admits every positive integer past.
+        // Also before the store is touched.
+        if let Some((schedule, interval)) =
+            crate::state::schedule_with_unsupported_create_interval(input.policy_details.as_ref())
+        {
+            return Err(
+                UpdateLifecyclePolicyErrorModeled::InvalidRequestException(
+                    crate::state::unsupported_create_rule_interval(&schedule, interval),
+                )
+                .into(),
+            );
+        }
+
         let mut store = state.lock();
         let Some(policy) = store.policies.get_mut(&input.policy_id) else {
             return Err(
@@ -235,6 +250,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
+        }
+
+        // The documented numeric domain of a default policy's cadence, as at
+        // create: the creation frequency's 1-to-7 days, the retention period's
+        // 2-to-14 days, and a retention period greater than the creation
+        // frequency. An update may state only one of the two, so the ordering is
+        // judged against what the policy already holds for the other: the body
+        // value a create or an earlier update stored, or — unless THIS request
+        // replaces the configuration structure — the one inside it. Refused
+        // before the first write, so the stored policy is left exactly as it was.
+        let replaced_details = input.policy_details.as_ref();
+        let kept_details = replaced_details
+            .is_none()
+            .then_some(policy.policy_details.as_ref())
+            .flatten();
+        if let Some(refusal) = (crate::state::Cadence {
+            body_create_interval: input.create_interval,
+            body_retain_interval: input.retain_interval,
+            details_create_interval: replaced_details.and_then(|details| details.create_interval),
+            details_retain_interval: replaced_details.and_then(|details| details.retain_interval),
+            stored_create_interval: policy
+                .create_interval
+                .or_else(|| kept_details.and_then(|details| details.create_interval)),
+            stored_retain_interval: policy
+                .retain_interval
+                .or_else(|| kept_details.and_then(|details| details.retain_interval)),
+        })
+        .violation()
+        {
+            return Err(
+                UpdateLifecyclePolicyErrorModeled::InvalidRequestException(refusal).into(),
+            );
         }
 
         // A partial update: only the members the request carries overwrite the

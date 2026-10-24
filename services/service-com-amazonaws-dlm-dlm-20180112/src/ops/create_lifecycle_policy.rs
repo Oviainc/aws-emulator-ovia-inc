@@ -247,6 +247,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The documented numeric domain of a default policy's cadence, which the
+        // members' `@range(min: 1)` cannot express: the creation frequency's
+        // 1-to-7 days, the retention period's 2-to-14 days, and a retention
+        // period greater than the creation frequency. Judged wherever the
+        // request states them — the request body or `PolicyDetails` — and
+        // refused before anything is stored, so a policy AWS would never have
+        // created is never persisted for a read to report.
+        if let Some(refusal) = (crate::state::Cadence {
+            body_create_interval: input.create_interval,
+            body_retain_interval: input.retain_interval,
+            details_create_interval: input
+                .policy_details
+                .as_ref()
+                .and_then(|details| details.create_interval),
+            details_retain_interval: input
+                .policy_details
+                .as_ref()
+                .and_then(|details| details.retain_interval),
+            // A create has nothing stored to compare against.
+            ..crate::state::Cadence::default()
+        })
+        .violation()
+        {
+            return Err(
+                CreateLifecyclePolicyErrorModeled::InvalidRequestException(refusal).into(),
+            );
+        }
+
         // The other cross-member rule the model cannot express: a schedule's
         // `CreateRule` states when to create EITHER as a cron expression OR as an
         // interval, never both. Refused before anything is stored, so a request
@@ -256,6 +284,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
                 crate::state::conflicting_create_rule(&schedule),
+            )
+            .into());
+        }
+
+        // And the documented domain of a custom schedule's creation interval:
+        // `CreateRule$Interval`'s supported value set, which its
+        // `@range(min: 1)` admits every positive integer past.
+        if let Some((schedule, interval)) =
+            crate::state::schedule_with_unsupported_create_interval(input.policy_details.as_ref())
+        {
+            return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
+                crate::state::unsupported_create_rule_interval(&schedule, interval),
             )
             .into());
         }

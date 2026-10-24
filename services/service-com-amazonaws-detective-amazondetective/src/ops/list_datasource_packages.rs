@@ -115,7 +115,10 @@ impl From<ListDatasourcePackagesErrorModeled> for ListDatasourcePackagesError {
 /// when the token is not one this operation issued.
 ///
 /// The token's own text is never echoed back: it is opaque to a caller, and a caller
-/// that invents one is told only that it is not a token from here.
+/// that invents one is told only that it is not a token from here. A token this
+/// operation issued always names a value of the modelled `DatasourcePackage` enum
+/// (`smithy_query(query="shape",shape="DatasourcePackage")`), which is what the store
+/// keys these records by.
 fn next_package(token: &str) -> Result<String, ListDatasourcePackagesError> {
     crate::state::decode_page_token(token)
         .filter(|package| DATASOURCE_PACKAGE_VALUES.contains(&package.as_str()))
@@ -188,6 +191,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::page_size(input.max_results);
         let start = input.next_token.as_deref().map(next_package).transpose()?;
 
+        // A pure report: this operation reads the packages the graph stores and writes
+        // nothing, so the next caller sees exactly what this one did.
         let store = state.lock();
         let graph = store.graph(&input.graph_arn).ok_or_else(|| {
             ListDatasourcePackagesErrorModeled::ResourceNotFoundException(
@@ -197,16 +202,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The packages are keyed by package name, so the walk has one stable total
         // order and a token can name the package the next page starts at.
-        let mut remaining = match &start {
+        let remaining = match &start {
             Some(package) => graph.datasource_packages.range(package.clone()..),
             None => graph.datasource_packages.range::<String, _>(..),
         };
 
+        // Reserve no more than the graph can actually yield.
         let mut datasource_packages = ::std::collections::HashMap::with_capacity(
             page_size.min(graph.datasource_packages.len()),
         );
         let mut next_token = None;
-        for (package, ingest) in remaining.by_ref() {
+        for (package, ingest) in remaining {
             // The first package that does not fit becomes the next page's start, and
             // only then is a `NextToken` emitted: the last page carries none.
             if datasource_packages.len() == page_size {

@@ -16,7 +16,7 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     CreateRule, CrossRegionCopyTarget, Exclusions, InvalidRequestException, LifecyclePolicy,
-    LifecyclePolicySummary, PolicyDetails, ResourceNotFoundException, Tag,
+    LifecyclePolicySummary, PolicyDetails, ResourceNotFoundException, Schedule, Tag,
 };
 
 /// The region a policy ARN is built for when the request carries no SigV4
@@ -134,6 +134,42 @@ pub const DEFAULT_COPY_TAGS: bool = false;
 /// `ExtendDeletion` documents "If you do not specify a value, the default is
 /// false."
 pub const DEFAULT_EXTEND_DELETION: bool = false;
+
+/// The documented bounds, in days, of a default policy's creation frequency:
+/// `CreateInterval` is "how often the policy should run and create snapshots or
+/// AMIs. The creation frequency can range from 1 to 7 days"
+/// (`smithy_query(query="doc", shape="CreateLifecyclePolicyRequest",
+/// member="CreateInterval")`, and the same sentence on
+/// `UpdateLifecyclePolicyRequest` and `PolicyDetails`).
+///
+/// The member targets `CreateInterval`, which is `@range(min: 1)` only, so the
+/// floor is enforced by the model and the CEILING is enforced here.
+pub const CREATE_INTERVAL_MIN_DAYS: i32 = 1;
+/// See [`CREATE_INTERVAL_MIN_DAYS`].
+pub const CREATE_INTERVAL_MAX_DAYS: i32 = 7;
+
+/// The documented bounds, in days, of a default policy's retention period:
+/// `RetainInterval` is "how long the policy should retain snapshots or AMIs
+/// before deleting them. The retention period can range from 2 to 14 days"
+/// (`smithy_query(query="doc", shape="CreateLifecyclePolicyRequest",
+/// member="RetainInterval")`, and the same sentence on
+/// `UpdateLifecyclePolicyRequest` and `PolicyDetails`).
+///
+/// The member targets `RetainInterval`, which is `@range(min: 1)`: BOTH the
+/// 2-day floor and the 14-day ceiling fall outside what the model expresses, so
+/// both are enforced here.
+pub const RETAIN_INTERVAL_MIN_DAYS: i32 = 2;
+/// See [`RETAIN_INTERVAL_MIN_DAYS`].
+pub const RETAIN_INTERVAL_MAX_DAYS: i32 = 14;
+
+/// The values a custom schedule's creation interval supports: `CreateRule$Interval`
+/// is "the interval between snapshots. The supported values are 1, 2, 3, 4, 6,
+/// 8, 12, and 24" (`smithy_query(query="doc", shape="CreateRule",
+/// member="Interval")`), with `CreateRule$IntervalUnit` offering `HOURS` alone.
+///
+/// The member targets `Interval`, which is `@range(min: 1)` — every positive
+/// integer — so the SET is enforced here.
+pub const SUPPORTED_CREATE_RULE_INTERVALS: [i32; 8] = [1, 2, 3, 4, 6, 8, 12, 24];
 
 /// The error code Amazon Data Lifecycle Manager answers when the caller may not
 /// pass the `ExecutionRoleArn` it named.
@@ -783,6 +819,138 @@ pub fn reserved_tag_key_refused() -> InvalidRequestException {
     invalid_request(RESERVED_TAG_KEY_MESSAGE.to_string())
 }
 
+/// A default policy's creation/retention cadence as ONE request states it,
+/// beside what the policy already holds — the input to
+/// [`Cadence::violation`].
+///
+/// `CreateInterval` and `RetainInterval` are declared three times over, by
+/// `CreateLifecyclePolicyRequest`, by `UpdateLifecyclePolicyRequest` and by
+/// `PolicyDetails`, and a request may state them in the body or in the
+/// configuration structure. This is the ONE place their documented domain is
+/// decided, so the create and the update refuse the same values.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Cadence {
+    /// `CreateInterval` as the request BODY states it.
+    pub body_create_interval: Option<i32>,
+    /// `RetainInterval` as the request BODY states it.
+    pub body_retain_interval: Option<i32>,
+    /// `PolicyDetails$CreateInterval` as this request's configuration states it.
+    pub details_create_interval: Option<i32>,
+    /// `PolicyDetails$RetainInterval` as this request's configuration states it.
+    pub details_retain_interval: Option<i32>,
+    /// The creation frequency the policy already holds because some earlier
+    /// request stated it, for an update that states none; a create has nothing
+    /// stored.
+    pub stored_create_interval: Option<i32>,
+    /// The retention period the policy already holds, by the same rule.
+    pub stored_retain_interval: Option<i32>,
+}
+
+impl Cadence {
+    /// Why Amazon Data Lifecycle Manager refuses this cadence, or `None` when it
+    /// is one the documentation admits.
+    ///
+    /// Three documented rules, none of them expressible as a `@range`: the
+    /// creation frequency's [1, 7] days, the retention period's [2, 14] days,
+    /// and "it must be greater than the creation frequency to ensure that the
+    /// policy retains at least 1 snapshot or AMI at any given time".
+    ///
+    /// The magnitude of a value is judged where the request STATES it, so the
+    /// refusal names the member the caller used — the body member or the
+    /// `PolicyDetails` one. The ordering is judged on the pair the policy would
+    /// run on, so an update stating one of the two is compared against the value
+    /// already stored for the other. A member NOTHING has stated takes the
+    /// documented default ([`DEFAULT_CREATE_INTERVAL`] /
+    /// [`DEFAULT_RETAIN_INTERVAL`], which satisfy the ordering), and a default
+    /// the service chose is not a value the caller stated: it is left out of the
+    /// comparison rather than turned into a refusal of the one member stated.
+    pub fn violation(&self) -> Option<InvalidRequestException> {
+        for (prefix, create_interval, retain_interval) in [
+            ("", self.body_create_interval, self.body_retain_interval),
+            (
+                POLICY_DETAILS_PREFIX,
+                self.details_create_interval,
+                self.details_retain_interval,
+            ),
+        ] {
+            if let Some(value) = create_interval {
+                if !(CREATE_INTERVAL_MIN_DAYS..=CREATE_INTERVAL_MAX_DAYS).contains(&value) {
+                    return Some(invalid_request(format!(
+                        "The parameter {prefix}CreateInterval must be between \
+                         {CREATE_INTERVAL_MIN_DAYS} and {CREATE_INTERVAL_MAX_DAYS} days, but \
+                         {value} was requested."
+                    )));
+                }
+            }
+            if let Some(value) = retain_interval {
+                if !(RETAIN_INTERVAL_MIN_DAYS..=RETAIN_INTERVAL_MAX_DAYS).contains(&value) {
+                    return Some(invalid_request(format!(
+                        "The parameter {prefix}RetainInterval must be between \
+                         {RETAIN_INTERVAL_MIN_DAYS} and {RETAIN_INTERVAL_MAX_DAYS} days, but \
+                         {value} was requested."
+                    )));
+                }
+            }
+        }
+
+        let create_interval = self
+            .body_create_interval
+            .or(self.details_create_interval)
+            .or(self.stored_create_interval);
+        let retain_interval = self
+            .body_retain_interval
+            .or(self.details_retain_interval)
+            .or(self.stored_retain_interval);
+        if let (Some(create_interval), Some(retain_interval)) = (create_interval, retain_interval) {
+            if retain_interval <= create_interval {
+                return Some(invalid_request(format!(
+                    "The parameter RetainInterval ({retain_interval} days) must be greater than \
+                     the creation frequency CreateInterval ({create_interval} days) to ensure \
+                     that the policy retains at least 1 snapshot or AMI at any given time."
+                )));
+            }
+        }
+        None
+    }
+}
+
+/// The first schedule in `details` whose `CreateRule` states a creation interval
+/// outside [`SUPPORTED_CREATE_RULE_INTERVALS`], as (how the schedule is named,
+/// the interval it stated), or `None` when every schedule states a supported one.
+///
+/// EVERY element of `Schedules` is examined (`@length(min: 1, max: 4)`), not just
+/// the first: a policy is refused for the interval of whichever schedule carries
+/// one the service does not support.
+pub fn schedule_with_unsupported_create_interval(
+    details: Option<&PolicyDetails>,
+) -> Option<(String, i32)> {
+    details?
+        .schedules
+        .as_ref()?
+        .iter()
+        .enumerate()
+        .find_map(|(position, schedule)| {
+            let interval = schedule.create_rule.as_ref()?.interval?;
+            (!SUPPORTED_CREATE_RULE_INTERVALS.contains(&interval))
+                .then(|| (schedule_label(position, schedule), interval))
+        })
+}
+
+/// The `InvalidRequestException` for a creation interval the service does not
+/// support. The message is built from the request: it names the schedule that
+/// carries the value, the value itself and the set it falls outside.
+pub fn unsupported_create_rule_interval(schedule: &str, interval: i32) -> InvalidRequestException {
+    let supported: Vec<String> = SUPPORTED_CREATE_RULE_INTERVALS
+        .iter()
+        .map(i32::to_string)
+        .collect();
+    invalid_request(format!(
+        "The parameter CreateRule.Interval in schedule {{{schedule}}} was {interval}. The \
+         supported values are {}.",
+        supported.join(", ")
+    ))
+}
+
 /// How the first schedule in `details` whose `CreateRule` states when to create
 /// BOTH ways is named, or `None` when no schedule does.
 ///
@@ -806,11 +974,20 @@ pub fn schedule_with_conflicting_create_rule(details: Option<&PolicyDetails>) ->
                 .as_ref()
                 .is_some_and(create_rule_states_both_forms)
         })
-        .map(|(position, schedule)| match schedule.name.as_deref() {
-            Some(name) if !name.is_empty() => name.to_string(),
-            // 1-based, as a validation path numbers a list element.
-            _ => format!("Schedules[{}]", position + 1),
-        })
+        .map(|(position, schedule)| schedule_label(position, schedule))
+}
+
+/// How a refusal names the schedule at `position` in `Schedules`.
+///
+/// `Schedule$Name` is optional, so a schedule that carries none is named by its
+/// position instead — what matters is that the caller can tell WHICH of its
+/// schedules to correct.
+fn schedule_label(position: usize, schedule: &Schedule) -> String {
+    match schedule.name.as_deref() {
+        Some(name) if !name.is_empty() => name.to_string(),
+        // 1-based, as a validation path numbers a list element.
+        _ => format!("Schedules[{}]", position + 1),
+    }
 }
 
 /// True when `rule` states its schedule as a cron expression AND as an interval.
