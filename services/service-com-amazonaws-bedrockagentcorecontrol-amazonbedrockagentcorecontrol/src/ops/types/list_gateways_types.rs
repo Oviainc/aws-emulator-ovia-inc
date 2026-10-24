@@ -25,7 +25,15 @@ pub struct ListGatewaysOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#GatewaySummary")]
+/// `GatewaySummary`, the row `ListGateways` carries. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `updatedAt` target `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="shape", shape="GatewaySummary")`),
+/// and the derive does not put that trait on a member schema — see
+/// `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GatewaySummary {
     pub gateway_id: String,
@@ -37,4 +45,34 @@ pub struct GatewaySummary {
     pub authorizer_type: String,
     pub protocol_type: Option<String>,
 }
+
+agentcore_schema_and_codec!(
+    GatewaySummary,
+    GATEWAY_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#GatewaySummary",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "GatewaySummary",
+    (M_GATEWAY_ID, gateway_id, "gatewayId", 0, req, string),
+    (M_NAME, name, "name", 1, req, string),
+    (M_STATUS, status, "status", 2, req, string),
+    (M_DESCRIPTION, description, "description", 3, opt, string),
+    (M_CREATED_AT, created_at, "createdAt", 4, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 5, req, date_time),
+    (
+        M_AUTHORIZER_TYPE,
+        authorizer_type,
+        "authorizerType",
+        6,
+        req,
+        string
+    ),
+    (
+        M_PROTOCOL_TYPE,
+        protocol_type,
+        "protocolType",
+        7,
+        opt,
+        string
+    ),
+);
 

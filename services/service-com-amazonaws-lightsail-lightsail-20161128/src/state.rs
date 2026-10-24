@@ -501,6 +501,9 @@ pub const OPERATION_TYPE_UPDATE_DOMAIN_ENTRY: &str = "UpdateDomainEntry";
 /// The `operationType` the log entry of an entry's removal from a zone carries,
 /// the modelled `OperationType` enum's own `DeleteDomainEntry` member.
 pub const OPERATION_TYPE_DELETE_DOMAIN_ENTRY: &str = "DeleteDomainEntry";
+/// The `operationType` the log entry of a whole zone's removal carries, the
+/// modelled `OperationType` enum's own `DeleteDomain` member.
+pub const OPERATION_TYPE_DELETE_DOMAIN: &str = "DeleteDomain";
 /// The `operationType` the log entry of an `ExportSnapshot` call carries.
 ///
 /// `Operation$operationType` targets the modelled `OperationType` enum, whose
@@ -7625,6 +7628,17 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// Store a newly created domain recordset.
     pub fn insert_domain(&mut self, domain: StoredDomain) {
         self.domains.insert(domain.name.clone(), domain);
+    }
+
+    /// Remove the domain recordset `name` names, answering it. `None` when
+    /// nothing matched.
+    ///
+    /// A zone's recordset entries live on the record, so removing it removes
+    /// "the specified domain recordset and all of its domain records" — what the
+    /// modelled `DeleteDomain` documentation says the call deletes — in one go,
+    /// with no second map to keep in step.
+    pub fn remove_domain(&mut self, name: &str) -> Option<StoredDomain> {
+        self.domains.remove(name)
     }
 
     /// The domain recordset `name` names, for an operation the spec says mutates

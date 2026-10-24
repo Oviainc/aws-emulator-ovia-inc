@@ -171,33 +171,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `maxResults` has the modeled range 1..100; absent, a page holds that
-        // same documented maximum. The floor of 1 keeps the handler correct on
-        // its own terms rather than relying on the boundary check: a page size
-        // of zero would be a silent dead end.
-        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
-            .unwrap_or(MAX_PAGE_SIZE as usize)
-            .max(1);
-
-        let mut agent_runtimes = Vec::new();
-        let mut next_token = None;
-        let mut last_included: Option<&str> = None;
-        for (id, record) in &store.agent_runtimes {
-            if resume_after.as_deref().is_some_and(|last| id.as_str() <= last) {
-                continue;
-            }
-            // A runtime whose every version was deleted has no summary to report.
-            let Some(summary) = record.summary(now) else {
-                continue;
-            };
-            if agent_runtimes.len() >= page_size {
-                // At least one runtime is left over, so hand back a token that
-                // resumes exactly where this page ended.
-                next_token = last_included.map(crate::state::encode_page_token);
-                break;
-            }
-            agent_runtimes.push(summary);
-            last_included = Some(id.as_str());
-        }
+        // same documented maximum. The page walk is `crate::state`'s, so every
+        // listing of this service pages by one rule; a runtime whose every
+        // version was deleted has no summary to report, which the walk passes
+        // over.
+        let page_size = crate::state::page_size(input.max_results, MAX_PAGE_SIZE);
+        let (agent_runtimes, next_token) = crate::state::page_over(
+            &store.agent_runtimes,
+            resume_after.as_deref(),
+            page_size,
+            |record| record.summary(now),
+        );
 
         Ok(ListAgentRuntimesOutput {
             agent_runtimes,
