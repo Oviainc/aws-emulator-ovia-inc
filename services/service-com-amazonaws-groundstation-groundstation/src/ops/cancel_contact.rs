@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(CancelContactOutput {
             contact_id: Some(contact.contact_id.clone()),
-            version_id: Some(contact.version_id),
+            version_id: Some(contact.latest_version_id()),
         })
     }
 }

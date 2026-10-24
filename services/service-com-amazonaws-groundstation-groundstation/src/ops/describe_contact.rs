@@ -192,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DescribeContactOutput {
             contact_id: Some(contact.contact_id.clone()),
             mission_profile_arn: Some(contact.mission_profile_arn.clone()),
-            satellite_arn: contact.satellite_arn.clone(),
+            satellite_arn: contact.satellite_arn().map(str::to_string),
             start_time: Some(contact.start_time),
             end_time: Some(contact.end_time),
             pre_pass_start_time: Some(contact.pre_pass_start_time),
@@ -208,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             dataflow_list: None,
             visibility_start_time: None,
             visibility_end_time: None,
-            tracking_overrides: contact.tracking_overrides.clone(),
+            tracking_overrides: contact.tracking_overrides().cloned(),
             ephemeris: None,
             version: Some(contact.version()),
         })

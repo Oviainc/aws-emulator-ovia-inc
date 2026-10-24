@@ -284,7 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input
                     .satellite_arn
                     .as_ref()
-                    .is_none_or(|arn| contact.satellite_arn.as_ref() == Some(arn))
+                    .is_none_or(|arn| contact.satellite_arn() == Some(arn.as_str()))
             })
             .filter(|contact| {
                 input
@@ -295,7 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|contact| ContactData {
                 contact_id: Some(contact.contact_id.clone()),
                 mission_profile_arn: Some(contact.mission_profile_arn.clone()),
-                satellite_arn: contact.satellite_arn.clone(),
+                satellite_arn: contact.satellite_arn().map(str::to_string),
                 start_time: Some(contact.start_time),
                 end_time: Some(contact.end_time),
                 pre_pass_start_time: Some(contact.pre_pass_start_time),

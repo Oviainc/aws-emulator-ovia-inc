@@ -54,6 +54,14 @@ pub const SCHEDULING_SETTLES_AFTER: Duration = Duration::from_millis(300);
 /// a caller that reads the group straight after creating it still observes `creating`.
 pub const ENDPOINT_CREATION_SETTLES_AFTER: Duration = Duration::from_millis(300);
 
+/// `UpdateContact` appends a contact version in `UPDATING` ("the version is being applied
+/// to the contact" — `smithy_query(query="shape", shape="VersionStatus")`); the service
+/// applies it and it becomes `ACTIVE` on its own. CHOSEN span (AWS documents no duration
+/// for it), inside the 250–750 ms band this project gives a clock-owed transition, so a
+/// caller that reads the contact straight after updating it still observes the version
+/// being applied and the configuration still in force.
+pub const VERSION_ACTIVATES_AFTER: Duration = Duration::from_millis(300);
+
 /// `CreateEphemeris` admits an ephemeris in `VALIDATING`; the service validates the
 /// supplied data and the ephemeris reaches `ENABLED`, `DISABLED` or `INVALID` on its own.
 /// CHOSEN span (AWS documents no duration for it — the real service takes up to minutes to
@@ -837,12 +845,19 @@ impl MissionProfile {
     }
 }
 
-/// A contact as `ReserveContact` stored it.
+/// A contact as `ReserveContact` stored it, plus every version `UpdateContact` has
+/// appended to it.
+///
+/// The satellite the contact is flown against and the tracking overrides the antenna
+/// uses are NOT fields here: they belong to a VERSION of the contact
+/// ([`ContactVersionRecord`]), and the contact is flown with whichever version is active
+/// — [`Contact::satellite_arn`] and [`Contact::tracking_overrides`] read it. That keeps
+/// one record of each value, rather than a contact-level copy that can drift from the
+/// version that produced it.
 #[derive(Debug, Clone)]
 pub struct Contact {
     pub contact_id: String,
     pub mission_profile_arn: String,
-    pub satellite_arn: Option<String>,
     pub start_time: DateTime,
     pub end_time: DateTime,
     pub pre_pass_start_time: DateTime,
@@ -850,9 +865,11 @@ pub struct Contact {
     pub ground_station: String,
     pub contact_status: String,
     pub region: String,
-    pub version_id: i32,
-    pub tracking_overrides: Option<TrackingOverrides>,
     pub tags: HashMap<String, String>,
+    /// Every version of this contact, oldest first and never empty: `ReserveContact`
+    /// mints version [`FIRST_VERSION_ID`] and each accepted `UpdateContact` appends the
+    /// next one.
+    pub versions: Vec<ContactVersionRecord>,
     /// When the reservation was accepted.
     pub created: DateTime,
     /// When the contact last changed.
@@ -863,14 +880,114 @@ pub struct Contact {
     pub scheduling_settles_at: Option<SystemTime>,
 }
 
-/// The status of the one version a reserved contact has: it is the current version of
-/// the contact, and the model's `VersionStatus` enum documents `ACTIVE` as exactly that
-/// ("The version is the current active version of the contact" —
-/// `smithy_query(query="shape", shape="VersionStatus")`, whose values are `UPDATING`,
-/// `ACTIVE`, `SUPERSEDED` and `FAILED_TO_UPDATE`). DERIVED, not recalled: this service
-/// mints one version per contact, nothing is updating it and nothing supersedes it while
-/// `UpdateContact` answers 501, which leaves `ACTIVE` as the only value that holds.
+/// The model's `VersionStatus` values, whose full set is `UPDATING`, `ACTIVE`,
+/// `SUPERSEDED` and `FAILED_TO_UPDATE` (`smithy_query(query="shape",
+/// shape="VersionStatus")`).
+///
+/// A version this service holds carries one of the first three: it is `UPDATING` while
+/// the service is applying it ("the version is being applied to the contact"), `ACTIVE`
+/// once it is the one in force ("the current active version of the contact") and
+/// `SUPERSEDED` once a newer version replaced it ("replaced by a newer version").
+/// `FAILED_TO_UPDATE` is the status of an update this emulator never produces: nothing
+/// here fails applying a version, so no version is ever left in it.
 pub const ACTIVE_VERSION_STATUS: &str = "ACTIVE";
+
+/// See [`ACTIVE_VERSION_STATUS`].
+pub const UPDATING_VERSION_STATUS: &str = "UPDATING";
+
+/// See [`ACTIVE_VERSION_STATUS`].
+pub const SUPERSEDED_VERSION_STATUS: &str = "SUPERSEDED";
+
+/// The version a reserved contact starts at, and the smallest `versionId` the model
+/// admits (`VersionId`, range 1..128 — `smithy_query(query="shape",
+/// shape="VersionId")`).
+pub const FIRST_VERSION_ID: i32 = 1;
+
+/// How many versions one contact can have: the LARGEST `versionId` the model admits
+/// (`VersionId`, range 1..128), since versions are numbered from [`FIRST_VERSION_ID`]
+/// without a gap. An `UpdateContact` that would need a version past it cannot be
+/// answered with a `versionId` the model can carry, so it is refused with the modelled
+/// `ResourceLimitExceededException`.
+pub const MAX_CONTACT_VERSIONS: i32 = 128;
+
+/// The `ContactStatus` values in which a contact still takes a new version.
+///
+/// `UpdateContact` changes what the antenna does during the pass — which satellite it
+/// tracks (`satelliteArn`) and how (`trackingOverrides`) — so it can only be answered
+/// while the pass is still ahead of the contact. Of the model's `ContactStatus` values
+/// (`smithy_query(query="shape", shape="ContactStatus")`), these two are the ones before
+/// a pass begins: from `PREPASS` on the ground station is already working the contact,
+/// `CANCELLING` is a release under way, `CANCELLED`, `AWS_CANCELLED`, `COMPLETED`,
+/// `FAILED`, `FAILED_TO_SCHEDULE` and `AWS_FAILED` are contacts that will never be
+/// flown again, and `AVAILABLE` is a window that was offered and never reserved, so it
+/// is not a contact this store holds.
+///
+/// CHOSEN gate: AWS documents `UpdateContact` only as "Updates a specific contact", so
+/// which statuses still take an update is this emulator's rule, stated once here rather
+/// than per operation.
+pub const STATUSES_OPEN_TO_UPDATE: &[&str] = &["SCHEDULED", "SCHEDULING"];
+
+/// One version of a contact: the configuration that version carries, and where the
+/// version stands in the contact's history.
+///
+/// A contact is versioned because `UpdateContact` POSTs to
+/// `/contact/{contactId}/versions` and answers a `versionId`
+/// (`smithy_query(query="operation", operation="UpdateContact")`): an update does not
+/// overwrite the contact's configuration, it appends a version which the service then
+/// applies, superseding the version before it.
+#[derive(Debug, Clone)]
+pub struct ContactVersionRecord {
+    pub version_id: i32,
+    /// The satellite this version flies the contact against; `None` when neither this
+    /// version nor the one it was based on named one.
+    pub satellite_arn: Option<String>,
+    /// The tracking overrides this version flies the contact with.
+    pub tracking_overrides: Option<TrackingOverrides>,
+    /// When the version was created ("time the contact version was created in UTC" —
+    /// `ContactVersion$created`).
+    pub created: DateTime,
+    /// When it became the contact's active version ("a version is activated when it
+    /// becomes the current active version of the contact"); `None` while it is still
+    /// being applied, or if a newer version replaced it before it was.
+    pub activated: Option<DateTime>,
+    /// When a newer version replaced it ("a version is superseded when a newer version
+    /// becomes active").
+    pub superseded: Option<DateTime>,
+    /// This version's [`ACTIVE_VERSION_STATUS`]-family status.
+    pub status: String,
+    /// The `clientToken` of the `UpdateContact` that appended this version, when it
+    /// carried one. `clientToken` is `@idempotencyToken` on an `@idempotent` operation,
+    /// so a retry carrying the same token answers with THIS version instead of
+    /// appending another.
+    pub client_token: Option<String>,
+    /// The instant the service owes this version its `UPDATING` -> `ACTIVE` move; `None`
+    /// once the move has been materialised, or for a version that was never pending.
+    pub activates_at: Option<SystemTime>,
+}
+
+impl ContactVersionRecord {
+    /// Version [`FIRST_VERSION_ID`], as `ReserveContact` mints it: the configuration the
+    /// contact is reserved with is in force from the instant the reservation is
+    /// accepted, so this version is `ACTIVE` and activated right away — nothing is still
+    /// applying it and nothing precedes it.
+    pub fn initial(
+        created: DateTime,
+        satellite_arn: Option<String>,
+        tracking_overrides: Option<TrackingOverrides>,
+    ) -> Self {
+        Self {
+            version_id: FIRST_VERSION_ID,
+            satellite_arn,
+            tracking_overrides,
+            created,
+            activated: Some(created),
+            superseded: None,
+            status: ACTIVE_VERSION_STATUS.to_string(),
+            client_token: None,
+            activates_at: None,
+        }
+    }
+}
 
 /// The `ContactStatus` values in which a contact holds NO antenna time for the account,
 /// so its window counts no minutes against the account's monthly usage.
@@ -919,19 +1036,156 @@ impl Contact {
         (seconds / 60.0).ceil().min(f64::from(i32::MAX)) as i32
     }
 
+    /// The version in force: the newest one that has been activated, which is the
+    /// configuration the contact is flown with. A version still being applied
+    /// (`UPDATING`) is not in force yet, so it is not this one.
+    pub fn active_version(&self) -> Option<&ContactVersionRecord> {
+        self.versions
+            .iter()
+            .rev()
+            .find(|version| version.status == ACTIVE_VERSION_STATUS)
+    }
+
+    /// The newest version of this contact, whatever its status — the one an update is
+    /// based on and the one a `versionId` answer names.
+    pub fn latest_version(&self) -> Option<&ContactVersionRecord> {
+        self.versions.last()
+    }
+
+    /// The `versionId` this contact's operations answer with: its newest version's.
+    pub fn latest_version_id(&self) -> i32 {
+        self.latest_version()
+            .map_or(FIRST_VERSION_ID, |version| version.version_id)
+    }
+
+    /// The satellite the contact is flown against: the active version's.
+    ///
+    /// The ACTIVE version, not the latest: a version still being applied is not in force
+    /// yet, so a read reports the configuration the contact would fly with right now.
+    /// [`Contact::append_version`] bases its merge on the LATEST version instead, so
+    /// chained updates compose rather than each one starting from the version in force.
+    pub fn satellite_arn(&self) -> Option<&str> {
+        self.active_version()
+            .and_then(|version| version.satellite_arn.as_deref())
+    }
+
+    /// The tracking overrides the contact is flown with: the active version's (see
+    /// [`Contact::satellite_arn`] on active versus latest).
+    pub fn tracking_overrides(&self) -> Option<&TrackingOverrides> {
+        self.active_version()
+            .and_then(|version| version.tracking_overrides.as_ref())
+    }
+
     /// This contact's version record, as `DescribeContact` and `ListContacts` report
-    /// it: the one version `ReserveContact` created, still the active one.
+    /// it: its NEWEST version — the one in force, or the one being applied while an
+    /// update settles, which is what a caller polls to watch an update land.
+    ///
+    /// INFALLIBLE, because a contact always has at least one version: a reservation
+    /// mints [`FIRST_VERSION_ID`] and nothing removes a version. Were that invariant
+    /// ever broken the answer falls back to the contact's own first version rather than
+    /// reporting no version at all.
     pub fn version(&self) -> ContactVersion {
+        match self.latest_version() {
+            Some(record) => self.version_record(record),
+            None => self.version_record(&ContactVersionRecord::initial(self.created, None, None)),
+        }
+    }
+
+    /// `record` as a `ContactVersion` response member.
+    pub fn version_record(&self, record: &ContactVersionRecord) -> ContactVersion {
         ContactVersion {
-            version_id: Some(self.version_id),
-            created: Some(self.created),
-            activated: None,
-            superseded: None,
-            last_updated: Some(self.last_updated),
-            status: Some(ACTIVE_VERSION_STATUS.to_string()),
+            version_id: Some(record.version_id),
+            created: Some(record.created),
+            activated: record.activated,
+            superseded: record.superseded,
+            // A version that has been superseded was last touched when it was
+            // superseded; the newest version is the one every later change to the
+            // contact lands on, so its lastUpdated is the contact's own.
+            last_updated: Some(record.superseded.unwrap_or(self.last_updated)),
+            status: Some(record.status.clone()),
+            // Nothing in this emulator fails applying a version, so the members
+            // reporting a failed update carry nothing.
             failure_codes: None,
             failure_message: None,
         }
+    }
+
+    /// Append a version carrying `satellite_arn` and `tracking_overrides`, and answer
+    /// its `versionId`.
+    ///
+    /// A member the update does not name keeps the value the newest version already
+    /// carries, so an update that names only one of them does not drop the other. The
+    /// version is admitted `UPDATING`: the service owes it its move to `ACTIVE`
+    /// [`VERSION_ACTIVATES_AFTER`] from now, which is when it takes force and supersedes
+    /// the version before it (see [`Contact::apply_due_versions`]).
+    pub fn append_version(
+        &mut self,
+        satellite_arn: Option<String>,
+        tracking_overrides: Option<TrackingOverrides>,
+        client_token: Option<String>,
+        now: DateTime,
+    ) -> i32 {
+        let base = self.latest_version();
+        let version_id = base.map_or(FIRST_VERSION_ID, |version| version.version_id + 1);
+        let satellite_arn =
+            satellite_arn.or_else(|| base.and_then(|version| version.satellite_arn.clone()));
+        let tracking_overrides = tracking_overrides
+            .or_else(|| base.and_then(|version| version.tracking_overrides.clone()));
+        self.versions.push(ContactVersionRecord {
+            version_id,
+            satellite_arn,
+            tracking_overrides,
+            created: now,
+            activated: None,
+            superseded: None,
+            status: UPDATING_VERSION_STATUS.to_string(),
+            client_token,
+            activates_at: Some(SystemTime::now() + VERSION_ACTIVATES_AFTER),
+        });
+        self.last_updated = now;
+        version_id
+    }
+
+    /// The version `client_token` already appended to this contact, when that token has
+    /// been seen: `clientToken` is `@idempotencyToken`, so a retry carrying it answers
+    /// with the version it minted the first time rather than appending another.
+    pub fn version_minted_by(&self, client_token: &str) -> Option<&ContactVersionRecord> {
+        self.versions
+            .iter()
+            .find(|version| version.client_token.as_deref() == Some(client_token))
+    }
+
+    /// Materialise the `UPDATING` -> `ACTIVE` move of every version the clock has
+    /// already made due: the newest due version takes force, every version before it is
+    /// superseded, and the contact is flown with the new one from here on.
+    ///
+    /// The move was owed at this instant whether or not anybody called, so applying it
+    /// on a read changes nothing a later caller could otherwise have seen.
+    pub fn apply_due_versions(&mut self) {
+        let now = SystemTime::now();
+        let Some(activating) = self
+            .versions
+            .iter()
+            .rposition(|version| version.activates_at.is_some_and(|due| due <= now))
+        else {
+            return;
+        };
+
+        let stamp = now_timestamp();
+        for (position, version) in self.versions.iter_mut().enumerate() {
+            if position == activating {
+                version.status = ACTIVE_VERSION_STATUS.to_string();
+                version.activated = Some(stamp);
+                version.activates_at = None;
+            } else if position < activating && version.superseded.is_none() {
+                // Every older version is replaced — including one still pending, which
+                // a newer version overtook before it could take force.
+                version.status = SUPERSEDED_VERSION_STATUS.to_string();
+                version.superseded = Some(stamp);
+                version.activates_at = None;
+            }
+        }
+        self.last_updated = stamp;
     }
 
     /// `tags` the way a response carries them: always the map, empty when the
@@ -1138,6 +1392,19 @@ pub fn config_mutation_not_found_message(config_type: &str, config_id: &str) -> 
 pub fn mission_profile_mutation_not_found_message(mission_profile_id: &str) -> String {
     format!(
         "No mission profile found with ID {mission_profile_id} for customer {}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The message `UpdateContact` carries when `{contactId}` names no contact: the id the
+/// request addressed plus the account the write was scoped to — the composition every
+/// MUTATION path of this service uses ([`config_mutation_not_found_message`],
+/// [`mission_profile_mutation_not_found_message`]), where the READ path
+/// (`DescribeContact`) answers a bare literal and `CancelContact` quotes the id on its
+/// own.
+pub fn contact_mutation_not_found_message(contact_id: &str) -> String {
+    format!(
+        "No contact found with ID {contact_id} for customer {}",
         ::engine::emulator_account_id()
     )
 }
@@ -2194,13 +2461,15 @@ impl ComAmazonawsGroundstationGroundstationState {
         }
     }
 
-    /// Materialise every `SCHEDULING` -> `SCHEDULED` move the clock has already made
-    /// due. A reporting operation calls this before reading: the move was owed at this
-    /// instant whether or not anybody called, so applying it changes nothing a later
-    /// caller could otherwise have seen.
+    /// Materialise every `SCHEDULING` -> `SCHEDULED` move and every `UPDATING` ->
+    /// `ACTIVE` contact-version move the clock has already made due. A reporting
+    /// operation calls this before reading: the moves were owed at this instant whether
+    /// or not anybody called, so applying them changes nothing a later caller could
+    /// otherwise have seen.
     pub fn settle_due_contacts(&mut self) {
         let now = SystemTime::now();
         for contact in self.contacts.values_mut() {
+            contact.apply_due_versions();
             let Some(due) = contact.scheduling_settles_at else {
                 continue;
             };

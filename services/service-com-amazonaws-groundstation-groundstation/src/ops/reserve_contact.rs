@@ -220,7 +220,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let contact = crate::state::Contact {
             contact_id: contact_id.clone(),
             mission_profile_arn: input.mission_profile_arn,
-            satellite_arn: input.satellite_arn,
             start_time: input.start_time,
             end_time: input.end_time,
             // The pre/post-pass window is the contact window widened by the profile's
@@ -238,8 +237,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // to SCHEDULED, which any later read materialises once it is due.
             contact_status: "SCHEDULING".to_string(),
             region: crate::state::request_region(ctx.parts()),
-            version_id: 1,
-            tracking_overrides: input.tracking_overrides,
+            // The satellite and the tracking overrides the contact is reserved with are
+            // its FIRST version: `UpdateContact` appends further ones, and the contact
+            // is flown with whichever is active.
+            versions: vec![crate::state::ContactVersionRecord::initial(
+                now,
+                input.satellite_arn,
+                input.tracking_overrides,
+            )],
             tags: input.tags.unwrap_or_default(),
             created: now,
             last_updated: now,
@@ -265,7 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 contact_id: contact_id.clone(),
             },
         );
-        let version_id = contact.version_id;
+        let version_id = contact.latest_version_id();
         guard.contacts.insert(contact_id.clone(), contact);
 
         Ok(ReserveContactOutput {
