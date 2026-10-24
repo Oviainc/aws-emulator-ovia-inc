@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRouterNetworkInterface
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRouterNetworkInterface`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRouterNetworkInterface::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a router network interface in this service's store and answers with the STORED
+//! record, read back out of the store. The interface's identity is the
+//! `routerNetworkInterface` ARN minted here; the read side is
+//! BatchGetRouterNetworkInterface.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +86,29 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{StoredRouterNetworkInterface, SERVICE_NAMESPACE};
+
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]).
+fn bad_request(detail: impl Into<String>) -> CreateRouterNetworkInterfaceError {
+    CreateRouterNetworkInterfaceErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
+/// The server-side failure for a store this service cannot reach.
+fn store_unavailable(detail: &str) -> CreateRouterNetworkInterfaceError {
+    CreateRouterNetworkInterfaceErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: detail.to_string(),
+        },
+    )
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,18 +183,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRouterNetworkInterface` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRouterNetworkInterfaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRouterNetworkInterface"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable(
+                "the mediaconnect router network interface store is unavailable",
+            ));
+        };
+
+        // "The Amazon Web Services Region for the router network interface. Defaults to the
+        // current region if not specified" — and the Region is a segment of the ARN this
+        // operation mints, which the modelled `RouterNetworkInterfaceArn` pattern constrains.
+        let region = match input.region_name.clone().filter(|name| !name.is_empty()) {
+            Some(name) if !crate::state::is_region_token(&name) => {
+                return Err(bad_request(format!(
+                    "RegionName {name:?} is not an Amazon Web Services Region name."
+                )))
+            }
+            Some(name) => name,
+            None => crate::state::request_region(ctx.parts()),
+        };
+
+        // `Tags` writes the same kind of tag map TagResource writes, so a pair it carries is
+        // bounded by the same rule, named once in `crate::state`.
+        let requested_tags = input.tags.clone().unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(bad_request(format!(
+                "A create router network interface request may include at most {} Tags \
+                 entries; this one has {}.",
+                crate::state::MAX_TAGS_PER_RESOURCE,
+                requested_tags.len()
+            )));
+        }
+        for (key, value) in &requested_tags {
+            if let Some(reason) = crate::state::tag_pair_rejection(key, value) {
+                return Err(bad_request(reason));
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `ClientToken` is the request's `@idempotencyToken`, "a unique identifier for the
+        // request to ensure idempotency": a create replaying a token this store already
+        // holds answers with the interface that token minted instead of minting a second
+        // one.
+        if let Some(token) = input.client_token.as_deref().filter(|t| !t.is_empty()) {
+            let minted = store
+                .router_network_interfaces
+                .values()
+                .find(|interface| interface.client_token.as_deref() == Some(token))
+                .map(|interface| interface.arn.clone());
+            if let Some(arn) = minted {
+                let router_network_interface = store
+                    .router_network_interface_projection(&arn)
+                    .ok_or_else(|| {
+                        store_unavailable(
+                            "the router network interface this ClientToken minted could not \
+                             be read back",
+                        )
+                    })?;
+                return Ok(CreateRouterNetworkInterfaceOutput {
+                    router_network_interface,
+                });
+            }
+        }
+
+        // The store is bounded: nothing evicts a network interface and a read must still
+        // answer what this operation created, so the create refuses once the store is full
+        // rather than growing it without limit. See
+        // `crate::state::MAX_ROUTER_NETWORK_INTERFACES`.
+        if store.router_network_interfaces.len() >= crate::state::MAX_ROUTER_NETWORK_INTERFACES {
+            return Err(
+                CreateRouterNetworkInterfaceErrorModeled::RouterNetworkInterfaceServiceQuotaExceededException(
+                    RouterNetworkInterfaceServiceQuotaExceededException {
+                        message: format!(
+                            "This account already holds the maximum of {} router network \
+                             interfaces. Delete a router network interface before creating \
+                             another one.",
+                            crate::state::MAX_ROUTER_NETWORK_INTERFACES
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let suffix = store.next_suffix();
+        let id = crate::state::router_resource_id(suffix);
+        let arn = ::engine::emulator_arn(
+            SERVICE_NAMESPACE,
+            &region,
+            &crate::state::router_network_interface_resource_fragment(&id),
+        );
+
+        store.router_network_interfaces.insert(
+            arn.clone(),
+            StoredRouterNetworkInterface {
+                arn: arn.clone(),
+                id,
+                name: input.name.clone(),
+                configuration: input.configuration.clone(),
+                region_name: region,
+                tags: requested_tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+                // A new network interface is not ready yet: AWS answers the create with an
+                // interface in the non-terminal `CREATING` state, which the clock settles
+                // into `ACTIVE` — there is no start call for an interface — once
+                // `crate::state::TRANSITION_SPAN` has passed.
+                state: crate::state::ROUTER_NETWORK_INTERFACE_STATE_CREATING.to_string(),
+                pending: Some(crate::state::PendingStatus {
+                    status: crate::state::ROUTER_NETWORK_INTERFACE_STATE_ACTIVE.to_string(),
+                    due_at: now + crate::state::TRANSITION_SPAN,
+                }),
+                client_token: input.client_token.clone().filter(|t| !t.is_empty()),
+                created_at: now,
+                updated_at: now,
+            },
+        );
+
+        // The response is the STORED record, read back out of the store, not the request —
+        // through the same projection the batch read answers from, so the association counts
+        // are counted from the inputs and outputs that name this interface (none can yet).
+        let router_network_interface = store
+            .router_network_interface_projection(&arn)
+            .ok_or_else(|| {
+                store_unavailable(
+                    "the router network interface could not be read back after it was stored",
+                )
+            })?;
+        Ok(CreateRouterNetworkInterfaceOutput {
+            router_network_interface,
+        })
     }
 }
+
