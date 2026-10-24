@@ -25,7 +25,9 @@
 //! started it and the instant it started, from which a read DERIVES how far the
 //! job has got. The service's own settings live here too:
 //! the logging options, one entry per scope a call named
-//! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::logging_options`]). Every
+//! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::logging_options`]), and the
+//! account's default encryption configuration
+//! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::default_encryption`]). Every
 //! handler reads and writes THIS struct through [`service_state`]; nothing in
 //! `src/ops/` keeps state of its own.
 
@@ -37,7 +39,7 @@ use crate::ops::types::{
     AssetModelCompositeModelPathSegment, AssetModelCompositeModelSummary, AssetModelHierarchy,
     AssetModelProperty, AssetModelPropertyDefinition, AssetModelStatus, AssetProperty,
     AssetPropertyValue, AssetStatus, AssetSummary, ComputeNode, ComputeNodeExecutionDetails,
-    ComputeNodeExecutionStatus, DatasetConfig, DatasetSource, DatasetStatus,
+    ComputeNodeExecutionStatus, ConfigurationStatus, DatasetConfig, DatasetSource, DatasetStatus,
     ExecutionEnvironmentVariables, ExportErrorReportLocation, ExpressionVariable,
     GatewayCapabilitySummary, GatewayPlatform, ImageLocation, LoggingOptions, Mount,
     MountOverrides, PipelineExecutionStatus, PortalStatus, PortalTypeEntry, ProcessingInput,
@@ -1783,7 +1785,20 @@ fn arn_region(arn: &str) -> &str {
 pub fn check_workspace_encryption(
     configuration: &WorkspaceEncryptionConfiguration,
 ) -> Result<(), String> {
-    let encryption_type = configuration.encryption_type.as_str();
+    check_encryption_selection(
+        configuration.encryption_type.as_str(),
+        configuration.kms_key_id.as_deref(),
+    )
+}
+
+/// The same rules over the two members a caller selects encryption with,
+/// wherever they are selected: the workspace's own configuration above, and the
+/// account-wide default encryption configuration, which carries the same pair of
+/// members at the top level.
+pub fn check_encryption_selection(
+    encryption_type: &str,
+    kms_key_id: Option<&str>,
+) -> Result<(), String> {
     if !ENCRYPTION_TYPE_VALUES.contains(&encryption_type) {
         return Err(format!(
             "The encryptionType {encryption_type} is not supported; it must be one of {}.",
@@ -1792,7 +1807,7 @@ pub fn check_workspace_encryption(
     }
     match (
         encryption_type == ENCRYPTION_TYPE_KMS_BASED,
-        configuration.kms_key_id.is_some(),
+        kms_key_id.is_some(),
     ) {
         (true, false) => Err(format!(
             "A kmsKeyId is required when encryptionType is {ENCRYPTION_TYPE_KMS_BASED}."
@@ -2189,6 +2204,11 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     pub logging_options: HashMap<String, LoggingOptionsRecord>,
     /// Datasets by `datasetId`.
     pub datasets: HashMap<String, DatasetRecord>,
+    /// The account's default encryption configuration, as the last
+    /// `PutDefaultEncryptionConfiguration` left it. `None` is an account nothing
+    /// has configured, which reports [`ENCRYPTION_TYPE_SITEWISE_DEFAULT`] without storing
+    /// anything — see [`Self::default_encryption_configuration`].
+    pub default_encryption: Option<DefaultEncryptionRecord>,
     /// Dataset export jobs by [`dataset_export_job_key`] — the workspace they
     /// were created in and their own id — because every operation on a job
     /// addresses it within a workspace.
@@ -3859,6 +3879,240 @@ pub fn new_id() -> String {
         &hex[16..20],
         &hex[20..32]
     )
+}
+
+/// The `ConfigurationState` of a configuration that is in force.
+pub const CONFIGURATION_STATE_ACTIVE: &str = "ACTIVE";
+
+/// The `ConfigurationState` of a configuration a put has accepted and the
+/// service has not finished applying yet.
+pub const CONFIGURATION_STATE_UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
+
+/// The resource prefix of a KMS alias, in both the bare `alias/<name>` form and
+/// inside an alias ARN.
+const KMS_ALIAS_PREFIX: &str = "alias/";
+
+/// The resource prefix of a KMS key's ARN.
+const KMS_KEY_PREFIX: &str = "key/";
+
+/// The number of digits in an Amazon Web Services account id, which the account
+/// field of an ARN carries.
+const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// The number of dash-separated groups in the id KMS mints for a single-Region
+/// key.
+const KEY_ID_GROUPS: usize = 5;
+
+/// The `mrk-` prefix of the id KMS mints for a multi-Region key, and the number
+/// of hexadecimal digits that follow it.
+const MULTI_REGION_KEY_PREFIX: &str = "mrk-";
+const MULTI_REGION_KEY_ID_DIGITS: usize = 32;
+
+/// The longest ARN this service reports, from the modelled `ARN` type
+/// (`len 1..1600`): a key identifier whose ARN would be longer than this names a
+/// key the service could not report at all, since `kmsKeyArn` is where it would
+/// be reported.
+pub const ARN_MAX_LENGTH: usize = 1600;
+
+/// Whether `candidate` is a KMS key id.
+///
+/// The emulator resolves no KMS key, so only the FORM is judged, and no more
+/// narrowly than the id's two shapes: [`KEY_ID_GROUPS`] non-empty groups of
+/// hexadecimal digits for a single-Region key, or [`MULTI_REGION_KEY_PREFIX`]
+/// and [`MULTI_REGION_KEY_ID_DIGITS`] hexadecimal digits for a multi-Region one.
+fn is_kms_key_id(candidate: &str) -> bool {
+    let hexadecimal =
+        |group: &str| !group.is_empty() && group.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if let Some(digits) = candidate.strip_prefix(MULTI_REGION_KEY_PREFIX) {
+        return digits.len() == MULTI_REGION_KEY_ID_DIGITS && hexadecimal(digits);
+    }
+    let mut groups = 0usize;
+    for group in candidate.split('-') {
+        if !hexadecimal(group) {
+            return false;
+        }
+        groups += 1;
+    }
+    groups == KEY_ID_GROUPS
+}
+
+/// Whether `candidate` is a KMS alias path: [`KMS_ALIAS_PREFIX`] followed by a
+/// non-empty name of the characters a KMS alias name admits (`[a-zA-Z0-9:/_-]`).
+fn is_kms_alias(candidate: &str) -> bool {
+    candidate.strip_prefix(KMS_ALIAS_PREFIX).is_some_and(|name| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b":/_-".contains(&byte))
+    })
+}
+
+/// Whether `candidate` is the full ARN of a KMS key or alias —
+/// `arn:<partition>:kms:<region>:<account>:key/<key id>` or `…:alias/<name>`.
+fn is_kms_arn(candidate: &str) -> bool {
+    let mut fields = candidate.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some(KMS_ARN_SERVICE), Some(region), Some(account), Some(resource)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return false;
+    };
+    !partition.is_empty()
+        && !region.is_empty()
+        && account.len() == ACCOUNT_ID_DIGITS
+        && account.bytes().all(|byte| byte.is_ascii_digit())
+        && (is_kms_alias(resource) || resource.strip_prefix(KMS_KEY_PREFIX).is_some_and(is_kms_key_id))
+}
+
+/// The ARN of the KMS key the identifier `key_id` selects, or `None` when it
+/// selects none.
+///
+/// A key identifier comes in the forms AWS KMS accepts for one: a key id, an
+/// `alias/<name>` path, or the full ARN of either. The ARN itself is built by
+/// [`kms_key_arn`], the one normalisation this service has for a key identifier;
+/// what this adds is the JUDGEMENT a member that must carry an ARN needs — the
+/// emulator resolves no KMS key, so the form of the identifier is all there is to
+/// judge, and an identifier in none of those forms, or one whose ARN names a
+/// partition or a Region the modelled `ARN` pattern excludes (see
+/// [`is_modelled_arn`]), selects nothing this service could report.
+pub fn selected_kms_key_arn(region: &str, key_id: &str) -> Option<String> {
+    if !is_kms_key_identifier(key_id) {
+        return None;
+    }
+    let arn = kms_key_arn(region, key_id);
+    is_modelled_arn(&arn).then_some(arn)
+}
+
+/// Whether `key_id` is a KMS key identifier at all: a key id, an `alias/<name>`
+/// path, or the full ARN of either.
+fn is_kms_key_identifier(key_id: &str) -> bool {
+    if key_id.starts_with("arn:") {
+        return is_kms_arn(key_id);
+    }
+    is_kms_alias(key_id) || is_kms_key_id(key_id)
+}
+
+/// The ARN prefixes the modelled `ARN` type's pattern admits, one per partition
+/// it names: `^arn:aws(-cn|-us-gov)?:`.
+const ARN_PARTITION_PREFIXES: [&str; 3] = ["arn:aws:", "arn:aws-cn:", "arn:aws-us-gov:"];
+
+/// Whether `value` is an ARN this service may report: the whole modelled `ARN`
+/// pattern, `^arn:aws(-cn|-us-gov)?:[a-zA-Z0-9-:\/_\.]+$`.
+///
+/// A caller-supplied ARN is read against this before it is reported back in an
+/// ARN member, because a value outside the pattern is one no member of that type
+/// can carry, whatever the resource it names.
+pub fn is_modelled_arn(value: &str) -> bool {
+    ARN_PARTITION_PREFIXES
+        .into_iter()
+        .find_map(|prefix| value.strip_prefix(prefix))
+        .is_some_and(|rest| {
+            !rest.is_empty()
+                && rest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-:/_.".contains(&byte))
+        })
+}
+
+/// The default encryption configuration a put stored: which encryption the
+/// account selected, the key it selected for it, and when the configuration the
+/// put accepted falls due to be in force.
+#[derive(Debug, Clone)]
+pub struct DefaultEncryptionRecord {
+    /// The modelled `EncryptionType` the put named.
+    pub encryption_type: String,
+    /// The ARN of the KMS key the put selected (see [`kms_key_arn`]); `None`
+    /// under [`ENCRYPTION_TYPE_SITEWISE_DEFAULT`], which uses no customer managed key.
+    pub kms_key_arn: Option<String>,
+    /// When [`CONFIGURATION_STATE_UPDATE_IN_PROGRESS`] ->
+    /// [`CONFIGURATION_STATE_ACTIVE`] falls due: the instant of the put plus
+    /// [`ACTIVATION_DELAY`]. Stored rather than slept for, so nothing blocks and
+    /// a caller reading straight after the put still observes the state the
+    /// service reports while it applies the change.
+    pub active_at: SystemTime,
+}
+
+impl DefaultEncryptionRecord {
+    /// The `ConfigurationState` this configuration reports at `now`.
+    pub fn state(&self, now: SystemTime) -> &'static str {
+        if now >= self.active_at {
+            CONFIGURATION_STATE_ACTIVE
+        } else {
+            CONFIGURATION_STATE_UPDATE_IN_PROGRESS
+        }
+    }
+}
+
+/// What the two default-encryption operations report: they answer with the same
+/// three members, so they read them from one place.
+#[derive(Debug, Clone)]
+pub struct DefaultEncryptionConfiguration {
+    /// The modelled `encryptionType`.
+    pub encryption_type: String,
+    /// The modelled `kmsKeyArn`, absent unless the configuration uses a customer
+    /// managed key.
+    pub kms_key_arn: Option<String>,
+    /// The modelled `configurationStatus`.
+    pub status: ConfigurationStatus,
+}
+
+impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
+    /// The default encryption configuration the account reports at `now`: the one
+    /// the last put stored, or the service-owned-key default while nothing has
+    /// stored any.
+    ///
+    /// A pure READ: an unconfigured account is not materialised, and a
+    /// configuration still settling is reported from the instant its put already
+    /// recorded, so reading cannot change what a later caller sees.
+    pub fn default_encryption_configuration(
+        &self,
+        now: SystemTime,
+    ) -> DefaultEncryptionConfiguration {
+        let status = |state: &str| ConfigurationStatus {
+            state: state.to_string(),
+            // No error: nothing in this emulator fails to apply a configuration,
+            // so the modelled `error` details have nothing to report.
+            error: None,
+        };
+        match &self.default_encryption {
+            Some(record) => DefaultEncryptionConfiguration {
+                encryption_type: record.encryption_type.clone(),
+                kms_key_arn: record.kms_key_arn.clone(),
+                status: status(record.state(now)),
+            },
+            None => DefaultEncryptionConfiguration {
+                encryption_type: ENCRYPTION_TYPE_SITEWISE_DEFAULT.to_string(),
+                kms_key_arn: None,
+                status: status(CONFIGURATION_STATE_ACTIVE),
+            },
+        }
+    }
+
+    /// Select `encryption_type` (and `kms_key_arn` with it) as the account's
+    /// default encryption configuration, and report what that call answers with.
+    ///
+    /// The whole setting is replaced: a put is the last word on the account's
+    /// encryption, so one naming the service-owned key drops the customer managed
+    /// key a previous put selected. The configuration the put accepted falls due
+    /// at [`ACTIVATION_DELAY`], the same span this service settles every other
+    /// transition the clock owes at.
+    pub fn set_default_encryption_configuration(
+        &mut self,
+        encryption_type: &str,
+        kms_key_arn: Option<String>,
+        now: SystemTime,
+    ) -> DefaultEncryptionConfiguration {
+        self.default_encryption = Some(DefaultEncryptionRecord {
+            encryption_type: encryption_type.to_string(),
+            kms_key_arn,
+            active_at: now + ACTIVATION_DELAY,
+        });
+        self.default_encryption_configuration(now)
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

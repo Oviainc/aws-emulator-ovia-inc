@@ -69,6 +69,12 @@ mod pipeline_lifecycle;
 // Same reasoning: declared outside the sorted list, which is the stretch every
 // concurrent iotsitewise change edits. Fold it into the list once the churn
 // settles.
+#[path = "all/default_encryption_configuration.rs"]
+mod default_encryption_configuration;
+
+// Same reasoning: declared outside the sorted list, which is the stretch every
+// concurrent iotsitewise change edits. Fold it into the list once the churn
+// settles.
 #[path = "all/task_lifecycle.rs"]
 mod task_lifecycle;
 

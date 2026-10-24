@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDefaultEncryptionConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDefaultEncryptionConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDefaultEncryptionConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The default encryption configuration is an account-wide SETTING, not a
+//! resource: this operation replaces it whole, and
+//! `DescribeDefaultEncryptionConfiguration` reads that same setting back. Both
+//! reach it through `crate::state`'s `default_encryption_configuration` /
+//! `set_default_encryption_configuration`, so neither keeps a copy of its own.
+//! A key identifier is read against the forms AWS KMS accepts for one and
+//! reported back as the key's ARN; the configuration a put accepts is in force
+//! from the instant the put records, so a read taken straight after it still
+//! observes the state the service reports while the change is applied.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +168,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDefaultEncryptionConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDefaultEncryptionConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDefaultEncryptionConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutDefaultEncryptionConfigurationError::Modeled(
+                PutDefaultEncryptionConfigurationErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+
+        // `encryptionType` and `kmsKeyId` are read TOGETHER, against the one
+        // statement this crate has of that pair of rules
+        // (`crate::state::check_encryption_selection`, which the workspace
+        // encryption configuration is read against too): the type must be one the
+        // modelled `EncryptionType` enum defines, and a key identifier is
+        // required under the KMS-based type — which is what that member's
+        // documentation states ("This is required if you use
+        // KMS_BASED_ENCRYPTION") — and refused beside the service-owned-key type.
+        // That second half is a DELIBERATE choice of this emulator's, stated by
+        // no documented rule: storing the key would leave the service either
+        // reporting one for a configuration that uses none, or silently dropping
+        // a member the caller set.
+        let encryption_type = input.encryption_type.as_str();
+        crate::state::check_encryption_selection(encryption_type, input.kms_key_id.as_deref())
+            .map_err(invalid_request)?;
+
+        // Past that check a key identifier is present exactly under the
+        // KMS-based type, and it is reported back as the ARN of the key it
+        // selects.
+        let kms_key_arn = match input.kms_key_id.as_deref() {
+            Some(key_id) => {
+                let region = crate::state::request_region(ctx.parts());
+                let Some(arn) = crate::state::selected_kms_key_arn(&region, key_id) else {
+                    return Err(invalid_request(format!(
+                        "The kmsKeyId {key_id} is not a KMS key identifier: give a key id, an \
+                         alias (alias/MyKey), or the full ARN of either."
+                    )));
+                };
+                // The key is reported back as `kmsKeyArn`, a modelled `ARN`, so
+                // an identifier whose ARN is longer than that type admits names a
+                // key this service could not report at all.
+                if arn.chars().count() > crate::state::ARN_MAX_LENGTH {
+                    return Err(invalid_request(format!(
+                        "The kmsKeyId {key_id} names a key whose ARN is longer than {} characters.",
+                        crate::state::ARN_MAX_LENGTH
+                    )));
+                }
+                Some(arn)
+            }
+            None => None,
+        };
+
+        // The whole setting is replaced — a put is the last word on the account's
+        // encryption — and the configuration it accepts falls due at the span
+        // `crate::state::set_default_encryption_configuration` records, so this
+        // answer reports the state the configuration is in at the instant of the
+        // call.
+        let configuration = state.lock().set_default_encryption_configuration(
+            encryption_type,
+            kms_key_arn,
+            ::std::time::SystemTime::now(),
+        );
+        Ok(PutDefaultEncryptionConfigurationOutput {
+            encryption_type: configuration.encryption_type,
+            kms_key_arn: configuration.kms_key_arn,
+            configuration_status: configuration.status,
+        })
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> PutDefaultEncryptionConfigurationError {
+    PutDefaultEncryptionConfigurationError::Modeled(
+        PutDefaultEncryptionConfigurationErrorModeled::InvalidRequestException(
+            InvalidRequestException { message },
+        ),
+    )
 }
