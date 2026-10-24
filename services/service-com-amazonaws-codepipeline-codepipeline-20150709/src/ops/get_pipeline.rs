@@ -156,19 +156,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        let declaration = pipeline.declaration_at(input.version).ok_or_else(|| {
-            GetPipelineError::from(
-                GetPipelineErrorModeled::PipelineVersionNotFoundException(
-                    PipelineVersionNotFoundException {
-                        message: Some(format!(
-                            "pipeline {} has no version {}",
-                            input.name,
-                            input.version.unwrap_or_default()
-                        )),
-                    },
-                ),
-            )
-        })?;
+        // A version the pipeline never had: the refusal states the same lookup the
+        // not-found above states, with the version the request asked for, so an absent
+        // version and an absent pipeline are distinguishable from the text alone.
+        let declaration = match input.version {
+            None => &pipeline.declaration,
+            Some(version) => pipeline.declaration_at(Some(version)).ok_or_else(|| {
+                GetPipelineError::from(
+                    GetPipelineErrorModeled::PipelineVersionNotFoundException(
+                        PipelineVersionNotFoundException {
+                            message: Some(crate::state::pipeline_version_not_found_message(
+                                &input.name,
+                                version,
+                            )),
+                        },
+                    ),
+                )
+            })?,
+        };
 
         Ok(GetPipelineOutput {
             pipeline: Some(declaration.clone()),

@@ -179,8 +179,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let tags = input.tags.unwrap_or_default();
         // A tag set no resource can carry, each defect reported as the error shape
-        // the model declares for it.
-        if let Err(problem) = crate::state::validate_tags(&tags) {
+        // the model declares for it. The tag-limit refusal names the resource the
+        // limit was exceeded FOR — this request's action-type identity — so a caller
+        // tagging many resources can tell which request was refused.
+        if let Err(problem) = crate::state::validate_tags(
+            &tags,
+            &crate::state::custom_action_type_resource(
+                &input.category,
+                &input.provider,
+                &input.version,
+            ),
+        ) {
             let message = Some(problem.message().to_string());
             return Err(match problem {
                 crate::state::TagProblem::TooMany(_) => {

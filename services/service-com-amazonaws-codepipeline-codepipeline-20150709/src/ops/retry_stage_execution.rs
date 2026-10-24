@@ -206,14 +206,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
 
+            // Unreachable: the id just matched the pipeline's latest execution, so the
+            // store holds it. Stated as the fact it would be — no such execution in
+            // this pipeline — through the one formatter that words that fact, rather
+            // than with a wording invented here.
             let Some(record) = state.executions.get_mut(&input.pipeline_execution_id) else {
                 return Err(
                     RetryStageExecutionErrorModeled::NotLatestPipelineExecutionException(
                         NotLatestPipelineExecutionException {
-                            message: Some(format!(
-                                "Pipeline {} has no execution {}",
-                                input.pipeline_name, input.pipeline_execution_id
-                            )),
+                            message: Some(
+                                crate::state::pipeline_execution_not_found_message(
+                                    &input.pipeline_name,
+                                    &input.pipeline_execution_id,
+                                ),
+                            ),
                         },
                     )
                     .into(),
@@ -226,9 +232,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             else {
                 return Err(RetryStageExecutionErrorModeled::StageNotFoundException(
                     StageNotFoundException {
-                        message: Some(format!(
-                            "Pipeline '{}' does not have a stage with name '{}'",
-                            input.pipeline_name, input.stage_name
+                        message: Some(crate::state::stage_not_found_message(
+                            &input.pipeline_name,
+                            &input.stage_name,
                         )),
                     },
                 )

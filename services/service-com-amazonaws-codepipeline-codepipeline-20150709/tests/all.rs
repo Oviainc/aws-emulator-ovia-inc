@@ -31,6 +31,8 @@ mod custom_action_jobs;
 mod custom_action_types;
 #[path = "all/delete_custom_action_type.rs"]
 mod delete_custom_action_type;
+#[path = "all/error_message_rules.rs"]
+mod error_message_rules;
 #[path = "all/execution_engine.rs"]
 mod execution_engine;
 #[path = "all/pipeline_lifecycle.rs"]

@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             ListPipelinesErrorModeled::InvalidNextTokenException(
                                 InvalidNextTokenException {
                                     message: Some(
-                                        "nextToken was not issued by ListPipelines".to_string(),
+                                        crate::state::invalid_next_token_message(token),
                                     ),
                                 },
                             ),

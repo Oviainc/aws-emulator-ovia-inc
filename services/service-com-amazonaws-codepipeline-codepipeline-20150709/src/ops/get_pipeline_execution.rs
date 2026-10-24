@@ -169,10 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 GetPipelineExecutionError::from(
                     GetPipelineExecutionErrorModeled::PipelineExecutionNotFoundException(
                         PipelineExecutionNotFoundException {
-                            message: Some(format!(
-                                "pipeline {} has no execution {}",
-                                input.pipeline_name, input.pipeline_execution_id
-                            )),
+                            message: Some(
+                                crate::state::pipeline_execution_not_found_message(
+                                    &input.pipeline_name,
+                                    &input.pipeline_execution_id,
+                                ),
+                            ),
                         },
                     ),
                 )

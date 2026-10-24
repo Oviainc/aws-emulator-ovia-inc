@@ -191,7 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         if let Some(tags) = input.tags.as_deref() {
-            if let Err(problem) = crate::state::validate_tags(tags) {
+            if let Err(problem) = crate::state::validate_tags(
+                tags,
+                &crate::state::webhook_resource(&input.webhook.name),
+            ) {
                 let message = Some(problem.message().to_string());
                 return Err(match problem {
                     crate::state::TagProblem::Invalid(_) => {
@@ -219,9 +222,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.pipelines.contains_key(&input.webhook.target_pipeline) {
             return Err(PutWebhookErrorModeled::PipelineNotFoundException(
                 PipelineNotFoundException {
-                    message: Some(format!(
-                        "pipeline {} was not found",
-                        input.webhook.target_pipeline
+                    message: Some(crate::state::pipeline_not_found_message(
+                        &input.webhook.target_pipeline,
                     )),
                 },
             )

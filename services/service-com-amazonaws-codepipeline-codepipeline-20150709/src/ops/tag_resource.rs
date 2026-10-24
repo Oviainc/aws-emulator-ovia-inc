@@ -191,7 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the error shape the model declares for it — the same rule every operation
         // that sets tags here applies. Judged before anything is written, so a
         // refused call leaves the resource's tags as they were.
-        if let Err(problem) = crate::state::validate_tags(&input.tags) {
+        if let Err(problem) = crate::state::validate_tags(
+            &input.tags,
+            &crate::state::arn_resource(&input.resource_arn),
+        ) {
             let message = Some(problem.message().to_string());
             return Err(match problem {
                 crate::state::TagProblem::TooMany(_) => {
@@ -205,15 +208,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The bound is judged on the MERGED set too: rewriting a key the resource
-        // already carries never grows it, while a new key does.
+        // already carries never grows it, while a new key does. Refused by the same
+        // formatter, so one rule is worded one way: the resource the limit was
+        // exceeded for, not the count.
         let merged = crate::state::tag_count_after_merge(&updated, &incoming);
         if merged > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(TagResourceErrorModeled::TooManyTagsException(
                 TooManyTagsException {
-                    message: Some(format!(
-                        "tagging {} would leave it holding {merged} tags, past the limit of {}",
-                        input.resource_arn,
-                        crate::state::MAX_TAGS_PER_RESOURCE
+                    message: Some(crate::state::too_many_tags_message(
+                        &crate::state::arn_resource(&input.resource_arn),
                     )),
                 },
             )
