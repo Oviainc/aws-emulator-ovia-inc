@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeBudgetNotificationsForAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeBudgetNotificationsForAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeBudgetNotificationsForAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists, for every budget the named account holds that carries at least one
+//! notification, that budget's name and the notifications stored on it — the
+//! notifications of the account, grouped by the budget that owns them. Entries are
+//! ordered by `BudgetName` (the order the pagination token indexes into) and paginated
+//! with `MaxResults` / `NextToken`. A budget holding no notification contributes no
+//! notification, so it is not reported. Reporting only — nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +118,12 @@ impl From<DescribeBudgetNotificationsForAccountErrorModeled> for DescribeBudgetN
     }
 }
 
+/// The page size a request that names none gets: "An integer that represents how many
+/// budgets a paginated response contains. The default is 50."
+/// (`DescribeBudgetNotificationsForAccountRequest$MaxResults`, from this service's
+/// model).
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
 /// The `DescribeBudgetNotificationsForAccount` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +160,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeBudgetNotificationsForAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeBudgetNotificationsForAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeBudgetNotificationsForAccount"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeBudgetNotificationsForAccountErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some(
+                        "budgets is mounted on an engine that holds no state for it".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let store = state.lock();
+        // Ordered by `BudgetName`: the pagination token indexes into this order, so it
+        // must not depend on `HashMap` iteration order.
+        let mut found: Vec<&crate::state::StoredBudget> = store
+            .budgets
+            .iter()
+            .filter(|((account, _), stored)| {
+                *account == input.account_id && !stored.notifications.is_empty()
+            })
+            .map(|(_, stored)| stored)
+            .collect();
+        found.sort_by(|left, right| left.budget.budget_name.cmp(&right.budget.budget_name));
+
+        // Paged over the stored budgets themselves, so only the page the caller asked
+        // for is projected rather than every notification the account holds.
+        let (page, next_token) = crate::state::page(
+            &found,
+            Some(input.max_results.unwrap_or(DEFAULT_MAX_RESULTS)),
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(|| {
+            DescribeBudgetNotificationsForAccountErrorModeled::InvalidNextTokenException(
+                InvalidNextTokenException {
+                    message: Some("The pagination token is invalid.".to_string()),
+                },
+            )
+        })?;
+
+        let reported: Vec<BudgetNotificationsForAccount> = page
+            .into_iter()
+            .map(|stored| BudgetNotificationsForAccount {
+                budget_name: Some(stored.budget.budget_name.clone()),
+                notifications: Some(
+                    stored
+                        .notifications
+                        .iter()
+                        .map(|held| held.notification.clone())
+                        .collect(),
+                ),
+            })
+            .collect();
+
+        Ok(DescribeBudgetNotificationsForAccountOutput {
+            budget_notifications_for_account: Some(reported),
+            next_token,
+        })
     }
 }
+
