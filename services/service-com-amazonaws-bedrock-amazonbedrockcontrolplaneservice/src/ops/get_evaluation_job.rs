@@ -191,8 +191,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`smithy_query(query="operation",operation="GetEvaluationJob")`), and that ARN
         // carries the region the job was created in — so the identifier addresses the
         // store on its own, and an ARN of another region names no job here.
-        let store = state.lock();
-        let Some(job) = store.evaluation_job(&input.job_identifier) else {
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(job) = store.evaluation_job(&input.job_identifier, now) else {
             return Err(GetEvaluationJobErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!(

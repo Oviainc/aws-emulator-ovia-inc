@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopEvaluationJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopEvaluationJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopEvaluationJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! Stops the running evaluation job the `jobIdentifier` ARN names: the stored job moves to
+//! `Stopping`, and the clock owes it its move to the terminal `Stopped`
+//! ([`crate::state::EVALUATION_JOB_STOPPED_AFTER`]). A job that is not running has nothing
+//! left to stop, so a further stop is refused with `ValidationException`, and an ARN no
+//! stored job answers to with `ResourceNotFoundException`. `GetEvaluationJob` reads the
+//! status back.
 //!
 //! ## Shape of an operation
 //!
@@ -146,20 +146,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopEvaluationJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopEvaluationJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StopEvaluationJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "evaluation job state is not available on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `EvaluationJobIdentifier` is the job's ARN alone
+        // (`smithy_query(query="operation",operation="StopEvaluationJob")`), and that ARN
+        // carries the region the job was created in — so the identifier addresses the store
+        // on its own, exactly as it does for a read.
+        let Some(job) = store.evaluation_job(&input.job_identifier, now) else {
+            return Err(StopEvaluationJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no evaluation job answers to {} in this account",
+                        input.job_identifier
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "Stops an evaluation job that is current being created or running": a job in any
+        // other status has nothing left to stop, so asking again is refused.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopEvaluationJob"))
+        // The refusal is the modelled `ValidationException` rather than the
+        // `ConflictException` this operation also models, and its message names the job the
+        // stop addressed and reports that the job is already stopped: that is what the
+        // corpus `simparity-behavioral-ga-prod-v1` records Amazon Bedrock answering for a
+        // stop of a job that is already stopped. The two non-running statuses reachable
+        // here are the two a stop itself produces (`Stopping` and `Stopped`), so that is
+        // what every refusal this branch words is about.
+        if !job.is_stoppable() {
+            return Err(StopEvaluationJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Evaluation job: {} is already in a stopped state.",
+                        input.job_identifier
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Stopping is asynchronous, so the job is reported `Stopping` from here onwards and
+        // the clock owes it the terminal status.
+        job.stop(now);
+        Ok(StopEvaluationJobOutput {})
     }
 }
+
