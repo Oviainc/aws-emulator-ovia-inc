@@ -203,6 +203,73 @@ const XML_NAMESPACE: &str = "http://ec2.amazonaws.com/doc/2016-11-15";
 /// and are left to the issue that owns them rather than reworded here.
 const RESPONSE_CONTENT_TYPE: &str = "text/xml;charset=UTF-8";
 
+/// The element an ec2Query ERROR envelope names its request id with.
+///
+/// The EC2 API Reference's error response is
+/// `<Response><Errors><Error><Code/><Message/></Error></Errors><RequestID/></Response>` —
+/// the id sits beside the `<Errors>` block and is spelled `RequestID`, where a SUCCESS
+/// envelope writes the lowercase `requestId` the framework already emits. The framework's
+/// ec2Query error envelope writes neither, so this service adds it here, once, for every
+/// error it renders.
+const ERROR_REQUEST_ID_ELEMENT: &str = "RequestID";
+
+/// The closing element of the ec2Query error envelope, which the request id is written in
+/// front of.
+const ERROR_ENVELOPE_CLOSE: &str = "</Response>";
+
+/// The source of each error envelope's request id: a process-wide counter, so no two
+/// responses of this process can report the same id.
+static NEXT_ERROR_REQUEST_ID: ::std::sync::atomic::AtomicU64 =
+    ::std::sync::atomic::AtomicU64::new(1);
+
+/// A fresh request id, in the 8-4-4-4-12 lowercase-hex form an AWS request id takes.
+///
+/// What a client does with a request id is CORRELATE one response with another, so
+/// uniqueness is the whole invariant — the framework's own renderer puts it as "an
+/// identifier, not a security token: a random v4 UUID is sufficient and need not be
+/// unpredictable" for the success envelope's `<requestId>`
+/// (`vendor/smithy-schema-server/src/query.rs`). So it is minted from a counter, the way
+/// this service mints every resource id it hands out
+/// (`state::ComAmazonawsEc2Amazonec2State::next_id`): a counter cannot repeat, needs no
+/// state of the store's and no dependency of its own, and nothing in a request can
+/// influence it.
+fn new_error_request_id() -> String {
+    let counted = NEXT_ERROR_REQUEST_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+    // 32 hex digits, which the 8-4-4-4-12 grouping below slices exactly.
+    let hex = format!("{counted:032x}");
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// `body` with a freshly generated request id written into the error envelope, or `None`
+/// when the body is not an envelope this can add one to.
+///
+/// One id per response ([`new_error_request_id`]): the id is what a client correlates a
+/// failure on, so each response carries its own — an identifier, not a secret. It is
+/// generated per RESPONSE rather than read from state, so nothing about it is stored and two
+/// refusals are distinguishable.
+///
+/// A body that does not end with the envelope's closing element is left alone rather than
+/// guessed at, so this can only ever add the element the envelope documents.
+fn with_error_request_id(body: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(body).ok()?;
+    let head = text.strip_suffix(ERROR_ENVELOPE_CLOSE)?;
+    let request_id = new_error_request_id();
+    Some(
+        format!(
+            "{head}<{ERROR_REQUEST_ID_ELEMENT}>{request_id}</{ERROR_REQUEST_ID_ELEMENT}>\
+             {ERROR_ENVELOPE_CLOSE}"
+        )
+        .into_bytes(),
+    )
+}
+
 /// The envelope's success flag, as the `<return>` element an ec2Query response
 /// carries.
 ///
@@ -349,6 +416,17 @@ impl ServerProtocol for Ec2QueryEnvelope {
         response
             .headers_mut()
             .insert("content-type", RESPONSE_CONTENT_TYPE);
+        // The envelope's own request id, which the framework's ec2Query error body does not
+        // carry; see [`ERROR_REQUEST_ID_ELEMENT`]. The body the serializer built is in
+        // memory, so it can be read back and rewritten here.
+        let rewritten = response
+            .body()
+            .bytes()
+            .and_then(with_error_request_id)
+            .map(::aws_smithy_types::body::SdkBody::from);
+        if let Some(body) = rewritten {
+            *response.body_mut() = body;
+        }
         Ok(response)
     }
 }
