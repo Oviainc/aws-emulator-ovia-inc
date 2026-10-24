@@ -42,7 +42,10 @@ use std::sync::Arc;
 const NOT_FOUND_CODE: &str = "NotFoundException";
 
 /// A live emulator holding only this service.
-struct Emulator {
+///
+/// `pub(crate)`, with the helpers below, because the sibling suite
+/// `tests/all/reserved_tag_keys.rs` drives the same surface and the harness has one home.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
@@ -56,7 +59,7 @@ impl Emulator {
     /// themselves are not on that gate — `tests/all/payer_account_gate.rs` asserts they
     /// answer the same 404 over the default store — so the designation only makes the
     /// setup reachable.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         engine
             .state::<BillingConductorState>()
@@ -69,7 +72,7 @@ impl Emulator {
 
     /// Send one request over the wire and return the status plus the parsed body
     /// (`Value::Null` for an empty body).
-    async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> (u16, Value) {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> (u16, Value) {
         let builder = http::Request::builder()
             .method(method)
             .uri(format!(
@@ -98,7 +101,7 @@ impl Emulator {
     }
 
     /// `POST /tags/{ResourceArn}` with `Tags` in the body — `TagResource`.
-    async fn tag(&self, resource_arn: &str, tags: &Value) -> (u16, Value) {
+    pub(crate) async fn tag(&self, resource_arn: &str, tags: &Value) -> (u16, Value) {
         self.call(
             "POST",
             &format!("/tags/{}", encode_label(resource_arn)),
@@ -109,7 +112,7 @@ impl Emulator {
 
     /// `DELETE /tags/{ResourceArn}?tagKeys=..&tagKeys=..` — `UntagResource`. `TagKeys` is
     /// bound to `@httpQuery("tagKeys")`, so every key is its own query pair.
-    async fn untag(&self, resource_arn: &str, tag_keys: &[&str]) -> (u16, Value) {
+    pub(crate) async fn untag(&self, resource_arn: &str, tag_keys: &[&str]) -> (u16, Value) {
         let query = tag_keys
             .iter()
             .map(|key| format!("tagKeys={}", encode_label(key)))
@@ -124,13 +127,13 @@ impl Emulator {
     }
 
     /// `GET /tags/{ResourceArn}` — `ListTagsForResource`.
-    async fn list_tags(&self, resource_arn: &str) -> (u16, Value) {
+    pub(crate) async fn list_tags(&self, resource_arn: &str) -> (u16, Value) {
         self.call("GET", &format!("/tags/{}", encode_label(resource_arn)), None)
             .await
     }
 
     /// Create a pricing plan and return the ARN it minted.
-    async fn create_plan(&self, name: &str, tags: Option<Value>) -> String {
+    pub(crate) async fn create_plan(&self, name: &str, tags: Option<Value>) -> String {
         let mut body = json!({ "Name": name });
         if let Some(tags) = tags {
             body["Tags"] = tags;
@@ -147,7 +150,7 @@ impl Emulator {
     }
 
     /// Create a billing group on `plan_arn` and return the ARN it minted.
-    async fn create_group(&self, name: &str, plan_arn: &str, tags: Option<Value>) -> String {
+    pub(crate) async fn create_group(&self, name: &str, plan_arn: &str, tags: Option<Value>) -> String {
         let mut body = json!({
             "Name": name,
             "AccountGrouping": { "LinkedAccountIds": ["111122223333"] },
@@ -169,7 +172,7 @@ impl Emulator {
     }
 
     /// Create a pricing rule and return the ARN it minted.
-    async fn create_rule(&self, name: &str, tags: Option<Value>) -> String {
+    pub(crate) async fn create_rule(&self, name: &str, tags: Option<Value>) -> String {
         let mut body = json!({
             "Name": name,
             "Scope": "GLOBAL",
@@ -192,7 +195,7 @@ impl Emulator {
 
     /// Create a custom line item on `group_arn` with the given `ChargeDetails` and return
     /// the ARN it minted.
-    async fn create_item(
+    pub(crate) async fn create_item(
         &self,
         name: &str,
         group_arn: &str,
@@ -223,7 +226,7 @@ impl Emulator {
 
     /// The tags `ListTagsForResource` reports, as sorted pairs, asserting the read
     /// itself was served.
-    async fn stored_tags(&self, case: &str, resource_arn: &str) -> Vec<(String, String)> {
+    pub(crate) async fn stored_tags(&self, case: &str, resource_arn: &str) -> Vec<(String, String)> {
         let (status, body) = self.list_tags(resource_arn).await;
         assert_eq!(
             status, LIST_TAGS_STATUS,
@@ -252,7 +255,7 @@ impl Emulator {
 /// The status the model binds to the tagging operations
 /// (`smithy_query(query="operation",operation="TagResource")`: `http.code` 204 for all
 /// three).
-const TAGGING_STATUS: u16 = 204;
+pub(crate) const TAGGING_STATUS: u16 = 204;
 
 /// `ListTagsForResource` answers on the same modelled code, with the `Tags` body.
 const LIST_TAGS_STATUS: u16 = TAGGING_STATUS;
@@ -275,7 +278,7 @@ pub(crate) fn encode_label(value: &str) -> String {
 }
 
 /// The wire error code of a failure response (`__type`), without any namespace.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<none>")
@@ -286,7 +289,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// A JSON tag map from pairs.
-fn tag_map(pairs: &[(&str, &str)]) -> Value {
+pub(crate) fn tag_map(pairs: &[(&str, &str)]) -> Value {
     Value::Object(
         pairs
             .iter()
@@ -296,7 +299,7 @@ fn tag_map(pairs: &[(&str, &str)]) -> Value {
 }
 
 /// The expected pairs, sorted the way [`Emulator::stored_tags`] reports them.
-fn expected(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn expected(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     let mut owned: Vec<(String, String)> = pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
