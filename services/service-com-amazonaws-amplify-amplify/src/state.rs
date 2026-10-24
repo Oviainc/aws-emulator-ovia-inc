@@ -9,9 +9,9 @@
 //! `GetApp` after `CreateApp` return the created record field-for-field: a reader
 //! clones what the writer stored, so the two cannot drift.
 //!
-//! Branches and webhooks live INSIDE their owning app, so `DeleteApp` removes them
-//! transitively and `ListBranches` / `ListWebhooks` can never reach another app's
-//! records. Jobs live INSIDE their owning branch for the same reason: `DeleteBranch`
+//! Branches, webhooks and domain associations live INSIDE their owning app, so
+//! `DeleteApp` removes them transitively and `ListBranches` / `ListWebhooks` /
+//! `ListDomainAssociations` can never reach another app's records. Jobs live INSIDE their owning branch for the same reason: `DeleteBranch`
 //! takes that branch's jobs with it, and `GetJob` can never reach a job of another
 //! branch. A deployment reserved on a branch and not started yet lives there too, so
 //! it shares its branch's lifetime and its `jobId` cannot collide with another
@@ -19,10 +19,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::ops::types::{App, Branch, Job, Step, Webhook};
+use crate::ops::types::{App, Branch, DomainAssociation, Job, Step, Webhook};
 
 /// One Amplify app as this service persists it: the modelled record it hands back,
-/// plus the branches and webhooks created on it.
+/// plus the branches, domain associations and webhooks created on it.
 ///
 /// The maps are `BTreeMap`s, not `HashMap`s, because the list operations are
 /// `@paginated` and a page boundary is only meaningful over a stable order: the
@@ -34,6 +34,14 @@ pub struct AmplifyApp {
     pub app: App,
     /// The branches of this app, keyed by `branchName`.
     pub branches: BTreeMap<String, AmplifyBranch>,
+    /// The domain associations of this app, keyed by `domainName`.
+    ///
+    /// A domain association is created under an app (`POST /apps/{appId}/domains`)
+    /// and addressed afterwards by that app and its domain name
+    /// (`GET /apps/{appId}/domains/{domainName}`), so it is held by the app rather
+    /// than in a store-wide map: the same custom domain name associated with two
+    /// apps is two records, and neither app's reader can reach the other's.
+    pub domains: BTreeMap<String, AmplifyDomain>,
     /// The webhooks of this app, keyed by `webhookId`.
     ///
     /// A webhook is created under an app (`POST /apps/{appId}/webhooks`) and is
@@ -48,6 +56,7 @@ impl AmplifyApp {
         Self {
             app,
             branches: BTreeMap::new(),
+            domains: BTreeMap::new(),
             webhooks: BTreeMap::new(),
         }
     }
@@ -360,6 +369,230 @@ pub const BUILD_STEP_NAME: &str = "BUILD";
 pub const NO_BUILD_ENVIRONMENT_REASON: &str =
     "This emulator has no build environment, so the job's build was never executed.";
 
+/// One domain association as this service persists it: the modelled
+/// [`DomainAssociation`] record every reader returns, the DNS record that would
+/// verify its certificate, and the instant at which the clock owes the association
+/// its next status.
+///
+/// Associating a custom domain is ASYNCHRONOUS — the create call answers with a
+/// non-terminal `domainStatus` and the association moves on afterwards — so the
+/// record carries when that move is due instead of blocking the call that started
+/// it. [`AmplifyDomain::settle`] materialises it.
+#[derive(Debug, Clone)]
+pub struct AmplifyDomain {
+    /// The domain-association record, exactly as every reader returns it.
+    pub association: DomainAssociation,
+    /// The DNS record a caller publishes to prove it controls the domain, minted
+    /// with the association and reported from the status at which the certificate
+    /// has been requested onwards.
+    ///
+    /// Held beside the record rather than inside it because a certificate that has
+    /// not been requested yet has no verification record to report, while the value
+    /// a later status reports has to be the same one on every read.
+    pub certificate_verification_dns_record: String,
+    /// Epoch milliseconds at which this association's status is due to move on, or
+    /// `None` once it has reached the last status the clock owes it.
+    pub settles_at: Option<i64>,
+}
+
+impl AmplifyDomain {
+    /// A newly created association: the first status of [`DOMAIN_STATUS_SEQUENCE`],
+    /// with the next one due [`DOMAIN_STATUS_STEP_MILLIS`] from now.
+    pub fn created(association: DomainAssociation, verification_dns_record: String) -> Self {
+        Self {
+            association,
+            certificate_verification_dns_record: verification_dns_record,
+            settles_at: Some(now_millis().saturating_add(DOMAIN_STATUS_STEP_MILLIS)),
+        }
+    }
+
+    /// Materialise every status change the clock has ALREADY made due, and nothing
+    /// else.
+    ///
+    /// Each change is owed at `settles_at` whether or not anybody calls, so a
+    /// reporting operation applies it before answering rather than reporting a
+    /// status the clock left behind seconds ago. The loop walks as many steps as the
+    /// elapsed time owes, so a reader that arrives late sees the status the
+    /// association would have reached while nobody was watching. Before the next due
+    /// instant this is a no-op, so a caller that reads straight after the create
+    /// still observes the first, non-terminal status.
+    pub fn settle(&mut self) {
+        while let Some(due) = self.settles_at {
+            if now_millis() < due {
+                return;
+            }
+            let Some(next) = next_domain_status(&self.association.domain_status) else {
+                self.settles_at = None;
+                return;
+            };
+            self.association.domain_status = next.to_string();
+            // The certificate is requested on the way into this status, so this is
+            // the first status that has a verification record to report; it stays
+            // the same value for every later status and every later read.
+            if next == DOMAIN_STATUS_REQUESTING_CERTIFICATE {
+                self.association.certificate_verification_dns_record =
+                    Some(self.certificate_verification_dns_record.clone());
+                if let Some(certificate) = self.association.certificate.as_mut() {
+                    certificate.certificate_verification_dns_record =
+                        Some(self.certificate_verification_dns_record.clone());
+                }
+            }
+            if next == DOMAIN_STATUS_PENDING_VERIFICATION {
+                self.association.status_reason = DNS_UNVERIFIED_REASON.to_string();
+            }
+            self.settles_at = next_domain_status(next)
+                .map(|_| due.saturating_add(DOMAIN_STATUS_STEP_MILLIS));
+        }
+    }
+}
+
+/// The statuses the clock walks a new domain association through, in order.
+///
+/// `DomainStatus` is modelled `PENDING_VERIFICATION | IN_PROGRESS | AVAILABLE |
+/// IMPORTING_CUSTOM_CERTIFICATE | PENDING_DEPLOYMENT | AWAITING_APP_CNAME | FAILED |
+/// CREATING | REQUESTING_CERTIFICATE | UPDATING`
+/// (`smithy_query(query="shape",shape="DomainStatus")`), and associating a custom
+/// domain is created, then has its certificate requested, and then waits for the
+/// domain's DNS records to prove the caller controls the domain — which is where it
+/// stops here: nothing in this emulator resolves DNS, so no record of the caller's
+/// is ever observed and no later status is owed. See [`DNS_UNVERIFIED_REASON`].
+pub const DOMAIN_STATUS_SEQUENCE: &[&str] = &[
+    DOMAIN_STATUS_CREATING,
+    DOMAIN_STATUS_REQUESTING_CERTIFICATE,
+    DOMAIN_STATUS_PENDING_VERIFICATION,
+];
+
+/// The status a domain association carries from its create call until the clock moves
+/// it on: the association exists and nothing has been provisioned for it yet.
+pub const DOMAIN_STATUS_CREATING: &str = "CREATING";
+
+/// The status at which the association's certificate has been requested, and so the
+/// first one that reports a `certificateVerificationDNSRecord`.
+pub const DOMAIN_STATUS_REQUESTING_CERTIFICATE: &str = "REQUESTING_CERTIFICATE";
+
+/// The status at which the association waits for the domain's DNS records, which is
+/// the last status the clock owes a new association here.
+pub const DOMAIN_STATUS_PENDING_VERIFICATION: &str = "PENDING_VERIFICATION";
+
+/// The status after `current` in [`DOMAIN_STATUS_SEQUENCE`], or `None` when `current`
+/// is the last one (or a status the sequence does not name, which the clock owes
+/// nothing).
+pub fn next_domain_status(current: &str) -> Option<&'static str> {
+    let at = DOMAIN_STATUS_SEQUENCE
+        .iter()
+        .position(|status| *status == current)?;
+    DOMAIN_STATUS_SEQUENCE.get(at + 1).copied()
+}
+
+/// How long after a status the clock owes the next one.
+///
+/// CHOSEN, not documented: AWS publishes no duration for a domain association's
+/// provisioning, and a real one takes minutes, which no caller of an emulator can
+/// wait for. The span is non-zero so a caller that reads the association straight
+/// after creating it still sees the first status a real client has to poll through.
+pub const DOMAIN_STATUS_STEP_MILLIS: i64 = 500;
+
+/// Why a domain association of this emulator stops at
+/// [`DOMAIN_STATUS_PENDING_VERIFICATION`], carried on `statusReason`.
+pub const DNS_UNVERIFIED_REASON: &str =
+    "Waiting for the domain's DNS records. This emulator resolves no DNS, so the \
+     certificate verification record and the subdomain records are never observed.";
+
+/// The certificate type an association created without `certificateSettings`
+/// carries.
+///
+/// `CertificateType` is modelled `AMPLIFY_MANAGED | CUSTOM`
+/// (`smithy_query(query="shape",shape="CertificateType")`) and the model states that
+/// "If a certificate type isn't specified, Amplify uses the default AMPLIFY_MANAGED
+/// certificate" (`smithy_query(query="shape",shape="CertificateSettings")`).
+pub const CERTIFICATE_TYPE_AMPLIFY_MANAGED: &str = "AMPLIFY_MANAGED";
+
+/// The certificate type that names a certificate the CALLER already holds, and so
+/// the one whose ARN the request has to carry.
+pub const CERTIFICATE_TYPE_CUSTOM: &str = "CUSTOM";
+
+/// How many domain associations one app may hold at once, past which creating
+/// another answers the modelled `LimitExceededException` (HTTP 429, "A resource
+/// could not be created because service quotas were exceeded").
+///
+/// CHOSEN, not a published quota: without a bound one app's domain map could grow
+/// without limit. It is the page maximum `ListDomainAssociations` models
+/// (`maxResults` `range 0..50`,
+/// `smithy_query(query="operation",operation="ListDomainAssociations")`), so an app's
+/// whole set of associations is reportable in one page.
+pub const MAX_DOMAIN_ASSOCIATIONS_PER_APP: usize = 50;
+
+/// `DomainName`'s modelled `@pattern`, verbatim from the model
+/// (`smithy_query(query="shape",shape="DomainAssociation")`).
+pub const DOMAIN_NAME_PATTERN: &str =
+    r"^(((?!-)[A-Za-z0-9-]{0,62}[A-Za-z0-9])\.)+((?!-)[A-Za-z0-9-]{1,62}[A-Za-z0-9])(\.)?$";
+
+/// Does one DNS label satisfy the label half of [`DOMAIN_NAME_PATTERN`]:
+/// `(?!-)[A-Za-z0-9-]{min_len-1,62}[A-Za-z0-9]`?
+///
+/// Letters, digits and hyphens only, never opening with a hyphen, always closing on
+/// a letter or a digit, and at most 63 characters. `min_len` is 1 for a label the
+/// pattern writes `{0,62}` and 2 for the final label it writes `{1,62}`.
+fn is_domain_label(label: &str, min_len: usize) -> bool {
+    let bytes = label.as_bytes();
+    bytes.len() >= min_len
+        && bytes.len() <= 63
+        && bytes.first() != Some(&b'-')
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+}
+
+/// Does `name` satisfy [`DOMAIN_NAME_PATTERN`]: two or more DNS labels, optionally
+/// closed by the root dot?
+///
+/// Checked here rather than left to the boundary validator because that pattern uses
+/// negative look-ahead, which the framework's regex engine cannot compile, and a
+/// `@pattern` it cannot compile is treated as matching every value. The
+/// `@length(0, 64)` half of the constraint IS enforced upstream, so it is not
+/// repeated here.
+pub fn is_domain_name(name: &str) -> bool {
+    // `(\.)?$` — one optional trailing dot, which is the DNS root and not a label.
+    let name = name.strip_suffix('.').unwrap_or(name);
+    let mut labels: Vec<&str> = name.split('.').collect();
+    // `((…)\.)+(…)`: the final label, preceded by at least one dotted label.
+    let Some(last) = labels.pop() else {
+        return false;
+    };
+    !labels.is_empty()
+        && labels.iter().all(|label| is_domain_label(label, 1))
+        && is_domain_label(last, 2)
+}
+
+/// The refusal a `domainName` outside its modelled `@pattern` takes, or `None` when
+/// the name satisfies it.
+///
+/// A value outside a MODELLED constraint is refused at request validation, before
+/// the operation runs — the same class of refusal as an `appId` outside its pattern
+/// or a `maxResults` outside its range, which the boundary validator answers with
+/// HTTP 400 `ValidationException` naming the failing member path and the constraint
+/// it violated. This pattern reaches a handler only because the framework's regex
+/// engine cannot compile a negative look-ahead, so the refusal states the same two
+/// facts in the clause shape that renderer uses
+/// (`N validation error(s) detected: Value '…' at '<path>' failed to satisfy
+/// constraint: <requirement>` — [`::aws_smithy_schema_server::Violation::message`]),
+/// with the member path and the pattern the model declares.
+///
+/// `member` is the Smithy member name the value arrived on, lowerCamel-ed by the
+/// framework's own path builder, so every operation that takes a `domainName`
+/// refuses a malformed one in one wording.
+pub fn domain_name_violation(member: &str, name: &str) -> Option<String> {
+    if is_domain_name(name) {
+        return None;
+    }
+    let path = ::aws_smithy_schema_server::constraints::path::member(member);
+    Some(format!(
+        "1 validation error detected: Value '{name}' at '{path}' failed to satisfy \
+         constraint: Member must satisfy regular expression pattern: {DOMAIN_NAME_PATTERN}"
+    ))
+}
+
 /// Per-service state for com-amazonaws-amplify-amplify. A handler reaches it through [`service_state`].
 ///
 /// The apps map is NOT partitioned by region: an app's ARN records the region of the
@@ -376,6 +609,9 @@ pub struct ComAmazonawsAmplifyAmplifyState {
     pub next_webhook_id_seq: u64,
     /// Monotonic counter feeding [`ComAmazonawsAmplifyAmplifyState::mint_upload_token`].
     pub next_upload_token_seq: u64,
+    /// Monotonic counter feeding
+    /// [`ComAmazonawsAmplifyAmplifyState::mint_certificate_verification_record`].
+    pub next_certificate_token_seq: u64,
 }
 
 impl ComAmazonawsAmplifyAmplifyState {
@@ -436,6 +672,24 @@ impl ComAmazonawsAmplifyAmplifyState {
         self.next_upload_token_seq = self.next_upload_token_seq.wrapping_add(1);
         let (high, low) = mixed_pair(self.next_upload_token_seq);
         format!("{high:016x}{low:016x}")
+    }
+
+    /// Mint the DNS record that verifies ONE domain association's certificate.
+    ///
+    /// A verification record proves the caller controls the domain, so neither half
+    /// of it can be something the caller already knows: both the record's own label
+    /// and the name it points at are 128 bits from the same mixer that mints an app
+    /// id, rendered as hexadecimal, minted once per association so no two
+    /// associations share a record. The domain name the record sits under is the one
+    /// the request named, because that is the zone the caller publishes it in.
+    pub fn mint_certificate_verification_record(&mut self, domain_name: &str) -> String {
+        self.next_certificate_token_seq = self.next_certificate_token_seq.wrapping_add(1);
+        let (label_high, label_low) = mixed_pair(self.next_certificate_token_seq);
+        let (value_high, value_low) = mixed_pair(label_low ^ label_high);
+        format!(
+            "_{label_high:016x}{label_low:016x}.{domain_name}. CNAME \
+             _{value_high:016x}{value_low:016x}.acm-validations.aws."
+        )
     }
 
     /// The webhook `webhook_id` names, whichever app holds it.
@@ -652,6 +906,10 @@ pub const JOB_ENTITY: &str = "Job";
 
 /// The entity name [`not_found_message`] uses for a webhook addressed by `webhookId`.
 pub const WEBHOOK_ENTITY: &str = "Webhook";
+
+/// The entity name [`not_found_message`] and [`already_exists_message`] use for a
+/// domain association addressed by `domainName`.
+pub const DOMAIN_ENTITY: &str = "Domain";
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

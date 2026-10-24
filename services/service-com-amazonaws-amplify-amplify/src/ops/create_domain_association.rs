@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDomainAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDomainAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDomainAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the domain association a custom domain is served through. Associating a
+//! domain is ASYNCHRONOUS: this call persists the association in the first status of
+//! [`crate::state::DOMAIN_STATUS_SEQUENCE`] and the clock moves it on from there,
+//! which a read materialises.
 //!
 //! ## Shape of an operation
 //!
@@ -163,20 +158,174 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDomainAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDomainAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDomainAssociation"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDomainAssociationErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the Amplify emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+
+        // The modelled `domainName` `@pattern` the boundary validator cannot
+        // compile: a value outside a constraint the MODEL declares is a
+        // request-validation refusal (HTTP 400 `ValidationException`, naming the
+        // member and the constraint), not one of this operation's modelled errors.
+        if let Some(message) = crate::state::domain_name_violation("domainName", &input.domain_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // "This field is required only when the certificate type is CUSTOM"
+        // (`smithy_query(query="shape",shape="CertificateSettings")`): a certificate
+        // the CALLER already holds is named by its ARN, and no ARN names no
+        // certificate — a pair of members the model cannot constrain against each
+        // other, so the operation refuses that combination itself.
+        let certificate_settings = input.certificate_settings.unwrap_or(CertificateSettings {
+            r#type: crate::state::CERTIFICATE_TYPE_AMPLIFY_MANAGED.to_string(),
+            custom_certificate_arn: None,
+        });
+        if certificate_settings.r#type == crate::state::CERTIFICATE_TYPE_CUSTOM
+            && certificate_settings
+                .custom_certificate_arn
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+        {
+            return Err(CreateDomainAssociationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "customCertificateArn is required when the certificate type is {}",
+                        crate::state::CERTIFICATE_TYPE_CUSTOM
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // Minted before the app lookup because minting reaches the store itself; the
+        // sequence behind it is monotonic, so a refused create simply leaves the
+        // value it minted unused.
+        let verification_dns_record = store.mint_certificate_verification_record(&input.domain_name);
+
+        // A domain association only exists as part of an app, so an unknown `appId`
+        // is a 404 rather than an app created on the way.
+        let app = store.apps.get_mut(&input.app_id).ok_or_else(|| {
+            CreateDomainAssociationErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    crate::state::APP_ENTITY,
+                    &input.app_id,
+                )),
+            })
+        })?;
+
+        // `domainName` identifies an association within its app, so a second create
+        // under the same name is refused rather than silently replacing the first
+        // one. The refusal's message is built from the request's own members through
+        // the one formatter every duplicate-name refusal in this crate shares.
+        if app.domains.contains_key(&input.domain_name) {
+            return Err(CreateDomainAssociationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::already_exists_message(
+                        crate::state::DOMAIN_ENTITY,
+                        &input.domain_name,
+                        &input.app_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The quota is enforced BEFORE the association is built or stored, so a
+        // refused create leaves the app exactly as it was and one app's domain map
+        // cannot grow without limit.
+        if app.domains.len() >= crate::state::MAX_DOMAIN_ASSOCIATIONS_PER_APP {
+            return Err(CreateDomainAssociationErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Number of domains exceeds the limit of {} for app {}",
+                        crate::state::MAX_DOMAIN_ASSOCIATIONS_PER_APP,
+                        input.app_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let sub_domains = input
+            .sub_domain_settings
+            .into_iter()
+            .map(|setting| SubDomain {
+                dns_record: sub_domain_dns_record(
+                    &setting,
+                    &input.domain_name,
+                    &app.app.default_domain,
+                ),
+                // Nothing is verified until the domain's DNS records are observed,
+                // which is what the association's own status waits for.
+                verified: false,
+                sub_domain_setting: setting,
+            })
+            .collect();
+
+        let association = DomainAssociation {
+            // A domain association is a sub-resource of its app, so its ARN extends
+            // the app's by the path this operation is bound to
+            // (`/apps/{appId}/domains`), exactly as a branch ARN extends it.
+            domain_association_arn: format!("{}/domains/{}", app.app.app_arn, input.domain_name),
+            domain_name: input.domain_name.clone(),
+            enable_auto_sub_domain: input.enable_auto_sub_domain.unwrap_or(false),
+            auto_sub_domain_creation_patterns: input.auto_sub_domain_creation_patterns,
+            auto_sub_domain_iam_role: input.auto_sub_domain_iam_role,
+            domain_status: crate::state::DOMAIN_STATUS_CREATING.to_string(),
+            // `updateStatus` reports "the domain update operation that is currently
+            // in progress", and creating an association is not an update of one.
+            update_status: None,
+            // The @required `statusReason` has no value while the association is
+            // simply proceeding; the status that waits on the caller states why.
+            status_reason: String::new(),
+            // The certificate has not been requested yet, so there is no
+            // verification record to publish; the clock reports it from the status
+            // that requests the certificate onwards.
+            certificate_verification_dns_record: None,
+            sub_domains,
+            certificate: Some(Certificate {
+                r#type: certificate_settings.r#type,
+                custom_certificate_arn: certificate_settings.custom_certificate_arn,
+                certificate_verification_dns_record: None,
+            }),
+        };
+
+        app.domains.insert(
+            input.domain_name,
+            crate::state::AmplifyDomain::created(association.clone(), verification_dns_record),
+        );
+
+        Ok(CreateDomainAssociationOutput {
+            domain_association: association,
+        })
     }
+}
+
+/// The DNS record one subdomain of an association is served through.
+///
+/// A subdomain points the name the setting's `prefix` makes under the associated
+/// domain — the domain itself when the prefix is empty, which is the apex — at the
+/// branch's own Amplify-managed address, which is `branchName` under the app's
+/// `defaultDomain`. Every part of it comes from the request and from the app's own
+/// record, so a reader reports the record the association was created with.
+fn sub_domain_dns_record(
+    setting: &SubDomainSetting,
+    domain_name: &str,
+    app_default_domain: &str,
+) -> String {
+    let name = if setting.prefix.is_empty() {
+        domain_name.to_string()
+    } else {
+        format!("{}.{domain_name}", setting.prefix)
+    };
+    format!("{name} CNAME {}.{app_default_domain}", setting.branch_name)
 }

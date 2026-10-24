@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDomainAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDomainAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDomainAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one page of an app's domain associations, in the stable order the app
+//! stores them in. The only thing it writes is the status change the clock has
+//! already made due for each association, exactly as `GetDomainAssociation` does.
 //!
 //! ## Shape of an operation
 //!
@@ -85,16 +79,24 @@ use super::types::*;
 // `ListDomainAssociationsError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-amplify-amplify.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `ListDomainAssociationsError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.amplify#ListDomainAssociations")]
+// The operation's MODELED errors, widened by `NotFoundException`.
+//
+// `extra_errors` is deliberate, and is the same widening `ListBranches` and
+// `ListJobs` take: this operation takes `appId` as an @httpLabel, so a request can
+// name an app that does not exist, and the only honest answer is the same 404 every
+// other app-scoped operation gives. The model's error union for THIS operation omits
+// the shape (the service declares it, and `GetDomainAssociation`,
+// `CreateDomainAssociation` and `GetApp` all list it), so the widening keeps one rule
+// across the resource instead of inventing a second one here.
+#[smithy_macros::operation_error(
+    "com.amazonaws.amplify#ListDomainAssociations",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum ListDomainAssociationsErrorModeled {
     BadRequestException(BadRequestException),
     InternalFailureException(InternalFailureException),
+    NotFoundException(NotFoundException),
     UnauthorizedException(UnauthorizedException),
 }
 
@@ -147,20 +149,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDomainAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDomainAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDomainAssociations"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDomainAssociationsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the Amplify emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+
+        // Every `nextToken` this operation issues is a `domainName`, so a token that
+        // could not be one was never issued by this service: refuse it instead of
+        // serving an arbitrary suffix of the collection for it.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_domain_name(token) {
+                return Err(ListDomainAssociationsErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some("Invalid nextToken".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A report, scoped to ONE app: the associations are read out of that app's
+        // own map, so no other app's association can appear in the page.
+        let mut store = state.lock();
+        let app = store.apps.get_mut(&input.app_id).ok_or_else(|| {
+            ListDomainAssociationsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    crate::state::APP_ENTITY,
+                    &input.app_id,
+                )),
+            })
+        })?;
+
+        // The ONLY write this report performs, and the same one `GetDomainAssociation`
+        // performs: the status change the clock has ALREADY made due for each
+        // association, which was owed at that instant whether or not anybody called.
+        // An association whose instant has not come is left exactly as it is, so a
+        // listed association agrees member for member with a read of the same one.
+        for stored in app.domains.values_mut() {
+            stored.settle();
+        }
+
+        let (domain_associations, next_token) = crate::state::page(
+            app.domains
+                .iter()
+                .map(|(domain_name, stored)| (domain_name.clone(), stored.association.clone())),
+            input.next_token.as_deref(),
+            crate::state::page_size(input.max_results, MAX_RESULTS),
+        );
+
+        Ok(ListDomainAssociationsOutput {
+            domain_associations,
+            next_token,
+        })
     }
 }
+
+/// The largest page `ListDomainAssociations` serves, and the page it serves a caller
+/// that set no bound: `maxResults` is modelled `range 0..50`
+/// (`smithy_query(query="operation",operation="ListDomainAssociations")`).
+const MAX_RESULTS: usize = 50;

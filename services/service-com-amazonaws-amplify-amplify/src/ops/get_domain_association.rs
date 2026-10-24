@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDomainAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDomainAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDomainAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one domain association of an app, as that app persists it. The only thing
+//! it writes is the status change the clock has already made due
+//! ([`crate::state::AmplifyDomain::settle`]), which is owed whether or not anybody
+//! calls.
 //!
 //! ## Shape of an operation
 //!
@@ -144,20 +139,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDomainAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDomainAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDomainAssociation"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetDomainAssociationErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the Amplify emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // The modelled `domainName` `@pattern` the boundary validator cannot
+        // compile; see `crate::state::domain_name_violation`.
+        if let Some(message) = crate::state::domain_name_violation("domainName", &input.domain_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // A report. The association is looked up INSIDE its app, so a domain name
+        // associated with another app is not found here. The 404 names the entity
+        // that is actually absent: the app when the app itself is unknown, otherwise
+        // the domain.
+        let mut store = state.lock();
+        let app = store.apps.get_mut(&input.app_id).ok_or_else(|| {
+            GetDomainAssociationErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    crate::state::APP_ENTITY,
+                    &input.app_id,
+                )),
+            })
+        })?;
+        let stored = app.domains.get_mut(&input.domain_name).ok_or_else(|| {
+            GetDomainAssociationErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    crate::state::DOMAIN_ENTITY,
+                    &input.domain_name,
+                )),
+            })
+        })?;
+
+        // The status change the clock already owed this association, materialised
+        // before it is reported: it was due at that instant even if nobody had
+        // called, and applying it is the only thing this read writes.
+        stored.settle();
+
+        Ok(GetDomainAssociationOutput {
+            domain_association: stored.association.clone(),
+        })
     }
 }
