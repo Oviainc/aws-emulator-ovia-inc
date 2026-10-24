@@ -6,6 +6,12 @@
 //!
 //! The rules this handler enforces, from the modelled contract reproduced below:
 //!
+//! * a RETRY of a release this feed has already served — the operation is `@idempotent`
+//!   and `associatedResourceName` is its `@idempotencyToken`, so the same name on the
+//!   same feed is that one release once more, not a second request — answers the first
+//!   call's success again and writes nothing
+//!   (`crate::state::Feed::has_served_release_of`): a caller whose first response was
+//!   lost must not be told the release failed when it succeeded;
 //! * only a feed that currently HOLDS an association can release one — a feed in any
 //!   other status is refused with the modelled `ValidationException`, and that refusal
 //!   REPORTS the status the feed was found in
@@ -205,6 +211,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A RETRY of a release this feed has already served is that same release once
+        // more, not a new request: the operation is `@idempotent` and
+        // `associatedResourceName` is its `@idempotencyToken`, so a request naming the
+        // release the feed has already served answers the success that call answered and
+        // writes nothing. It is decided BEFORE the status precondition below, because the
+        // state a retry would be judged against is the state its own first call left: the
+        // preconditions were already met and already consumed once, and judging them a
+        // second time is what would tell a caller that never saw the first response that
+        // the release failed when it in fact succeeded.
+        //
+        // Only the feed the release was served for can answer it, so a feed that has
+        // since left the store is simply not found (above), and a name the feed never
+        // served a release of falls through to the checks below.
+        if feed.has_served_release_of(&input.associated_resource_name) {
+            return Ok(DisassociateFeedOutput {
+                arn: feed.arn.clone(),
+                id: feed.id.clone(),
+            });
+        }
+
         // The feed's status is the precondition: releasing a resource is only possible
         // for the one status that means a resource is held (ACTIVE). Every other status
         // — a feed that was never associated, one already released, one whose deletion
@@ -269,6 +295,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to the pool of feeds a resource can claim.
         feed.status = crate::state::FeedStatus::Archived;
         feed.transition_due_at = None;
+        // The release has now been SERVED under this name, which is what makes a retry of
+        // it recognisable as the same release rather than a new request (the check at the
+        // top). Recorded only here, on the call that actually released the resource: a
+        // dry run returned above without serving one.
+        feed.released_resource_name = Some(input.associated_resource_name);
         Ok(output)
     }
 }
