@@ -37,6 +37,8 @@ mod events;
 mod harness;
 #[path = "all/lifecycle.rs"]
 mod lifecycle;
+#[path = "all/managed_action_history.rs"]
+mod managed_action_history;
 #[path = "all/not_found_messages.rs"]
 mod not_found_messages;
 #[path = "all/operations_role.rs"]
