@@ -1093,62 +1093,133 @@ pub const TAG_KEY_MAX_LEN: i64 = 128;
 /// See [`TAG_KEY_MIN_LEN`].
 pub const TAG_KEY_PATTERN: &str = "^[a-zA-Z0-9 _.:/=+@-]+$";
 
-/// [`TAG_KEY_MIN_LEN`]/[`TAG_KEY_MAX_LEN`]/[`TAG_KEY_PATTERN`] as the trait map the
-/// framework's constraint walk reads.
-static TAG_KEY_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
-    ::std::sync::LazyLock::new(|| {
-        let mut traits = ::aws_smithy_schema::TraitMap::new();
-        traits.insert(Box::new(
-            ::aws_smithy_schema_server::constraints::LengthTrait::new(
-                Some(TAG_KEY_MIN_LEN),
-                Some(TAG_KEY_MAX_LEN),
-            ),
-        ));
-        traits.insert(Box::new(
-            ::aws_smithy_schema_server::constraints::PatternTrait::new(TAG_KEY_PATTERN),
-        ));
-        traits
-    });
+/// The modelled `DeploymentSpecifications` KEY rules, from
+/// `smithy_query(query="shape", shape="DeploymentSpecifications,KeyString")`: a
+/// `DeploymentSpecifications` key targets `KeyString`, which is
+/// `@length(min: 3, max: 256)` with `@pattern("^[a-zA-Z0-9-:]+$")`.
+///
+/// Restated here for the same reason as [`TAG_KEY_MIN_LEN`] — codegen does not carry a
+/// map's KEY constraints — and pinned to the model by
+/// `tests/all/create_deployment_validation.rs::the_specification_key_rules_the_handlers_enforce_are_the_models`.
+pub const SPECIFICATION_KEY_MIN_LEN: i64 = 3;
+/// See [`SPECIFICATION_KEY_MIN_LEN`].
+pub const SPECIFICATION_KEY_MAX_LEN: i64 = 256;
+/// See [`SPECIFICATION_KEY_MIN_LEN`].
+pub const SPECIFICATION_KEY_PATTERN: &str = "^[a-zA-Z0-9-:]+$";
 
-/// The key leaf of a `Tags` map, carrying [`TAG_KEY_TRAITS`].
+/// A map KEY leaf schema: one string member carrying the key shape's `@length` and
+/// `@pattern`.
 ///
 /// A map's KEY constraints are the one part of a shape the generated schemas do not
-/// carry (codegen captures a collection's element/value constraints only), so a
-/// `Tags` key is the one thing the constraint walk over `TagResourceInput` cannot
-/// judge. This schema gives it back, so the rules a key is judged by are the model's
-/// and the refusal is worded by the same renderer as every other constraint. The
-/// member is named `tags` so the refusal names the member the caller sent.
-static TAG_KEY_SCHEMA: ::std::sync::LazyLock<::aws_smithy_schema::Schema> =
+/// carry (codegen captures a collection's element/value constraints only), so a map key
+/// is the one thing the constraint walk over an input cannot judge — it judges a key
+/// against the member's schema, which composes the VALUE shape's constraints. These
+/// schemas give the key rules back, so the rules a key is judged by are the model's and
+/// the refusal is worded by the same renderer as every other constraint. `member` is
+/// the INPUT member the map arrived on, so the refusal names what the caller sent.
+fn map_key_schema(
+    shape_id: &'static str,
+    member: &'static str,
+    traits: &'static ::std::sync::LazyLock<::aws_smithy_schema::TraitMap>,
+) -> ::aws_smithy_schema::Schema {
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(shape_id, "com.amazonaws.launchwizard", member),
+        ::aws_smithy_schema::ShapeType::String,
+        member,
+        0,
+    )
+    .with_traits(traits)
+}
+
+/// A key shape's `@length` and `@pattern` as the trait map the framework's constraint
+/// walk reads. Each key shape holds its own in a static, because
+/// [`map_key_schema`] composes a `&'static` one.
+fn map_key_traits(
+    min_len: i64,
+    max_len: i64,
+    pattern: &'static str,
+) -> ::aws_smithy_schema::TraitMap {
+    let mut traits = ::aws_smithy_schema::TraitMap::new();
+    traits.insert(Box::new(
+        ::aws_smithy_schema_server::constraints::LengthTrait::new(Some(min_len), Some(max_len)),
+    ));
+    traits.insert(Box::new(
+        ::aws_smithy_schema_server::constraints::PatternTrait::new(pattern),
+    ));
+    traits
+}
+
+/// [`TAG_KEY_MIN_LEN`]/[`TAG_KEY_MAX_LEN`]/[`TAG_KEY_PATTERN`] as the walk reads them.
+static TAG_KEY_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
     ::std::sync::LazyLock::new(|| {
-        ::aws_smithy_schema::Schema::new_member(
-            ::aws_smithy_schema::ShapeId::from_static(
-                "com.amazonaws.launchwizard#Tags$key",
-                "com.amazonaws.launchwizard",
-                "tags",
-            ),
-            ::aws_smithy_schema::ShapeType::String,
-            "tags",
-            0,
-        )
-        .with_traits(&TAG_KEY_TRAITS)
+        map_key_traits(TAG_KEY_MIN_LEN, TAG_KEY_MAX_LEN, TAG_KEY_PATTERN)
     });
 
-/// The refusal message for the `Tags` keys that break their modelled shape, or `None`
-/// when every one of them is within it. See [`TAG_KEY_SCHEMA`].
+/// [`SPECIFICATION_KEY_MIN_LEN`]/[`SPECIFICATION_KEY_MAX_LEN`]/
+/// [`SPECIFICATION_KEY_PATTERN`] as the walk reads them.
+static SPECIFICATION_KEY_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    ::std::sync::LazyLock::new(|| {
+        map_key_traits(
+            SPECIFICATION_KEY_MIN_LEN,
+            SPECIFICATION_KEY_MAX_LEN,
+            SPECIFICATION_KEY_PATTERN,
+        )
+    });
+
+/// The key leaf of a `Tags` map, as it arrives on the `tags` member. See
+/// [`map_key_schema`].
+static TAG_KEY_SCHEMA: ::std::sync::LazyLock<::aws_smithy_schema::Schema> =
+    ::std::sync::LazyLock::new(|| {
+        map_key_schema(
+            "com.amazonaws.launchwizard#Tags$key",
+            "tags",
+            &TAG_KEY_TRAITS,
+        )
+    });
+
+/// The key leaf of a `DeploymentSpecifications` map, as it arrives on the
+/// `specifications` member. See [`map_key_schema`].
+static SPECIFICATION_KEY_SCHEMA: ::std::sync::LazyLock<::aws_smithy_schema::Schema> =
+    ::std::sync::LazyLock::new(|| {
+        map_key_schema(
+            "com.amazonaws.launchwizard#DeploymentSpecifications$key",
+            "specifications",
+            &SPECIFICATION_KEY_TRAITS,
+        )
+    });
+
+/// The refusal message for the map keys that break the shape `schema` carries, or
+/// `None` when every one of them is within it.
 ///
 /// Worded by [`validation_report`], the same renderer `src/service.rs` words a
 /// boundary refusal with, so a key refused inside a handler reads exactly like one
 /// refused at the boundary.
-pub fn tag_key_refusal<'a>(keys: impl Iterator<Item = &'a str>) -> Option<String> {
+fn map_key_refusal<'a>(
+    schema: &::aws_smithy_schema::Schema,
+    keys: impl Iterator<Item = &'a str>,
+) -> Option<String> {
     use ::aws_smithy_schema::serde::ShapeSerializer as _;
 
     let mut validator = ::aws_smithy_schema_server::constraints::ValidatingSerializer::new();
     for key in keys {
         // Infallible: the validator accumulates violations instead of failing.
-        let _ = validator.write_string(&TAG_KEY_SCHEMA, key);
+        let _ = validator.write_string(schema, key);
     }
     let violations = validator.into_violations();
     (!violations.is_empty()).then(|| validation_report(&violations))
+}
+
+/// The refusal message for the `Tags` keys that break their modelled shape, or `None`
+/// when every one of them is within it. See [`TAG_KEY_SCHEMA`].
+pub fn tag_key_refusal<'a>(keys: impl Iterator<Item = &'a str>) -> Option<String> {
+    map_key_refusal(&TAG_KEY_SCHEMA, keys)
+}
+
+/// The refusal message for the `DeploymentSpecifications` keys that break their
+/// modelled shape, or `None` when every one of them is within it. See
+/// [`SPECIFICATION_KEY_SCHEMA`].
+pub fn specification_key_refusal<'a>(keys: impl Iterator<Item = &'a str>) -> Option<String> {
+    map_key_refusal(&SPECIFICATION_KEY_SCHEMA, keys)
 }
 
 /// The refusal message for a request whose own modelled constraints a handler judges
@@ -1173,7 +1244,10 @@ pub fn constraint_refusal(
 ///
 /// Launch Wizard judges a deployment's settings against the schema of the pattern it
 /// deploys, and `UpdateDeployment$force` exists to apply an update "even if validation
-/// warnings are present" — so these are the warnings that member overrides. Each one
+/// warnings are present" — so these are the warnings that member overrides. A CREATE
+/// models no such member, so for `CreateDeployment` the same clauses are a refusal
+/// ([`specification_create_refusal`]): the schema published with `required` and
+/// `allowedValues` is what a deployment of that pattern has to fill in. Each one
 /// is a statement the STORED schema makes about the submitted map: a setting the
 /// pattern does not define, a value outside a field's `allowedValues`, and a field the
 /// pattern marks required that the map does not carry.
@@ -1222,23 +1296,48 @@ pub fn specification_warnings(
     warnings
 }
 
+/// How many clauses, then the clauses — the shape [`validation_report`] states a
+/// refusal in, because a caller reads both the same way. `noun` is pluralised by
+/// appending an `s`, which is what both callers' nouns take.
+fn counted_clauses(noun: &str, clauses: &[String]) -> String {
+    let plural = if clauses.len() == 1 {
+        noun.to_string()
+    } else {
+        format!("{noun}s")
+    };
+    format!(
+        "{} validation {plural} detected: {}",
+        clauses.len(),
+        clauses.join("; ")
+    )
+}
+
 /// The `ValidationException` message an update refused for its specification warnings
 /// carries: every warning, and the member that applies the update regardless.
 ///
-/// Worded like [`validation_report`] — how many clauses, then the clauses — because a
-/// caller reads both the same way. AWS documents no text for this refusal, so only the
-/// HTTP 400 and the modelled `ValidationException` code are the contract.
+/// AWS documents no text for this refusal, so only the HTTP 400 and the modelled
+/// `ValidationException` code are the contract.
 pub fn specification_warning_refusal(warnings: &[String]) -> String {
-    let noun = if warnings.len() == 1 {
-        "warning"
-    } else {
-        "warnings"
-    };
     format!(
-        "{} validation {noun} detected: {}; resubmit with force set to true to update the \
-         deployment anyway.",
-        warnings.len(),
-        warnings.join("; ")
+        "{}; resubmit with force set to true to update the deployment anyway.",
+        counted_clauses("warning", warnings)
+    )
+}
+
+/// The `ValidationException` message a CREATE refused for its specification warnings
+/// carries.
+///
+/// `CreateDeployment` models no `force`, so what an update merely warns about is the
+/// end of a create: the clauses are stated as the errors they are, and the caller is
+/// pointed at the operation that publishes the schema they were judged against — the
+/// one `CreateDeployment`'s own docs name "to retrieve the specifications required to
+/// create a deployment". Same caveat as above: only the status and the code are the
+/// contract.
+pub fn specification_create_refusal(warnings: &[String]) -> String {
+    format!(
+        "{}; the specifications a deployment pattern accepts are reported by \
+         GetWorkloadDeploymentPattern.",
+        counted_clauses("error", warnings)
     )
 }
 

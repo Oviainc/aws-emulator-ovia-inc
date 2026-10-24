@@ -21,6 +21,8 @@ mod apps_list_reporting;
 mod error_message_members;
 #[path = "all/member_accounts.rs"]
 mod member_accounts;
+#[path = "all/policy_document_validation.rs"]
+mod policy_document_validation;
 #[path = "all/policy_lifecycle.rs"]
 mod policy_lifecycle;
 #[path = "all/protection_status.rs"]

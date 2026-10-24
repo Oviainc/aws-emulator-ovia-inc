@@ -188,8 +188,11 @@ fn cases() -> Vec<Case> {
             ]),
         },
         Case {
-            // A nested PolicyOption, an ExcludeMap, resource sets, and an
-            // explicitly non-default PolicyStatus.
+            // A nested PolicyOption, an ExcludeMap, and an explicitly
+            // non-default PolicyStatus. No `ResourceSetIds`: those must name
+            // resource sets that EXIST, which needs an id this static table
+            // cannot know — the `policy_document_validation` suite creates the
+            // sets and asserts both sides of that rule.
             name: "network-firewall-out-of-admin-scope",
             policy: json!({
                 "PolicyName": "nfw-vpcs",
@@ -201,7 +204,6 @@ fn cases() -> Vec<Case> {
                 },
                 "ResourceType": "AWS::EC2::VPC",
                 "ExcludeMap": { "ORG_UNIT": ["ou-1234-abcdefgh"] },
-                "ResourceSetIds": ["abcdefghij0123456789AB"],
                 "ExcludeResourceTags": false,
                 "RemediationEnabled": false,
                 "PolicyStatus": "OUT_OF_ADMIN_SCOPE"
@@ -783,7 +785,9 @@ async fn an_unknown_policy_id_is_not_found() {
                         "PolicyUpdateToken": "whatever",
                         "PolicyName": "demo",
                         "SecurityServicePolicyData": { "Type": "WAFV2" },
-                        "ResourceType": "AWS::EC2::VPC",
+                        // A resource type the model lists for a WAFV2 policy,
+                        // so what is under test here is the unknown PolicyId.
+                        "ResourceType": "AWS::ElasticLoadBalancingV2::LoadBalancer",
                         "ExcludeResourceTags": false,
                         "RemediationEnabled": false
                     }}),

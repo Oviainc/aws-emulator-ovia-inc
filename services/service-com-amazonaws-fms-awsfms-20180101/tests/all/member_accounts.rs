@@ -54,9 +54,16 @@ fn error_message(body: &Value) -> String {
         .to_string()
 }
 
-/// A policy document carrying the given scope maps. Only the members `PutPolicy`
+/// A policy document carrying the given scope map(s). Only the members `PutPolicy`
 /// requires, plus the maps under test, so a row differs from the others ONLY in its
 /// scope maps.
+///
+/// A row names at most ONE of the two maps: "You can specify inclusions or
+/// exclusions, but not both" (`Policy$IncludeMap` / `Policy$ExcludeMap`), so a
+/// document carrying both is refused — the rule the `policy_document_validation`
+/// suite asserts. The accounts a policy contributes are therefore spread across
+/// SEVERAL stored policies here, which is also what makes the aggregation across
+/// records visible.
 fn policy_with(name: &str, include: Option<Value>, exclude: Option<Value>) -> Value {
     let mut policy = json!({
         "PolicyName": name,
@@ -304,11 +311,17 @@ async fn list_member_accounts_reports_the_accounts_the_store_records() {
             adds: &[],
         },
         Row {
-            name: "both-keys-in-both-maps",
+            name: "both-keys-in-the-include-map",
             include: Some(json!({ "ACCOUNT": ["444444444444"], "ORG_UNIT": ["ou-abc1-87654321"] })),
+            exclude: None,
+            adds: &["444444444444"],
+        },
+        Row {
+            name: "both-keys-in-the-exclude-map",
+            include: None,
             exclude: Some(json!({ "ACCOUNT": ["7"], "ORG_UNIT": ["ou-abc1-11112222"] })),
             // "7" is an `AWSAccountId` at its minimum length (1..1024, `^[0-9]+$`).
-            adds: &["444444444444", "7"],
+            adds: &["7"],
         },
         Row {
             name: "values-that-are-not-account-ids",
@@ -320,8 +333,14 @@ async fn list_member_accounts_reports_the_accounts_the_store_records() {
             adds: &["555555555555"],
         },
         Row {
-            name: "accounts-another-row-already-named",
+            name: "included-accounts-another-row-already-named",
             include: Some(json!({ "ACCOUNT": ["111111111111", "7"] })),
+            exclude: None,
+            adds: &[],
+        },
+        Row {
+            name: "excluded-accounts-another-row-already-named",
+            include: None,
             exclude: Some(json!({ "ACCOUNT": ["333333333333"] })),
             adds: &[],
         },
@@ -391,18 +410,21 @@ async fn the_member_account_page_is_bounded_and_the_token_round_trips() {
         &json!({ "AdminAccount": admin }),
     )
     .await;
+    // The halves are carried by different scope MAPS as well as by different
+    // policies: one `IncludeMap` (with an `ORG_UNIT` key beside its accounts) and
+    // one `ExcludeMap`, since no single policy may carry both.
     put_policy(
         &router,
         &policy_with(
             "first-half",
-            Some(json!({ "ACCOUNT": first })),
-            Some(json!({ "ORG_UNIT": ["ou-abc1-12345678"] })),
+            Some(json!({ "ACCOUNT": first, "ORG_UNIT": ["ou-abc1-12345678"] })),
+            None,
         ),
     )
     .await;
     put_policy(
         &router,
-        &policy_with("second-half", Some(json!({ "ACCOUNT": second })), None),
+        &policy_with("second-half", None, Some(json!({ "ACCOUNT": second }))),
     )
     .await;
 

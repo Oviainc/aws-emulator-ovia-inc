@@ -48,8 +48,8 @@ const MAX_TAG_VALUE_LEN: usize = 256;
 const TAG_PUNCTUATION: &str = " _.:/=+@-";
 
 /// This service's Smithy model, as the tagging shapes' declared constraints are read
-/// off it.
-fn model() -> Value {
+/// off it. Shared with the sibling suites that pin a restated bound to the model.
+pub(crate) fn model() -> Value {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/smithy-model/com-amazonaws-launchwizard-launchwizard.json"
@@ -59,7 +59,7 @@ fn model() -> Value {
 }
 
 /// The `traits` of one shape in the model.
-fn shape_traits(model: &Value, shape: &str) -> Value {
+pub(crate) fn shape_traits(model: &Value, shape: &str) -> Value {
     model["shapes"][format!("com.amazonaws.launchwizard#{shape}")]["traits"].clone()
 }
 
