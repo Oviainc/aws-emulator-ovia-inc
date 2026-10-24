@@ -173,12 +173,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The target is resolved BEFORE anything is minted or written, so a rotation naming
         // a channel or an ingest endpoint this service does not hold changes nothing. An
         // ingest endpoint exists only as part of its channel, so both labels have to
-        // resolve, and each reports the resource that is missing.
+        // resolve: a channel the service does not hold reports itself missing, and an
+        // endpoint the RESOLVED channel does not hold is reported against that channel,
+        // naming both ids — the lookup was scoped to it, and the same guid may well exist
+        // under another channel (`crate::state::child_not_found`).
         let Some(record) = state.channels.get(&input.id) else {
             return Err(crate::state::channel_not_found(&input.id).into());
         };
         let Some(position) = record.ingest_endpoint_position(&input.ingest_endpoint_id) else {
-            return Err(crate::state::ingest_endpoint_not_found(&input.ingest_endpoint_id).into());
+            return Err(crate::state::ingest_endpoint_not_found(
+                &input.id,
+                &input.ingest_endpoint_id,
+            )
+            .into());
         };
 
         // Minted through the store — its mint counter is part of every generated value's

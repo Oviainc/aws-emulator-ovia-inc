@@ -76,6 +76,8 @@ mod fast_launch_images;
 mod fpga_image_tasks_and_volume_io;
 #[path = "all/get_password_data.rs"]
 mod get_password_data;
+#[path = "all/host_reservation_offerings.rs"]
+mod host_reservation_offerings;
 #[path = "all/image_usage_reports.rs"]
 mod image_usage_reports;
 #[path = "all/images.rs"]

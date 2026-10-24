@@ -2,8 +2,10 @@
 
 //! @op ListHarvestJobs
 //! Pages over the stored HarvestJobs in id order, rendering each from its stored record.
-//! `IncludeChannelId` and `IncludeStatus` filter BEFORE paging, so a page is `MaxResults`
-//! MATCHING jobs and the `NextToken` points at the next matching one.
+//! `IncludeChannelId` and `IncludeStatus` are MUTUALLY EXCLUSIVE — a request carrying both
+//! is refused with `UnprocessableEntityException` (422) — and the one a request does carry
+//! filters BEFORE paging, so a page is `MaxResults` MATCHING jobs and the `NextToken`
+//! points at the next matching one.
 //!
 //! Reporting only: the one write it makes is through `settle_harvest_jobs`, which
 //! materialises the status transitions the clock had already made due — which is what
@@ -155,6 +157,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The two filters are MUTUALLY EXCLUSIVE: they select by different properties and
+        // MediaPackage refuses the combination outright rather than intersecting them, so
+        // a request carrying both is refused before any state is reached or settled — it
+        // reports nothing and changes nothing.
+        if input.include_channel_id.is_some() && input.include_status.is_some() {
+            return Err(crate::state::harvest_job_filters_mutually_exclusive().into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListHarvestJobsErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {

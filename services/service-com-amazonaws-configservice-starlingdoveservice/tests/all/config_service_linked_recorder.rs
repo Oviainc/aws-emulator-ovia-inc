@@ -8,7 +8,9 @@
 //! back through the operations that report configuration recorders.
 //!
 //! The rule under test: `PutServiceLinkedConfigurationRecorder` creates ONE
-//! configuration recorder per Amazon Web Services service principal, whose name Config
+//! configuration recorder per SUPPORTED Amazon Web Services service principal — a
+//! service Config links a configuration recorder of this account's own resources to
+//! (`state::SERVICE_LINKED_PRINCIPALS`) — whose name Config
 //! assigns itself from that service principal (the reserved
 //! `AWSConfigurationRecorderFor` prefix plus the principal's leading DNS label,
 //! upper-camel-cased) and whose configuration is set by the linked service rather than
@@ -16,7 +18,8 @@
 //! `INTERNAL` recording scope, with Config's own service-linked role, recording from
 //! creation because the caller cannot start or stop it. A second create for the same
 //! service is the modelled `ConflictException`, a value that names no service principal
-//! the modelled `ValidationException`, one past the account's service-linked recorder
+//! — and a well-formed one naming a service Config links no such recorder to — the
+//! modelled `ValidationException`, one past the account's service-linked recorder
 //! limit the modelled `LimitExceededException`, and the recorder it creates is no
 //! customer managed recorder: it does not consume that quota and
 //! `StartConfigurationRecorder`, `StopConfigurationRecorder` and
@@ -26,8 +29,10 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_configservice_starlingdoveservice::state::{
-    config_service_linked_role_arn, RECORDING_FREQUENCY_CONTINUOUS,
-    RECORDING_SCOPE_INTERNAL, RECORDING_SCOPE_PAID, RECORDING_STRATEGY_ALL_SUPPORTED,
+    config_service_linked_role_arn, mint_recorder_id, recorder_arn, service_state,
+    supports_service_linked_recording, RecorderEntry, RecorderStatusEntry, TagSet,
+    RECORDING_FREQUENCY_CONTINUOUS, RECORDING_SCOPE_INTERNAL, RECORDING_SCOPE_PAID,
+    RECORDING_STRATEGY_ALL_SUPPORTED, SERVICE_LINKED_PRINCIPALS,
     SERVICE_LINKED_RECORDERS_QUOTA, SERVICE_LINKED_RECORDER_NAME_PREFIX,
 };
 
@@ -39,53 +44,24 @@ const PUT: &str = "PutServiceLinkedConfigurationRecorder";
 /// Service principals and the name Config assigns the service-linked configuration
 /// recorder of each: `(case, the service principal, the assigned recorder name)`.
 ///
-/// The rows differ along what the naming rule generalises over — how many labels the
-/// principal carries, whether the service's own label is hyphenated, underscored,
-/// digit-bearing or already capitalised — and none of them is a principal this issue's
-/// recording used. The prefix is the one
-/// `smithy_query(query="doc", shape="PutServiceLinkedConfigurationRecorderResponse",
+/// The rows are every service `PutServiceLinkedConfigurationRecorder` creates a
+/// recorder for (`state::SERVICE_LINKED_PRINCIPALS`, the Config Developer Guide's list
+/// of supported services/service principals the operation's own doc points at), and
+/// they differ along what the naming rule generalises over: how many labels the
+/// principal carries and whether the service's own label is hyphenated. The prefix is
+/// the one `smithy_query(query="doc", shape="PutServiceLinkedConfigurationRecorderResponse",
 /// member="Name")` publishes: "Config automatically assigns a name that has the prefix
 /// \"AWSConfigurationRecorderFor\"".
-const NAMING: [(&str, &str, &str); 8] = [
+const NAMING: [(&str, &str, &str); 2] = [
     (
         "a single-label service",
-        "ssm.amazonaws.com",
-        "AWSConfigurationRecorderForSsm",
+        SERVICE_LINKED_PRINCIPALS[0],
+        "AWSConfigurationRecorderForObservabilityadmin",
     ),
     (
-        "a service name carrying a digit",
-        "s3.amazonaws.com",
-        "AWSConfigurationRecorderForS3",
-    ),
-    (
-        "a hyphenated service name",
-        "config-multiaccountsetup.amazonaws.com",
-        "AWSConfigurationRecorderForConfigMultiaccountsetup",
-    ),
-    (
-        "several hyphens",
-        "a-b-c.amazonaws.com",
-        "AWSConfigurationRecorderForABC",
-    ),
-    (
-        "an underscored service name",
-        "my_service.amazonaws.com",
-        "AWSConfigurationRecorderForMyService",
-    ),
-    (
-        "a principal with a sub-label",
-        "azure.partner.amazonaws.com",
-        "AWSConfigurationRecorderForAzure",
-    ),
-    (
-        "a regional principal",
-        "logs.us-east-1.amazonaws.com",
-        "AWSConfigurationRecorderForLogs",
-    ),
-    (
-        "a service name that is already capitalised",
-        "SecurityHub.amazonaws.com",
-        "AWSConfigurationRecorderForSecurityHub",
+        "a hyphenated service name under a sub-label",
+        SERVICE_LINKED_PRINCIPALS[1],
+        "AWSConfigurationRecorderForTelemetryEnablement",
     ),
 ];
 
@@ -105,6 +81,48 @@ fn put_request(service_principal: &str, tags: &[(&str, &str)]) -> Value {
             .collect();
     }
     request
+}
+
+/// Place `count` service-linked configuration recorders in the store, reaching it the
+/// way a handler does, so a case can fill the account up to its quota without naming a
+/// service principal the API would refuse.
+fn seed_service_linked(emulator: &Emulator, count: usize) {
+    let state = service_state(&*emulator.engine).expect("the test engine is the shared engine");
+    let mut store = state.lock();
+    for index in 0..count {
+        let name = format!("{SERVICE_LINKED_RECORDER_NAME_PREFIX}Seed{index:02}");
+        let service_principal = format!("seed{index:02}.amazonaws.com");
+        let sequence = store.next_recorder_seq;
+        store.next_recorder_seq = sequence.saturating_add(1);
+        let id = mint_recorder_id(sequence);
+        let arn = recorder_arn(&emulator.region, &name, &id);
+        store.recorder_status.insert(
+            name.clone(),
+            RecorderStatusEntry::started(
+                &name,
+                &arn,
+                &service_principal,
+                std::time::SystemTime::now(),
+            ),
+        );
+        store.recorders.insert(
+            name.clone(),
+            RecorderEntry {
+                name,
+                id,
+                arn,
+                role_arn: Some(config_service_linked_role_arn()),
+                recording_group: None,
+                recording_mode: None,
+                recording_scope: Some(RECORDING_SCOPE_INTERNAL.to_string()),
+                service_principal: Some(service_principal),
+                connector_arn: None,
+                scope_configuration: None,
+                provider: None,
+                tags: TagSet::new(),
+            },
+        );
+    }
 }
 
 /// The one recorder `DescribeConfigurationRecorders` reports for `service_principal`.
@@ -242,9 +260,8 @@ async fn a_service_linked_recorder_is_named_by_its_service_and_read_back_from_st
 
 #[tokio::test]
 async fn a_service_linked_recorder_records_from_creation_and_settles_on_its_own() {
-    // Rows differ along the service the recorder is linked to, so the status is checked
-    // on more than the one principal a recording used.
-    for (case, service_principal, _) in [NAMING[0], NAMING[5]] {
+    // Rows differ along the service the recorder is linked to: every supported one.
+    for (case, service_principal, _) in NAMING {
         let emulator = Emulator::new();
         emulator.ok(PUT, &put_request(service_principal, &[])).await;
 
@@ -264,6 +281,15 @@ async fn a_service_linked_recorder_records_from_creation_and_settles_on_its_own(
             status.get("lastStartTime").is_some(),
             "case {case:?}: the start is stamped, got {status}"
         );
+        // A status reports the service a SERVICE-LINKED recorder is linked to
+        // (`ConfigurationRecorderStatus$servicePrincipal`: "For service-linked
+        // configuration recorders, the service principal of the linked Amazon Web
+        // Services service"), which is what tells a client this recorder is not its
+        // own to start, stop or delete.
+        assert_eq!(
+            status["servicePrincipal"], json!(service_principal),
+            "case {case:?}: the status reports the linked service, got {status}"
+        );
 
         // The move to Success is owed by the clock, not by the describe.
         tokio::time::sleep(Duration::from_millis(700)).await;
@@ -275,6 +301,11 @@ async fn a_service_linked_recorder_records_from_creation_and_settles_on_its_own(
         assert!(
             flag(&settled, "recording"),
             "case {case:?}: the recorder is still recording, got {settled}"
+        );
+        assert_eq!(
+            settled["servicePrincipal"], json!(service_principal),
+            "case {case:?}: the settled status still reports the linked service, \
+             got {settled}"
         );
 
         // Reporting the recorder twice reports the same recorder: a read changes
@@ -294,10 +325,11 @@ async fn a_second_recorder_for_the_same_service_is_a_conflict() {
     // with different tags (tags are taken at creation, so this is no update either),
     // and the same service named with a sub-labelled principal of its own.
     type ConflictCase = (&'static str, &'static str, &'static [(&'static str, &'static str)]);
-    let cases: [ConflictCase; 3] = [
+    let cases: [ConflictCase; 4] = [
         ("the same request again", NAMING[0].1, &[]),
         ("the same service with other tags", NAMING[0].1, &[("tier", "gold")]),
-        ("a sub-labelled principal of the same service", NAMING[5].1, &[]),
+        ("another linked service, again", NAMING[1].1, &[]),
+        ("another linked service with other tags", NAMING[1].1, &[("tier", "gold")]),
     ];
 
     for (case, service_principal, tags) in cases {
@@ -368,63 +400,160 @@ async fn a_value_that_names_no_service_principal_is_refused() {
 }
 
 #[tokio::test]
-async fn the_account_holds_no_more_service_linked_recorders_than_its_quota() {
-    let emulator = Emulator::new();
+async fn a_service_principal_outside_the_supported_set_is_refused() {
+    // Every row satisfies the modelled `ServicePrincipal` constraints (length 1..128,
+    // pattern `^[\w+=,.@-]+$`, from `smithy_query(query="operation",
+    // operation="PutServiceLinkedConfigurationRecorder")`) and is a well-formed service
+    // principal, so the handler is what has to refuse them: none of them names a
+    // service Config links a configuration recorder of this account's own resources to.
+    // The rows differ in FORM — another Amazon Web Services service, a service Config
+    // links a recorder to only through a CONNECTOR (`securityhub.amazonaws.com`, which
+    // only `PutThirdPartyServiceLinkedConfigurationRecorder` creates one for), a
+    // supported principal mis-cased, a supported principal carrying an extra label, a
+    // supported service under another suffix, and the longest principal the model
+    // allows.
+    let longest = format!("{}.amazonaws.com", "x".repeat(114));
+    let supported = SERVICE_LINKED_PRINCIPALS[0];
+    let cases: Vec<(&str, String)> = vec![
+        ("another Amazon Web Services service", "ssm.amazonaws.com".to_string()),
+        (
+            "a service linked only through a connector",
+            "securityhub.amazonaws.com".to_string(),
+        ),
+        ("a supported principal mis-cased", supported.to_uppercase()),
+        (
+            "a supported principal with an extra label",
+            format!("{supported}.example"),
+        ),
+        (
+            "a supported service under another suffix",
+            supported.replace("amazonaws.com", "amazonaws.com.cn"),
+        ),
+        ("the longest principal the model allows", longest),
+    ];
 
-    // Up to the quota, each distinct service gets its own recorder. The principals are
-    // generated rather than listed: what the rule generalises over is HOW MANY the
-    // account holds, not which services they are.
-    for index in 0..SERVICE_LINKED_RECORDERS_QUOTA {
-        let service_principal = format!("svc{index}.amazonaws.com");
-        let created = emulator.ok(PUT, &put_request(&service_principal, &[])).await;
+    for (case, service_principal) in cases {
+        assert!(
+            !service_principal.is_empty() && service_principal.len() <= 128,
+            "case {case:?}: the row must satisfy the modelled length, got {} characters",
+            service_principal.len()
+        );
+        assert!(
+            !supports_service_linked_recording(&service_principal),
+            "case {case:?}: the row must name no service Config links a configuration \
+             recorder to, got {service_principal:?}"
+        );
+
+        let emulator = Emulator::new();
+        let (status, code) = emulator
+            .refused(PUT, &put_request(&service_principal, &[]))
+            .await;
         assert_eq!(
-            created["Name"],
-            json!(format!("{SERVICE_LINKED_RECORDER_NAME_PREFIX}Svc{index}")),
-            "case \"recorder {index}\": expected the name assigned to \
-             {service_principal:?}, got {created}"
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?} ({service_principal:?}): expected 400 ValidationException, \
+             got {status} {code}"
+        );
+
+        // The refused create persisted nothing: no recorder, and nothing to summarise.
+        let described = emulator
+            .ok("DescribeConfigurationRecorders", &json!({}))
+            .await;
+        assert_eq!(
+            described["ConfigurationRecorders"],
+            json!([]),
+            "case {case:?}: the refused create must persist no recorder, got {described}"
+        );
+        let listed = emulator
+            .ok("ListConfigurationRecorders", &json!({}))
+            .await;
+        assert_eq!(
+            listed["ConfigurationRecorderSummaries"],
+            json!([]),
+            "case {case:?}: the refused create must summarise no recorder, got {listed}"
         );
     }
 
-    let at_quota = emulator
-        .ok("ListConfigurationRecorders", &json!({}))
-        .await;
-    assert_eq!(
-        at_quota["ConfigurationRecorderSummaries"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or_default(),
-        SERVICE_LINKED_RECORDERS_QUOTA,
-        "case \"at the quota\": expected {SERVICE_LINKED_RECORDERS_QUOTA} recorders, \
-         got {at_quota}"
-    );
+    // And every supported service principal still gets its recorder, so the refusal is
+    // about which service was named and nothing else.
+    for (case, service_principal, want_name) in NAMING {
+        let emulator = Emulator::new();
+        let created = emulator.ok(PUT, &put_request(service_principal, &[])).await;
+        assert_eq!(
+            created["Name"], want_name,
+            "case {case:?}: a supported service principal must be accepted, got {created}"
+        );
+    }
+}
 
-    // One past it, for a service that has no recorder yet, is refused.
-    let past = format!("svc{SERVICE_LINKED_RECORDERS_QUOTA}.amazonaws.com");
-    let (status, code) = emulator.refused(PUT, &put_request(&past, &[])).await;
-    assert_eq!(
-        (status, code.as_str()),
-        (400, "LimitExceededException"),
-        "case \"one past the quota\": expected 400 LimitExceededException, got {status} {code}"
-    );
+#[tokio::test]
+async fn the_account_holds_no_more_service_linked_recorders_than_its_quota() {
+    // Only a service Config links a recorder to can be named over the API, so the
+    // recorders that fill the account up to its quota are placed in the store the way a
+    // handler reaches it: what the rule generalises over is HOW MANY the account holds,
+    // not which services they are. The rows are the bound itself and one past it.
+    for (case, held, expected) in [
+        ("one below the quota", SERVICE_LINKED_RECORDERS_QUOTA - 1, None),
+        (
+            "at the quota",
+            SERVICE_LINKED_RECORDERS_QUOTA,
+            Some("LimitExceededException"),
+        ),
+    ] {
+        let emulator = Emulator::new();
+        seed_service_linked(&emulator, held);
 
-    // The refusal persisted nothing: the account still holds exactly its quota, and the
-    // recorders it already had are unchanged.
-    let after = emulator
-        .ok("ListConfigurationRecorders", &json!({}))
-        .await;
-    assert_eq!(
-        after["ConfigurationRecorderSummaries"], at_quota["ConfigurationRecorderSummaries"],
-        "case \"one past the quota\": the refused create must leave the store alone, \
-         got {after}"
-    );
+        let before = emulator
+            .ok("ListConfigurationRecorders", &json!({}))
+            .await;
+        assert_eq!(
+            before["ConfigurationRecorderSummaries"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default(),
+            held,
+            "case {case:?}: expected {held} recorders in the store, got {before}"
+        );
 
-    // The customer managed recorder is a separate quota, so it is still creatable.
-    emulator
-        .ok(
-            "PutConfigurationRecorder",
-            &recorder_request(json!({ "roleARN": ROLE_ARN })),
-        )
-        .await;
+        let (service_principal, want_name) = (NAMING[0].1, NAMING[0].2);
+        match expected {
+            None => {
+                let created = emulator.ok(PUT, &put_request(service_principal, &[])).await;
+                assert_eq!(
+                    created["Name"], want_name,
+                    "case {case:?}: the create below the quota must succeed, got {created}"
+                );
+            }
+            Some(want_code) => {
+                let (status, code) = emulator
+                    .refused(PUT, &put_request(service_principal, &[]))
+                    .await;
+                assert_eq!(
+                    (status, code.as_str()),
+                    (400, want_code),
+                    "case {case:?}: expected 400 {want_code}, got {status} {code}"
+                );
+                // The refusal persisted nothing: the store still holds exactly what it
+                // did before the call.
+                let after = emulator
+                    .ok("ListConfigurationRecorders", &json!({}))
+                    .await;
+                assert_eq!(
+                    after["ConfigurationRecorderSummaries"],
+                    before["ConfigurationRecorderSummaries"],
+                    "case {case:?}: the refused create must leave the store alone, got {after}"
+                );
+            }
+        }
+
+        // The customer managed recorder is a separate quota, so it is still creatable.
+        emulator
+            .ok(
+                "PutConfigurationRecorder",
+                &recorder_request(json!({ "roleARN": ROLE_ARN })),
+            )
+            .await;
+    }
 }
 
 #[tokio::test]
@@ -432,7 +561,7 @@ async fn service_linked_recorders_are_no_customer_managed_recorder() {
     let emulator = Emulator::new();
     // Two services, each with its own recorder, created before the account has any
     // recorder of its own.
-    for (case, service_principal, want_name) in [NAMING[1], NAMING[2]] {
+    for (case, service_principal, want_name) in NAMING {
         let created = emulator.ok(PUT, &put_request(service_principal, &[])).await;
         assert_eq!(
             created["Name"], want_name,
@@ -493,7 +622,7 @@ async fn service_linked_recorders_are_no_customer_managed_recorder() {
     );
 
     // The caller's recorder operations do not affect a service-linked recorder.
-    for (case, service_principal, name) in [NAMING[1], NAMING[2]] {
+    for (case, service_principal, name) in NAMING {
         for operation in [
             "StartConfigurationRecorder",
             "StopConfigurationRecorder",

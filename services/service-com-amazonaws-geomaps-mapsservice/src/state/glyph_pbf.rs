@@ -92,8 +92,25 @@ fn is_renderable(codepoint: u32) -> bool {
     codepoint >= 0x20 && !(0xD800..=0xDFFF).contains(&codepoint) && codepoint != 0x7F
 }
 
-/// One glyph: its metrics, derived from the font record, and its SDF bitmap.
-fn glyph(font: &FontRecord, codepoint: u32) -> Glyph {
+/// The box one glyph of `font` occupies, in the font's own pixels.
+///
+/// The ONE place a glyph's measurements are decided. `GetGlyphs` reports them
+/// as the glyph range's metrics, and the static-map renderer measures the
+/// labels it draws with the same boxes (see [`super::labels`]), so a label on a
+/// rendered image is as wide as a client laying the same text out from the
+/// served glyph range would compute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlyphBox {
+    /// The em size the box is measured in, clamped from the font record.
+    pub em: u32,
+    pub width: u32,
+    pub height: u32,
+    /// How far the pen moves after drawing this glyph.
+    pub advance: u32,
+}
+
+/// Measure one glyph of `font`.
+pub fn glyph_box(font: &FontRecord, codepoint: u32) -> GlyphBox {
     // The catalog supplies these, but clamp them anyway: the bitmap is sized
     // from them, so a record with an absurd em or advance would size an
     // allocation. 64px is far above the 24px em an SDF glyph pipeline uses.
@@ -102,15 +119,26 @@ fn glyph(font: &FontRecord, codepoint: u32) -> Glyph {
     // Three widths per font, so a range carries narrow, normal and wide glyphs
     // the way a real stack does, all scaled by the stack's own advance.
     let width = (font.advance.clamp(4, 64) * (2 + codepoint % 3) / 3).max(2);
+    GlyphBox {
+        em,
+        width,
+        height,
+        advance: width + 1,
+    }
+}
+
+/// One glyph: its metrics, derived from the font record, and its SDF bitmap.
+fn glyph(font: &FontRecord, codepoint: u32) -> Glyph {
+    let metrics = glyph_box(font, codepoint);
     let buffer = font.buffer.min(8);
     Glyph {
         id: codepoint,
-        bitmap: Some(sdf_box(width, height, buffer)),
-        width,
-        height,
+        bitmap: Some(sdf_box(metrics.width, metrics.height, buffer)),
+        width: metrics.width,
+        height: metrics.height,
         left: 0,
         top: -font.ascender,
-        advance: width + 1,
+        advance: metrics.advance,
     }
 }
 

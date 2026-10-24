@@ -15,9 +15,10 @@
 //! 2. A submitted job is `IN_PROGRESS` and reaches its terminal status only when the
 //!    CLOCK makes that transition due, at a stored instant 250-750 ms after the submit; a
 //!    read reports what the clock made due and never advances a job itself.
-//! 3. `ListHarvestJobs` filters by `IncludeChannelId` and `IncludeStatus` BEFORE paging,
-//!    so the filtered pages carry exactly the matching jobs, in id order, with a
-//!    `NextToken` only while more remain — and a status filter follows the status the
+//! 3. `ListHarvestJobs` filters by `IncludeChannelId` or by `IncludeStatus` — never by
+//!    both, which it refuses (`tests/all/mutually_exclusive_list_filters.rs`) — BEFORE
+//!    paging, so the filtered pages carry exactly the matching jobs, in id order, with a
+//!    `NextToken` only while more remain, and a status filter follows the status the
 //!    clock left each job in.
 //! 4. A submit this service cannot carry out changes nothing: an `OriginEndpointId`
 //!    naming no stored endpoint and an `Id` already in use are refused with
@@ -596,20 +597,9 @@ async fn list_filters_select_by_channel_and_by_the_status_the_clock_left() {
             ids_for_channel(Some("sports-channel")),
         ),
         (
-            format!(
-                "?includeChannelId=news-channel&includeStatus={}",
-                state::HARVEST_IN_PROGRESS
-            ),
-            ids_for_channel(Some("news-channel")),
-        ),
-        (
-            format!(
-                "?includeChannelId=news-channel&includeStatus={}",
-                state::HARVEST_FAILED
-            ),
+            "?includeChannelId=holds-nothing".to_string(),
             Vec::new(),
         ),
-        ("?includeChannelId=holds-nothing".to_string(), Vec::new()),
         ("?includeStatus=NOT_A_STATUS".to_string(), Vec::new()),
     ] {
         let uri = format!("/harvest_jobs{filter}");
@@ -637,6 +627,20 @@ async fn list_filters_select_by_channel_and_by_the_status_the_clock_left() {
         }
     }
 
+    // Neither filter may be combined with the other: the service refuses the pair rather
+    // than intersecting them, so no row above carries both.
+    // `tests/all/mutually_exclusive_list_filters.rs` is the suite for that rule.
+    for status in [state::HARVEST_IN_PROGRESS, state::HARVEST_FAILED] {
+        let uri = format!("/harvest_jobs?includeChannelId=news-channel&includeStatus={status}");
+        let (code, body) = call(&router, "GET", &uri, None).await;
+        assert_eq!(code, 422, "case {uri:?}: expected 422, got {code} {body:?}");
+        assert_eq!(
+            error_code(&body),
+            "UnprocessableEntityException",
+            "case {uri:?}: expected UnprocessableEntityException, got {body:?}"
+        );
+    }
+
     // Once the clock has made the transitions due the SAME filters follow the new status:
     // the transient one now selects nothing and the terminal one selects everything.
     make_transitions_due(&engine);
@@ -650,10 +654,7 @@ async fn list_filters_select_by_channel_and_by_the_status_the_clock_left() {
             ids_for_channel(None),
         ),
         (
-            format!(
-                "?includeChannelId=sports-channel&includeStatus={}",
-                state::HARVEST_OUTCOME
-            ),
+            "?includeChannelId=sports-channel".to_string(),
             ids_for_channel(Some("sports-channel")),
         ),
     ] {

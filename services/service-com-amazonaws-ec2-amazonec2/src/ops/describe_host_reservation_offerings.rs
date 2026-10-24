@@ -1,15 +1,42 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeHostReservationOfferings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeHostReservationOfferings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeHostReservationOfferings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Dedicated Host reservation offerings that are available to purchase.
+//!
+//! An offering is a published price-list entry, not a resource a caller creates: no EC2
+//! operation adds or withdraws one, and the results "describe all of the Dedicated Host
+//! reservation offerings, including offerings that might not match the instance family
+//! and Region of your Dedicated Hosts". So the catalog is derived once by
+//! [`host_offering_catalog`] (at the foot of this module) from the instance families the
+//! modelled `InstanceType` enum declares, the modelled `PaymentOption` values and the
+//! terms the duration members document, and this handler writes NOTHING: two calls
+//! report the same offerings under the same ids, which is what lets a caller purchase an
+//! offering a describe reported earlier.
+//!
+//! What the request chooses is which offerings are reported, and how many at a time:
+//!
+//! * `Filter` (`instance-family`, `payment-option`) are ANDed with each other and ORed
+//!   over each filter's values, with EC2's `*` / `?` wildcards; a filter this operation
+//!   does not document is refused with `InvalidParameterValue`. The model bounds none of
+//!   the request-controlled factors of that matching, so the filter count, the values per
+//!   filter and each value's size are held to this service's caps, and the PRODUCT of
+//!   them and the candidates is charged to one `crate::state::MatchBudget` — a request
+//!   asking for more comparisons than that is refused with `RequestLimitExceeded` rather
+//!   than answered from a narrowing that stopped half way.
+//! * `MinDuration` and `MaxDuration` bound the term in seconds — "the minimum duration
+//!   of the reservation you'd like to purchase" and "the maximum duration of the
+//!   reservation to purchase" — inclusively, so a request naming both reports the terms
+//!   between them and a request naming neither reports every term.
+//! * `OfferingId` names one offering of that catalog. An id the catalog does not hold
+//!   names no offering and is reported as none: this operation's model declares no error
+//!   shape, and the catalog is a published list rather than the caller's own resources,
+//!   so an id outside it is a selection that matches nothing rather than a missing
+//!   resource.
+//! * `MaxResults` and `NextToken` page the matching offerings in a stable order: the
+//!   token is the opaque cursor `crate::state::encode_page_token` mints, naming the
+//!   offering the next page starts at, and the last page carries no token. A request
+//!   naming no `MaxResults` gets the largest page the model publishes.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +180,453 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeHostReservationOfferings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeHostReservationOfferingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // This operation reports a published catalog and persists nothing, so it reaches
+        // neither the engine on `self` nor the request metadata on `ctx`: the offerings
+        // "might not match the instance family and Region of your Dedicated Hosts", so
+        // not even the Region the request was signed for narrows them.
+        let _ = (&self.engine, ctx);
+
+        // "The token to use to retrieve the next page of results" — anything else is
+        // refused rather than read as a cursor, and it is refused before any member that
+        // selects what to report is looked at, so whether a bogus token is caught never
+        // depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(crate::state::invalid_pagination_token)?,
+            ),
+        };
+
+        // Matching cost is filters x values x value length x candidate families and
+        // options, and the model bounds none of the request-controlled factors (`Filter`
+        // carries no `@length`), so they are capped here, before any work proportional to
+        // them is done — and their PRODUCT is charged to one `MatchBudget` below, which is
+        // the bound the per-factor caps cannot give. The caps are the ones the other
+        // filtered describes of this service hold a request to.
+        let supplied_filters = input.filter.as_ref().map_or(0, Vec::len);
+        if supplied_filters > crate::state::MAX_FILTERS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum of {}",
+                crate::state::MAX_FILTERS
+            )));
+        }
+
+        // "If you specify multiple filters, the filters are joined with an AND"; and
+        // within one filter, "If you specify multiple values for a filter, the values are
+        // joined with an OR" (the `Filter` shape's own doc). A filter whose name this
+        // operation does not document is refused rather than ignored, so a misspelled
+        // filter cannot read as "everything matched".
+        let filters = input.filter.as_deref().unwrap_or_default();
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !HOST_RESERVATION_OFFERING_FILTERS.contains(&name) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > crate::state::MAX_FILTER_VALUES {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of {}",
+                    values.len(),
+                    crate::state::MAX_FILTER_VALUES
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the candidate's, so each value's size is
+            // bounded too, before any matching runs.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > crate::state::MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of {}",
+                    oversize.len(),
+                    crate::state::MAX_FILTER_VALUE_BYTES
+                )));
+            }
+        }
+
+        // Each documented filter compares against ONE field of an offering, so the field
+        // each one names is narrowed before any offering is built: a filter value is
+        // compiled once and compared against the families or the payment options, never
+        // against every family-term-option triple. That is the same answer as testing
+        // each built offering, at a cost proportional to families + options + terms
+        // rather than to their product.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeHostReservationOfferings"))
+        // Every comparison the request makes is charged to ONE budget, so the product of
+        // filters, values, value length and candidates is bounded however the caller
+        // combines them.
+        let compiled: Vec<(&str, Vec<crate::state::FilterPattern>)> = filters
+            .iter()
+            .map(|filter| {
+                let patterns = filter
+                    .values
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|wanted| crate::state::FilterPattern::compile(wanted))
+                    .collect();
+                (filter.name.as_deref().unwrap_or_default(), patterns)
+            })
+            .collect();
+        let mut budget = crate::state::MatchBudget::new(crate::state::MAX_FILTER_MATCH_STEPS);
+        let admitted = |field: &str, candidate: &str, budget: &mut crate::state::MatchBudget| {
+            compiled
+                .iter()
+                .filter(|(name, _)| *name == field)
+                .all(|(_, patterns)| {
+                    patterns
+                        .iter()
+                        .any(|pattern| pattern.matches_within(candidate, budget))
+                })
+        };
+        let admitted_families: ::std::collections::BTreeSet<String> =
+            host_offering_instance_families()
+                .into_iter()
+                .filter(|instance_family| {
+                    admitted("instance-family", instance_family, &mut budget)
+                })
+                .collect();
+        let admitted_options: ::std::collections::BTreeSet<&'static str> =
+            host_offering_payment_options()
+                .iter()
+                .copied()
+                .filter(|payment_option| admitted("payment-option", payment_option, &mut budget))
+                .collect();
+        // A spent budget means the narrowing is INCOMPLETE, which is not something to
+        // report as a result: the request asked for more filtering than one call will do,
+        // and is told so rather than given a silently shortened catalog. With the
+        // per-factor caps above and candidates as short as a family name, a request can
+        // get close to this ceiling but not reliably past it, so this is the defensive
+        // bound the per-factor caps cannot give rather than a path a test can pin: a test
+        // for it would assert the matcher's exact step accounting, not a rule of the API.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {} comparisons to \
+                     evaluate; narrow them or page with MaxResults",
+                    crate::state::MAX_FILTER_MATCH_STEPS
+                ),
+            ));
+        }
+
+        // "This is the minimum duration of the reservation you'd like to purchase" /
+        // "the maximum duration of the reservation to purchase, specified in seconds":
+        // bounds on the term, inclusive at both ends, so a request naming exactly one
+        // term's length reports that term.
+        let durations: Vec<i32> = host_reservation_durations()
+            .into_iter()
+            .filter(|duration| {
+                input.min_duration.is_none_or(|minimum| *duration >= minimum)
+                    && input.max_duration.is_none_or(|maximum| *duration <= maximum)
+            })
+            .collect();
+
+        // The published catalog is built ONCE ([`host_offering_catalog`]) and the request
+        // selects from it: each offering is admitted by a set lookup of its family and
+        // its payment option, by the term bounds, and by `OfferingId` — "The ID of the
+        // reservation offering" — which names one entry of that catalog. The filter
+        // VALUES were matched against the fields above, never against the offerings, so
+        // the wildcard matching stays proportional to families + options rather than to
+        // the whole product.
+        let matching: Vec<&'static crate::ops::describe_host_reservation_offerings::HostOfferingRecord> =
+            host_offering_catalog()
+                .iter()
+                .filter(|offering| {
+                    admitted_families.contains(&offering.instance_family)
+                        && admitted_options.contains(&offering.payment_option)
+                        && durations.contains(&offering.duration_seconds)
+                        && input
+                            .offering_id
+                            .as_deref()
+                            .is_none_or(|offering_id| offering.offering_id == offering_id)
+                })
+                .collect();
+
+        // `MaxResults` bounds one page of THAT set, and the cursor names the offering the
+        // next page starts at, so a token always advances in the catalog's own cursor
+        // order. The model's `range 5..500` on `MaxResults` has already refused anything
+        // outside it, so the only value that cannot convert is one the boundary validator
+        // would have rejected.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => matching
+                .partition_point(|offering| host_offering_page_cursor(offering).as_str() < cursor),
+        };
+        let page = matching.get(from..).unwrap_or_default();
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        // "This value is null when there are no more results to return"
+        // (`DescribeHostReservationOfferingsResult$NextToken`): a token only when an
+        // offering follows this page.
+        let next_token = page
+            .get(limit)
+            .map(|offering| crate::state::encode_page_token(&host_offering_page_cursor(offering)));
+
+        Ok(DescribeHostReservationOfferingsOutput {
+            next_token,
+            offering_set: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|offering| offering.to_host_offering())
+                    .collect(),
+            ),
+        })
     }
+}
+
+/// The page size a request that names no `MaxResults` gets: the largest the model
+/// publishes for this operation (`DescribeHostReservationsMaxResults`, `range 5..500`),
+/// which is also the most EC2 serves in one page ("This value can be between 5 and 500.
+/// If maxResults is given a larger value than 500, you receive an error").
+const DEFAULT_MAX_RESULTS: usize = 500;
+
+// ---------------------------------------------------------------------------
+// The published offering catalog
+// ---------------------------------------------------------------------------
+//
+// An offering is a price-list entry a caller purchases, never a resource it creates, so
+// the catalog is DERIVED from the model rather than stored: it lives here, beside the
+// only operation that reports one today, rather than in `crate::state`, which holds the
+// resources callers create. The shared facts it is built from — the instance-type
+// catalog, the EC2 filter matcher, the page-token codec — are `crate::state`'s, so
+// nothing is duplicated; when `PurchaseHostReservation` and
+// `GetHostReservationPurchasePreview` are implemented, this is the one definition they
+// read an offering from.
+
+/// Every filter `DescribeHostReservationOfferings` documents, as its `Filter` member
+/// lists them
+/// (`smithy_query(query="doc",shape="DescribeHostReservationOfferingsRequest",member="Filter")`:
+/// "instance-family - The instance family of the offering (for example, m4).
+/// payment-option - The payment option (NoUpfront | PartialUpfront | AllUpfront)").
+/// A filter outside this set is refused; each filter inside it compares against ONE
+/// field of an offering, which is what lets a describe narrow that field before the
+/// catalog itself is built.
+pub const HOST_RESERVATION_OFFERING_FILTERS: [&str; 2] = ["instance-family", "payment-option"];
+
+/// The seconds in one reservation year, as the duration members spell it out: "the
+/// number of seconds specified must be the number of seconds in a year (365x24x60x60)
+/// times one of the supported durations (1 or 3)"
+/// (`DescribeHostReservationOfferingsRequest$MinDuration`).
+pub const SECONDS_PER_RESERVATION_YEAR: i32 = 365 * 24 * 60 * 60;
+
+/// The terms a Dedicated Host reservation is offered for, in years: "Reservations are
+/// available in one-year and three-year terms … times one of the supported durations (1
+/// or 3)" (`DescribeHostReservationOfferingsRequest$MinDuration`).
+pub const HOST_RESERVATION_TERM_YEARS: [i32; 2] = [1, 3];
+
+/// The currency every offering is priced in: the only value of the modelled
+/// `CurrencyCodeValues` enum (`super::types::CURRENCY_CODE_VALUES_VALUES`).
+pub const HOST_OFFERING_CURRENCY_CODE: &str = "USD";
+
+/// The id prefix a Dedicated Host reservation offering carries, as AWS's own offering
+/// ids read (`hro-03f707bf363b6b324`, the form the `OfferingId` member's examples name).
+pub const HOST_OFFERING_ID_PREFIX: &str = "hro";
+
+/// The modelled `PaymentOption` value that pays the whole reservation at purchase
+/// (`super::types::PAYMENT_OPTION_VALUES`).
+pub const PAYMENT_OPTION_ALL_UPFRONT: &str = "AllUpfront";
+
+/// The modelled `PaymentOption` value that pays part at purchase and the rest hourly.
+pub const PAYMENT_OPTION_PARTIAL_UPFRONT: &str = "PartialUpfront";
+
+/// The hourly rate one reserved Dedicated Host is priced at, in thousandths of
+/// [`HOST_OFFERING_CURRENCY_CODE`] — prices are reported as decimal strings with three
+/// decimal places, so counting in whole thousandths keeps the arithmetic exact.
+///
+/// CHOSEN: AWS's price list is published outside the API, so neither the Smithy model
+/// nor a request carries what a family's host costs, and ONE rate serves every family
+/// here rather than a per-family table invented for the purpose. What the catalog does
+/// report faithfully is the RELATION the payment option defines between the upfront and
+/// the hourly price of the same term — see [`host_offering_prices`].
+const HOST_RATE_MILLI_PER_HOUR: i64 = 1_000;
+
+/// The seconds in an hour, for turning a reservation's term into the hours its hourly
+/// price is charged for.
+const SECONDS_PER_HOUR: i64 = 3_600;
+
+/// One Dedicated Host reservation offering, as the describe reads it.
+///
+/// `payment_option` is a `&'static str` because it is one value of the modelled
+/// `PaymentOption` enum, taken from that enum's generated value list rather than from a
+/// request. The two prices are held in thousandths of the offering's currency and
+/// rendered by [`format_price_milli`], so the `String` price members the model declares
+/// cannot drift apart from the arithmetic that produced them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostOfferingRecord {
+    /// `hro-00000000000000000` — [`host_offering_id`] of the three facts below.
+    pub offering_id: String,
+    /// The instance family the reservation covers, e.g. `m4`.
+    pub instance_family: String,
+    /// `AllUpfront`, `PartialUpfront` or `NoUpfront`.
+    pub payment_option: &'static str,
+    /// The term, in seconds, as `HostOffering$Duration` reports it.
+    pub duration_seconds: i32,
+    /// The hourly price, in thousandths of the currency.
+    pub hourly_price_milli: i64,
+    /// The price due at purchase, in thousandths of the currency.
+    pub upfront_price_milli: i64,
+}
+
+impl HostOfferingRecord {
+    /// This offering as the modelled `HostOffering` shape.
+    pub fn to_host_offering(&self) -> HostOffering {
+        HostOffering {
+            currency_code: Some(HOST_OFFERING_CURRENCY_CODE.to_string()),
+            duration: Some(self.duration_seconds),
+            hourly_price: Some(format_price_milli(self.hourly_price_milli)),
+            instance_family: Some(self.instance_family.clone()),
+            offering_id: Some(self.offering_id.clone()),
+            payment_option: Some(self.payment_option.to_string()),
+            upfront_price: Some(format_price_milli(self.upfront_price_milli)),
+        }
+    }
+}
+
+/// A price held in thousandths of its currency, as the `String` price members quote it:
+/// three decimal places, the form AWS's own offerings are quoted in (`"0.000"`,
+/// `"1.499"`). Every price this module computes is non-negative, which the assertion
+/// states rather than leaves to the formatting.
+pub fn format_price_milli(milli: i64) -> String {
+    debug_assert!(milli >= 0, "a price is never negative, got {milli}");
+    format!("{}.{:03}", milli / 1_000, milli.rem_euclid(1_000))
+}
+
+/// The hourly and the upfront price of one offering, in thousandths: what
+/// `payment_option` says about WHEN a reservation is paid for, applied to the term's
+/// total of [`HOST_RATE_MILLI_PER_HOUR`] × the term's hours.
+///
+/// Each value of the modelled `PaymentOption` enum names the split it makes of that one
+/// total: `AllUpfront` pays all of it at purchase and nothing per hour, `NoUpfront`
+/// nothing at purchase and all of it per hour, and `PartialUpfront` half each way. That
+/// is why `UpfrontPrice` "does not apply to No Upfront offerings"
+/// (`HostOffering$UpfrontPrice`) and a No Upfront offering quotes it as zero.
+fn host_offering_prices(payment_option: &str, duration_seconds: i32) -> (i64, i64) {
+    let hours = i64::from(duration_seconds) / SECONDS_PER_HOUR;
+    let total = HOST_RATE_MILLI_PER_HOUR.saturating_mul(hours);
+    match payment_option {
+        PAYMENT_OPTION_ALL_UPFRONT => (0, total),
+        PAYMENT_OPTION_PARTIAL_UPFRONT => (HOST_RATE_MILLI_PER_HOUR / 2, total / 2),
+        // `NoUpfront`, and anything outside the modelled enum — which the request walk
+        // refuses before a handler runs, so no such value reaches a built offering.
+        _ => (HOST_RATE_MILLI_PER_HOUR, 0),
+    }
+}
+
+/// The instance families Dedicated Host reservations are offered for, in catalog order.
+///
+/// A family is the part of an instance type before the size, read off the modelled
+/// `InstanceType` enum's generated value list by `crate::state::instance_family_of` —
+/// the same derivation `AllocateHosts` and the mac-host describes use, and the same
+/// catalog `crate::state::offered_instance_types` reports — so a family is offered
+/// exactly when the model declares an instance type in it. AWS offers reservations for a
+/// subset of the fleet, and neither the model nor a request carries WHICH subset, so the
+/// set is not narrowed here by a list invented for the purpose.
+pub fn host_offering_instance_families() -> Vec<String> {
+    crate::state::offered_instance_types()
+        .iter()
+        .map(|instance_type| crate::state::instance_family_of(instance_type).to_string())
+        .collect::<::std::collections::BTreeSet<String>>()
+        .into_iter()
+        .collect()
+}
+
+/// Every payment option an offering is published on: the modelled `PaymentOption`
+/// enum's generated value list, so an option is offered exactly when the model declares
+/// it.
+pub fn host_offering_payment_options() -> &'static [&'static str] {
+    PAYMENT_OPTION_VALUES
+}
+
+/// Every term a reservation is offered for, in seconds and ascending:
+/// [`HOST_RESERVATION_TERM_YEARS`] years of [`SECONDS_PER_RESERVATION_YEAR`] seconds.
+pub fn host_reservation_durations() -> Vec<i32> {
+    HOST_RESERVATION_TERM_YEARS
+        .iter()
+        .map(|years| years * SECONDS_PER_RESERVATION_YEAR)
+        .collect()
+}
+
+/// The id of the offering at position `index` of the published catalog.
+///
+/// An offering is a catalog entry rather than a stored resource, so its id is DERIVED
+/// from its PLACE in that catalog instead of minted from the store's id counter: a
+/// describe must not write to report a catalog, and `PurchaseHostReservation` has to be
+/// able to name an offering a describe reported earlier. The place is unique by
+/// construction — no two entries of [`host_offering_catalog`] share one — and the
+/// catalog is built from the model's own value lists and two constants, so the same
+/// offering carries the same id on every call and in every build, with no mixing
+/// function needed to make it so. The form is the `<prefix>-<17 lowercase hex digits>`
+/// EC2 uses, the same shape `ComAmazonawsEc2Amazonec2State::next_id` mints a stored
+/// resource's id in.
+fn host_offering_id(index: usize) -> String {
+    format!("{HOST_OFFERING_ID_PREFIX}-{index:017x}")
+}
+
+/// The whole published catalog: every offering of every family, on every payment option,
+/// for every term — built ONCE.
+///
+/// Every input is fixed at build time (the modelled `InstanceType` and `PaymentOption`
+/// value lists, [`HOST_RESERVATION_TERM_YEARS`] and [`SECONDS_PER_RESERVATION_YEAR`]), so
+/// the catalog cannot differ between two requests and is not rebuilt for each: what a
+/// request does is SELECT from it. The entries are produced in
+/// [`host_offering_page_cursor`] order — family, then term, then payment option — which is
+/// the order a `NextToken` walk resumes in, so an entry's index also names its place in
+/// the page order. The families and the terms come out of their own builders sorted; the
+/// payment options are sorted HERE rather than trusted to come out of the generated value
+/// list in order, because the binary search a `NextToken` does over this catalog is only
+/// correct while the order holds, and an unordered enum list would otherwise skip or
+/// repeat offerings in a build with `debug_assert!` compiled out.
+fn host_offering_catalog() -> &'static [HostOfferingRecord] {
+    static CATALOG: ::std::sync::OnceLock<Vec<HostOfferingRecord>> = ::std::sync::OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let instance_families = host_offering_instance_families();
+        let durations = host_reservation_durations();
+        let mut payment_options: Vec<&'static str> = host_offering_payment_options().to_vec();
+        payment_options.sort_unstable();
+        let mut offerings: Vec<HostOfferingRecord> =
+            Vec::with_capacity(instance_families.len() * durations.len() * payment_options.len());
+        for instance_family in &instance_families {
+            for duration in &durations {
+                for payment_option in payment_options.iter().copied() {
+                    let (hourly_price_milli, upfront_price_milli) =
+                        host_offering_prices(payment_option, *duration);
+                    offerings.push(HostOfferingRecord {
+                        offering_id: host_offering_id(offerings.len()),
+                        instance_family: instance_family.clone(),
+                        payment_option,
+                        duration_seconds: *duration,
+                        hourly_price_milli,
+                        upfront_price_milli,
+                    });
+                }
+            }
+        }
+        debug_assert!(
+            offerings.is_sorted_by_key(host_offering_page_cursor),
+            "the catalog is built in cursor order, which the page walk depends on"
+        );
+        offerings
+    })
+}
+
+/// The pagination cursor naming `offering`: its instance family, its term and its
+/// payment option, joined by a space.
+///
+/// Paging is by cursor rather than by index, the way `crate::state::encode_page_token`
+/// and `DescribeInstanceTypeOfferings` do it, so a token names the offering the next
+/// page starts at instead of a position a changed filter would shift. The duration is
+/// zero-padded so the cursor sorts by the term's length rather than by its leading
+/// digit, and the separator sorts ahead of every character a family or a payment option
+/// can carry, so one family being a prefix of another cannot reorder the two.
+pub fn host_offering_page_cursor(offering: &HostOfferingRecord) -> String {
+    format!(
+        "{} {:010} {}",
+        offering.instance_family, offering.duration_seconds, offering.payment_option
+    )
 }

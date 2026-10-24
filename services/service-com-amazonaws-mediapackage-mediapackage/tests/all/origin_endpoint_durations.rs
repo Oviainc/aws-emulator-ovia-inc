@@ -10,8 +10,10 @@
 //! `UnprocessableEntityException` (HTTP 422) keyed by that member, and persists nothing:
 //! the create stores no endpoint and the update leaves the stored one exactly as it was.
 //! Zero is a real value for every one of them (`StartoverWindowSeconds` 0 is startover
-//! playback disabled), so the floor is zero, and a value at or above it is stored and
-//! read back.
+//! playback disabled), so the shared floor is zero, and a value at or above it is stored
+//! and read back. One member of the set, `StartoverWindowSeconds`, has a published minimum
+//! of its OWN above that floor, so it is judged against that minimum here and
+//! `tests/all/startover_window_bound.rs` is the suite for its whole accepted domain.
 //!
 //! Every case drives real HTTP through the `MultiServiceRouter` — the same dispatch the
 //! served emulator uses — so what is asserted is the wire behaviour, not a handler call.
@@ -33,12 +35,28 @@
 //! operation carries it (create or update).
 
 use serde_json::{json, Value};
+use service_com_amazonaws_mediapackage_mediapackage::state;
 
 use crate::channel_lifecycle::{call, emulator, error_code};
 
+/// The floor the member at `path` must meet, taken from the service's own constants rather
+/// than restated here: every duration-in-seconds member shares
+/// `crate::state::MIN_DURATION_SECONDS`, except `startoverWindowSeconds`, whose ENABLED
+/// window has a published minimum of its own — `tests/all/startover_window_bound.rs` is the
+/// suite for that member's whole accepted domain.
+fn floor(path: &str) -> i32 {
+    if path == state::STARTOVER_WINDOW_MEMBER {
+        state::MIN_ENABLED_STARTOVER_WINDOW_SECONDS
+    } else {
+        state::MIN_DURATION_SECONDS
+    }
+}
+
 /// The requirement a refused duration states, as this service words every violated
-/// numeric floor (`crate::state::MIN_DURATION_SECONDS`).
-const REQUIREMENT: &str = "must be greater than or equal to 0";
+/// numeric floor: the member's own floor, in one sentence.
+fn requirement(path: &str) -> String {
+    format!("must be greater than or equal to {}", floor(path))
+}
 
 /// A SPEKE key provider, which every packaging format's `Encryption` requires
 /// (`SpekeKeyProvider$ResourceId`, `$RoleArn`, `$SystemIds` and `$Url` are all required),
@@ -183,12 +201,13 @@ const MEMBERS: &[Member] = &[
     },
 ];
 
-/// Negative values every member must refuse: the smallest step below the floor, the value
-/// the issue reported, and the smallest `__integer` there is.
+/// Negative values every member must refuse, whatever its floor: the smallest step below
+/// zero, the value the issue reported, and the smallest `__integer` there is.
 const REFUSED: &[i32] = &[-1, -100, i32::MIN];
 
-/// Values at or above the floor, which every member must store: zero (a real value for
-/// each of them) and a positive one.
+/// Values every member must store: zero (a real value for each of them — for
+/// `startoverWindowSeconds` it is startover playback disabled) and a positive one above
+/// every member's floor.
 const ACCEPTED: &[i32] = &[0, 86_400];
 
 /// The JSON pointer that reads a member back out of an endpoint projection, derived from
@@ -242,7 +261,7 @@ async fn a_negative_duration_is_refused_on_create_and_stores_no_endpoint() {
             );
             assert_eq!(
                 refusal.pointer(&format!("/errors/{}", member.path)),
-                Some(&json!(REQUIREMENT)),
+                Some(&json!(requirement(member.path))),
                 "case {case:?}: the refusal must be keyed by {:?} and state the floor, \
                  got {refusal:?}",
                 member.path
@@ -342,7 +361,7 @@ async fn a_negative_duration_is_refused_on_update_and_changes_nothing() {
             );
             assert_eq!(
                 refusal.pointer(&format!("/errors/{}", member.path)),
-                Some(&json!(REQUIREMENT)),
+                Some(&json!(requirement(member.path))),
                 "case {case:?}: the refusal must be keyed by {:?} and state the floor, \
                  got {refusal:?}",
                 member.path
