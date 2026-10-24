@@ -29,6 +29,8 @@ mod shared_endpoint_routing;
 mod ssl_policies;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/target_group_attribute_writes.rs"]
+mod target_group_attribute_writes;
 #[path = "all/target_group_attributes_and_modification.rs"]
 mod target_group_attributes_and_modification;
 #[path = "all/target_group_health_check_port.rs"]
