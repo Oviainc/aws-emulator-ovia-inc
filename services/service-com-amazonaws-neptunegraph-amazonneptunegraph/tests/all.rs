@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/error_message_rendering.rs"]
 mod error_message_rendering;
+#[path = "all/export_task_lifecycle.rs"]
+mod export_task_lifecycle;
 #[path = "all/graph_lifecycle.rs"]
 mod graph_lifecycle;
 #[path = "all/graph_run_state.rs"]

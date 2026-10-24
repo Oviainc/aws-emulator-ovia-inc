@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::ops::types::{ResourceNotFoundException, VectorSearchConfiguration};
+use crate::ops::types::{ExportFilter, ResourceNotFoundException, VectorSearchConfiguration};
 
 /// The ARN namespace (and SigV4 signing name) of this service, from the model's
 /// `aws.api#service` trait:
@@ -243,6 +243,146 @@ impl Snapshot {
     }
 }
 
+/// How long after the `StartExportTask` that starts it an export task's terminal
+/// status is owed: the task answers `INITIALIZING` until this span has passed, then
+/// the next read finds the status the clock settled it into.
+///
+/// The real service exports for as long as the graph's data takes; this emulator picks
+/// a span inside the emulator-wide 250ms..750ms band for a transition the clock owes,
+/// so a caller that reads the task straight after starting it still observes the
+/// transient `INITIALIZING` status. No handler ever sleeps for it — the due instant is
+/// stored and compared on read.
+pub const EXPORT_TASK_SPAN: Duration = Duration::from_millis(500);
+
+/// Why an export task this emulator accepts ends `FAILED`.
+///
+/// `StartExportTask` starts a RUN that reads a graph's vertices and edges and writes
+/// them, as CSV or Parquet objects encrypted with the caller's KMS key, under the
+/// Amazon S3 URI the request names. This emulator holds no graph data plane and makes
+/// no outbound connection to S3 or KMS, so nothing is ever read from the graph and no
+/// object is ever written: reporting `EXPORTING` or `SUCCEEDED` would claim a run that
+/// did not happen and objects that do not exist, so the task reaches the modelled
+/// failure status carrying this reason instead.
+pub const EXPORT_NOT_PERFORMED_REASON: &str =
+    "this emulator does not export graph data: no data was read from the graph and nothing \
+     was written to the destination";
+
+/// The statuses this slice of the emulator puts an export task into.
+///
+/// Both variants' wire forms are modelled `ExportTaskStatus` values
+/// (`crate::ops::types::EXPORT_TASK_STATUS_VALUES`). `EXPORTING` and `SUCCEEDED` are
+/// never produced here because no export run happens (see
+/// [`EXPORT_NOT_PERFORMED_REASON`]); `CANCELLING`, `CANCELLED` and `DELETED` belong to
+/// `CancelExportTask`, which is still scaffolded, and are added with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportTaskStatus {
+    /// `StartExportTask` has accepted the task; no data has moved yet.
+    Initializing,
+    /// The task is over and nothing was exported ([`EXPORT_NOT_PERFORMED_REASON`]).
+    Failed,
+}
+
+impl ExportTaskStatus {
+    /// This status as the modelled `ExportTaskStatus` enum value.
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Initializing => "INITIALIZING",
+            Self::Failed => "FAILED",
+        }
+    }
+}
+
+/// One stored export task: every member `GetExportTask` reports, plus the instant at
+/// which the terminal status the clock owes it becomes due.
+///
+/// An export task is a resource in its own right — it is addressed by its own
+/// `^t-[a-z0-9]{10}$` id and outlives the graph it reads — so it is stored beside the
+/// graphs rather than inside the graph record, the way a snapshot is.
+#[derive(Debug, Clone)]
+pub struct ExportTask {
+    pub id: String,
+    /// The ARN the tagging surface reads this task's tags back through. Spelled with
+    /// the same hyphenated resource segment convention as the other resources this
+    /// service mints (`graph/`, `graph-snapshot/`).
+    pub arn: String,
+    /// The graph the export reads, kept as that graph's id (not a borrow) so deleting
+    /// the graph leaves the task's provenance intact.
+    pub source_graph_id: String,
+    pub role_arn: String,
+    pub format: String,
+    pub parquet_type: Option<String>,
+    pub destination: String,
+    pub kms_key_identifier: String,
+    pub export_filter: Option<ExportFilter>,
+    pub status: ExportTaskStatus,
+    pub status_reason: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    /// When the task was accepted: what `ExportTaskDetails$startTime` reports.
+    pub start_time: SystemTime,
+    /// The monotonic counterpart of [`Self::start_time`], which
+    /// `ExportTaskDetails$timeElapsedSeconds` is measured from.
+    pub started_at: Instant,
+    /// When the terminal status falls due. `None` once there is nothing outstanding.
+    pub settles_at: Option<Instant>,
+}
+
+impl ExportTask {
+    /// Materialise the transition the clock has already made due.
+    ///
+    /// The same one write a reporting operation may make as [`Graph::settle`]: the task
+    /// would have ended at `settles_at` whether or not anybody called, so applying it
+    /// on read is bookkeeping rather than a state change caused by the read.
+    pub fn settle(&mut self, now: Instant) {
+        if self.settles_at.is_some_and(|due| now >= due) {
+            self.status = ExportTaskStatus::Failed;
+            self.status_reason = Some(EXPORT_NOT_PERFORMED_REASON.to_string());
+            self.settles_at = None;
+        }
+    }
+
+    /// How long the task has been running, in whole seconds: what
+    /// `ExportTaskDetails$timeElapsedSeconds` reports.
+    pub fn elapsed_seconds(&self, now: Instant) -> i64 {
+        i64::try_from(now.saturating_duration_since(self.started_at).as_secs())
+            .unwrap_or(i64::MAX)
+    }
+
+    /// The task's `ExportTaskDetails`, as of `now`.
+    ///
+    /// `progressPercentage` is zero and the written-element counts are ABSENT because
+    /// no export run happens here (see [`EXPORT_NOT_PERFORMED_REASON`]): no vertex or
+    /// edge was written, so there is no count to report rather than a count of zero
+    /// that would claim a run which wrote nothing.
+    pub fn details(&self, now: Instant) -> crate::ops::types::ExportTaskDetails {
+        crate::ops::types::ExportTaskDetails {
+            start_time: ::aws_smithy_types::DateTime::from(self.start_time),
+            time_elapsed_seconds: self.elapsed_seconds(now),
+            progress_percentage: 0,
+            num_vertices_written: None,
+            num_edges_written: None,
+        }
+    }
+
+    /// This task as `GetExportTask`'s output, as of `now`: the stored record plus the
+    /// details derived from the clock, so that read cannot drift from what
+    /// `StartExportTask` reported.
+    pub fn get_output(&self, now: Instant) -> crate::ops::types::GetExportTaskOutput {
+        crate::ops::types::GetExportTaskOutput {
+            graph_id: self.source_graph_id.clone(),
+            role_arn: self.role_arn.clone(),
+            task_id: self.id.clone(),
+            status: self.status.as_wire().to_string(),
+            format: self.format.clone(),
+            destination: self.destination.clone(),
+            kms_key_identifier: self.kms_key_identifier.clone(),
+            parquet_type: self.parquet_type.clone(),
+            status_reason: self.status_reason.clone(),
+            export_task_details: Some(self.details(now)),
+            export_filter: self.export_filter.clone(),
+        }
+    }
+}
+
 /// The states this slice of the emulator puts an in-flight query into.
 ///
 /// Every variant's wire form is one of the modelled `QueryState` values
@@ -411,10 +551,15 @@ pub struct ComAmazonawsNeptunegraphAmazonneptunegraphState {
     /// that runs it and leaves this map when it terminates, so the map holds exactly
     /// the queries `GetQuery`, `ListQueries` and `CancelQuery` can still name.
     pub queries: BTreeMap<String, BTreeMap<String, Query>>,
+    /// Every stored export task, keyed by its minted `t-xxxxxxxxxx` id. A `BTreeMap`
+    /// so `ListExportTasks` has one stable total order to page over.
+    pub export_tasks: BTreeMap<String, ExportTask>,
     /// Feeds the graph-id generator, so ids are unique within a store.
     pub id_counter: u64,
     /// Feeds the snapshot-id generator, so ids are unique within a store.
     pub snapshot_id_counter: u64,
+    /// Feeds the export-task-id generator, so ids are unique within a store.
+    pub export_task_id_counter: u64,
 }
 
 impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
@@ -446,6 +591,34 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
     pub fn insert_graph(&mut self, graph: Graph) {
         self.graph_names.insert(graph.name.clone(), graph.id.clone());
         self.graphs.insert(graph.id.clone(), graph);
+    }
+
+    /// Mint an id no export task in this store holds, matching the modelled
+    /// `ExportTaskId` pattern `^t-[a-z0-9]{10}$`.
+    pub fn next_export_task_id(&mut self) -> String {
+        loop {
+            self.export_task_id_counter = self.export_task_id_counter.wrapping_add(1);
+            let id = encode_resource_id(
+                EXPORT_TASK_ID_PREFIX,
+                scramble(self.export_task_id_counter) % BASE36_POW10,
+            );
+            if !self.export_tasks.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// Store a new export task.
+    pub fn insert_export_task(&mut self, task: ExportTask) {
+        self.export_tasks.insert(task.id.clone(), task);
+    }
+
+    /// Apply the terminal transition the clock has made due, then borrow one export
+    /// task.
+    pub fn settled_export_task(&mut self, id: &str, now: Instant) -> Option<&ExportTask> {
+        let task = self.export_tasks.get_mut(id)?;
+        task.settle(now);
+        Some(task)
     }
 
     /// Store a new snapshot and index its name.
@@ -569,6 +742,9 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         for snapshot in self.snapshots.values_mut() {
             snapshot.settle(now);
         }
+        for task in self.export_tasks.values_mut() {
+            task.settle(now);
+        }
     }
 
     /// Apply the snapshot transition the clock has made due, then borrow one
@@ -589,9 +765,9 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
     ///
     /// Tags live on the resource record itself, which is what makes a tag supplied at
     /// create time and one written later by `TagResource` the same bytes, read back by
-    /// this one lookup. Graphs and snapshots are the taggable resources this slice
-    /// stores; private endpoints and tasks join this lookup with the operations that
-    /// mint them.
+    /// this one lookup. Graphs, snapshots and export tasks are the taggable resources
+    /// this slice stores; private endpoints and import tasks join this lookup with the
+    /// operations that mint them.
     pub fn tags_of(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
         self.graphs
             .values()
@@ -602,6 +778,12 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
                     .values()
                     .find(|snapshot| snapshot.arn == arn)
                     .map(|snapshot| &snapshot.tags)
+            })
+            .or_else(|| {
+                self.export_tasks
+                    .values()
+                    .find(|task| task.arn == arn)
+                    .map(|task| &task.tags)
             })
     }
 
@@ -616,10 +798,17 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
                 .find(|graph| graph.arn == arn)
                 .map(|graph| &mut graph.tags);
         }
-        self.snapshots
+        if self.snapshots.values().any(|snapshot| snapshot.arn == arn) {
+            return self
+                .snapshots
+                .values_mut()
+                .find(|snapshot| snapshot.arn == arn)
+                .map(|snapshot| &mut snapshot.tags);
+        }
+        self.export_tasks
             .values_mut()
-            .find(|snapshot| snapshot.arn == arn)
-            .map(|snapshot| &mut snapshot.tags)
+            .find(|task| task.arn == arn)
+            .map(|task| &mut task.tags)
     }
 }
 
@@ -654,6 +843,21 @@ pub const MAX_GRAPHS: usize = 100;
 /// with the `ServiceQuotaExceededException` (402) the model declares for exactly
 /// this condition. Set well above any realistic use of a local emulator.
 pub const MAX_SNAPSHOTS: usize = 100;
+
+/// The most export tasks one store holds.
+///
+/// Emulator resource guard, NOT a quota AWS publishes, and the same bound
+/// [`MAX_GRAPHS`] puts on the graph map: the store is shared process-wide and grows by
+/// one entry per `StartExportTask`, and an export task is never reclaimed (a finished
+/// task stays readable for the life of the process), so without a ceiling repeated
+/// calls grow the emulator's memory without bound. `StartExportTask` models no quota
+/// error (`smithy_query(query="operation",operation="StartExportTask")` declares
+/// `ConflictException`, `ValidationException`, `ThrottlingException`,
+/// `ResourceNotFoundException` and `InternalServerException` only), so reaching it is
+/// reported as the `ValidationException` that names this bound — not as throttling,
+/// which would promise that a retry can succeed. Set well above any realistic use of a
+/// local emulator.
+pub const MAX_EXPORT_TASKS: usize = 100;
 
 /// The most queries one store holds in flight, across every graph.
 ///
@@ -696,6 +900,39 @@ pub fn is_graph_id(value: &str) -> bool {
 /// Whether `value` matches the modelled `SnapshotId` pattern `^gs-[a-z0-9]{10}$`.
 pub fn is_snapshot_id(value: &str) -> bool {
     is_resource_id(value, "gs-")
+}
+
+/// Whether `value` matches the modelled `ExportTaskId` pattern `^t-[a-z0-9]{10}$`.
+pub fn is_export_task_id(value: &str) -> bool {
+    is_resource_id(value, EXPORT_TASK_ID_PREFIX)
+}
+
+/// The prefix the modelled `ExportTaskId` pattern `^t-[a-z0-9]{10}$` requires.
+pub const EXPORT_TASK_ID_PREFIX: &str = "t-";
+
+/// The scheme an Amazon S3 URI is spelled with, which an export `destination` has to
+/// carry: the member is documented as "The Amazon S3 URI where data will be exported
+/// to" (`smithy_query(query="doc",shape="StartExportTaskInput",member="destination")`)
+/// and is modelled as a plain `String` of 1..1024 characters, so the scheme is the one
+/// part of it no boundary constraint checks.
+pub const S3_URI_SCHEME: &str = "s3://";
+
+/// Whether `value` is an Amazon S3 URI: the `s3://` scheme followed by a bucket name,
+/// optionally followed by `/` and a key prefix.
+///
+/// Only the two facts that make a URI addressable are required — the scheme and a
+/// non-empty bucket segment — because S3's own bucket-name rules are enforced by S3,
+/// not by the service that is handed the URI.
+pub fn is_s3_uri(value: &str) -> bool {
+    value
+        .strip_prefix(S3_URI_SCHEME)
+        .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
+}
+
+/// The requirement clause a `destination` that is not an Amazon S3 URI fails, in the
+/// wording [`constraint_clause`] frames.
+pub fn s3_uri_requirement() -> String {
+    format!("Member must be an Amazon S3 URI of the form {S3_URI_SCHEME}bucket[/key-prefix]")
 }
 
 /// Whether `value` is `prefix` followed by exactly ten `[a-z0-9]` characters — the
@@ -820,6 +1057,22 @@ pub fn snapshot_not_found(snapshot_identifier: &str) -> ResourceNotFoundExceptio
 pub fn query_not_found(graph_identifier: &str, query_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: format!("No query found on graph [{graph_identifier}] with query id [{query_id}]"),
+    }
+}
+
+/// The modelled `ResourceNotFoundException` for a `taskIdentifier` that names no
+/// stored export task.
+///
+/// The export-task namespace is per-account like the graph and snapshot namespaces, so
+/// the failure names the account the lookup was resolved in beside the identifier the
+/// request asked for — the same two facts [`graph_not_found`] reports, and for the same
+/// reason.
+pub fn export_task_not_found(task_identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!(
+            "No export task found for customer [{}] with task id [{task_identifier}]",
+            caller_account_id()
+        ),
     }
 }
 
@@ -1058,6 +1311,28 @@ macro_rules! snapshot_record_output {
 }
 
 snapshot_record_output!(CreateGraphSnapshotOutput, GetGraphSnapshotOutput);
+
+/// `StartExportTask` reports the record it stored. The listing projection
+/// (`ExportTaskSummary`) and `CancelExportTaskOutput` join this rendering with the
+/// operations that produce them; `GetExportTaskOutput` is built by
+/// [`ExportTask::get_output`] instead, because it also carries the `exportTaskDetails`
+/// that are derived from the clock.
+impl From<&ExportTask> for crate::ops::types::StartExportTaskOutput {
+    fn from(task: &ExportTask) -> Self {
+        Self {
+            graph_id: task.source_graph_id.clone(),
+            role_arn: task.role_arn.clone(),
+            task_id: task.id.clone(),
+            status: task.status.as_wire().to_string(),
+            format: task.format.clone(),
+            destination: task.destination.clone(),
+            kms_key_identifier: task.kms_key_identifier.clone(),
+            parquet_type: task.parquet_type.clone(),
+            status_reason: task.status_reason.clone(),
+            export_filter: task.export_filter.clone(),
+        }
+    }
+}
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

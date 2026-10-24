@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartExportTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartExportTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints an export task of a stored graph into the shared store and
+//! reports the stored record. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartExportTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this emulator does and does not do
+//!
+//! The CONTROL plane is real: the task is a resource with a minted
+//! `^t-[a-z0-9]{10}$` id, the parameters the request chose, its tags and its status,
+//! and `GetExportTask` reads that record back. The RUN is not: an export reads a
+//! graph's vertices and edges and writes CSV or Parquet objects to Amazon S3 under the
+//! caller's KMS key, which needs a graph data plane and an outbound connection this
+//! emulator does not have. So nothing is read and nothing is written, and the clock
+//! owes the task the modelled `FAILED` status carrying
+//! [`crate::state::EXPORT_NOT_PERFORMED_REASON`] rather than a `SUCCEEDED` that would
+//! claim objects which do not exist.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +179,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartExportTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartExportTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartExportTaskErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `destination` is modelled as a plain `String` of 1..1024 characters, so its
+        // length is refused at the boundary but its FORM is not: the member is the
+        // Amazon S3 URI data is exported to, and a value that is not one addresses no
+        // destination at all. Refused in the same wording every other constraint
+        // violation of this service is reported in.
+        if !crate::state::is_s3_uri(&input.destination) {
+            return Err(StartExportTaskErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::validation_envelope(&[
+                        crate::state::constraint_clause(
+                            "destination",
+                            Some(&input.destination),
+                            &crate::state::s3_uri_requirement(),
+                        ),
+                    ]),
+                    reason: Some("CONSTRAINT_VIOLATION".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Nothing caller-sized reaches the store unchecked — the bound on what one
+        // record's tags may hold is stated once, in `crate::state`, and is reached by
+        // every operation that accepts a `tags` map.
+        if let Some(tags) = input.tags.as_ref() {
+            if let Err(message) = crate::state::bound_tags(tags) {
+                return Err(StartExportTaskErrorModeled::ValidationException(
+                    ValidationException {
+                        message,
+                        reason: Some("CONSTRAINT_VIOLATION".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // An export reads a graph, so the graph has to exist. The lookup settles the
+        // transitions the clock already made due first, so a graph whose provisioning
+        // has come due is exportable.
+        let Some(graph) = store.settled_graph(&input.graph_identifier, now) else {
+            return Err(StartExportTaskErrorModeled::ResourceNotFoundException(
+                crate::state::graph_not_found(&input.graph_identifier),
+            )
+            .into());
+        };
+        let source_graph_id = graph.id.clone();
+        let source_graph_status = graph.status;
+
+        // "The graph state should be AVAILABLE"
+        // (`smithy_query(query="operation",operation="StartExportTask")`): while an
+        // earlier transition is still outstanding the graph's data is in flight, which
+        // is the same precondition `CreateGraphSnapshot` states.
+        if source_graph_status != crate::state::GraphStatus::Available {
+            return Err(StartExportTaskErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "graph {source_graph_id} is in status {} and cannot be exported",
+                        source_graph_status.as_wire()
+                    ),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // The store is shared and grows by one task per call, and a finished task stays
+        // readable, so it has a ceiling (`crate::state::MAX_EXPORT_TASKS`). This
+        // operation models no quota error, and throttling would promise that a retry can
+        // succeed when nothing frees an entry, so the bound is reported as the
+        // validation failure that names it.
+        if store.export_tasks.len() >= crate::state::MAX_EXPORT_TASKS {
+            return Err(StartExportTaskErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "this emulator holds at most {} export tasks",
+                        crate::state::MAX_EXPORT_TASKS
+                    ),
+                    reason: Some("CONSTRAINT_VIOLATION".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let id = store.next_export_task_id();
+        let task = crate::state::ExportTask {
+            arn: ::engine::emulator_arn(
+                crate::state::ARN_NAMESPACE,
+                &region,
+                &format!("export-task/{id}"),
+            ),
+            id,
+            source_graph_id,
+            role_arn: input.role_arn,
+            format: input.format,
+            parquet_type: input.parquet_type,
+            destination: input.destination,
+            kms_key_identifier: input.kms_key_identifier,
+            export_filter: input.export_filter,
+            // No data has moved when the call returns; the clock owes the terminal
+            // status a fixed span later (`crate::state::EXPORT_TASK_SPAN`), which is
+            // `FAILED` because this emulator performs no export run.
+            status: crate::state::ExportTaskStatus::Initializing,
+            status_reason: None,
+            settles_at: Some(now + crate::state::EXPORT_TASK_SPAN),
+            start_time: ::std::time::SystemTime::now(),
+            started_at: now,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        // Exporting READS the graph, so the graph's own status is left where it is: the
+        // model puts no export status on `GraphStatus`, and the task carries the state
+        // of the export.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartExportTask"))
+        // Report the record that was stored, so this response cannot drift from what a
+        // later GetExportTask answers.
+        let output = Self::Output::from(&task);
+        store.insert_export_task(task);
+        Ok(output)
     }
 }
