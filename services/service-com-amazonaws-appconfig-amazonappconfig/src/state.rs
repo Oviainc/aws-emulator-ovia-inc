@@ -1484,6 +1484,32 @@ pub fn extension_version_not_found(extension_identifier: &str, version_number: i
 }
 
 // =============================================================================
+// `BadRequestException` messages
+// =============================================================================
+
+/// `Message` for a delete refused because the addressed configuration profile still
+/// holds hosted configuration versions.
+///
+/// AppConfig will not take a container resource out of the tree while the children it
+/// owns are still there, so the caller is told WHICH profile is blocked and WHY, and the
+/// sentence is derived from the request's own profile id rather than stored.
+pub fn configuration_profile_still_has_hosted_versions(configuration_profile_id: &str) -> String {
+    format!(
+        "Cannot delete configuration profile {configuration_profile_id} because there are still \
+         hosted configuration versions existing under it."
+    )
+}
+
+/// `Message` for a `NextToken` the listing being called did not mint.
+///
+/// [`paginate`] owns the cursor rule for every listing this service serves, so the
+/// sentence that reports a token it will not resume lives here beside it rather than once
+/// per `List*` handler.
+pub fn next_token_not_issued() -> String {
+    "NextToken is not a pagination token this operation issued.".to_string()
+}
+
+// =============================================================================
 // `ConflictException` messages
 // =============================================================================
 
@@ -2106,6 +2132,10 @@ pub const MAX_LIST_PAGE_SIZE: usize = 50;
 /// The `kind` a `ListConfigurationProfiles` cursor is stamped with, so a token minted
 /// by another listing cannot resume this one. See [`paginate`].
 pub const LISTING_CONFIGURATION_PROFILES: &str = "ListConfigurationProfiles";
+
+/// The `kind` a `ListApplications` cursor is stamped with, so a token minted by another
+/// listing cannot resume this one. See [`paginate`].
+pub const LISTING_APPLICATIONS: &str = "ListApplications";
 
 /// The `kind` a `ListEnvironments` cursor is stamped with, so a token minted by another
 /// listing cannot resume this one. See [`paginate`].

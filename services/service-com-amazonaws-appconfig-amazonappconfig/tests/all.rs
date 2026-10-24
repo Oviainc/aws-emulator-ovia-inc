@@ -21,6 +21,8 @@ mod configuration_profile_type;
 mod control_plane_fidelity;
 #[path = "all/create_deployment_strategy.rs"]
 mod create_deployment_strategy;
+#[path = "all/delete_configuration_profile.rs"]
+mod delete_configuration_profile;
 #[path = "all/delete_hosted_configuration_version.rs"]
 mod delete_hosted_configuration_version;
 #[path = "all/deployment_wire_fidelity.rs"]
@@ -35,6 +37,8 @@ mod experiment_definitions;
 mod extensions;
 #[path = "all/feature_flag_metadata.rs"]
 mod feature_flag_metadata;
+#[path = "all/list_applications.rs"]
+mod list_applications;
 #[path = "all/list_configuration_profiles.rs"]
 mod list_configuration_profiles;
 #[path = "all/list_deployment_strategies.rs"]

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConfigurationProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConfigurationProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConfigurationProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -175,20 +166,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConfigurationProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConfigurationProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConfigurationProfile"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteConfigurationProfileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // `DeletionProtectionCheck` asks for deletion protection to be bypassed, applied
+        // or left to the account setting. Protection refuses a delete only when the
+        // profile served a configuration inside the protected interval; the call that
+        // would record that (`GetLatestConfiguration`) belongs to the `appconfigdata`
+        // service, so this service observes no such activity and has nothing to refuse
+        // on, whichever value the caller sent — the same reading `DeleteEnvironment`
+        // applies to its own copy of this header.
+        let _requested_check = input.deletion_protection_check;
+
+        // A configuration profile only exists under an application, so the parent is
+        // resolved first and whichever level is missing is the resource the 404 names —
+        // the same order `GetConfigurationProfile` and `UpdateConfigurationProfile`
+        // resolve this path in.
+        let Some(application) = store.applications.get_mut(&input.application_id) else {
+            return Err(DeleteConfigurationProfileErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::application_not_found(&input.application_id)),
+                    resource_name: Some(input.application_id),
+                },
+            )
+            .into());
+        };
+        let Some(profile) = application.profiles.get(&input.configuration_profile_id) else {
+            return Err(DeleteConfigurationProfileErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::configuration_profile_not_found(
+                        &input.application_id,
+                        &input.configuration_profile_id,
+                    )),
+                    resource_name: Some(input.configuration_profile_id),
+                },
+            )
+            .into());
+        };
+
+        // A profile OWNS the hosted configuration versions written into it, and AppConfig
+        // does not cascade that ownership away: while any version is still there the
+        // delete is a bad request, and the caller is told to remove the children first.
+        // The refusal is taken BEFORE anything is removed, so it changes nothing a later
+        // caller sees — the profile stays describable and listable and its versions stay
+        // readable. A profile whose `LocationUri` is not the hosted store holds no hosted
+        // version at all, so this never blocks it.
+        if !profile.hosted_versions.is_empty() {
+            // An attribution record for the refusal: which resource was addressed and
+            // what this call answered, so a destructive call that changed nothing leaves
+            // a trace beside the ones that did.
+            tracing::debug!(
+                operation = "DeleteConfigurationProfile",
+                outcome = "BadRequestException",
+                application_id = input.application_id.as_str(),
+                configuration_profile_id = input.configuration_profile_id.as_str(),
+                hosted_versions = profile.hosted_versions.len(),
+                "refused a configuration profile delete"
+            );
+            return Err(DeleteConfigurationProfileErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(
+                        crate::state::configuration_profile_still_has_hosted_versions(
+                            &input.configuration_profile_id,
+                        ),
+                    ),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
+
+        // The delete IS the removal of the stored record: once this answers 204,
+        // `GetConfigurationProfile`, `UpdateConfigurationProfile`,
+        // `ListConfigurationProfiles`, the hosted-version operations and the tagging
+        // operations all miss on this profile, because each of them reads the map this
+        // took it out of. The profile held no hosted version (the refusal above), so no
+        // hosted-content budget is freed here and no other resource is touched: the
+        // deployments an environment holds are that environment's records, and they keep
+        // reporting the configuration they were started with.
+        application.profiles.remove(&input.configuration_profile_id);
+
+        // An attribution record for the removal, so the one call that takes a stored
+        // resource out of this service's state is observable beside its refusals.
+        tracing::debug!(
+            operation = "DeleteConfigurationProfile",
+            outcome = "deleted",
+            application_id = input.application_id.as_str(),
+            configuration_profile_id = input.configuration_profile_id.as_str(),
+            "deleted a configuration profile"
+        );
+
+        Ok(DeleteConfigurationProfileOutput)
     }
 }
