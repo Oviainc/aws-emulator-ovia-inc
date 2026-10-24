@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRotationOverride
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRotationOverride`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one override of an on-call rotation, rebuilt from what `CreateRotationOverride`
+//! persisted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRotationOverride::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORTING operation: it writes nothing, so two reads of an unchanged override answer
+//! the same.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +159,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRotationOverride` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRotationOverrideErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRotationOverride"))
+        // This operation addresses its override by the rotation's ARN and the override's
+        // own id, and reads nothing off the request envelope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal());
+        };
+
+        let state = state.lock();
+
+        // The account gate comes FIRST: it is evaluated before `RotationId` is resolved, so
+        // a non-onboarded account is refused identically whether or not its override
+        // exists. The refusal is the ARN-shaped one `GetRotation` answers, since this
+        // operation's subject is a resource under that ARN.
+        state
+            .require_active_replication_set_for(&input.rotation_id)
+            .map_err(account_precondition_failed)?;
+
+        // The id is unique only WITHIN its rotation, so the pair is what is looked up: an
+        // id that belongs to another rotation names nothing under this one.
+        let key = crate::state::rotation_override_key(&input.rotation_id, &input.rotation_override_id);
+        let Some(record) = state.rotation_overrides.get(&key) else {
+            return Err(GetRotationOverrideErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Rotation override {} not found for rotation {}",
+                        input.rotation_override_id, input.rotation_id
+                    ),
+                    resource_id: input.rotation_override_id.clone(),
+                    resource_type: ROTATION_OVERRIDE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetRotationOverrideOutput {
+            rotation_override_id: Some(record.rotation_override_id.clone()),
+            rotation_arn: Some(record.rotation_arn.clone()),
+            new_contact_ids: Some(record.new_contact_ids.clone()),
+            start_time: Some(record.start_time),
+            end_time: Some(record.end_time),
+            // The instant the create STORED the override, held on the record rather than
+            // recomputed here, so every read answers the same `CreateTime`.
+            create_time: Some(::aws_smithy_types::DateTime::from(record.create_time)),
+        })
     }
+}
+
+/// The `resourceType` this operation's not-found error names.
+const ROTATION_OVERRIDE_RESOURCE_TYPE: &str = "rotation-override";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` and `fields` is present but EMPTY, exactly as every gated
+/// operation in this service answers: the failure is account level, so no field of the
+/// request is at fault.
+fn account_precondition_failed(message: String) -> GetRotationOverrideError {
+    GetRotationOverrideErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// The modelled server fault for an engine that holds no state at all: without a store
+/// there is nothing to read an override from, and that is this emulator's own failure
+/// rather than anything about the request.
+fn internal() -> GetRotationOverrideError {
+    GetRotationOverrideErrorModeled::InternalServerException(InternalServerException {
+        message: "this service is mounted on an engine that holds no state".to_string(),
+        retry_after_seconds: 0,
+    })
+    .into()
 }

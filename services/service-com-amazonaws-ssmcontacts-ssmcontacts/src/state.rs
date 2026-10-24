@@ -116,6 +116,37 @@ pub struct RotationRecord {
     pub created_at: SystemTime,
 }
 
+/// What `CreateRotationOverride` persists, and what `GetRotationOverride` rebuilds its
+/// response from.
+///
+/// An override is NOT an ARN-named resource: the model identifies it by a `Uuid`
+/// (`RotationOverrideId`) that is only meaningful together with the rotation it overrides —
+/// every operation that names one names the `RotationId` beside it — so the record is keyed
+/// by [`rotation_override_key`], the rotation's ARN and that id joined. The key has the
+/// rotation's ARN as its PREFIX, so the overrides of one rotation are a contiguous range of
+/// the map.
+#[derive(Debug, Clone)]
+pub struct RotationOverrideRecord {
+    /// The minted `RotationOverrideId`, unique within the rotation.
+    pub rotation_override_id: String,
+    /// The `RotationArn` of the rotation this override applies to.
+    pub rotation_arn: String,
+    /// The contacts that replace the rotation's own team for the override's window, in the
+    /// order the create listed them.
+    pub new_contact_ids: Vec<String>,
+    /// When the override goes into effect, exactly as created.
+    pub start_time: ::aws_smithy_types::DateTime,
+    /// When the override ends, exactly as created.
+    pub end_time: ::aws_smithy_types::DateTime,
+    /// When the create stored the override, which is what `GetRotationOverride$CreateTime`
+    /// reports.
+    pub create_time: SystemTime,
+    /// Insertion order, so a caller can tell which of two overrides the store minted first,
+    /// and the id derivation has something to distinguish two otherwise identical creates
+    /// with.
+    pub sequence: u64,
+}
+
 /// An engagement as it is persisted: the message `StartEngagement` sent to a contact or
 /// escalation plan, plus when it started and — once `StopEngagement` has run — when it
 /// stopped.
@@ -195,6 +226,15 @@ pub struct ComAmazonawsSsmcontactsSsmcontactsState {
     /// which the model permits, declaring no conflict error for `CreateRotation` — are
     /// still two resources with two ARNs.
     pub rotations_created: u64,
+    /// Overrides of on-call rotations, keyed by [`rotation_override_key`] — the overridden
+    /// rotation's ARN and the override's own `Uuid`. `CreateRotationOverride` inserts,
+    /// `GetRotationOverride`/`ListRotationOverrides` report and `DeleteRotationOverride`
+    /// removes.
+    pub rotation_overrides: BTreeMap<String, RotationOverrideRecord>,
+    /// How many rotation overrides this store has ever minted. Feeds
+    /// [`RotationOverrideRecord::sequence`] and the override's opaque id, so two overrides
+    /// of the same rotation over the same window are still two resources with two ids.
+    pub rotation_overrides_created: u64,
     /// How many activation codes this store has ever delivered. Feeds the code's opaque
     /// derivation, so a channel's second code differs from its first.
     pub activation_codes_issued: u64,
@@ -272,6 +312,50 @@ impl ComAmazonawsSsmcontactsSsmcontactsState {
         Err(invalid_resource_arn_message(arn))
     }
 
+    /// The overrides of the rotation `rotation_arn` names, in creation order.
+    ///
+    /// The store key has the rotation's ARN as its prefix, so this is a prefix scan of the
+    /// map rather than a filter over every override in the account.
+    pub fn rotation_overrides_of(&self, rotation_arn: &str) -> Vec<&RotationOverrideRecord> {
+        let mut overrides: Vec<&RotationOverrideRecord> = self
+            .rotation_override_keys_of(rotation_arn)
+            .filter_map(|key| self.rotation_overrides.get(key))
+            .collect();
+        overrides.sort_by_key(|record| record.sequence);
+        overrides
+    }
+
+    /// Remove every override of the rotation `rotation_arn` names, and the replay-ledger
+    /// entries that named them, answering how many went.
+    ///
+    /// Called by `DeleteRotation`: an override is an override OF a rotation and is keyed
+    /// under its ARN, so once the rotation is gone nothing can read or delete its overrides
+    /// again and keeping them would leave one resident record per override.
+    pub fn remove_rotation_overrides_of(&mut self, rotation_arn: &str) -> usize {
+        let keys: Vec<String> = self
+            .rotation_override_keys_of(rotation_arn)
+            .cloned()
+            .collect();
+        for key in &keys {
+            self.rotation_overrides.remove(key);
+            self.forget_idempotency_tokens_for(key);
+        }
+        keys.len()
+    }
+
+    /// The store keys of one rotation's overrides, as a prefix scan of the map rather than a
+    /// filter over every override in the account.
+    fn rotation_override_keys_of<'a>(
+        &'a self,
+        rotation_arn: &str,
+    ) -> impl Iterator<Item = &'a String> {
+        let prefix = rotation_override_key_prefix(rotation_arn);
+        self.rotation_overrides
+            .range(prefix.clone()..)
+            .map(|(key, _)| key)
+            .take_while(move |key| key.starts_with(&prefix))
+    }
+
     /// The ARNs of the channels that belong to `contact_arn`, in creation order.
     pub fn channel_arns_of(&self, contact_arn: &str) -> Vec<String> {
         let mut channels: Vec<&ContactChannelRecord> = self
@@ -300,6 +384,10 @@ impl ComAmazonawsSsmcontactsSsmcontactsState {
             || self.contact_channels.contains_key(arn)
             || self.rotations.contains_key(arn)
             || self.engagements.contains_key(arn)
+            // A rotation override has no ARN, so what the ledger records for it is its
+            // store KEY ([`rotation_override_key`]); it is looked up in the same map the
+            // other four entries are looked up in.
+            || self.rotation_overrides.contains_key(arn)
         {
             return Some(arn.clone());
         }
@@ -419,6 +507,12 @@ pub const MAX_CONTACT_CHANNELS: usize = 50_000;
 /// `ServiceQuotaExceededException` `CreateRotation` declares. See [`MAX_CONTACTS`].
 pub const MAX_ROTATIONS: usize = 10_000;
 
+/// The same bound for the overrides of ONE rotation, answered with the modelled
+/// `ServiceQuotaExceededException` `CreateRotationOverride` declares. An override is only
+/// ever reached through the rotation it overrides, so the ceiling is per rotation; together
+/// with [`MAX_ROTATIONS`] it bounds the override map too. See [`MAX_CONTACTS`].
+pub const MAX_ROTATION_OVERRIDES_PER_ROTATION: usize = 1_000;
+
 /// The same bound for engagements. Nothing in this service deletes an engagement — the
 /// model declares no delete for one — so without a ceiling N `StartEngagement` calls leave
 /// N resident records for ever. `StartEngagement` models no quota error, so a create past
@@ -500,6 +594,33 @@ pub fn contact_channel_arn(region: &str, alias: &str, name: &str, sequence: u64)
 pub fn rotation_arn(region: &str, name: &str, sequence: u64) -> String {
     let id = opaque_uuid(&["rotation", name, &sequence.to_string()].join("\u{1f}"));
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("rotation/{id}"))
+}
+
+/// The store key of one override of one rotation: the overridden rotation's ARN, the
+/// literal `/override/`, and the override's own `Uuid`.
+///
+/// A `RotationOverrideId` is unique only WITHIN its rotation — the model always names the
+/// two together — so the pair is the identity, and putting the rotation's ARN first makes
+/// one rotation's overrides a contiguous range of the map
+/// ([`ComAmazonawsSsmcontactsSsmcontactsState::rotation_overrides_of`]).
+pub fn rotation_override_key(rotation_arn: &str, rotation_override_id: &str) -> String {
+    format!("{}{rotation_override_id}", rotation_override_key_prefix(rotation_arn))
+}
+
+/// The common prefix of every [`rotation_override_key`] of one rotation.
+fn rotation_override_key_prefix(rotation_arn: &str) -> String {
+    format!("{rotation_arn}/override/")
+}
+
+/// The `RotationOverrideId` the store mints for the `sequence`-th override it creates.
+///
+/// The model types it `Uuid` (`length` 36..39, the 8-4-4-4-12 `pattern`), and an override
+/// has no caller-chosen unique name — two creates may name the same rotation, contacts and
+/// window — so the id is derived from the rotation's ARN plus the store's own override
+/// counter: reproducible for a given sequence of calls, and distinct for every override the
+/// store mints.
+pub fn rotation_override_id(rotation_arn: &str, sequence: u64) -> String {
+    opaque_uuid(&["rotation-override", rotation_arn, &sequence.to_string()].join("\u{1f}"))
 }
 
 /// An engagement's ARN:

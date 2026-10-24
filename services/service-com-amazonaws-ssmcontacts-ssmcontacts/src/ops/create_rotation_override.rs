@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRotationOverride
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRotationOverride`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates one override of an on-call rotation and answers the `RotationOverrideId` the
+//! store minted for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRotationOverride::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The override is persisted under the rotation it overrides (the store key
+//! [`crate::state::rotation_override_key`] builds), so `GetRotationOverride` reads back
+//! exactly what this call stored and `DeleteRotationOverride` removes it.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +159,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRotationOverride` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRotationOverrideErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRotationOverride"))
+        // Every resource this call touches is addressed by ARN, and the id it mints is
+        // derived from the rotation's own ARN, so nothing is read off the request envelope.
+        let _ = ctx;
+
+        use crate::state::{rotation_override_id, rotation_override_key, RotationOverrideRecord};
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal());
+        };
+
+        let mut state = state.lock();
+
+        // The account gate comes FIRST: the override would live in the Regions of the
+        // account's Incident Manager replication set, so until the account has an ACTIVE
+        // one there is nothing to resolve the request against — before `RotationId` is
+        // resolved, and before anything is written.
+        state
+            .require_active_replication_set()
+            .map_err(account_precondition_failed)?;
+
+        // An override is an override OF a rotation, so the rotation has to exist.
+        if !state.rotations.contains_key(&input.rotation_id) {
+            return Err(not_found(
+                format!("Rotation {} not found", input.rotation_id),
+                &input.rotation_id,
+                ROTATION_RESOURCE_TYPE,
+            ));
+        }
+
+        // The replacement team is named by `ContactArn`, so every entry must resolve to a
+        // stored contact, exactly as `CreateRotation` resolves its own `ContactIds`.
+        if let Some(missing) = input
+            .new_contact_ids
+            .iter()
+            .find(|contact_id| !state.contacts.contains_key(*contact_id))
+        {
+            return Err(not_found(
+                format!("Contact {missing} not found"),
+                missing,
+                CONTACT_RESOURCE_TYPE,
+            ));
+        }
+
+        // The model's own wording: `StartTime` is "the date and time when the override goes
+        // into effect" and `EndTime` "the date and time when the override ends", so a
+        // window whose end does not follow its start covers no shift at all and is refused
+        // rather than stored.
+        if instant(&input.end_time) <= instant(&input.start_time) {
+            return Err(validation(format!(
+                "Value at 'endTime' failed to satisfy constraint: Member must be later than \
+                 'startTime' ({})",
+                input.start_time.as_secs_f64()
+            )));
+        }
+
+        // A retried create carrying the token its first call carried is the SAME call, so
+        // long as the override that token minted is still stored under the same rotation.
+        if let Some(key) = state.idempotent_replay(Self::NAME, input.idempotency_token.as_deref()) {
+            if let Some(replayed) = state
+                .rotation_overrides
+                .get(&key)
+                .filter(|record| record.rotation_arn == input.rotation_id)
+            {
+                return Ok(CreateRotationOverrideOutput {
+                    rotation_override_id: replayed.rotation_override_id.clone(),
+                });
+            }
+        }
+
+        // The emulator's own store ceiling, answered with the quota error the model
+        // declares for exactly this condition. An override is only ever reached through the
+        // rotation it overrides, so the ceiling counts that rotation's own overrides, which
+        // is what the `quotaCode` below names.
+        if state.rotation_overrides_of(&input.rotation_id).len()
+            >= crate::state::MAX_ROTATION_OVERRIDES_PER_ROTATION
+        {
+            return Err(
+                CreateRotationOverrideErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "This emulator holds at most {} overrides per rotation; delete one \
+                             before creating another",
+                            crate::state::MAX_ROTATION_OVERRIDES_PER_ROTATION
+                        ),
+                        resource_id: Some(input.rotation_id.clone()),
+                        resource_type: Some(ROTATION_OVERRIDE_RESOURCE_TYPE.to_string()),
+                        quota_code: "RotationOverridesPerRotation".to_string(),
+                        service_code: "ssm-contacts".to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let sequence = state.rotation_overrides_created;
+        state.rotation_overrides_created += 1;
+        let override_id = rotation_override_id(&input.rotation_id, sequence);
+        let key = rotation_override_key(&input.rotation_id, &override_id);
+        let record = RotationOverrideRecord {
+            rotation_override_id: override_id.clone(),
+            rotation_arn: input.rotation_id.clone(),
+            new_contact_ids: input.new_contact_ids.clone(),
+            start_time: input.start_time,
+            end_time: input.end_time,
+            create_time: ::std::time::SystemTime::now(),
+            sequence,
+        };
+        state.rotation_overrides.insert(key.clone(), record);
+        state.remember_idempotency_token(Self::NAME, input.idempotency_token.as_deref(), &key);
+
+        Ok(CreateRotationOverrideOutput {
+            rotation_override_id: override_id,
+        })
     }
+}
+
+/// The `resourceType` a not-found error names for the rotation being overridden, spelled as
+/// `CreateRotation`'s own errors spell it.
+const ROTATION_RESOURCE_TYPE: &str = "rotation";
+
+/// The `resourceType` the quota refusal names for the override itself.
+const ROTATION_OVERRIDE_RESOURCE_TYPE: &str = "rotation-override";
+
+/// The `resourceType` a not-found error names for a contact, spelled as the contact
+/// handlers spell it.
+const CONTACT_RESOURCE_TYPE: &str = "contact";
+
+/// One instant as a total-ordering key, so two `DateTime`s compare to the nanosecond.
+fn instant(at: &::aws_smithy_types::DateTime) -> (i64, u32) {
+    (at.secs(), at.subsec_nanos())
+}
+
+/// This operation's modelled 404, carrying the ARN the request named.
+fn not_found(
+    message: String,
+    resource_id: &str,
+    resource_type: &str,
+) -> CreateRotationOverrideError {
+    CreateRotationOverrideErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_id: resource_id.to_string(),
+        resource_type: resource_type.to_string(),
+    })
+    .into()
+}
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` and `fields` is present but EMPTY: the failure is account
+/// level, so no field of the request is at fault.
+fn account_precondition_failed(message: String) -> CreateRotationOverrideError {
+    CreateRotationOverrideErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// A member-level refusal: the same modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> CreateRotationOverrideError {
+    CreateRotationOverrideErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: None,
+    })
+    .into()
+}
+
+/// The modelled server fault for an engine that holds no state at all: without a store
+/// there is nowhere to persist an override, and that is this emulator's own failure rather
+/// than anything about the request.
+fn internal() -> CreateRotationOverrideError {
+    CreateRotationOverrideErrorModeled::InternalServerException(InternalServerException {
+        message: "this service is mounted on an engine that holds no state".to_string(),
+        retry_after_seconds: 0,
+    })
+    .into()
 }
