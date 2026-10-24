@@ -55,12 +55,6 @@ pub struct MembershipDatasources {
     pub datasource_package_ingest_history: Option<std::collections::HashMap<String, std::collections::HashMap<String, TimestampForCollection>>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.detective#TimestampForCollection")]
-#[derive(Debug, Clone, Default)]
-pub struct TimestampForCollection {
-    pub timestamp: Option<::aws_smithy_types::DateTime>,
-}
-
 #[smithy_macros::smithy(shape = "com.amazonaws.detective#UnprocessedAccount")]
 #[derive(Debug, Clone, Default)]
 pub struct UnprocessedAccount {
@@ -75,20 +69,20 @@ pub struct ServiceQuotaExceededException {
     pub resources: Option<Vec<String>>,
 }
 
-// `MemberDetail` and `DatasourcePackageUsageInfo` (reached only through it) are the two
-// shapes in this module written out by hand rather than produced by
-// `#[smithy_macros::smithy(shape = ...)]`, and the reason is a single trait the macro
-// does not read: `@timestampFormat`.
+// `MemberDetail`, `DatasourcePackageUsageInfo` (reached only through it) and
+// `TimestampForCollection` are the shapes in this module written out by hand rather than
+// produced by `#[smithy_macros::smithy(shape = ...)]`, and the reason is a single trait
+// the macro does not read: `@timestampFormat`.
 //
-// Every `Timestamp` member of these two shapes carries `@timestampFormat("date-time")`
-// (`smithy_query(query="shape",shape="MemberDetail")` reports `"timestampFormat":
-// "date-time"` on each), and their own documentation says so: "The value is an ISO8601
-// formatted string. For example, 2021-08-18T16:35:56.284Z." The vendored codegen never
-// emits `with_timestamp_format`, so a macro-built member schema reports no format and
-// the restJson1 JSON codec falls back to its protocol default, epoch seconds — a NUMBER
-// where the model (and every AWS SDK's generated deserializer for a `date-time` member)
-// requires an ISO-8601 string. The hand-written member schemas below differ from the
-// macro's output in exactly that one chain call.
+// Every `Timestamp` member of these shapes carries `@timestampFormat("date-time")`
+// (`smithy_query(query="shape",shape="MemberDetail,TimestampForCollection")` reports
+// `"timestampFormat": "date-time"` on each), and their own documentation says so: "The
+// value is an ISO8601 formatted string. For example, 2021-08-18T16:35:56.284Z." The
+// vendored codegen never emits `with_timestamp_format`, so a macro-built member schema
+// reports no format and the restJson1 JSON codec falls back to its protocol default,
+// epoch seconds — a NUMBER where the model (and every AWS SDK's generated deserializer
+// for a `date-time` member) requires an ISO-8601 string. The hand-written member schemas
+// below differ from the macro's output in exactly that one chain call.
 //
 // Everything else mirrors the macro's output for a structure: one `M_<MEMBER>` member
 // schema per member (index = position in the model's member list), a `SCHEMA` naming them
@@ -421,6 +415,74 @@ impl ::aws_smithy_schema_server::DeserializableStruct for DatasourcePackageUsage
                         Some(d.read_timestamp(&Self::M_VOLUME_USAGE_UPDATE_TIME)?)
                 }
                 _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
+/// When data collection began for a source package, as `ListDatasourcePackages`'
+/// `LastIngestStateChange` and `BatchGetMembershipDatasources`'
+/// `DatasourcePackageIngestHistory` report it.
+#[derive(Debug, Clone, Default)]
+pub struct TimestampForCollection {
+    pub timestamp: Option<::aws_smithy_types::DateTime>,
+}
+
+#[allow(non_upper_case_globals)]
+impl TimestampForCollection {
+    const SHAPE_ID: &'static str = "com.amazonaws.detective#TimestampForCollection";
+    const NAMESPACE: &'static str = "com.amazonaws.detective";
+
+    /// `@timestampFormat("date-time")` — the chain the macro cannot emit, and the one
+    /// reason this shape is hand-written: "The value is an ISO8601 formatted string."
+    pub const M_TIMESTAMP: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.detective#TimestampForCollection$Timestamp",
+            Self::NAMESPACE,
+            "Timestamp",
+        ),
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        "Timestamp",
+        0,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            Self::SHAPE_ID,
+            Self::NAMESPACE,
+            "TimestampForCollection",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_TIMESTAMP],
+    );
+}
+
+pub static TIMESTAMP_FOR_COLLECTION_SCHEMA: &::aws_smithy_schema::Schema =
+    &TimestampForCollection::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for TimestampForCollection {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.timestamp.as_ref() {
+            s.write_timestamp(&Self::M_TIMESTAMP, v)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for TimestampForCollection {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            if member.member_index() == Some(0) {
+                out.timestamp = Some(d.read_timestamp(&Self::M_TIMESTAMP)?);
             }
             Ok(())
         })?;

@@ -245,18 +245,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             } else {
                 crate::state::DATASOURCE_PACKAGE_STATE_STOPPED
             };
-            if ingest.state != wanted {
-                ingest.state = wanted.to_string();
-                ingest.last_state_change_millis = now;
-            }
+            ingest.enter(wanted, now);
         }
         for package in &input.datasource_packages {
             graph
                 .datasource_packages
                 .entry(package.clone())
-                .or_insert_with(|| crate::state::DatasourcePackageIngest {
-                    state: crate::state::DATASOURCE_PACKAGE_STATE_STARTED.to_string(),
-                    last_state_change_millis: now,
+                .or_insert_with(|| {
+                    crate::state::DatasourcePackageIngest::entering(
+                        crate::state::DATASOURCE_PACKAGE_STATE_STARTED,
+                        now,
+                    )
                 });
         }
 

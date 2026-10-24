@@ -257,10 +257,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // starts with exactly that one started and the rest off.
             datasource_packages: [(
                 crate::state::MANDATORY_DATASOURCE_PACKAGE.to_string(),
-                crate::state::DatasourcePackageIngest {
-                    state: crate::state::DATASOURCE_PACKAGE_STATE_STARTED.to_string(),
-                    last_state_change_millis: created_time_millis,
-                },
+                crate::state::DatasourcePackageIngest::entering(
+                    crate::state::DATASOURCE_PACKAGE_STATE_STARTED,
+                    created_time_millis,
+                ),
             )]
             .into_iter()
             .collect(),
