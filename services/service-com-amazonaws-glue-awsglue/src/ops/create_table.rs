@@ -256,9 +256,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
             return Err(CreateTableErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(format!(
-                        "Database {} not found in catalog {catalog_id}",
-                        crate::state::fold_name(&input.database_name)
+                    message: Some(crate::state::messages::database_not_found(
+                        &input.database_name,
                     )),
                     from_federation_source: None,
                 },
@@ -269,7 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if database.tables.contains_key(&folded_table) {
             return Err(CreateTableErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
-                    message: Some(format!("Table already exists: {folded_table}")),
+                    message: Some(crate::state::messages::TABLE_ALREADY_EXISTS.to_string()),
                 },
             )
             .into());

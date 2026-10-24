@@ -238,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.crawlers.contains_key(&input.name) {
             return Err(CreateCrawlerErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
-                    message: Some(format!("Crawler already exists: {}", input.name)),
+                    message: Some(crate::state::messages::CRAWLER_ALREADY_EXISTS.to_string()),
                 },
             )
             .into());

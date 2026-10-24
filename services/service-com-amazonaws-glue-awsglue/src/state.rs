@@ -1216,6 +1216,73 @@ pub fn next_version_id(current: &str) -> String {
         .to_string()
 }
 
+/// The text the service puts in an error body's `Message` member.
+///
+/// Error wording here is PER OPERATION AND PER RESOURCE, never one template this
+/// emulator invents and reuses: the service answers a fixed constant where its message
+/// names no resource, and otherwise a template carrying only the request member the
+/// refusal is about — never the name of a container the caller also sent, and never
+/// emulator-side context such as the resolved `CatalogId`.
+///
+/// Four of these are pinned by the recorded wire corpus: `GetCrawler`'s crawler miss
+/// ("Crawler entry with name `<Name>` does not exist"), `DeleteTable`'s table miss
+/// ("Table `<Name>` not found."), `GetTable`'s table miss (the constant
+/// "Entity Not Found", which names neither table nor database) and `CreateDatabase`'s
+/// duplicate (the constant "Database already exists.", which withholds the requested
+/// name). The rest are the same per-resource wording for the same refusal on the
+/// sibling operations. Every handler refuses through these constructors, so one
+/// operation's wording is never silently borrowed for another's refusal.
+///
+/// This is the TOP-LEVEL error body only. A per-item failure a batch reports inside its
+/// output (`BatchDeleteTable`'s `TableError$ErrorDetail`) has its own recorded wording
+/// and is built by [`super::catalog_error_detail`]. The job and connection slices are
+/// not here either: no recording or doc states their wording, so their messages are not
+/// requirements and are left to the issues that own them rather than guessed at.
+pub mod messages {
+    /// A crawler lookup (`GetCrawler`) for a name no crawler in this account has.
+    /// Built from the request's `Name`, which is stored and matched exactly as sent.
+    pub fn crawler_not_found(name: &str) -> String {
+        format!("Crawler entry with name {name} does not exist")
+    }
+
+    /// `CreateCrawler` for a name already taken. NOT recorded: inferred from the
+    /// recorded `CreateDatabase` duplicate, whose already-exists wording states the
+    /// resource kind and withholds the name. What is pinned here is the behaviour — 400,
+    /// `AlreadyExistsException`, and no disclosure of the requested name.
+    pub const CRAWLER_ALREADY_EXISTS: &str = "Crawler already exists.";
+
+    /// Any Data Catalog operation whose `DatabaseName`/`Name` names no database
+    /// (`GetDatabase`, `DeleteDatabase`, `UpdateDatabase`, and the parent-database miss
+    /// of every table operation: `GetTable`, `GetTables`, `CreateTable`, `UpdateTable`,
+    /// `DeleteTable`, `BatchDeleteTable`). Built from the requested name alone — the
+    /// catalog the emulator resolved is not part of the refusal.
+    pub fn database_not_found(name: &str) -> String {
+        format!("Database {name} not found.")
+    }
+
+    /// `CreateDatabase` (and `UpdateDatabase`, whose rename collides the same way) for
+    /// a `DatabaseInput$Name` already taken. Recorded constant: the requested name is
+    /// deliberately withheld.
+    pub const DATABASE_ALREADY_EXISTS: &str = "Database already exists.";
+
+    /// `GetTable` for a table the database does not hold. Recorded constant: this
+    /// read's refusal names neither the table nor the database.
+    pub const TABLE_ENTITY_NOT_FOUND: &str = "Entity Not Found";
+
+    /// `DeleteTable` (and `UpdateTable`, the other write that addresses one table) for a
+    /// table the database does not hold. Recorded template, built from the request's
+    /// `Name` and naming no database — a different refusal from `GetTable`'s, which is
+    /// why the two are not one shared string.
+    pub fn table_not_found(name: &str) -> String {
+        format!("Table {name} not found.")
+    }
+
+    /// `CreateTable` for a table name the database already holds. NOT recorded either:
+    /// inferred from the recorded `CreateDatabase` duplicate, like
+    /// [`CRAWLER_ALREADY_EXISTS`].
+    pub const TABLE_ALREADY_EXISTS: &str = "Table already exists.";
+}
+
 /// Fold a database or table name the way the catalog stores it: ASCII-lowercased.
 /// Applied on both write and lookup, so a name is reachable by any casing the client
 /// sends. The fold is ASCII because Hive compatibility is an ASCII rule, and because
