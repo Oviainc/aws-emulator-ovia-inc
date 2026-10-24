@@ -42,7 +42,11 @@ const REGION: &str = "us-east-1";
 /// The one language Amazon Transcribe Medical supports, as the model's own doc for
 /// `CreateMedicalVocabularyRequest$LanguageCode` states ("US English (en-US) is the
 /// only language supported with Amazon Transcribe Medical").
-const MEDICAL_LANGUAGE: &str = "en-US";
+///
+/// `pub(crate)`, like [`listed_names`] and [`medical_vocabulary_arn`] below: the
+/// medical-vocabulary input-contract suite (`crate::medical_vocabulary_constraints`)
+/// states the same facts, and one spelling is better than two.
+pub(crate) const MEDICAL_LANGUAGE: &str = "en-US";
 
 /// The class of `CreateMedicalVocabulary` request, one row per axis the rules
 /// generalise over: the form of the vocabulary name, which URI scheme the table file
@@ -108,9 +112,19 @@ pub(crate) fn is_absent(reply: &Reply, member: &str) -> bool {
     reply.body.get(member).is_none_or(Value::is_null)
 }
 
+/// An Amazon Transcribe medical-vocabulary ARN naming `name`, in the form
+/// `TranscribeArn`'s `@pattern` pins: the resource type is `medical-vocabulary`, the
+/// one the Amazon Transcribe "Tagging resources" guide lists for this family.
+pub(crate) fn medical_vocabulary_arn(name: &str) -> String {
+    format!(
+        "arn:aws:transcribe:{REGION}:{account}:medical-vocabulary/{name}",
+        account = engine::emulator_account_id()
+    )
+}
+
 /// The `VocabularyName`s of a `ListMedicalVocabularies` answer, in the order the
 /// answer listed them.
-fn listed_names(reply: &Reply, case: &str) -> Vec<String> {
+pub(crate) fn listed_names(reply: &Reply, case: &str) -> Vec<String> {
     reply.ok(case)["Vocabularies"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected Vocabularies, got {:?}", reply.body))
@@ -628,12 +642,7 @@ async fn tags_round_trip_on_a_medical_vocabulary() {
         .await
         .ok("create the medical vocabulary to tag");
 
-    // The resource type is `medical-vocabulary`, the one the Amazon Transcribe
-    // "Tagging resources" guide lists for this family.
-    let resource_arn = format!(
-        "arn:aws:transcribe:{REGION}:{account}:medical-vocabulary/tagged-medical-vocab",
-        account = engine::emulator_account_id()
-    );
+    let resource_arn = medical_vocabulary_arn("tagged-medical-vocab");
 
     let listed = transcribe
         .call("ListTagsForResource", json!({"ResourceArn": resource_arn}))
@@ -690,12 +699,7 @@ async fn tags_round_trip_on_a_medical_vocabulary() {
     transcribe
         .call(
             "ListTagsForResource",
-            json!({
-                "ResourceArn": format!(
-                    "arn:aws:transcribe:{REGION}:{account}:medical-vocabulary/never-created",
-                    account = engine::emulator_account_id()
-                )
-            }),
+            json!({"ResourceArn": medical_vocabulary_arn("never-created")}),
         )
         .await
         .refused("a medical vocabulary that does not exist", 400, "BadRequestException");

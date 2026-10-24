@@ -79,9 +79,9 @@ pub(crate) async fn associate_admin(router: &MultiServiceRouter) {
 }
 
 /// Read or write the service's store the way a handler does — used to seed the
-/// resources whose own writers (`PutAppsList`, `AssociateThirdPartyFirewall`,
-/// resource discovery) are still stubs tracked by their own issues, and the
-/// managed lists no API creates.
+/// resources whose own writers (`AssociateThirdPartyFirewall`, resource
+/// discovery) are still stubs tracked by their own issues, and the managed
+/// lists no API creates.
 ///
 /// `pub(crate)` so a sibling suite in this test target reaches the store through
 /// the same seam.
@@ -124,9 +124,10 @@ pub(crate) fn seed_protocols_list(
     );
 }
 
-/// One stored applications list, as `PutAppsList` will write it: the record
-/// `GetAppsList` and `DeleteAppsList` read, seeded directly because that
-/// writer is still a stub tracked by its own issue.
+/// One stored applications list, as `PutAppsList` writes it: the record
+/// `GetAppsList` and `DeleteAppsList` read, seeded directly so a suite has an
+/// existing list without first opening the administrator gate under test — and
+/// so it can hold a Firewall Manager MANAGED list, which no API creates.
 ///
 /// The ARN carries `region`, so a suite can assert a reader reports the ARN of
 /// the Region the record was stored under; `default_list` picks the namespace
@@ -207,6 +208,16 @@ fn gated_calls() -> Vec<Gated> {
         Gated {
             operation: "ListProtocolsLists",
             body: json!({ "MaxResults": 100 }),
+        },
+        Gated {
+            operation: "PutAppsList",
+            body: json!({
+                "AppsList": {
+                    "ListName": "gated",
+                    "AppsList": [{ "AppName": "https", "Protocol": "tcp", "Port": 443 }],
+                },
+                "TagList": [{ "Key": "gated", "Value": "yes" }],
+            }),
         },
         Gated {
             operation: "PutProtocolsList",

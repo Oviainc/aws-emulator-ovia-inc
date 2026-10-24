@@ -7,7 +7,8 @@
 //! (`CreateMilestone`, `GetMilestone`, `ListMilestones`), the review templates
 //! (`CreateReviewTemplate`, `GetReviewTemplate`, `ListReviewTemplates`,
 //! `DeleteReviewTemplate`), the answers of
-//! a workload's lens reviews (`ListAnswers`) and the answers of a review template's lens
+//! a workload's lens reviews (`ListAnswers`), the improvement plan of one of those lens
+//! reviews (`ListLensReviewImprovements`) and the answers of a review template's lens
 //! reviews (`ListReviewTemplateAnswers`) are backed entirely by the maps below, so a
 //! create is visible to the next request on the same engine. The custom lenses
 //! `ImportLens`
@@ -1010,23 +1011,37 @@ pub const REVIEW_TEMPLATE_ANSWER_STATUS_UNANSWERED: &str = "UNANSWERED";
 /// so this is what bounds the milestone map per workload.
 pub const MAX_MILESTONES_PER_WORKLOAD: i32 = 100;
 
-/// The largest page any paginated operation of this service serves, and the page size a
-/// request that omits `MaxResults` gets.
+/// The largest page most of this service's paginated operations serve, and the page size
+/// a request that omits `MaxResults` gets.
 ///
-/// Every paginated operation here targets the one modelled `MaxResults` shape, which is
-/// `@range(min: 1, max: 50)` (`smithy_query(query="shape", shape="MaxResults")`), so
-/// one ceiling covers them all: a request that omits the member asks for a full page.
+/// Every paginated operation here targets the one modelled `MaxResults` shape, but its
+/// `@range` is a MEMBER trait: all but one of them bound it to
+/// `@range(min: 1, max: 50)`, so one ceiling covers them, and a request that omits the
+/// member asks for a full page. The exception carries its own ceiling
+/// ([`IMPROVEMENTS_MAX_RESULTS_CEILING`]).
 pub const MAX_RESULTS_CEILING: i32 = 50;
+
+/// The ceiling `ListLensReviewImprovements` serves: its `MaxResults` member is
+/// `@range(min: 1, max: 100)`
+/// (`smithy_query(query="operation", operation="ListLensReviewImprovements")`), twice
+/// what every other paginated member of this service allows.
+pub const IMPROVEMENTS_MAX_RESULTS_CEILING: i32 = 100;
 
 /// [`MAX_RESULTS_CEILING`] applied to the `MaxResults` a request carried: the modelled
 /// range restated in the handler, so the page size is in `1..=MAX_RESULTS_CEILING`
 /// whatever reaches it.
 pub fn page_size(max_results: Option<i32>) -> usize {
-    let clamped = max_results
-        .unwrap_or(MAX_RESULTS_CEILING)
-        .clamp(1, MAX_RESULTS_CEILING);
+    page_size_up_to(max_results, MAX_RESULTS_CEILING)
+}
+
+/// [`page_size`] against the ceiling the CALLING operation's `MaxResults` member is
+/// bounded by, for the one whose bound is not [`MAX_RESULTS_CEILING`]: the page size is
+/// in `1..=ceiling` whatever reaches it, and a request that omits the member gets a full
+/// page of that operation's own size.
+pub fn page_size_up_to(max_results: Option<i32>, ceiling: i32) -> usize {
+    let clamped = max_results.unwrap_or(ceiling).clamp(1, ceiling);
     usize::try_from(clamped)
-        .expect("MaxResults is clamped into 1..=MAX_RESULTS_CEILING, which always fits in a usize")
+        .expect("MaxResults is clamped into 1..=ceiling, which always fits in a usize")
 }
 
 /// One stored answer to one question of one lens review, as the operations that answer

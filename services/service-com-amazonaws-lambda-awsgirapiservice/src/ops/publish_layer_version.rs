@@ -277,6 +277,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 code_size,
                 code_sha256,
                 created: crate::state::iso8601(now),
+                // A freshly published version has had no permission granted on it yet,
+                // so it holds no resource-based policy at all.
+                policy: None,
             },
         );
         record.latest_version = version_number;

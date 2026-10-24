@@ -21,6 +21,11 @@
 //! * `Setting$type` is a property of the NAME: `aws_managed` for the one setting Amazon
 //!   Web Services manages, `user` for the rest — and an `aws_managed` setting is
 //!   read-only, so a write of it is refused.
+//! * `DeleteAccountSetting` "disables an account setting for a specified user, role, or
+//!   the root user for an account": the principal's stored value is removed, so the
+//!   value in effect for it falls back to the account-wide default (and, for the root
+//!   user, to the setting's documented default), and the response reports the setting
+//!   that stopped applying.
 //! * `ClusterSetting$value`: "If a cluster value is specified, it will override the
 //!   `containerInsights` value set with PutAccountSetting or PutAccountSettingDefault" —
 //!   so a cluster that set nothing reports the account setting in effect.
@@ -33,7 +38,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::ecs_wire::{list, ok, refused, service, string, ACCOUNT};
+use crate::ecs_wire::{list, ok, refusal, refused, service, string, ACCOUNT};
 
 /// Every Amazon ECS account setting, from
 /// `smithy_query(query="shape", shape="SettingName")` -> values, with the value it has
@@ -797,6 +802,337 @@ async fn the_store_holds_settings_for_a_bounded_number_of_principals() {
         "case {case:?}: the settings already stored must survive the refusal, got \
          {first:?}"
     );
+}
+
+/// Disable one account setting and return the `Setting` the call reports.
+async fn disable(router: &MultiServiceRouter, request: Value, case: &str) -> Value {
+    ok(router, "DeleteAccountSetting", request, case)
+        .await["setting"]
+        .clone()
+}
+
+/// The documented default of `name`, from this suite's catalog.
+fn documented_default(name: &str) -> String {
+    ACCOUNT_SETTINGS
+        .iter()
+        .find(|(setting, _, _)| *setting == name)
+        .map(|(_, value, _)| (*value).to_string())
+        .unwrap_or_else(|| panic!("{name} is one of this suite's account settings"))
+}
+
+#[tokio::test]
+async fn a_disabled_setting_stops_applying_and_the_account_default_takes_over() {
+    // The rows differ along the setting and the two value FORMS it is written with: the
+    // enabled/disabled toggle, its on/off spelling, the three-valued `containerInsights`,
+    // the two-worded `defaultLogDriverMode` and the numeric Fargate wait period.
+    let cases: [(&str, &str, &str, &str); 5] = [
+        ("trunking", "awsvpcTrunking", "enabled", "disabled"),
+        ("insights", "containerInsights", "enabled", "enhanced"),
+        ("tag authorization", "tagResourceAuthorization", "on", "off"),
+        (
+            "log driver",
+            "defaultLogDriverMode",
+            "blocking",
+            "non-blocking",
+        ),
+        (
+            "retirement",
+            "fargateTaskRetirementWaitPeriod",
+            "14",
+            "0",
+        ),
+    ];
+
+    for (case, name, account_value, principal_value) in cases {
+        // A fresh engine per row, so one row's writes cannot leak into another.
+        let router = service();
+        ok(
+            &router,
+            "PutAccountSettingDefault",
+            json!({ "name": name, "value": account_value }),
+            case,
+        )
+        .await;
+        ok(
+            &router,
+            "PutAccountSetting",
+            json!({ "name": name, "value": principal_value }),
+            case,
+        )
+        .await;
+
+        // The disable reports the setting that stopped applying to this principal.
+        let disabled = disable(&router, json!({ "name": name }), case).await;
+        assert_eq!(
+            (
+                disabled["name"].clone(),
+                disabled["value"].clone(),
+                disabled["principalArn"].clone()
+            ),
+            (
+                json!(name),
+                json!(principal_value),
+                json!(authenticated_principal())
+            ),
+            "case {case:?}: the disable must report the setting it cleared for this \
+             principal, got {disabled}"
+        );
+
+        // ... and the store no longer holds it, so the account default applies again.
+        let own = all_settings(
+            &router,
+            json!({ "name": name, "effectiveSettings": false }),
+            case,
+        )
+        .await;
+        assert!(
+            own.is_empty(),
+            "case {case:?}: a disabled setting is no longer this principal's own, got \
+             {own:?}"
+        );
+        let in_effect = effective(&router, name, case).await;
+        assert_eq!(
+            (
+                in_effect["value"].clone(),
+                in_effect["principalArn"].clone()
+            ),
+            (json!(account_value), json!(root_principal())),
+            "case {case:?}: after the disable the account default is in effect, got \
+             {in_effect}"
+        );
+
+        // Disabling the ROOT user's setting is disabling the account-wide default, so
+        // the name falls back to the value it has for an account that never wrote it.
+        let root_disabled = disable(
+            &router,
+            json!({ "name": name, "principalArn": root_principal() }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            (
+                root_disabled["value"].clone(),
+                root_disabled["principalArn"].clone()
+            ),
+            (json!(account_value), json!(root_principal())),
+            "case {case:?}: the disable must report the account default it cleared, got \
+             {root_disabled}"
+        );
+        let after_root = effective(&router, name, case).await;
+        assert_eq!(
+            after_root["value"],
+            json!(documented_default(name)),
+            "case {case:?}: with no account default left, the setting's own default is in \
+             effect, got {after_root}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn disabling_a_setting_nobody_wrote_reports_what_is_in_effect_and_changes_nothing() {
+    let router = service();
+
+    // The rows span the value forms a never-written setting can have: off, on, a word
+    // pair and a number — one row per documented default shape, including names this
+    // suite's other rows never write.
+    let names = [
+        "fargateFIPSMode",
+        "serviceLongArnFormat",
+        "taskLongArnFormat",
+        "defaultLogDriverMode",
+        "fargateTaskRetirementWaitPeriod",
+    ];
+
+    for name in names {
+        let case = format!("{name} never written");
+        let expected = documented_default(name);
+        // Twice: a disable of a setting that is not stored is idempotent, and the second
+        // call answers exactly what the first did.
+        for attempt in 0..2 {
+            let reported = disable(&router, json!({ "name": name }), &case).await;
+            assert_eq!(
+                (
+                    reported["name"].clone(),
+                    reported["value"].clone(),
+                    reported["principalArn"].clone()
+                ),
+                (
+                    json!(name),
+                    json!(expected),
+                    json!(root_principal())
+                ),
+                "case {case:?}: attempt {attempt} must report the setting in effect, got \
+                 {reported}"
+            );
+        }
+
+        let own = all_settings(
+            &router,
+            json!({ "name": name, "effectiveSettings": false }),
+            &case,
+        )
+        .await;
+        assert!(
+            own.is_empty(),
+            "case {case:?}: a disable must not store a setting, got {own:?}"
+        );
+    }
+
+    // Every name is still at its documented default: the disables wrote nothing.
+    let reported = all_settings(&router, json!({ "effectiveSettings": true }), "after disabling").await;
+    let expected: Vec<(String, String)> = ACCOUNT_SETTINGS
+        .iter()
+        .map(|(name, value, _)| ((*name).to_string(), (*value).to_string()))
+        .collect();
+    assert_eq!(
+        values(&reported),
+        expected,
+        "case \"after disabling\": a disable of an unwritten setting must leave every \
+         setting at its default, got {reported:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_disable_touches_one_principal_and_one_name_only() {
+    let router = service();
+    let case = "one principal, one name";
+    let other = format!("arn:aws:iam::{ACCOUNT}:role/deployer");
+
+    for (principal, name) in [
+        (authenticated_principal(), "awsvpcTrunking"),
+        (authenticated_principal(), "containerInsights"),
+        (other.clone(), "awsvpcTrunking"),
+    ] {
+        ok(
+            &router,
+            "PutAccountSetting",
+            json!({ "name": name, "value": "enabled", "principalArn": principal }),
+            case,
+        )
+        .await;
+    }
+
+    disable(&router, json!({ "name": "awsvpcTrunking" }), case).await;
+
+    let own = all_settings(&router, json!({ "effectiveSettings": false }), case).await;
+    assert_eq!(
+        values(&own),
+        vec![("containerInsights".to_string(), "enabled".to_string())],
+        "case {case:?}: the disable must leave this principal's other names alone, got \
+         {own:?}"
+    );
+    let others = all_settings(
+        &router,
+        json!({ "principalArn": other, "effectiveSettings": false }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        values(&others),
+        vec![("awsvpcTrunking".to_string(), "enabled".to_string())],
+        "case {case:?}: the disable must leave another principal's setting of the same \
+         name alone, got {others:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_disable_outside_the_documented_parameters_is_refused() {
+    let router = service();
+
+    // `guardDutyActivate` is the one `aws_managed` setting, so it is read-only: a
+    // disable of it is refused just as a write of it is.
+    refused(
+        &router,
+        "DeleteAccountSetting",
+        json!({ "name": "guardDutyActivate" }),
+        "InvalidParameterException",
+        "guardDutyActivate is read-only",
+    )
+    .await;
+
+    // The principal a setting may belong to is an IAM ARN; the rows differ along the
+    // field that makes the value something else.
+    let refused_arns: [(&str, String); 4] = [
+        ("not an ARN at all", "emulator".to_string()),
+        ("no resource", format!("arn:aws:iam::{ACCOUNT}:")),
+        (
+            "a region on a global service",
+            format!("arn:aws:iam:us-west-2:{ACCOUNT}:user/emulator"),
+        ),
+        (
+            "a key longer than the store holds",
+            format!("arn:aws:iam::{ACCOUNT}:user/{}", "p".repeat(2048)),
+        ),
+    ];
+    for (case, principal_arn) in refused_arns {
+        refused(
+            &router,
+            "DeleteAccountSetting",
+            json!({ "name": "awsvpcTrunking", "principalArn": principal_arn }),
+            "InvalidParameterException",
+            case,
+        )
+        .await;
+    }
+    // None of the refusals changed anything: `guardDutyActivate` is still what Amazon
+    // Web Services reports for it.
+    let setting = effective(&router, "guardDutyActivate", "after the refusals").await;
+    assert_eq!(
+        (setting["value"].clone(), setting["type"].clone()),
+        (json!(documented_default("guardDutyActivate")), json!("aws_managed")),
+        "case \"after the refusals\": a read-only setting must keep its value, got \
+         {setting}"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_principal_is_named_in_the_refusal_with_the_value_it_was_given() {
+    let router = service();
+
+    // The refusal is built from the REQUEST: it names the member that is wrong and the
+    // value that member carried. The rows differ along that value's form, and the same
+    // sentence is expected from every account-setting operation that takes a principal.
+    let forms: [(&str, String); 4] = [
+        ("not an ARN at all", "not-an-arn".to_string()),
+        ("an empty string", String::new()),
+        (
+            "another service entirely",
+            format!("arn:aws:ecs::{ACCOUNT}:cluster/default"),
+        ),
+        (
+            "a region on a global service",
+            format!("arn:aws:iam:us-west-2:{ACCOUNT}:user/emulator"),
+        ),
+    ];
+
+    for (form, principal_arn) in forms {
+        for operation in [
+            "DeleteAccountSetting",
+            "PutAccountSetting",
+            "ListAccountSettings",
+        ] {
+            let case = format!("{operation} with {form}");
+            let mut request = json!({ "principalArn": principal_arn });
+            if operation != "ListAccountSettings" {
+                request["name"] = json!("awsvpcTrunking");
+            }
+            if operation == "PutAccountSetting" {
+                request["value"] = json!("enabled");
+            }
+            let (code, message) = refusal(&router, operation, request, &case).await;
+            assert_eq!(
+                code, "InvalidParameterException",
+                "case {case:?}: expected an InvalidParameterException, got {code:?} with \
+                 {message:?}"
+            );
+            assert_eq!(
+                message,
+                format!("Invalid PrincipalArn: {principal_arn}"),
+                "case {case:?}: the refusal must name the member and the value it was \
+                 given, got {message:?}"
+            );
+        }
+    }
 }
 
 /// The catalog the handlers resolve values over must cover EXACTLY the `SettingName`

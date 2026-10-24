@@ -27,6 +27,8 @@ mod harness;
 mod idle_recommendations;
 #[path = "all/lambda_function_recommendations.rs"]
 mod lambda_function_recommendations;
+#[path = "all/organization_enrollment_statuses.rs"]
+mod organization_enrollment_statuses;
 #[path = "all/rds_database_recommendations.rs"]
 mod rds_database_recommendations;
 #[path = "all/rds_database_recommendations_export.rs"]

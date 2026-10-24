@@ -329,6 +329,45 @@ pub fn environment_not_found_validation(environment_id: &str) -> ValidationExcep
     }
 }
 
+/// The refusal a LIST operation addressed to one environment answers while that
+/// environment is still initializing, and `None` once it no longer is.
+///
+/// "The input fails to satisfy the specified constraints. You will see this exception
+/// if invalid inputs are provided for any of the Amazon EVS environment operations, or
+/// if a list operation is performed on an environment resource that is still
+/// initializing." (`ValidationException` doc, `smithy_query(query="shape",
+/// shape="ValidationException")`.) So a list addressed to an environment resource is
+/// refused with `ValidationException` — HTTP 400 — for as long as that environment is
+/// initializing, rather than reporting the half-built inventory of one: the caller is
+/// told to wait, not handed a partial answer it cannot tell from a complete one.
+///
+/// "Initializing" is [`STATE_CREATING`], the state `CreateEnvironment` mints an
+/// environment in and the one it leaves when the transition the clock owes it comes due
+/// ([`TRANSITION_DELAY`]). Every other `EnvironmentState` the model declares —
+/// `CREATED`, `DELETING`, `DELETED`, `CREATE_FAILED` (`smithy_query(query="shape",
+/// shape="EnvironmentState")`) — is past initialization, built or abandoned, so a list
+/// against one of those is answered: the doc names the initializing case and no other.
+///
+/// The sentence is built from the request and the state the store holds, exactly as the
+/// equivalent precondition in `CreateEnvironmentHost` is, and its `fieldList` entry
+/// names `environmentId` — the member that carried the environment the list could not
+/// be performed on.
+pub fn list_refused_while_initializing(
+    environment: &StoredEnvironment,
+) -> Option<ValidationException> {
+    if !environment.is_initializing() {
+        return None;
+    }
+    Some(field_validation_error(
+        "environmentId",
+        &format!(
+            "names an environment whose state is {}; a list operation cannot be performed on \
+             an environment resource that is still initializing",
+            environment.state
+        ),
+    ))
+}
+
 /// The `ResourceNotFoundException` every operation answers for a connector id the
 /// addressed environment holds no record of.
 ///
@@ -976,6 +1015,18 @@ pub struct StoredEnvironment {
 }
 
 impl StoredEnvironment {
+    /// Whether this environment is STILL INITIALIZING — its `EnvironmentState` is
+    /// [`STATE_CREATING`], the state a create mints it in and the state it leaves when
+    /// the transition the clock owes it comes due.
+    ///
+    /// The condition the `ValidationException` doc attaches to a list addressed to an
+    /// environment resource; see [`list_refused_while_initializing`], which builds that
+    /// refusal. A `CREATED`, `DELETING`, `DELETED` or `CREATE_FAILED` environment is
+    /// past initialization and answers `false`.
+    pub fn is_initializing(&self) -> bool {
+        self.state == STATE_CREATING
+    }
+
     /// Apply the owed lifecycle transition if `now` has reached its due instant, and
     /// the status change every entitlement of this environment is owed with it.
     ///

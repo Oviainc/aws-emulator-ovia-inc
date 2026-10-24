@@ -227,6 +227,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The TAG KEYS next, still before any state is touched: a key in the
+        // namespace AWS reserves for its own generated tags is a bad request, so it
+        // is refused here rather than at the merge below — the judgement is on the
+        // INPUT, so the refusal does not depend on whether this call would create
+        // the parameter (and apply `tags`) or update one that exists (where the
+        // member documents that `tags` is ignored). Nothing is stored either way.
+        if let Some(tags) = input.tags.as_ref() {
+            if let Err(why) =
+                crate::state::validate_tag_keys_unreserved(tags.keys().map(String::as_str), "tags")
+            {
+                return Err(PutDeploymentParameterErrorModeled::ValidationException(why).into());
+            }
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutDeploymentParameterErrorModeled::InternalServerException(
                 InternalServerException {

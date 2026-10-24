@@ -39,6 +39,8 @@ mod packaging_lifecycle;
 mod region_scoping;
 #[path = "all/resource_tag_listing.rs"]
 mod resource_tag_listing;
+#[path = "all/resource_tag_removal.rs"]
+mod resource_tag_removal;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/success_path_projections.rs"]

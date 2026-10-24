@@ -2,7 +2,8 @@
 
 //! @op GetEnrollmentStatus
 //!
-//! IMPLEMENTED: reports the stored enrollment record without changing it. Before any
+//! IMPLEMENTED: reports the stored enrollment record without changing it, and counts the
+//! organization's opted-in member accounts over the member accounts themselves. Before any
 //! `UpdateEnrollmentStatus` call that record is the documented default: `Inactive`, with
 //! no member accounts enrolled and no last-updated timestamp.
 //!
@@ -172,7 +173,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A pure report: the enrollment record moves only when a client calls
         // `UpdateEnrollmentStatus`, so reading it must leave it exactly as it is.
-        let enrollment = state.lock().enrollment.clone();
+        let now = crate::state::now_secs();
+        let guard = state.lock();
+        let enrollment = guard.enrollment.clone();
+        // "The count of organization member accounts that are opted in to the service":
+        // counted over the member accounts themselves, so this count and the rows
+        // `GetEnrollmentStatusesForOrganization` reports cannot disagree.
+        let number_of_member_accounts_opted_in = guard.member_accounts_opted_in(now);
+        drop(guard);
         Ok(GetEnrollmentStatusOutput {
             status: Some(enrollment.status),
             status_reason: enrollment.status_reason,
@@ -181,9 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A COUNT is reported whatever it is: zero member accounts opted in is `0`,
             // not an absent member, so a client reading the count unconditionally can
             // tell "none are opted in" from "not reported".
-            number_of_member_accounts_opted_in: Some(
-                enrollment.number_of_member_accounts_opted_in,
-            ),
+            number_of_member_accounts_opted_in: Some(number_of_member_accounts_opted_in),
         })
     }
 }

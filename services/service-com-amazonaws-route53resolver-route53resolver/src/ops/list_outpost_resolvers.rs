@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOutpostResolvers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOutpostResolvers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOutpostResolvers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. Lists the Resolvers on Outposts this service holds — the records
+//! `CreateOutpostResolver` persisted — one `@paginated` page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +153,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOutpostResolvers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOutpostResolversErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOutpostResolvers"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListOutpostResolversErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A pure read: the page is computed from the stored records, each
+        // record's status from its own due instant, and the cursor is a pure
+        // function of the offset — so nothing a later caller sees changes.
+        let page = {
+            let store = state.lock();
+            let now = ::std::time::Instant::now();
+            let selected: Vec<OutpostResolver> = store
+                .outpost_resolvers_in_creation_order()
+                .into_iter()
+                // "The Resolvers on Outposts that were created by using the
+                // current Amazon Web Services account, and that match the
+                // specified filters, if any": the only filter this operation
+                // models is `OutpostArn`. The emulator holds no Outpost
+                // inventory, so an `OutpostArn` no stored Resolver sits on
+                // selects nothing rather than being refused.
+                .filter(|record| {
+                    input
+                        .outpost_arn
+                        .as_deref()
+                        .is_none_or(|requested| record.outpost_arn == requested)
+                })
+                .map(|record| record.to_outpost_resolver(now))
+                .collect();
+
+            let scope = crate::state::outpost_resolver_list_scope(input.outpost_arn.as_deref());
+            crate::state::paginate(
+                selected,
+                &scope,
+                input.max_results,
+                input.next_token.as_deref(),
+            )
+        };
+
+        let Some(page) = page else {
+            // This operation models no `InvalidNextTokenException`, so a cursor
+            // this service did not mint for this query is refused with the
+            // `ValidationException` it does model, rather than being read as
+            // "start from the beginning" and silently repeating page one.
+            return Err(ListOutpostResolversErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "The NextToken you provided was not issued by this service for this query"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListOutpostResolversOutput {
+            outpost_resolvers: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }
