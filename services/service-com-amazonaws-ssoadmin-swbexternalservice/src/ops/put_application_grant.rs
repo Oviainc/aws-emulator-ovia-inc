@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutApplicationGrant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutApplicationGrant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: adds or updates one OAuth 2.0 grant of an application stored in this
+//! service's state (`crate::state`), and answers an empty 200. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutApplicationGrant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The grants live ON the application record ([`crate::state::ApplicationRecord::grants`]),
+//! keyed by `GrantType`: a put of a type the application already carries REPLACES that
+//! grant and leaves every other type alone. The operation is `@idempotent`, so repeating
+//! the same request leaves the same single grant stored.
+//!
+//! Two refusals the model cannot express are the handler's. The `Grant` union documents
+//! that the variant it carries "must match the grant type selected", so a request whose
+//! two halves disagree is the modelled `ValidationException`; and the member each grant
+//! documents as required under its own type (`AuthorizationCodeGrant$RedirectUris`,
+//! `JwtBearerGrant$AuthorizedTokenIssuers`) is OPTIONAL in the model, so a grant that
+//! omits it is refused here. An `ApplicationArn` this account holds no application for is
+//! refused the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +205,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutApplicationGrant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutApplicationGrantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutApplicationGrantErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+
+        // The `GrantType` is a property OF the grant the request carries (the `Grant`
+        // union: "Exactly one member of the union must be specified, and must match the
+        // grant type selected"), so a request whose two halves disagree names no grant
+        // this service could store under either of them. The model declares both members
+        // independently and cannot tie them together, so the refusal is the handler's.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutApplicationGrant"))
+        // Deliberately BEFORE the application is resolved: a request that does not name
+        // one storable grant is malformed whatever `ApplicationArn` it carries, so it
+        // earns the same `ValidationException` the boundary validator would have given it
+        // had the model been able to express the rule.
+        let carried_type = crate::state::grant_type_of(&input.grant);
+        if carried_type != input.grant_type {
+            return Err(PutApplicationGrantErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::grant_type_mismatch_message(
+                        &input.grant_type,
+                        carried_type,
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // The member each grant documents as REQUIRED under its own type is modelled
+        // OPTIONAL — a member required only under one union variant is not expressible —
+        // so the boundary validator passes a grant that omits it and the handler refuses
+        // it. The lists are `length 1..10`, so "authorized by no entry" is the member's
+        // ABSENCE and an empty list never reaches here. The two grants that carry no
+        // member at all (`refresh_token`, `token-exchange`) have nothing to require.
+        let missing_member = match &input.grant {
+            Grant::AuthorizationCode(grant) if grant.redirect_uris.is_none() => {
+                Some("AuthorizationCodeGrant.RedirectUris")
+            }
+            Grant::JwtBearer(grant) if grant.authorized_token_issuers.is_none() => {
+                Some("JwtBearerGrant.AuthorizedTokenIssuers")
+            }
+            _ => None,
+        };
+        if let Some(member) = missing_member {
+            return Err(PutApplicationGrantErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::grant_member_required_message(
+                        member,
+                        carried_type,
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // What the CLOCK already owes every instance, so this write resolves the same
+        // application a read at this instant would resolve (an application whose instance
+        // the clock has already removed no longer exists).
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        // The application whose grant this sets must exist: the grants live ON the
+        // application record, so an `ApplicationArn` nothing holds is the modelled
+        // `ResourceNotFoundException` rather than a grant stored under an ARN no read
+        // resolves.
+        let application = store
+            .application_mut(&input.application_arn)
+            .ok_or_else(|| {
+                PutApplicationGrantErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::application_not_found_message(
+                            &input.application_arn,
+                        )),
+                        // The model's `ResourceNotFoundExceptionReason` enum carries only
+                        // `KMS_NotFoundException`, which this is not.
+                        reason: None,
+                    },
+                )
+            })?;
+
+        // "Adds a grant to an application": the grant is keyed by its TYPE, so a put of a
+        // type the application already carries REPLACES that grant instead of adding a
+        // second one, and every other type is left alone. The operation is `@idempotent`,
+        // so repeating the same request leaves the same grant stored. No memory ceiling is
+        // needed: `GrantType` admits exactly four values, so this map holds at most four
+        // entries per application.
+        application.grants.insert(input.grant_type, input.grant);
+        Ok(PutApplicationGrantOutput)
     }
 }

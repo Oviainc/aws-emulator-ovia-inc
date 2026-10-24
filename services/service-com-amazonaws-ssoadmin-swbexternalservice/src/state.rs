@@ -22,8 +22,8 @@ use ::aws_smithy_types::DateTime;
 use crate::ops::types::{
     AccessControlAttribute, AccountAssignment, AccountAssignmentOperationStatus,
     ApplicationProvider, AttachedManagedPolicy, AuthenticationMethod,
-    CustomerManagedPolicyReference, DisplayData,
-    EncryptionConfigurationDetails, InstanceAccessControlAttributeConfiguration, InstanceMetadata,
+    CustomerManagedPolicyReference, DisplayData, EncryptionConfigurationDetails, Grant,
+    InstanceAccessControlAttributeConfiguration, InstanceMetadata,
     PermissionSet, PermissionsBoundary, PortalOptions, RegionMetadata, ResourceServerConfig,
     ResourceServerScopeDetails, Tag, TrustedTokenIssuerConfiguration,
 };
@@ -465,6 +465,75 @@ pub fn authentication_method_type_mismatch_message(declared: &str, carried: &str
 /// judging the policy language inside it.
 pub const ACTOR_POLICY_NOT_AN_OBJECT_MESSAGE: &str =
     "IamAuthenticationMethod.ActorPolicy must be a JSON object: an IAM policy document";
+
+/// `GrantType::authorization_code` — the OAuth 2.0 Authorization Code grant
+/// (`types::GRANT_TYPE_VALUES`).
+pub const GRANT_TYPE_AUTHORIZATION_CODE: &str = "authorization_code";
+
+/// `GrantType::refresh_token` — the OAuth 2.0 Refresh Token grant.
+pub const GRANT_TYPE_REFRESH_TOKEN: &str = "refresh_token";
+
+/// `GrantType::urn:ietf:params:oauth:grant-type:jwt-bearer` — the JWT Bearer Token
+/// Authorization grant.
+pub const GRANT_TYPE_JWT_BEARER: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+
+/// `GrantType::urn:ietf:params:oauth:grant-type:token-exchange` — the OAuth 2.0 Token
+/// Exchange grant.
+pub const GRANT_TYPE_TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+
+/// The `GrantType` a [`Grant`] union value carries.
+///
+/// The `Grant` union documents the relationship itself — "Exactly one member of the union
+/// must be specified, and must match the grant type selected" — so the type is a PROPERTY
+/// of the union value rather than an independent member, and this function is the single
+/// place the mapping lives. Every variant the model declares maps onto one enum value, so
+/// the mapping is total in both directions.
+pub fn grant_type_of(grant: &Grant) -> &'static str {
+    match grant {
+        Grant::AuthorizationCode(_) => GRANT_TYPE_AUTHORIZATION_CODE,
+        Grant::RefreshToken(_) => GRANT_TYPE_REFRESH_TOKEN,
+        Grant::JwtBearer(_) => GRANT_TYPE_JWT_BEARER,
+        Grant::TokenExchange(_) => GRANT_TYPE_TOKEN_EXCHANGE,
+    }
+}
+
+/// The refusal a `PutApplicationGrant` whose `GrantType` disagrees with the variant its
+/// `Grant` union carries earns, as the message of the modelled `ValidationException`.
+///
+/// The rule is the `Grant` union's own documentation ("must match the grant type
+/// selected"), which the model declares as two independent members and cannot tie
+/// together. Built from the request: it names both halves, since the caller has to learn
+/// which of the two to change.
+pub fn grant_type_mismatch_message(declared: &str, carried: &str) -> String {
+    format!(
+        "Grant carries a {carried} grant, which does not match the GrantType {declared} \
+         the request declares"
+    )
+}
+
+/// The refusal a `Grant` that omits the member its own grant type documents as required
+/// earns, as the message of the modelled `ValidationException`; `member` names the
+/// missing member and `grant_type` the grant that requires it.
+///
+/// The rule is each member's own documentation — `AuthorizationCodeGrant$RedirectUris`
+/// ("RedirectUris is required when the grant type is authorization_code") and
+/// `JwtBearerGrant$AuthorizedTokenIssuers` ("AuthorizedTokenIssuers is required when the
+/// grant type is JwtBearerGrant"). The model marks both members OPTIONAL, because a
+/// member required only under one union variant is not expressible, so the boundary
+/// validator passes the request and the handler refuses it.
+pub fn grant_member_required_message(member: &str, grant_type: &str) -> String {
+    format!("{member} is required when the grant type is {grant_type}.")
+}
+
+/// The refusal a `GrantType` the application carries no grant for earns, as the message
+/// of the modelled `ResourceNotFoundException`.
+///
+/// Built from the request, like [`authentication_method_not_found_message`]: it names both
+/// the grant type and the application it was looked for on, because an unconfigured grant
+/// type on a known application is a different failure from an unknown application.
+pub fn grant_not_found_message(application_arn: &str, grant_type: &str) -> String {
+    format!("Could not find grant {grant_type} for application {application_arn}.")
+}
 
 /// The attribute-based access control (ABAC) configuration of an instance, as the
 /// `CreateInstanceAccessControlAttributeConfiguration` that enabled ABAC — and any later
@@ -1371,6 +1440,19 @@ pub struct ApplicationRecord {
     /// boundary validator enforces, so this map holds at most one entry per application.
     /// A `BTreeMap` so an enumeration walks one stable order and can page by type.
     pub authentication_methods: BTreeMap<String, AuthenticationMethod>,
+    /// The OAuth 2.0 GRANTS of this application, by `GrantType`, as
+    /// `PutApplicationGrant` stored them.
+    ///
+    /// On the application record for the same reason as [`Self::access_scopes`]: an
+    /// application that no longer exists carries no grant, and the grant operations
+    /// resolve the same application every other read resolves. Keyed by the grant's TYPE,
+    /// which is what identifies it — a put of a type the application already carries
+    /// replaces that grant and leaves every other type alone. The key needs no memory
+    /// ceiling: the model's `GrantType` enum admits exactly four values
+    /// (`types::GRANT_TYPE_VALUES`), which the boundary validator enforces, so this map
+    /// holds at most four entries per application. A `BTreeMap` so an enumeration walks
+    /// one stable order and can page by grant type.
+    pub grants: BTreeMap<String, Grant>,
 }
 
 /// A direct assignment of one principal to one application.
@@ -1699,7 +1781,8 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     }
 
     /// The application `application_arn` names, for a handler that updates it (a
-    /// `PutApplicationAccessScope` writing one of its access scopes, say).
+    /// `PutApplicationAccessScope` writing one of its access scopes, or a
+    /// `DeleteApplicationGrant` removing one of its grants, say).
     pub fn application_mut(&mut self, application_arn: &str) -> Option<&mut ApplicationRecord> {
         self.applications.get_mut(application_arn)
     }

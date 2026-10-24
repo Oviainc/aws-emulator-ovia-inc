@@ -231,6 +231,23 @@ pub(crate) fn error_code(body: &Value) -> String {
         .to_string()
 }
 
+/// Assert one call was REFUSED: HTTP 400 carrying `expected` as its wire error code.
+///
+/// The shared refusal assertion of this crate's suites: `case` names the table row,
+/// `what` the call that was refused, so a failure reads as the row and the actual answer
+/// rather than as a bare `400 != 200`.
+pub(crate) fn assert_refused(case: &str, what: &str, expected: &str, status: u16, body: &Value) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: {what} must be refused 400, got {status} {body}"
+    );
+    assert_eq!(
+        error_code(body),
+        expected,
+        "case {case:?}: {what} expected {expected}, got {body}"
+    );
+}
+
 /// The ARN of the one seeded instance, read the way a client reads it.
 pub(crate) async fn seeded_instance_arn(router: &MultiServiceRouter) -> String {
     let (status, body) = call(router, "ListInstances", &json!({})).await;
