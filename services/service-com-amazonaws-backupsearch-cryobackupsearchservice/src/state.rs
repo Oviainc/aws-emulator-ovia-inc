@@ -12,6 +12,12 @@
 //! `GetSearchResultExportJob`/`ListSearchResultExportJobs` report exactly that record.
 //! Every one of those answers is computed from the records held here.
 //!
+//! BOTH are taggable resources of this service in their own right — each is minted by an
+//! operation taking a `TagMap` and each ARN is an `@arnReference` to this service — so
+//! the tag APIs resolve their `ResourceArn` against every record held here
+//! ([`ComAmazonawsBackupsearchCryobackupsearchserviceState::tags_by_arn`]), not against
+//! one resource type.
+//!
 //! ## The clock, not the reader, moves a status
 //!
 //! A search job AWS returns is `RUNNING` — a non-terminal status — so the service owes
@@ -208,6 +214,27 @@ pub fn export_job_arn(signing_name: &str, region: &str, identifier: &str) -> Str
 /// carries no such field.
 pub fn arn_account(arn: &str) -> Option<&str> {
     arn.split(':').nth(4)
+}
+
+/// The resource TYPE an ARN names: the part of its resource field before the first `/`
+/// or `:` separator (`search-job`, `export-job`), and the empty string when the resource
+/// field carries no separator at all — a field like an S3 bucket name is an id alone and
+/// claims no type — or when the string has no resource field.
+///
+/// This is what the tag APIs report as `ResourceNotFoundException$resourceType`, which
+/// the model documents as the "hypothetical type of the resource affected" — the type the
+/// SUBMITTED ARN claims, since no resource of it was found. Reading it off the ARN is
+/// what keeps the refusal from naming one resource type for every miss, now that the
+/// lookup spans more than one.
+pub fn arn_resource_type(arn: &str) -> String {
+    // `splitn(6, ..)` so the resource field keeps its own colons: an ARN is
+    // `arn:<partition>:<service>:<region>:<account>:<resource>` and a resource field may
+    // itself be `<type>:<id>`.
+    arn.splitn(6, ':')
+        .nth(5)
+        .and_then(|resource| resource.split_once(['/', ':']))
+        .map(|(resource_type, _)| resource_type.to_string())
+        .unwrap_or_default()
 }
 
 /// Why this service cannot pass `role_arn` to itself, or `None` when it can.
@@ -429,16 +456,56 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
         self.search_jobs.get_mut(identifier)
     }
 
-    /// The job whose minted ARN is `arn` — how the tagging operations, which take a
-    /// `ResourceArn`, resolve the resource they name.
-    pub fn job_by_arn(&self, arn: &str) -> Option<&SearchJob> {
-        self.search_jobs.values().find(|job| job.arn == arn)
+    /// The tag set stored on the resource whose minted ARN is `arn` — how the tagging
+    /// operations, which take an unconstrained `ResourceArn`, resolve the resource they
+    /// name.
+    ///
+    /// The lookup spans EVERY resource this service mints and holds, not one type of
+    /// them: a `ResourceArn` is documented only as "the resource that will have the
+    /// indicated tags", and both of this service's resources are its own
+    /// (`SearchJobArn` and `ExportJobArn` are each `@arnReference` to this service) and
+    /// both carry the same `TagMap` on the operation that mints them. So an ARN matching
+    /// a held search job or a held export job resolves, and `None` — the
+    /// `ResourceNotFoundException` the tag APIs answer — is reserved for an ARN that
+    /// matches no record this store holds.
+    pub fn tags_by_arn(&self, arn: &str) -> Option<&HashMap<String, String>> {
+        self.search_jobs
+            .values()
+            .find(|job| job.arn == arn)
+            .map(|job| &job.tags)
+            .or_else(|| {
+                self.export_jobs
+                    .values()
+                    .find(|job| job.arn == arn)
+                    .map(|job| &job.tags)
+            })
     }
 
-    /// The job whose minted ARN is `arn`, mutably.
-    pub fn job_by_arn_mut(&mut self, arn: &str) -> Option<&mut SearchJob> {
-        let identifier = self.job_by_arn(arn).map(|job| job.identifier.clone())?;
-        self.search_jobs.get_mut(&identifier)
+    /// The tag set stored on the resource whose minted ARN is `arn`, mutably — the same
+    /// resolution [`tags_by_arn`](Self::tags_by_arn) performs, for `TagResource` and
+    /// `UntagResource`.
+    pub fn tags_by_arn_mut(&mut self, arn: &str) -> Option<&mut HashMap<String, String>> {
+        // Resolved to an identifier first, then borrowed mutably: the map a record lives
+        // in cannot be borrowed for the search and the write at once.
+        if let Some(identifier) = self
+            .search_jobs
+            .values()
+            .find(|job| job.arn == arn)
+            .map(|job| job.identifier.clone())
+        {
+            return self
+                .search_jobs
+                .get_mut(&identifier)
+                .map(|job| &mut job.tags);
+        }
+        let identifier = self
+            .export_jobs
+            .values()
+            .find(|job| job.arn == arn)
+            .map(|job| job.identifier.clone())?;
+        self.export_jobs
+            .get_mut(&identifier)
+            .map(|job| &mut job.tags)
     }
 
     /// Every job NEWEST-CREATED FIRST, which is the sequence `ListSearchJobs` filters
