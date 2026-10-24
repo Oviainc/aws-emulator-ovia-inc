@@ -77,6 +77,10 @@ mod list_tags_reader;
 mod management_event_lookup;
 #[path = "all/query_cancellation.rs"]
 mod query_cancellation;
+#[path = "all/query_results.rs"]
+mod query_results;
+#[path = "all/query_results_target_prefix.rs"]
+mod query_results_target_prefix;
 #[path = "all/range_refusal_wording.rs"]
 mod range_refusal_wording;
 #[path = "all/refusal_fidelity.rs"]
@@ -119,8 +123,11 @@ mod trail_refusals;
 #[path = "all/trail_update.rs"]
 mod trail_update;
 // Declared only because the build's layout check requires every file under `tests/all/`
-// to be declared: these two are empty leftovers (see their own doc comments), kept
-// because the fixers' tool cannot delete a file.
+// to be declared: these three are empty leftovers (see their own doc comments), kept
+// because the fixers' tool cannot delete a file. `probe.rs` held what is now the
+// better-named `query_results_target_prefix.rs`.
+#[path = "all/probe.rs"]
+mod probe;
 #[path = "all/wire.rs"]
 mod wire;
 #[path = "all/zz_diagnostic.rs"]
