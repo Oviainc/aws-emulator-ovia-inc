@@ -30,6 +30,11 @@
 //! `Client::record_workload_share` (see its doc): a share whose recipient is the caller
 //! has no HTTP path in a single-account emulator, while the share offered to ANOTHER
 //! principal — the negative row of rule 1 — is created over the wire.
+//!
+//! The seeding helpers and the published catalogs below are `pub(crate)` because
+//! `super::share_invitation_answers` — the suite for `UpdateShareInvitation`, the
+//! operation that ANSWERS one of these invitations — reads the same invitations back and
+//! must not keep a second copy of either.
 
 use serde_json::Value;
 
@@ -37,11 +42,11 @@ use super::workload_harness::{created_id, minimal_create, Answer, Client};
 
 /// The `PermissionType` members the model publishes —
 /// `smithy_query(query="shape", shape="PermissionType")` lists exactly these two.
-const PERMISSION_TYPES: [&str; 2] = ["CONTRIBUTOR", "READONLY"];
+pub(crate) const PERMISSION_TYPES: [&str; 2] = ["CONTRIBUTOR", "READONLY"];
 
 /// The `ShareStatus` members the model publishes —
 /// `smithy_query(query="shape", shape="ShareStatus")`.
-const SHARE_STATUSES: [&str; 8] = [
+pub(crate) const SHARE_STATUSES: [&str; 8] = [
     "ACCEPTED",
     "ASSOCIATED",
     "ASSOCIATING",
@@ -67,7 +72,7 @@ const NAME_PREFIX_MEMBERS: [&str; 4] = [
 ];
 
 /// The `ShareInvitationSummaries` of a successful `ListShareInvitations`.
-fn invitations(answer: &Answer, case: &str) -> Vec<Value> {
+pub(crate) fn invitations(answer: &Answer, case: &str) -> Vec<Value> {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected ListShareInvitations 200, got {answer:?}"
@@ -85,29 +90,29 @@ fn invitations(answer: &Answer, case: &str) -> Vec<Value> {
         })
 }
 
-fn member<'a>(value: &'a Value, name: &str) -> &'a str {
+pub(crate) fn member<'a>(value: &'a Value, name: &str) -> &'a str {
     value.get(name).and_then(Value::as_str).unwrap_or_default()
 }
 
 /// The `ShareInvitationId`s a page reported, in the order it reported them.
-fn invitation_ids(page: &[Value]) -> Vec<String> {
+pub(crate) fn invitation_ids(page: &[Value]) -> Vec<String> {
     page.iter()
         .map(|invitation| member(invitation, "ShareInvitationId").to_string())
         .collect()
 }
 
 /// A workload created over HTTP plus one share of it seeded into the shared state.
-struct Seeded {
-    workload_id: String,
-    workload_name: String,
-    share_id: String,
-    invitation_id: String,
-    permission_type: String,
-    status: String,
+pub(crate) struct Seeded {
+    pub(crate) workload_id: String,
+    pub(crate) workload_name: String,
+    pub(crate) share_id: String,
+    pub(crate) invitation_id: String,
+    pub(crate) permission_type: String,
+    pub(crate) status: String,
 }
 
 /// Create a workload over HTTP and record one share of it with `shared_with`.
-async fn seed(
+pub(crate) async fn seed(
     client: &Client,
     workload_name: &str,
     shared_with: &str,

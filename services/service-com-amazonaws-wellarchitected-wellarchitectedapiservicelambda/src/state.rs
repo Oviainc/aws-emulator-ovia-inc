@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     Choice, ConflictException, LensSummary, Milestone, MilestoneSummary,
     ResourceNotFoundException,
-    ReviewTemplate, ShareInvitationSummary, Workload, WorkloadDiscoveryConfig,
+    ReviewTemplate, ShareInvitation, ShareInvitationSummary, Workload, WorkloadDiscoveryConfig,
     WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput, WorkloadShare,
     WorkloadShareSummary, WorkloadSummary, QUESTION_VALUES, RISK_VALUES,
 };
@@ -766,6 +766,13 @@ pub const PROFILE_RESOURCE_TYPE: &str = "PROFILE";
 /// kind `WORKLOAD`, so a share of one is named here by what it is.
 pub const WORKLOAD_SHARE_RESOURCE_TYPE: &str = "WORKLOAD_SHARE";
 
+/// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for a
+/// share invitation. The invitation is a resource of its own — it has its own
+/// `ShareInvitationId`, which `UpdateShareInvitation` resolves it by — so it is named
+/// here by what it is, distinctly from the share it mediates
+/// ([`WORKLOAD_SHARE_RESOURCE_TYPE`]).
+pub const SHARE_INVITATION_RESOURCE_TYPE: &str = "SHARE_INVITATION";
+
 /// `ShareStatus` a newly created workload share carries.
 ///
 /// A share is mediated by a workload invitation — "Shared access to a workload is not
@@ -774,8 +781,38 @@ pub const WORKLOAD_SHARE_RESOURCE_TYPE: &str = "WORKLOAD_SHARE";
 /// `PENDING` is the `ShareStatus` member for exactly that
 /// (`smithy_query(query="shape", shape="ShareStatus")`). Nothing the CLOCK does moves it:
 /// it leaves `PENDING` only when the recipient answers the invitation
-/// (`UpdateShareInvitation`, still a stub with its own issue).
+/// (`UpdateShareInvitation`).
 pub const DEFAULT_SHARE_STATUS: &str = "PENDING";
+
+/// The `ShareInvitationAction` members the model publishes
+/// (`smithy_query(query="shape", shape="ShareInvitationAction")`): the two answers the
+/// principal a resource was shared with can give its invitation.
+pub const SHARE_INVITATION_ACTION_ACCEPT: &str = "ACCEPT";
+/// See [`SHARE_INVITATION_ACTION_ACCEPT`].
+pub const SHARE_INVITATION_ACTION_REJECT: &str = "REJECT";
+
+/// The `ShareStatus` a share carries once the principal it was offered to has accepted
+/// its invitation, and the one it carries once that principal has rejected it — both
+/// published members of the enum (`smithy_query(query="shape", shape="ShareStatus")`).
+/// Each is TERMINAL: the answer is the last thing that happens to the share's status, so
+/// nothing the clock does moves it afterwards.
+pub const SHARE_STATUS_ACCEPTED: &str = "ACCEPTED";
+/// See [`SHARE_STATUS_ACCEPTED`].
+pub const SHARE_STATUS_REJECTED: &str = "REJECTED";
+
+/// The `ShareStatus` the share mediated by an invitation moves to when that invitation
+/// is answered with `action`, or `None` when `action` is not a published
+/// `ShareInvitationAction` member.
+///
+/// One mapping, here, so every resource kind whose share invitation can be answered
+/// records the same status for the same answer.
+pub fn share_status_for_invitation_action(action: &str) -> Option<&'static str> {
+    match action {
+        SHARE_INVITATION_ACTION_ACCEPT => Some(SHARE_STATUS_ACCEPTED),
+        SHARE_INVITATION_ACTION_REJECT => Some(SHARE_STATUS_REJECTED),
+        _ => None,
+    }
+}
 
 /// The `ShareResourceType` member that names a REVIEW TEMPLATE share
 /// (`smithy_query(query="shape", shape="ShareResourceType")` publishes `WORKLOAD`,
@@ -1307,11 +1344,12 @@ impl WorkloadRecord {
             architectural_design: self.architectural_design.clone(),
             review_owner: self.review_owner.clone(),
             // Only the workload AS THE RECIPIENT SEES IT carries these: they describe
-            // the share invitation the recipient was offered. A share can be created
-            // (`CreateWorkloadShare`) and the invitations it raises are reported
-            // (`ListShareInvitations`), but accepting one — `UpdateShareInvitation` — is
-            // still a stub with its own issue, so no workload in this store is one the
-            // caller reached through an accepted invitation.
+            // the share invitation the recipient was offered, so they belong to a
+            // workload ANOTHER account owns and shared in. Every request this emulator
+            // serves is attributed to its one account, which owns every workload this
+            // store holds — `CreateWorkloadShare` is what records a share and it refuses
+            // a `SharedWith` naming the sharer — so no workload here is one the caller
+            // reached through an invitation it accepted.
             review_restriction_date: None,
             share_invitation_id: None,
             is_review_owner_update_acknowledged: Some(self.is_review_owner_update_acknowledged),
@@ -2354,6 +2392,26 @@ impl WorkloadShareRecord {
             template_arn: None,
         }
     }
+
+    /// The `ShareInvitation` projection `UpdateShareInvitation` answers with: the
+    /// invitation this share raised, named by its own `ShareInvitationId` and by the
+    /// resource it offers.
+    ///
+    /// Only the members of the shared resource KIND are filled — a workload invitation
+    /// names a workload, and the `LensAlias`, `LensArn`, `ProfileArn` and `TemplateArn`
+    /// members of the shape (`smithy_query(query="shape", shape="ShareInvitation")`)
+    /// belong to invitations of those kinds.
+    pub fn to_invitation(&self) -> ShareInvitation {
+        ShareInvitation {
+            share_invitation_id: Some(self.share_invitation_id.clone()),
+            share_resource_type: Some(WORKLOAD_RESOURCE_TYPE.to_string()),
+            workload_id: Some(self.workload_id.clone()),
+            lens_alias: None,
+            lens_arn: None,
+            profile_arn: None,
+            template_arn: None,
+        }
+    }
 }
 
 /// What a `CreateWorkloadShare` idempotency token resolves to: the share the original
@@ -2714,6 +2772,28 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             .get(workload_id)?
             .values()
             .find(|share| share.shared_with == shared_with)
+    }
+
+    /// The share the invitation `share_invitation_id` mediates, if it was offered to
+    /// `principal` — what `UpdateShareInvitation` resolves, for writing.
+    ///
+    /// An invitation is named by its own `ShareInvitationId` alone, with no workload in
+    /// the request, so the search spans every workload's shares. It is offered to the
+    /// principal the resource was shared WITH, so an invitation addressed to anyone else
+    /// is not this principal's to answer and resolves to nothing — the same `None` as an
+    /// id no share carries, so neither discloses the other.
+    pub fn workload_share_by_invitation_mut(
+        &mut self,
+        share_invitation_id: &str,
+        principal: &str,
+    ) -> Option<&mut WorkloadShareRecord> {
+        self.workload_shares
+            .values_mut()
+            .flat_map(|shares| shares.values_mut())
+            .find(|share| {
+                share.share_invitation_id == share_invitation_id
+                    && share.shared_with == principal
+            })
     }
 }
 
@@ -3282,6 +3362,38 @@ pub fn workload_share_conflict(existing: &WorkloadShareRecord) -> ConflictExcept
         &format!(
             "The workload with ID {} is already shared with {}.",
             existing.workload_id, existing.shared_with
+        ),
+    )
+}
+
+/// [`resource_not_found`] for a `ShareInvitationId` that names no invitation this
+/// principal has been offered — none is recorded under it, or the one that is was
+/// offered to another principal.
+///
+/// The `ResourceId` is the id AS SENT, which is how the request named the invitation.
+pub fn share_invitation_not_found(share_invitation_id: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        SHARE_INVITATION_RESOURCE_TYPE,
+        share_invitation_id.to_string(),
+        &format!("share invitation with ID {share_invitation_id}"),
+    )
+}
+
+/// [`conflict`] for an invitation that is no longer waiting on an answer: the share it
+/// mediates has left [`DEFAULT_SHARE_STATUS`], so the invitation has already been
+/// processed — the modelled `ConflictException`'s own "The resource has already been
+/// processed, was deleted" case. `status` is the `ShareStatus` the share stands in, which
+/// is what tells the caller whether it (or someone else) already answered it.
+pub fn share_invitation_answered_conflict(
+    share_invitation_id: &str,
+    status: &str,
+) -> ConflictException {
+    conflict(
+        SHARE_INVITATION_RESOURCE_TYPE,
+        share_invitation_id.to_string(),
+        &format!(
+            "The share invitation with ID {share_invitation_id} is no longer waiting on an \
+             answer; the share it mediates is {status}."
         ),
     )
 }
