@@ -30,6 +30,13 @@ pub(crate) const PAST_TRANSITION: Duration = Duration::from_millis(900);
 /// The emulated HealthLake service behind the production router.
 pub(crate) struct HealthLake {
     router: MultiServiceRouter,
+    /// The SINGLE shared engine the service was built from — the same store
+    /// every handler reads and writes.
+    ///
+    /// `pub(crate)` so a suite can seed, or read back, a record the operation
+    /// that MINTS it has not been written yet (`tests/all/fhir_export_job_listing.rs`
+    /// seeds export jobs this way), without each suite building its own router.
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl HealthLake {
@@ -37,9 +44,9 @@ impl HealthLake {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(
-            service_com_amazonaws_healthlake_healthlake::EmulatedService::new(engine),
+            service_com_amazonaws_healthlake_healthlake::EmulatedService::new(Arc::clone(&engine)),
         );
-        Self { router }
+        Self { router, engine }
     }
 
     /// Dispatch one awsJson1_0 call, returning the HTTP status and the parsed body.
@@ -1111,9 +1118,9 @@ async fn an_unimplemented_operation_still_answers_501() {
     // that satisfies every modelled constraint it must answer "nobody has
     // written it yet", never an empty success. (`UpdateFHIRDatastore` is NOT in
     // this list any more — it is implemented; see
-    // `control_plane_error_semantics`.)
+    // `control_plane_error_semantics`. Neither is `ListFHIRExportJobs` — see
+    // `fhir_export_job_listing`.)
     let cases = [
-        ("ListFHIRExportJobs", json!({ "DatastoreId": &id })),
         ("ListFHIRImportJobs", json!({ "DatastoreId": &id })),
         (
             "UntagResource",

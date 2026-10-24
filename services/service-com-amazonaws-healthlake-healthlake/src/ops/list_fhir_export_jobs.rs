@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFHIRExportJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFHIRExportJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFHIRExportJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the persisted FHIR export jobs of the data store the request's
+//! required `DatastoreId` names, from [`crate::state`], narrowed by the
+//! `JobName` / `JobStatus` / `SubmittedBefore` / `SubmittedAfter` filter members
+//! and paged by `MaxResults`/`NextToken`. A `DatastoreId` the service holds no
+//! data store for is the modelled `ResourceNotFoundException`, not an empty
+//! page.
+//!
+//! The records come from [`crate::state::ComAmazonawsHealthlakeHealthlakeState::export_jobs`],
+//! the ONE map `StartFHIRExportJob` mints into and `DescribeFHIRExportJob` reads
+//! back, so a job is reported identically by every operation that can see it.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +164,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFHIRExportJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFHIRExportJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFHIRExportJobs"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListFHIRExportJobsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the HealthLake data store registry is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Both records must have caught up with the clock before either is
+        // read: the data store registry, because a store whose retention has
+        // run out is gone along with its jobs, and the job records, because a
+        // job whose transition is already due would otherwise be listed — and
+        // filtered on — under the status it has left.
+        store.settle_lifecycle();
+        store.settle_export_jobs();
+
+        // `DatastoreId` is required, so this listing is always scoped to one
+        // data store; a request naming one the service does not hold is the
+        // `ResourceNotFoundException` the model documents for this operation
+        // ("The requested data store was not found."), stated in this
+        // service's FIXED not-found sentence, never an empty page.
+        if !store.datastores.contains_key(&input.datastore_id) {
+            return Err(ListFHIRExportJobsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let mut matched: Vec<&crate::state::ExportJob> = store
+            .export_jobs
+            .values()
+            .filter(|job| job.datastore_id == input.datastore_id)
+            .filter(|job| matches_request(job, &input))
+            .collect();
+        // A stable total order is what makes paging resumable: oldest
+        // submission first, identifier breaking a tie between two jobs
+        // submitted in one tick. The model documents no order, so this is the
+        // one `ListFHIRDatastores` already pages this service's other resource
+        // in.
+        matched.sort_by(|a, b| {
+            crate::state::epoch_nanos(&a.submitted_at)
+                .cmp(&crate::state::epoch_nanos(&b.submitted_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        // `NextToken` is the identifier of the first entry the next page
+        // returns, so resuming is a lookup in this same order.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => matched
+                .iter()
+                .position(|job| job.id == token)
+                .ok_or_else(|| {
+                    ListFHIRExportJobsError::from(
+                        ListFHIRExportJobsErrorModeled::ValidationException(ValidationException {
+                            message: Some(
+                                "NextToken does not resume a ListFHIRExportJobs page".to_string(),
+                            ),
+                        }),
+                    )
+                })?,
+        };
+        // `MaxResultsInteger` is modelled 1..500, so an absent value pages at
+        // the largest page the model allows. The boundary validator has already
+        // refused a value outside that range — `tests/all/fhir_export_job_listing.rs`
+        // pins 0 and 501 at a 400 `ValidationException` — so the conversion
+        // below is a defensive floor rather than a silent re-reading of the
+        // request: it can only ever see a value in range.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(0)
+            .clamp(1, usize::try_from(MAX_PAGE_SIZE).unwrap_or(usize::MAX));
+
+        let page: Vec<ExportJobProperties> = matched[start..]
+            .iter()
+            .take(page_size)
+            .map(|job| job.properties())
+            .collect();
+        // A token is emitted ONLY when entries remain after this page.
+        let next_token = matched.get(start + page.len()).map(|job| job.id.clone());
+
+        Ok(ListFHIRExportJobsOutput {
+            export_job_properties_list: page,
+            next_token,
+        })
     }
+}
+
+/// The largest page `MaxResultsInteger` allows (modelled range 1..500), which is
+/// also the page size a request that names none gets.
+const MAX_PAGE_SIZE: i32 = 500;
+
+/// Whether `job` satisfies every filter member the request set.
+///
+/// Each member narrows the listing on its own and all of them together:
+/// `JobName` and `JobStatus` match exactly (the model: "limits the response to
+/// the export job with the specified job name" / "with the specified job
+/// status"), and `SubmittedBefore` / `SubmittedAfter` are INCLUSIVE cutoffs on
+/// `SubmitTime` — the same reading `ListFHIRDatastores` gives its own
+/// `CreatedBefore` / `CreatedAfter` pair, so one data store's two listings
+/// cannot disagree about whether a boundary instant is in the window.
+fn matches_request(job: &crate::state::ExportJob, input: &ListFHIRExportJobsInput) -> bool {
+    if let Some(name) = input.job_name.as_deref() {
+        if job.name.as_deref() != Some(name) {
+            return false;
+        }
+    }
+    // The boundary validator has already refused any value outside the modelled
+    // `JobStatus` value set, and a record can only hold a modelled one, so this
+    // is a comparison rather than a second validation.
+    if let Some(status) = input.job_status.as_deref() {
+        if job.status.as_wire() != status {
+            return false;
+        }
+    }
+    let submitted = crate::state::epoch_nanos(&job.submitted_at);
+    if let Some(before) = input.submitted_before.as_ref() {
+        if submitted > crate::state::epoch_nanos(before) {
+            return false;
+        }
+    }
+    if let Some(after) = input.submitted_after.as_ref() {
+        if submitted < crate::state::epoch_nanos(after) {
+            return false;
+        }
+    }
+    true
 }

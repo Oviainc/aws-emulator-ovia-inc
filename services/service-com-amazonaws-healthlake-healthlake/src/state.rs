@@ -15,14 +15,21 @@
 //! The data transformation profile is the second: `CreateDataTransformationProfile`
 //! mints one in DRAFT here and `GetDataTransformationProfile` reads the SAME
 //! record back, version by version.
+//!
+//! The FHIR export job is the third: a job record belongs to the data store it
+//! exports and `ListFHIRExportJobs` reports the records held here, filtered and
+//! paged. `StartFHIRExportJob` is the operation that MINTS one; it is still a
+//! scaffold stub (its own issue), so until it is written the only records in
+//! [`ComAmazonawsHealthlakeHealthlakeState::export_jobs`] are the ones a test
+//! seeds.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
     AnalyticsConfiguration, BackupConfiguration, DatastoreBackupStatus, DatastoreProperties,
-    ErrorCause, IdentityProviderConfiguration, NlpConfiguration, PreloadDataConfig,
-    ProfileConfiguration, SseConfiguration, Tag,
+    ErrorCause, ExportJobProperties, IdentityProviderConfiguration, NlpConfiguration,
+    OutputDataConfig, PreloadDataConfig, ProfileConfiguration, SseConfiguration, Tag,
 };
 
 /// How long after the call that starts it a data store's pending lifecycle
@@ -589,6 +596,137 @@ pub struct RestoreWindow {
     pub latest: ::aws_smithy_types::DateTime,
 }
 
+/// The states a FHIR job moves through, as the modelled `JobStatus` enum names
+/// them on the wire (`JOB_STATUS_VALUES`).
+///
+/// A typed status rather than a stored string: a record can only ever hold a
+/// value the modelled enum declares, so no read can report a status the model
+/// would refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStatus {
+    Submitted,
+    Queued,
+    InProgress,
+    Completed,
+    CompletedWithErrors,
+    Failed,
+    CancelSubmitted,
+    CancelInProgress,
+    CancelCompleted,
+    CancelFailed,
+}
+
+impl JobStatus {
+    /// The modelled enum value this status serializes as.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Submitted => "SUBMITTED",
+            Self::Queued => "QUEUED",
+            Self::InProgress => "IN_PROGRESS",
+            Self::Completed => "COMPLETED",
+            Self::CompletedWithErrors => "COMPLETED_WITH_ERRORS",
+            Self::Failed => "FAILED",
+            Self::CancelSubmitted => "CANCEL_SUBMITTED",
+            Self::CancelInProgress => "CANCEL_IN_PROGRESS",
+            Self::CancelCompleted => "CANCEL_COMPLETED",
+            Self::CancelFailed => "CANCEL_FAILED",
+        }
+    }
+
+    /// Whether this is a status a job never leaves.
+    ///
+    /// What makes it matter is `ExportJobProperties$EndTime` — "the time the
+    /// export job completed" — which is owed exactly once, when the job reaches
+    /// one of these and not while it is still moving.
+    pub fn is_terminal(self) -> bool {
+        match self {
+            Self::Completed
+            | Self::CompletedWithErrors
+            | Self::Failed
+            | Self::CancelCompleted
+            | Self::CancelFailed => true,
+            Self::Submitted
+            | Self::Queued
+            | Self::InProgress
+            | Self::CancelSubmitted
+            | Self::CancelInProgress => false,
+        }
+    }
+}
+
+/// One persisted FHIR export job: what the request that started it asked for,
+/// plus the identifier and the status the service owns.
+///
+/// Held in ONE map beside the data store registry rather than on the data store
+/// record, because a job is addressed by its own `JobId`; the data store it
+/// belongs to is a field, and the state's own `forget_export_jobs_for` drops a
+/// data store's jobs with the data store, so a job never outlives it.
+#[derive(Debug, Clone)]
+pub struct ExportJob {
+    /// The `JobId` the service minted for this job.
+    pub id: String,
+    /// The `DatastoreId` the job exports from.
+    pub datastore_id: String,
+    /// The `JobName` the request carried, if any.
+    pub name: Option<String>,
+    pub status: JobStatus,
+    /// The next transition the clock owes this job, as `(due instant, next
+    /// status)`. `None` when the job is not waiting on the clock. A job that
+    /// moves through several statuses re-arms this as each one falls due, so
+    /// one slot carries one step.
+    pub pending: Option<(Instant, JobStatus)>,
+    /// `SubmitTime`: the instant the job was started.
+    pub submitted_at: ::aws_smithy_types::DateTime,
+    /// `EndTime`: the instant the job reached a terminal status, written ONCE
+    /// by [`ExportJob::settle`] so two reads of a finished job cannot differ.
+    pub ended_at: Option<::aws_smithy_types::DateTime>,
+    /// The `OutputDataConfig` the request supplied, reported back verbatim.
+    pub output_data_config: OutputDataConfig,
+    /// The `DataAccessRoleArn` the request supplied.
+    pub data_access_role_arn: Option<String>,
+    /// `Message`: why the job ended as it did, when there is anything to say.
+    pub message: Option<String>,
+}
+
+impl ExportJob {
+    /// This record as the modelled `ExportJobProperties`, the one shape
+    /// `DescribeFHIRExportJob` and `ListFHIRExportJobs` both report.
+    pub fn properties(&self) -> ExportJobProperties {
+        ExportJobProperties {
+            job_id: self.id.clone(),
+            job_name: self.name.clone(),
+            job_status: self.status.as_wire().to_string(),
+            submit_time: self.submitted_at,
+            end_time: self.ended_at,
+            datastore_id: self.datastore_id.clone(),
+            output_data_config: self.output_data_config.clone(),
+            data_access_role_arn: self.data_access_role_arn.clone(),
+            message: self.message.clone(),
+        }
+    }
+
+    /// Materialise the transition the clock has ALREADY made due on this job.
+    ///
+    /// The transition was owed at `now` whether or not anybody called, so a
+    /// reporting operation applying it is the record catching up with the clock
+    /// rather than a read with a side effect.
+    fn settle(&mut self, now: Instant) {
+        let Some((due, next)) = self.pending else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.status = next;
+        self.pending = None;
+        // `EndTime` is owed once, by the step that reaches a status the job
+        // never leaves, and is then stored — never re-derived per read.
+        if next.is_terminal() && self.ended_at.is_none() {
+            self.ended_at = Some(::aws_smithy_types::DateTime::from(SystemTime::now()));
+        }
+    }
+}
+
 /// What one `CreateFHIRDatastore` `ClientToken` recorded: the data store it
 /// minted, and a fingerprint of the request that minted it, so a token reused
 /// with a DIFFERENT request is refused instead of silently answering with the
@@ -787,6 +925,11 @@ pub struct ComAmazonawsHealthlakeHealthlakeState {
     /// How many profiles have been minted, mixed into the next identifier so two
     /// creates in the same clock tick still get distinct ones.
     pub profiles_created: u64,
+    /// Every FHIR export job, by `JobId`. A `BTreeMap` so
+    /// `ListFHIRExportJobs` pages in a stable, resumable order. A job's record
+    /// is dropped with the data store it belongs to, by this state's own
+    /// `forget_export_jobs_for`.
+    pub export_jobs: BTreeMap<String, ExportJob>,
 }
 
 impl ComAmazonawsHealthlakeHealthlakeState {
@@ -842,6 +985,7 @@ impl ComAmazonawsHealthlakeHealthlakeState {
         for id in reaped {
             self.datastores.remove(&id);
             self.forget_client_tokens_for(&id);
+            self.forget_export_jobs_for(&id);
         }
     }
 
@@ -858,7 +1002,31 @@ impl ComAmazonawsHealthlakeHealthlakeState {
         for id in reaped {
             self.datastores.remove(&id);
             self.forget_client_tokens_for(&id);
+            self.forget_export_jobs_for(&id);
         }
+    }
+
+    /// Materialise every export job transition the clock has ALREADY made due.
+    ///
+    /// The companion of [`Self::settle_lifecycle`] for the job records: called
+    /// by the operations that REPORT a job's status as well as by any that
+    /// change it, because the transition was owed at this instant whether or
+    /// not anybody called. The walk is over the job records the store holds;
+    /// the ceiling on how many of those there can be belongs with the operation
+    /// that MINTS them (`StartFHIRExportJob`, still a scaffold stub), which is
+    /// the only place a job count can be refused, so none is asserted here.
+    pub fn settle_export_jobs(&mut self) {
+        let now = Instant::now();
+        for job in self.export_jobs.values_mut() {
+            job.settle(now);
+        }
+    }
+
+    /// Drop every export job of `datastore_id`, so a job never outlives the
+    /// data store it exported from.
+    fn forget_export_jobs_for(&mut self, datastore_id: &str) {
+        self.export_jobs
+            .retain(|_, job| job.datastore_id != datastore_id);
     }
 
     /// Record `token` as having minted `datastore_id` from a request with
