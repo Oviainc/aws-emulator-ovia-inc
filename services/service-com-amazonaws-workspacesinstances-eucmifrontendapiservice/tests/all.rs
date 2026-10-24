@@ -21,6 +21,8 @@ mod region_catalog;
 mod state_roundtrip;
 #[path = "all/validation_messages.rs"]
 mod validation_messages;
+#[path = "all/volume_configuration_validation.rs"]
+mod volume_configuration_validation;
 #[path = "all/volume_lifecycle.rs"]
 mod volume_lifecycle;
 #[path = "all/wire_error_responses.rs"]

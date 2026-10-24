@@ -176,15 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                reports every supported Region in one response and returns \
                                no pagination token";
             return Err(ListRegionsErrorModeled::ValidationException(
-                ValidationException {
-                    message: WHY.to_string(),
-                    reason: "FIELD_VALIDATION_FAILED".to_string(),
-                    field_list: Some(vec![ValidationExceptionField {
-                        name: "NextToken".to_string(),
-                        reason: "FIELD_VALIDATION_FAILED".to_string(),
-                        message: WHY.to_string(),
-                    }]),
-                },
+                crate::state::field_validation_failed("NextToken", WHY),
             )
             .into());
         }

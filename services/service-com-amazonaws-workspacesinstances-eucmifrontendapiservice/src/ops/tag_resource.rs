@@ -177,15 +177,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the request would leave the WorkSpace Instance holding more than the {} tags a resource can hold",
                 crate::state::MAX_TAGS_PER_INSTANCE
             );
-            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
-                message: why.clone(),
-                reason: "FIELD_VALIDATION_FAILED".to_string(),
-                field_list: Some(vec![ValidationExceptionField {
-                    name: "Tags".to_string(),
-                    reason: "FIELD_VALIDATION_FAILED".to_string(),
-                    message: why,
-                }]),
-            })
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::field_validation_failed("Tags", why),
+            )
             .into());
         }
         record.tags = merged;

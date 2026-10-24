@@ -991,6 +991,201 @@ pub const SUPPORTED_REGIONS: &[&str] = &[
     "us-west-2",
 ];
 
+/// The Region a request belongs to when it carries no SigV4 credential scope to read
+/// one from: the Region every emulator defaults to (`::engine::emulator_arn`, whose
+/// doc gives `us-east-1` as that default).
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// Whether `candidate` is shaped like an AWS Region name: `Region$RegionName`'s
+/// `^[-0-9a-z]{1,31}$` (`smithy_query(query="shape",shape="Region")`).
+///
+/// The model constrains the Region names this service REPORTS; this is the same test
+/// applied to a Region name the service reads out of a request's credential scope,
+/// which no boundary validator sees.
+pub fn is_modelled_region_name(candidate: &str) -> bool {
+    (1..=31).contains(&candidate.len())
+        && candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// The Region this request was signed for, from its SigV4 credential scope;
+/// [`DEFAULT_REGION`] when it carries none.
+///
+/// A regional resource belongs to the Region its create call was signed for, so this
+/// is where the Region comes from — never from a request member. The scope is
+/// caller-controlled text that is rendered into Availability Zone names, so a value
+/// that is not shaped like a Region name at all ([`is_modelled_region_name`]) names no
+/// Region and the default is used instead.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| is_modelled_region_name(region))
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The letters an AWS Region's Availability Zones are named with.
+///
+/// A zone's name is its Region's name followed by a letter, counting from `a`
+/// (`us-east-1a`). WHICH zones the account has is a fact of the account's Region
+/// rather than of this service, so the set is the one this emulator models
+/// everywhere: `services/common/src/network.rs` states the account-network contract
+/// as "a Region's default subnets sit one per Availability Zone, in the zones named
+/// `<region>a`, `<region>b`, `<region>c`", and the EC2 service derives exactly those
+/// three zones for a Region. A client that asks EC2 which zones a Region has and then
+/// creates a volume here must see one set of zones, not two.
+pub const AVAILABILITY_ZONE_LETTERS: [char; 3] = ['a', 'b', 'c'];
+
+/// The Availability Zone names Region `region` has: `<region><letter>`, one per
+/// [`AVAILABILITY_ZONE_LETTERS`].
+///
+/// Derived rather than stored: no operation of this service creates, changes or
+/// deletes an Availability Zone, so two emulators built from this source place a
+/// volume in the same zones and reading the set changes nothing.
+pub fn availability_zones_in_region(region: &str) -> Vec<String> {
+    AVAILABILITY_ZONE_LETTERS
+        .iter()
+        .map(|letter| format!("{region}{letter}"))
+        .collect()
+}
+
+/// The volume type a `CreateVolume` that names none creates.
+///
+/// "Default: gp2" (Amazon EBS `CreateVolume$VolumeType`). This service's own model
+/// documents no default for its `CreateVolumeRequest$VolumeType`, and what the call
+/// creates IS an Amazon EBS volume, so the backing service's default is the one that
+/// applies — and the type the per-type rules below are then read for.
+pub const DEFAULT_VOLUME_TYPE: &str = "gp2";
+
+/// The `SizeInGB` range this service's model admits at all: `VolumeSizeInGB`'s
+/// `range 1..16384` (`smithy_query(query="shape",shape="VolumeSizeInGB")`).
+///
+/// The boundary validator refuses anything outside it before a handler runs, so a
+/// per-type range is only ever applied INSIDE this one — see
+/// [`VolumeTypeSpec::size_range`].
+pub const MODELLED_VOLUME_SIZE_RANGE: (i32, i32) = (1, 16_384);
+
+/// What ONE Amazon EBS volume type accepts: the size range AWS publishes for it, the
+/// provisioned-IOPS range (and whether IOPS are required), and the throughput range.
+///
+/// `None` means the type takes that member at all: a volume type that provisions no
+/// IOPS is one `Iops` must be omitted for, not one with a wide range.
+#[derive(Debug, Clone, Copy)]
+pub struct VolumeTypeSpec {
+    /// A `VolumeTypeEnum` value (`crate::ops::types::VOLUME_TYPE_ENUM_VALUES`).
+    pub volume_type: &'static str,
+    /// The size range AWS publishes for the type, in GiB, as `(min, max)`.
+    pub published_size_gib: (i32, i32),
+    /// The provisioned-IOPS range the type accepts, or `None` for a type that
+    /// provisions none.
+    pub iops: Option<(i32, i32)>,
+    /// Whether a create of this type must name `Iops`.
+    pub iops_required: bool,
+    /// The throughput range the type accepts, in MiB/s, or `None` for a type whose
+    /// throughput is not configurable.
+    pub throughput_mib: Option<(i32, i32)>,
+}
+
+impl VolumeTypeSpec {
+    /// The size range a request may name for this type HERE: the published range
+    /// narrowed to what the model can carry ([`MODELLED_VOLUME_SIZE_RANGE`]).
+    ///
+    /// `gp3` and `io2` are published up to 65,536 GiB, which `SizeInGB` (`range
+    /// 1..16384`) cannot express, so the model's ceiling is the effective one for
+    /// them; the per-type MINIMUM is above the model's floor for `io1`, `io2`, `st1`
+    /// and `sc1`, so it is the effective one there.
+    pub fn size_range(&self) -> (i32, i32) {
+        let (model_min, model_max) = MODELLED_VOLUME_SIZE_RANGE;
+        (
+            self.published_size_gib.0.max(model_min),
+            self.published_size_gib.1.min(model_max),
+        )
+    }
+}
+
+/// Every volume type this service provisions, and what each one accepts.
+///
+/// These are the configuration rules of the BACKING Amazon EBS volume service, which
+/// this service's model cannot express (`Iops` and `Throughput` are plain
+/// `NonNegativeInteger`s and `SizeInGB` one range for every type), so they are the
+/// handler's to apply. SOURCE: the Amazon EBS `CreateVolume` reference —
+///
+/// * `Size`: "Valid sizes: gp2: 1 - 16,384 GiB; gp3: 1 - 65,536 GiB; io1: 4 - 16,384
+///   GiB; io2: 4 - 65,536 GiB; st1 and sc1: 125 - 16,384 GiB; standard: 1 - 1024 GiB";
+/// * `Iops`: "Required for io1 and io2 volumes. Optional for gp3 volumes. Omit for all
+///   other volume types. Valid ranges: gp3: 3,000 - 80,000 IOPS; io1: 100 - 64,000
+///   IOPS; io2: 100 - 256,000 IOPS";
+/// * `Throughput`: "Supported for gp3 volumes only. Omit for all other volume types.
+///   Valid Range: 125 - 2000 MiB/s".
+///
+/// The published table is the same one the EC2 service crate models for its own
+/// `CreateVolume` (`VOLUME_SIZE_RANGES` / `VOLUME_IOPS_RANGES` there): it is a fact of
+/// Amazon EBS, so the two must stay the values above rather than diverge.
+///
+/// Every value of the modelled `VolumeTypeEnum`
+/// (`crate::ops::types::VOLUME_TYPE_ENUM_VALUES`) appears exactly once, so no admitted
+/// type is left without rules.
+pub const VOLUME_TYPE_SPECS: [VolumeTypeSpec; 7] = [
+    VolumeTypeSpec {
+        volume_type: "gp2",
+        published_size_gib: (1, 16_384),
+        iops: None,
+        iops_required: false,
+        throughput_mib: None,
+    },
+    VolumeTypeSpec {
+        volume_type: "gp3",
+        published_size_gib: (1, 65_536),
+        iops: Some((3_000, 80_000)),
+        iops_required: false,
+        throughput_mib: Some((125, 2_000)),
+    },
+    VolumeTypeSpec {
+        volume_type: "io1",
+        published_size_gib: (4, 16_384),
+        iops: Some((100, 64_000)),
+        iops_required: true,
+        throughput_mib: None,
+    },
+    VolumeTypeSpec {
+        volume_type: "io2",
+        published_size_gib: (4, 65_536),
+        iops: Some((100, 256_000)),
+        iops_required: true,
+        throughput_mib: None,
+    },
+    VolumeTypeSpec {
+        volume_type: "sc1",
+        published_size_gib: (125, 16_384),
+        iops: None,
+        iops_required: false,
+        throughput_mib: None,
+    },
+    VolumeTypeSpec {
+        volume_type: "st1",
+        published_size_gib: (125, 16_384),
+        iops: None,
+        iops_required: false,
+        throughput_mib: None,
+    },
+    VolumeTypeSpec {
+        volume_type: "standard",
+        published_size_gib: (1, 1_024),
+        iops: None,
+        iops_required: false,
+        throughput_mib: None,
+    },
+];
+
+/// The rules [`VOLUME_TYPE_SPECS`] carries for `volume_type`, or `None` for a type
+/// this service has no rules for — which the modelled enum cannot admit, so a `None`
+/// here means the model and the table have drifted.
+pub fn volume_type_spec(volume_type: &str) -> Option<&'static VolumeTypeSpec> {
+    VOLUME_TYPE_SPECS
+        .iter()
+        .find(|spec| spec.volume_type == volume_type)
+}
+
 /// One WorkSpace Instance, as created by `CreateWorkspaceInstance`.
 #[derive(Debug, Clone)]
 pub struct WorkspaceInstanceRecord {
@@ -1225,14 +1420,31 @@ pub fn decode_next_token(token: &str) -> Option<String> {
 /// whichever list produced it. `Reason` is the modelled enum value for a single bad
 /// member, and `FieldList` names that member.
 pub fn invalid_next_token() -> ValidationException {
-    const WHY: &str = "NextToken is not a token this service issued";
+    field_validation_failed("NextToken", "NextToken is not a token this service issued")
+}
+
+/// The modelled `ValidationException` (HTTP 400) for ONE member of a request this
+/// service cannot act on.
+///
+/// The ONE place this shape is built for a bad member, so every refusal of this
+/// service carries the same structure: `Reason` is the modelled single-member reason
+/// [`VALIDATION_REASON_FIELD_VALIDATION_FAILED`], `FieldList` names the member, and
+/// the field's `Message` is the overall `Message` — one wording, in both places a
+/// client reads.
+///
+/// `why` names the member and the constraint it violated and NONE of what the caller
+/// sent: this service does not reflect request values back into an error body (see
+/// [`INSTANCE_NOT_FOUND_MESSAGE`]), which is why the refusal renderer in
+/// `crate::service` states a boundary violation the same way.
+pub fn field_validation_failed(name: &str, why: impl Into<String>) -> ValidationException {
+    let why = why.into();
     ValidationException {
-        message: WHY.to_string(),
+        message: why.clone(),
         reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
         field_list: Some(vec![ValidationExceptionField {
-            name: "NextToken".to_string(),
+            name: name.to_string(),
             reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
-            message: WHY.to_string(),
+            message: why,
         }]),
     }
 }
