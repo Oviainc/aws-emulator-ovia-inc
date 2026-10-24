@@ -44,7 +44,7 @@ const ACCOUNT_C: &str = "999988887777";
 
 /// Seed `requests` as the pending aggregation requests this account holds, reaching the
 /// store the way a handler does.
-fn seed(emulator: &Emulator, requests: &[(String, String)]) {
+pub(crate) fn seed(emulator: &Emulator, requests: &[(String, String)]) {
     let state = service_state(&*emulator.engine).expect("the test engine is the shared engine");
     let mut store = state.lock();
     for (account, region) in requests {

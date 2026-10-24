@@ -253,6 +253,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The tag set the new connection would carry, judged by the one rule every
+        // writer of a connection's tags uses: each entry inside the lengths the model
+        // gives `TagKey` and `TagValue`, and no more entries than a resource holds.
+        // A resource created with tags is therefore bounded the same way one tagged
+        // later is, so neither path can store a set the other would refuse.
+        if let Some(message) = input
+            .tags
+            .as_ref()
+            .and_then(|tags| crate::state::tag_write_violation(None, tags))
+        {
+            return Err(CreateConnectionErrorModeled::InterconnectValidationException(
+                InterconnectValidationException { message },
+            )
+            .into());
+        }
+
         // The account's connection quota, which counts the connections the account
         // HOLDS: a quota is about live resources, so a record already in the
         // terminal `deleted` state does not consume it, even though the store keeps

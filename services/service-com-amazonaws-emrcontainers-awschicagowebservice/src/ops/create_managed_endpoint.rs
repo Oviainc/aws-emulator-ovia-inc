@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateManagedEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateManagedEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a managed endpoint in a virtual cluster this store HOLDS and persists it in
+//! [`crate::state`]: a fresh `ResourceIdString` id, the `EndpointArn` built from it,
+//! `createdAt = now` and every member the request carried, so `DescribeManagedEndpoint`
+//! and `ListManagedEndpoints` read it back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateManagedEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An endpoint is provisioned rather than instant, so it is accepted `CREATING` and
+//! reaches `ACTIVE` on the clock ([`crate::state::TRANSITION_SPAN`]).
+//!
+//! `clientToken` is `@idempotencyToken`, so a token already spent on this operation in
+//! this cluster does NOT mint a second endpoint: the same request replayed answers with
+//! the endpoint the first call minted.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +171,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateManagedEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateManagedEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateManagedEndpoint"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateManagedEndpointError::Modeled(
+                CreateManagedEndpointErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the managed endpoint store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let region = crate::state::request_region(ctx);
+        let scope = crate::state::create_managed_endpoint_scope(&input.virtual_cluster_id);
+        let mut state = store.lock();
+        state.settle();
+
+        // A managed endpoint is a gateway INTO a virtual cluster, so the cluster is
+        // resolved out of state first: one that was never created, or one that is no
+        // longer RUNNING because it was deleted, cannot host an endpoint.
+        let cluster_running = state
+            .virtual_clusters
+            .get(&input.virtual_cluster_id)
+            .is_some_and(|cluster| cluster.state == crate::state::CLUSTER_RUNNING);
+        if !cluster_running {
+            return Err(CreateManagedEndpointErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Virtual cluster {} is not available to host a managed endpoint",
+                        input.virtual_cluster_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `clientToken` is `@idempotencyToken`: the same token replayed names the endpoint
+        // the first call minted rather than provisioning a second gateway.
+        let replayed = state
+            .replayed_idempotency(&scope, &input.client_token)
+            .cloned();
+        if let Some(existing) = replayed.and_then(|id| state.managed_endpoints.get(&id)) {
+            return Ok(CreateManagedEndpointOutput {
+                id: Some(existing.id.clone()),
+                name: Some(existing.name.clone()),
+                arn: Some(existing.arn.clone()),
+                virtual_cluster_id: Some(existing.virtual_cluster_id.clone()),
+            });
+        }
+
+        // The store is capped, and an endpoint that has been torn down is reclaimed to
+        // make room. Once every slot holds a live endpoint there is nothing to reclaim and
+        // the create is refused instead of growing the store without bound. The cap is the
+        // EMULATOR's own retention bound, not an AWS quota, so a test that drives the
+        // store to capacity sees an emulator-only condition reported through the client
+        // error this operation models for a request it cannot answer.
+        if !state.reserve_managed_endpoint() {
+            return Err(CreateManagedEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "This emulator retains at most {} managed endpoints; delete one and retry",
+                        crate::state::MAX_MANAGED_ENDPOINTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.mint_id();
+        let sequence = state.id_counter;
+        let arn = crate::state::managed_endpoint_arn(&region, &input.virtual_cluster_id, &id);
+        let record = crate::state::ManagedEndpointRecord {
+            id: id.clone(),
+            name: input.name.clone(),
+            virtual_cluster_id: input.virtual_cluster_id.clone(),
+            arn: arn.clone(),
+            endpoint_type: input.r#type,
+            // An endpoint is provisioned, so it is accepted CREATING and reaches ACTIVE on
+            // the clock: a caller that reads straight back sees the transient state, as it
+            // would against AWS.
+            state: crate::state::ENDPOINT_CREATING.to_string(),
+            release_label: input.release_label,
+            execution_role_arn: input.execution_role_arn,
+            // Persisted as submitted: the member is deprecated and this emulator resolves
+            // nothing against ACM.
+            certificate_arn: input.certificate_arn,
+            configuration_overrides: input.configuration_overrides,
+            session_idle_timeout_in_minutes: input.session_idle_timeout_in_minutes,
+            created_at_millis: crate::state::now_millis(),
+            tags: input.tags.unwrap_or_default(),
+            client_token: input.client_token,
+            sequence,
+            pending: Some(crate::state::PendingTransition::due(
+                crate::state::ENDPOINT_ACTIVE,
+            )),
+        };
+        // `insert_managed_endpoint` is what writes the per-cluster index entry and the
+        // `(CreateManagedEndpoint:{cluster}, clientToken) -> id` entry the replay lookup
+        // above reads, in this same lock, so a record can never be stored without them.
+        state.insert_managed_endpoint(record);
+
+        Ok(CreateManagedEndpointOutput {
+            id: Some(id),
+            name: Some(input.name),
+            arn: Some(arn),
+            virtual_cluster_id: Some(input.virtual_cluster_id),
+        })
     }
 }

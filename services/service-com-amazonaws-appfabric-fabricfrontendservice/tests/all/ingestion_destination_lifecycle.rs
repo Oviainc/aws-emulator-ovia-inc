@@ -338,8 +338,6 @@ fn firehose_destination(stream: &str) -> Value {
 /// enum members.
 #[tokio::test]
 async fn an_update_replaces_the_destination_configuration_and_persists_it() {
-    let emulator = Emulator::new();
-
     // (case, processingConfiguration, created destinationConfiguration, updated one)
     let cases: Vec<(&str, Value, Value, Value)> = vec![
         (
@@ -393,6 +391,9 @@ async fn an_update_replaces_the_destination_configuration_and_persists_it() {
     ];
 
     for (case, processing_configuration, created_destination, updated_destination) in cases {
+        // A fresh store per row: a Region holds one app bundle, and every row
+        // sets up its own.
+        let emulator = Emulator::new();
         let (bundle, ingestion) = emulator.bundle_with_ingestion().await;
         let created = emulator
             .create_destination(
@@ -491,8 +492,6 @@ async fn an_update_replaces_the_destination_configuration_and_persists_it() {
 /// the bundle, the ingestion and the destination.
 #[tokio::test]
 async fn an_update_resolves_every_identifier_in_either_form() {
-    let emulator = Emulator::new();
-
     // (case, how to name the bundle, the ingestion, the destination)
     let forms: Vec<(&str, bool, bool, bool)> = vec![
         ("all ARNs", true, true, true),
@@ -503,6 +502,8 @@ async fn an_update_resolves_every_identifier_in_either_form() {
     ];
 
     for (case, bundle_as_arn, ingestion_as_arn, destination_as_arn) in forms {
+        // A fresh store per row: a Region holds one app bundle.
+        let emulator = Emulator::new();
         let (bundle_arn, ingestion_arn) = emulator.bundle_with_ingestion().await;
         let created = emulator
             .create_destination(
@@ -991,8 +992,6 @@ fn numbered_destination(index: usize) -> Value {
 /// form names each of the three levels.
 #[tokio::test]
 async fn a_delete_removes_exactly_the_named_destination() {
-    let emulator = Emulator::new();
-
     // (case, destinations held, index deleted, bundle as ARN?, ingestion as
     //  ARN?, destination as ARN?)
     let cases: Vec<(&str, usize, usize, bool, bool, bool)> = vec![
@@ -1047,6 +1046,8 @@ async fn a_delete_removes_exactly_the_named_destination() {
     ];
 
     for (case, held, deleted_index, bundle_as_arn, ingestion_as_arn, destination_as_arn) in cases {
+        // A fresh store per row: a Region holds one app bundle.
+        let emulator = Emulator::new();
         let (bundle_arn, ingestion_arn) = emulator.bundle_with_ingestion().await;
         let mut destinations: Vec<String> = Vec::new();
         for index in 0..held {

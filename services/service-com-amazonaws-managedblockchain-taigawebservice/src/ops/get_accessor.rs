@@ -148,7 +148,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // materialising the status transitions the clock already owed elsewhere in the
         // store. An accessor itself has none — `AccessorStatus` declares no creating
         // state — so this reports exactly what the create persisted.
-        let _ = ctx;
+        //
+        // The Region this request is addressed to, read off its own credential scope: an
+        // accessor belongs to the Region its `CreateAccessor` was signed for, so the
+        // lookup below is scoped to it.
+        let region = crate::state::request_region(ctx);
 
         // An `AccessorId` outside the accessor-id space is an id this service could never
         // have issued, so it is a request to FIX rather than a resource to look up: it is
@@ -173,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());
 
-        let Some(accessor) = guard.accessors.get(&input.accessor_id) else {
+        let Some(accessor) = guard.accessor(&region, &input.accessor_id) else {
             return Err(GetAccessorErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_ACCESSOR, &input.accessor_id),
             )

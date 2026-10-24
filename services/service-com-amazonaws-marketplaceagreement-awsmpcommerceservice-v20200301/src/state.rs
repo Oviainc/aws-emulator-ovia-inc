@@ -1483,27 +1483,31 @@ impl PaymentRequest {
     }
 }
 
-/// Whether the caller is the `party_type` party of `request`.
+/// Whether the caller is the `party_type` party of a request a SELLER submitted
+/// under an agreement — a payment request ([`PaymentRequest`]) or a cancellation
+/// request ([`AgreementCancellationRequest`]).
 ///
-/// `ListAgreementPaymentRequestsInput$partyType` states the two roles: "Use
-/// `Proposer` to list payment requests where you are the seller, or `Acceptor`
-/// to list payment requests where you are the buyer." The buyer is the acceptor
-/// of the agreement the request was sent for, which [`caller_is_party`] decides
-/// — so `agreement` is the stored agreement `request.agreement_id` names, and a
-/// request whose agreement is gone has no buyer to match. The seller is the
-/// account that submitted the payment request, which this service DOES record
-/// (`SendAgreementPaymentRequest` is the seller's own call), unlike the proposer
-/// of an agreement.
+/// A `partyType` states the two roles the same way for both listings: "Use
+/// `Proposer` to list … where you are the seller, or `Acceptor` to list … where
+/// you are the buyer." The seller is the account that SUBMITTED the request,
+/// which this service records for every seller-submitted request
+/// (`SendAgreementPaymentRequest` and `SendAgreementCancellationRequest` are
+/// both documented as the seller's own call) — so `proposer_account_id` is the
+/// account the submitting call recorded on the request, not the proposer of an
+/// agreement, which this service never learns. The buyer is the acceptor of the
+/// agreement the request was sent under, which [`caller_is_party`] decides — so
+/// `agreement` is the stored agreement the request's `agreement_id` names, and a
+/// request whose agreement is gone has no buyer to match.
 ///
 /// A `party_type` that is neither value matches nothing; the handler refuses it
 /// before any request is scanned.
-pub fn payment_request_party_matches(
-    request: &PaymentRequest,
+pub fn submitted_request_party_matches(
+    proposer_account_id: &str,
     agreement: Option<&Agreement>,
     party_type: &str,
 ) -> bool {
     match party_type {
-        PARTY_TYPE_PROPOSER => request.proposer_account_id == ::engine::emulator_account_id(),
+        PARTY_TYPE_PROPOSER => proposer_account_id == ::engine::emulator_account_id(),
         PARTY_TYPE_ACCEPTOR => {
             agreement.is_some_and(|agreement| caller_is_party(agreement, PARTY_TYPE_ACCEPTOR))
         }
@@ -1523,8 +1527,9 @@ pub fn payment_request_party_matches(
 /// nothing; a handler refuses it where it is a request member, with
 /// [`validation_exception`] and the modelled `INVALID_PARTY_TYPE` reason.
 ///
-/// Shared by `SearchAgreements`' `PartyType` filter and by every operation that
-/// takes a `partyType` of its own.
+/// Shared by `SearchAgreements`' `PartyType` filter and by the acceptor side of
+/// [`submitted_request_party_matches`], which is how every listing of
+/// seller-submitted requests resolves its buyer.
 pub fn caller_is_party(agreement: &Agreement, party_type: &str) -> bool {
     let caller = Some(::engine::emulator_account_id());
     match party_type {
@@ -1561,6 +1566,12 @@ pub struct AgreementCancellationRequest {
     pub reason_code: String,
     /// The optional free-text reason the create call carried.
     pub description: Option<String>,
+    /// The account that submitted the request, which is its proposer: "Allows
+    /// sellers (proposers) to submit a cancellation request for an active
+    /// agreement". It is what [`submitted_request_party_matches`] resolves the
+    /// seller side of a `partyType` against, exactly as the sibling
+    /// [`PaymentRequest::proposer_account_id`] does.
+    pub proposer_account_id: String,
     /// The `clientToken` the create call carried, if any.
     pub client_token: Option<String>,
     pub created_at: SystemTime,

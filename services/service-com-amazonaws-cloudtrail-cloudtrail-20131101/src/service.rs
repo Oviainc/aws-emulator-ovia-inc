@@ -75,6 +75,15 @@ const INVALID_TAG_PARAMETER_EXCEPTION: &str = "InvalidTagParameterException";
 /// The HTTP status that shape's `@httpError` declares.
 const INVALID_TAG_PARAMETER_EXCEPTION_STATUS: u16 = 400;
 
+/// The error code this service refuses a `MaxResults` outside its modelled range
+/// with: the shape `com.amazonaws.cloudtrail#InvalidMaxResultsException`, "thrown if
+/// the limit specified is not valid"
+/// (`smithy_query(query="shape", shape="InvalidMaxResultsException")`).
+const INVALID_MAX_RESULTS_EXCEPTION: &str = "InvalidMaxResultsException";
+
+/// The HTTP status that shape's `@httpError` declares.
+const INVALID_MAX_RESULTS_EXCEPTION_STATUS: u16 = 400;
+
 /// The member path of `LookupEventsRequest$EventCategory`, as the framework spells a
 /// member path (lowerCamel, dotted from the request's root). The match is on the WHOLE
 /// path, not its last segment: `AggregationConfiguration` carries an `EventCategory`
@@ -287,6 +296,45 @@ fn invalid_tag_parameter(violations: &[Violation]) -> Option<Refused> {
     })
 }
 
+/// How CloudTrail states a `MaxResults` that broke its modelled `@range`, or `None`
+/// for a violation that is not that member's bound.
+///
+/// A paged operation whose model declares `InvalidMaxResultsException` does not answer
+/// a limit outside its range with the framework's generic `ValidationException`: the
+/// shape's own doc is "this exception is thrown if the limit specified is not valid",
+/// and `ValidationException` is not an error those operations declare, so a client
+/// catching the modelled error would miss the refusal altogether. The message is built
+/// from the request — the member and the bound it broke, the bound read off the
+/// violation so the sentence cannot drift from the model's range.
+///
+/// Only a page-size member is read here ([`PAGE_SIZE_MEMBERS`]): a page size is the
+/// one value this error speaks for, and the operations it is wired to are exactly
+/// those whose model declares the shape.
+fn max_results_refusal(violation: &Violation) -> Option<String> {
+    if !PAGE_SIZE_MEMBERS.contains(&violation.path.as_str()) {
+        return None;
+    }
+    let bound = match &violation.kind {
+        ViolationKind::MinValue(min) => format!("greater than or equal to {min}"),
+        ViolationKind::MaxValue(max) => format!("less than or equal to {max}"),
+        // Every other class is not a limit outside its range, so it is not what this
+        // shape speaks for and keeps the framework's own refusal.
+        _ => return None,
+    };
+    Some(format!(
+        "The limit at '{}' is not valid: it must have value {bound}.",
+        violation.path
+    ))
+}
+
+/// How the validating walk spells the page-size member of a paged operation:
+/// lowerCamel, at the top level of the input. Both spellings the model gives that
+/// member are here — `MaxResults` on the listings, `MaxQueryResults` on
+/// `GetQueryResults` (`smithy_query(query="operation",
+/// operation="GetQueryResults,ListQueries,LookupEvents,ListEventDataStores")`) —
+/// because the error is about the LIMIT, whichever name the operation gives it.
+const PAGE_SIZE_MEMBERS: [&str; 2] = ["maxResults", "maxQueryResults"];
+
 /// Which event-selector member a constraint-violation path walks into, or `None` for a
 /// path that walks into neither.
 ///
@@ -361,12 +409,13 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
 /// `service_common::rpc_target` reads out of an `X-Amz-Target` and the generated table
 /// is keyed by.
 macro_rules! wrap_operations {
-    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+    ($table:expr, $engine:expr, $refusal:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
         $(
             $table.add_operation(
                 stringify!($operation),
                 ::std::boxed::Box::new(InModelledEnvelope::new(
                     crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                    $refusal,
                 )) as ::std::boxed::Box<dyn ErasedOperation>,
             );
         )+
@@ -387,12 +436,28 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         wrap_operations!(
             in_modelled_envelope,
             engine,
+            ModelledRefusal::InvalidTagParameter,
             add_tags::AddTags,
             create_channel::CreateChannel,
             create_dashboard::CreateDashboard,
             create_event_data_store::CreateEventDataStore,
             create_trail::CreateTrail,
             remove_tags::RemoveTags,
+        );
+        // Every operation whose model declares `InvalidMaxResultsException` — the four
+        // paged operations that carry a `MaxResults` AND list that error
+        // (`smithy_query(query="digest")`). A paged operation whose model does NOT
+        // declare it is deliberately absent: its limit keeps the framework's own
+        // refusal, because answering a code its model does not carry would be the
+        // same defect in the other direction.
+        wrap_operations!(
+            in_modelled_envelope,
+            engine,
+            ModelledRefusal::InvalidMaxResults,
+            get_query_results::GetQueryResults,
+            list_event_data_stores::ListEventDataStores,
+            list_queries::ListQueries,
+            lookup_events::LookupEvents,
         );
         Self {
             entry: crate::ServiceDefinition::new(engine),
@@ -429,12 +494,32 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// error.
 struct InModelledEnvelope<O> {
     operation: O,
+    /// Which refusal this operation states in a shape its own model declares.
+    refusal: ModelledRefusal,
+}
+
+/// A refusal that precedes a handler and that CloudTrail answers in a shape the
+/// operation's own model declares, rather than in the framework's generic
+/// `ValidationException`.
+///
+/// One variant per such shape. Which operations each is wired to is stated once, where
+/// they are wrapped in [`EmulatedService::new`]: an operation is wrapped for a variant
+/// only when its model declares that error, so this can never answer a code the
+/// operation does not carry.
+#[derive(Debug, Clone, Copy)]
+enum ModelledRefusal {
+    /// A tag key or value outside the modelled `TagKey` / `TagValue` length — see
+    /// [`tag_length_refusal`].
+    InvalidTagParameter,
+    /// A `MaxResults` outside the modelled range of the operation's page-size member
+    /// — see [`max_results_refusal`].
+    InvalidMaxResults,
 }
 
 impl<O> InModelledEnvelope<O> {
     /// Wrap one operation, already constructed from the shared engine.
-    fn new(operation: O) -> Self {
-        Self { operation }
+    fn new(operation: O, refusal: ModelledRefusal) -> Self {
+        Self { operation, refusal }
     }
 }
 
@@ -452,7 +537,7 @@ where
             // Read the protocol out before the await: `&dyn ErasedServiceDefinition`
             // is not `Sync`, and this future is. The protocol itself is.
             let protocol: &dyn ServerHttpProtocol = svc.definition().protocol();
-            if let Some(refused) = refused_before_handling::<O>(protocol, req) {
+            if let Some(refused) = refused_before_handling::<O>(protocol, req, self.refusal) {
                 return refused;
             }
             self.operation.run(svc, req, ctx).await
@@ -466,12 +551,12 @@ where
     }
 }
 
-/// This service's `InvalidTagParameterException` for `req`, when one of the tags it
-/// carries is outside its modelled length; `None` when every tag is within it, so the
-/// request reaches the handler.
+/// The modelled error `refusal` states for `req`, when the request breaks the rule
+/// that refusal speaks for; `None` when it does not, so the request reaches the
+/// handler.
 ///
 /// `None` also when the request cannot be read at all — a body the codec rejects, or
-/// one missing a required member, carries no tag to hold to its length, and the
+/// one missing a required member, carries no value to hold to its constraint, and the
 /// framework's own walk words that refusal — and when the chosen error cannot be
 /// serialized, which leaves that walk to refuse the request rather than answering with
 /// no reason at all.
@@ -485,23 +570,40 @@ where
 fn refused_before_handling<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
+    refusal: ModelledRefusal,
 ) -> Option<RtResponse> {
     let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
     let input = <O::Input as DeserializableStruct>::deserialize(&mut *deserializer).ok()?;
     drop(deserializer);
-    let message = constraints::validate(&input, O::INPUT_SCHEMA)
-        .iter()
-        .find_map(tag_length_refusal)?;
-    protocol
-        .serialize_error(
-            &crate::ops::types::shared_types::InvalidTagParameterException {
-                message: Some(message),
-            },
-            &crate::ops::types::shared_types::SCHEMA_INVALID_TAG_PARAMETER_EXCEPTION,
-            INVALID_TAG_PARAMETER_EXCEPTION,
-            INVALID_TAG_PARAMETER_EXCEPTION_STATUS,
-        )
-        .ok()
+    let violations = constraints::validate(&input, O::INPUT_SCHEMA);
+    match refusal {
+        ModelledRefusal::InvalidTagParameter => {
+            let message = violations.iter().find_map(tag_length_refusal)?;
+            protocol
+                .serialize_error(
+                    &crate::ops::types::shared_types::InvalidTagParameterException {
+                        message: Some(message),
+                    },
+                    &crate::ops::types::shared_types::SCHEMA_INVALID_TAG_PARAMETER_EXCEPTION,
+                    INVALID_TAG_PARAMETER_EXCEPTION,
+                    INVALID_TAG_PARAMETER_EXCEPTION_STATUS,
+                )
+                .ok()
+        }
+        ModelledRefusal::InvalidMaxResults => {
+            let message = violations.iter().find_map(max_results_refusal)?;
+            protocol
+                .serialize_error(
+                    &crate::ops::types::shared_types::InvalidMaxResultsException {
+                        message: Some(message),
+                    },
+                    &crate::ops::types::shared_types::SCHEMA_INVALID_MAX_RESULTS_EXCEPTION,
+                    INVALID_MAX_RESULTS_EXCEPTION,
+                    INVALID_MAX_RESULTS_EXCEPTION_STATUS,
+                )
+                .ok()
+        }
+    }
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -591,12 +693,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //   ([`value_free_envelope`]). The code stays the one the framework would have
         //   answered — a client branches on the code, so only the wording changes.
         //
-        // NOT reworded: `MaxResults`. A dozen operations carry a `MaxResults` member and
-        // they model DIFFERENT errors for a bad one (`InvalidMaxResultsException`,
-        // `InvalidParameterException`, or none at all), and this seam is not told which
-        // operation was called — so the `@range` clause above stays rather than a code
-        // that would be wrong for most of them. Every other refusal, authentication
-        // included, keeps the framework's wording because every reader declines it.
+        // NOT reworded HERE: a page-size member (`MaxResults` / `MaxQueryResults`). A
+        // dozen operations carry one and they model DIFFERENT errors for a bad limit
+        // (`InvalidMaxResultsException`, `InvalidParameterException`, or none at all),
+        // and this seam is not told which operation was called — so the `@range` clause
+        // above stays here. The operations whose model DOES declare
+        // `InvalidMaxResultsException` answer it through the per-operation seam instead
+        // ([`ModelledRefusal::InvalidMaxResults`], wired in [`InModelledEnvelope`]), which
+        // knows which operation it wraps. Every other refusal, authentication included,
+        // keeps the framework's wording because every reader declines it.
         let Refusal::Invalid(violations) = refusal else {
             return None;
         };

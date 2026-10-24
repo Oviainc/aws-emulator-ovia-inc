@@ -7,7 +7,9 @@
 //! same path a client takes.
 //!
 //! The rule under test: `ListAgreementCancellationRequests` reports the stored
-//! cancellation requests of the agreements the caller is a party to, selected by
+//! cancellation requests the caller is the named party of — the ones it
+//! submitted as the seller, and the ones whose agreement it accepted as the
+//! buyer — selected by
 //! every optional filter the request names against the member of the STORED
 //! record it names, ordered and paged so each request is reported once — and a
 //! `partyType` that names neither documented party is refused with a 400
@@ -418,11 +420,16 @@ async fn every_optional_filter_selects_on_the_stored_member() {
     }
 }
 
-/// A party type selects by the account the agreement records for that side: this
-/// emulator accepts every agreement it stores, so the caller is their acceptor
-/// and never their proposer.
+/// A party type selects by the account the record names for that side: the
+/// caller accepted the agreement, so it is the acceptor of its cancellation
+/// requests, and it SENT the request, so it is their proposer (seller) too —
+/// `SendAgreementCancellationRequest` is the seller's own call. Both views of
+/// the one record therefore report it.
+///
+/// The seller's view is covered across a population of inputs in
+/// `seller_submitted_request_views`.
 #[tokio::test]
-async fn a_party_type_selects_the_requests_of_the_agreements_it_names() {
+async fn a_party_type_selects_the_requests_the_caller_is_that_party_of() {
     let router = emulator();
     let agreement_id = agreement(&router, "ap-party").await;
     let id = cancellation_over(&router, &agreement_id, "OTHER").await;
@@ -430,7 +437,7 @@ async fn a_party_type_selects_the_requests_of_the_agreements_it_names() {
     let as_acceptor = list(&router, json!({"partyType": "Acceptor"})).await;
     assert_eq!(
         listed_ids(&as_acceptor),
-        vec![id],
+        vec![id.clone()],
         "the caller accepted the agreement, so it is the acceptor of its cancellation requests"
     );
 
@@ -442,9 +449,10 @@ async fn a_party_type_selects_the_requests_of_the_agreements_it_names() {
     );
     assert_eq!(
         listed_ids(&as_proposer),
-        Vec::<String>::new(),
-        "no stored agreement names this account as its proposer, so none of their \
-         cancellation requests is available to a proposer"
+        vec![id],
+        "the caller sent the cancellation request, so it is the seller (proposer) that \
+         submitted it and its own listing reports it, got {:?}",
+        as_proposer.body
     );
 }
 

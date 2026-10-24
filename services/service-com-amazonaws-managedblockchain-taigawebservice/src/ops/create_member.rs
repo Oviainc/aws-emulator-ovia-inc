@@ -194,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "An idempotent operation completes no more than one time"
         // (`ClientRequestToken`): a token already used replays the member id its first
         // call minted instead of joining the network twice.
-        let token = crate::state::idempotency_key(Self::NAME, &input.client_request_token);
+        let token = crate::state::idempotency_key(&region, Self::NAME, &input.client_request_token);
         if let Some(created) = guard.replay_idempotent(&token) {
             return Ok(CreateMemberOutput {
                 member_id: created.member_id.clone(),
@@ -202,10 +202,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The network is resolved ONCE: "The unique identifier of the network in which
-        // the member is created" must name a network that exists, so one that does not is
-        // the modelled 404 and nothing is created. The facts the rules below read are
-        // copied out here, so the write path can take the single mutable borrow it needs.
-        let Some(network) = guard.networks.get(&input.network_id) else {
+        // the member is created" must name a network that exists in the Region this
+        // request addresses, so one that does not is the modelled 404 and nothing is
+        // created. The facts the rules below read are copied out here, so the write path
+        // can take the single mutable borrow it needs.
+        let Some(network) = guard.network(&region, &input.network_id) else {
             return Err(CreateMemberErrorModeled::ResourceNotFoundException(
                 // `crate::state::not_found` is the one construction for a resource this
                 // request named BY ID and this service does not hold: the identification
@@ -218,8 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let framework = network.framework.clone();
         let network_status = network.status.clone();
         let name_taken = network
-            .members
-            .values()
+            .members_in(&region)
             .any(|member| member.name == input.member_configuration.name);
 
         // This operation "Applies only to Hyperledger Fabric", and a network of any other
@@ -261,9 +261,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // InvitationId". One issued to another account or onto another network is not this
         // caller's to use here, so it is as good as absent.
         let account = ::engine::emulator_account_id();
-        let Some(invitation) = guard.invitations.get(&input.invitation_id).filter(|invitation| {
-            invitation.principal == account && invitation.network_id == input.network_id
-        }) else {
+        let Some(invitation) = guard
+            .invitation(&region, &input.invitation_id)
+            .filter(|invitation| {
+                invitation.principal == account && invitation.network_id == input.network_id
+            })
+        else {
             return Err(CreateMemberErrorModeled::ResourceNotFoundException(
                 // The invitation is named by id, so — exactly as for the network above —
                 // `ResourceName` is left absent rather than defaulted to the ARN of some
@@ -333,7 +336,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // path that adds a member to a network, and it is what keeps the member map at or
         // under `crate::state::MAX_MEMBERS_PER_NETWORK`; the refusal is the modelled
         // `ResourceLimitExceededException`.
-        let Some(network) = guard.networks.get_mut(&input.network_id) else {
+        let Some(network) = guard.network_mut(&region, &input.network_id) else {
             return Err(CreateMemberErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {},
             )
@@ -355,7 +358,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "ACCEPTING - The invitee has begun creating a member, and creation hasn't yet
         // completed" (`InvitationStatus`); the clock owes it `ACCEPTED` when the member
         // it created finishes creating.
-        if let Some(invitation) = guard.invitations.get_mut(&input.invitation_id) {
+        if let Some(invitation) = guard.invitation_mut(&region, &input.invitation_id) {
             invitation.status = crate::state::INVITATION_STATUS_ACCEPTING.to_string();
             invitation.accepted_at = Some(now + crate::state::TRANSITION_SPAN);
         }
@@ -372,11 +375,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // Answer from the STORED record, so this is the id every later read of the member
-        // answers to.
+        // answers to — read back through the same Region-scoped resolver every other read
+        // goes through.
         let stored = guard
-            .networks
-            .get(&input.network_id)
-            .and_then(|network| network.members.get(&member_id));
+            .network(&region, &input.network_id)
+            .and_then(|network| network.member(&region, &member_id));
         let Some(stored) = stored else {
             return Err(CreateMemberErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {},

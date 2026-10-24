@@ -50,7 +50,9 @@ const OTHER_UNKNOWN_ARN: &str =
 pub(crate) const FLOW_ARN: &str =
     "arn:aws:mediaconnect:us-east-1:000000000000:flow:1-0000000a:rni-target";
 
-/// `pub(crate)` because `update_router_network_interface` mints its subjects the same way.
+/// `pub(crate)` because `update_router_network_interface` mints its subjects the same way,
+/// and `crate::create_router_network_interface_rules` drives the same front door for the
+/// create rules this suite does not cover.
 pub(crate) async fn create_network_interface(
     emulator: &Emulator,
     body: Value,
@@ -66,7 +68,7 @@ pub(crate) async fn create_network_interface(
 /// `GET /v1/routerNetworkInterfaces`, `Arns` `@httpQuery("arns")`).
 ///
 /// `pub(crate)` because `update_router_network_interface` reads its subjects back through the
-/// same implemented reader.
+/// same implemented reader, as does `crate::create_router_network_interface_rules`.
 pub(crate) async fn batch_get_network_interfaces(
     emulator: &Emulator,
     arns: &[&str],

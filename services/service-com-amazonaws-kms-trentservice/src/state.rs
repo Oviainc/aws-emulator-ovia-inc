@@ -37,8 +37,8 @@ use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AliasListEntry, KeyMetadata, MultiRegionConfiguration, MultiRegionKey,
-    CUSTOMER_MASTER_KEY_SPEC_VALUES,
+    AliasListEntry, GrantConstraints, GrantListEntry, KeyMetadata, MultiRegionConfiguration,
+    MultiRegionKey, CUSTOMER_MASTER_KEY_SPEC_VALUES,
 };
 
 /// `KeyState` values, from `smithy_query(shape="KeyState")`.
@@ -137,6 +137,20 @@ pub const ALIAS_PREFIX_AWS_MANAGED: &str = "alias/aws/";
 /// grow this store.
 pub const MAX_ALIASES_PER_KEY: usize = 50;
 
+/// The largest number of aliases this emulator's store holds across every key and
+/// Region.
+///
+/// A bound the EMULATOR imposes, not a quota KMS publishes. It exists because
+/// [`MAX_ALIASES_PER_KEY`] is counted per key AND Region, and the Region comes from
+/// the caller's own credential scope rather than from a fixed set, so the per-key
+/// count alone leaves the number of records the store holds in the caller's hands.
+/// Past it `CreateAlias` refuses with the modelled `LimitExceededException` and
+/// persists nothing.
+pub const MAX_ALIASES: usize = 5_000;
+
+/// [`MAX_ALIASES`], for grants.
+pub const MAX_GRANTS: usize = 5_000;
+
 /// Per-service state for com-amazonaws-kms-trentservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsKmsTrentserviceState {
@@ -157,6 +171,14 @@ pub struct ComAmazonawsKmsTrentserviceState {
     /// The alias ARNs in creation order, so an alias reader reports them in a
     /// stable order rather than the hash map's.
     pub alias_order: Vec<String>,
+    /// Every persisted grant, keyed by its grant id. A grant id is minted from the
+    /// OS CSPRNG ([`mint_grant_id`]) and so identifies one grant across every key
+    /// and Region.
+    pub grants: HashMap<String, Grant>,
+    /// The grant ids in creation order. A grant reader pages over this, so a page
+    /// boundary is stable across calls and a new grant never reshuffles earlier
+    /// pages.
+    pub grant_order: Vec<String>,
 }
 
 impl ComAmazonawsKmsTrentserviceState {
@@ -173,6 +195,25 @@ impl ComAmazonawsKmsTrentserviceState {
     /// before it mints one.
     pub fn has_room_for_another_key(&self) -> bool {
         self.keys.len() < MAX_KEYS
+    }
+
+    /// Whether the store can hold another alias, across every key and Region, which
+    /// is what `CreateAlias` checks before it creates one.
+    ///
+    /// The per-key bound alone does not bound the STORE: the Region an alias lives in
+    /// comes from the caller's own credential scope and is not drawn from a fixed set,
+    /// so the per-key count is per (key, Region) and its dimension is the caller's to
+    /// choose. This cap is over the whole map, so no sequence of requests can grow it
+    /// past [`MAX_ALIASES`].
+    pub fn has_room_for_another_alias(&self) -> bool {
+        self.aliases.len() < MAX_ALIASES
+    }
+
+    /// Whether the store can hold another grant, across every key and Region, which
+    /// is what `CreateGrant` checks before it mints one. See
+    /// [`Self::has_room_for_another_alias`] for why the per-key bound is not enough.
+    pub fn has_room_for_another_grant(&self) -> bool {
+        self.grants.len() < MAX_GRANTS
     }
 
     /// Persist a freshly created alias, remembering its place in creation order.
@@ -229,6 +270,94 @@ impl ComAmazonawsKmsTrentserviceState {
             .values()
             .filter(|alias| alias.region == region && alias.target_key_id == key_id)
             .count()
+    }
+
+    /// Persist a freshly created grant, remembering its place in creation order.
+    ///
+    /// The caller refuses the request past [`MAX_GRANTS_PER_KEY`] BEFORE minting it,
+    /// so this never grows the store without a bound.
+    pub fn insert_grant(&mut self, grant: Grant) {
+        self.grant_order.push(grant.grant_id.clone());
+        self.grants.insert(grant.grant_id.clone(), grant);
+    }
+
+    /// The grant `region`'s endpoint serves for the exact grant id `grant_id`.
+    ///
+    /// A grant belongs to one key in one Region, so a grant id minted through
+    /// another Region's endpoint is not found here.
+    pub fn grant(&self, region: &str, grant_id: &str) -> Option<&Grant> {
+        self.grants
+            .get(grant_id)
+            .filter(|grant| grant.region == region)
+    }
+
+    /// The grants `region`'s endpoint holds for the key `key_id`, in creation order
+    /// — what a grant reader pages over, so a page boundary is stable across calls.
+    pub fn grants_for_key(&self, region: &str, key_id: &str) -> Vec<&Grant> {
+        self.grants_in(region)
+            .into_iter()
+            .filter(|grant| grant.key_id == key_id)
+            .collect()
+    }
+
+    /// Every grant `region`'s endpoint holds, in creation order. A grant reader that
+    /// is not scoped to one key pages over this.
+    pub fn grants_in(&self, region: &str) -> Vec<&Grant> {
+        self.grant_order
+            .iter()
+            .filter_map(|grant_id| self.grants.get(grant_id))
+            .filter(|grant| grant.region == region)
+            .collect()
+    }
+
+    /// The grant a grant token names, or `None` when the token is not one this
+    /// service minted, or names a grant the store no longer holds because it was
+    /// retired or revoked.
+    pub fn grant_for_token(&self, region: &str, token: &str) -> Option<&Grant> {
+        self.grant(region, &decode_grant_token(token)?)
+    }
+
+    /// The grants the grant tokens a request presents name.
+    ///
+    /// An empty `tokens` answers an empty list: a request that presents none is not
+    /// asking to be authorized by a grant.
+    ///
+    /// [`GrantRefusal::MalformedToken`] when a token is not one this service minted,
+    /// so it names no grant at all. [`GrantRefusal::NotAuthorized`] when every token
+    /// is well formed but none names a grant the store still holds: the permission
+    /// that came from a grant is gone once the grant is.
+    pub fn grants_for_tokens(
+        &self,
+        region: &str,
+        tokens: &[String],
+    ) -> Result<Vec<&Grant>, GrantRefusal> {
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut named = Vec::with_capacity(tokens.len());
+        for token in tokens {
+            let grant_id = decode_grant_token(token).ok_or(GrantRefusal::MalformedToken)?;
+            if let Some(grant) = self.grant(region, &grant_id) {
+                named.push(grant);
+            }
+        }
+        if named.is_empty() {
+            return Err(GrantRefusal::NotAuthorized);
+        }
+        Ok(named)
+    }
+
+    /// Forget the grant `grant_id`, answering the record that was dropped (`None`
+    /// when `region`'s endpoint holds no such grant).
+    ///
+    /// Removal is from the grant store ITSELF, so the permissions the grant carried
+    /// are gone from the next request on, and the creation order is kept in step so a
+    /// later reader cannot page over a grant the store no longer holds.
+    pub fn remove_grant(&mut self, region: &str, grant_id: &str) -> Option<Grant> {
+        self.grant(region, grant_id)?;
+        let removed = self.grants.remove(grant_id)?;
+        self.grant_order.retain(|held| held != grant_id);
+        Some(removed)
     }
 
     /// The key a `KeyId` request member names, accepting every form KMS does:
@@ -1777,6 +1906,590 @@ fn encryption_context_aad(context: Option<&HashMap<String, String>>) -> Vec<u8> 
 }
 
 // ---------------------------------------------------------------------------
+// Grants
+// ---------------------------------------------------------------------------
+
+/// The largest number of grants this emulator's store holds for ONE KMS key.
+///
+/// A bound the EMULATOR imposes, not the quota KMS publishes: `CreateGrant` is
+/// reachable by any caller and a grant without a `Name` is a new record every time,
+/// so without a cap a loop of valid creates grows the process without end. Past it
+/// `CreateGrant` refuses with the modelled `LimitExceededException` — "a length
+/// constraint or quota was exceeded" — and persists nothing.
+pub const MAX_GRANTS_PER_KEY: usize = 500;
+
+/// One grant on a KMS key: "a policy instrument that allows Amazon Web Services
+/// principals to use KMS keys in cryptographic operations"
+/// (`smithy_query(query="doc",shape="CreateGrant")`).
+#[derive(Debug, Clone)]
+pub struct Grant {
+    /// The minted grant id, which is also this record's map key.
+    pub grant_id: String,
+    /// The key id of the KMS key the grant applies to. A grant records the key it
+    /// RESOLVED to, never the alias the request named, so repointing an alias
+    /// cannot move an existing grant to another key.
+    pub key_id: String,
+    /// That key's ARN, which is what a grant reader reports as the entry's `KeyId`:
+    /// `KeyIdType` carries either form, and KMS reports the grant's key as the ARN.
+    pub key_arn: String,
+    /// The Region whose endpoint the grant was created through. A KMS key is a
+    /// regional resource, so its grants are too.
+    pub region: String,
+    /// "The Amazon Web Services account under which the grant was issued"
+    /// (`smithy_query(shape="GrantListEntry")` -> `IssuingAccount`).
+    pub issuing_account: String,
+    /// The `Name` the request gave, if any: "If a name was provided in the
+    /// CreateGrant request, that name is returned. Otherwise this value is null"
+    /// (`smithy_query(shape="GrantListEntry")` -> `Name`).
+    pub name: Option<String>,
+    pub creation_date: SystemTime,
+    pub grantee_principal: Option<String>,
+    pub grantee_service_principal: Option<String>,
+    pub retiring_principal: Option<String>,
+    pub retiring_service_principal: Option<String>,
+    /// "The list of operations permitted by the grant", in the order the request
+    /// listed them.
+    pub operations: Vec<String>,
+    pub constraints: Option<GrantConstraints>,
+}
+
+impl Grant {
+    /// This grant's `GrantListEntry`, computed from the record — the one place a
+    /// grant is projected onto the wire, so two readers cannot disagree.
+    pub fn list_entry(&self) -> GrantListEntry {
+        GrantListEntry {
+            key_id: Some(self.key_arn.clone()),
+            grant_id: Some(self.grant_id.clone()),
+            name: self.name.clone(),
+            creation_date: Some(date_time(self.creation_date)),
+            grantee_principal: self.grantee_principal.clone(),
+            retiring_principal: self.retiring_principal.clone(),
+            issuing_account: Some(self.issuing_account.clone()),
+            operations: Some(self.operations.clone()),
+            constraints: self.constraints.clone(),
+            grantee_service_principal: self.grantee_service_principal.clone(),
+            retiring_service_principal: self.retiring_service_principal.clone(),
+        }
+    }
+
+    /// Everything about this grant that came from the request that created it,
+    /// digested into 64 hex characters.
+    ///
+    /// "When this value is present, you can retry a `CreateGrant` request with
+    /// identical parameters; if the grant already exists, the original `GrantId` is
+    /// returned without creating a new grant"
+    /// (`smithy_query(query="doc",shape="CreateGrantRequest",member="Name")`), so a
+    /// retry has to be recognisable from the request alone — this is what "identical
+    /// parameters" is compared as.
+    ///
+    /// The permitted operations are sorted and de-duplicated first: they are a SET
+    /// of permissions, so a request listing the same ones in another order is the
+    /// same request. The encryption-context constraints are maps, and are
+    /// canonicalized the same way for the same reason. Every part is
+    /// length-prefixed, so no two different requests can digest to the same bytes.
+    /// The grant id, the creation date and the grant tokens are NOT part of it: the
+    /// first two are what a retry is allowed to reuse, and the last is "unique with
+    /// every `CreateGrant` request".
+    pub fn fingerprint(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"kms-grant\0");
+        for part in [
+            self.key_id.as_str(),
+            self.name.as_deref().unwrap_or_default(),
+            self.grantee_principal.as_deref().unwrap_or_default(),
+            self.grantee_service_principal.as_deref().unwrap_or_default(),
+            self.retiring_principal.as_deref().unwrap_or_default(),
+            self.retiring_service_principal.as_deref().unwrap_or_default(),
+        ] {
+            feed(&mut hasher, part);
+        }
+
+        let mut operations: Vec<&str> = self.operations.iter().map(String::as_str).collect();
+        operations.sort_unstable();
+        operations.dedup();
+        for operation in operations {
+            feed(&mut hasher, operation);
+        }
+
+        let constraints = self.constraints.as_ref();
+        feed(
+            &mut hasher,
+            constraints
+                .and_then(|constraints| constraints.source_arn.as_deref())
+                .unwrap_or_default(),
+        );
+        feed_context(
+            &mut hasher,
+            "EncryptionContextEquals",
+            constraints.and_then(|constraints| constraints.encryption_context_equals.as_ref()),
+        );
+        feed_context(
+            &mut hasher,
+            "EncryptionContextSubset",
+            constraints.and_then(|constraints| constraints.encryption_context_subset.as_ref()),
+        );
+
+        hex::encode(hasher.finalize())
+    }
+
+    /// Whether this grant permits `operation` on the key `key_id` under the request's
+    /// encryption context `context`.
+    ///
+    /// A grant covers ONE key, so a grant on another key permits nothing here: "a
+    /// grant on one KMS key does not authorize use of another". It covers exactly the
+    /// operations it lists. And its encryption-context constraints "allow the
+    /// permissions in the grant only when the encryption context in the request
+    /// matches (EncryptionContextEquals) or includes (EncryptionContextSubset) the
+    /// encryption context specified in the constraint"
+    /// (`smithy_query(query="doc",shape="CreateGrantRequest",member="Constraints")`),
+    /// and they "apply only to cryptographic operations that support an encryption
+    /// context" — so an operation that takes none is judged without them.
+    ///
+    /// A `SourceArn` constraint restricts "an Amazon Web Services resource on behalf
+    /// of which the request is made"; nothing in a direct request names such a
+    /// resource, so it narrows nothing here.
+    pub fn permits(
+        &self,
+        key_id: &str,
+        operation: &str,
+        context: Option<&HashMap<String, String>>,
+    ) -> bool {
+        if self.key_id != key_id {
+            return false;
+        }
+        if !self
+            .operations
+            .iter()
+            .any(|permitted| permitted == operation)
+        {
+            return false;
+        }
+        let takes_context = GRANT_OPERATION_PROFILES
+            .iter()
+            .find(|profile| profile.operation == operation)
+            .is_some_and(|profile| profile.encryption_context);
+        if !takes_context {
+            return true;
+        }
+        self.constraints
+            .as_ref()
+            .is_none_or(|constraints| encryption_context_allows(constraints, context))
+    }
+}
+
+/// Why a request's grant tokens do not authorize it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantRefusal {
+    /// A token is not one this service minted, so it names no grant at all — which is
+    /// what makes the GRANT TOKEN the thing that "is not valid".
+    MalformedToken,
+    /// The tokens are well formed, but no grant they name authorizes the request: the
+    /// grant is gone, is on another key, does not permit the operation, or its
+    /// encryption-context constraint is not met. Permission that would have come from
+    /// a grant is absent, which is an authorization failure rather than a bad request.
+    NotAuthorized,
+}
+
+/// Whether a grant's encryption-context constraints allow a request carrying
+/// `context`.
+///
+/// "In a grant constraint, the key in each key-value pair is not case sensitive, but
+/// the value is case sensitive"
+/// (`smithy_query(query="doc",shape="GrantConstraints")`), so the keys are folded and
+/// the values are not. An absent context is an empty one: `EncryptionContextEquals`
+/// then allows only an empty constraint, and `EncryptionContextSubset` only one with
+/// no pairs to include.
+fn encryption_context_allows(
+    constraints: &GrantConstraints,
+    context: Option<&HashMap<String, String>>,
+) -> bool {
+    let empty = HashMap::new();
+    let request = folded_keys(context.unwrap_or(&empty));
+
+    if let Some(equals) = constraints.encryption_context_equals.as_ref() {
+        if folded_keys(equals) != request {
+            return false;
+        }
+    }
+    if let Some(subset) = constraints.encryption_context_subset.as_ref() {
+        if !folded_keys(subset)
+            .into_iter()
+            .all(|(key, value)| request.get(&key) == Some(&value))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// An encryption context with its keys folded to lower case, so two contexts that
+/// differ only in the case of their KEYS compare equal while their values stay
+/// case-sensitive.
+fn folded_keys(context: &HashMap<String, String>) -> BTreeMap<String, String> {
+    context
+        .iter()
+        .map(|(key, value)| (key.to_lowercase(), value.clone()))
+        .collect()
+}
+
+/// Add one length-prefixed part to a digest, so two different sequences of parts
+/// cannot run together into the same bytes.
+fn feed(hasher: &mut Sha256, part: &str) {
+    let len = u32::try_from(part.len()).unwrap_or(u32::MAX);
+    hasher.update(len.to_be_bytes());
+    hasher.update(part.as_bytes());
+}
+
+/// [`feed`] for an encryption-context map, under `label` so the two constraint maps
+/// cannot be swapped without changing the digest. The entries are sorted first: the
+/// map is unordered, so only its content may decide the digest.
+fn feed_context(hasher: &mut Sha256, label: &str, context: Option<&HashMap<String, String>>) {
+    feed(hasher, label);
+    let mut entries: Vec<(&str, &str)> = context
+        .map(|context| {
+            context
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort_unstable();
+    for (key, value) in entries {
+        feed(hasher, key);
+        feed(hasher, value);
+    }
+}
+
+/// The account ARN KMS reports as a grant's `IssuingAccount`: the emulator's own
+/// account, which is the account that owns every key here.
+pub fn issuing_account_arn() -> String {
+    ::engine::emulator_arn("iam", "", "root")
+}
+
+/// How KMS words `DryRunOperationException`, "the request was rejected because the
+/// DryRun parameter was specified"
+/// (`smithy_query(query="doc",shape="DryRunOperationException")`).
+///
+/// One constant for the whole service, so no two operations word the same refusal
+/// differently.
+pub const DRY_RUN_MESSAGE: &str =
+    "The request would have succeeded, but the DryRun option is set.";
+
+/// How a `GrantId` that cannot name any grant is refused: `InvalidGrantIdException`'s
+/// message names the value the request gave, since that string is the whole of what
+/// is wrong with it.
+///
+/// One function for the whole service, so no two operations word the same malformed
+/// grant id differently.
+pub fn invalid_grant_id_message(requested: &str) -> String {
+    format!("The specified GrantId is not valid: {requested}.")
+}
+
+/// How a grant that is not held is refused: the grant id the request gave, since a
+/// grant that was never created, one already retired and one already revoked are the
+/// same absence.
+///
+/// One function for the whole service, so no two operations word it differently.
+pub fn grant_not_found_message(grant_id: &str) -> String {
+    format!("Grant ID {grant_id} not found")
+}
+
+/// How a `RetireGrant` is refused when the grant it identified is not held.
+///
+/// "Permission to retire a grant is determined primarily by the grant"
+/// (`smithy_query(query="doc",shape="RetireGrant")`), so with no such grant there is
+/// no permission to retire one, and the refusal names the grant the request gave.
+pub fn retire_grant_access_denied_message(grant_id: &str) -> String {
+    format!("No grant with the id {grant_id} authorizes kms:RetireGrant.")
+}
+
+/// How a request whose only permission would have come from a grant is refused when
+/// no grant it named gives that permission.
+///
+/// The message is built from the request — the operation asked for and the key it
+/// names — rather than from a caller identity, which this emulator does not have.
+///
+/// One function for the whole service, so no two operations word it differently.
+pub fn grant_access_denied_message(operation: &str, key_arn: &str) -> String {
+    format!("The grant tokens in the request do not authorize kms:{operation} on {key_arn}.")
+}
+
+/// A freshly minted grant id: the 64 lowercase hex characters KMS gives a grant,
+/// drawn from the OS CSPRNG so two grants never share one.
+///
+/// `None` means the platform refused to produce entropy; the caller answers a
+/// modelled server error rather than minting a predictable id.
+pub fn mint_grant_id() -> Option<String> {
+    let mut bytes = [0u8; 32];
+    SystemRandom::new().fill(&mut bytes).ok()?;
+    Some(hex::encode(bytes))
+}
+
+/// How many characters a grant id has: [`mint_grant_id`] draws 32 bytes, and hex
+/// doubles them.
+const GRANT_ID_HEX_LEN: usize = 64;
+
+/// Whether `grant_id` has the form a grant id takes.
+///
+/// `GrantIdType`'s modelled 1..128 length accepts far more than a grant id can be,
+/// so the form is what identifies a value that cannot name any grant — as opposed to
+/// a well-formed id that simply names none.
+pub fn names_a_grant_id(grant_id: &str) -> bool {
+    grant_id.len() == GRANT_ID_HEX_LEN
+        && grant_id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+}
+
+/// Tags a grant token as one this service minted, and distinguishes it from the
+/// pagination tokens, which share the encoding.
+const GRANT_TOKEN_PREFIX: &str = "grant-token/1/";
+
+/// A freshly minted grant token for `grant_id`.
+///
+/// "The returned grant token is unique with every `CreateGrant` request, even when a
+/// duplicate `GrantId` is returned. All grant tokens for the same grant ID can be
+/// used interchangeably"
+/// (`smithy_query(query="doc",shape="CreateGrantRequest",member="Name")`): the token
+/// therefore carries the grant id it belongs to plus a fresh nonce, so a new one is
+/// minted per call and any of them names the same grant. It is self-describing
+/// rather than persisted, so a grant does not accumulate a token per retry.
+///
+/// `None` means the platform refused to produce entropy.
+pub fn mint_grant_token(grant_id: &str) -> Option<String> {
+    let mut nonce = [0u8; 16];
+    SystemRandom::new().fill(&mut nonce).ok()?;
+    Some(hex::encode(format!(
+        "{GRANT_TOKEN_PREFIX}{grant_id}/{}",
+        hex::encode(nonce)
+    )))
+}
+
+/// The grant id a grant token names, or `None` when the token is not one this
+/// service minted — which is what makes a foreign token an
+/// `InvalidGrantTokenException` instead of being silently ignored.
+pub fn decode_grant_token(token: &str) -> Option<String> {
+    let decoded = hex::decode(token).ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    let rest = text.strip_prefix(GRANT_TOKEN_PREFIX)?;
+    let (grant_id, nonce) = rest.split_once('/')?;
+    (!grant_id.is_empty() && !nonce.is_empty()).then(|| grant_id.to_string())
+}
+
+/// Whether `principal` is given the way KMS requires a grant principal to be: "use
+/// the Amazon Resource Name (ARN) of an Amazon Web Services principal"
+/// (`smithy_query(query="doc",shape="CreateGrantRequest",member="GranteePrincipal")`).
+///
+/// `PrincipalIdType`'s modelled pattern accepts any word-ish string, so the ARN form
+/// is what is left to check: `arn:<partition>:<service>:<region>:<account>:<resource>`
+/// with a non-empty partition, service, account and resource. The Region segment may
+/// be empty, because an IAM principal ARN carries none.
+pub fn names_a_principal_arn(principal: &str) -> bool {
+    let Some(rest) = principal.strip_prefix("arn:") else {
+        return false;
+    };
+    let segments: Vec<&str> = rest.splitn(5, ':').collect();
+    let [partition, service, _region, account, resource] = segments.as_slice() else {
+        return false;
+    };
+    !partition.is_empty() && !service.is_empty() && !account.is_empty() && !resource.is_empty()
+}
+
+/// What one `GrantOperation` needs of the KMS key it is granted on.
+///
+/// "This list must include only operations that are permitted in a grant. Also, the
+/// operation must be supported on the KMS key. For example, you cannot create a
+/// grant for a symmetric encryption KMS key that allows the `Sign` operation, or a
+/// grant for an asymmetric KMS key that allows the `GenerateDataKey` operation"
+/// (`smithy_query(query="doc",shape="CreateGrantRequest",member="Operations")`) —
+/// the first example is a `KeyUsage` mismatch and the second a key-TYPE mismatch, so
+/// a profile records both.
+#[derive(Debug, Clone, Copy)]
+pub struct GrantOperationProfile {
+    /// The `GrantOperation` value this profile describes
+    /// (`crate::ops::types::GRANT_OPERATION_VALUES`).
+    pub operation: &'static str,
+    /// The `KeyUsage` values a key must carry for this operation. EMPTY means the
+    /// operation is key management, which every usage permits.
+    pub usages: &'static [&'static str],
+    /// The key types ([`KeySpecProfile::family`]) that support this operation. EMPTY
+    /// means every type does.
+    pub families: &'static [&'static str],
+    /// Whether the operation this grants takes an `EncryptionContext`. The
+    /// encryption-context grant constraints "apply only to cryptographic operations
+    /// that support an encryption context … not … operations that do not support an
+    /// encryption context, such as cryptographic operations with asymmetric KMS keys
+    /// and management operations"
+    /// (`smithy_query(query="doc",shape="GrantConstraints")`), so this is what decides
+    /// whether a constraint is applied at all.
+    pub encryption_context: bool,
+}
+
+/// What each `GrantOperation` needs of the key, from the `KeyUsage` matrix
+/// (`smithy_query(query="doc",shape="CreateKeyRequest",member="KeyUsage")`) and the
+/// operation each one grants: a cryptographic operation needs the usage that
+/// operation runs under, and the key type whose material can perform it, while
+/// `CreateGrant`, `DescribeKey` and `RetireGrant` are management operations that
+/// every key supports.
+pub const GRANT_OPERATION_PROFILES: &[GrantOperationProfile] = &[
+    GrantOperationProfile {
+        operation: "CreateGrant",
+        usages: &[],
+        families: &[],
+        encryption_context: false,
+    },
+    GrantOperationProfile {
+        operation: "DescribeKey",
+        usages: &[],
+        families: &[],
+        encryption_context: false,
+    },
+    GrantOperationProfile {
+        operation: "RetireGrant",
+        usages: &[],
+        families: &[],
+        encryption_context: false,
+    },
+    GrantOperationProfile {
+        operation: "Encrypt",
+        usages: &[KEY_USAGE_ENCRYPT_DECRYPT],
+        families: &[],
+        encryption_context: true,
+    },
+    GrantOperationProfile {
+        operation: "Decrypt",
+        usages: &[KEY_USAGE_ENCRYPT_DECRYPT],
+        families: &[],
+        encryption_context: true,
+    },
+    GrantOperationProfile {
+        operation: "ReEncryptFrom",
+        usages: &[KEY_USAGE_ENCRYPT_DECRYPT],
+        families: &[],
+        encryption_context: true,
+    },
+    GrantOperationProfile {
+        operation: "ReEncryptTo",
+        usages: &[KEY_USAGE_ENCRYPT_DECRYPT],
+        families: &[],
+        encryption_context: true,
+    },
+    // A data key is generated under a SYMMETRIC encryption key, which is what makes
+    // `GenerateDataKey` on an asymmetric key the documented example of an operation
+    // the key does not support.
+    GrantOperationProfile {
+        operation: "GenerateDataKey",
+        usages: &[KEY_USAGE_ENCRYPT_DECRYPT],
+        families: &[FAMILY_SYMMETRIC],
+        encryption_context: true,
+    },
+    GrantOperationProfile {
+        operation: "GenerateDataKeyWithoutPlaintext",
+        usages: &[KEY_USAGE_ENCRYPT_DECRYPT],
+        families: &[FAMILY_SYMMETRIC],
+        encryption_context: true,
+    },
+    GrantOperationProfile {
+        operation: "GenerateDataKeyPair",
+        usages: &[KEY_USAGE_ENCRYPT_DECRYPT],
+        families: &[FAMILY_SYMMETRIC],
+        encryption_context: true,
+    },
+    GrantOperationProfile {
+        operation: "GenerateDataKeyPairWithoutPlaintext",
+        usages: &[KEY_USAGE_ENCRYPT_DECRYPT],
+        families: &[FAMILY_SYMMETRIC],
+        encryption_context: true,
+    },
+    GrantOperationProfile {
+        operation: "Sign",
+        usages: &[KEY_USAGE_SIGN_VERIFY],
+        families: &[FAMILY_ASYMMETRIC],
+        encryption_context: false,
+    },
+    GrantOperationProfile {
+        operation: "Verify",
+        usages: &[KEY_USAGE_SIGN_VERIFY],
+        families: &[FAMILY_ASYMMETRIC],
+        encryption_context: false,
+    },
+    GrantOperationProfile {
+        operation: "GenerateMac",
+        usages: &[KEY_USAGE_GENERATE_VERIFY_MAC],
+        families: &[FAMILY_HMAC],
+        encryption_context: false,
+    },
+    GrantOperationProfile {
+        operation: "VerifyMac",
+        usages: &[KEY_USAGE_GENERATE_VERIFY_MAC],
+        families: &[FAMILY_HMAC],
+        encryption_context: false,
+    },
+    GrantOperationProfile {
+        operation: "DeriveSharedSecret",
+        usages: &[KEY_USAGE_KEY_AGREEMENT],
+        families: &[FAMILY_ASYMMETRIC],
+        encryption_context: false,
+    },
+    // The public half exists only for a key pair, under any of the three usages an
+    // asymmetric spec can carry.
+    GrantOperationProfile {
+        operation: "GetPublicKey",
+        usages: &[
+            KEY_USAGE_ENCRYPT_DECRYPT,
+            KEY_USAGE_SIGN_VERIFY,
+            KEY_USAGE_KEY_AGREEMENT,
+        ],
+        families: &[FAMILY_ASYMMETRIC],
+        encryption_context: false,
+    },
+];
+
+/// The key type [`KeySpecProfile::family`] reports for a symmetric encryption key.
+pub const FAMILY_SYMMETRIC: &str = "symmetric";
+/// See [`FAMILY_SYMMETRIC`].
+pub const FAMILY_ASYMMETRIC: &str = "asymmetric";
+/// See [`FAMILY_SYMMETRIC`].
+pub const FAMILY_HMAC: &str = "HMAC";
+
+/// Why `key` does not support the grant operation `operation`, or `None` when it
+/// does.
+///
+/// An operation [`GRANT_OPERATION_PROFILES`] does not describe is reported as
+/// supported: the modelled `GrantOperation` enum refuses an unknown value before any
+/// handler runs, so reaching here with one is not possible, and a value added to the
+/// model later must not be refused by a table that has not caught up.
+pub fn grant_operation_refusal(key: &Cmk, operation: &str) -> Option<String> {
+    let profile = GRANT_OPERATION_PROFILES
+        .iter()
+        .find(|profile| profile.operation == operation)?;
+
+    if !profile.usages.is_empty() && !profile.usages.contains(&key.key_usage.as_str()) {
+        return Some(format!(
+            "Operation {operation} is not permitted in a grant on {}, whose KeyUsage is \
+             {}; it requires a KeyUsage of {}.",
+            key.arn,
+            key.key_usage,
+            profile.usages.join(" or ")
+        ));
+    }
+
+    let family = key_spec_profile(&key.key_spec).map(KeySpecProfile::family);
+    if !profile.families.is_empty()
+        && family.is_none_or(|family| !profile.families.contains(&family))
+    {
+        return Some(format!(
+            "Operation {operation} is not permitted in a grant on {}, whose KeySpec {} is \
+             {}; it requires {} key material.",
+            key.arn,
+            key.key_spec,
+            family.unwrap_or("of an unknown type"),
+            profile.families.join(" or ")
+        ));
+    }
+
+    None
+}
+
+// ---------------------------------------------------------------------------
 // List pagination
 // ---------------------------------------------------------------------------
 
@@ -1787,6 +2500,13 @@ const MARKER_PREFIX: &str = "keys/1/";
 /// from one list is not accepted by another, which would silently resume a page at
 /// an item of the wrong kind instead of answering `InvalidMarkerException`.
 const ALIAS_MARKER_PREFIX: &str = "aliases/1/";
+
+/// [`MARKER_PREFIX`], for the grant list.
+const GRANT_MARKER_PREFIX: &str = "grants/1/";
+
+/// [`MARKER_PREFIX`], for the retirable-grant list, which pages over a different
+/// selection of grants than the per-key list and so mints its own tokens.
+const RETIRABLE_GRANT_MARKER_PREFIX: &str = "retirable-grants/1/";
 
 /// The `NextMarker` that resumes a list after `key_id`.
 ///
@@ -1811,6 +2531,27 @@ pub fn encode_alias_marker(alias_arn: &str) -> String {
 /// [`decode_marker`], for the alias list.
 pub fn decode_alias_marker(marker: &str) -> Option<String> {
     decode_marker_for(ALIAS_MARKER_PREFIX, marker)
+}
+
+/// [`encode_marker`], for the grant list: the token resumes after the grant whose
+/// id is `grant_id`.
+pub fn encode_grant_marker(grant_id: &str) -> String {
+    encode_marker_for(GRANT_MARKER_PREFIX, grant_id)
+}
+
+/// [`decode_marker`], for the grant list.
+pub fn decode_grant_marker(marker: &str) -> Option<String> {
+    decode_marker_for(GRANT_MARKER_PREFIX, marker)
+}
+
+/// [`encode_marker`], for the retirable-grant list.
+pub fn encode_retirable_grant_marker(grant_id: &str) -> String {
+    encode_marker_for(RETIRABLE_GRANT_MARKER_PREFIX, grant_id)
+}
+
+/// [`decode_marker`], for the retirable-grant list.
+pub fn decode_retirable_grant_marker(marker: &str) -> Option<String> {
+    decode_marker_for(RETIRABLE_GRANT_MARKER_PREFIX, marker)
 }
 
 /// One encoding for every list, so no two pagers mint tokens a reader must handle

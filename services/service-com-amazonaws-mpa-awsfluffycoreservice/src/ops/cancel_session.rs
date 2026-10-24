@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels the approval session the request's `SessionArn` names: the stored
+//! [`crate::state::Session`] `StartApprovalTeamBaseline` recorded is put into the terminal
+//! `CANCELLED` status and stamped with its completion instant
+//! ([`crate::state::Session::cancel`]), so `GetSession` reports it `CANCELLED` afterwards
+//! and `GetApprovalTeam` no longer reports it as any approver's pending baseline session
+//! ([`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::pending_baseline_session_arn`]).
+//! No `SessionStatusCode` token stands for a cancellation, so none is reported, and no
+//! approver is claimed to have answered: every response stays as it stood.
+//!
+//! * The account boundary is decided FIRST: a `SessionArn` outside the caller's own
+//!   account is refused with `AccessDeniedException` (403) before the session is resolved
+//!   ([`crate::state::authorize_resource_arn`]), so a cancellation the caller may not make
+//!   is never reported as a completed one. A value that is not a well-formed MPA session
+//!   ARN is refused at the framework boundary by `SessionArn`'s own `@pattern`, reworded
+//!   to the one sentence this service answers that class with
+//!   ([`crate::state::INVALID_ARN_MESSAGE`], `ValidationException` 400).
+//! * A session ARN inside the caller's account that this store holds nothing under earns
+//!   `ResourceNotFoundException` (404), with the one not-found sentence this service
+//!   states ([`crate::state::resource_not_found`]).
+//! * Only an OUTSTANDING session (`CREATING` or `PENDING`) can be cancelled. The
+//!   operation is `@idempotent`, so a session already `CANCELLED` is a success that writes
+//!   nothing and keeps the completion instant the first call recorded; a session that
+//!   reached another terminal status (`APPROVED`, or `FAILED` once its expiration came
+//!   due) can no longer be cancelled and earns `ConflictException` (409), the error this
+//!   model declares for exactly that clash, as `start_active_approval_team_deletion.rs`
+//!   refuses a team whose status the requested transition does not start from.
+//!
+//! The management-account gate [`crate::service`] puts in front of the creates does not
+//! apply: this request identifies its resource BY ARN, so its authorization decision
+//! reads a value out of the request and belongs after the request is read, which is the
+//! cross-account check above.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +171,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelSession"))
+        let _ = ctx;
+        // The account boundary is evaluated BEFORE the resource is resolved: an ARN
+        // outside the caller's account is refused with the modelled
+        // `AccessDeniedException` (403) whatever is stored under it, so a client can tell
+        // "not permitted" from "does not exist".
+        crate::state::authorize_resource_arn(Self::NAME, &input.session_arn)
+            .map_err(CancelSessionErrorModeled::AccessDeniedException)?;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CancelSessionError::Modeled(CancelSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the approval-team store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let mut state = store.lock();
+        let now = ::std::time::SystemTime::now();
+        state.materialize_due(now);
+
+        let Some(session) = state.session_mut(&input.session_arn) else {
+            // The one message this service answers every resource lookup that resolves
+            // to nothing with (`crate::state::resource_not_found`).
+            return Err(CancelSessionErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+            .into());
+        };
+
+        match session.status {
+            // An outstanding session is what a cancellation ends, whether it is still
+            // waiting for its activation or already waiting on its approvers.
+            crate::state::SessionStatus::Creating | crate::state::SessionStatus::Pending => {
+                session.cancel(now);
+            }
+            // Already cancelled: the operation is `@idempotent`, so the caller is in the
+            // state it asked for and nothing is written, and the completion instant the
+            // first call recorded does not move.
+            crate::state::SessionStatus::Cancelled => {}
+            // A session that has already reached another terminal status cannot be
+            // cancelled: the request conflicts with the state the resource is in.
+            other @ (crate::state::SessionStatus::Approved
+            | crate::state::SessionStatus::Failed) => {
+                return Err(CancelSessionErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "Approval session '{}' is {} and no longer outstanding, so it cannot \
+                         be cancelled.",
+                        input.session_arn,
+                        other.as_wire()
+                    ),
+                })
+                .into());
+            }
+        }
+
+        Ok(CancelSessionOutput {})
     }
 }

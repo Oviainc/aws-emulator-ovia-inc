@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWorkspace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWorkspace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWorkspace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -164,20 +155,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWorkspace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWorkspaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWorkspace"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateWorkspaceError::Modeled(UpdateWorkspaceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        let record = store
+            .workspaces
+            .get_mut(&input.workspace_name)
+            .ok_or_else(|| not_found(&input.workspace_name))?;
+
+        // "If you retry a request that completed successfully using the same client
+        // token, the retry succeeds without performing any further actions": the retry
+        // writes nothing and reports the workspace's status as it stands. It is the
+        // FIRST thing checked once the workspace resolves — before every rule about
+        // the body it carries — because the call it repeats was already accepted, and
+        // because that very call is what left the workspace in UPDATING.
+        if input.client_token.is_some() && input.client_token == record.update_token {
+            return Ok(UpdateWorkspaceOutput {
+                workspace_status: record.status(now),
+            });
+        }
+
+        // A supplied configuration's own rules hold here exactly as they do on the
+        // create, and are checked before anything is written so a refused update
+        // neither changes the stored workspace nor moves its state. AFTER the lookup
+        // above: a request addressing a workspace this store does not hold is a
+        // not-found refusal whatever else it carries.
+        if let Some(configuration) = input.encryption_configuration.as_ref() {
+            crate::state::check_workspace_encryption(configuration).map_err(invalid_request)?;
+        }
+
+        // "You can update only workspaces in the ACTIVE or FAILED state": a workspace
+        // still settling a call it already accepted has an operation in flight, which
+        // is what the modelled conflict reports.
+        let settled = matches!(
+            record.state(now),
+            crate::state::STATE_ACTIVE | crate::state::STATE_FAILED
+        );
+        if !settled {
+            return Err(UpdateWorkspaceError::Modeled(
+                UpdateWorkspaceErrorModeled::ConflictingOperationException(
+                    ConflictingOperationException {
+                        message: format!(
+                            "The workspace {} is in the {} state; it can be updated only in \
+                             the {} or {} state.",
+                            record.name,
+                            record.state(now),
+                            crate::state::STATE_ACTIVE,
+                            crate::state::STATE_FAILED
+                        ),
+                        resource_id: record.name.clone(),
+                        resource_arn: record.arn.clone(),
+                    },
+                ),
+            ));
+        }
+
+        // "Fields that you omit from the request are left unchanged": an absent member
+        // keeps the value the workspace already carried, and a present one replaces it.
+        let description = input
+            .workspace_description
+            .clone()
+            .or_else(|| record.description.clone());
+
+        let encryption = match input.encryption_configuration.as_ref() {
+            // "Omit this field to leave encryption unchanged."
+            None => record.encryption.clone(),
+            Some(configuration) => {
+                // "After a customer managed key configuration becomes active, the key
+                // can't be changed; supplying the same key is accepted" — so a
+                // workspace already under a customer managed key accepts only the
+                // configuration it is already under, which is also what makes
+                // recovering a FAILED workspace by "supplying its encryption
+                // configuration again" succeed.
+                //
+                // "The same key" is the key the request NAMES, compared as the stored
+                // configuration holds it: naming the stored key through an ALIAS
+                // instead counts as naming a different one, because resolving an alias
+                // to the key behind it needs a key registry this service does not
+                // hold, and accepting an unresolvable name as "the same key" would let
+                // a real key change through.
+                if record.encryption.encryption_type == crate::state::ENCRYPTION_TYPE_KMS_BASED
+                    && (configuration.encryption_type != record.encryption.encryption_type
+                        || configuration.kms_key_id != record.encryption.kms_key_id)
+                {
+                    return Err(invalid_request(format!(
+                        "The customer managed key configuration of the workspace {} is \
+                         active and can't be changed.",
+                        record.name
+                    )));
+                }
+                configuration.clone()
+            }
+        };
+
+        // The accepted write moves the workspace to UPDATING — `workspaceStatus` is
+        // "The status of the workspace after the update, which is UPDATING when the
+        // operation returns" — and the instant it settles is stored, never slept on.
+        record.record_update(description, encryption, input.client_token.clone(), now);
+
+        Ok(UpdateWorkspaceOutput {
+            workspace_status: record.status(now),
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the workspace the request addressed.
+fn not_found(workspace_name: &str) -> UpdateWorkspaceError {
+    UpdateWorkspaceError::Modeled(UpdateWorkspaceErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(
+                crate::state::RESOURCE_WORKSPACE,
+                workspace_name,
+            ),
+        },
+    ))
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> UpdateWorkspaceError {
+    UpdateWorkspaceError::Modeled(UpdateWorkspaceErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
 }

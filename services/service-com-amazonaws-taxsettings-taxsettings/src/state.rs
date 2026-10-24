@@ -1725,7 +1725,14 @@ pub fn check_supplemental_jurisdiction(
 /// `DeleteSupplementalTaxRegistration` also models `ResourceNotFoundException`,
 /// but the real service answers an unknown `authorityId` — a junk string and a
 /// well-formed UUID alike — with the 400 class, so this is the refusal both get:
-/// an `authorityId` is valid only while it names a registration.
+/// an `authorityId` is valid only while it names a registration. The model's
+/// two doc strings do not choose between the errors; the recorded units
+/// `taxsettings.delete-supplemental-tax-registration-not-found` and
+/// `taxsettings.concurrent-delete-supplemental-tax-registration-consistent` do,
+/// and `tests/all/missing_resource_errors.rs` pins their outcome against the
+/// 404 the `accountId`-addressed operations answer, so the two classes cannot be
+/// swapped by re-reading the docs. A later fixer holding a recording that
+/// disagrees should follow the recording.
 pub fn invalid_authority_id() -> ValidationException {
     validation(
         ERROR_CODE_FIELD_VALIDATION_FAILED,

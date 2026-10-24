@@ -192,7 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        // This service's endpoint is regional: the domain is resolved in the Region the
+        // request was signed for, so a job under a domain of another Region is not found
+        // here.
+        let region = crate::state::region_of(ctx);
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
@@ -213,12 +216,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into()
         };
-        if store.live_domain(&input.domain_id).is_none() {
+        if store.live_domain(&region, &input.domain_id).is_none() {
             return Err(not_found(
                 crate::service::error_detail::domain_not_found_message(&input.domain_id),
             ));
         }
-        let Some(job) = store.patient_insights_job(&input.domain_id, &input.job_id) else {
+        let Some(job) = store.patient_insights_job(&region, &input.domain_id, &input.job_id) else {
             return Err(not_found(
                 crate::service::error_detail::patient_insights_job_not_found_message(&input.job_id),
             ));

@@ -161,8 +161,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata.
-        let _ = ctx;
+        // request metadata — here the Region this request was signed for, which is the
+        // endpoint the dictionary must belong to.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetDictionaryErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -179,9 +180,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which feeds reference this dictionary is DERIVED from the feed store, so a
         // feed whose subtitling output names it makes it REFERENCED here with that
         // feed's id in `references`.
-        let references = state.feeds_referencing(&input.id);
+        let references = state.feeds_referencing(&region, &input.id);
 
-        let Some(dictionary) = state.dictionaries.get(&input.id) else {
+        // The id is resolved WITHIN the request's Region: the service is regional, so a
+        // dictionary created through another Region's endpoint names nothing here.
+        let Some(dictionary) = state.dictionary(&region, &input.id) else {
             return Err(GetDictionaryErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::NOT_FOUND_MESSAGE.to_string(),

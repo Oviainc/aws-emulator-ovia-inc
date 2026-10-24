@@ -328,16 +328,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than inheriting it from the container `crate::state` happens to hold.
         selected.sort_by(|left, right| left.network_interface_id.cmp(&right.network_interface_id));
 
-        // That order is both the stable paging order and the cursor, so a token naming the
-        // id the next page starts at always advances.
-        let from = match start_at.as_deref() {
-            None => 0,
-            Some(cursor) => selected.partition_point(|interface| {
-                interface.network_interface_id.as_deref().unwrap_or_default() < cursor
-            }),
-        };
-        let page = selected.get(from..).unwrap_or_default();
-
         // "The maximum number of items to return for this request"
         // (`DescribeNetworkInterfacesRequest$MaxResults`). A request that names none gets
         // the largest page the model publishes, so the `NextToken` path below behaves the
@@ -352,21 +342,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|max_results| max_results.clamp(1, MAX_PAGE_SIZE))
             .unwrap_or(MAX_PAGE_SIZE);
 
-        // "This value is null when there are no more items to return"
-        // (`DescribeNetworkInterfacesResult$NextToken`): a token only when an interface
-        // follows this page.
-        let next_token = page
-            .get(limit)
-            .and_then(|interface| interface.network_interface_id.as_deref())
-            .map(crate::state::encode_page_token);
+        // The cursor paging every describe of this crate shares: the token names a position
+        // in the id order above, so a page is cut after the cursor and a token is minted
+        // only when another interface follows it — "this value is null when there are no
+        // more items to return" (`DescribeNetworkInterfacesResult$NextToken`). Shared rather
+        // than hand-rolled here, so one reading of a token serves the whole crate.
+        let (page, next_token) = crate::state::page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            crate::state::PageTokenRule::WhenAnotherItemFollows,
+            |interface| {
+                interface
+                    .network_interface_id
+                    .as_deref()
+                    .unwrap_or_default()
+            },
+        );
 
         Ok(DescribeNetworkInterfacesOutput {
-            network_interfaces: Some(
-                page.iter()
-                    .take(limit)
-                    .map(|interface| (*interface).clone())
-                    .collect(),
-            ),
+            network_interfaces: Some(page.iter().map(|interface| (*interface).clone()).collect()),
             next_token,
         })
     }

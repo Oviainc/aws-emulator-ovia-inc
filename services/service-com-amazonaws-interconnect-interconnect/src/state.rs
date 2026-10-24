@@ -498,6 +498,102 @@ pub fn not_a_connection_arn_message(arn: &str) -> String {
     format!("{REFUSAL_ENVELOPE}{arn} is not the ARN of an Interconnect {ARN_RESOURCE_TYPE}")
 }
 
+/// The shortest and longest a tag KEY may be: `TagKey` is modelled
+/// `@length(min: 1, max: 128)`, so an empty key and one past 128 are both outside
+/// what a `TagMap` can carry.
+pub const TAG_KEY_LENGTH: (usize, usize) = (1, 128);
+
+/// The shortest and longest a tag VALUE may be: `TagValue` is modelled
+/// `@length(min: 0, max: 256)`, so a value may be empty but not longer than 256.
+pub const TAG_VALUE_LENGTH: (usize, usize) = (0, 256);
+
+/// Why a `TagMap` the request carries does not satisfy the lengths the model gives
+/// `TagKey` and `TagValue`, worded for the caller — or `None` when every entry is
+/// inside them. The entry-count half of the rule lives in [`tag_write_violation`],
+/// which is what the handlers call.
+///
+/// Entries are walked in key order so the same request is always refused for the
+/// same entry, and the message names the member and the bound it broke rather than
+/// quoting a value back at the caller.
+fn tag_length_violation(tags: &std::collections::HashMap<String, String>) -> Option<String> {
+    let mut entries: Vec<(&String, &String)> = tags.iter().collect();
+    entries.sort_by(|left, right| left.0.cmp(right.0));
+    for (key, value) in entries {
+        // `@length` on a string counts characters, not bytes, so a non-ASCII key is
+        // measured the way the model measures it.
+        let key_length = key.chars().count();
+        let (key_min, key_max) = TAG_KEY_LENGTH;
+        if !(key_min..=key_max).contains(&key_length) {
+            return Some(format!(
+                "{REFUSAL_ENVELOPE}a tag key must be between {key_min} and {key_max} characters long, and one of length {key_length} is not"
+            ));
+        }
+        let value_length = value.chars().count();
+        let (value_min, value_max) = TAG_VALUE_LENGTH;
+        if !(value_min..=value_max).contains(&value_length) {
+            return Some(format!(
+                "{REFUSAL_ENVELOPE}the tag value for key {key} must be between {value_min} and {value_max} characters long, and one of length {value_length} is not"
+            ));
+        }
+    }
+    None
+}
+
+/// The most tags ONE resource holds at once.
+///
+/// A tag map is written from the request, so without a bound on its entry count a
+/// caller could keep adding fresh keys to the same connection until the store filled
+/// memory — the record-count bounds above ([`MAX_CONNECTIONS`],
+/// [`MAX_STORED_RECORDS`]) limit how many resources exist, not how large one gets.
+/// The model puts no `@length` on `TagMap`, so the number itself is the one AWS
+/// publishes for a resource's tag set; what matters is that there IS one and that
+/// exceeding it is refused, with nothing written, rather than growing the store.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// How many tags a resource currently holding `existing` would hold once `incoming`
+/// is merged into it: a key already present takes the new value instead of adding an
+/// entry, so only the keys that are new count towards the growth.
+fn merged_tag_count(
+    existing: Option<&std::collections::HashMap<String, String>>,
+    incoming: &std::collections::HashMap<String, String>,
+) -> usize {
+    let held = existing.map(|tags| tags.len()).unwrap_or(0);
+    let added = incoming
+        .keys()
+        .filter(|key| existing.is_none_or(|tags| !tags.contains_key(*key)))
+        .count();
+    held + added
+}
+
+/// Why writing `incoming` onto a resource that currently holds `existing` is not a
+/// tag set this service stores, worded for the caller — or `None` when the write is
+/// within every bound.
+///
+/// Both of this service's tag writers (tag-on-create and the tagging operation) judge
+/// their input here, so one rule decides what a stored tag set can be however it was
+/// reached: every entry inside the lengths the model gives `TagKey` and `TagValue`,
+/// and at most [`MAX_TAGS_PER_RESOURCE`] entries on the resource once the write is
+/// merged. A request outside either bound is a fault in the INPUT — the 400 the
+/// service models for one, never a missing resource and never a 501 — and is refused
+/// before anything is written, so a refused write leaves the resource exactly as it
+/// was. The length check is needed because the boundary validator holds a LIST's
+/// members to their target's constraints but not a MAP's keys.
+pub fn tag_write_violation(
+    existing: Option<&std::collections::HashMap<String, String>>,
+    incoming: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if let Some(message) = tag_length_violation(incoming) {
+        return Some(message);
+    }
+    let merged = merged_tag_count(existing, incoming);
+    if merged > MAX_TAGS_PER_RESOURCE {
+        return Some(format!(
+            "{REFUSAL_ENVELOPE}a {ARN_RESOURCE_TYPE} holds at most {MAX_TAGS_PER_RESOURCE} tags, and this request would leave it with {merged}"
+        ));
+    }
+    None
+}
+
 /// The terminal `ConnectionState` a completed `DeleteConnection` settles into.
 pub const DELETED_CONNECTION_STATE: &str = "deleted";
 

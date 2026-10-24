@@ -146,7 +146,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A MUTATION: the spec says this call rejects the invitation, so it moves the
         // stored record's status. The settle() below it materialises only what the clock
         // already owed.
-        let _ = ctx;
+        //
+        // The Region this request is addressed to, read off its own credential scope: an
+        // invitation is recorded in one Region, so one of another Region is not this
+        // request's to reject.
+        let region = crate::state::request_region(ctx);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(RejectInvitationErrorModeled::InternalServiceErrorException(
@@ -163,8 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not this caller's to reject, so it is as good as absent.
         let account = ::engine::emulator_account_id();
         let Some(invitation) = guard
-            .invitations
-            .get_mut(&input.invitation_id)
+            .invitation_mut(&region, &input.invitation_id)
             .filter(|invitation| invitation.principal == account)
         else {
             return Err(RejectInvitationErrorModeled::ResourceNotFoundException(

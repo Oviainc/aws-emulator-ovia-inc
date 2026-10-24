@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the page the request's `PageId` names, rebuilt from the store: the message the
+//! engagement sent to that contact channel, when Incident Manager engaged it, and — once
+//! `AcceptPage` has recorded them — when it was delivered and read.
+//!
+//! Two refusals come first, and this operation writes nothing either way:
+//!
+//! 1. the account-level Incident Manager precondition
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set_for`])
+//!    — this read's whole subject is one resource ARN, so with no ACTIVE replication set the
+//!    account has no home Region for it and the ARN resolves to nothing: the modelled
+//!    `ValidationException` (HTTP 400), BEFORE the page is looked up;
+//! 2. a `PageId` the store holds no page for — the modelled `ResourceNotFoundException`
+//!    (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +181,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePage"))
+        // The page is addressed by ARN and nothing is read off the request envelope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribePageErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        let state = state.lock();
+
+        // The account gate comes FIRST, before `PageId` is resolved, so a non-onboarded
+        // account is refused identically whether or not the page it named exists.
+        state
+            .require_active_replication_set_for(&input.page_id)
+            .map_err(account_precondition_failed)?;
+
+        let Some(page) = state.pages.get(&input.page_id) else {
+            return Err(DescribePageErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Page {} not found", input.page_id),
+                    resource_id: input.page_id.clone(),
+                    resource_type: PAGE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        Ok(crate::state::page_details(page))
     }
+}
+
+/// The `resourceType` this operation's not-found error names, spelled as `AcceptPage` — the
+/// other operation addressed by a `PageId` — spells it.
+const PAGE_RESOURCE_TYPE: &str = "page";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` because the failure is not a member-level one, and `fields` is
+/// present but EMPTY for the same reason — no field of the request is at fault.
+fn account_precondition_failed(message: String) -> DescribePageError {
+    DescribePageErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
 }

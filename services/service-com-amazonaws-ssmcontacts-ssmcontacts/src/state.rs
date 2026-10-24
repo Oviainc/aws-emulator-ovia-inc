@@ -13,7 +13,9 @@
 //! opaque `NextToken` only has to carry the ARN the last page ended on.
 //!
 //! `engagements` is keyed by `EngagementArn` for the same reason: `StopEngagement` and
-//! `DescribeEngagement` both name an engagement by its ARN.
+//! `DescribeEngagement` both name an engagement by its ARN. `pages` — the channels one
+//! engagement engaged — is keyed by `PageArn`, which `AcceptPage` and `DescribePage` name a
+//! page by.
 //!
 //! Besides the state itself this module holds the helpers more than one operation needs —
 //! ARN minting, the page/token codec, the shared enum check and the output-shape
@@ -28,8 +30,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    Contact, ContactChannel, ContactChannelAddress, DescribeEngagementOutput, Engagement, Plan,
-    RecurrenceSettings, Rotation, RotationOverride, Tag,
+    Contact, ContactChannel, ContactChannelAddress, DescribeEngagementOutput, DescribePageOutput,
+    Engagement, Plan, RecurrenceSettings, Rotation, RotationOverride, Tag,
 };
 
 /// What `CreateContact` persists, and what `GetContact`/`ListContacts` rebuild their
@@ -182,6 +184,88 @@ pub struct EngagementRecord {
     pub stop_reason: Option<String>,
 }
 
+/// One page as it is persisted: Incident Manager engaging ONE contact channel as part of an
+/// engagement.
+///
+/// A page is NOT created by a call of its own — the model has no `CreatePage` — so
+/// `StartEngagement` is what mints them: starting an engagement of a contact pages every
+/// contact channel that contact's engagement plan targets. `DescribePage` rebuilds its whole
+/// response from this record, and `AcceptPage` is what stamps [`delivery_time`]/[`read_time`]
+/// and appends to [`receipts`].
+///
+/// [`delivery_time`]: PageRecord::delivery_time
+/// [`read_time`]: PageRecord::read_time
+/// [`receipts`]: PageRecord::receipts
+#[derive(Debug, Clone)]
+pub struct PageRecord {
+    /// The `PageArn`, which is also this record's key in [`pages`].
+    ///
+    /// [`pages`]: ComAmazonawsSsmcontactsSsmcontactsState::pages
+    pub arn: String,
+    /// The `EngagementArn` of the engagement this page is part of.
+    pub engagement_arn: String,
+    /// The `ContactArn` of the contact whose channel this page engages, which is the
+    /// engaged contact itself unless an escalation plan reached it through another contact.
+    pub contact_arn: String,
+    /// The `ContactChannelArn` this page was sent to. A page is Incident Manager engaging a
+    /// contact CHANNEL, so every page has exactly one.
+    pub contact_channel_arn: String,
+    /// The message the engagement carried, copied from the engagement so a page reports what
+    /// was sent to it even after the engagement was stopped.
+    pub sender: String,
+    pub subject: String,
+    pub content: String,
+    pub public_subject: Option<String>,
+    pub public_content: Option<String>,
+    pub incident_id: Option<String>,
+    /// When Incident Manager engages this page's channel: the engagement's start plus the
+    /// durations of the plan stages ahead of the stage that targets it.
+    pub sent_time: SystemTime,
+    /// When the page was first acknowledged `DELIVERED`, once it has been.
+    pub delivery_time: Option<SystemTime>,
+    /// When the page was first acknowledged `READ`, once it has been.
+    pub read_time: Option<SystemTime>,
+    /// The code Incident Manager sent WITH the page, which `AcceptPage` checks the caller's
+    /// `AcceptCode` against while `AcceptCodeValidation` is `ENFORCE`.
+    ///
+    /// AWS puts it in the message it delivers to the channel out of band, never on the
+    /// control-plane wire, so — exactly as a contact channel's activation code — the store is
+    /// the only place it can be read from.
+    pub accept_code: String,
+    /// Every acknowledgement event recorded against this page, oldest first: what
+    /// `ListPageReceipts` reports. Bounded by [`MAX_RECEIPTS_PER_PAGE`].
+    pub receipts: Vec<ReceiptRecord>,
+    /// Insertion order, so the pages of one engagement keep the order the plan engaged them
+    /// in even though the map is keyed by ARN.
+    pub sequence: u64,
+}
+
+/// One event recorded against a page: the modelled `Receipt`, as it is persisted.
+#[derive(Debug, Clone)]
+pub struct ReceiptRecord {
+    /// The channel the event is about, which is the paged channel itself.
+    pub contact_channel_arn: String,
+    /// One of [`crate::ops::types::RECEIPT_TYPE_VALUES`].
+    pub receipt_type: String,
+    /// The `Note` the acknowledgement carried, when it carried one.
+    pub receipt_info: Option<String>,
+    pub receipt_time: SystemTime,
+}
+
+/// One page `StartEngagement` is to send: the channel it goes to, the contact that owns
+/// that channel, and how far into the engagement the plan stage targeting it begins.
+#[derive(Debug, Clone)]
+pub struct PageTarget {
+    /// The `ContactArn` of the contact the paged channel belongs to.
+    pub contact_arn: String,
+    /// The alias of that contact, which is the first segment of the page's own ARN.
+    pub contact_alias: String,
+    pub contact_channel_arn: String,
+    /// The plan's own offset for this target: the sum of `DurationInMinutes` over the
+    /// stages ahead of the stage that targets it, so a later stage's page is sent later.
+    pub stage_offset_minutes: u32,
+}
+
 /// The account's Incident Manager replication set, as the services FRONTED by it see it.
 ///
 /// Amazon SSM Contacts is a global service whose contacts, escalation plans, on-call
@@ -250,6 +334,18 @@ pub struct ComAmazonawsSsmcontactsSsmcontactsState {
     /// nothing about the request distinguishes them, since the model declares no unique
     /// name for an engagement.
     pub engagements_started: u64,
+    /// Pages, keyed by `PageArn`: one per contact channel an engagement engaged.
+    /// `StartEngagement` inserts, `AcceptPage` acknowledges and `DescribePage` reports;
+    /// nothing in this service removes one, since the model has no delete for a page.
+    ///
+    /// Bounded by the channels it is derived from: a start pages each targeted channel at
+    /// most once, so one start mints at most as many pages as the account holds channels
+    /// ([`MAX_CONTACT_CHANNELS`]) and never more than [`MAX_PAGES_PER_ENGAGEMENT`], and
+    /// [`MAX_ENGAGEMENTS`] bounds the starts.
+    pub pages: BTreeMap<String, PageRecord>,
+    /// How many pages this store has ever sent. Feeds [`PageRecord::sequence`] and the page
+    /// ARN's opaque id, so the same channel paged by two engagements holds two pages.
+    pub pages_sent: u64,
     /// `(operation, IdempotencyToken)` -> the ARN that token's first call minted, so a
     /// retried create answers with the same resource instead of minting a second one.
     ///
@@ -368,6 +464,86 @@ impl ComAmazonawsSsmcontactsSsmcontactsState {
             .into_iter()
             .map(|channel| channel.arn.clone())
             .collect()
+    }
+
+    /// The channels one engagement of `contact_arn` pages, in the order the engagement plan
+    /// engages them.
+    ///
+    /// Engaging a contact engages its plan: each stage's `ChannelTargetInfo` names a contact
+    /// channel to page, and each stage's `ContactTargetInfo` names a contact whose OWN plan
+    /// is engaged in turn — which is what makes an escalation plan reach a person's channels.
+    /// A target naming a channel or contact the store does not hold pages nothing, and a plan
+    /// that reaches a contact already queued does not engage it twice, so a plan that cycles
+    /// terminates.
+    ///
+    /// The walk is a WORKLIST, not a recursion: how long a chain of contact-to-contact plans
+    /// a caller has stored is caller-chosen, so descending it recursively would make that
+    /// chain's length the stack depth of one request. The queue costs heap instead, bounded by
+    /// [`MAX_PLANS_PER_ENGAGEMENT`] plans, and the pages it emits by
+    /// [`MAX_PAGES_PER_ENGAGEMENT`].
+    ///
+    /// A plan's `RotationIds` are deliberately not walked here: which contacts an on-call
+    /// rotation engages is the rotation-shift calculation, which the rotation-shift
+    /// operations own.
+    pub fn page_targets_of(&self, contact_arn: &str) -> Vec<PageTarget> {
+        let mut targets: Vec<PageTarget> = Vec::new();
+        let mut paged_channels: BTreeSet<String> = BTreeSet::new();
+        // The plans already queued, which is what keeps a cyclic or diamond-shaped plan from
+        // engaging one contact twice — and, being capped, what bounds the whole walk.
+        let mut queued: BTreeSet<String> = BTreeSet::new();
+        // Each entry is a plan to engage and how far into the engagement it is entered.
+        let mut worklist: VecDeque<(String, u32)> = VecDeque::new();
+        queued.insert(contact_arn.to_string());
+        worklist.push_back((contact_arn.to_string(), 0));
+
+        while let Some((engaged_arn, entry_offset)) = worklist.pop_front() {
+            if targets.len() >= MAX_PAGES_PER_ENGAGEMENT {
+                break;
+            }
+            let Some(contact) = self.contacts.get(&engaged_arn) else {
+                continue;
+            };
+            let mut offset = entry_offset;
+            for stage in contact.plan.stages.iter().flatten() {
+                for target in &stage.targets {
+                    if let Some(channel) = target
+                        .channel_target_info
+                        .as_ref()
+                        .and_then(|info| self.contact_channels.get(&info.contact_channel_id))
+                    {
+                        if targets.len() < MAX_PAGES_PER_ENGAGEMENT
+                            && paged_channels.insert(channel.arn.clone())
+                        {
+                            let alias = self
+                                .contacts
+                                .get(&channel.contact_arn)
+                                .map(|owner| owner.alias.clone())
+                                .unwrap_or_else(|| contact.alias.clone());
+                            targets.push(PageTarget {
+                                contact_arn: channel.contact_arn.clone(),
+                                contact_alias: alias,
+                                contact_channel_arn: channel.arn.clone(),
+                                stage_offset_minutes: offset,
+                            });
+                        }
+                    }
+                    if let Some(engaged) = target
+                        .contact_target_info
+                        .as_ref()
+                        .and_then(|info| info.contact_id.as_deref())
+                    {
+                        if queued.len() < MAX_PLANS_PER_ENGAGEMENT
+                            && queued.insert(engaged.to_string())
+                        {
+                            worklist.push_back((engaged.to_string(), offset));
+                        }
+                    }
+                }
+                // The next stage begins once this one's wait has elapsed.
+                offset = offset.saturating_add(stage.duration_in_minutes.max(0) as u32);
+            }
+        }
+        targets
     }
 
     /// The ARN a previous call with this `(operation, token)` minted, when the resource it
@@ -520,6 +696,32 @@ pub const MAX_ROTATION_OVERRIDES_PER_ROTATION: usize = 1_000;
 /// [`MAX_CONTACTS`].
 pub const MAX_ENGAGEMENTS: usize = 50_000;
 
+/// How many engagement plans ONE `StartEngagement` walks.
+///
+/// A stage's `ContactTargetInfo` names a contact whose own plan is engaged in turn, so the
+/// length of a contact-to-contact chain is caller-chosen: this is the ceiling on how far one
+/// start follows it, bounding both the walk's queue and the work one request does, however
+/// many contacts the store holds. It sits far above any realistic escalation plan.
+pub const MAX_PLANS_PER_ENGAGEMENT: usize = 100;
+
+/// How many pages ONE `StartEngagement` sends, however many stages and targets the
+/// engagement plan chains together.
+///
+/// A page is minted per channel the plan targets, so without a ceiling a plan whose stages
+/// fan out through many contacts would leave an unbounded number of resident page records
+/// per start. The cap sits far above any realistic engagement plan, and the channel map's
+/// own ceiling ([`MAX_CONTACT_CHANNELS`]) means nothing legitimate reaches it. See
+/// [`MAX_CONTACTS`].
+pub const MAX_PAGES_PER_ENGAGEMENT: usize = 1_000;
+
+/// How many acknowledgement events ONE page records before a further `AcceptPage` is
+/// refused with that operation's modelled `ValidationException`.
+///
+/// A page can be acknowledged any number of times — each acknowledgement is an event, not a
+/// state — so the receipt list is the one part of a page a caller can grow without creating
+/// a resource, and this is what bounds it. See [`MAX_CONTACTS`].
+pub const MAX_RECEIPTS_PER_PAGE: usize = 1_000;
+
 /// How many tags one resource holds.
 ///
 /// This is the MODEL's bound, not the emulator's: `TagsList` — the shape both
@@ -637,14 +839,42 @@ pub fn engagement_arn(region: &str, alias: &str, sequence: u64) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("engagement/{alias}/{id}"))
 }
 
+/// A page's ARN:
+/// `arn:aws:ssm-contacts:<region>:<account>:page/<contact alias>/<id>`.
+///
+/// The paged contact's alias is the first segment, exactly as Incident Manager names a page
+/// after the contact whose channel it engages. A page has no caller-chosen name at all —
+/// nothing creates one directly — so the id is derived from the alias plus the store's own
+/// page counter: deterministic for a given sequence of calls, and distinct for every page
+/// the store sends.
+pub fn page_arn(region: &str, alias: &str, sequence: u64) -> String {
+    let id = opaque_uuid(&["page", alias, &sequence.to_string()].join("\u{1f}"));
+    ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("page/{alias}/{id}"))
+}
+
 /// The activation code delivered to a contact channel on its `sequence`-th delivery.
 ///
 /// Derived from the channel's ARN and the store's delivery counter, so it is reproducible
-/// for a given sequence of calls and a channel's successive codes differ. Six decimal
-/// digits, which is inside the modelled `ActivationCode` (`length` 6..10, `pattern`
-/// `^[0-9]*$`).
+/// for a given sequence of calls and a channel's successive codes differ.
 fn activation_code(channel_arn: &str, sequence: u64) -> String {
-    let digest = opaque_id(&["activation-code", channel_arn, &sequence.to_string()].join("\u{1f}"));
+    numeric_code(&["activation-code", channel_arn, &sequence.to_string()].join("\u{1f}"))
+}
+
+/// The accept code Incident Manager sends WITH the page `page_arn` names.
+///
+/// Derived from the page's own ARN, which already carries the store's page counter, so every
+/// page has its own code and a given sequence of calls reproduces it. Six decimal digits,
+/// which is inside the modelled `AcceptCode` (`length` 6..10, `pattern` `^[0-9]*$`) and what
+/// its own documentation calls it.
+pub fn page_accept_code(page_arn: &str) -> String {
+    numeric_code(&["accept-code", page_arn].join("\u{1f}"))
+}
+
+/// Six decimal digits derived from `seed`: the form this service's out-of-band codes take —
+/// a contact channel's `ActivationCode` and a page's `AcceptCode`, both of which the model
+/// constrains to `length` 6..10 and `pattern` `^[0-9]*$`.
+fn numeric_code(seed: &str) -> String {
+    let digest = opaque_id(seed);
     let value = u32::from_str_radix(&digest[..8], 16).unwrap_or_default() % 1_000_000;
     format!("{value:06}")
 }
@@ -762,6 +992,30 @@ pub fn engagement_summary(record: &EngagementRecord) -> Engagement {
         incident_id: record.incident_id.clone(),
         start_time: Some(::aws_smithy_types::DateTime::from(record.start_time)),
         stop_time: record.stop_time.map(::aws_smithy_types::DateTime::from),
+    }
+}
+
+/// The `DescribePage` response for a stored page.
+///
+/// Every member is rebuilt from the record, the message included: a page carries the message
+/// the engagement sent to it, so it reports the same `Sender`/`Subject`/`Content` after the
+/// engagement has been stopped. `DeliveryTime` and `ReadTime` are present exactly when the
+/// page has been acknowledged that way, so a caller reads what `AcceptPage` recorded rather
+/// than a value derived from this request.
+pub fn page_details(record: &PageRecord) -> DescribePageOutput {
+    DescribePageOutput {
+        page_arn: record.arn.clone(),
+        engagement_arn: record.engagement_arn.clone(),
+        contact_arn: record.contact_arn.clone(),
+        sender: record.sender.clone(),
+        subject: record.subject.clone(),
+        content: record.content.clone(),
+        public_subject: record.public_subject.clone(),
+        public_content: record.public_content.clone(),
+        incident_id: record.incident_id.clone(),
+        sent_time: Some(::aws_smithy_types::DateTime::from(record.sent_time)),
+        delivery_time: record.delivery_time.map(::aws_smithy_types::DateTime::from),
+        read_time: record.read_time.map(::aws_smithy_types::DateTime::from),
     }
 }
 

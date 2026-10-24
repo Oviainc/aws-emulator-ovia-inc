@@ -182,18 +182,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Restarts the specified connector [and] all of its tasks": only a
         // connector that is running HAS tasks to restart — one still being
-        // created, one already restarting, or one being deleted has none — so
-        // the request is refused rather than recorded against work that cannot
-        // happen. The same shape of refusal `CreateConnector` answers for a
-        // custom plugin that is not `ACTIVE` yet.
+        // created, one already restarting, one updating, or one being deleted
+        // has none — so the request is refused rather than recorded against
+        // work that cannot happen. The same shape of refusal `CreateConnector`
+        // answers for a custom plugin that is not `ACTIVE` yet.
         if connector.state != crate::state::CONNECTOR_RUNNING {
             return Err(RestartConnectorErrorModeled::BadRequestException(BadRequestException {
                 message: Some(crate::state::invalid_parameter_because(
                     "connectorArn",
-                    &format!(
-                        "The connector is not {}.",
-                        crate::state::CONNECTOR_RUNNING
-                    ),
+                    &crate::state::connector_is_not_running(),
                 )),
             })
             .into());

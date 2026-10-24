@@ -115,11 +115,17 @@ async fn ingestion_arns(emulator: &Emulator, bundle: &str, case: &str) -> Vec<St
 
 /// Create one app bundle and `total` ingestions under it, and answer
 /// `(bundle arn, ingestion arns in creation order)`.
-async fn bundle_with_ingestions(emulator: &Emulator, total: usize, case: &str) -> (String, Vec<String>) {
-    let bundle = arn_of(
-        &emulator.create_app_bundle(json!({})).await.body,
-        "appBundle",
-    );
+///
+/// `bundle_index` picks the Region the bundle is created in, so a fixture needing
+/// two bundles at once gives them different indices: an account holds one app
+/// bundle per Region.
+async fn bundle_with_ingestions(
+    emulator: &Emulator,
+    bundle_index: usize,
+    total: usize,
+    case: &str,
+) -> (String, Vec<String>) {
+    let bundle = emulator.fixture_bundle(bundle_index).await;
     let mut ingestions = Vec::with_capacity(total);
     for index in 0..total {
         let created = emulator
@@ -165,7 +171,7 @@ async fn deleting_an_ingestion_removes_exactly_that_ingestion() {
 
     for (case, total, index, bundle_form, ingestion_form) in cases {
         let emulator = Emulator::new();
-        let (bundle, ingestions) = bundle_with_ingestions(&emulator, total, case).await;
+        let (bundle, ingestions) = bundle_with_ingestions(&emulator, 0, total, case).await;
         let doomed = ingestions[index].clone();
         let survivors: Vec<String> = ingestions
             .iter()
@@ -250,9 +256,9 @@ async fn deleting_an_ingestion_removes_exactly_that_ingestion() {
 #[tokio::test]
 async fn deleting_an_ingestion_the_bundle_does_not_hold_is_a_noop_success() {
     let emulator = Emulator::new();
-    let (bundle, ingestions) = bundle_with_ingestions(&emulator, 2, "set-up").await;
+    let (bundle, ingestions) = bundle_with_ingestions(&emulator, 0, 2, "set-up").await;
     let (other_bundle, other_ingestions) =
-        bundle_with_ingestions(&emulator, 1, "set-up sibling").await;
+        bundle_with_ingestions(&emulator, 1, 1, "set-up sibling").await;
     let foreign = other_ingestions[0].clone();
 
     // (case, bundle identifier, ingestion identifier the bundle does not hold)
@@ -323,7 +329,7 @@ async fn deleting_an_ingestion_the_bundle_does_not_hold_is_a_noop_success() {
 #[tokio::test]
 async fn deleting_under_an_unknown_app_bundle_is_not_found() {
     let emulator = Emulator::new();
-    let (bundle, ingestions) = bundle_with_ingestions(&emulator, 1, "set-up").await;
+    let (bundle, ingestions) = bundle_with_ingestions(&emulator, 0, 1, "set-up").await;
     let real = ingestions[0].clone();
 
     // (case, unknown bundle identifier, ingestion identifier)
@@ -444,7 +450,7 @@ async fn an_ingestion_is_deletable_only_once_stopped_and_emptied() {
     for (case, state, destinations, expected) in cases {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let emulator = Emulator::with_engine(&engine);
-        let (bundle, ingestions) = bundle_with_ingestions(&emulator, 1, case).await;
+        let (bundle, ingestions) = bundle_with_ingestions(&emulator, 0, 1, case).await;
         let ingestion = ingestions[0].clone();
         for index in 0..destinations {
             create_destination(&emulator, &bundle, &ingestion, &format!("audit-logs-{index}"))

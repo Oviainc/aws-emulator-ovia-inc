@@ -223,17 +223,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.purge_due_deletions(now);
 
-        // The account-wide Domain cap, enforced BEFORE anything is minted so a refused
-        // request advances nothing. It is a LIVE count of the domains the account holds,
-        // so a `DeleteDomain` (once its purge has fallen due) frees the slot and the next
-        // create succeeds. The purge above is what makes the count live at this instant.
-        let held = store.domains_held_by(&account_id);
+        // The account's Domain cap IN THE REGION this create is addressed to, enforced
+        // BEFORE anything is minted so a refused request advances nothing. It is a LIVE
+        // count of the domains the account holds in this Region, so a `DeleteDomain`
+        // (once its purge has fallen due) frees the slot and the next create succeeds,
+        // and a domain the account holds in another Region consumes none of it. The purge
+        // above is what makes the count live at this instant.
+        let held = store.domains_held_by(&region, &account_id);
         if held >= crate::state::MAX_DOMAINS_PER_ACCOUNT {
             return Err(CreateDomainErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(format!(
                         "Account {account_id} has reached the maximum limit of {} domains.",
                         crate::state::MAX_DOMAINS_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+        // This STORE's own ceiling, beside the quota above and enforced just as early.
+        // The quota is counted per Region, and the Region a record is filed under is read
+        // off the request, so the quota alone would be a limit per value a caller chose.
+        // This one is an absolute count of the records held, so a caller looping a create
+        // cannot grow the shared store whatever Region — or however many Regions — it
+        // signs for.
+        if store.domains.len() >= crate::state::MAX_DOMAINS_HELD {
+            return Err(CreateDomainErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "The request would exceed the maximum number of domains allowed in this \
+                         service ({} domains).",
+                        crate::state::MAX_DOMAINS_HELD
                     )),
                 },
             )
@@ -297,6 +317,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             domain_id: domain_id.clone(),
             arn: arn.clone(),
             account_id,
+            // The Region this create was addressed to OWNS the domain: it is the region
+            // segment of the ARN above, and the Region whose endpoint can list, read,
+            // mutate and delete it.
+            region: region.clone(),
             // Every domain this emulator creates is onboarded through the one
             // provisioning path it implements; the generation is fixed here, at
             // creation, and read back from the record by every response.

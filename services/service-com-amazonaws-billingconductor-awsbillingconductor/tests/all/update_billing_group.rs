@@ -1032,7 +1032,10 @@ async fn the_responsibility_transfer_arn_of_an_existing_group_cannot_be_modified
 
     // Naming the value the group already holds modifies nothing, so it is served — and
     // so is an `AccountGrouping` that names only the member this operation may change.
-    let served: [(&str, &String, Value); 2] = [
+    // Automatic account association is elected by at most one group of the family at a
+    // time (see `tests/all/auto_associate_billing_group_cap.rs`), so the middle row
+    // hands the election back before the second group takes it.
+    let served: [(&str, &String, Value, bool); 3] = [
         (
             "a transfer group restates the relationship it holds",
             &transfer,
@@ -1040,15 +1043,23 @@ async fn the_responsibility_transfer_arn_of_an_existing_group_cannot_be_modified
                 "ResponsibilityTransferArn": transfer_arn("1234abcd"),
                 "AutoAssociate": true,
             }}),
+            true,
+        ),
+        (
+            "the transfer group turns AutoAssociate back off",
+            &transfer,
+            json!({ "AccountGrouping": { "AutoAssociate": false } }),
+            false,
         ),
         (
             "a standard group names only AutoAssociate",
             &standard,
             json!({ "AccountGrouping": { "AutoAssociate": true } }),
+            true,
         ),
     ];
 
-    for (case, arn, patch) in served {
+    for (case, arn, patch, expected) in served {
         let (status, response) = em.update_group(arn, &patch).await;
         assert_eq!(
             status, 200,
@@ -1057,8 +1068,8 @@ async fn the_responsibility_transfer_arn_of_an_existing_group_cannot_be_modified
         let listed = em.listed(arn).await;
         assert_eq!(
             listed["AccountGrouping"]["AutoAssociate"].as_bool(),
-            Some(true),
-            "case {case:?}: the member the operation may change must be persisted, got {listed}"
+            Some(expected),
+            "case {case:?}: expected the persisted AutoAssociate {expected}, got {listed}"
         );
     }
 

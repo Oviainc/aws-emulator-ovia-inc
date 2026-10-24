@@ -981,6 +981,31 @@ pub const STATUSES_CANCELLABLE_BEFORE_PASS: &[&str] = &["SCHEDULING", "SCHEDULED
 /// a cancel here is a stop — reported as [`CONTACT_CANCELLING`] while it is carried out.
 pub const STATUSES_CANCELLABLE_DURING_PASS: &[&str] = &["PREPASS", "PASS", "POSTPASS"];
 
+/// The `ContactStatus` values a contact can no longer leave: its pass is over, it was
+/// released, or it will never be flown.
+///
+/// Source: the model's own enum (`smithy_query(query="shape", shape="ContactStatus")`).
+/// Of its thirteen values these six are the ends of the lifecycle — a contact released by
+/// the customer or by AWS (`CANCELLED`, `AWS_CANCELLED`), one whose pass finished
+/// (`COMPLETED`), one that failed or that the service itself failed (`FAILED`,
+/// `AWS_FAILED`) and a reservation that never became a contact (`FAILED_TO_SCHEDULE`).
+/// Every other value is a contact still going somewhere: `SCHEDULING` and `SCHEDULED`
+/// have their pass ahead of them, `PREPASS`, `PASS` and `POSTPASS` are in it,
+/// `CANCELLING` is a release under way, and `AVAILABLE` is a window still on offer.
+///
+/// It is what makes a contact NON-terminal, which is the state the model's
+/// `ResourceInUseException` is about: "the specified resource is in use by non-terminal
+/// state contacts and cannot be modified or deleted" (`smithy_query(query="shape",
+/// shape="ResourceInUseException")`).
+pub const TERMINAL_CONTACT_STATUSES: &[&str] = &[
+    "AWS_CANCELLED",
+    "AWS_FAILED",
+    "CANCELLED",
+    "COMPLETED",
+    "FAILED",
+    "FAILED_TO_SCHEDULE",
+];
+
 /// Every `ContactStatus` in which a cancel still has a reservation to release, in
 /// lifecycle order, as a refusal naming them spells them.
 pub fn cancellable_statuses() -> String {
@@ -1108,6 +1133,24 @@ impl Contact {
         let status = self.contact_status.as_str();
         STATUSES_CANCELLABLE_BEFORE_PASS.contains(&status)
             || STATUSES_CANCELLABLE_DURING_PASS.contains(&status)
+    }
+
+    /// Whether this contact is still going somewhere: its status is not one of
+    /// [`TERMINAL_CONTACT_STATUSES`], so what it is flown with is still a live dependency.
+    pub fn is_non_terminal(&self) -> bool {
+        !TERMINAL_CONTACT_STATUSES.contains(&self.contact_status.as_str())
+    }
+
+    /// Whether this contact is flown against the satellite `satellite_arn` names.
+    ///
+    /// The version in force answers it, and so does the version still being applied: an
+    /// `UPDATING` version is the configuration the contact is about to be flown with, so a
+    /// satellite either version names is one this contact depends on.
+    pub fn flies_satellite(&self, satellite_arn: &str) -> bool {
+        [self.active_version(), self.latest_version()]
+            .into_iter()
+            .flatten()
+            .any(|version| version.satellite_arn.as_deref() == Some(satellite_arn))
     }
 
     /// Release this contact's reservation, from whichever side of its pass the cancel
@@ -2000,6 +2043,22 @@ pub const EPHEMERIS_EXPIRED: &str = "EXPIRED";
 /// ephemeris by that label answers it, so it is one text of the service.
 pub const EPHEMERIS_NOT_FOUND: &str = "Ephemeris not found";
 
+/// What this service answers while the ephemeris a delete addressed is still in use: the
+/// refusal names the contacts that hold it, which is what tells a caller what has to be
+/// flown or released first.
+///
+/// The status (409) and the error code (`ResourceInUseException`) are the contract; this is
+/// the wording that goes with them, and the ids in it are the ones the store holds rather
+/// than anything echoed from the request — the same composition this service already uses
+/// for a config a mission profile still references ([`config_in_use_message`]).
+pub fn ephemeris_in_use_message(contact_ids: &[String]) -> String {
+    format!(
+        "Ephemeris cannot be deleted; it is currently being used by the following \
+         contacts: {}",
+        contact_ids.join(", ")
+    )
+}
+
 /// Why an ephemeris whose supplied data describes a backwards-running validity range did
 /// not validate: a value of the model's `EphemerisInvalidReason` enum, whose members are
 /// `METADATA_INVALID`, `TIME_RANGE_INVALID`, `TRAJECTORY_INVALID`, `KMS_KEY_INVALID` and
@@ -2814,6 +2873,79 @@ impl ComAmazonawsGroundstationGroundstationState {
             .dataflow_endpoint_groups
             .remove(dataflow_endpoint_group_id)?;
         self.arn_index.remove(&removed.dataflow_endpoint_group_arn);
+        Some(removed)
+    }
+
+    /// The contacts that still depend on the ephemeris `ephemeris_id` names, as the
+    /// refusal of a delete lists them; empty when nothing depends on it.
+    ///
+    /// An ephemeris is what a contact's antenna is pointed by, through the satellite the
+    /// ephemeris applies to: a contact names its satellite by ARN
+    /// ([`Contact::flies_satellite`]), and the ephemeris in force for that satellite is the
+    /// trajectory its pass is flown on. So the ephemerides a contact depends on are the
+    /// ones that apply to its satellite, and a contact depends on them for as long as it is
+    /// not terminal ([`Contact::is_non_terminal`]) — once its pass is over or its
+    /// reservation released, nothing of it is still to be flown.
+    ///
+    /// Only an ephemeris whose status is [`EPHEMERIS_ENABLED`] is in force: that status is
+    /// what "whether or not the ephemeris is enabled" (`smithy_query(query="operation",
+    /// operation="DescribeEphemeris")`) reports, and one still validating, disabled,
+    /// invalid or expired is not the trajectory anything is flown on. CHOSEN coupling: AWS
+    /// documents only that such a resource "is in use by non-terminal state contacts", so
+    /// which contacts hold which ephemeris is this emulator's rule, stated once here rather
+    /// than per operation.
+    ///
+    /// Sorted, so a refusal listing them reads the same on every call whatever order the
+    /// map iterates in.
+    pub fn contacts_using_ephemeris(&self, ephemeris_id: &str) -> Vec<String> {
+        let Some(ephemeris) = self.ephemerides.get(ephemeris_id) else {
+            return Vec::new();
+        };
+        if ephemeris.status != EPHEMERIS_ENABLED {
+            return Vec::new();
+        }
+        // An ephemeris that applies to no satellite is the trajectory of nothing, so no
+        // contact is flown on it.
+        let Some(satellite_arn) = ephemeris
+            .satellite_id
+            .as_deref()
+            .and_then(|satellite_id| self.satellites.get(satellite_id))
+            .map(|satellite| satellite.satellite_arn.clone())
+        else {
+            return Vec::new();
+        };
+        let mut holding: Vec<String> = self
+            .contacts
+            .values()
+            .filter(|contact| contact.is_non_terminal() && contact.flies_satellite(&satellite_arn))
+            .map(|contact| contact.contact_id.clone())
+            .collect();
+        holding.sort();
+        holding
+    }
+
+    /// Remove the ephemeris `ephemeris_id` addresses, along with the ARN index entry that
+    /// resolved to it and any satellite reference that named it, and answer it; `None` when
+    /// no ephemeris has that id.
+    ///
+    /// Dropping the index entry is what makes the deletion complete: the tagging
+    /// operations address an ephemeris by ARN, and after this that ARN resolves to nothing,
+    /// exactly as the ARN of one that never existed does.
+    pub fn remove_ephemeris(&mut self, ephemeris_id: &str) -> Option<Ephemeris> {
+        let removed = self.ephemerides.remove(ephemeris_id)?;
+        self.arn_index.remove(&removed.ephemeris_arn);
+        // A satellite reports the ephemeris its trajectory is computed from; a deleted one
+        // is no longer that, so the reference goes with it rather than being left dangling.
+        for satellite in self.satellites.values_mut() {
+            if satellite
+                .current_ephemeris
+                .as_ref()
+                .and_then(|metadata| metadata.ephemeris_id.as_deref())
+                == Some(ephemeris_id)
+            {
+                satellite.current_ephemeris = None;
+            }
+        }
         Some(removed)
     }
 

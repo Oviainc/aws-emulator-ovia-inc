@@ -41,6 +41,8 @@ mod harness;
 mod output_provenance;
 #[path = "all/refusals_from_state.rs"]
 mod refusals_from_state;
+#[path = "all/region_isolation.rs"]
+mod region_isolation;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/response_members.rs"]

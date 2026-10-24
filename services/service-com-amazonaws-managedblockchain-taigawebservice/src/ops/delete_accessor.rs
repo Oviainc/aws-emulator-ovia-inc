@@ -148,7 +148,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The deletion is driven entirely by stored state; the request carries no
         // region-dependent value to mint.
-        let _ = ctx;
+        //
+        // The Region this request is addressed to, read off its own credential scope: an
+        // accessor belongs to the Region its `CreateAccessor` was signed for, so one of
+        // another Region is not this request's to delete.
+        let region = crate::state::request_region(ctx);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteAccessorErrorModeled::InternalServiceErrorException(
@@ -161,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.settle(now);
 
-        let Some(accessor) = guard.accessors.get_mut(&input.accessor_id) else {
+        let Some(accessor) = guard.accessor_mut(&region, &input.accessor_id) else {
             return Err(DeleteAccessorErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_ACCESSOR, &input.accessor_id),
             )

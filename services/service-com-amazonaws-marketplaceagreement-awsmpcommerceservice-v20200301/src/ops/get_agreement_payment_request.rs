@@ -224,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The calling identity must be either the acceptor or proposer of the
         // payment request": the proposer is the account the send recorded on the
         // request and the acceptor is the one the agreement records, which
-        // `crate::state::payment_request_party_matches` decides. This emulator
+        // `crate::state::submitted_request_party_matches` decides. This emulator
         // serves a single account, which is both for every request it stores, so
         // no stored request is readable by a non-party and the modelled
         // `AccessDeniedException` has no case to answer here.

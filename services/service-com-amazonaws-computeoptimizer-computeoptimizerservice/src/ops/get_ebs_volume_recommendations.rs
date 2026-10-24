@@ -421,35 +421,22 @@ impl FindingFilter {
 /// This request's filters, refusing any `Finding` value that is not an `EBSFinding`
 /// ("The valid values are `Optimized`, or `NotOptimized`", `EBSFilter$values`). Refused
 /// up front, so a request cannot be answered by a filter that silently matched nothing.
+///
+/// The rule is the crate's ([`crate::state::ebs_filter_rejection`]), shared with
+/// `ExportEBSVolumeRecommendations`, which takes the same `EBSFilters`; this wrapper only
+/// lifts the reason into this operation's error channel and resolves each admitted filter
+/// to the test it applies.
 fn volume_filters(
     filters: Option<&[EBSFilter]>,
 ) -> Result<Vec<FindingFilter>, GetEBSVolumeRecommendationsError> {
-    let mut resolved = Vec::new();
-    for filter in filters.unwrap_or_default() {
-        let findings = filter.values.clone().unwrap_or_default();
-        let name = filter
-            .name
-            .as_deref()
-            .unwrap_or(crate::state::EBS_FILTER_NAME_FINDING);
-        if name != crate::state::EBS_FILTER_NAME_FINDING {
-            return Err(invalid_parameter(format!(
-                "The value supplied for parameter filters is not valid: {name} is not a filter \
-                 name Amazon EBS volume recommendations can be filtered by."
-            )));
-        }
-        for finding in &findings {
-            if finding != crate::state::FINDING_OPTIMIZED
-                && finding != crate::state::FINDING_NOT_OPTIMIZED
-            {
-                return Err(invalid_parameter(format!(
-                    "The value supplied for parameter filters is not valid: {finding} is not a \
-                     valid value of the {name} filter. Valid values are {} and {}.",
-                    crate::state::FINDING_OPTIMIZED,
-                    crate::state::FINDING_NOT_OPTIMIZED,
-                )));
-            }
-        }
-        resolved.push(FindingFilter { findings });
+    let filters = filters.unwrap_or_default();
+    if let Some(reason) = crate::state::ebs_filter_rejection(filters) {
+        return Err(invalid_parameter(reason));
     }
-    Ok(resolved)
+    Ok(filters
+        .iter()
+        .map(|filter| FindingFilter {
+            findings: filter.values.clone().unwrap_or_default(),
+        })
+        .collect())
 }

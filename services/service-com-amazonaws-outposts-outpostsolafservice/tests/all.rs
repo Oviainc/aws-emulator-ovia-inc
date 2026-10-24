@@ -29,6 +29,8 @@ mod orderable_instance_types;
 mod outpost_assets;
 #[path = "all/outpost_decommission.rs"]
 mod outpost_decommission;
+#[path = "all/outpost_server_connection.rs"]
+mod outpost_server_connection;
 #[path = "all/private_connectivity.rs"]
 mod private_connectivity;
 #[path = "all/private_connectivity_ownership.rs"]

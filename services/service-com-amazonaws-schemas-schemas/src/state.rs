@@ -960,7 +960,11 @@ pub struct Schema {
     /// One of [`crate::ops::types::TYPE_VALUES`].
     pub r#type: String,
     pub tags: BTreeMap<String, String>,
-    /// The highest version number stored; rendered as the decimal `SchemaVersion`.
+    /// The highest version number ever minted for this schema; rendered as the
+    /// decimal `SchemaVersion`. It only ever rises, so a number a delete freed is
+    /// never handed out again — which is why the version a read of "the latest"
+    /// selects comes from [`Schema::latest_stored_version`], the highest version the
+    /// schema still HOLDS, and not from here.
     pub latest_version: u64,
     /// When the schema itself was last written (created, or a new version added).
     pub last_modified: SystemTime,
@@ -972,9 +976,10 @@ pub struct Schema {
     /// of the same definition — what the member's `@idempotencyToken` trait is for.
     ///
     /// Bounded by the version map: only a call that mints a version records a token,
-    /// so there is at most one entry per version ever minted. An entry whose version
-    /// has since been deleted names nothing, and `UpdateSchema` ignores it rather
-    /// than answering a version the store no longer holds.
+    /// so there is at most one entry per version the schema HOLDS — an entry is
+    /// removed with the version it names ([`Schema::remove_version`]), so freeing a
+    /// version number frees its token entry too and this map never outgrows the
+    /// versions it records mints into.
     pub minted_by_token: BTreeMap<String, u64>,
     /// The code bindings `PutCodeBinding` has started for this schema, keyed by the
     /// schema version they were generated from and the language they were generated
@@ -1105,9 +1110,60 @@ impl Schema {
     /// value, so surrounding space is not a version number.
     pub fn version_for(&self, requested: Option<&str>) -> Option<&SchemaVersion> {
         match requested {
-            None => self.versions.get(&self.latest_version),
-            Some(raw) => self.versions.get(&raw.parse::<u64>().ok()?),
+            // The newest version the schema still HOLDS: a deleted version is gone
+            // from every later read, so after one is deleted the latest is the
+            // highest-numbered of those that remain. `None` here means the schema
+            // holds no version at all.
+            None => self.versions.values().next_back(),
+            Some(raw) => self.versions.get(&Self::version_number(raw)?),
         }
+    }
+
+    /// The version number a `SchemaVersion` label names, if it names one at all.
+    ///
+    /// The ONE definition of how a request's version label is read, so every reader
+    /// and the delete resolve it the same way: a version number is the whole decimal
+    /// value, so anything else — surrounding space, a sign, a decimal point, a word —
+    /// names no version.
+    fn version_number(requested: &str) -> Option<u64> {
+        requested.parse::<u64>().ok()
+    }
+
+    /// The highest version number this schema still HOLDS, if it holds any.
+    ///
+    /// Distinct from [`Schema::latest_version`], which counts every version ever
+    /// minted: once a version is deleted the store no longer holds it, so what a read
+    /// of "the latest version" answers is the newest one that survives.
+    pub fn latest_stored_version(&self) -> Option<u64> {
+        self.versions.keys().next_back().copied()
+    }
+
+    /// Remove the version numbered `version`, and with it everything derived from
+    /// that version alone; answer whether the schema held it.
+    ///
+    /// A code binding is generated FROM one version's content, so a binding of a
+    /// version the store no longer holds describes nothing and goes with it, and so
+    /// does the idempotency-token entry that names it: a token whose version is gone
+    /// names nothing a retry could answer with, which is also what keeps that map no
+    /// larger than the version set it records mints into. The schema itself, every
+    /// other version and [`Schema::latest_version`] are left exactly as they were:
+    /// deleting a definition is not deleting the schema, and a freed number is never
+    /// minted again.
+    pub fn remove_version(&mut self, version: u64) -> bool {
+        if self.versions.remove(&version).is_none() {
+            return false;
+        }
+        self.code_bindings
+            .retain(|(bound_version, _), _| *bound_version != version);
+        self.minted_by_token.retain(|_, minted| *minted != version);
+        true
+    }
+
+    /// Remove the version a request's `SchemaVersion` label NAMES, resolving the
+    /// label exactly as [`Schema::version_for`] resolves it for a read; answer
+    /// whether the schema held it.
+    pub fn remove_version_named(&mut self, requested: &str) -> bool {
+        Self::version_number(requested).is_some_and(|version| self.remove_version(version))
     }
 
     /// Store `content` as this schema's NEXT version and answer the version stored.

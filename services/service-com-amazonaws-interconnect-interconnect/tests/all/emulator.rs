@@ -222,6 +222,16 @@ pub(crate) fn tags_of(value: &Value) -> std::collections::BTreeMap<String, Strin
         .unwrap_or_default()
 }
 
+/// A `Connection` with its tag set projected out, so two records can be compared on
+/// everything a tag change must NOT touch.
+pub(crate) fn without_tags(connection: &Value) -> Value {
+    let mut copy = connection.clone();
+    if let Some(map) = copy.as_object_mut() {
+        map.remove("tags");
+    }
+    copy
+}
+
 /// A string member, or `""` when absent — so a missing member fails an assertion
 /// rather than panicking the harness.
 pub(crate) fn text(value: &Value, member: &str) -> String {

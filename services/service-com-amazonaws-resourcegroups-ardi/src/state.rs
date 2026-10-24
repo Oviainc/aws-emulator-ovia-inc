@@ -126,47 +126,82 @@ fn is_tag_character(c: char) -> bool {
         || matches!(c, '_' | '.' | ':' | '/' | '=' | '+' | '-' | '@')
 }
 
-/// `Ok(())` when the pair `key`/`value` is one a caller may write to a group,
-/// else the message the refusal reports.
+/// The request member a tagging call carries its pairs in, as the refusal names it.
+pub const TAGS_MEMBER: &str = "Tags";
+
+/// The request member an untagging call carries its keys in, as the refusal names
+/// it.
+pub const TAG_KEYS_MEMBER: &str = "Keys";
+
+/// `Ok(())` when `key` names a tag a caller may change on a group, else the
+/// message the refusal reports — prefixed with `member`, the request member the
+/// key arrived in, so a caller reading the message alone knows what to fix.
 ///
-/// The ONE place this service decides whether a tag may be written, so every path
-/// that stores tags — a create that carries them and a later tagging call —
-/// refuses the same pairs the same way:
+/// The ONE place this service decides whether a string names a tag key a caller
+/// controls, so every path that writes tags and the one that removes them judge a
+/// key the same way:
 ///
-/// * the key and the value stay inside the modelled lengths and character set
-///   ([`MAX_TAG_KEY_LENGTH`], [`MAX_TAG_VALUE_LENGTH`], [`is_tag_character`]);
-/// * the key is outside the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.
-pub fn check_tag(key: &str, value: &str) -> Result<(), String> {
+/// * it stays inside the modelled key length and character set
+///   ([`MAX_TAG_KEY_LENGTH`], [`is_tag_character`]);
+/// * it is outside the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace, which a
+///   caller can neither write nor remove.
+pub fn check_tag_key(member: &str, key: &str) -> Result<(), String> {
     let key_length = key.chars().count();
     if !(1..=MAX_TAG_KEY_LENGTH).contains(&key_length) {
         return Err(format!(
-            "Tags is not valid: a tag key is 1 to {MAX_TAG_KEY_LENGTH} characters long, \
+            "{member} is not valid: a tag key is 1 to {MAX_TAG_KEY_LENGTH} characters long, \
              and this one is {key_length}",
         ));
     }
     if let Some(character) = key.chars().find(|c| !is_tag_character(*c)) {
         return Err(format!(
-            "Tags is not valid: the tag key {key} carries {character:?}, which is not one of \
+            "{member} is not valid: the tag key {key} carries {character:?}, which is not one of \
              the letters, numbers, separators and `_ . : / = + - @` a tag may use",
-        ));
-    }
-    let value_length = value.chars().count();
-    if value_length > MAX_TAG_VALUE_LENGTH {
-        return Err(format!(
-            "Tags is not valid: a tag value is at most {MAX_TAG_VALUE_LENGTH} characters long, \
-             and the value of {key} is {value_length}",
-        ));
-    }
-    if let Some(character) = value.chars().find(|c| !is_tag_character(*c)) {
-        return Err(format!(
-            "Tags is not valid: the value of the tag key {key} carries {character:?}, which is \
-             not one of the letters, numbers, separators and `_ . : / = + - @` a tag may use",
         ));
     }
     if is_reserved_tag_key(key) {
         return Err(format!(
-            "Tags is not valid: the {RESERVED_TAG_KEY_PREFIX} prefix is reserved, so the tag \
-             key {key} cannot be written",
+            "{member} is not valid: the {RESERVED_TAG_KEY_PREFIX} prefix is reserved, so the tag \
+             key {key} is not one a caller can change",
+        ));
+    }
+    Ok(())
+}
+
+/// `Ok(())` when every key in `keys` is one a caller may remove from a group, else
+/// the message the refusal reports.
+///
+/// The whole batch is judged BEFORE anything is removed, so a request holding one
+/// key this service refuses removes none of its keys.
+pub fn check_tag_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+    for key in keys {
+        check_tag_key(TAG_KEYS_MEMBER, key)?;
+    }
+    Ok(())
+}
+
+/// `Ok(())` when the pair `key`/`value` is one a caller may write to a group,
+/// else the message the refusal reports.
+///
+/// The ONE place this service decides whether a tag may be written, so every path
+/// that stores tags — a create that carries them and a later tagging call —
+/// refuses the same pairs the same way: the key is one [`check_tag_key`] admits,
+/// and the value stays inside the modelled length and character set
+/// ([`MAX_TAG_VALUE_LENGTH`], [`is_tag_character`]).
+pub fn check_tag(key: &str, value: &str) -> Result<(), String> {
+    check_tag_key(TAGS_MEMBER, key)?;
+    let value_length = value.chars().count();
+    if value_length > MAX_TAG_VALUE_LENGTH {
+        return Err(format!(
+            "{TAGS_MEMBER} is not valid: a tag value is at most {MAX_TAG_VALUE_LENGTH} \
+             characters long, and the value of {key} is {value_length}",
+        ));
+    }
+    if let Some(character) = value.chars().find(|c| !is_tag_character(*c)) {
+        return Err(format!(
+            "{TAGS_MEMBER} is not valid: the value of the tag key {key} carries {character:?}, \
+             which is not one of the letters, numbers, separators and `_ . : / = + - @` a tag \
+             may use",
         ));
     }
     Ok(())
@@ -324,6 +359,28 @@ impl GroupRecord {
             .filter_map(|(key, _)| self.tags.get_key_value(*key))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect())
+    }
+
+    /// Remove the tags `keys` names from this record, and report the keys whose
+    /// tag this call actually removed.
+    ///
+    /// A key the record does not carry removes nothing and is reported in
+    /// nothing, so removing the same key twice is idempotent: the second call
+    /// reports no key and leaves the same map behind. A key the batch repeats is
+    /// likewise reported once. A key the batch does not name keeps the value it
+    /// had, so the removal touches only the keys the request asked for.
+    ///
+    /// The reported keys come from what the record HELD, in the order the batch
+    /// named them, so a caller reports the tags the store lost rather than the
+    /// list the request sent.
+    pub fn remove_tags<'a>(&mut self, keys: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        let mut removed = Vec::new();
+        for key in keys {
+            if self.tags.remove(key).is_some() {
+                removed.push(key.to_string());
+            }
+        }
+        removed
     }
 
     /// Record `resource_arn` as a member, keeping [`GroupRecord::members`] sorted

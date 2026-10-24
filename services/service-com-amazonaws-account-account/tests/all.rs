@@ -15,6 +15,8 @@
 mod account_information_wire_fidelity;
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/alternate_contact_delete_precedence.rs"]
+mod alternate_contact_delete_precedence;
 #[path = "all/contact_information.rs"]
 mod contact_information;
 #[path = "all/enum_input_validation.rs"]

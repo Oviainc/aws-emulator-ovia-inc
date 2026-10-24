@@ -12,8 +12,9 @@ use std::sync::Arc;
 use smithy_server_runtime::MultiServiceRouter;
 
 pub(crate) use crate::network_and_node_lifecycle::{
-    available_network, call, create_network, create_network_body, is_date_time, is_resource_id,
-    member_configuration, new_router, router_over, Answer, ACCOUNT, PAST_TRANSITION, REGION,
+    available_network, call, call_in_region, create_network, create_network_body, is_date_time,
+    is_resource_id, member_configuration, new_router, router_over, Answer, ACCOUNT,
+    PAST_TRANSITION, REGION,
 };
 
 /// A router and the store its handlers read and write — the SAME engine, so a suite can

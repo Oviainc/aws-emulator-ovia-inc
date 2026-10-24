@@ -1720,6 +1720,79 @@ pub fn managed_node_id_is_well_formed(id: &str) -> bool {
     false
 }
 
+/// The regular expression a managed-node id has to satisfy, as a refusal reports it: the
+/// alternation the modelled `InstanceId` pattern `^(^i-(\w{8}|\w{17})$)|(^mi-\w{17}$)$`
+/// is, without the outer anchors the model wraps it in — each branch anchors itself, so
+/// the alternation is the whole constraint. [`managed_node_id_is_well_formed`] decides the
+/// same expression by hand.
+pub const MANAGED_NODE_ID_PATTERN: &str = r"(^i-(\w{8}|\w{17})$)|(^mi-\w{17}$)";
+
+/// The input member a managed-node id fills, as a refusal names it. The `InstanceId`
+/// shape is ONE identifier space across this service, so a value that is not one of its
+/// ids is reported at that member whichever filter or list carried it.
+pub const MANAGED_NODE_ID_MEMBER: &str = "instanceId";
+
+/// How a value that violates a modelled regular-expression constraint is reported: the
+/// member the value filled and the expression the model constrains that member with, in
+/// the uniform wording a constraint violation carries.
+///
+/// The text is DERIVED from the constraint rather than written out as prose, because that
+/// is what makes it readable by something other than a human: a client, or an SDK-level
+/// validator, extracts the member path and the pattern from it to report which input to
+/// fix and what it has to satisfy.
+///
+/// The requirement clause is the one the framework's boundary validator renders for the
+/// same violation (`smithy_schema_server::constraints`, `Violation::message`), which this
+/// cannot call: that form echoes the offending value ("Value '<v>' at '<member>' …"),
+/// while a managed-node filter's refusal states only the member and the pattern it had to
+/// satisfy.
+pub fn pattern_constraint_violation(member: &str, pattern: &str) -> String {
+    format!(
+        "Value at '{member}' failed to satisfy constraint: Member must satisfy regular \
+         expression pattern: {pattern}"
+    )
+}
+
+/// The refusal a value that is not shaped like a managed-node id carries — the violated
+/// constraint, built from [`MANAGED_NODE_ID_MEMBER`] and [`MANAGED_NODE_ID_PATTERN`] — so
+/// every operation that reads a node id reports the same violation of the same
+/// constraint.
+pub fn managed_node_id_constraint_violation() -> String {
+    pattern_constraint_violation(MANAGED_NODE_ID_MEMBER, MANAGED_NODE_ID_PATTERN)
+}
+
+/// The refusal a request that mixes filter kinds carries, as the service words it: one
+/// sentence about the KINDS, carrying none of the request's keys — a tag filter and an
+/// inventory filter each select by something other than a property of the node, so neither
+/// can narrow the same query a filter on a property does.
+pub const MIXED_FILTER_KINDS_REJECTION: &str =
+    "Cannot mix tag or inventory filter with any other filter.";
+
+/// Why the filter keys of a managed-node describe cannot hold together, or `None` when
+/// they can.
+///
+/// "Tag filters can't be combined with other filter types"
+/// (`DescribeInstanceInformationRequest$Filters`): a filter on a tag and a filter on a
+/// property of a node cannot be ANDed in one request, while two tag filters, and two
+/// property filters, can — the rule is about which filter KINDS may be combined. Every
+/// key reaching this is a key the operation accepts, so what it refuses is the
+/// COMBINATION of two recognised keys, which is a validation of the request rather than an
+/// unknown key.
+pub fn tag_filter_combination_rejection<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Option<&'static str> {
+    let mut tags = 0usize;
+    let mut properties = 0usize;
+    for key in keys {
+        if is_tag_filter_key(key) {
+            tags += 1;
+        } else {
+            properties += 1;
+        }
+    }
+    (tags != 0 && properties != 0).then_some(MIXED_FILTER_KINDS_REJECTION)
+}
+
 /// How `LessThan` and `GreaterThan` order two filter values.
 ///
 /// Both operators are declared for a filter over properties that are mostly dotted

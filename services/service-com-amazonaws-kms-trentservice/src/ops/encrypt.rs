@@ -10,6 +10,17 @@
 //! plaintext does not appear in it — and a blob sealed by one key cannot be opened
 //! by another.
 //!
+//! One deliberate divergence: `GrantTokens`. A request that presents one is treated as
+//! drawing its permission FROM the grant the token names, so the grant must be on this
+//! key, permit this operation, and have its encryption-context constraints met,
+//! otherwise the request is denied. In the real service a grant token is ADDITIVE — a
+//! caller already permitted by the key policy or an IAM policy succeeds even when the
+//! token it presents grants nothing relevant — but a handler here has no caller identity
+//! to evaluate a policy against (`emulator_server::sigv4_credential_scope` yields only an
+//! access key id), so a presented grant token is the only permission there is to judge.
+//! The effect is narrower than AWS: an otherwise-permitted call that carries an
+//! unrelated or stale grant token is refused here.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -250,19 +261,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A grant token is handed out by `CreateGrant`, which is not implemented, so
-        // no token presented here can be one KMS issued.
-        if input.grant_tokens.iter().flatten().next().is_some() {
-            return Err(EncryptErrorModeled::InvalidGrantTokenException(
-                InvalidGrantTokenException {
-                    message: Some("The specified grant token is not valid.".to_string()),
-                },
-            )
-            .into());
-        }
-
         let region = crate::state::request_region(ctx);
         let state = state.lock();
+
+        // Permission a request draws from a grant is judged below, once the key is
+        // known and its key state has been judged.
+        let tokens = input.grant_tokens.clone().unwrap_or_default();
+
         // `Encrypt` models no `InvalidArnException`, so a malformed ARN is reported
         // the same way as an identifier that names nothing: the key is not found.
         let key = match state.resolve(&region, &input.key_id) {
@@ -278,7 +283,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A key that is not in the `Enabled` state cannot be used in a cryptographic
         // operation: a disabled key answers `DisabledException`, and any other
         // non-usable state answers `KMSInvalidStateException`, which names the state
-        // the key is actually in.
+        // the key is actually in. Judged BEFORE the grant tokens, so a key that cannot
+        // be used at all reports why rather than reporting an authorization failure.
         if !key.is_usable() {
             if key.key_state == crate::state::KEY_STATE_DISABLED {
                 return Err(EncryptErrorModeled::DisabledException(DisabledException {
@@ -292,6 +298,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // A grant token is handed out by `CreateGrant` and names the grant it was
+        // minted for. A token that is not one this service minted names no grant at
+        // all, so the TOKEN "is not valid". Otherwise the permission a request draws
+        // from a grant is exactly what that grant carries:
+        // the grant is on THIS key, it permits this operation, and the request's
+        // encryption context satisfies its constraints. A request presenting no grant
+        // token is not asking to be authorized by a grant, and is not judged here:
+        // evaluating a key policy or an IAM policy needs a caller identity, which this
+        // emulator does not model, so a grant token is the only permission it can
+        // judge.
+        if !tokens.is_empty() {
+            let named = match state.grants_for_tokens(&region, &tokens) {
+                Ok(named) => named,
+                Err(crate::state::GrantRefusal::MalformedToken) => {
+                    return Err(EncryptErrorModeled::InvalidGrantTokenException(
+                        InvalidGrantTokenException {
+                            message: Some("The specified grant token is not valid.".to_string()),
+                        },
+                    )
+                    .into());
+                }
+                Err(crate::state::GrantRefusal::NotAuthorized) => Vec::new(),
+            };
+            let permitted = named.iter().any(|grant| {
+                grant.permits(
+                    &key.key_id,
+                    Self::NAME,
+                    input.encryption_context.as_ref(),
+                )
+            });
+            if !permitted {
+                return Err(crate::scaffolded::Scaffolded::access_denied(
+                    crate::state::grant_access_denied_message(Self::NAME, &key.arn),
+                ));
+            }
         }
 
         // "For encrypting, decrypting, re-encrypting, and generating data keys, the

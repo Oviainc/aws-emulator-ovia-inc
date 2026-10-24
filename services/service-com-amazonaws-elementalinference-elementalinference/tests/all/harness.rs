@@ -38,6 +38,24 @@ pub fn expected_dictionary_arn(id: &str) -> String {
     )
 }
 
+/// The path a tagging request goes to, with the `resourceArn` percent-encoded.
+///
+/// `resourceArn` is an `@httpLabel` bound to one path segment, so a client encodes
+/// every character that is not unreserved (RFC 3986) — notably the `/` before the
+/// resource id, which would otherwise read as a further path segment.
+pub fn tags_path(resource_arn: &str) -> String {
+    let encoded: String = resource_arn
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(byte).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect();
+    format!("/v1/tags/{encoded}")
+}
+
 /// A router serving this service alone over one shared engine.
 pub fn router() -> MultiServiceRouter {
     router_with_engine().0
@@ -56,8 +74,26 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
 }
 
 /// Send one request and return its status and parsed body (`Value::Null` when empty).
+///
+/// Signed for [`REGION`], the Region every suite that is not testing the Region
+/// dimension uses.
 pub async fn call(
     router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    call_in_region(router, REGION, method, uri, body).await
+}
+
+/// Send one request signed for `region` and return its status and parsed body.
+///
+/// This service is REGIONAL: the Region a request is signed for is the endpoint it
+/// reached, and the service reads it out of the SigV4 credential scope. A suite that
+/// asserts what one Region's endpoint owns sends its requests through here.
+pub async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
     method: &str,
     uri: &str,
     body: Option<Value>,
@@ -70,7 +106,7 @@ pub async fn call(
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/{SIGNING_NAME}/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{region}/{SIGNING_NAME}/aws4_request, \
                  SignedHeaders=host, Signature=deadbeef"
             ),
         )

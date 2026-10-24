@@ -290,7 +290,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A key's aliases are bounded, so a loop of valid creates cannot grow the
-        // store without end.
+        // store without end. The store as a whole is bounded too: the per-key count is
+        // per key AND Region, and the Region is the caller's to choose.
         let held = state.alias_count_for_key(&region, &target_key_id);
         if held >= crate::state::MAX_ALIASES_PER_KEY {
             return Err(CreateAliasErrorModeled::LimitExceededException(
@@ -299,6 +300,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "The request was rejected because a quota was exceeded: a KMS key \
                          carries at most {} aliases, and this key already has {held}.",
                         crate::state::MAX_ALIASES_PER_KEY
+                    )),
+                },
+            )
+            .into());
+        }
+        if !state.has_room_for_another_alias() {
+            return Err(CreateAliasErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The request was rejected because a quota was exceeded: this \
+                         emulator holds at most {} aliases.",
+                        crate::state::MAX_ALIASES
                     )),
                 },
             )

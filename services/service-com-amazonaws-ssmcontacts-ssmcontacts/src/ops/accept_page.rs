@@ -1,15 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcceptPage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcceptPage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcceptPage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Acknowledges one page — Incident Manager's engagement of a single contact channel — the
+//! request's `PageId` names: the acknowledgement is recorded against the stored page as a
+//! receipt of the `AcceptType` the call carried (with its `Note`, when it carried one), and
+//! the page's `DeliveryTime` or `ReadTime` is stamped with the instant of the FIRST
+//! acknowledgement of that type, so `DescribePage` reports it from then on. Acknowledging a
+//! page again records a further receipt and leaves the stamped instant where it is: the time
+//! the page was delivered to, or read on, the channel does not move.
+//!
+//! The refusals come in this order, and none of them records anything:
+//!
+//! 1. the account-level Incident Manager precondition
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set_for`])
+//!    — this operation's whole subject is one resource ARN, so with no ACTIVE replication set
+//!    the account has no home Region for it and the ARN resolves to nothing: the modelled
+//!    `ValidationException` (HTTP 400), BEFORE the page is looked up;
+//! 2. an `AcceptType` or `AcceptCodeValidation` outside the model's value set for it — an
+//!    enum member reaches a handler as a plain string, so the value set is checked here (HTTP
+//!    400), also before the page is looked up;
+//! 3. a `PageId` the store holds no page for — the modelled `ResourceNotFoundException`
+//!    (HTTP 404);
+//! 4. a `ContactChannelId` that is not the channel this page engages — a page engages exactly
+//!    one channel, so naming another names no acknowledgement this call could make: the
+//!    modelled `ValidationException` (HTTP 400);
+//! 5. an `AcceptCode` that is not the code Incident Manager sent with the page, while
+//!    `AcceptCodeValidation` is `ENFORCE` — the model's own wording: enforcing "causes
+//!    Incident Manager to verify that the code entered by the user matches the code sent by
+//!    Incident Manager with the page", while `IGNORE` "causes Incident Manager to accept any
+//!    value entered". Validation is what the service does unless the caller asks for
+//!    `IGNORE`, so an absent member enforces;
+//! 6. an acknowledgement past [`crate::state::MAX_RECEIPTS_PER_PAGE`] — the emulator's own
+//!    ceiling on the receipt list, which is the one part of a page a caller can grow without
+//!    creating a resource. This operation models no quota error, so the refusal is its
+//!    `ValidationException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +185,181 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcceptPage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcceptPageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcceptPage"))
+        use crate::state::{check_enum, ReceiptRecord};
+
+        // The page is addressed by ARN and nothing is read off the request envelope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AcceptPageErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+
+        // The account gate comes FIRST, before `PageId` is resolved, so a non-onboarded
+        // account is refused identically whether or not the page it named exists.
+        state
+            .require_active_replication_set_for(&input.page_id)
+            .map_err(account_precondition_failed)?;
+
+        // An enum member arrives as a plain string: the boundary validator enforces
+        // length/pattern/range, not an enum's value set.
+        check_enum(ACCEPT_TYPE_MEMBER, &input.accept_type, ACCEPT_TYPE_VALUES)
+            .map_err(|message| validation(message, ACCEPT_TYPE_MEMBER))?;
+        if let Some(requested) = input.accept_code_validation.as_deref() {
+            check_enum(
+                ACCEPT_CODE_VALIDATION_MEMBER,
+                requested,
+                ACCEPT_CODE_VALIDATION_VALUES,
+            )
+            .map_err(|message| validation(message, ACCEPT_CODE_VALIDATION_MEMBER))?;
+        }
+
+        let Some(page) = state.pages.get_mut(&input.page_id) else {
+            return Err(AcceptPageErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Page {} not found", input.page_id),
+                    resource_id: input.page_id.clone(),
+                    resource_type: PAGE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+        // The page is reached ONCE, mutably: the refusals below read it through that same
+        // borrow, so there is no second lookup and no "it went away" path that the held lock
+        // makes impossible anyway.
+        let channel_arn = page.contact_channel_arn.clone();
+
+        // A page engages exactly ONE contact channel, so a `ContactChannelId` naming another
+        // channel names no acknowledgement this page could carry.
+        if let Some(named) = input
+            .contact_channel_id
+            .as_deref()
+            .filter(|named| *named != channel_arn)
+        {
+            return Err(validation(
+                format!(
+                    "Value '{named}' at '{CONTACT_CHANNEL_MEMBER}' failed to satisfy \
+                     constraint: Member must be the contact channel the page engaged"
+                ),
+                CONTACT_CHANNEL_MEMBER,
+            ));
+        }
+
+        // Enforcing is what the service does unless the caller asks for `IGNORE`: the code
+        // is compared against the one sent WITH this page, which AWS delivers to the channel
+        // out of band, so the store is the only place it can be read from.
+        let enforced = input.accept_code_validation.as_deref() != Some(IGNORE);
+        if enforced && input.accept_code != page.accept_code {
+            return Err(validation(
+                format!(
+                    "Value at '{ACCEPT_CODE_MEMBER}' failed to satisfy constraint: Member must \
+                     be the accept code sent with this page"
+                ),
+                ACCEPT_CODE_MEMBER,
+            ));
+        }
+
+        // Each acknowledgement is an EVENT, so the receipt list grows with every accepted
+        // call: it is the one part of a page a caller can grow without creating a resource,
+        // and this ceiling is what bounds it. This operation models no quota error, so the
+        // refusal is its `ValidationException`.
+        if page.receipts.len() >= crate::state::MAX_RECEIPTS_PER_PAGE {
+            return Err(validation(
+                format!(
+                    "This emulator records at most {} receipts per page",
+                    crate::state::MAX_RECEIPTS_PER_PAGE
+                ),
+                ACCEPT_TYPE_MEMBER,
+            ));
+        }
+
+        let accepted_at = ::std::time::SystemTime::now();
+
+        // The instant stamped on the page is the FIRST acknowledgement of that type: when
+        // the page reached the channel, and when it was read there, do not move because the
+        // same acknowledgement arrived twice.
+        let stamped = match input.accept_type.as_str() {
+            READ => &mut page.read_time,
+            _ => &mut page.delivery_time,
+        };
+        if stamped.is_none() {
+            *stamped = Some(accepted_at);
+        }
+
+        page.receipts.push(ReceiptRecord {
+            contact_channel_arn: channel_arn,
+            // `ReceiptType` carries the model's whole engagement cycle
+            // (SENT/DELIVERED/READ/ERROR/STOP); an acknowledgement records the `AcceptType`
+            // the caller named, which is one of its values.
+            receipt_type: input.accept_type.clone(),
+            receipt_info: input.note.clone(),
+            receipt_time: accepted_at,
+        });
+
+        Ok(AcceptPageOutput {})
     }
+}
+
+/// The `AcceptType` value that acknowledges a page as read, from the model's own
+/// `AcceptType` value set ([`ACCEPT_TYPE_VALUES`]). Its other value, `DELIVERED`, stamps the
+/// delivery instead.
+const READ: &str = "READ";
+
+/// The `AcceptCodeValidation` value that accepts any `AcceptCode`, from the model's own
+/// value set ([`ACCEPT_CODE_VALIDATION_VALUES`]).
+const IGNORE: &str = "IGNORE";
+
+/// The `resourceType` this operation's not-found error names: what the request named is a
+/// page — an engagement to one contact channel.
+const PAGE_RESOURCE_TYPE: &str = "page";
+
+/// The wire name of the `AcceptType` member, as the `ValidationException`'s `fields` spells
+/// a member at fault.
+const ACCEPT_TYPE_MEMBER: &str = "acceptType";
+
+/// The wire name of the `AcceptCode` member. See [`ACCEPT_TYPE_MEMBER`].
+const ACCEPT_CODE_MEMBER: &str = "acceptCode";
+
+/// The wire name of the `AcceptCodeValidation` member. See [`ACCEPT_TYPE_MEMBER`].
+const ACCEPT_CODE_VALIDATION_MEMBER: &str = "acceptCodeValidation";
+
+/// The wire name of the `ContactChannelId` member. See [`ACCEPT_TYPE_MEMBER`].
+const CONTACT_CHANNEL_MEMBER: &str = "contactChannelId";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` because the failure is not a member-level one — every member of
+/// the request is well formed; what cannot be resolved is the account's registry — and
+/// `fields` is present but EMPTY for the same reason.
+fn account_precondition_failed(message: String) -> AcceptPageError {
+    AcceptPageErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// A member-level refusal: the same modelled `ValidationException`, naming the field at
+/// fault.
+fn validation(message: impl Into<String>, member: &str) -> AcceptPageError {
+    let message = message.into();
+    AcceptPageErrorModeled::ValidationException(ValidationException {
+        message: message.clone(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message,
+        }]),
+    })
+    .into()
 }

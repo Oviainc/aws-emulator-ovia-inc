@@ -8,6 +8,7 @@
 //! instead of from the store would still have to make a later read agree.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -197,6 +198,30 @@ pub(crate) fn export_uri(registry: &str, schema: &str, export_type: &str) -> Str
         "{}/export?type={export_type}",
         schema_uri(registry, schema)
     )
+}
+
+/// The `ListSchemaVersions` URI of one schema.
+pub(crate) fn versions_uri(registry: &str, schema: &str) -> String {
+    format!("{}/versions", schema_uri(registry, schema))
+}
+
+/// The version labels a `ListSchemaVersions` answer reports, as a set.
+///
+/// Shared with the sibling suites: every case that asks which versions a schema
+/// holds reads them through this one reducer, so two suites cannot disagree about
+/// what the listing said.
+pub(crate) fn listed_versions(answer: &Answer) -> BTreeSet<String> {
+    answer.body["SchemaVersions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a SchemaVersions array in {:?}", answer.body))
+        .iter()
+        .map(|item| {
+            item["SchemaVersion"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
 }
 
 /// Create a registry, asserting it succeeded; the lifecycle cases start here.

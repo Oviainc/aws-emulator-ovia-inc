@@ -9,7 +9,7 @@
 //! beside this one — shared service logic lives here rather than being copied into
 //! each operation file.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use ::aws_smithy_schema_server::constraints::{Violation, ViolationKind};
@@ -787,113 +787,577 @@ impl ComAmazonawsLaunchwizardLaunchwizardState {
     }
 }
 
-/// A specification field of the seeded schema.
-fn spec_field(
-    name: &str,
-    description: &str,
-    required: bool,
-    allowed_values: &[&str],
-) -> SpecificationField {
+/// A specification field of the seeded schema: one that takes any `ValueString`, or
+/// one of `allowed_values` when that list is not empty.
+///
+/// A field is built UNREQUIRED here. Whether a field has to be filled in is a property
+/// of the deployment PATTERN publishing it, not of the field: one pattern can read a
+/// setting another pattern of the same workload insists on. Each pattern therefore
+/// states its own required set once ([`SAP_HANA_SINGLE_REQUIRED`] and its siblings),
+/// applied over the
+/// composed schema by [`mark_required`].
+fn spec_field(name: &str, description: &str, allowed_values: &[&str]) -> SpecificationField {
     SpecificationField {
         name: name.to_string(),
         description: description.to_string(),
         allowed_values: allowed_values.iter().map(|v| (*v).to_string()).collect(),
-        required,
+        required: false,
         conditionals: Vec::new(),
     }
 }
 
-/// The specification fields EVERY seeded deployment pattern accepts.
+/// [`spec_field`] for a field that is read only when another field of the same schema
+/// carries a particular value.
+fn conditional_field(
+    name: &str,
+    description: &str,
+    allowed_values: &[&str],
+    conditionals: Vec<SpecificationConditional>,
+) -> SpecificationField {
+    SpecificationField {
+        conditionals,
+        ..spec_field(name, description, allowed_values)
+    }
+}
+
+/// One conditional: this field is read only when the field named `on` compares
+/// `comparator` to `value`.
+fn conditional(on: &str, comparator: &str, value: &str) -> SpecificationConditional {
+    SpecificationConditional {
+        name: on.to_string(),
+        value: value.to_string(),
+        comparator: comparator.to_string(),
+    }
+}
+
+/// Field names other fields' conditionals read, so a conditional cannot name a field
+/// the schema does not publish.
+const FIELD_CREATE_SECURITY_GROUP: &str = "CreateSecurityGroup";
+/// See [`FIELD_CREATE_SECURITY_GROUP`].
+const FIELD_ENABLE_EBS_VOLUME_ENCRYPTION: &str = "EnableEbsVolumeEncryption";
+/// See [`FIELD_CREATE_SECURITY_GROUP`].
+const FIELD_CLUSTER_QUORUM_TYPE: &str = "ClusterQuorumType";
+
+/// The field names the required set of every seeded pattern holds: a deployment always
+/// launches EC2 instances into a VPC, whichever pattern it deploys.
+const COMMON_REQUIRED_FIELDS: [&str; 2] = ["KeyPairName", "VpcId"];
+
+/// The quorum mechanisms a clustered pattern offers, and the one that needs no witness
+/// instance of its own. EMULATOR-owned vocabulary (see [`sap_hana_single_fields`]).
+const CLUSTER_QUORUM_TYPES: [&str; 2] = ["FileShareWitness", "CloudWitness"];
+/// See [`CLUSTER_QUORUM_TYPES`].
+const CLUSTER_QUORUM_CLOUD_WITNESS: &str = "CloudWitness";
+
+/// The Microsoft SQL Server versions and editions the seeded SQL Server patterns offer,
+/// and the Microsoft Active Directory editions the AD patterns offer. EMULATOR-owned
+/// vocabularies (see [`sap_hana_single_fields`]).
+const SQL_SERVER_VERSIONS: [&str; 3] = ["2017", "2019", "2022"];
+/// See [`SQL_SERVER_VERSIONS`].
+const SQL_SERVER_EDITIONS: [&str; 2] = ["Standard", "Enterprise"];
+/// See [`SQL_SERVER_VERSIONS`].
+const DIRECTORY_EDITIONS: [&str; 2] = ["Standard", "Enterprise"];
+/// How many nodes a scale-out or multi-controller pattern may launch. EMULATOR-owned,
+/// see [`sap_hana_single_fields`].
+const NODE_COUNTS: [&str; 3] = ["2", "3", "4"];
+
+/// The infrastructure fields EVERY seeded deployment pattern reads.
 ///
 /// The names are the infrastructure keys the model's own `CreateDeployment` example
 /// submits (`KeyPairName`, `VpcId`, `CreateSecurityGroup`,
-/// `DisableDeploymentRollback`, `SaveDeploymentArtifacts`), and each one is a valid
-/// `DeploymentSpecifications` key (len 3..256, `^[a-zA-Z0-9-:]+$`), so a caller can
-/// take a reported name straight to `CreateDeployment`.
+/// `DisableDeploymentRollback`, `SaveDeploymentArtifacts`, `SnsTopicArn`), and each one
+/// is a valid `DeploymentSpecifications` key (len 3..256, `^[a-zA-Z0-9-:]+$`), so a
+/// caller can take a reported name straight to `CreateDeployment`.
 fn common_specification_fields() -> Vec<SpecificationField> {
-    let create_security_group = spec_field(
-        "CreateSecurityGroup",
-        "Whether the deployment creates a security group for the instances it launches.",
-        false,
-        &[REQUIRED_YES, REQUIRED_NO],
-    );
-    let existing_security_group = SpecificationField {
-        // Read only when the deployment is told NOT to create a security group, which
-        // is what a conditional on another field expresses.
-        conditionals: vec![SpecificationConditional {
-            name: create_security_group.name.clone(),
-            value: REQUIRED_NO.to_string(),
-            comparator: COMPARATOR_EQUAL.to_string(),
-        }],
-        ..spec_field(
-            "SecurityGroupId",
-            "The id of an existing security group to attach to the instances this \
-             deployment launches.",
-            false,
-            &[],
-        )
-    };
     vec![
         spec_field(
             "KeyPairName",
             "The name of the EC2 key pair used to access the instances this deployment \
              launches.",
-            true,
             &[],
         ),
         spec_field(
             "VpcId",
             "The id of the VPC the deployment launches its resources into.",
-            true,
             &[],
         ),
-        create_security_group,
-        existing_security_group,
+        spec_field(
+            FIELD_CREATE_SECURITY_GROUP,
+            "Whether the deployment creates a security group for the instances it launches.",
+            &[REQUIRED_YES, REQUIRED_NO],
+        ),
+        conditional_field(
+            "SecurityGroupId",
+            "The id of an existing security group to attach to the instances this \
+             deployment launches.",
+            &[],
+            // Read only when the deployment is told NOT to create a security group,
+            // which is what a conditional on another field expresses.
+            vec![conditional(
+                FIELD_CREATE_SECURITY_GROUP,
+                COMPARATOR_EQUAL,
+                REQUIRED_NO,
+            )],
+        ),
         spec_field(
             "DisableDeploymentRollback",
             "Whether the deployment keeps the resources it created when a step fails.",
-            false,
             &[REQUIRED_YES, REQUIRED_NO],
         ),
         spec_field(
             "SaveDeploymentArtifacts",
             "Whether the deployment keeps the artifacts it generated after it finishes.",
-            false,
             &[REQUIRED_YES, REQUIRED_NO],
+        ),
+        spec_field(
+            "SnsTopicArn",
+            "The ARN of the Amazon SNS topic the deployment publishes its notifications \
+             to.",
+            &[],
         ),
     ]
 }
 
-/// The specification fields only `workload`'s patterns accept, on top of
-/// [`common_specification_fields`].
+/// The fields every pattern of `workload` reads on top of
+/// [`common_specification_fields`]: the settings that belong to the application being
+/// deployed rather than to one way of deploying it.
 ///
-/// SAP's two are the SAP-specific keys the model's `CreateDeployment` example submits;
-/// the other seeded workloads add none, so their patterns are described by the common
-/// fields alone rather than by invented ones.
+/// SAP's names are the SAP-specific keys the model's own `CreateDeployment` example
+/// submits (`SapSysGroupId`, `SapVirtualIPOptIn`, `EnableEbsVolumeEncryption`,
+/// `ProxyServerAddress`, `Timezone`); the rest are the EMULATOR's own, for the reason
+/// [`sap_hana_single_fields`] gives.
 fn workload_specification_fields(workload: &str) -> Vec<SpecificationField> {
     match workload {
         "SAP" => vec![
             spec_field(
                 "SapSysGroupId",
                 "The group id of the SAP system's sapsys group.",
-                false,
                 &[],
             ),
             spec_field(
-                "EnableEbsVolumeEncryption",
-                "Whether the EBS volumes of the SAP instances are encrypted.",
-                false,
+                "SapVirtualIPOptIn",
+                "Whether the SAP instances are reached through a virtual IP address.",
                 &[REQUIRED_YES, REQUIRED_NO],
+            ),
+            spec_field(
+                FIELD_ENABLE_EBS_VOLUME_ENCRYPTION,
+                "Whether the EBS volumes of the SAP instances are encrypted.",
+                &[REQUIRED_YES, REQUIRED_NO],
+            ),
+            conditional_field(
+                "EbsEncryptionKeyArn",
+                "The ARN of the KMS key the EBS volumes of the SAP instances are \
+                 encrypted with.",
+                &[],
+                vec![conditional(
+                    FIELD_ENABLE_EBS_VOLUME_ENCRYPTION,
+                    COMPARATOR_EQUAL,
+                    REQUIRED_YES,
+                )],
+            ),
+            spec_field(
+                "ProxyServerAddress",
+                "The address of the proxy server the SAP instances reach the internet \
+                 through.",
+                &[],
+            ),
+            spec_field(
+                "Timezone",
+                "The time zone the SAP instances are configured with.",
+                &[],
+            ),
+        ],
+        "SQLServer" => vec![
+            spec_field(
+                "SqlServerVersion",
+                "The version of Microsoft SQL Server the deployment installs.",
+                &SQL_SERVER_VERSIONS,
+            ),
+            spec_field(
+                "SqlServerEdition",
+                "The edition of Microsoft SQL Server the deployment installs.",
+                &SQL_SERVER_EDITIONS,
+            ),
+        ],
+        "ActiveDirectory" => vec![
+            spec_field(
+                "DomainDNSName",
+                "The fully qualified name of the Active Directory domain.",
+                &[],
+            ),
+            spec_field(
+                "DomainNetBIOSName",
+                "The NetBIOS name of the Active Directory domain.",
+                &[],
+            ),
+            spec_field(
+                "DomainAdminUser",
+                "The name of the account the deployment administers the domain with.",
+                &[],
             ),
         ],
         _ => Vec::new(),
     }
 }
 
+/// The fields a pattern that deploys into ONE Availability Zone reads.
+fn one_zone_fields() -> Vec<SpecificationField> {
+    vec![
+        spec_field(
+            "AvailabilityZone1",
+            "The Availability Zone the deployment launches its instances into.",
+            &[],
+        ),
+        spec_field(
+            "PrivateSubnet1Id",
+            "The id of the private subnet, in the first Availability Zone, the \
+             deployment launches its instances into.",
+            &[],
+        ),
+    ]
+}
+
+/// The fields a pattern that spreads across TWO Availability Zones reads: the first
+/// zone's, plus the second zone's — the settings a single-zone pattern has no use for.
+fn two_zone_fields() -> Vec<SpecificationField> {
+    let mut fields = one_zone_fields();
+    fields.extend([
+        spec_field(
+            "AvailabilityZone2",
+            "The second Availability Zone the deployment spreads its instances across.",
+            &[],
+        ),
+        spec_field(
+            "PrivateSubnet2Id",
+            "The id of the private subnet, in the second Availability Zone, the \
+             deployment launches its instances into.",
+            &[],
+        ),
+    ]);
+    fields
+}
+
+/// The fields every seeded pattern that installs an SAP HANA database reads.
+fn hana_database_fields() -> Vec<SpecificationField> {
+    vec![
+        spec_field(
+            "HanaSid",
+            "The system id of the SAP HANA database the deployment installs.",
+            &[],
+        ),
+        spec_field(
+            "HanaInstanceType",
+            "The EC2 instance type of the SAP HANA database instances.",
+            &[],
+        ),
+        spec_field(
+            "HanaInstanceNumber",
+            "The instance number of the SAP HANA database.",
+            &[],
+        ),
+    ]
+}
+
+/// The fields ONE seeded pattern reads of its OWN, on top of the common and per-workload
+/// ones: the settings that belong to this way of deploying the application rather than to
+/// the application. Each of these is named by its pattern's row in the catalogue table
+/// ([`seeded_workloads`]), so what a pattern publishes lives beside its name instead of
+/// in a second list keyed by it.
+///
+/// This is what makes two patterns of one workload publish different schemas — a pattern
+/// that spreads across two Availability Zones reads the second zone's settings and the
+/// cluster's, which a single-instance pattern of the same workload has no use for.
+///
+/// Launch Wizard's catalogue is service-owned (no API creates a workload, a pattern or a
+/// specification), so these names and vocabularies are the EMULATOR's own for the
+/// patterns it seeds — like [`CATALOGUE_PATTERN_VERSIONS`] — rather than a claim about
+/// which settings AWS publishes for them; the ones the model's own `CreateDeployment`
+/// example submits are named where they are used. Every name is a valid
+/// `DeploymentSpecifications` key, so a reported name can be taken straight to
+/// `CreateDeployment`.
+fn sap_hana_single_fields() -> Vec<SpecificationField> {
+    let mut fields = hana_database_fields();
+    fields.extend(one_zone_fields());
+    fields
+}
+
+/// The scale-out SAP HANA pattern's own fields: the single-instance pattern's, plus how
+/// far the database is spread and what the nodes share. See [`sap_hana_single_fields`].
+fn sap_hana_multi_node_fields() -> Vec<SpecificationField> {
+    let mut fields = sap_hana_single_fields();
+    fields.extend([
+        spec_field(
+            "HanaWorkerNodeCount",
+            "How many worker nodes the scale-out SAP HANA database is spread over.",
+            &NODE_COUNTS,
+        ),
+        spec_field(
+            "HanaSharedFileSystemId",
+            "The id of the shared file system the SAP HANA nodes mount.",
+            &[],
+        ),
+    ]);
+    fields
+}
+
+/// The highly available SAP NetWeaver on SAP HANA pattern's own fields: a HANA database
+/// across TWO zones, plus the NetWeaver system in front of it. See
+/// [`sap_hana_single_fields`].
+fn sap_nw_on_hana_ha_fields() -> Vec<SpecificationField> {
+    let mut fields = hana_database_fields();
+    fields.extend(two_zone_fields());
+    fields.extend([
+        spec_field(
+            "SapNWSid",
+            "The system id of the SAP NetWeaver system the deployment installs.",
+            &[],
+        ),
+        spec_field(
+            "SapNWInstanceType",
+            "The EC2 instance type of the SAP NetWeaver instances.",
+            &[],
+        ),
+        spec_field(
+            "EnableHanaSystemReplication",
+            "Whether the SAP HANA database replicates to the second Availability Zone.",
+            &[REQUIRED_YES, REQUIRED_NO],
+        ),
+    ]);
+    fields
+}
+
+/// The single-instance Microsoft SQL Server pattern's own fields. See
+/// [`sap_hana_single_fields`].
+fn sql_server_single_fields() -> Vec<SpecificationField> {
+    let mut fields = one_zone_fields();
+    fields.extend([
+        spec_field(
+            "SqlServerInstanceType",
+            "The EC2 instance type of the Microsoft SQL Server instance.",
+            &[],
+        ),
+        spec_field(
+            "SqlServerDataVolumeSize",
+            "The size, in gibibytes, of the volume holding the Microsoft SQL Server data \
+             files.",
+            &[],
+        ),
+    ]);
+    fields
+}
+
+/// The highly available Microsoft SQL Server pattern's own fields: two zones, the
+/// availability group, how the cluster establishes quorum and the domain its nodes join.
+/// See [`sap_hana_single_fields`].
+fn sql_server_ha_fields() -> Vec<SpecificationField> {
+    let mut fields = two_zone_fields();
+    fields.extend([
+        spec_field(
+            "SqlServerInstanceType",
+            "The EC2 instance type of the Microsoft SQL Server instances.",
+            &[],
+        ),
+        spec_field(
+            "AlwaysOnAvailabilityGroupName",
+            "The name of the Always On availability group the deployment creates.",
+            &[],
+        ),
+        spec_field(
+            FIELD_CLUSTER_QUORUM_TYPE,
+            "How the Windows Server failover cluster establishes quorum.",
+            &CLUSTER_QUORUM_TYPES,
+        ),
+        conditional_field(
+            "WitnessInstanceType",
+            "The EC2 instance type of the instance hosting the cluster's file share \
+             witness.",
+            &[],
+            vec![conditional(
+                FIELD_CLUSTER_QUORUM_TYPE,
+                COMPARATOR_NOT_EQUAL,
+                CLUSTER_QUORUM_CLOUD_WITNESS,
+            )],
+        ),
+        spec_field(
+            "DomainDNSName",
+            "The fully qualified name of the Active Directory domain the cluster nodes \
+             join.",
+            &[],
+        ),
+    ]);
+    fields
+}
+
+/// The AWS Directory Service managed directory pattern's own fields: the two zones a
+/// managed directory is spread over and its edition. See [`sap_hana_single_fields`].
+fn aws_managed_ad_fields() -> Vec<SpecificationField> {
+    let mut fields = two_zone_fields();
+    fields.push(spec_field(
+        "DirectoryEdition",
+        "The edition of the AWS Directory Service managed directory the deployment \
+         creates.",
+        &DIRECTORY_EDITIONS,
+    ));
+    fields
+}
+
+/// The self-managed Active Directory pattern's own fields: the domain controllers the
+/// caller administers, across two zones. See [`sap_hana_single_fields`].
+fn self_managed_ad_fields() -> Vec<SpecificationField> {
+    let mut fields = two_zone_fields();
+    fields.extend([
+        spec_field(
+            "DomainControllerInstanceType",
+            "The EC2 instance type of the domain controllers the deployment launches.",
+            &[],
+        ),
+        spec_field(
+            "DomainControllerCount",
+            "How many domain controllers the deployment launches.",
+            &NODE_COUNTS,
+        ),
+    ]);
+    fields
+}
+
+/// What one pattern marks `required` beyond [`COMMON_REQUIRED_FIELDS`]: the settings a
+/// deployment of THAT pattern cannot be created without, named by its row in the
+/// catalogue table ([`seeded_workloads`]) beside the fields it publishes.
+///
+/// Requirement is the pattern's own statement about a field (see [`spec_field`]): a
+/// pattern that spreads across Availability Zones or forms a cluster cannot make those
+/// choices for the caller — which zone, which subnet, which quorum, which domain — so it
+/// insists on them, while a single-instance pattern launches into whichever zone and
+/// subnet of the named VPC the service picks and defaults the database identifiers, so
+/// the caller only has to name the key pair and the VPC. That is also why the request the
+/// model documents for the single-instance SAP HANA pattern carries nothing beyond the
+/// common core and is served as written.
+const SAP_HANA_SINGLE_REQUIRED: &[&str] = &[];
+/// See [`SAP_HANA_SINGLE_REQUIRED`].
+const SAP_HANA_MULTI_NODE_REQUIRED: &[&str] = &[
+    "HanaSid",
+    "HanaInstanceType",
+    "AvailabilityZone1",
+    "PrivateSubnet1Id",
+    "HanaWorkerNodeCount",
+];
+/// See [`SAP_HANA_SINGLE_REQUIRED`].
+const SAP_NW_ON_HANA_HA_REQUIRED: &[&str] = &[
+    "HanaSid",
+    "HanaInstanceType",
+    "AvailabilityZone1",
+    "PrivateSubnet1Id",
+    "AvailabilityZone2",
+    "PrivateSubnet2Id",
+    "SapNWSid",
+    "SapNWInstanceType",
+    "EnableHanaSystemReplication",
+];
+/// See [`SAP_HANA_SINGLE_REQUIRED`].
+const SQL_SERVER_SINGLE_REQUIRED: &[&str] = &[
+    "SqlServerVersion",
+    "SqlServerInstanceType",
+    "AvailabilityZone1",
+    "PrivateSubnet1Id",
+];
+/// See [`SAP_HANA_SINGLE_REQUIRED`].
+const SQL_SERVER_HA_REQUIRED: &[&str] = &[
+    "SqlServerVersion",
+    "SqlServerInstanceType",
+    "AvailabilityZone1",
+    "PrivateSubnet1Id",
+    "AvailabilityZone2",
+    "PrivateSubnet2Id",
+    "AlwaysOnAvailabilityGroupName",
+    FIELD_CLUSTER_QUORUM_TYPE,
+    "DomainDNSName",
+];
+/// See [`SAP_HANA_SINGLE_REQUIRED`].
+const AWS_MANAGED_AD_REQUIRED: &[&str] = &[
+    "DomainDNSName",
+    "DirectoryEdition",
+    "AvailabilityZone1",
+    "PrivateSubnet1Id",
+    "AvailabilityZone2",
+    "PrivateSubnet2Id",
+];
+/// See [`SAP_HANA_SINGLE_REQUIRED`].
+const SELF_MANAGED_AD_REQUIRED: &[&str] = &[
+    "DomainDNSName",
+    "DomainNetBIOSName",
+    "DomainAdminUser",
+    "DomainControllerInstanceType",
+    "AvailabilityZone1",
+    "PrivateSubnet1Id",
+    "AvailabilityZone2",
+    "PrivateSubnet2Id",
+];
+
+/// Apply one pattern's required set over its composed schema.
+///
+/// Requirement is stated per pattern rather than per field, so this is where the two
+/// meet: a field the pattern names is published as [`REQUIRED_YES`], every other field
+/// as [`REQUIRED_NO`]. A required name the pattern does not publish could not be filled
+/// in by any caller, so it is a catalogue bug rather than a schema — caught here in the
+/// test build instead of leaving a pattern no `CreateDeployment` can satisfy.
+fn mark_required(fields: &mut [SpecificationField], required: &[&str]) {
+    for field in fields.iter_mut() {
+        field.required = required.contains(&field.name.as_str());
+    }
+    debug_assert!(
+        required
+            .iter()
+            .all(|name| fields.iter().any(|field| field.name == *name)),
+        "every required specification must be one the pattern publishes"
+    );
+}
+
+/// The specification schema the seeded catalogue publishes for ONE deployment pattern:
+/// the infrastructure fields every pattern reads, the fields its workload adds, the
+/// fields the pattern itself defines, and then the pattern's own required set — all read
+/// off that pattern's catalogue row.
+///
+/// Composed per pattern rather than per workload, because the schema a pattern publishes
+/// is the contract a `CreateDeployment` for THAT pattern fills in — which is why
+/// `required`, `allowedValues` and `conditionals` are modelled per field and per
+/// pattern. Well inside `DeploymentSpecificationsData`'s `@length(min: 1, max: 100)`.
+///
+/// A field NAME is what a caller fills in, so each one is published once: a name two of
+/// the three layers state (a setting that belongs to the application and that one way of
+/// deploying it also reads) keeps the first layer's definition rather than being reported
+/// twice, which would publish two contradictory contracts for one key.
+fn seeded_specification_fields(workload: &str, pattern: &SeededPattern) -> Vec<SpecificationField> {
+    let mut fields = common_specification_fields();
+    fields.extend(workload_specification_fields(workload));
+    fields.extend((pattern.own_fields)());
+    let mut published = BTreeSet::new();
+    fields.retain(|field| published.insert(field.name.clone()));
+    let required: Vec<&str> = COMMON_REQUIRED_FIELDS
+        .iter()
+        .copied()
+        .chain(pattern.own_required.iter().copied())
+        .collect();
+    mark_required(&mut fields, &required);
+    fields
+}
+
 /// One deployment pattern of the seeded catalogue, as the table in
-/// [`seeded_workloads`] spells it: its `DeploymentPatternName`, its display name and
-/// its description.
-type SeededPattern = (&'static str, &'static str, &'static str);
+/// [`seeded_workloads`] spells it: its `DeploymentPatternName`, its display name, its
+/// description, the fields it reads of its own and the names it marks required beyond
+/// [`COMMON_REQUIRED_FIELDS`].
+///
+/// Everything the catalogue states about a pattern is in ONE row, so a pattern cannot be
+/// seeded with the schema or the required set of another, and one added here cannot be
+/// forgotten in a second list keyed by its name.
+struct SeededPattern {
+    /// `DeploymentPatternName`: len 1..256, `^[A-Za-z0-9][a-zA-Z0-9-]*$`.
+    name: &'static str,
+    display_name: &'static str,
+    description: &'static str,
+    /// See [`sap_hana_single_fields`].
+    own_fields: fn() -> Vec<SpecificationField>,
+    /// See [`SAP_HANA_SINGLE_REQUIRED`].
+    own_required: &'static [&'static str],
+}
 
 /// One workload of the seeded catalogue: its `WorkloadName`, its display name, the
 /// description `GetWorkload` reports and the patterns it offers.
@@ -925,22 +1389,29 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
             "SAP",
             "Deploy SAP HANA and SAP NetWeaver applications on Amazon Web Services.",
             &[
-                (
-                    "SapHanaSingle",
-                    "SAP HANA on a single instance",
-                    "Deploys an SAP HANA database on one instance.",
-                ),
-                (
-                    "SapHanaMultiNode",
-                    "SAP HANA on multiple nodes",
-                    "Deploys a scale-out SAP HANA database across several instances.",
-                ),
-                (
-                    "SapNWOnHanaHA",
-                    "SAP NetWeaver on SAP HANA, highly available",
-                    "Deploys SAP NetWeaver on an SAP HANA database across two \
-                     Availability Zones.",
-                ),
+                SeededPattern {
+                    name: "SapHanaSingle",
+                    display_name: "SAP HANA on a single instance",
+                    description: "Deploys an SAP HANA database on one instance.",
+                    own_fields: sap_hana_single_fields,
+                    own_required: SAP_HANA_SINGLE_REQUIRED,
+                },
+                SeededPattern {
+                    name: "SapHanaMultiNode",
+                    display_name: "SAP HANA on multiple nodes",
+                    description: "Deploys a scale-out SAP HANA database across several \
+                                  instances.",
+                    own_fields: sap_hana_multi_node_fields,
+                    own_required: SAP_HANA_MULTI_NODE_REQUIRED,
+                },
+                SeededPattern {
+                    name: "SapNWOnHanaHA",
+                    display_name: "SAP NetWeaver on SAP HANA, highly available",
+                    description: "Deploys SAP NetWeaver on an SAP HANA database across two \
+                                  Availability Zones.",
+                    own_fields: sap_nw_on_hana_ha_fields,
+                    own_required: SAP_NW_ON_HANA_HA_REQUIRED,
+                },
             ][..],
         ),
         (
@@ -948,17 +1419,21 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
             "Microsoft SQL Server",
             "Deploy Microsoft SQL Server, standalone or highly available, on Amazon Web Services.",
             &[
-                (
-                    "SqlServerSingle",
-                    "Microsoft SQL Server on a single instance",
-                    "Deploys Microsoft SQL Server on one instance.",
-                ),
-                (
-                    "SqlServerHA",
-                    "Microsoft SQL Server, highly available",
-                    "Deploys a Microsoft SQL Server Always On availability group across \
-                     two Availability Zones.",
-                ),
+                SeededPattern {
+                    name: "SqlServerSingle",
+                    display_name: "Microsoft SQL Server on a single instance",
+                    description: "Deploys Microsoft SQL Server on one instance.",
+                    own_fields: sql_server_single_fields,
+                    own_required: SQL_SERVER_SINGLE_REQUIRED,
+                },
+                SeededPattern {
+                    name: "SqlServerHA",
+                    display_name: "Microsoft SQL Server, highly available",
+                    description: "Deploys a Microsoft SQL Server Always On availability group \
+                                  across two Availability Zones.",
+                    own_fields: sql_server_ha_fields,
+                    own_required: SQL_SERVER_HA_REQUIRED,
+                },
             ][..],
         ),
         (
@@ -967,42 +1442,43 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
             "Deploy AWS Managed Microsoft AD or self-managed Active Directory on Amazon Web \
              Services.",
             &[
-                (
-                    "AWSManagedAD",
-                    "AWS Managed Microsoft AD",
-                    "Deploys an AWS Directory Service managed Microsoft AD directory.",
-                ),
-                (
-                    "SelfManagedAD",
-                    "Self-managed Active Directory",
-                    "Deploys Active Directory domain controllers you administer yourself.",
-                ),
+                SeededPattern {
+                    name: "AWSManagedAD",
+                    display_name: "AWS Managed Microsoft AD",
+                    description: "Deploys an AWS Directory Service managed Microsoft AD \
+                                  directory.",
+                    own_fields: aws_managed_ad_fields,
+                    own_required: AWS_MANAGED_AD_REQUIRED,
+                },
+                SeededPattern {
+                    name: "SelfManagedAD",
+                    display_name: "Self-managed Active Directory",
+                    description: "Deploys Active Directory domain controllers you administer \
+                                  yourself.",
+                    own_fields: self_managed_ad_fields,
+                    own_required: SELF_MANAGED_AD_REQUIRED,
+                },
             ][..],
         ),
     ];
     catalogue
         .into_iter()
         .map(|(workload_name, display_name, description, patterns)| {
-            let specifications = {
-                let mut fields = common_specification_fields();
-                fields.extend(workload_specification_fields(workload_name));
-                fields
-            };
             let patterns = patterns
                 .iter()
-                .map(|(pattern_name, pattern_display, pattern_description)| {
+                .map(|pattern| {
                     (
-                        (*pattern_name).to_string(),
+                        pattern.name.to_string(),
                         DeploymentPattern {
                             workload_name: workload_name.to_string(),
-                            pattern_name: (*pattern_name).to_string(),
-                            display_name: (*pattern_display).to_string(),
-                            description: (*pattern_description).to_string(),
+                            pattern_name: pattern.name.to_string(),
+                            display_name: pattern.display_name.to_string(),
+                            description: pattern.description.to_string(),
                             status: PATTERN_ACTIVE.to_string(),
                             status_message: None,
                             workload_version_name: CATALOGUE_VERSION.to_string(),
-                            versions: seeded_pattern_versions(pattern_description),
-                            specifications: specifications.clone(),
+                            versions: seeded_pattern_versions(pattern.description),
+                            specifications: seeded_specification_fields(workload_name, pattern),
                         },
                     )
                 })
@@ -1369,6 +1845,11 @@ pub fn constraint_refusal(
 /// is a statement the STORED schema makes about the submitted map: a setting the
 /// pattern does not define, a value outside a field's `allowedValues`, and a field the
 /// pattern marks required that the map does not carry.
+///
+/// A field's `conditionals` are PUBLISHED metadata only: they tell a caller which other
+/// setting decides whether this one is read, and no clause here is raised from them — a
+/// conditional field is accepted whatever the field it depends on carries, which is why
+/// no pattern marks a conditional field required.
 ///
 /// `DeploymentSpecifications` is `@sensitive`, so a warning names the KEY it is about
 /// (a caller cannot fix the request otherwise) and never the submitted VALUE; an

@@ -219,6 +219,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A delete delivers no pixel data: what the image set held goes with it
                 // when the deletion lands.
                 delivered_image_frames: None,
+                // Nor any DICOM attributes: a delete takes content away rather than
+                // bringing any.
+                delivered_dicom_tags: None,
                 retires_image_set: true,
             });
         }

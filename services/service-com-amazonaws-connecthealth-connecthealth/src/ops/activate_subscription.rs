@@ -154,13 +154,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        // This service's endpoint is regional: the domain is resolved in the Region the
+        // request was signed for, so a subscription under a domain of another Region is
+        // not found here.
+        let region = crate::state::region_of(ctx);
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
         store.purge_due_deletions(now);
 
-        let Some(subscription) = store.live_subscription_mut(&input.domain_id, &input.subscription_id)
+        let Some(subscription) =
+            store.live_subscription_mut(&region, &input.domain_id, &input.subscription_id)
         else {
             return Err(ActivateSubscriptionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

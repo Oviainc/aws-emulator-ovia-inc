@@ -56,9 +56,11 @@ async fn an_answer_with_no_body_states_its_length() {
     // Rows: one per implemented operation whose output is `Unit`, each reached after
     // the state it deletes was created, and each in the two shapes its resource comes
     // in — a schema deleted from a registry of its own, and the registry itself.
-    // `DeleteSchemaVersion`, `DeleteResourcePolicy`, `TagResource` and `UntagResource`
-    // are the same 204 in the model but are still scaffold stubs (each has its own
-    // stub issue), so they answer 501 with a body and are not rows here.
+    // `DeleteResourcePolicy`, `TagResource` and `UntagResource` are the same 204 in the
+    // model but are still scaffold stubs (each has its own stub issue), so they answer
+    // 501 with a body and are not rows here. `DeleteSchemaVersion` is implemented and
+    // its own suite (`schema_version_deletion.rs`) carries its framing row, because the
+    // version it deletes has to be minted first.
     for (case, registry, schemas) in [
         ("one schema", "framing-one", vec!["only-schema"]),
         (

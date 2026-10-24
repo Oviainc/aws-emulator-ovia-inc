@@ -44,15 +44,15 @@ const CLOCK_SLACK: Duration = Duration::from_millis(250);
 
 /// `Approvers` is `length(min: 1, max: 20)` on `CreateApprovalTeam`, and
 /// `StartApprovalTeamBaselineApproverIds` is `length(max: 20)`.
-const MAX_APPROVERS: usize = 20;
+pub(crate) const MAX_APPROVERS: usize = 20;
 
 /// `ApprovalTeamName` is `length(max: 64)`, pattern `^[a-zA-Z0-9._-]+$`.
-const MAX_TEAM_NAME: usize = 64;
+pub(crate) const MAX_TEAM_NAME: usize = 64;
 
 /// The message of an error envelope, whichever case the renderer used: a handler-raised
 /// modelled error carries the modelled `Message` member, while a refusal the framework
 /// boundary rendered (this service's malformed-ARN rewording, say) carries `message`.
-fn message(body: &Value) -> String {
+pub(crate) fn message(body: &Value) -> String {
     body.get("Message")
         .or_else(|| body.get("message"))
         .and_then(Value::as_str)
@@ -100,7 +100,7 @@ async fn create_team(
 }
 
 /// `POST /approval-teams/{Arn}/baseline` — `StartApprovalTeamBaseline`.
-async fn start_baseline(
+pub(crate) async fn start_baseline(
     harness: &Harness,
     team_arn: &str,
     approver_ids: Option<&[String]>,
@@ -116,19 +116,19 @@ async fn start_baseline(
 }
 
 /// `GET /sessions/{SessionArn}` — `GetSession`.
-async fn get_session(harness: &Harness, session_arn: &str) -> (u16, Value) {
+pub(crate) async fn get_session(harness: &Harness, session_arn: &str) -> (u16, Value) {
     harness
         .call("GET", &format!("/sessions/{}", encode_label(session_arn)), None)
         .await
 }
 
 /// `GET /approval-teams/{Arn}` — `GetApprovalTeam`.
-async fn get_team(harness: &Harness, team_arn: &str) -> (u16, Value) {
+pub(crate) async fn get_team(harness: &Harness, team_arn: &str) -> (u16, Value) {
     harness.get(team_arn).await
 }
 
 /// Wait out a clock-owed transition of `delay`.
-fn wait_for_the_clock(delay: Duration) {
+pub(crate) fn wait_for_the_clock(delay: Duration) {
     std::thread::sleep(delay + CLOCK_SLACK);
 }
 
@@ -153,7 +153,7 @@ fn stored_approvers(harness: &Harness, team_arn: &str) -> Vec<(String, String, S
 }
 
 /// The approver ids the store recorded for a team, in team order.
-fn stored_approver_ids(harness: &Harness, team_arn: &str) -> Vec<String> {
+pub(crate) fn stored_approver_ids(harness: &Harness, team_arn: &str) -> Vec<String> {
     stored_approvers(harness, team_arn)
         .into_iter()
         .map(|(approver_id, _, _)| approver_id)
@@ -163,7 +163,7 @@ fn stored_approver_ids(harness: &Harness, team_arn: &str) -> Vec<String> {
 /// Force a stored session's expiration to have already passed, so the clock-owed
 /// `FAILED` / `EXPIRED` outcome is due on the next call. Only the DUE INSTANT is moved;
 /// the outcome itself is the service's own.
-fn expire_session(harness: &Harness, session_arn: &str, expiration: SystemTime) {
+pub(crate) fn expire_session(harness: &Harness, session_arn: &str, expiration: SystemTime) {
     let store = state::service_state(&*harness.engine).expect("the service store");
     let mut guard = store.lock();
     let session = guard
@@ -181,7 +181,12 @@ fn expire_deletion_window(harness: &Harness, team_arn: &str) {
 }
 
 /// A team made ACTIVE: created, then the clock-owed invitation responses waited out.
-async fn active_team(harness: &Harness, name: &str, approvers: usize, min_approvals: i64) -> String {
+pub(crate) async fn active_team(
+    harness: &Harness,
+    name: &str,
+    approvers: usize,
+    min_approvals: i64,
+) -> String {
     let (status, created) = create_team(harness, name, approvers, min_approvals).await;
     assert_eq!(status, 200, "case {name}: create returned {created:?}");
     wait_for_the_clock(state::INVITATION_RESPONSE_DELAY);

@@ -190,8 +190,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // catalog, so every selector about the agreement reads it from
             // there rather than from a second copy on the payment request.
             let agreement = store.agreements.get(&request.agreement_id);
-            if !crate::state::payment_request_party_matches(
-                request,
+            if !crate::state::submitted_request_party_matches(
+                &request.proposer_account_id,
                 agreement,
                 &input.party_type,
             ) {

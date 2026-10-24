@@ -191,7 +191,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "GetDomain could not reach this service's store",
             ));
         };
-        let _ = ctx;
+        // This service's endpoint is regional: the domain is resolved in the Region the
+        // request was signed for, so one created in another Region is not found here.
+        let region = crate::state::region_of(ctx);
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
@@ -199,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // domain whose DELETING span has elapsed is purged here and answers 404.
         store.purge_due_deletions(now);
 
-        let Some(domain) = store.domains.get(&input.domain_id) else {
+        let Some(domain) = store.held_domain(&region, &input.domain_id) else {
             return Err(GetDomainErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::service::error_detail::domain_not_found_message(

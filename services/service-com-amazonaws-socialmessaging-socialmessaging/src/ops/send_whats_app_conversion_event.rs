@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendWhatsAppConversionEvent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendWhatsAppConversionEvent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendWhatsAppConversionEvent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Accepts a conversion event for a WhatsApp Business Account's Meta Conversions API
+//! dataset and reports the `requestId` the call was accepted under.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +151,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendWhatsAppConversionEvent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendWhatsAppConversionEventErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendWhatsAppConversionEvent"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SendWhatsAppConversionEventErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the social-messaging store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // The event is sent for ONE account's ONE dataset: an account this request's `id`
+        // names no record of, and a `datasetId` that is not the dataset created for that
+        // account, are the same not-found to a caller — neither names a dataset this
+        // service holds. `id` accepts the `waba-...` short form and the account ARN alike.
+        let account_with_dataset = store
+            .linked_account_id(&input.id)
+            .filter(|account_id| {
+                store
+                    .linked_accounts
+                    .get(account_id)
+                    .and_then(|account| account.dataset_id.as_deref())
+                    == Some(input.dataset_id.as_str())
+            });
+        let Some(linked_account_id) = account_with_dataset else {
+            return Err(
+                SendWhatsAppConversionEventErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::DATASET_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let request_id = store.mint_request_id();
+        store.record_conversion_event(crate::state::ConversionEvent {
+            request_id: request_id.clone(),
+            linked_account_id,
+            dataset_id: input.dataset_id,
+            event_data: input.event_data,
+            sent_at: std::time::SystemTime::now(),
+        });
+
+        Ok(SendWhatsAppConversionEventOutput { request_id })
     }
 }

@@ -17,6 +17,8 @@ mod approval_sessions;
 mod approval_team_lifecycle;
 #[path = "all/authorization_gate.rs"]
 mod authorization_gate;
+#[path = "all/baseline_session_minting.rs"]
+mod baseline_session_minting;
 #[path = "all/identity_source_deletion.rs"]
 mod identity_source_deletion;
 #[path = "all/identity_sources.rs"]
@@ -39,5 +41,7 @@ mod resource_arn_reads;
 mod resource_policies;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/session_cancellation.rs"]
+mod session_cancellation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

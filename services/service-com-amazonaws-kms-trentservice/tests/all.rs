@@ -19,6 +19,8 @@ mod aliases;
 mod client_error_status;
 #[path = "all/decrypt_key_origin.rs"]
 mod decrypt_key_origin;
+#[path = "all/grants.rs"]
+mod grants;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/key_deletion_cancellation.rs"]

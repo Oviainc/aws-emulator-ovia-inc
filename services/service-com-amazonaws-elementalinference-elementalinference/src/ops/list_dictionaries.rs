@@ -164,8 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata, and this operation needs none of it.
-        let _ = ctx;
+        // request metadata — here the Region this request was signed for, whose
+        // dictionaries a list reports.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListDictionariesErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -204,21 +205,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_due_transitions(std::time::Instant::now());
 
         // BTreeMap order, so paging is stable and resuming after an id that has since
-        // been deleted still continues at the next dictionary.
-        let mut remaining = state.dictionaries.iter().filter(|(id, _)| {
+        // been deleted still continues at the next dictionary. Scoped to the Region the
+        // request was signed for: the service is regional, so a dictionary created
+        // through another Region's endpoint is not one this endpoint reports.
+        let mut remaining = state.dictionaries_in(&region).filter(|dictionary| {
             resume_after
                 .as_deref()
-                .is_none_or(|after| id.as_str() > after)
+                .is_none_or(|after| dictionary.id.as_str() > after)
         });
-        let page: Vec<(&String, &crate::state::Dictionary)> =
-            remaining.by_ref().take(page_size).collect();
+        let page: Vec<&crate::state::Dictionary> = remaining.by_ref().take(page_size).collect();
         // A token only when a further dictionary is actually there to be fetched.
         let has_more = remaining.next().is_some();
         // Which feeds reference a dictionary is DERIVED from the feed store, so the
         // status reported here is the same one `GetDictionary` reports for that record.
         let dictionaries: Vec<DictionarySummary> = page
             .iter()
-            .map(|(id, dictionary)| dictionary.summary(&state.feeds_referencing(id)))
+            .map(|dictionary| {
+                dictionary.summary(&state.feeds_referencing(&region, &dictionary.id))
+            })
             .collect();
         let next_token = match (has_more, dictionaries.last()) {
             (true, Some(last)) => Some(crate::state::encode_page_token(&last.id)),

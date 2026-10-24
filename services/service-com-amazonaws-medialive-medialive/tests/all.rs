@@ -23,6 +23,9 @@ mod channel_lifecycle;
 #[path = "all/channel_pipeline_restart.rs"]
 mod channel_pipeline_restart;
 
+#[path = "all/channel_placement_group_listing.rs"]
+mod channel_placement_group_listing;
+
 #[path = "all/channel_placement_group_update.rs"]
 mod channel_placement_group_update;
 

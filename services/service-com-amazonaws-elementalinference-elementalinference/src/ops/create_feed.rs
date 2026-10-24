@@ -277,18 +277,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle_due_transitions(now);
 
-        // The feed store is BOUNDED: past the quota the service refuses the create
-        // rather than growing its state by another record, which is also what the
-        // real service answers once an account's feed quota is exhausted.
-        if state.feeds.len() >= crate::state::MAX_FEEDS {
+        // The feed store is BOUNDED, and a service quota is a PER-REGION figure: past
+        // the Region's quota the service refuses the create rather than growing its
+        // state by another record, which is also what the real service answers once
+        // that Region's feed quota is exhausted. Another Region's feeds neither consume
+        // this Region's quota nor are consumed by it, and the refusal states the bound
+        // it was decided from (`crate::state::feed_quota_refusal`).
+        if let Some(message) = state.feed_quota_refusal(&region) {
             return Err(CreateFeedErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: format!(
-                        "This account already holds the maximum of {} feeds. \
-                         Delete unused feeds or request a quota increase.",
-                        crate::state::MAX_FEEDS
-                    ),
-                },
+                ServiceQuotaExceededException { message },
             )
             .into());
         }
@@ -299,6 +296,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             data_endpoints: crate::state::feed_data_endpoints(&region, &id),
             name: input.name,
             id,
+            // This service is REGIONAL: the feed belongs to the endpoint it was created
+            // through, which is the Region the request was signed for — the same Region
+            // its ARN carries. Every later read and mutation resolves its id within that
+            // Region, so no other Region's endpoint lists, reports or changes it.
+            region: region.clone(),
             // Outputs supplied to CreateFeed did not come from AssociateFeed, so
             // `fromAssociation` is false for every one of them.
             outputs: input

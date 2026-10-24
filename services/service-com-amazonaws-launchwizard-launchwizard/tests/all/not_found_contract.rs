@@ -190,7 +190,14 @@ async fn a_workload_lookup_that_finds_nothing_carries_the_fixed_message() {
             .refused(
                 &case,
                 "/createDeployment",
-                create_body(&workload, known_pattern, &format!("unknown-{}", workload.len()), false),
+                create_body(
+                    &harness,
+                    &workload,
+                    known_pattern,
+                    &format!("unknown-{}", workload.len()),
+                    false,
+                )
+                .await,
                 404,
                 "ResourceNotFoundException",
             )
@@ -259,7 +266,8 @@ async fn an_unknown_deployment_pattern_carries_one_fixed_identifier_free_message
             .refused(
                 &case,
                 "/createDeployment",
-                create_body(&names[0], &pattern, &format!("pattern-{index}"), false),
+                create_body(&harness, &names[0], &pattern, &format!("pattern-{index}"), false)
+                    .await,
                 404,
                 "ResourceNotFoundException",
             )

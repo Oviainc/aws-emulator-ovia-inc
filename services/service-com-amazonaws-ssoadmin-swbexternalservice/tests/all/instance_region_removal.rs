@@ -23,11 +23,17 @@
 //! Every call goes through `MultiServiceRouter::dispatch`, so the modelled constraints and
 //! the `X-Amz-Target` routing are exercised rather than bypassed; the harness is the one
 //! `ssoadmin_permission_sets.rs` owns. Additional Regions are seeded through the service's
-//! own `state::Region` constructor, because the operation that adds one (`AddRegion`) is
+//! own `state::Instance::add_region`, because the operation that adds one (`AddRegion`) is
 //! still a scaffold stub with an issue of its own; and where a test has to be on the far
 //! side of a due instant it moves the STORED instant rather than sleeping — the transition
 //! itself is still applied by the service's own `materialize_due`, exactly as in
 //! production.
+//!
+//! One further rule lives here, because this is where a Region record is seeded: the
+//! number of Regions one instance holds is bounded by the emulator's own per-instance
+//! memory ceiling (`state::MAX_REGIONS_PER_INSTANCE`) — enabling a Region appends a record
+//! that lives until a caller removes it, and the modelled `RegionName` admits unboundedly
+//! many names — so an add past the ceiling is refused instead of growing the process.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -64,10 +70,10 @@ async fn instance_arn_in(router: &MultiServiceRouter, region: &str) -> String {
 /// An account whose instance is enabled in `primary` and additionally enabled in
 /// `additional`, and that instance's ARN.
 ///
-/// The additional Regions are seeded through `state::Region::active` — the constructor the
-/// service's own records use — because `AddRegion`, the operation that enables one over the
-/// wire, is still a scaffold stub tracked by its own issue. Everything asserted afterwards
-/// goes over the wire.
+/// The additional Regions are seeded through `state::Instance::add_region` — the one
+/// place the service's own records append a Region — because `AddRegion`, the operation
+/// that enables one over the wire, is still a scaffold stub tracked by its own issue.
+/// Everything asserted afterwards goes over the wire.
 async fn instance_enabled_in(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
@@ -81,8 +87,11 @@ async fn instance_enabled_in(
             .expect("the account's instance was just read over the wire");
         for name in additional {
             instance
-                .regions
-                .push(state::Region::active(name, DateTime::from(SystemTime::now())));
+                .add_region(state::Region::active(
+                    name,
+                    DateTime::from(SystemTime::now()),
+                ))
+                .expect("the seeded Regions stay under the emulator's per-instance ceiling");
         }
     });
     instance_arn
@@ -661,4 +670,83 @@ async fn remove_region_conflicts_with_another_region_workflow_in_progress() {
             "case {label:?}: RemoveRegion answers REMOVING, got {removed}"
         );
     }
+}
+
+/// A Region name the model's `RegionName` pattern `^([a-z]+-){2,3}\d$` admits, distinct
+/// for each `index`: the middle segment is the index written in lowercase letters, which
+/// is what the pattern allows there (letters only, digits only in the last segment).
+fn seeded_region_name(index: usize) -> String {
+    let mut remaining = index;
+    let mut letters = String::new();
+    loop {
+        letters.insert(
+            0,
+            char::from(b'a' + u8::try_from(remaining % 26).expect("a remainder below 26")),
+        );
+        remaining /= 26;
+        if remaining == 0 {
+            break;
+        }
+    }
+    format!("eu-{letters}-1")
+}
+
+/// The emulator's own per-instance memory ceiling bounds caller-driven growth of an
+/// instance's Regions: enabling a Region appends a record that lives until a caller
+/// removes it, and the modelled `RegionName` admits unboundedly many names, so an add
+/// past `state::MAX_REGIONS_PER_INSTANCE` is refused — naming the instance — rather than
+/// growing the process, and no read ever reports more Regions than the ceiling.
+#[tokio::test]
+async fn an_instance_holds_at_most_the_emulators_region_ceiling() {
+    let (router, engine) = router_and_engine();
+    let instance_arn = instance_arn_in(&router, "us-east-1").await;
+
+    // More adds than the ceiling admits, each a distinct Region name, through the one
+    // place a Region record is appended.
+    let attempts = state::MAX_REGIONS_PER_INSTANCE + 5;
+    let (accepted, refusals) = with_store(&engine, |store| {
+        let instance = store
+            .instance_mut(&instance_arn)
+            .expect("the account's instance was just read over the wire");
+        let mut accepted = 0usize;
+        let mut refusals: Vec<String> = Vec::new();
+        for index in 0..attempts {
+            match instance.add_region(state::Region::active(
+                &seeded_region_name(index),
+                DateTime::from(SystemTime::now()),
+            )) {
+                Ok(()) => accepted += 1,
+                Err(message) => refusals.push(message),
+            }
+        }
+        (accepted, refusals)
+    });
+
+    // The primary Region already occupies one of the places the ceiling admits.
+    assert_eq!(
+        accepted,
+        state::MAX_REGIONS_PER_INSTANCE - 1,
+        "the instance must accept Regions up to the ceiling and no further, it accepted \
+         {accepted}"
+    );
+    assert_eq!(
+        refusals.len(),
+        attempts - accepted,
+        "every add past the ceiling must be refused, got {refusals:?}"
+    );
+    for message in &refusals {
+        assert!(
+            message.contains(&instance_arn),
+            "a refusal must name the instance the ceiling was reached on, got {message:?}"
+        );
+    }
+
+    // What a client reads is bounded by the same ceiling.
+    let reported = described_regions(&router, "us-east-1", &instance_arn).await;
+    assert_eq!(
+        reported.len(),
+        state::MAX_REGIONS_PER_INSTANCE,
+        "the instance must report at most {} Regions, got {reported:?}",
+        state::MAX_REGIONS_PER_INSTANCE
+    );
 }

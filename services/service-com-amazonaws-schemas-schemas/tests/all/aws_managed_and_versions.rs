@@ -23,8 +23,8 @@ use service_com_amazonaws_schemas_schemas::state::{
 };
 
 use crate::registry_schema_lifecycle::{
-    create_registry, export_uri, registry_names, registry_uri, schema_names, schema_uri, walk,
-    Answer, Emulator,
+    create_registry, export_uri, listed_versions, registry_names, registry_uri, schema_names,
+    schema_uri, versions_uri, walk, Emulator,
 };
 
 /// A schema body `CreateSchema` accepts, distinct per `marker`.
@@ -33,25 +33,6 @@ fn schema_body(marker: &str) -> Value {
         "Content": format!(r#"{{"openapi":"3.0.0","info":{{"title":"{marker}","version":"1"}}}}"#),
         "Type": "OpenApi3",
     })
-}
-
-fn versions_uri(registry: &str, schema: &str) -> String {
-    format!("{}/versions", schema_uri(registry, schema))
-}
-
-/// The version labels `ListSchemaVersions` reports, as a set.
-fn listed_versions(answer: &Answer) -> BTreeSet<String> {
-    answer.body["SchemaVersions"]
-        .as_array()
-        .unwrap_or_else(|| panic!("expected a SchemaVersions array in {:?}", answer.body))
-        .iter()
-        .map(|item| {
-            item["SchemaVersion"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string()
-        })
-        .collect()
 }
 
 /// RULE: a registry is a container, so deleting one is refused 409

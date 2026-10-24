@@ -75,6 +75,20 @@ pub fn encode_label(value: &str) -> String {
         .collect()
 }
 
+/// The error code a client matches on, with the `shape#` prefix a restJson1
+/// envelope may carry stripped. Empty on a success answer, which carries no
+/// error type at all.
+pub fn error_code(answer: &Answer) -> String {
+    answer
+        .error_type
+        .as_deref()
+        .unwrap_or_default()
+        .rsplit('#')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
 pub async fn call(
     router: &MultiServiceRouter,
     region: &str,

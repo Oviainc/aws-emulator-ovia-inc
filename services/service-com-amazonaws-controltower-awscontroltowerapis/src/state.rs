@@ -18,6 +18,14 @@
 //! `GetBaselineOperation` resolves. The two logs are separate: an identifier a landing
 //! zone call returned is not a baseline operation and vice versa.
 //!
+//! Control enablement keeps a log of its own, the same shape one level down again: a call
+//! that enables, updates, resets or disables a control starts an asynchronous operation
+//! whose record lands in
+//! [`ComAmazonawsControltowerAwscontroltowerapisState::control_operations`], keyed by
+//! `operationIdentifier` and resolved by `GetControlOperation`/`ListControlOperations`.
+//! It is a THIRD separate log: an identifier a landing zone or baseline call returned is
+//! not a control operation, and vice versa.
+//!
 //! The baseline CATALOG is a third kind of data: the baselines themselves are AWS-managed
 //! and identical in every account, so they live in the constant [`BASELINE_CATALOG`] that
 //! `GetBaseline` resolves an identifier against, not in the per-account store. No call
@@ -28,9 +36,10 @@
 //! runs under the state lock, without limit:
 //!
 //! * `landing_zones` holds the one landing zone an account may have;
-//! * the two operation logs are append-only only WITHIN a bound, retaining at most
-//!   [`MAX_LANDING_ZONE_OPERATIONS`] / [`MAX_BASELINE_OPERATIONS`] records and evicting
-//!   the oldest TERMINAL record to make room (see [`enforce_log_bound`]);
+//! * the three operation logs are append-only only WITHIN a bound, retaining at most
+//!   [`MAX_LANDING_ZONE_OPERATIONS`] / [`MAX_BASELINE_OPERATIONS`] /
+//!   [`MAX_CONTROL_OPERATIONS`] records and evicting the oldest TERMINAL record to make
+//!   room (see [`enforce_log_bound`]);
 //! * `enabled_baselines` holds at most [`MAX_ENABLED_BASELINES`] enablements, and
 //!   `EnableBaseline` is REFUSED past that cap rather than growing the store (see
 //!   [`record_enablement`]), because an enablement is a resource a caller must tear down
@@ -115,6 +124,15 @@ pub const MAX_ENABLED_CONTROL_PARAMETERS: usize = 200;
 /// configuration, and small enough that [`MAX_ENABLED_CONTROLS`] records bound the
 /// store's size in bytes as well as in entries.
 pub const MAX_ENABLED_CONTROL_PARAMETER_BYTES: usize = 64 * 1024;
+
+/// The most control operation records the log retains.
+///
+/// Same reasoning, and the same CHOSEN size, as [`MAX_LANDING_ZONE_OPERATIONS`]: a record
+/// stays resolvable through `GetControlOperation`/`ListControlOperations` until the log is
+/// full, at which point the oldest terminal record is evicted. Counted separately because
+/// the three logs are separate stores, so a busy control caller cannot evict landing zone
+/// or baseline history.
+pub const MAX_CONTROL_OPERATIONS: usize = 1024;
 
 /// The most baseline operation records the log retains.
 ///
@@ -747,6 +765,76 @@ pub struct BaselineOperationRecord {
     pub due_at: SystemTime,
 }
 
+/// `ControlOperationType`: which call produced a control operation record.
+///
+/// Wire values from the model's `ControlOperationType` enum (`ENABLE_CONTROL` |
+/// `DISABLE_CONTROL` | `UPDATE_ENABLED_CONTROL` | `RESET_ENABLED_CONTROL`), which is
+/// exactly the set of calls that act on an `EnabledControl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlOperationType {
+    EnableControl,
+    DisableControl,
+    UpdateEnabledControl,
+    ResetEnabledControl,
+}
+
+impl ControlOperationType {
+    /// The value this operation type serializes as.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::EnableControl => "ENABLE_CONTROL",
+            Self::DisableControl => "DISABLE_CONTROL",
+            Self::UpdateEnabledControl => "UPDATE_ENABLED_CONTROL",
+            Self::ResetEnabledControl => "RESET_ENABLED_CONTROL",
+        }
+    }
+}
+
+/// `ControlOperationStatus`: how far a control operation has got.
+///
+/// Wire values from the model's `ControlOperationStatus` enum
+/// (`SUCCEEDED` | `FAILED` | `IN_PROGRESS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlOperationStatus {
+    InProgress,
+    Succeeded,
+    Failed,
+}
+
+impl ControlOperationStatus {
+    /// The value this status serializes as.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::InProgress => "IN_PROGRESS",
+            Self::Succeeded => "SUCCEEDED",
+            Self::Failed => "FAILED",
+        }
+    }
+}
+
+/// One entry of the control operation log.
+#[derive(Debug, Clone)]
+pub struct ControlOperationRecord {
+    pub operation_identifier: String,
+    pub operation_type: ControlOperationType,
+    /// The `controlIdentifier` the call named, carried on the record so a reporting call
+    /// reports the control the operation acted on without the enablement it belongs to
+    /// still being in the store.
+    pub control_identifier: String,
+    /// The `targetIdentifier` the call named, carried for the same reason.
+    pub target_identifier: String,
+    /// The `EnabledControl` this operation acted on. Kept even after that resource is
+    /// gone, so a `DISABLE_CONTROL` identifier still resolves.
+    pub enabled_control_arn: String,
+    pub status: ControlOperationStatus,
+    pub start_time: SystemTime,
+    pub end_time: Option<SystemTime>,
+    pub status_message: Option<String>,
+    /// The instant the clock owes this operation its terminal status. Stored, never
+    /// slept on: a reader materialises the transition once it is due.
+    pub due_at: SystemTime,
+}
+
 /// Per-service state for com-amazonaws-controltower-awscontroltowerapis. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsControltowerAwscontroltowerapisState {
@@ -761,6 +849,11 @@ pub struct ComAmazonawsControltowerAwscontroltowerapisState {
     /// `ListEnabledControls`/`GetEnabledControl`. Holds at most
     /// [`MAX_ENABLED_CONTROLS`] entries.
     pub enabled_controls: HashMap<String, EnabledControl>,
+    /// The control operation log, keyed by `operationIdentifier`. Written by every call
+    /// that acts on an `EnabledControl` and read by
+    /// `GetControlOperation`/`ListControlOperations`. Append-only up to
+    /// [`MAX_CONTROL_OPERATIONS`] records; see the module header on retention.
+    pub control_operations: HashMap<String, ControlOperationRecord>,
     /// Enabled baselines keyed by the `EnabledBaseline` ARN this service minted for them.
     pub enabled_baselines: HashMap<String, EnabledBaseline>,
     /// The baseline operation log, keyed by `operationIdentifier`. Append-only up to
@@ -842,6 +935,15 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
                 if control.resource_drift_status == DriftStatus::Unknown {
                     control.resource_drift_status = DriftStatus::InSync;
                 }
+            }
+        }
+
+        for operation in self.control_operations.values_mut() {
+            if operation.status == ControlOperationStatus::InProgress && now >= operation.due_at {
+                operation.status = ControlOperationStatus::Succeeded;
+                // The end time is when the operation became due, not when a caller
+                // happened to look, so repeated reads report one stable instant.
+                operation.end_time = Some(operation.due_at);
             }
         }
 
@@ -1039,6 +1141,38 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             &mut self.landing_zone_operations,
             MAX_LANDING_ZONE_OPERATIONS,
         );
+        operation_identifier
+    }
+
+    /// Append a control operation to its log and return its `operationIdentifier`.
+    ///
+    /// Enforces the log's retention bound ([`MAX_CONTROL_OPERATIONS`]) on the way out, so
+    /// this is the single place that log can grow.
+    pub fn record_control_operation(
+        &mut self,
+        operation_type: ControlOperationType,
+        control_identifier: &str,
+        target_identifier: &str,
+        enabled_control_arn: &str,
+        now: SystemTime,
+    ) -> String {
+        let operation_identifier = new_operation_identifier();
+        self.control_operations.insert(
+            operation_identifier.clone(),
+            ControlOperationRecord {
+                operation_identifier: operation_identifier.clone(),
+                operation_type,
+                control_identifier: control_identifier.to_string(),
+                target_identifier: target_identifier.to_string(),
+                enabled_control_arn: enabled_control_arn.to_string(),
+                status: ControlOperationStatus::InProgress,
+                start_time: now,
+                end_time: None,
+                status_message: None,
+                due_at: now + OPERATION_SETTLE_AFTER,
+            },
+        );
+        enforce_log_bound(&mut self.control_operations, MAX_CONTROL_OPERATIONS);
         operation_identifier
     }
 
@@ -1257,8 +1391,8 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
 
 /// One record of an asynchronous operation log, as the shared retention bound reads it.
 ///
-/// Implemented by both logs' record types so [`enforce_log_bound`] is written once; the
-/// two logs hold different record shapes but retain them by the same rule.
+/// Implemented by every log's record type so [`enforce_log_bound`] is written once; the
+/// logs hold different record shapes but retain them by the same rule.
 trait OperationLogRecord {
     /// The record's `operationIdentifier`, which is also its key in the log.
     fn identifier(&self) -> &str;
@@ -1293,6 +1427,20 @@ impl OperationLogRecord for BaselineOperationRecord {
 
     fn is_in_flight(&self) -> bool {
         self.status == BaselineOperationStatus::InProgress
+    }
+}
+
+impl OperationLogRecord for ControlOperationRecord {
+    fn identifier(&self) -> &str {
+        &self.operation_identifier
+    }
+
+    fn start_time(&self) -> SystemTime {
+        self.start_time
+    }
+
+    fn is_in_flight(&self) -> bool {
+        self.status == ControlOperationStatus::InProgress
     }
 }
 

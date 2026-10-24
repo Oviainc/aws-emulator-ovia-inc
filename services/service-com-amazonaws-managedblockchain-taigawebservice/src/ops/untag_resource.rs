@@ -144,7 +144,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A mutation the spec states this call makes: "Removes the specified tags from
         // the Amazon Managed Blockchain resource."
-        let _ = ctx;
+        //
+        // The Region this request is addressed to, read off its own credential scope: a
+        // resource lives in one Region, so an ARN naming another Region's names nothing
+        // this request can untag.
+        let region = crate::state::request_region(ctx);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServiceErrorException(
@@ -181,7 +185,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());
 
-        let Some(tags) = guard.tags_for_resource_mut(&input.resource_arn) else {
+        // An ARN of another Region names no resource this Region holds — see the same
+        // Region check in `tag_resource.rs`.
+        let Some(tags) = crate::state::arn_in_region(&input.resource_arn, &region)
+            .then(|| guard.tags_for_resource_mut(&input.resource_arn))
+            .flatten()
+        else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::not_found_arn(resource_type, &input.resource_arn),
             )

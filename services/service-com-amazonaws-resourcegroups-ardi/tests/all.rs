@@ -17,6 +17,8 @@ mod group_owner_configuration_and_update;
 mod group_query;
 #[path = "all/group_tags.rs"]
 mod group_tags;
+#[path = "all/group_untag.rs"]
+mod group_untag;
 #[path = "all/grouping_statuses.rs"]
 mod grouping_statuses;
 #[path = "all/resource_group_lifecycle.rs"]

@@ -196,16 +196,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "Lists agreement cancellation requests available to you as a
             // seller or buyer… Use Proposer to list cancellation requests where
             // you are the seller, or Acceptor to list cancellation requests
-            // where you are the buyer": a request is available to the caller
-            // when the agreement it belongs to names the caller's account as
-            // the party the call claims to be.
-            let available = store
-                .agreements
-                .get(&request.agreement_id)
-                .is_some_and(|agreement| {
-                    crate::state::caller_is_party(agreement, &input.party_type)
-                });
-            if !available {
+            // where you are the buyer": the seller is the account that
+            // SUBMITTED the request, which the send recorded on it, and the
+            // buyer is the acceptor of the agreement it was sent under — what
+            // `crate::state::submitted_request_party_matches` decides for both
+            // this listing and the payment-request one.
+            if !crate::state::submitted_request_party_matches(
+                &request.proposer_account_id,
+                store.agreements.get(&request.agreement_id),
+                &input.party_type,
+            ) {
                 continue;
             }
             // Every remaining input member is "an optional parameter to filter

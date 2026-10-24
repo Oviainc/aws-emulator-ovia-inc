@@ -262,6 +262,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // `AutoAssociate` elects the ONE group that "will automatically associate
+        // newly added Amazon Web Services accounts that join your consolidated billing
+        // family", so a create that would leave the family with more enabled groups
+        // than [`crate::state::MAX_AUTO_ASSOCIATE_BILLING_GROUPS`] is refused with the
+        // reason the model enumerates for exactly this case. The group being created
+        // holds no ARN yet, so every stored group with the flag on counts against the
+        // cap.
+        if input.account_grouping.auto_associate.unwrap_or(false) {
+            let holders = state.other_auto_associate_billing_groups("");
+            if holders.len() >= crate::state::MAX_AUTO_ASSOCIATE_BILLING_GROUPS {
+                return Err(CreateBillingGroupErrorModeled::ValidationException(
+                    crate::state::too_many_auto_associate_billing_groups(
+                        "AccountGrouping.AutoAssociate",
+                        &holders,
+                    ),
+                )
+                .into());
+            }
+        }
+
         // Nothing in this slice deletes a pricing plan and a group is deleted only
         // when the caller asks, so both stores are bounded by an explicit maximum
         // and a create past it is refused rather than served by evicting a resource

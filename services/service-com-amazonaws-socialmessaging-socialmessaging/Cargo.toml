@@ -7,6 +7,9 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+# How a constraint-violation clause states the value the caller submitted — including a
+# list or a structure, which the framework's own violation can only summarise as a count.
+service-common = { path = "../common" }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
@@ -33,6 +36,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Percent-encodes a query-bound member's value in the test harness, so an ARN-form id
+# survives the round trip without a hand-rolled encoder.
+percent-encoding = "2.3"
 
 [lints]
 workspace = true

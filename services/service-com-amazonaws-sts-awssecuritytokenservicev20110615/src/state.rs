@@ -4,10 +4,16 @@
 //!
 //! STS is a credential vendor: every operation either mints a session (`AssumeRole`,
 //! `GetSessionToken`, `GetFederationToken`) or reports on one (`GetCallerIdentity`,
-//! `GetAccessKeyInfo`). This module holds the one registry those operations share —
+//! `GetAccessKeyInfo`). This module holds the registries those operations share —
 //! the sessions keyed by the access key id each was minted under, plus the role id
-//! STS keeps stable per role ARN — and the pure rules the handlers apply to it, so a
-//! handler file contains only its own operation's decisions.
+//! STS keeps stable per role ARN — and the pure rules the handlers apply to them, so
+//! a handler file contains only its own operation's decisions.
+//!
+//! Beside the sessions it keeps the encoded authorization messages the account has
+//! issued: STS is also the service that decodes the opaque blob an authorization
+//! failure hands a caller (`DecodeAuthorizationMessage`), and the authorization
+//! detail behind such a blob is privileged, so the blob carries only the token that
+//! names the record here.
 //!
 //! Secrets are deliberately NOT stored here. The access key id, secret access key
 //! and session token are minted by the emulator's credential store
@@ -218,6 +224,14 @@ pub struct ComAmazonawsStsAwssecuritytokenservicev20110615State {
     /// id. At most [`MAX_SESSIONS`] entries; each entry's tags and transitive tag
     /// keys are bounded by the model (`tagListType` / `tagKeyListType`, 0..50).
     pub sessions: HashMap<String, Session>,
+    /// Every encoded authorization message the account has issued and not yet let
+    /// expire, keyed by the token the blob carries. At most
+    /// [`MAX_AUTHORIZATION_MESSAGES`] entries.
+    pub authorization_messages: HashMap<String, AuthorizationMessage>,
+    /// How many encoded authorization messages this account has ever issued. It only
+    /// ever counts up — unlike the registry's size, which shrinks as messages expire
+    /// or give way at the cap — which is what makes every token distinct.
+    pub authorization_messages_issued: u64,
 }
 
 /// Shorthand for this service's state, for use inside the crate.
@@ -293,6 +307,307 @@ impl StsState {
         self.sessions
             .retain(|_, session| now < session.expires_at + EXPIRED_SESSION_RETENTION);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Encoded authorization messages
+// ---------------------------------------------------------------------------
+
+/// The envelope every encoded authorization message this account issues starts with,
+/// before it is base64-encoded. It is what separates a blob this service minted from
+/// any other run of bytes a caller may hand `DecodeAuthorizationMessage`, and it
+/// carries a version so a later envelope can be told from this one.
+const ENCODED_MESSAGE_ENVELOPE: &[u8] = b"STSEncodedAuthorizationMessage/1:";
+
+/// How long an encoded authorization message stays decodable.
+///
+/// A CHOSEN window, not a duration AWS documents — the model says only that the
+/// message may have "expired". It is long enough for a caller that was handed a blob
+/// by an authorization failure to decode it, and short enough that the registry
+/// shrinks back on an idle emulator.
+pub const ENCODED_MESSAGE_VALIDITY: Duration = Duration::from_secs(3600);
+
+/// The most encoded authorization messages this registry holds at once.
+///
+/// Issuing one is a request-driven insert, so the registry needs a declared ceiling.
+/// At the cap the oldest record gives way: unlike a credential, an encoded message is
+/// a diagnostic the caller may decode once, not a promise this service made for a
+/// stated duration. A chosen emulator ceiling; AWS publishes no such limit.
+pub const MAX_AUTHORIZATION_MESSAGES: usize = 1024;
+
+/// How many digest bytes name one record: 16, rendered as 32 hex characters — far
+/// more than enough to keep the [`MAX_AUTHORIZATION_MESSAGES`] records held at once
+/// apart.
+const AUTHORIZATION_MESSAGE_TOKEN_BYTES: usize = 16;
+
+/// What an authorization failure decided, as the decoded message reports it: whether
+/// the request was allowed, whether a `Deny` statement said so explicitly, and the
+/// context of the request it was decided for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuthorizationDecision {
+    pub allowed: bool,
+    /// Whether the refusal came from an explicit `Deny` rather than from the absence
+    /// of an `Allow`.
+    pub explicit_deny: bool,
+    /// The principal that made the request: its unique id and its ARN.
+    pub principal_id: String,
+    pub principal_arn: String,
+    /// The requested action and resource.
+    pub action: String,
+    pub resource: String,
+    /// The condition keys in the context of the request, each with its values.
+    pub conditions: Vec<(String, Vec<String>)>,
+    /// The policy statements the decision matched, each by its statement id and its
+    /// effect. Empty when the request matched none, which is what an implicit deny
+    /// looks like.
+    pub matched_statements: Vec<(String, String)>,
+}
+
+/// One encoded authorization message the account has issued, keyed in
+/// [`StsState::authorization_messages`] by the token its blob carries.
+#[derive(Debug, Clone)]
+pub struct AuthorizationMessage {
+    /// The registry key: the token the encoded blob names this record by.
+    pub token: String,
+    pub issued_at: SystemTime,
+    /// `issued_at + ENCODED_MESSAGE_VALIDITY`: past this instant the message is no
+    /// longer decodable.
+    pub expires_at: SystemTime,
+    /// The document `DecodeAuthorizationMessage` answers with.
+    pub decoded_message: String,
+}
+
+impl StsState {
+    /// The record a token names, expired or not.
+    pub fn authorization_message(&self, token: &str) -> Option<&AuthorizationMessage> {
+        self.authorization_messages.get(token)
+    }
+
+    /// Materialise every encoded-message expiry the clock has already made due: a
+    /// message past its validity window cannot be decoded any more, whether or not
+    /// anybody called, so its record is dropped. That is what keeps the registry's
+    /// size tied to the messages still decodable rather than to every one ever
+    /// issued.
+    pub fn expire_authorization_messages(&mut self, now: SystemTime) {
+        self.authorization_messages
+            .retain(|_, message| now < message.expires_at);
+    }
+
+    /// Record an issued encoded authorization message, bounded by
+    /// [`MAX_AUTHORIZATION_MESSAGES`]: expiries the clock has made due are
+    /// materialised first, and at the cap the earliest-issued record gives way, so NO
+    /// path can push the registry past the cap.
+    pub fn record_authorization_message(&mut self, message: AuthorizationMessage, now: SystemTime) {
+        self.expire_authorization_messages(now);
+        while self.authorization_messages.len() >= MAX_AUTHORIZATION_MESSAGES {
+            let oldest = self
+                .authorization_messages
+                .values()
+                .min_by(|one, other| {
+                    (one.issued_at, one.token.as_str()).cmp(&(other.issued_at, other.token.as_str()))
+                })
+                .map(|held| held.token.clone());
+            match oldest {
+                Some(token) => {
+                    self.authorization_messages.remove(&token);
+                }
+                None => break,
+            }
+        }
+        self.authorization_messages
+            .insert(message.token.clone(), message);
+    }
+}
+
+/// The decoded message for an authorization decision: the document AWS's
+/// `DecodeAuthorizationMessage` answers with, which states whether the request was
+/// allowed and whether a deny was explicit, the statements the decision matched, and
+/// the context it was decided in — the principal, the action, the resource and the
+/// condition keys of the request.
+pub fn authorization_decision_document(decision: &AuthorizationDecision) -> String {
+    let matched: Vec<serde_json::Value> = decision
+        .matched_statements
+        .iter()
+        .map(|(statement_id, effect)| {
+            serde_json::json!({ "statementId": statement_id, "effect": effect })
+        })
+        .collect();
+    let conditions: Vec<serde_json::Value> = decision
+        .conditions
+        .iter()
+        .map(|(key, values)| {
+            let values: Vec<serde_json::Value> = values
+                .iter()
+                .map(|value| serde_json::json!({ "value": value }))
+                .collect();
+            serde_json::json!({ "key": key, "values": { "items": values } })
+        })
+        .collect();
+    serde_json::json!({
+        "allowed": decision.allowed,
+        "explicitDeny": decision.explicit_deny,
+        "matchedStatements": { "items": matched },
+        // Nothing here evaluates a policy it could not read, so there is never a
+        // failure to report — the member is still part of the document's shape.
+        "failures": { "items": [] },
+        "context": {
+            "principal": { "id": decision.principal_id, "arn": decision.principal_arn },
+            "action": decision.action,
+            "resource": decision.resource,
+            "conditions": { "items": conditions },
+        },
+    })
+    .to_string()
+}
+
+/// Issue an encoded authorization message for an authorization decision: record the
+/// decoded document and hand back the opaque blob the denying operation returns to its
+/// caller.
+///
+/// The blob is the envelope and the token that names the record, and nothing
+/// else: the authorization detail "can contain privileged information that the user
+/// who requested the operation should not see" (this operation's documentation), so it
+/// stays here and never travels with the blob. It is rendered in the URL-safe base64
+/// alphabet with the padding stripped, the form an encoded authorization message
+/// travels in.
+pub fn encode_authorization_message(
+    state: &mut StsState,
+    now: SystemTime,
+    decision: &AuthorizationDecision,
+) -> String {
+    let decoded_message = authorization_decision_document(decision);
+    state.authorization_messages_issued = state.authorization_messages_issued.wrapping_add(1);
+    let token = authorization_message_token(
+        &decoded_message,
+        now,
+        state.authorization_messages_issued,
+    );
+    state.record_authorization_message(
+        AuthorizationMessage {
+            token: token.clone(),
+            issued_at: now,
+            expires_at: now + ENCODED_MESSAGE_VALIDITY,
+            decoded_message,
+        },
+        now,
+    );
+    let mut payload = ENCODED_MESSAGE_ENVELOPE.to_vec();
+    payload.extend_from_slice(token.as_bytes());
+    ::aws_smithy_types::base64::encode(payload)
+        .replace('+', "-")
+        .replace('/', "_")
+        .trim_end_matches('=')
+        .to_string()
+}
+
+/// The decoded message an encoded authorization message carries, or the wording to
+/// refuse it with.
+///
+/// A message decodes only when it is base64 of this account's envelope AND names a
+/// record the registry still holds: bytes that are not base64 at all, base64 of
+/// something this account never issued, and a message whose validity window has run
+/// out are all messages this service cannot decode — exactly the cases
+/// `InvalidAuthorizationMessageException` reports. A read, so nothing recorded here
+/// changes: the same message decodes again to the same document for as long as it is
+/// valid.
+pub fn decode_authorization_message(
+    state: &StsState,
+    encoded: &str,
+    now: SystemTime,
+) -> Result<String, String> {
+    let Some(bytes) = encoded_message_bytes(encoded) else {
+        return Err(invalid_authorization_message(encoded.as_bytes()));
+    };
+    bytes
+        .strip_prefix(ENCODED_MESSAGE_ENVELOPE)
+        .and_then(|token| std::str::from_utf8(token).ok())
+        .and_then(|token| state.authorization_message(token))
+        .filter(|record| now < record.expires_at)
+        .map(|record| record.decoded_message.clone())
+        .ok_or_else(|| invalid_authorization_message(&bytes))
+}
+
+/// The bytes an encoded message carries, or `None` when it is not base64 at all.
+///
+/// Read in BOTH base64 alphabets — the standard one (`+`, `/`) and the URL-safe one
+/// (`-`, `_`), which is the one AWS's own encoded authorization messages travel in —
+/// and with the padding optional, because the padding carries no data. Whitespace and
+/// anything outside those alphabets — "invalid characters, such as line breaks", as
+/// the modelled error puts it — is not base64 here, so such a message carries no
+/// bytes at all. The decoding itself is `aws_smithy_types::base64`, the codec the wire
+/// serializer already uses for every blob.
+fn encoded_message_bytes(encoded: &str) -> Option<Vec<u8>> {
+    // Only a message in the URL-safe alphabet needs a copy; one already in the
+    // standard alphabet is decoded where it lies.
+    let standard: std::borrow::Cow<'_, str> = if encoded.contains(['-', '_']) {
+        std::borrow::Cow::Owned(
+            encoded
+                .chars()
+                .map(|character| match character {
+                    '-' => '+',
+                    '_' => '/',
+                    other => other,
+                })
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(encoded)
+    };
+    if let Ok(bytes) = ::aws_smithy_types::base64::decode(standard.as_ref()) {
+        return Some(bytes);
+    }
+    let missing_padding = (4 - standard.len() % 4) % 4;
+    if missing_padding == 0 || standard.ends_with('=') {
+        return None;
+    }
+    let mut padded = standard.into_owned();
+    for _ in 0..missing_padding {
+        padded.push('=');
+    }
+    ::aws_smithy_types::base64::decode(padded).ok()
+}
+
+/// The wording a message this service cannot decode is refused with: the sentence
+/// AWS answers, followed by the bytes of the message rendered as signed 8-bit values.
+///
+/// Those bytes are all the service can report of a blob it did not issue — nothing
+/// else about it is known to it — and they are the decoded bytes, which is what the
+/// message actually carried. A blob that is not base64 at all has none, so its own
+/// bytes are what gets reported. The rendering is bounded by the request: the model
+/// caps `EncodedMessage` at 10,240 characters, and the boundary validator refuses a
+/// longer one before any handler runs.
+fn invalid_authorization_message(bytes: &[u8]) -> String {
+    let mut rendered = String::new();
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            rendered.push_str(", ");
+        }
+        rendered.push_str(&byte.cast_signed().to_string());
+    }
+    format!("Message is not valid: [{rendered}]")
+}
+
+/// The token that names one recorded decision: hex of a SHA-256 digest over the
+/// decoded document, the instant the message was issued and how many messages this
+/// account has issued so far — so a token is a function of the message it names, and
+/// two messages for the same decision, even at the same instant, get different tokens.
+///
+/// It is an identifier, not a secret: what it names is a decision this emulator itself
+/// recorded, and the caller it was handed to is the one the decision is about.
+fn authorization_message_token(document: &str, issued_at: SystemTime, issued: u64) -> String {
+    let nanos = issued_at
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let mut digest = Sha256::new();
+    digest.update(document.as_bytes());
+    digest.update(nanos.to_be_bytes());
+    digest.update(issued.to_be_bytes());
+    digest
+        .finalize()
+        .iter()
+        .take(AUTHORIZATION_MESSAGE_TOKEN_BYTES)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
