@@ -25,6 +25,8 @@ mod error_envelope;
 mod idempotent_repeats;
 #[path = "all/input_probe.rs"]
 mod input_probe;
+#[path = "all/job_engine_version_resolution.rs"]
+mod job_engine_version_resolution;
 #[path = "all/job_engine_versions.rs"]
 mod job_engine_versions;
 #[path = "all/job_from_template.rs"]
@@ -51,6 +53,8 @@ mod preset_lifecycle;
 mod preset_update;
 #[path = "all/queue_deletion.rs"]
 mod queue_deletion;
+#[path = "all/queue_hopping.rs"]
+mod queue_hopping;
 #[path = "all/queue_listing.rs"]
 mod queue_listing;
 #[path = "all/queue_pause_gating.rs"]

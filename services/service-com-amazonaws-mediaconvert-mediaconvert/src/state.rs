@@ -36,10 +36,16 @@
 //!   SINGLE field on the job — "the most recent share attempt" — so sharing a job over
 //!   and over replaces that one attempt instead of growing anything, and
 //!   `pending_shares` holds at most one entry per stored job, bounding it by `MAX_JOBS`.
+//!   A job's `queue_transitions` grow by at most ONE entry per hop destination the job was
+//!   created with, because each hop destination is used at most once (see
+//!   [`JobRecord::next_hop`]), so a job's hopping history cannot outgrow the list the one
+//!   request that created it carried; `pending_hops` holds at most one entry per stored
+//!   job, so it is bounded by `MAX_JOBS` exactly as `pending_shares` is.
 //! * Every lookup is an O(log n) `BTreeMap` probe; no handler clones the whole store.
 //! * [`ComAmazonawsMediaconvertMediaconvertState::settle`] — the only work a reporting
 //!   operation does — touches ONLY the records whose due instant has already passed, by
-//!   draining the `pending`, `pending_queries` and `pending_shares` indexes that are
+//!   draining the `pending`, `pending_queries`, `pending_shares` and `pending_hops`
+//!   indexes that are
 //!   ordered by that instant, and does a CONSTANT amount of work per record it drains. It
 //!   costs O(k log n) in the number k of records actually due, which is zero on the
 //!   overwhelming majority of calls; it is never a sweep of the job set.
@@ -80,7 +86,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     AccelerationSettings, HopDestination, Input, InputTemplate, Job, JobEngineVersion, JobMessages,
     JobSettings, JobTemplate, JobTemplateSettings, Output, Policy, Preset, PresetSettings, Queue,
-    ReservationPlan, ReservationPlanSettings, Timing,
+    QueueTransition, ReservationPlan, ReservationPlanSettings, Timing,
 };
 
 /// The built-in queue a job with no `Queue` member is sent to.
@@ -224,9 +230,13 @@ pub const JOBS_QUERY_FILTER_KEY_FILE_INPUT: &str = "fileInput";
 /// See [`JOBS_QUERY_FILTER_KEY_QUEUE`].
 pub const JOBS_QUERY_FILTER_KEY_JOB_ENGINE_VERSION_REQUESTED: &str = "jobEngineVersionRequested";
 /// See [`JOBS_QUERY_FILTER_KEY_QUEUE`].
+pub const JOBS_QUERY_FILTER_KEY_JOB_ENGINE_VERSION_USED: &str = "jobEngineVersionUsed";
+/// See [`JOBS_QUERY_FILTER_KEY_QUEUE`].
 pub const JOBS_QUERY_FILTER_KEY_AUDIO_CODEC: &str = "audioCodec";
 /// See [`JOBS_QUERY_FILTER_KEY_QUEUE`].
 pub const JOBS_QUERY_FILTER_KEY_VIDEO_CODEC: &str = "videoCodec";
+/// See [`JOBS_QUERY_FILTER_KEY_QUEUE`].
+pub const JOBS_QUERY_FILTER_KEY_ERROR_CODE: &str = "errorCode";
 
 /// `Order` values (`smithy_query(query="shape",shape="Order")`).
 pub const ORDER_ASCENDING: &str = "ASCENDING";
@@ -736,6 +746,104 @@ fn resource_name_from_reference<'a>(resource_type: &str, reference: &'a str) -> 
 /// references a queue resource exactly as `CreateJob$Queue` does.
 pub fn hop_destination_queues(hops: &[HopDestination]) -> impl Iterator<Item = &str> + '_ {
     hops.iter().filter_map(|hop| hop.queue.as_deref())
+}
+
+/// The bottom of the range `HopDestination$WaitMinutes` publishes: "Minimum wait time in
+/// minutes until the job can hop to the destination queue. Valid range is 1 to 4320
+/// minutes, inclusive."
+pub const MIN_HOP_WAIT_MINUTES: i32 = 1;
+
+/// The top of that range. See [`MIN_HOP_WAIT_MINUTES`].
+pub const MAX_HOP_WAIT_MINUTES: i32 = 4_320;
+
+/// The NAME of the queue a hop destination moves a job to — this store's key for it.
+///
+/// `HopDestination$Queue`: "Optional unless the job is submitted on the default queue. When
+/// you set up a job to use queue hopping, you can specify a destination queue. This queue
+/// cannot be the original queue to which the job is submitted. If the original queue isn't
+/// the default queue and you don't specify the destination queue, the job will move to the
+/// default queue." So a hop that names a queue moves the job to it, in either reference
+/// form, and a hop that names none moves the job to the account's default queue.
+pub fn hop_destination_queue_name(hop: &HopDestination) -> &str {
+    hop.queue
+        .as_deref()
+        .map_or(DEFAULT_QUEUE_NAME, queue_name_from_reference)
+}
+
+/// How long a job waits in its current queue before this hop destination can move it.
+///
+/// `HopDestination$WaitMinutes` is a wait the CALLER asked for, in minutes, so it keeps the
+/// value the request stated. `None` for a hop destination that states no wait, which
+/// therefore sets up no hop; every operation that accepts hop destinations refuses such an
+/// entry up front ([`hop_wait_problem`]), so a stored job only ever carries hops that have
+/// one.
+pub fn hop_wait(hop: &HopDestination) -> Option<Duration> {
+    let minutes = u64::try_from(hop.wait_minutes?).ok()?;
+    minutes.checked_mul(60).map(Duration::from_secs)
+}
+
+/// Why the hop destinations a request carries cannot set up a hop, or `None` when every
+/// entry can.
+///
+/// `HopDestination$WaitMinutes`: "Required for setting up a job to use queue hopping.
+/// Minimum wait time in minutes until the job can hop to the destination queue. Valid range
+/// is 1 to 4320 minutes, inclusive." The member is a bare `__integer` in the model, so
+/// nothing refuses a missing or out-of-range wait before a handler runs. Every operation
+/// that accepts hop destinations takes this one test, so what they accept cannot drift
+/// apart; the wording is built from the member and its published range, as every other
+/// member-naming refusal in this module is (see [`not_found_message`]).
+pub fn hop_wait_problem(hops: &[HopDestination]) -> Option<String> {
+    for hop in hops {
+        let Some(minutes) = hop.wait_minutes else {
+            return Some(
+                "WaitMinutes is required for every entry in hopDestinations: it is the \
+                 minimum wait time in minutes until the job can hop to the destination \
+                 queue."
+                    .to_string(),
+            );
+        };
+        if !(MIN_HOP_WAIT_MINUTES..=MAX_HOP_WAIT_MINUTES).contains(&minutes) {
+            return Some(format!(
+                "{} Valid range is {MIN_HOP_WAIT_MINUTES} to {MAX_HOP_WAIT_MINUTES} \
+                 minutes, inclusive.",
+                invalid_value_sentence("WaitMinutes")
+            ));
+        }
+    }
+    None
+}
+
+/// How this service refuses a hop destination that would move a job to the very queue it
+/// was submitted to.
+///
+/// `HopDestination$Queue`: "This queue cannot be the original queue to which the job is
+/// submitted", and the member is "Optional unless the job is submitted on the default
+/// queue" — a hop that names no queue moves the job to the default queue
+/// ([`hop_destination_queue_name`]), so on a job submitted to the default queue the member
+/// has to name one. Both cases are the same request problem: the destination resolves to
+/// the queue the job is already in, which moves nothing.
+pub fn hop_destination_is_source_message(queue: &str) -> String {
+    format!(
+        "{} A hop destination cannot be the queue the job is submitted to ({queue}); name \
+         another queue, which is required when the job is submitted on the {DEFAULT_QUEUE_NAME} \
+         queue.",
+        invalid_value_sentence("hopDestinations")
+    )
+}
+
+/// How this service refuses a `JobEngineVersion` the account's catalogue does not publish.
+///
+/// `Job$JobEngineVersionUsed` states the rule: "Requests to create jobs with an invalid
+/// version result in a 400 error message, and no job is created." The wording names the
+/// member the version came from and the catalogue a caller reads the valid labels from, as
+/// every other member-naming refusal here does; `JobEngineVersion$Version` gives the form
+/// ("Job engine versions are in a YYYY-MM-DD format").
+pub fn invalid_job_engine_version_message() -> String {
+    format!(
+        "{} Job engine versions are in a YYYY-MM-DD format; call ListVersions for the Job \
+         engine versions this account can run jobs on.",
+        invalid_value_sentence("jobEngineVersion")
+    )
 }
 
 /// What a submitted job's settings graph is missing for the job to describe a transcode at
@@ -1454,8 +1562,34 @@ pub struct JobRecord {
     /// `None` while nothing has ever asked for one — the single source of BOTH share
     /// members [`Self::view`] reports, so the status and the details can never disagree.
     pub share: Option<ShareAttempt>,
+    /// The hop destinations this job was submitted with, in request order — "Specify an
+    /// alternate queue and the maximum time that your job will wait in the initial queue
+    /// before hopping." Each one is used at most once, in that order; `next_hop` says how
+    /// far through the list the clock has got.
     pub hop_destinations: Vec<HopDestination>,
+    /// The index in `hop_destinations` of the hop the clock owes this job NEXT, so a hop
+    /// destination moves the job at most once and
+    /// [`ComAmazonawsMediaconvertMediaconvertState::settle`] does constant work per hop it
+    /// materialises. Equal to `hop_destinations.len()` once no hop is left.
+    pub next_hop: usize,
+    /// When the clock owes this job its next hop — the instant it has waited
+    /// `hop_destinations[next_hop]`'s `WaitMinutes` in the queue it entered last. `None`
+    /// once no hop is left, or once the job has left `SUBMITTED` and is no longer waiting
+    /// in a queue at all.
+    pub hops_at: Option<SystemTime>,
+    /// The queue moves this job has already made, oldest first, as `Job$QueueTransitions`
+    /// reports them.
+    pub queue_transitions: Vec<QueueTransitionRecord>,
+    /// The `JobEngineVersion` the request asked for, exactly as it was stated.
     pub job_engine_version_requested: Option<String>,
+    /// The Job engine version the job actually runs on: the requested one when the
+    /// account's catalogue publishes it and it has not expired, and `None` otherwise —
+    /// `Job$JobEngineVersionUsed`: "When you request an expired version, the response for
+    /// this property will be empty. Requests to create jobs with an expired version result
+    /// in a regular job, as if no specific Job engine version was requested." Resolved once,
+    /// by `CreateJob`, against the catalogue `ListVersions` reports, and persisted, so every
+    /// reader of the job sees the same version.
+    pub job_engine_version_used: Option<String>,
     pub simulate_reserved_queue: Option<String>,
     pub user_metadata: BTreeMap<String, String>,
     pub client_request_token: Option<String>,
@@ -1483,6 +1617,36 @@ pub struct JobTiming {
     pub submit_time: Option<SystemTime>,
     pub start_time: Option<SystemTime>,
     pub finish_time: Option<SystemTime>,
+}
+
+/// One move of a job between queues, as `QueueTransition` reports it: "Description of the
+/// source and destination queues between which the job has moved, along with the timestamp
+/// of the move."
+///
+/// Both queues are stored as this store's KEY for them — the queue name — and projected as
+/// ARNs by [`Self::view`], exactly as `Job$Queue` is, so a transition survives the
+/// deletion of either queue and names the region of the request that reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueTransitionRecord {
+    /// "The queue that the job was on before the transition."
+    pub source_queue: String,
+    /// "The queue that the job was on after the transition."
+    pub destination_queue: String,
+    /// "The time, in Unix epoch format, that the job moved from the source queue to the
+    /// destination queue" — the instant the hop was DUE, which is the instant the clock
+    /// made the move, not the instant some later read happened to materialise it.
+    pub at: SystemTime,
+}
+
+impl QueueTransitionRecord {
+    /// The modelled `QueueTransition`.
+    pub fn view(&self, region: &str) -> QueueTransition {
+        QueueTransition {
+            destination_queue: Some(queue_arn(region, &self.destination_queue)),
+            source_queue: Some(queue_arn(region, &self.source_queue)),
+            timestamp: Some(epoch_seconds(self.at)),
+        }
+    }
 }
 
 /// One share attempt against a job: the support case the `CreateResourceShare` request
@@ -1564,15 +1728,22 @@ impl JobRecord {
             JOBS_QUERY_FILTER_KEY_JOB_ENGINE_VERSION_REQUESTED => {
                 self.job_engine_version_requested.as_deref() == Some(value)
             }
+            // "jobEngineVersionUsed - The Job engine version that your job used": the
+            // version `CreateJob` resolved against the account's catalogue, which is what
+            // a reader of the job sees too.
+            JOBS_QUERY_FILTER_KEY_JOB_ENGINE_VERSION_USED => {
+                self.job_engine_version_used.as_deref() == Some(value)
+            }
             JOBS_QUERY_FILTER_KEY_AUDIO_CODEC => self.audio_codecs().any(|codec| codec == value),
             JOBS_QUERY_FILTER_KEY_VIDEO_CODEC => self.video_codecs().any(|codec| codec == value),
-            // The two remaining keys, `jobEngineVersionUsed` and `errorCode`, match on
-            // the `Job` members no job in this store carries: nothing transcoded a job
-            // here, so no engine version was USED and no transcoder error code was
-            // produced — exactly the absent members [`Self::view`] reports. No stored job
-            // matches either, and a key the model does not declare never reaches here at
-            // all: the member targets the `JobsQueryFilterKey` enum, so the boundary
-            // validator has already refused it.
+            // "errorCode - The error code that your job failed with": the code the job
+            // reports, which only a job that FAILED carries.
+            JOBS_QUERY_FILTER_KEY_ERROR_CODE => self
+                .error_code
+                .is_some_and(|code| code.to_string() == value),
+            // A key the model does not declare never reaches here at all: the member
+            // targets the `JobsQueryFilterKey` enum, so the boundary validator has already
+            // refused it.
             _ => false,
         }
     }
@@ -1635,8 +1806,11 @@ impl JobRecord {
             hop_destinations: Some(self.hop_destinations.clone()),
             id: Some(self.id.clone()),
             job_engine_version_requested: self.job_engine_version_requested.clone(),
-            // Nothing transcoded this job, so no engine version was used.
-            job_engine_version_used: None,
+            // The Job engine version this job runs on, resolved against the account's
+            // catalogue when the job was created: absent when no version was requested,
+            // and absent for a requested version that had expired, which runs "as if no
+            // specific Job engine version was requested".
+            job_engine_version_used: self.job_engine_version_used.clone(),
             job_percent_complete: None,
             job_template: self.job_template.clone(),
             // "Contains information about the most recent share attempt for the job" —
@@ -1656,8 +1830,14 @@ impl JobRecord {
             // the stored queue name and the reading request's region — as every other ARN
             // this service reports is.
             queue: Some(queue_arn(region, &self.queue)),
-            // A job is never hopped between queues here, so its hopping history is empty.
-            queue_transitions: Some(Vec::new()),
+            // Every move this job has made between queues, oldest first — empty for a job
+            // no hop destination has moved.
+            queue_transitions: Some(
+                self.queue_transitions
+                    .iter()
+                    .map(|transition| transition.view(region))
+                    .collect(),
+            ),
             retry_count: Some(0),
             role: self.role.clone(),
             settings: self.settings.clone(),
@@ -2377,6 +2557,11 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     /// the instant it comes due, drained by [`Self::settle`] exactly as `pending` is. At
     /// most one entry per stored job, so it is bounded by [`MAX_JOBS`].
     pending_shares: BTreeSet<(SystemTime, String)>,
+    /// The jobs still owed a hop to one of their hop destinations, ordered by the instant
+    /// the hop comes due, drained by [`Self::settle`] exactly as `pending` is. At most one
+    /// entry per stored job — a job is waiting for ONE hop at a time, the one its
+    /// `next_hop` names — so it is bounded by [`MAX_JOBS`] as `pending_shares` is.
+    pending_hops: BTreeSet<(SystemTime, String)>,
     /// Monotonic suffix source for a minted job id; never reset, so no id repeats.
     job_sequence: u64,
     /// Monotonic suffix source for a minted jobs query id. See `job_sequence`.
@@ -2461,6 +2646,7 @@ impl Default for ComAmazonawsMediaconvertMediaconvertState {
             pending: BTreeSet::new(),
             pending_queries: BTreeSet::new(),
             pending_shares: BTreeSet::new(),
+            pending_hops: BTreeSet::new(),
             job_sequence: 0,
             jobs_query_sequence: 0,
             job_settles_after: JOB_SETTLES_AFTER,
@@ -2480,18 +2666,21 @@ enum Due {
     JobsQuery,
     /// A job's share attempt reaching `SHARED`.
     Share,
+    /// A job's hop to the queue one of its hop destinations names.
+    Hop,
 }
 
 impl ComAmazonawsMediaconvertMediaconvertState {
     /// Materialise every status change the clock had already made due at `now` — a job's
-    /// exit from `SUBMITTED`, a jobs query's completion and a job's share attempt
-    /// reaching `SHARED`.
+    /// exit from `SUBMITTED`, a jobs query's completion, a job's share attempt reaching
+    /// `SHARED` and a job's hop to one of its hop destinations.
     ///
     /// Bounded by the number of records actually due, not by the size of the store: every
     /// pending index is ordered by due instant, so this drains their already-due prefix,
-    /// oldest first across the three, and stops at the first entry still in the future.
+    /// oldest first across the four, and stops at the first entry still in the future.
     /// Each drained entry costs a bounded, constant amount of work — a job's status and
-    /// timing, a query's status flip or a share attempt's status flip — so the cost of
+    /// timing, a query's status flip, a share attempt's status flip or one move of a job
+    /// between two queues — so the cost of
     /// one call is the number of records that came due and nothing else; no kind re-reads
     /// the store. It is the only write a reporting operation makes, and every change it
     /// applies was owed at `now` whether or not anybody called.
@@ -2503,7 +2692,7 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     /// `ACTIVE` again. See [`Self::settle_job`].
     pub fn settle(&mut self, now: SystemTime) {
         loop {
-            // The three timelines are drained as one, oldest due instant first, so each
+            // The four timelines are drained as one, oldest due instant first, so each
             // change lands in the order the clock made it due. `min_by_key` over the
             // head of each index keeps that ordering without a match arm per pair.
             let next = [
@@ -2514,6 +2703,9 @@ impl ComAmazonawsMediaconvertMediaconvertState {
                 self.pending_shares
                     .first()
                     .map(|entry| (entry.clone(), Due::Share)),
+                self.pending_hops
+                    .first()
+                    .map(|entry| (entry.clone(), Due::Hop)),
             ]
             .into_iter()
             .flatten()
@@ -2534,6 +2726,10 @@ impl ComAmazonawsMediaconvertMediaconvertState {
                 Due::Share => {
                     self.pending_shares.remove(&entry);
                     self.complete_share(entry.0, &entry.1);
+                }
+                Due::Hop => {
+                    self.pending_hops.remove(&entry);
+                    self.hop_job(entry.0, &entry.1);
                 }
             }
         }
@@ -2662,6 +2858,102 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         }
     }
 
+    /// The hop the clock owed the job `id` at `due`: it has now waited its next hop
+    /// destination's `WaitMinutes` in the queue it is in, so that hop destination moves it.
+    ///
+    /// `HopDestination` is "Configuration for a destination queue to which the job can hop
+    /// once a customer-defined minimum wait time has passed" and
+    /// `CreateJob$HopDestinations` is "Use queue hopping to avoid overly long waits in the
+    /// backlog of the queue that you submit your job to" — so the move is owed to a job
+    /// still WAITING in its queue. A job that has already left `SUBMITTED` is in no
+    /// backlog, and nothing hops it.
+    ///
+    /// The job moves to the queue the hop names, or to the default queue when it names
+    /// none ([`hop_destination_queue_name`]), takes the hop's `Priority` when it states one
+    /// ("you can specify a different relative priority for the job in the destination
+    /// queue. If you don't specify, the relative priority will remain the same as in the
+    /// previous queue"), and the move is recorded as a `QueueTransition`. The hop
+    /// destinations are used in request order, at most once each, and the NEXT one's wait is
+    /// counted from THIS move, because the wait is time the job spends in the queue it is
+    /// in.
+    ///
+    /// CONSTANT work per hop, as the three transitions above are: one hop destination read
+    /// by index, one queue probed, one transition pushed.
+    ///
+    /// An entry whose instant is not the one the job is waiting for belongs to a hop that
+    /// has already been materialised, and moves nothing.
+    fn hop_job(&mut self, due: SystemTime, id: &str) {
+        let Some(job) = self.jobs.get(id) else {
+            return;
+        };
+        if job.hops_at != Some(due) {
+            return;
+        }
+        let waiting = job.status == JOB_STATUS_SUBMITTED;
+        let hop = job.hop_destinations.get(job.next_hop).cloned();
+        let next_hop = job.next_hop + 1;
+        // The wait of the hop AFTER this one, counted from the instant this one lands.
+        // `checked_add` rather than `+`, so a wait near the end of the representable range
+        // cannot panic — it simply owes no further hop.
+        let next_due = job
+            .hop_destinations
+            .get(next_hop)
+            .and_then(hop_wait)
+            .and_then(|wait| due.checked_add(wait));
+        let source = job.queue.clone();
+        // A destination this store no longer holds moves nothing, because a job's `Queue`
+        // never names a queue no reader can see; neither does one that resolves to the
+        // queue the job is already in.
+        let destination = hop
+            .as_ref()
+            .map(|hop| hop_destination_queue_name(hop).to_string())
+            .filter(|name| name != &source && self.queues.contains_key(name));
+        let priority = hop.as_ref().and_then(|hop| hop.priority);
+        let destination_paused = destination
+            .as_deref()
+            .is_some_and(|name| self.queue_is_paused(name));
+        let settles_after = self.job_settles_after;
+
+        let Some(job) = self.jobs.get_mut(id) else {
+            return;
+        };
+        job.hops_at = None;
+        if !waiting {
+            // The job is no longer waiting in a queue, so none of its hop destinations is
+            // owed anything further.
+            job.next_hop = job.hop_destinations.len();
+            return;
+        }
+        job.next_hop = next_hop;
+        let mut rearmed = None;
+        if let Some(destination) = destination {
+            job.queue_transitions.push(QueueTransitionRecord {
+                source_queue: source,
+                destination_queue: destination.clone(),
+                at: due,
+            });
+            job.queue = destination;
+            if let Some(priority) = priority {
+                job.priority = priority;
+            }
+            // A job held back by a PAUSED queue carries no due instant for its exit from
+            // `SUBMITTED`; once it has hopped to a queue that lets it begin, the clock owes
+            // it that exit again, over the same span [`Self::rearm_queue`] gives it.
+            if job.settles_at.is_none() && !destination_paused {
+                let settles_at = due.checked_add(settles_after);
+                job.settles_at = settles_at;
+                rearmed = settles_at;
+            }
+        }
+        job.hops_at = next_due;
+        if let Some(settles_at) = rearmed {
+            self.pending.insert((settles_at, id.to_string()));
+        }
+        if let Some(next_due) = next_due {
+            self.pending_hops.insert((next_due, id.to_string()));
+        }
+    }
+
     /// Record a share attempt against a stored job: "Create a new resource share request
     /// for MediaConvert resources with AWS Support."
     ///
@@ -2752,8 +3044,9 @@ impl ComAmazonawsMediaconvertMediaconvertState {
 
     /// Store a newly submitted job, refusing it once the store is at [`MAX_JOBS`].
     ///
-    /// Owns the id, the `pending` entry and the idempotency entry together, so the three
-    /// cannot be left inconsistent by a caller that forgets one.
+    /// Owns the id, the `pending` entry, the first hop's `pending_hops` entry and the
+    /// idempotency entry together, so the four cannot be left inconsistent by a caller that
+    /// forgets one.
     pub fn accept_job(&mut self, mut record: JobRecord, now: SystemTime) -> AcceptOutcome {
         if self.jobs.len() >= MAX_JOBS {
             return AcceptOutcome::AtCapacity;
@@ -2764,6 +3057,18 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         // SUBMITTED is not terminal, so the clock owes this job its exit from it.
         record.settles_at = Some(due);
         self.pending.insert((due, id.clone()));
+        // The first hop destination is owed its move once the job has waited that hop's
+        // `WaitMinutes` in the queue it was submitted to; each later one is scheduled by the
+        // move before it (see [`Self::hop_job`]).
+        record.next_hop = 0;
+        record.hops_at = record
+            .hop_destinations
+            .first()
+            .and_then(hop_wait)
+            .and_then(|wait| now.checked_add(wait));
+        if let Some(hop_due) = record.hops_at {
+            self.pending_hops.insert((hop_due, id.clone()));
+        }
         if let Some(token) = record.client_request_token.clone() {
             self.idempotency.insert(
                 token,
@@ -2838,8 +3143,14 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         job.timing.finish_time = Some(now);
         // A cancelled job is terminal, so the clock owes it nothing further.
         let due = job.settles_at.take();
+        let hop_due = job.hops_at.take();
+        job.next_hop = job.hop_destinations.len();
         if let Some(due) = due {
             self.pending.remove(&(due, id.to_string()));
+        }
+        // A cancelled job is in no queue's backlog, so it hops nowhere either.
+        if let Some(hop_due) = hop_due {
+            self.pending_hops.remove(&(hop_due, id.to_string()));
         }
         CancelOutcome::Canceled
     }

@@ -21,11 +21,19 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_mediaconvert_mediaconvert::state::{
-    MAX_JOBS_QUERIES, MAX_JOBS_QUERY_TERMS,
+    JobEngineVersionRecord, JOB_ENGINE_VERSION_LIFETIME, MAX_JOBS_QUERIES, MAX_JOBS_QUERY_TERMS,
 };
 use service_com_amazonaws_mediaconvert_mediaconvert::ComAmazonawsMediaconvertMediaconvertState;
 
 use super::job_lifecycle::{arn, Emulator, Reply, ROLE};
+
+/// The Job engine version label the `alpha` fixture job requests.
+///
+/// `CreateJob` resolves a requested version against the account's catalogue, so this label
+/// is SEEDED into that catalogue below rather than assumed to be in it: a version the
+/// account does not publish is refused, which is a rule
+/// `create_job_job_engine_version` covers.
+const FIXTURE_ENGINE_VERSION: &str = "2024-09-25";
 
 /// A completion span short enough that a case can wait past it.
 const SHORT_QUERY: Duration = Duration::from_millis(20);
@@ -148,6 +156,23 @@ struct Fixture {
 /// Three jobs differing in every job detail a jobs query can filter on, so one table can
 /// span the whole `JobsQueryFilterKey` catalogue.
 async fn seed_jobs(emulator: &Emulator) -> Fixture {
+    // The catalogue entry the `alpha` job requests: available, so the job both requests
+    // and uses it.
+    {
+        let state = emulator
+            .engine
+            .state::<ComAmazonawsMediaconvertMediaconvertState>();
+        let mut state = state.lock();
+        let released_at = ::std::time::SystemTime::now();
+        state.job_engine_versions.insert(
+            FIXTURE_ENGINE_VERSION.to_string(),
+            JobEngineVersionRecord {
+                version: FIXTURE_ENGINE_VERSION.to_string(),
+                released_at,
+                expires_at: released_at + JOB_ENGINE_VERSION_LIFETIME,
+            },
+        );
+    }
     for name in ["alpha", "beta"] {
         let created = emulator.create_queue(json!({ "name": name })).await;
         assert_eq!(
@@ -164,7 +189,7 @@ async fn seed_jobs(emulator: &Emulator) -> Fixture {
             "s3://example-bucket/in/alpha-clip.mp4",
             "AAC",
             "H_264",
-            Some("2024-09-25"),
+            Some(FIXTURE_ENGINE_VERSION),
         ),
         (
             "beta",
@@ -287,21 +312,23 @@ async fn a_jobs_query_matches_on_any_value_of_any_filter() {
             "jobEngineVersionRequested",
             json!({ "filterList": [{
                 "key": "jobEngineVersionRequested",
-                "values": ["2024-09-25"]
+                "values": [FIXTURE_ENGINE_VERSION]
             }] }),
             vec![&jobs.alpha],
         ),
-        // `jobEngineVersionUsed` and `errorCode` name the two `Job` members no job in
-        // this emulator carries: nothing transcoded a job, so no engine version was
-        // used and no transcoder error code was produced.
+        // `jobEngineVersionUsed` — "The Job engine version that your job used": the
+        // `alpha` job requested a version the account's catalogue publishes and has not
+        // expired, so that version is the one it uses.
         (
             "jobEngineVersionUsed",
             json!({ "filterList": [{
                 "key": "jobEngineVersionUsed",
-                "values": ["2024-09-25"]
+                "values": [FIXTURE_ENGINE_VERSION]
             }] }),
-            vec![],
+            vec![&jobs.alpha],
         ),
+        // `errorCode` — "The error code that your job failed with": only a job that
+        // failed carries one, and no fixture job here has.
         (
             "errorCode",
             json!({ "filterList": [{ "key": "errorCode", "values": ["1010"] }] }),

@@ -1260,6 +1260,35 @@ impl<Token> TokenLedger<Token> {
 /// 50 is the most a stored resource can hold too.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// Every resource type of this service a TAG operation can name, as
+/// `(ARN resource prefix, modelled `ResourceType`, the words a message calls it by)`.
+///
+/// "The WorkloadArn parameter can be a workload ARN, a custom lens ARN, a profile ARN, or
+/// review template ARN" (`ListTagsForResource` / `TagResource` / `UntagResource` doc) —
+/// the four resource types whose creates take a `TagMap` — plus the agent profile, the
+/// fifth taggable resource this service's model carries (`CreateAgentProfile$tags`,
+/// `smithy_query(query="operation", operation="CreateAgentProfile")`): a tag recorded on a
+/// resource has to be readable back off it.
+///
+/// The prefixes are matched against the RESOURCE PART of the ARN
+/// (`arn:<partition>:<service>:<region>:<account>:<resource>`), so `profile/` cannot also
+/// match an `agent-profile/` ARN.
+const TAGGABLE_RESOURCE_KINDS: &[(&str, &str, &str)] = &[
+    ("workload/", WORKLOAD_RESOURCE_TYPE, "workload"),
+    ("lens/", LENS_RESOURCE_TYPE, "custom lens"),
+    ("profile/", PROFILE_RESOURCE_TYPE, "profile"),
+    (
+        "review-template/",
+        REVIEW_TEMPLATE_RESOURCE_TYPE,
+        "review template",
+    ),
+    (
+        "agent-profile/",
+        AGENT_PROFILE_RESOURCE_TYPE,
+        "agent profile",
+    ),
+];
+
 /// One stored workload. Every member of the modelled `Workload` output that a request
 /// can set is persisted here, and the members the SERVICE computes — the risk roll-up
 /// and the defaulted discovery configuration — are derived from this record by the two
@@ -3718,6 +3747,46 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             .map_or(0, BTreeMap::len)
     }
 
+    /// The tags recorded on the resource an ARN names, or `None` when it names no
+    /// resource this store holds.
+    ///
+    /// A tag operation names its resource by ARN ALONE, across every taggable resource
+    /// type of the service ([`TAGGABLE_RESOURCE_KINDS`]), so ONE lookup spans them all:
+    /// the workloads, the custom lenses, the Well-Architected Tool profiles, the review
+    /// templates and the agent profiles. Resolved in one place so every operation that
+    /// reads or writes a resource's tags agrees about what an ARN names.
+    ///
+    /// A workload is keyed in this store by its `WorkloadId` rather than by its ARN, so
+    /// its ARN is matched over the stored workloads — a scan bounded by
+    /// [`MAX_WORKLOADS_PER_ACCOUNT_REGION`]; every other type is keyed by the ARN itself,
+    /// so it costs ONE lookup. A lens is resolved through
+    /// [`Self::lens_by_alias`], which requires the ARN to agree with the lens's own
+    /// (account and Region included) and accepts a version-pinned ARN as naming the same
+    /// lens, and it is consulted only for a string that IS an ARN: a bare lens id is not
+    /// an ARN, so it names no resource here.
+    pub fn resource_tags(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
+        if let Some(record) = self
+            .workloads
+            .values()
+            .find(|record| record.workload_arn == resource_arn)
+        {
+            return Some(&record.tags);
+        }
+        if let Some(record) = self.review_templates.get(resource_arn) {
+            return Some(&record.tags);
+        }
+        if let Some(record) = self.profiles.get(resource_arn) {
+            return Some(&record.tags);
+        }
+        if let Some(record) = self.agent_profiles.get(resource_arn) {
+            return Some(&record.tags);
+        }
+        if !resource_arn.starts_with("arn:") {
+            return None;
+        }
+        self.lens_by_alias(resource_arn)
+            .map(|record| &record.tags)
+    }
 
     /// The next 32-lowercase-hex candidate id: a per-store counter and the wall clock,
     /// hashed, so it is never derived from the request. The callers above are what check
@@ -4587,6 +4656,35 @@ pub fn profile_not_found(profile_arn: &str) -> ResourceNotFoundException {
         PROFILE_RESOURCE_TYPE,
         profile_arn.to_string(),
         &format!("profile with ARN {profile_arn}"),
+    )
+}
+
+/// [`resource_not_found`] for an ARN a TAG operation names that resolves to no resource
+/// this store holds ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::resource_tags`]).
+///
+/// `ResourceType` is read off the ARN's own resource part
+/// ([`TAGGABLE_RESOURCE_KINDS`]), so a caller is told which KIND of resource was looked
+/// for; an ARN naming no taggable kind at all is reported under the resource type of the
+/// member that carried it (`WorkloadArn`). `ResourceId` is the ARN AS SENT. Shared by
+/// every operation that resolves a resource by tag ARN, so they cannot word it
+/// differently.
+pub fn tagged_resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
+    // partition : service : region : account : resource
+    let resource_part = resource_arn
+        .strip_prefix("arn:")
+        .and_then(|rest| rest.splitn(5, ':').nth(4))
+        .unwrap_or_default();
+    let (resource_type, subject) = TAGGABLE_RESOURCE_KINDS
+        .iter()
+        .find(|(prefix, _, _)| resource_part.starts_with(prefix))
+        .map_or(
+            (WORKLOAD_RESOURCE_TYPE, "resource"),
+            |(_, resource_type, subject)| (*resource_type, *subject),
+        );
+    resource_not_found(
+        resource_type,
+        resource_arn.to_string(),
+        &format!("{subject} with ARN {resource_arn}"),
     )
 }
 
