@@ -168,24 +168,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        let store = state.lock();
+        let mut store = state.lock();
+
+        // Apply what the clock already owed first: an EventRule whose activation
+        // has fallen due is ACTIVE, and this configuration's status is derived
+        // from exactly that. The step was owed at this instant whether or not
+        // anybody called, so materialising it is not a mutation this read chose.
+        store.settle_due_event_rules(::std::time::SystemTime::now());
 
         // The arn is the only key: an arn no configuration is stored under does
         // not exist, whatever its shape.
         let record = store.configurations.get(&input.arn).ok_or_else(|| {
             GetNotificationConfigurationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("no NotificationConfiguration exists with arn {}", input.arn),
+                    message: crate::state::not_found_message(
+                        crate::state::CONFIGURATION_RESOURCE_LABEL,
+                        crate::state::ARN_IDENTIFIER_LABEL,
+                        &input.arn,
+                    ),
                     resource_id: input.arn.clone(),
                 },
             )
         })?;
 
+        // `status` is DERIVED from the EventRules the configuration owns rather
+        // than stored on the record, so it is read the same way here as in the
+        // create response and in a listing.
+        let status = store.configuration_status(&input.arn);
+
         Ok(GetNotificationConfigurationOutput {
             arn: record.arn.clone(),
             name: record.name.clone(),
             description: record.description.clone(),
-            status: record.status.clone(),
+            status,
             creation_time: record.creation_time,
             aggregation_duration: record.aggregation_duration.clone(),
             subtype: record.subtype.clone(),

@@ -202,9 +202,22 @@ impl Emulator {
         self.send("GET", &uri, None).await
     }
 
+    /// `ListEventRules` for one configuration, with a raw extra query string
+    /// (empty for an unpaged listing).
+    async fn list_event_rules(&self, configuration_arn: &str, extra: &str) -> (u16, Value) {
+        let mut uri = format!(
+            "/event-rules?notificationConfigurationArn={}",
+            encode_path_label(configuration_arn)
+        );
+        if !extra.is_empty() {
+            uri.push('&');
+            uri.push_str(extra);
+        }
+        self.send("GET", &uri, None).await
+    }
+
     /// How many EventRules the store holds, read straight out of it — what a
-    /// refused create must not have changed, and what no reporting operation
-    /// lists yet (`ListEventRules` is still a 501 stub with its own issue).
+    /// refused create must not have changed.
     fn stored_event_rule_count(&self) -> usize {
         let state = self
             .engine
@@ -807,4 +820,149 @@ fn generated_regions(count: usize) -> Vec<String> {
             format!("ab-{first}{second}-{}", index % 10)
         })
         .collect()
+}
+
+/// RULE: `ListEventRules` reports the EventRules OF the configuration it names, newest
+/// first, as the same records a Get reports — and nothing of another configuration's.
+/// A page carries at most `maxResults` entries and the pages of one listing concatenate
+/// to the whole set; an arn no configuration is stored under is the modelled 404.
+#[tokio::test]
+async fn the_listing_reports_a_configurations_own_rules_newest_first() {
+    let emulator = Emulator::new();
+    let configuration = emulator.create_configuration("listed-host").await;
+    let other = emulator.create_configuration("other-listed-host").await;
+
+    // Rows differ in how many rules the configuration owns, so the listing is
+    // exercised empty, with one rule and with several.
+    let (status, empty) = emulator.list_event_rules(&configuration, "").await;
+    assert_eq!(status, 200, "case empty: a listing answers 200, got {empty:?}");
+    assert_eq!(
+        empty["eventRules"],
+        json!([]),
+        "case empty: a configuration with no rule lists none, got {empty:?}"
+    );
+
+    // Five rules, each differing in `eventType` so none is a repeat of another, in
+    // creation order.
+    let mut created_oldest_first = Vec::new();
+    for index in 0..5usize {
+        let (status, created) = emulator
+            .create_event_rule(json!({
+                "notificationConfigurationArn": configuration,
+                "source": "aws.ec2",
+                "eventType": format!("Listed Event {index}"),
+                "regions": [COMMONPLACE_REGION],
+            }))
+            .await;
+        assert_eq!(
+            status, 201,
+            "case {index}: the rule under test must be created, got {created:?}"
+        );
+        created_oldest_first.push(created["arn"].as_str().unwrap_or_default().to_string());
+    }
+    // The other configuration carries one rule, which must never be listed here.
+    let (_, foreign) = emulator
+        .create_event_rule(request_body(&cases()[1], &other))
+        .await;
+    let foreign_arn = foreign["arn"].as_str().unwrap_or_default().to_string();
+
+    let newest_first: Vec<String> = created_oldest_first.iter().rev().cloned().collect();
+
+    for page_size in [1usize, 2, 4, 5, 1000] {
+        let mut collected: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            pages += 1;
+            assert!(
+                pages <= newest_first.len() + 1,
+                "case maxResults={page_size}: paging did not terminate after {pages} pages"
+            );
+            let extra = match &token {
+                Some(value) => format!("maxResults={page_size}&nextToken={value}"),
+                None => format!("maxResults={page_size}"),
+            };
+            let (status, page) = emulator.list_event_rules(&configuration, &extra).await;
+            assert_eq!(
+                status, 200,
+                "case maxResults={page_size}: a listing answers 200, got {page:?}"
+            );
+            let entries = page["eventRules"]
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!("case maxResults={page_size}: eventRules is required, got {page:?}")
+                })
+                .clone();
+            assert!(
+                entries.len() <= page_size,
+                "case maxResults={page_size}: a page must not exceed maxResults, got {} entries",
+                entries.len()
+            );
+            for entry in &entries {
+                let arn = entry["arn"].as_str().unwrap_or_default().to_string();
+                assert!(
+                    is_event_rule_arn(&arn),
+                    "case maxResults={page_size}: a listed arn matches the modelled pattern, got {arn:?}"
+                );
+                assert_ne!(
+                    arn, foreign_arn,
+                    "case maxResults={page_size}: another configuration's rule must not be listed, got {entry:?}"
+                );
+                assert_eq!(
+                    entry["notificationConfigurationArn"].as_str(),
+                    Some(configuration.as_str()),
+                    "case maxResults={page_size}: a listed entry names the configuration it belongs to, got {entry:?}"
+                );
+                // The listing reports the same record the Get reports.
+                let (status, got) = emulator.get_event_rule(&arn).await;
+                assert_eq!(
+                    status, 200,
+                    "case maxResults={page_size}: a listed rule is readable, got {got:?}"
+                );
+                for member in [
+                    "arn",
+                    "notificationConfigurationArn",
+                    "source",
+                    "eventType",
+                    "eventPattern",
+                    "regions",
+                    "creationTime",
+                    "statusSummaryByRegion",
+                ] {
+                    assert_eq!(
+                        entry[member], got[member],
+                        "case maxResults={page_size}: the listing and the Get must agree on {member}, got {entry:?} and {got:?}"
+                    );
+                }
+                collected.push(arn);
+            }
+            match page.get("nextToken").and_then(Value::as_str) {
+                Some(next) => {
+                    assert!(
+                        !entries.is_empty(),
+                        "case maxResults={page_size}: an empty page must not carry a token"
+                    );
+                    token = Some(next.to_string());
+                }
+                None => break,
+            }
+        }
+        assert_eq!(
+            collected, newest_first,
+            "case maxResults={page_size}: the pages concatenate to every rule of the configuration, newest first"
+        );
+    }
+
+    // An arn no configuration is stored under is the modelled 404, not an empty page.
+    let (status, refused) = emulator
+        .list_event_rules(UNMINTED_CONFIGURATION_ARN, "")
+        .await;
+    assert_eq!(
+        status, 404,
+        "case an unminted configuration: the listing answers the modelled 404, got {refused:?}"
+    );
+    assert!(
+        error_code(&refused).contains("ResourceNotFoundException"),
+        "case an unminted configuration: that refusal is a ResourceNotFoundException, got {refused:?}"
+    );
 }

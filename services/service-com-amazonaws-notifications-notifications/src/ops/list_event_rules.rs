@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEventRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEventRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEventRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the `EventRule`s of one `NotificationConfiguration`, newest first,
+//! paged by `maxResults` and `nextToken`. An arn no configuration is stored under
+//! is a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +79,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The page token codec every paginated listing in this service shares: the cursor
+// here is the creation sequence of the last rule on the page, and the next page is
+// everything created before it.
+use crate::state::{decode_page_token, encode_page_token};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -119,6 +119,12 @@ impl From<ListEventRulesErrorModeled> for ListEventRulesError {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
 }
+
+/// The page size this operation uses when a request names none: "The default
+/// value is 20", from the `maxResults` member's own documentation. The modelled
+/// range (1..1000) bounds what a request may ask for, and the boundary validator
+/// refuses anything outside it before this handler runs.
+const DEFAULT_MAX_RESULTS: usize = 20;
 
 /// The `ListEventRules` operation.
 ///
@@ -156,18 +162,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEventRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEventRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEventRules"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListEventRulesErrorModeled::InternalServerException(InternalServerException {
+                message: "the notifications store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // Apply what the clock already owed first: a rule whose activation has
+        // fallen due is ACTIVE everywhere it covers, and this listing reports each
+        // rule's per-Region status. The step was owed at this instant whether or
+        // not anybody called.
+        store.settle_due_event_rules(::std::time::SystemTime::now());
+
+        // The listing is the rules OF one configuration: an arn naming none is a
+        // reference to a resource that does not exist, not an empty page.
+        if !store
+            .configurations
+            .contains_key(&input.notification_configuration_arn)
+        {
+            return Err(ListEventRulesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::not_found_message(
+                        crate::state::CONFIGURATION_RESOURCE_LABEL,
+                        crate::state::ARN_IDENTIFIER_LABEL,
+                        &input.notification_configuration_arn,
+                    ),
+                    resource_id: input.notification_configuration_arn.clone(),
+                },
+            )
+            .into());
+        }
+
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                // A token this process never issued is refused, rather than
+                // silently restarting the listing at the newest rule.
+                ListEventRulesErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                    reason: Some("fieldValidationFailed".to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "nextToken".to_string(),
+                        message: "the value is not a pagination token this service issued"
+                            .to_string(),
+                    }]),
+                })
+            })?),
+            None => None,
+        };
+
+        // "in reverse chronological order (newest first)", so the most recently
+        // created rule leads the listing and a page token walks backwards through
+        // creation order.
+        let mut ordered =
+            store.event_rules_in_creation_order(&input.notification_configuration_arn);
+        ordered.reverse();
+
+        let start = match resume_after {
+            Some(cursor) => ordered
+                .iter()
+                .position(|rule| rule.sequence < cursor)
+                .unwrap_or(ordered.len()),
+            None => 0,
+        };
+        let page_size = match input.max_results {
+            Some(requested) => usize::try_from(requested).map_err(|_| {
+                // The modelled range (1..1000) makes this unreachable through the
+                // boundary validator; refuse rather than quietly substituting a
+                // page size the caller did not ask for.
+                ListEventRulesErrorModeled::ValidationException(ValidationException {
+                    message: "maxResults must be a positive count".to_string(),
+                    reason: Some("fieldValidationFailed".to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "maxResults".to_string(),
+                        message: "the value is not a positive count".to_string(),
+                    }]),
+                })
+            })?,
+            None => DEFAULT_MAX_RESULTS,
+        };
+
+        let page: Vec<&crate::state::EventRuleRecord> =
+            ordered.iter().skip(start).take(page_size).copied().collect();
+
+        // A token is emitted only while rules remain behind this page; the final
+        // page carries none.
+        let next_token = match page.last() {
+            Some(last) if start + page.len() < ordered.len() => {
+                Some(encode_page_token(last.sequence))
+            }
+            _ => None,
+        };
+
+        Ok(ListEventRulesOutput {
+            next_token,
+            event_rules: page
+                .into_iter()
+                .map(|rule| EventRuleStructure {
+                    arn: rule.arn.clone(),
+                    notification_configuration_arn: rule.notification_configuration_arn.clone(),
+                    creation_time: rule.creation_time,
+                    source: rule.source.clone(),
+                    event_type: rule.event_type.clone(),
+                    event_pattern: rule.reported_event_pattern(),
+                    regions: rule.regions.clone(),
+                    managed_rules: rule.managed_rules(),
+                    status_summary_by_region: rule.status_summary_by_region(),
+                })
+                .collect(),
+        })
     }
 }

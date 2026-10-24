@@ -186,7 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exist, whatever its shape.
         let record = store.event_rules.get(&input.arn).ok_or_else(|| {
             GetEventRuleErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("no EventRule exists with arn {}", input.arn),
+                message: crate::state::not_found_message(
+                    crate::state::EVENT_RULE_RESOURCE_LABEL,
+                    crate::state::ARN_IDENTIFIER_LABEL,
+                    &input.arn,
+                ),
                 resource_id: input.arn.clone(),
             })
         })?;

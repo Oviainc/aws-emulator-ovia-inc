@@ -24,9 +24,12 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. EDITED here: a numeric-bound (`@range`) violation is
-//!   stated against the member and the bound, without quoting the submitted number
-//!   back; every other class keeps the framework's wording. See [`clause`].
+//!   before any handler ran. EDITED here: a numeric-bound (`@range`) and a `@pattern`
+//!   violation are stated against the member and the requirement alone, without quoting
+//!   the submitted value back, and a `@pattern` expression is quoted without the anchors
+//!   the model wraps it in; a MAP member over its `@length` maximum is stated as the
+//!   schema layer's property-count finding; every other class keeps the framework's
+//!   wording. See [`clause`].
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -56,13 +59,22 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 
 /// The clause this service states for one violated constraint.
 ///
-/// A NUMERIC BOUND (`@range`) violation names the member and the bound it broke and does
-/// NOT quote the number submitted there: the recorded refusal of a `maxResults` outside
-/// its range reads `Value at '<member>' failed to satisfy constraint: Member must have
-/// value less than or equal to <max>`. Every other violation class keeps the framework's
-/// own clause — which quotes the submitted value, the form
-/// `services/common/src/validation.rs` states as the cross-service default — so this
-/// service rewords only the half its recordings pin.
+/// A NUMERIC BOUND (`@range`) violation names the member and the bound it broke, and a
+/// `@pattern` violation names the member and the expression a value has to satisfy;
+/// NEITHER quotes the value submitted there. The recorded refusal of a `maxResults`
+/// outside its range reads `Value at '<member>' failed to satisfy constraint: Member must
+/// have value less than or equal to <max>`, and the recorded refusal of a patterned
+/// member reads `Value at '<member>' failed to satisfy constraint: Member must satisfy
+/// regular expression pattern: <expression>`.
+///
+/// The EXPRESSION is quoted without the whole-value anchors the model wraps it in, which
+/// is `service_common::validation::unanchored` — the one implementation of that rule,
+/// called rather than inlined again. The CHECK still runs the model's pattern as
+/// written; only the rendering drops the pair.
+///
+/// Every other violation class keeps the framework's own clause — which quotes the
+/// submitted value, the form `services/common/src/validation.rs` states as the
+/// cross-service default — so this service rewords only the classes its recordings pin.
 ///
 /// (The subject half of a validation message is one of the two parts
 /// `services/common/src/validation.rs` lists as still to migrate into it; until that
@@ -80,6 +92,12 @@ fn clause(violation: &Violation) -> String {
              equal to {max}",
             violation.path
         ),
+        ViolationKind::Pattern(pattern) => format!(
+            "Value at '{}' failed to satisfy constraint: Member must satisfy regular expression \
+             pattern: {}",
+            violation.path,
+            service_common::validation::unanchored(pattern)
+        ),
         _ => violation.message(),
     }
 }
@@ -88,7 +106,7 @@ fn clause(violation: &Violation) -> String {
 fn reworded(violation: &Violation) -> bool {
     matches!(
         violation.kind,
-        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
+        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_) | ViolationKind::Pattern(_)
     )
 }
 
@@ -102,6 +120,7 @@ fn invalid_refusal(violations: &[Violation]) -> Option<Refused> {
     if !violations.iter().any(reworded) {
         return None;
     }
+
     let clauses: Vec<String> = violations.iter().map(clause).collect();
     let message = match clauses.len() {
         0 => return None,
@@ -169,12 +188,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this
         // service reword it.
         //
-        // This service states a NUMERIC BOUND failure against the member that failed
-        // and the bound it broke, without quoting the submitted number back (see
-        // [`clause`]); every other class keeps the framework's wording, and so does an
-        // authentication refusal, which is not an input-constraint failure at all. The
+        // This service states a NUMERIC BOUND and a `@pattern` failure against the
+        // member that failed and the requirement it broke, without quoting the submitted
+        // value back and with a pattern's anchors dropped from the expression it quotes
+        // (see [`clause`]); every other class keeps the framework's wording, and so does
+        // an authentication refusal, which is not an input-constraint failure at all. The
         // code stays the modelled `ValidationException` (HTTP 400), which is what the
         // framework would have answered; only the wording changes.
+        //
+        // A MAP member over its `@length` maximum is answered by the schema layer that
+        // reads the request as a JSON object, which reports the object's property count
+        // rather than a member-length clause — and reports it INSTEAD of the per-member
+        // envelope, so it is asked first.
+        if let Some(refused) = service_common::validation_message::property_count_refusal(refusal) {
+            return Some(refused);
+        }
         match refusal {
             Refusal::Invalid(violations) => invalid_refusal(violations),
             _ => None,

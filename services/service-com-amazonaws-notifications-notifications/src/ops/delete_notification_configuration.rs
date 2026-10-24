@@ -157,9 +157,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteNotificationConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "no NotificationConfiguration exists with arn {}",
-                            input.arn
+                        message: crate::state::not_found_message(
+                            crate::state::CONFIGURATION_RESOURCE_LABEL,
+                            crate::state::ARN_IDENTIFIER_LABEL,
+                            &input.arn,
                         ),
                         resource_id: input.arn.clone(),
                     },

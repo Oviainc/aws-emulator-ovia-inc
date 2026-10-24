@@ -13,12 +13,16 @@
 // points it into `tests/all/`.
 #[path = "all/channel_associations.rs"]
 mod channel_associations;
+#[path = "all/configuration_status.rs"]
+mod configuration_status;
 #[path = "all/event_rules.rs"]
 mod event_rules;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/managed_notification_configurations.rs"]
 mod managed_notification_configurations;
+#[path = "all/not_found_messages.rs"]
+mod not_found_messages;
 #[path = "all/notification_configurations.rs"]
 mod notification_configurations;
 #[path = "all/notification_hubs.rs"]
