@@ -335,7 +335,8 @@ pub const ACME_DOMAIN_VALIDATION_STATUS_INVALID: &str = "INVALID";
 /// `DNS_PREVALIDATION` alone).
 pub const PREVALIDATION_TYPE_DNS: &str = "DNS_PREVALIDATION";
 
-/// How long after `CreateAcmeDomainValidation` the validation reaches
+/// How long after `CreateAcmeDomainValidation` — or after an update replaced the
+/// prevalidation configuration the domain was proved against — the validation reaches
 /// [`ACME_DOMAIN_VALIDATION_STATUS_VALID`].
 ///
 /// A CHOSEN span, not a documented one: neither the model nor ACM's documentation
@@ -830,12 +831,14 @@ pub struct PendingAcmeDomainValidationStatus {
 }
 
 impl PendingAcmeDomainValidationStatus {
-    /// The transition owed to a validation created at `created_at`: its prevalidation
-    /// completes [`ACME_DOMAIN_VALIDATION_SETTLE_DELAY`] later and it becomes
+    /// The transition owed to a validation whose prevalidation started at `started_at`
+    /// — when it was created, or when its prevalidation configuration was replaced and
+    /// the domain had to be proved again: the prevalidation completes
+    /// [`ACME_DOMAIN_VALIDATION_SETTLE_DELAY`] later and it becomes
     /// [`ACME_DOMAIN_VALIDATION_STATUS_VALID`].
-    pub fn validating_at(created_at: SystemTime) -> Self {
+    pub fn validating_at(started_at: SystemTime) -> Self {
         Self {
-            due_at: created_at + ACME_DOMAIN_VALIDATION_SETTLE_DELAY,
+            due_at: started_at + ACME_DOMAIN_VALIDATION_SETTLE_DELAY,
             status: ACME_DOMAIN_VALIDATION_STATUS_VALID.to_string(),
         }
     }
@@ -891,8 +894,8 @@ impl AcmeDomainValidationRecord {
     /// Apply the status transition the clock already owes this validation at `now`.
     ///
     /// A validation ACM reports as `VALIDATING` is waiting on prevalidation work ACM
-    /// does on its own; the instant that work completes was fixed when the validation
-    /// was created, so applying it here materialises a change the clock already made
+    /// does on its own; the instant that work completes was fixed by the call that
+    /// started it, so applying it here materialises a change the clock already made
     /// rather than a side effect of whoever happened to call.
     pub fn materialize_due(&mut self, now: SystemTime) {
         let Some(pending) = self

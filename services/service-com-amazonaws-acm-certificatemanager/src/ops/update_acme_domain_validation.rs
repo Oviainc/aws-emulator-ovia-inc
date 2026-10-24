@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAcmeDomainValidation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAcmeDomainValidation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: writes the prevalidation configuration the request names onto the
+//! stored ACME domain validation its `AcmeDomainValidationArn` identifies, leaves every
+//! other member of the record (and everything this operation models no input member
+//! for) exactly as it stands, and answers an empty body. An ARN with no record behind it
+//! is `ResourceNotFoundException`; a validation ACM is itself still acting on is a
+//! conflict.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAcmeDomainValidation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A changed prevalidation configuration is evidence ACM has not checked yet, so the
+//! call puts the validation back into `VALIDATING` and records the `VALID` transition
+//! the clock then owes it ([`crate::state::PendingAcmeDomainValidationStatus`]) — a
+//! status only the service moves, which whichever call next touches the store
+//! materialises. A request that asks for the configuration the validation already
+//! carries (the operation is `@idempotent`) leaves the record, its status and its
+//! `UpdatedAt` where they are.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +173,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAcmeDomainValidation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAcmeDomainValidationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // No request metadata is needed: the `AcmeDomainValidationArn` the request names
+        // carries the Region and the account the validation was minted under, so the
+        // record is found by ARN alone — as in `DescribeAcmeDomainValidation`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator (the engine IS the shared store);
+            // this operation models a server fault, so that is the honest answer.
+            return Err(
+                UpdateAcmeDomainValidationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the acm acme domain validation store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // ONE instant answers the whole request: it materialises the transitions the
+        // clock already owes (so this call decides on the status a reader would see at
+        // this instant) and dates the change this call makes.
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        store.materialize_due(now);
+        let Some(validation) = store
+            .acme_domain_validations
+            .get_mut(&input.acme_domain_validation_arn)
+        else {
+            return Err(
+                UpdateAcmeDomainValidationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::acme_domain_validation_not_found_message(
+                            &input.acme_domain_validation_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Only a validation ACM is not itself acting on can be reconfigured. Of the
+        // statuses `AcmeDomainValidationStatus` declares (`smithy_query(query="shape",
+        // shape="com.amazonaws.acm#AcmeDomainValidationStatus")`: VALIDATING | VALID |
+        // INVALID | DELETING) exactly two are settled — `VALID`, where prevalidation
+        // succeeded, and `INVALID`, where it failed. In the other two ACM is still
+        // working the validation through, which is what this operation's
+        // `ConflictException` names: "you are trying to update a resource or
+        // configuration that is already being created or updated. Wait for the previous
+        // operation to finish and try again."
+        if validation.status != crate::state::ACME_DOMAIN_VALIDATION_STATUS_VALID
+            && validation.status != crate::state::ACME_DOMAIN_VALIDATION_STATUS_INVALID
+        {
+            return Err(UpdateAcmeDomainValidationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "ACME domain validation {} is {} and cannot be updated. Wait for the previous operation to finish and try again.",
+                        validation.arn, validation.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `PrevalidationOptions` is "the updated prevalidation options": the member
+        // carries the configuration as a whole, so a request that names it REPLACES the
+        // stored one member for member, and a request that omits it asks for no change
+        // at all and leaves the record as it stands.
+        let Some(PrevalidationOptions::DnsPrevalidation(options)) =
+            input.prevalidation_options.as_ref()
+        else {
+            return Ok(UpdateAcmeDomainValidationOutput);
+        };
+        // The union models one member today (`DnsPrevalidation`), and
+        // `PrevalidationType` correspondingly declares one value, so the variant IS the
+        // type the record reports.
+        let prevalidation_type = crate::state::PREVALIDATION_TYPE_DNS;
+
+        // Whether this request asks for any change at all. The operation is
+        // `@idempotent`, so writing the configuration a validation already carries is a
+        // request a client may repeat: it must not re-open the prevalidation, and must
+        // not move `UpdatedAt` ("the time at which the domain validation was last
+        // updated", `AcmeDomainValidation$UpdatedAt` doc).
+        let changed = validation.prevalidation_type != prevalidation_type
+            || !same_domain_scope(&validation.domain_scope, &options.domain_scope)
+            || validation.hosted_zone_id != options.hosted_zone_id;
+        if !changed {
+            return Ok(UpdateAcmeDomainValidationOutput);
+        }
+
+        validation.prevalidation_type = prevalidation_type.to_string();
+        validation.domain_scope = options.domain_scope.clone();
+        validation.hosted_zone_id = options.hosted_zone_id.clone();
+        // The DNS record the caller publishes is NOT reconfigured: it is minted from this
+        // validation's own identity and the domain it validates
+        // ([`crate::state::acme_prevalidation_resource_record`]), neither of which this
+        // operation models a member for.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAcmeDomainValidation"))
+        // Domain ownership was proved against the configuration that has just been
+        // replaced, so it is unproven under the new one: the validation goes back to
+        // `VALIDATING` and the `VALID` transition is owed from here on, due the same span
+        // after this call as after the create — the service's own clock, never the
+        // caller, being what moves the status.
+        validation.status = crate::state::ACME_DOMAIN_VALIDATION_STATUS_VALIDATING.to_string();
+        // Whatever a previous prevalidation failed on is no longer what the validation
+        // reports: `FailureDetails` is "details about the failure, if the validation
+        // failed" (`AcmeDomainValidation$FailureDetails` doc), and this one has not.
+        validation.failure_details = None;
+        validation.pending_status = Some(
+            crate::state::PendingAcmeDomainValidationStatus::validating_at(now),
+        );
+        validation.updated_at = now;
+
+        Ok(UpdateAcmeDomainValidationOutput)
+    }
+}
+
+/// Whether two prevalidation domain scopes say the same thing.
+///
+/// `DomainScope` is an optional structure of three optional `DomainScopeOption` members
+/// (`smithy_query(query="shape", shape="com.amazonaws.acm#DomainScope")`), so a scope
+/// the request omits is not the same configuration as an empty one it sends: a stored
+/// scope and a requested scope are equal only when both are absent, or both are present
+/// and agree member for member.
+fn same_domain_scope(stored: &Option<DomainScope>, requested: &Option<DomainScope>) -> bool {
+    match (stored, requested) {
+        (None, None) => true,
+        (Some(stored), Some(requested)) => {
+            stored.exact_domain == requested.exact_domain
+                && stored.subdomains == requested.subdomains
+                && stored.wildcards == requested.wildcards
+        }
+        _ => false,
     }
 }
