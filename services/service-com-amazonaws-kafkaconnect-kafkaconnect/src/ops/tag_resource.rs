@@ -8,6 +8,11 @@
 //! name keeps the value it had. Every later `ListTagsForResource` answers from
 //! that same map.
 //!
+//! A caller-supplied tag has to be one AWS would accept: no key may claim the
+//! `aws:` namespace AWS reserves for its own tags, and a key or value may carry
+//! only the published tag character set. A request naming one that does not is a
+//! `BadRequestException` (HTTP 400) with nothing written.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -175,10 +180,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the lookup is the ARN itself rather than anything parsed out of it, and
         // one checked seam covers all three kinds. The write is per key: a
         // repeated key is overwritten, a new one is added, and a key the request
-        // does not name is left exactly as it was — unless the merged set would
-        // hold more tags than a resource may, in which case nothing is written.
+        // does not name is left exactly as it was — unless a key or value breaks
+        // an AWS tag rule, or the merged set would hold more tags than a resource
+        // may, in which case nothing is written.
         match state.attach_tags(&input.resource_arn, input.tags) {
             Ok(()) => Ok(TagResourceOutput {}),
+            // A tag rule the model cannot express (`TagKey`/`TagValue` carry
+            // lengths and no pattern), so the handler is where it is refused:
+            // the modelled 400, blaming the member that carried the tags.
+            Err(crate::state::TagWriteRefusal::IllegalTag(breach)) => {
+                Err(TagResourceErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(crate::state::invalid_parameter_because(
+                        "tags",
+                        &breach.reason(),
+                    )),
+                })
+                .into())
+            }
             Err(crate::state::TagWriteRefusal::NoSuchResource) => {
                 Err(TagResourceErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::invalid_parameter_because(

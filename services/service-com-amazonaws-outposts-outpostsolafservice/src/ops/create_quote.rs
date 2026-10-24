@@ -161,12 +161,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateQuoteErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        let region = crate::state::request_region(ctx.parts());
 
         // `OutpostIdentifier` is optional: "If not specified, the quote is created
         // without an Outpost association." When it IS named it accepts the bare id
@@ -186,15 +186,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // A quote may be associated only with an Outpost that exists, so an
         // identifier naming none is the not-found error this operation models. The
-        // ARN the quote reports is the Outpost's OWN `OutpostArn`, so it carries the
-        // region that Outpost was created in rather than this request's.
+        // Outpost is resolved in the region this request is addressed to: one of
+        // another region is not part of this region's inventory. The ARN the quote
+        // reports is that Outpost's OWN `OutpostArn`.
         let outpost_arn = outpost_id
             .as_deref()
             .zip(outpost_identifier.as_deref())
             .map(|(outpost_id, supplied)| {
                 store
-                    .outposts
-                    .get(outpost_id)
+                    .outpost(&region, outpost_id)
                     .and_then(|record| record.outpost.outpost_arn.clone())
                     .ok_or_else(|| {
                         CreateQuoteErrorModeled::NotFoundException(NotFoundException {
@@ -271,6 +271,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             quote_id,
             crate::state::QuoteRecord {
                 sequence,
+                // The quote belongs to the region this request was addressed to, the
+                // only one it is reachable through.
+                region,
                 quote: quote.clone(),
             },
         );

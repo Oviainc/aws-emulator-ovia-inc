@@ -106,6 +106,11 @@ pub const ROTATION_TYPE_ON_DEMAND: &str = "ON_DEMAND";
 /// (`smithy_query(query="doc",shape="RotateKeyOnDemand")`).
 pub const MAX_ON_DEMAND_ROTATIONS: usize = 25;
 
+/// The rotation period an `EnableKeyRotation` that names none gets: "If no value is
+/// specified, the default value is 365 days"
+/// (`smithy_query(query="doc",shape="EnableKeyRotationRequest",member="RotationPeriodInDays")`).
+pub const DEFAULT_ROTATION_PERIOD_IN_DAYS: i32 = 365;
+
 /// The `MultiRegionKeyType` of the key a `MultiRegion` create mints, from
 /// `smithy_query(shape="MultiRegionKeyType")`.
 pub const MULTI_REGION_KEY_TYPE_PRIMARY: &str = "PRIMARY";
@@ -795,6 +800,11 @@ pub struct Cmk {
     /// `ListKeyRotations` reports and the one [`Self::on_demand_rotation_count`]
     /// counts against the on-demand quota.
     pub rotations: Vec<KeyRotation>,
+    /// This key's automatic key rotation schedule, or `None` while automatic
+    /// rotation of its key material is not enabled — see [`RotationSchedule`].
+    /// `EnableKeyRotation` sets it, `DisableKeyRotation` clears it, and
+    /// `GetKeyRotationStatus` reports it.
+    pub rotation_schedule: Option<RotationSchedule>,
 }
 
 impl std::fmt::Debug for Cmk {
@@ -825,6 +835,7 @@ impl std::fmt::Debug for Cmk {
             // versions are retained, never their bytes.
             .field("superseded_material", &self.superseded_material.len())
             .field("rotations", &self.rotations)
+            .field("rotation_schedule", &self.rotation_schedule)
             .finish()
     }
 }
@@ -883,6 +894,10 @@ impl Cmk {
             material,
             superseded_material: Vec::new(),
             rotations: Vec::new(),
+            // A new KMS key has no automatic rotation schedule: "when you enable
+            // automatic rotation of a customer managed KMS key" is what starts
+            // one (`smithy_query(query="doc",shape="EnableKeyRotation")`).
+            rotation_schedule: None,
         }
     }
 
@@ -919,6 +934,59 @@ impl Cmk {
             .iter()
             .filter(|rotation| rotation.rotation_type == ROTATION_TYPE_ON_DEMAND)
             .count()
+    }
+
+    /// Start or re-configure this key's automatic rotation schedule, from the
+    /// rotation period the request named or [`DEFAULT_ROTATION_PERIOD_IN_DAYS`] when
+    /// it named none.
+    ///
+    /// "KMS rotates the key material of the KMS key one year (approximately 365
+    /// days) from the enable date and every year thereafter", and
+    /// `RotationPeriodInDays` both chooses that period and modifies "the rotation
+    /// period of a key that you previously enabled automatic key rotation on"
+    /// (`smithy_query(query="doc",shape="EnableKeyRotation")`) — so the schedule is
+    /// measured from the call that configured it, and configuring it again measures
+    /// the new period from that later call.
+    pub fn schedule_rotation(&mut self, period_in_days: Option<i32>) {
+        self.rotation_schedule = Some(RotationSchedule {
+            period_in_days: period_in_days.unwrap_or(DEFAULT_ROTATION_PERIOD_IN_DAYS),
+            scheduled_from: SystemTime::now(),
+        });
+    }
+
+    /// Stop automatic rotation of this key's key material, leaving the material and
+    /// the rotations it has already had exactly as they are: `DisableKeyRotation`
+    /// "disables automatic rotation of the key material"
+    /// (`smithy_query(query="doc",shape="DisableKeyRotation")`), it does not undo a
+    /// rotation.
+    pub fn unschedule_rotation(&mut self) {
+        self.rotation_schedule = None;
+    }
+
+    /// The automatic rotation schedule a READER reports for this key, which is the
+    /// one it carries except while it is awaiting deletion: "while a KMS key is
+    /// pending deletion, its key rotation status is false and KMS does not rotate
+    /// the key material. If you cancel the deletion, the original key rotation
+    /// status returns" (`smithy_query(query="doc",shape="GetKeyRotationStatus")`) —
+    /// so the schedule is kept on the record and masked at read time, never cleared.
+    ///
+    /// A disabled key is NOT masked: "the key rotation status does not change when
+    /// you disable a KMS key" (same doc).
+    pub fn reported_rotation_schedule(&self) -> Option<&RotationSchedule> {
+        if self.key_state == KEY_STATE_PENDING_DELETION {
+            return None;
+        }
+        self.rotation_schedule.as_ref()
+    }
+
+    /// Whether automatic rotation of this key's key material is supported at all:
+    /// "automatic key rotation is supported only on symmetric encryption KMS keys.
+    /// You cannot enable automatic rotation of asymmetric KMS keys, HMAC KMS keys,
+    /// KMS keys with imported key material, or KMS keys in a custom key store"
+    /// (`smithy_query(query="doc",shape="EnableKeyRotation")`). Read from the key's
+    /// own kind and the origin of its material rather than from one spec's name.
+    pub fn supports_automatic_rotation(&self) -> bool {
+        self.is_symmetric_encryption() && self.origin == ORIGIN_AWS_KMS
     }
 
     /// Whether this key is a *symmetric encryption* KMS key: one whose key material
@@ -1033,6 +1101,130 @@ pub struct KeyRotation {
     pub rotation_date: SystemTime,
     /// A `RotationType` value (`smithy_query(shape="RotationType")`).
     pub rotation_type: String,
+}
+
+/// One KMS key's automatic key rotation schedule: how long KMS waits between
+/// rotations of its key material, and when the current schedule started.
+///
+/// The next rotation date is DERIVED from the two ([`Self::next_rotation_date`])
+/// rather than stored, so it cannot drift from the period a later
+/// `EnableKeyRotation` set.
+#[derive(Debug, Clone)]
+pub struct RotationSchedule {
+    /// The number of days between automatic rotations — a
+    /// `RotationPeriodInDaysType` (90..2560,
+    /// `smithy_query(query="operation",operation="EnableKeyRotation")`).
+    pub period_in_days: i32,
+    /// The instant the call that configured this schedule was served: the "enable
+    /// date" the first rotation is measured from.
+    pub scheduled_from: SystemTime,
+}
+
+impl RotationSchedule {
+    /// When KMS next rotates the key material under this schedule: one rotation
+    /// period after the call that configured it, since KMS "rotates the key material
+    /// of the KMS key one year (approximately 365 days) from the enable date and
+    /// every year thereafter"
+    /// (`smithy_query(query="doc",shape="EnableKeyRotation")`), with the period in
+    /// place of the year.
+    pub fn next_rotation_date(&self) -> SystemTime {
+        let period = std::time::Duration::from_secs(
+            u64::try_from(self.period_in_days.max(0)).unwrap_or(0) * SECONDS_PER_DAY,
+        );
+        self.scheduled_from + period
+    }
+}
+
+/// Seconds in a day, for turning a rotation period in days into a duration.
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// Why a request to CONFIGURE a KMS key's automatic rotation schedule is refused.
+/// One enum for `EnableKeyRotation` and `DisableKeyRotation`, which model the same
+/// errors and accept the same keys: "you can enable (EnableKeyRotation) and disable
+/// automatic rotation (DisableKeyRotation) of the key material in customer managed
+/// KMS keys" (`smithy_query(query="doc",shape="GetKeyRotationStatus")`).
+#[derive(Debug, Clone)]
+pub enum RotationConfigRefusal {
+    /// The key is not one whose automatic rotation is configurable at all —
+    /// `UnsupportedOperationException`, "a specified resource is not valid for this
+    /// operation". KMS reports a key the rotation operations cannot rotate with the
+    /// error code ALONE: the refusal is recorded on the wire with an empty message,
+    /// so this variant carries none and [`unsupported_rotation_message`] is what
+    /// every rotation operation builds its wire message from.
+    Unsupported,
+    /// The key is disabled — the modelled `DisabledException`, whose message names
+    /// the key and its state ([`invalid_state_message`]).
+    Disabled(String),
+    /// The key is in some other key state this operation is not compatible with —
+    /// `KMSInvalidStateException`, worded the same way.
+    InvalidState(String),
+}
+
+/// The `message` a rotation operation puts on an `UnsupportedOperationException`:
+/// none.
+///
+/// KMS refuses a key whose kind cannot be rotated with the error code alone — the
+/// refusal of an unsupported key type is recorded on the wire with an empty message
+/// — so no explanatory text is manufactured for it. The reason the key was refused
+/// is stated in a comment at the check that refuses it, not on the wire.
+pub fn unsupported_rotation_message() -> Option<String> {
+    None
+}
+
+/// Whether `key` is one whose automatic key rotation schedule a caller may set or
+/// clear, and which refusal reports it when it is not.
+///
+/// The partition is the documented one: automatic rotation is configurable on a
+/// customer managed symmetric encryption KMS key whose key material KMS generated,
+/// in a compatible key state, and on the PRIMARY key of a multi-Region key set
+/// rather than on a replica — "you cannot enable automatic rotation of asymmetric
+/// KMS keys, HMAC KMS keys, KMS keys with imported key material, or KMS keys in a
+/// custom key store. To enable or disable automatic rotation of a set of related
+/// multi-Region keys, set the property on the primary key. ... You cannot enable or
+/// disable automatic rotation of Amazon Web Services managed KMS keys"
+/// (`smithy_query(query="doc",shape="EnableKeyRotation")`).
+///
+/// One function for both operations, so they cannot judge the same key differently.
+pub fn check_rotation_configurable(key: &Cmk) -> Result<(), RotationConfigRefusal> {
+    // "You cannot enable or disable automatic rotation of Amazon Web Services
+    // managed KMS keys. KMS always rotates the key material of Amazon Web Services
+    // managed keys every year."
+    if key.key_manager != KEY_MANAGER_CUSTOMER {
+        return Err(RotationConfigRefusal::Unsupported);
+    }
+
+    // Which keys cannot rotate automatically follows from the key's own kind and the
+    // origin of its material, never from one spec's name: an asymmetric key and an
+    // HMAC key are not symmetric encryption keys, and a key whose material did not
+    // come from KMS is a key with imported key material.
+    if !key.is_symmetric_encryption() || key.origin != ORIGIN_AWS_KMS {
+        return Err(RotationConfigRefusal::Unsupported);
+    }
+
+    // "The KMS key that you use for this operation must be in a compatible key
+    // state": a disabled key has its own modelled refusal, and any other key state
+    // outside `Enabled` is a key state this operation is not compatible with.
+    if key.key_state == KEY_STATE_DISABLED {
+        return Err(RotationConfigRefusal::Disabled(invalid_state_message(key)));
+    }
+    if !key.is_usable() {
+        return Err(RotationConfigRefusal::InvalidState(invalid_state_message(
+            key,
+        )));
+    }
+
+    // "To enable or disable automatic rotation of a set of related multi-Region
+    // keys, set the property on the primary key" — so a replica key of a set does
+    // not carry the schedule; the primary key of its set does.
+    if key
+        .multi_region_topology
+        .as_ref()
+        .is_some_and(|topology| topology.primary_region != key.region)
+    {
+        return Err(RotationConfigRefusal::Unsupported);
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

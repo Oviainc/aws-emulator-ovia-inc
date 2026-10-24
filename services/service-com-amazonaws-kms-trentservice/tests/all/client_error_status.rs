@@ -325,7 +325,7 @@ async fn a_scaffolded_operation_still_answers_501() {
     let cases: Vec<(&str, Value)> = vec![
         ("ListResourceTags", json!({"KeyId": key_id})),
         ("ListKeyPolicies", json!({"KeyId": key_id})),
-        ("EnableKeyRotation", json!({"KeyId": key_id})),
+        ("ListKeyRotations", json!({"KeyId": key_id})),
         (
             "GenerateDataKey",
             json!({"KeyId": key_id, "KeySpec": "AES_256"}),

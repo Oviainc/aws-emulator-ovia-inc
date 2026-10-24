@@ -202,21 +202,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => MAX_RESULTS as usize,
         };
 
-        // The window: "the exclusive start" and "the inclusive end" of the queried
-        // range. An absent bound leaves that side open.
-        let after = input.start_date.as_ref().map(date_key);
-        let through = input.end_date.as_ref().map(date_key);
-        if let (Some(start), Some(end)) = (after, through) {
-            if end < start {
-                return Err(invalid_request(
-                    "endDate must not precede startDate.".to_string(),
-                ));
-            }
-        }
-
-        // `timeOrdering` is a modelled enum defaulting to ASCENDING, so only its two
-        // values can reach here.
-        let descending = input.time_ordering.as_deref() == Some(ORDER_DESCENDING);
+        // What this read asks of the stream: the window — "the exclusive start" and
+        // "the inclusive end" of the queried range, an absent bound leaving that side
+        // open — the quality filter, and the ordering (`timeOrdering` is a modelled
+        // enum defaulting to ASCENDING, so only its two values can reach here). The
+        // selection itself lives in `crate::state`, shared with
+        // `BatchGetAssetPropertyValueHistory`, so the two readers cannot disagree
+        // about what a window covers or which samples a quality filter keeps.
+        let query = crate::state::HistoryQuery::new(
+            input.start_date.as_ref(),
+            input.end_date.as_ref(),
+            input.qualities.as_deref(),
+            input.time_ordering.as_deref() == Some(ORDER_DESCENDING),
+        )
+        .ok_or_else(|| invalid_request("endDate must not precede startDate.".to_string()))?;
 
         let store = state.lock();
 
@@ -266,21 +265,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // The stored series is sorted ascending by timestamp, so the window and the
-        // quality filter select from it in order and ASCENDING needs no sort at all.
-        let mut selected: Vec<AssetPropertyValue> = store
-            .series(&stream)
-            .iter()
-            .filter(|sample| {
-                let at = crate::state::timestamp_key(&sample.timestamp);
-                after.is_none_or(|start| at > start) && through.is_none_or(|end| at <= end)
-            })
-            .filter(|sample| keeps_quality(input.qualities.as_deref(), sample))
-            .cloned()
-            .collect();
-        if descending {
-            selected.reverse();
-        }
+        let mut selected: Vec<AssetPropertyValue> =
+            crate::state::history_values(&store, &stream, &query);
 
         // `nextToken` is this enumeration's resume point: the timestamp of the first
         // sample of the next page, hex-encoded so the token matches the modelled
@@ -324,34 +310,6 @@ const MAX_RESULTS: i32 = 20_000;
 /// `smithy_query(query="shape", shape="TimeOrdering")` — ASCENDING | DESCENDING,
 /// with ASCENDING the documented default.
 const ORDER_DESCENDING: &str = "DESCENDING";
-
-/// Whether `sample` survives the requested quality filter.
-///
-/// `qualities` is "the quality by which to filter asset data": a request that names
-/// none asks for every sample, and one that names a quality keeps only the samples
-/// reporting it. The quality a sample stored without one counts as comes from the
-/// shared [`crate::state::quality_of`], so this filter and the quality-aware write
-/// in `BatchPutAssetPropertyValue` cannot disagree about it.
-fn keeps_quality(qualities: Option<&[String]>, sample: &AssetPropertyValue) -> bool {
-    match qualities {
-        // A filter naming no quality — absent, or the empty list — asks for all of them.
-        None | Some([]) => true,
-        Some(wanted) => {
-            let quality = crate::state::quality_of(sample);
-            wanted.iter().any(|candidate| candidate == quality)
-        }
-    }
-}
-
-/// A modelled `Timestamp` as the same `(seconds, nanoseconds)` total order
-/// [`crate::state::timestamp_key`] puts the stored samples in.
-fn date_key(at: &::aws_smithy_types::DateTime) -> (i64, i32) {
-    (
-        at.secs(),
-        // A subsecond offset is at most 999_999_999 nanoseconds, so it always fits.
-        i32::try_from(at.subsec_nanos()).unwrap_or(i32::MAX),
-    )
-}
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
 fn invalid_token() -> GetAssetPropertyValueHistoryError {

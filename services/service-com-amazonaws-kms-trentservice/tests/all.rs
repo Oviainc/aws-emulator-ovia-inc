@@ -31,6 +31,8 @@ mod key_lifecycle;
 mod key_policy;
 #[path = "all/key_rotation_on_demand.rs"]
 mod key_rotation_on_demand;
+#[path = "all/key_rotation_schedule.rs"]
+mod key_rotation_schedule;
 #[path = "all/key_specs.rs"]
 mod key_specs;
 #[path = "all/multi_region_primary.rs"]

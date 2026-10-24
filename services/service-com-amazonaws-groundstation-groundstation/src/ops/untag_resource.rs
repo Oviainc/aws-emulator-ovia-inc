@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deassigns tags from the resource `resourceArn` names: every key the request's
+//! `tagKeys` list names is DROPPED from that resource's tag map, and every key it does
+//! not name keeps its value exactly as it was. A key the resource does not carry is not a
+//! failure — the model marks this operation idempotent (`smithy_query(query="operation",
+//! operation="UntagResource")`), so removing a key twice, or naming it twice in one
+//! request, leaves the same map as removing it once — and an empty list removes nothing.
+//! What is left is the one map the resource's own read and `ListTagsForResource` report.
+//!
+//! Every resource this service hands out is taggable and is addressed here only by ARN,
+//! so the resolution is `crate::state`'s one ARN index
+//! ([`crate::state::ComAmazonawsGroundstationGroundstationState::tags_mut`]) — the same
+//! index `TagResource` writes through; an ARN this service never minted, or one whose
+//! resource has been deleted, is `ResourceNotFoundException` (HTTP 434).
+//!
+//! The keys themselves are held to the half of AWS's platform-wide tagging rules that
+//! decides which keys are a caller's at all ([`crate::state::validate_tag_keys`]), judged
+//! before the ARN is resolved and before anything is removed, so a refused removal leaves
+//! the resource exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -134,20 +144,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // Which keys are a caller's to remove is a property of the KEYS, so it is judged
+        // from the request alone, before the ARN is resolved: a request that is wrong in
+        // itself is answered for what is wrong with it (431) whether or not the resource
+        // exists — the same precedence `TagResource` gives the map it is handed.
+        crate::state::validate_tag_keys(&input.tag_keys)
+            .map_err(UntagResourceErrorModeled::InvalidParameterException)?;
+
+        // One lock for the lookup AND the removal, so the whole read-modify-write of the
+        // resource's tag map is atomic: a concurrent write of other keys is not lost.
+        let mut guard = state.lock();
+        let tags = guard.tags_mut(&input.resource_arn).ok_or_else(|| {
+            UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::tagged_resource_not_found_message(
+                    &input.resource_arn,
+                )),
+            })
+        })?;
+
+        // Drop exactly the named keys, in one pass over the stored map however many keys
+        // the request names — the named keys go into a set first, which is also why a key
+        // named twice means what a key named once means. A key the resource does not carry
+        // is simply not there to drop, and every key the request does not name is left
+        // untouched, so what the next read reports is the stored map minus these keys.
+        let dropped: ::std::collections::HashSet<&str> =
+            input.tag_keys.iter().map(String::as_str).collect();
+        tags.retain(|key, _| !dropped.contains(key.as_str()));
+
+        Ok(UntagResourceOutput {})
     }
 }

@@ -21,12 +21,13 @@
 //!   service's private registry, so a digest nothing pushed there is refused with
 //!   the same `DoesNotExist` envelope, and the registry it reports stays
 //!   unchanged.
-//! * `DeleteContainerImage` deletes an image that registry HOLDS, so it succeeds
-//!   only for a name `GetContainerImages` reports and refuses a name the registry
-//!   does not hold — including a second delete of a name it just dropped — with
-//!   this service's not-found rejection, while a request naming no container
-//!   service in the request's region is refused with the modelled
-//!   `InvalidInputException`.
+//! * `DeleteContainerImage` enforces only its PARENT resource: it removes the
+//!   named image when that registry holds it and is accepted as a no-op when it
+//!   does not — a never-registered name, a name of another service, a
+//!   public-registry name, a second delete of a name it just dropped — answering
+//!   the modelled empty success either way and leaving the rest of the registry
+//!   untouched, while a request naming no container service in the request's
+//!   region is refused with the modelled `InvalidInputException`.
 
 use std::sync::Arc;
 
@@ -229,6 +230,20 @@ fn assert_does_not_exist(case: &str, status: u16, refused: &Value) {
             .as_str()
             .is_some_and(|message| !message.is_empty()),
         "case {case}: expected a message saying what does not exist, got {refused:?}"
+    );
+}
+
+/// Assert that `body` is `DeleteContainerImage`'s modelled success: HTTP 204
+/// (the operation's modelled success status) carrying no output member, the
+/// modelled `DeleteContainerImageResult` having none.
+fn assert_empty_success(case: &str, status: u16, body: &Value) {
+    assert_eq!(
+        status, 204,
+        "case {case}: expected HTTP 204, got {status} {body:?}"
+    );
+    assert!(
+        *body == Value::Null || *body == json!({}),
+        "case {case}: expected no output members, got {body:?}"
     );
 }
 
@@ -575,14 +590,13 @@ async fn deleting_an_image_the_registry_holds_removes_it() {
     }
 }
 
-/// RULE: a delete can only remove an image the registry holds, so a name it does
-/// not hold — a never-registered name, a name belonging to another service, a
-/// public-registry name the service cannot hold at all, or a name this very call
-/// already deleted — is refused with this service's not-found rejection, and the
-/// registry is left as it was. The delete is therefore NOT unconditionally
-/// idempotent: repeating it answers the refusal, not a second success.
+/// RULE: the delete enforces only its parent resource, so an image name the
+/// registry does not hold — a never-registered name, a name belonging to another
+/// service, a public-registry name the service cannot hold at all, a name in no
+/// registry form — is accepted as a no-op: the modelled empty success, with the
+/// registry left exactly as it was, however many times it is repeated.
 #[tokio::test]
-async fn deleting_an_image_the_registry_does_not_hold_is_refused() {
+async fn deleting_an_image_the_registry_does_not_hold_is_a_no_op() {
     for service in SERVICE_ROWS {
         let emulator = Emulator::new();
         emulator.create_service(service.region, service.name).await;
@@ -596,63 +610,89 @@ async fn deleting_an_image_the_registry_does_not_hold_is_refused() {
         for (row, image) in UNHELD_IMAGES {
             let image = image.replace("{service}", service.name);
             let case = format!("{row} on {}", service.case);
-            // Twice: the refusal is the same answer every time, and neither
+            // Twice: the success is the same answer every time, and neither
             // attempt changes the registry.
             for attempt in 1..=2 {
-                let (status, refused) = emulator
+                let (status, body) = emulator
                     .delete_image(service.region, service.name, &image)
                     .await;
-                assert_does_not_exist(&format!("{case} (attempt {attempt})"), status, &refused);
-                assert!(
-                    refused["message"]
-                        .as_str()
-                        .is_some_and(|message| message.contains(&image)),
-                    "case {case} (attempt {attempt}): expected the message to name the image \
-                     the request carried, got {refused:?}"
-                );
+                assert_empty_success(&format!("{case} (attempt {attempt})"), status, &body);
             }
             let got = emulator.image_names(service.region, service.name).await;
             assert_eq!(
                 got, seeded,
-                "case {case}: a refused delete must leave the registry as it was ({seeded:?}), \
+                "case {case}: a no-op delete must leave the registry as it was ({seeded:?}), \
                  got {got:?}"
             );
         }
-
-        // The second delete of a name that WAS held is the same refusal: the
-        // image is gone, so there is nothing left to delete.
-        let target = HELD_IMAGES[0].name(service.name);
-        let case = format!("a second delete of a held name on {}", service.case);
-        let (status, body) = emulator
-            .delete_image(service.region, service.name, &target)
-            .await;
-        assert_eq!(
-            status, 204,
-            "case {case}: expected the first delete to succeed, got {status} {body:?}"
-        );
-        let (status, refused) = emulator
-            .delete_image(service.region, service.name, &target)
-            .await;
-        assert_does_not_exist(&case, status, &refused);
     }
 }
 
-/// RULE: an empty registry holds nothing, so EVERY delete against a service
-/// nothing has been pushed to is refused — which is the state every service of
+/// RULE: because the name need not be held, the delete is idempotent: deleting a
+/// name the registry DOES hold removes it, and every later delete of that same
+/// name answers the same empty success while the registry stays without it.
+#[tokio::test]
+async fn repeating_the_delete_of_a_held_image_keeps_succeeding() {
+    for service in SERVICE_ROWS {
+        let emulator = Emulator::new();
+        emulator.create_service(service.region, service.name).await;
+        let seeded: Vec<String> = HELD_IMAGES
+            .iter()
+            .map(|image| image.name(service.name))
+            .collect();
+        let borrowed: Vec<&str> = seeded.iter().map(String::as_str).collect();
+        emulator.push(service.region, service.name, &borrowed);
+
+        for held in HELD_IMAGES {
+            let target = held.name(service.name);
+            let case = format!("repeated deletes of {} on {}", held.case, service.case);
+            for attempt in 1..=3 {
+                let (status, body) = emulator
+                    .delete_image(service.region, service.name, &target)
+                    .await;
+                assert_empty_success(&format!("{case} (attempt {attempt})"), status, &body);
+                let got = emulator.image_names(service.region, service.name).await;
+                assert!(
+                    !got.contains(&target),
+                    "case {case} (attempt {attempt}): expected {target:?} to be gone from the \
+                     registry, got {got:?}"
+                );
+            }
+        }
+        let got = emulator.image_names(service.region, service.name).await;
+        assert!(
+            got.is_empty(),
+            "case {}: deleting every held name must leave an empty registry, got {got:?}",
+            service.case
+        );
+    }
+}
+
+/// RULE: an empty registry holds nothing to remove, so EVERY delete against a
+/// service nothing has been pushed to is the same accepted no-op and the
+/// registry still reads as empty afterwards — which is the state every service of
 /// this emulator is in until a container image registry can be pushed to (see
 /// `RegisterContainerImage`).
 #[tokio::test]
-async fn deleting_from_an_empty_registry_is_always_refused() {
+async fn deleting_from_an_empty_registry_always_succeeds() {
     for service in SERVICE_ROWS {
         let emulator = Emulator::new();
         emulator.create_service(service.region, service.name).await;
 
         for held in HELD_IMAGES {
             let case = format!("{} on an empty registry of {}", held.case, service.case);
-            let (status, refused) = emulator
+            let (status, body) = emulator
                 .delete_image(service.region, service.name, &held.name(service.name))
                 .await;
-            assert_does_not_exist(&case, status, &refused);
+            assert_empty_success(&case, status, &body);
+        }
+        for (row, image) in UNHELD_IMAGES {
+            let image = image.replace("{service}", service.name);
+            let case = format!("{row} on an empty registry of {}", service.case);
+            let (status, body) = emulator
+                .delete_image(service.region, service.name, &image)
+                .await;
+            assert_empty_success(&case, status, &body);
         }
         assert!(
             emulator.images(service.region, service.name).await.is_empty(),

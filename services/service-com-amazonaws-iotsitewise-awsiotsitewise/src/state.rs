@@ -3475,6 +3475,15 @@ pub fn not_found_arn_message(requested_arn: &str) -> String {
     format!("Resource with ARN {requested_arn} not found")
 }
 
+/// `a, b, c` — the accepted values a refusal names, so a message states the RULE
+/// that refused the request rather than only that it was refused.
+///
+/// One place, so every operation that refuses a value outside a modelled
+/// catalogue words the catalogue the same way.
+pub fn catalog_names<'a>(values: impl Iterator<Item = &'a str>) -> String {
+    values.collect::<Vec<&str>>().join(", ")
+}
+
 /// Turn `AssetModelPropertyDefinition`s into the stored `AssetModelProperty`s,
 /// minting an id for every definition that did not supply one.
 ///
@@ -3704,6 +3713,53 @@ pub fn decode_timestamp_token(token: &str) -> Option<(i64, i32)> {
 
 /// What joins the two halves of a token [`encode_timestamp_token`] builds.
 const TIMESTAMP_TOKEN_SEPARATOR: char = '.';
+
+/// Where a page of a BATCH read resumes: the entry still being answered and how
+/// many of that entry's data points earlier pages already carried.
+///
+/// ONE recipe for every batch read of this service that pages ACROSS its entries
+/// (`BatchGetAssetPropertyAggregates`, `BatchGetAssetPropertyValueHistory`), so
+/// the token format and what counts as a token this service never issued cannot
+/// drift between them.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchCursor {
+    /// Index into the request's `entries` of the first entry not yet finished.
+    pub entry: usize,
+    /// How many of THAT entry's data points previous pages already reported.
+    pub value: usize,
+}
+
+impl BatchCursor {
+    /// The cursor of a request that carries no `nextToken`.
+    pub const START: Self = Self { entry: 0, value: 0 };
+
+    /// This cursor as a `nextToken`: hex, so the token stays opaque to the caller
+    /// and inside the `^[A-Za-z0-9+/=]+$` pattern the paging members of this
+    /// service carry.
+    pub fn encode(self) -> String {
+        ::hex::encode(format!(
+            "{}{BATCH_CURSOR_SEPARATOR}{}",
+            self.entry, self.value
+        ))
+    }
+
+    /// The cursor `token` encodes, or `None` for text this service never issued as
+    /// one — which its caller answers as the modelled refusal for an invalid
+    /// `nextToken`.
+    pub fn decode(token: &str) -> Option<Self> {
+        let decoded = ::hex::decode(token)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())?;
+        let (entry, value) = decoded.split_once(BATCH_CURSOR_SEPARATOR)?;
+        Some(Self {
+            entry: entry.parse().ok()?,
+            value: value.parse().ok()?,
+        })
+    }
+}
+
+/// What joins the two halves of a token [`BatchCursor::encode`] builds.
+const BATCH_CURSOR_SEPARATOR: char = ':';
 
 /// The `Quality` a TQV that names none carries.
 ///
@@ -3951,6 +4007,116 @@ pub fn property_notification_topic(
 /// The `PropertyNotificationState` a property takes when `UpdateAssetProperty`
 /// omits one: the model's own documented default for that member.
 pub const NOTIFICATION_STATE_DISABLED: &str = "DISABLED";
+
+// ---------------------------------------------------------------------------
+// Selecting one series' stored samples.
+//
+// A history read asks the same question of a data stream whether it names one
+// property or a batch of them: which stored samples fall inside the queried
+// range, which qualities are kept and which way round they are reported. The
+// selection therefore lives here, beside the series it reads, so
+// `GetAssetPropertyValueHistory` and `BatchGetAssetPropertyValueHistory` cannot
+// disagree about what a window covers or what a quality filter keeps.
+// ---------------------------------------------------------------------------
+
+/// What one history read asks of one stored series.
+///
+/// Built only by [`HistoryQuery::new`], so a window whose end precedes its start
+/// — which names no range at all — cannot reach a series: the constructor hands
+/// back `None` for it instead.
+#[derive(Debug, Clone, Copy)]
+pub struct HistoryQuery<'a> {
+    /// The EXCLUSIVE start of the queried range, in nanoseconds of Unix epoch
+    /// time: "The exclusive start of the range from which to query historical
+    /// data" (the `startDate` member of either history reader). `None` leaves
+    /// that side of the range open.
+    start_exclusive_nanos: Option<i128>,
+    /// The INCLUSIVE end of the queried range: "The inclusive end of the range
+    /// from which to query historical data" (the `endDate` member). `None`
+    /// leaves that side open.
+    end_inclusive_nanos: Option<i128>,
+    /// The qualities a sample may carry to be reported — "the quality by which
+    /// to filter asset data". A read that names none asks for every sample: a
+    /// history read reports the samples themselves, so an absent filter filters
+    /// nothing out.
+    qualities: Option<&'a [String]>,
+    /// `true` for `TimeOrdering` DESCENDING; ASCENDING is the modelled default.
+    descending: bool,
+}
+
+impl<'a> HistoryQuery<'a> {
+    /// The query a request's window, quality filter and ordering name, or `None`
+    /// when `end_date` PRECEDES `start_date` — the caller's cue to refuse the
+    /// request (or the batch entry) with the modelled `InvalidRequestException`
+    /// rather than answer an impossible range with an empty history.
+    pub fn new(
+        start_date: Option<&::aws_smithy_types::DateTime>,
+        end_date: Option<&::aws_smithy_types::DateTime>,
+        qualities: Option<&'a [String]>,
+        descending: bool,
+    ) -> Option<Self> {
+        let start_exclusive_nanos = start_date.map(date_time_nanos);
+        let end_inclusive_nanos = end_date.map(date_time_nanos);
+        if let (Some(start), Some(end)) = (start_exclusive_nanos, end_inclusive_nanos) {
+            if end < start {
+                return None;
+            }
+        }
+        Some(Self {
+            start_exclusive_nanos,
+            end_inclusive_nanos,
+            qualities,
+            descending,
+        })
+    }
+
+    /// Whether `sample` survives this read's quality filter. The quality a
+    /// sample stored without one counts as comes from the shared
+    /// [`quality_of`], so this filter and the quality-aware write in
+    /// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::record_property_value`]
+    /// cannot disagree about it.
+    fn keeps_quality(&self, sample: &AssetPropertyValue) -> bool {
+        match self.qualities {
+            // A filter naming no quality — absent, or the empty list — asks for
+            // all of them.
+            None | Some([]) => true,
+            Some(wanted) => {
+                let quality = quality_of(sample);
+                wanted.iter().any(|candidate| candidate == quality)
+            }
+        }
+    }
+}
+
+/// The stored samples of the stream `stream` names that `query` selects, in the
+/// order it asks for — what either history reader reports for one data stream,
+/// associated with an asset property or not.
+///
+/// The stored series is kept sorted ascending by timestamp, so the range and the
+/// quality filter select from it in order and ASCENDING needs no sort at all; a
+/// series is bounded at [`MAX_SAMPLES_PER_SERIES`], so the work one read can ask
+/// for is bounded however wide a range it names.
+pub fn history_values(
+    store: &ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    stream: &SeriesKey,
+    query: &HistoryQuery<'_>,
+) -> Vec<AssetPropertyValue> {
+    let mut selected: Vec<AssetPropertyValue> = store
+        .series(stream)
+        .iter()
+        .filter(|sample| {
+            let at = timestamp_nanos(&sample.timestamp);
+            query.start_exclusive_nanos.is_none_or(|start| at > start)
+                && query.end_inclusive_nanos.is_none_or(|end| at <= end)
+        })
+        .filter(|sample| query.keeps_quality(sample))
+        .cloned()
+        .collect();
+    if query.descending {
+        selected.reverse();
+    }
+    selected
+}
 
 // ---------------------------------------------------------------------------
 // Deriving one series' aggregates.

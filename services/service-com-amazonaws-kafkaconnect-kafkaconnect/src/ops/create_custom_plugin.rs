@@ -177,6 +177,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
 
+        // The `tags` a create carries are held to the same AWS tag rules as a
+        // later `TagResource` write (`crate::state::tag_map_breach`), so a
+        // create cannot store a tag the tagging path would refuse. `TagKey` and
+        // `TagValue` carry lengths and no pattern, so the handler is where the
+        // rules are applied.
+        if let Some(breach) = input.tags.as_ref().and_then(crate::state::tag_map_breach) {
+            return Err(CreateCustomPluginErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_parameter_because(
+                    "tags",
+                    &breach.reason(),
+                )),
+            })
+            .into());
+        }
+
         // The plugin's file is named by an S3 bucket ARN plus a key; a
         // `bucketArn` that is not an ARN at all names no bucket, so the request
         // is refused rather than stored. The model types the member as a plain

@@ -425,31 +425,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(&message));
         }
 
-        // "For a Lambda integration, specify the URI of a Lambda function. For an HTTP
-        // integration, specify a fully-qualified URL" (`CreateIntegration$IntegrationUri`):
-        // every integration type names an endpoint except `MOCK`, which "lets API Gateway
-        // return a response without sending the request further to the backend".
-        if input.integration_uri.is_none() && input.integration_type != MOCK_INTEGRATION_TYPE {
-            return Err(bad_request(&format!(
-                "IntegrationUri is required for an integration of type {}.",
-                input.integration_type
-            )));
+        // Every rule the integration RECORD has to satisfy, in the one place that owns
+        // them, so `UpdateIntegration` cannot disagree about any of them: which members
+        // name what the integration invokes, the payload format its type supports, the
+        // link a private connection connects through, and the variables a selection
+        // expression may name (see `crate::state::validate_integration`).
+        if let Err(message) = crate::state::validate_integration(
+            &input.integration_type,
+            input.integration_subtype.as_deref(),
+            input.integration_uri.as_deref(),
+            input.payload_format_version.as_deref(),
+            input
+                .connection_type
+                .as_deref()
+                .unwrap_or(crate::state::DEFAULT_CONNECTION_TYPE),
+            input.connection_id.as_deref(),
+            input.template_selection_expression.as_deref(),
+        ) {
+            return Err(bad_request(&message));
         }
         // "Specifies the format of the payload sent to an integration. Required for HTTP
-        // APIs" (`CreateIntegration$PayloadFormatVersion`).
+        // APIs" (`CreateIntegration$PayloadFormatVersion`). The requirement is the
+        // CREATE's: a record of an HTTP api always carries one afterwards, so a later
+        // patch does not have to resend it.
         if is_http && input.payload_format_version.is_none() {
             return Err(bad_request(
                 "PayloadFormatVersion is required for HTTP APIs.",
             ));
-        }
-        // "The ID of the VPC link for a private integration" is what a `VPC_LINK`
-        // connection connects through, and it means nothing without one.
-        if input.connection_type.as_deref() == Some(VPC_LINK_CONNECTION_TYPE)
-            && input.connection_id.is_none()
-        {
-            return Err(bad_request(&format!(
-                "ConnectionId is required for a connection of type {VPC_LINK_CONNECTION_TYPE}."
-            )));
         }
 
         // Bound the growth a caller drives: AWS's published quota is 300 integrations per
@@ -544,15 +546,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The one `IntegrationType` that names no endpoint, from `INTEGRATION_TYPE_VALUES`:
-/// "MOCK: for integrating the route or method request with API Gateway as a ‘loopback'
-/// endpoint without invoking any backend."
-const MOCK_INTEGRATION_TYPE: &str = "MOCK";
-
-/// The `ConnectionType` of a private integration, from `CONNECTION_TYPE_VALUES`: the
-/// one that connects through a VPC link and so needs the link's id.
-const VPC_LINK_CONNECTION_TYPE: &str = "VPC_LINK";
 
 /// This operation's refusal of a request it models no more specific error for: the
 /// modelled `BadRequestException` ("The request is not valid, for example, the input is

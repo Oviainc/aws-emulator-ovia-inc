@@ -202,8 +202,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => MAX_RESULTS as usize,
         };
         let cursor = match input.next_token.as_deref() {
-            Some(token) => decode_token(token)?,
-            None => Cursor::START,
+            Some(token) => crate::state::BatchCursor::decode(token).ok_or_else(invalid_token)?,
+            None => crate::state::BatchCursor::START,
         };
         if cursor.entry >= input.entries.len() {
             return Err(invalid_token());
@@ -285,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         aggregated_values: aggregated[from..from + remaining].to_vec(),
                     });
                 }
-                next_token = Some(Cursor {
+                next_token = Some(crate::state::BatchCursor {
                     entry: at,
                     value: from + remaining,
                 }
@@ -322,41 +322,12 @@ const MAX_ENTRIES: usize = 16;
 /// maxResults is 4000."
 const MAX_RESULTS: i32 = 4_000;
 
-/// Where a page of this batch resumes: the entry still being answered and how many
-/// of its data points earlier pages already carried.
-#[derive(Debug, Clone, Copy)]
-struct Cursor {
-    /// Index into the request's `entries` of the first entry not yet finished.
-    entry: usize,
-    /// How many of THAT entry's aggregated values previous pages already reported.
-    value: usize,
-}
-
-impl Cursor {
-    /// The cursor of a request that carries no `nextToken`.
-    const START: Self = Self { entry: 0, value: 0 };
-
-    /// This cursor as a `nextToken`: hex, so the token matches the modelled
-    /// `^[A-Za-z0-9+/=]+$` and stays opaque to the caller, the same encoding
-    /// `ListAssets` uses for its own resume point.
-    fn encode(self) -> String {
-        ::hex::encode(format!("{}:{}", self.entry, self.value))
-    }
-}
-
-/// Decode a `nextToken` back into the cursor it names.
-fn decode_token(token: &str) -> Result<Cursor, BatchGetAssetPropertyAggregatesError> {
-    let decoded = ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)?;
-    let (entry, value) = decoded.split_once(':').ok_or_else(invalid_token)?;
-    Ok(Cursor {
-        entry: entry.parse().map_err(|_| invalid_token())?,
-        value: value.parse().map_err(|_| invalid_token())?,
-    })
-}
-
+/// Where a page of a batch read resumes lives in `crate::state`
+/// ([`crate::state::BatchCursor`]), hoisted there once
+/// `BatchGetAssetPropertyValueHistory` became a second caller, so the two
+/// paginated batch readers cannot drift in token format or in what counts as a
+/// token this service never issued.
+///
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued
 /// for these entries.
 fn invalid_token() -> BatchGetAssetPropertyAggregatesError {
@@ -526,11 +497,10 @@ fn resolve_entry<'a>(
     Ok((stream, query))
 }
 
-/// `a, b, c` — the accepted values a refusal names, so the message states the rule
-/// that refused the request rather than only that it was refused.
-fn names<'a>(values: impl Iterator<Item = &'a str>) -> String {
-    values.collect::<Vec<&str>>().join(", ")
-}
+// `a, b, c` — the accepted values a refusal names — lives in `crate::state`
+// (`catalog_names`), so every operation that refuses a value outside a modelled
+// catalogue words that catalogue the same way.
+use crate::state::catalog_names as names;
 
 // ---------------------------------------------------------------------------
 // Deriving one series' aggregates.

@@ -2,7 +2,8 @@
 
 //! Engine state for the com-amazonaws-outposts-outpostsolafservice service, plus
 //! the rules more than one operation in the site + Outpost lifecycle applies: id
-//! and ARN minting, resolving the `id OR ARN` identifier forms the modelled
+//! and ARN minting, scoping a resource to the region it was created in, resolving the
+//! `id OR ARN` identifier forms the modelled
 //! `@httpLabel` patterns accept, projecting a resource's tag map and an Outpost's
 //! two Availability Zone identities, selecting a site's two addresses by the
 //! modelled `AddressType` and keeping the `Site` projection of the operating one in
@@ -251,6 +252,8 @@ pub struct SiteRecord {
     /// Position in this store's creation order — the sort key every list and every
     /// page token is expressed in, so a token stays correct across calls.
     pub sequence: u64,
+    /// The region this site was created in. See [`RegionalRecord`].
+    pub region: String,
     /// The site as `CreateSite` / `GetSite` / `ListSites` return it.
     pub site: Site,
     /// The full operating address the caller supplied, which `Site` projects down
@@ -354,6 +357,8 @@ impl SiteRecord {
 pub struct OutpostRecord {
     /// See [`SiteRecord::sequence`].
     pub sequence: u64,
+    /// The region this Outpost was created in. See [`RegionalRecord`].
+    pub region: String,
     /// The Outpost as `CreateOutpost` / `GetOutpost` / `ListOutposts` return it.
     pub outpost: Outpost,
     /// The private connectivity configuration of this Outpost, or `None` for an
@@ -631,8 +636,99 @@ macro_rules! capacity_task_projection {
 pub struct QuoteRecord {
     /// See [`SiteRecord::sequence`].
     pub sequence: u64,
+    /// The region this quote was created in. See [`RegionalRecord`].
+    pub region: String,
     /// The quote as `CreateQuote` / `GetQuote` return it.
     pub quote: Quote,
+}
+
+/// A stored resource that belongs to ONE region: the region of the endpoint it was
+/// created through, which is the only region it is reachable through.
+///
+/// This service is regional — its `awsService` trait declares an `endpointPrefix`
+/// and a `sigv4` configuration, and the modelled `SiteArn` / `OutpostArn` patterns
+/// pin a region segment into every ARN it mints — so a resource is part of its own
+/// region's inventory and of no other's. Every operation therefore resolves an
+/// identifier, and enumerates a list, WITHIN the region the request is addressed to
+/// ([`request_region`]), through [`ComAmazonawsOutpostsOutpostsolafserviceState`]'s
+/// region-scoped accessors below; a resource of another region is as absent as one
+/// that was never created, which is what makes the ARN a read reports carry the
+/// region the read was addressed to.
+///
+/// Only a resource a request can name DIRECTLY carries its region. The resources
+/// kept inside an [`OutpostRecord`] (its private connectivity configuration, its
+/// assets, its instances) and the capacity tasks nested under it are reachable only
+/// by resolving that Outpost first, so the Outpost's region already scopes them and
+/// a second copy of it could only drift.
+pub trait RegionalRecord {
+    /// The region this record belongs to.
+    fn region(&self) -> &str;
+}
+
+impl RegionalRecord for SiteRecord {
+    fn region(&self) -> &str {
+        &self.region
+    }
+}
+
+impl RegionalRecord for OutpostRecord {
+    fn region(&self) -> &str {
+        &self.region
+    }
+}
+
+impl RegionalRecord for QuoteRecord {
+    fn region(&self) -> &str {
+        &self.region
+    }
+}
+
+impl RegionalRecord for ConnectionRecord {
+    fn region(&self) -> &str {
+        &self.region
+    }
+}
+
+impl RegionalRecord for OrderRecord {
+    fn region(&self) -> &str {
+        &self.region
+    }
+}
+
+/// The record `id` names IN `region`, or `None` when the store holds no such record
+/// in it — including when it holds one of that id in ANOTHER region, which this
+/// region's endpoint does not serve. See [`RegionalRecord`].
+fn in_region<'a, R: RegionalRecord>(
+    records: &'a BTreeMap<String, R>,
+    region: &str,
+    id: &str,
+) -> Option<&'a R> {
+    records.get(id).filter(|record| record.region() == region)
+}
+
+/// The same record, to CHANGE. See [`in_region`].
+fn in_region_mut<'a, R: RegionalRecord>(
+    records: &'a mut BTreeMap<String, R>,
+    region: &str,
+    id: &str,
+) -> Option<&'a mut R> {
+    records
+        .get_mut(id)
+        .filter(|record| record.region() == region)
+}
+
+/// Every record of `region`, in the store's creation order. See [`RegionalRecord`].
+fn all_in_region<'a, R: RegionalRecord>(
+    records: &'a BTreeMap<String, R>,
+    region: &str,
+) -> impl Iterator<Item = &'a R> + 'a {
+    // The region is copied into the filter so the iterator borrows only the store:
+    // a caller that answers a reference out of it (`outpost_at_site`) is then not
+    // holding the request's own value alive for as long as the record.
+    let region = region.to_string();
+    records
+        .values()
+        .filter(move |record| record.region() == region.as_str())
 }
 
 /// A persisted order: the modelled [`Order`] plus its creation order and the instant
@@ -641,6 +737,8 @@ pub struct QuoteRecord {
 pub struct OrderRecord {
     /// See [`SiteRecord::sequence`].
     pub sequence: u64,
+    /// The region this order was placed in. See [`RegionalRecord`].
+    pub region: String,
     /// The order as `CreateOrder` / `GetOrder` return it.
     pub order: Order,
     /// When this order's [`ORDER_STATUS_PREPARING`] -> [`ORDER_STATUS_IN_PROGRESS`]
@@ -671,6 +769,8 @@ pub struct ConnectionRecord {
     /// addresses and underlay address are allocated from, so no two connections of
     /// one store are handed the same address.
     pub sequence: u64,
+    /// The region this connection was started in. See [`RegionalRecord`].
+    pub region: String,
     /// The minted `ConnectionId` this record is keyed by.
     pub connection_id: String,
     /// The `AssetId` of the Outpost server being installed — the asset the start
@@ -1094,23 +1194,29 @@ pub fn orderable_instance_type_catalog() -> Vec<OrderableInstanceTypeRecord> {
 /// Per-service state for com-amazonaws-outposts-outpostsolafservice. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsOutpostsOutpostsolafserviceState {
-    /// Every persisted site, keyed by its bare `SiteId` (`os-…`), which is how
-    /// `GetSite`, `CreateOutpost` and `DeleteSite` resolve one.
+    /// Every persisted site, keyed by its bare `SiteId` (`os-…`). A minted id is
+    /// unique across the whole store, and a site belongs to the region it was
+    /// created in, so `GetSite`, `CreateOutpost` and `DeleteSite` resolve one
+    /// through [`Self::site`] rather than off this map directly.
     pub sites: BTreeMap<String, SiteRecord>,
-    /// Every persisted Outpost, keyed by its bare `OutpostId` (`op-…`).
+    /// Every persisted Outpost, keyed by its bare `OutpostId` (`op-…`). Resolved
+    /// through [`Self::outpost`]; see [`Self::sites`].
     pub outposts: BTreeMap<String, OutpostRecord>,
-    /// Every persisted capacity task, keyed by its `CapacityTaskId` (`cap-…`),
-    /// which is how `GetCapacityTask` resolves one.
+    /// Every persisted capacity task, keyed by its `CapacityTaskId` (`cap-…`).
+    ///
+    /// A task is reachable only under the Outpost it runs on, so the Outpost's own
+    /// region already scopes it (see [`RegionalRecord`]) and `GetCapacityTask`
+    /// resolves it by id once that parent has been resolved.
     pub capacity_tasks: BTreeMap<String, CapacityTaskRecord>,
-    /// Every persisted quote, keyed by its bare `QuoteId` (`oq-…`), which is how
-    /// `GetQuote` resolves one.
+    /// Every persisted quote, keyed by its bare `QuoteId` (`oq-…`). Resolved through
+    /// [`Self::quote`]; see [`Self::sites`].
     pub quotes: BTreeMap<String, QuoteRecord>,
     /// Every persisted order, keyed by the `OrderId` (`oo-…`) `CreateOrder` minted
-    /// for it, which is how `GetOrder` resolves one.
+    /// for it. Resolved through [`Self::order`]; see [`Self::sites`].
     pub orders: BTreeMap<String, OrderRecord>,
     /// Every persisted Outpost-server installation connection, keyed by the
-    /// `ConnectionId` `StartConnection` minted for it, which is how `GetConnection`
-    /// resolves one.
+    /// `ConnectionId` `StartConnection` minted for it. Resolved through
+    /// [`Self::connection`]; see [`Self::sites`].
     pub connections: BTreeMap<String, ConnectionRecord>,
     /// This store's own tunnel-server public key, or `None` until the first
     /// connection mints it. See [`Self::server_public_key`].
@@ -1149,6 +1255,75 @@ impl Default for ComAmazonawsOutpostsOutpostsolafserviceState {
 }
 
 impl ComAmazonawsOutpostsOutpostsolafserviceState {
+    /// The site `site_id` names in `region`, or `None` when this region holds no
+    /// such site. See [`RegionalRecord`].
+    pub fn site(&self, region: &str, site_id: &str) -> Option<&SiteRecord> {
+        in_region(&self.sites, region, site_id)
+    }
+
+    /// The same site, to CHANGE. See [`Self::site`].
+    pub fn site_mut(&mut self, region: &str, site_id: &str) -> Option<&mut SiteRecord> {
+        in_region_mut(&mut self.sites, region, site_id)
+    }
+
+    /// Remove the site `site_id` names in `region` and answer the record removed, or
+    /// `None` — leaving the store untouched — when this region holds no such site.
+    pub fn remove_site(&mut self, region: &str, site_id: &str) -> Option<SiteRecord> {
+        in_region(&self.sites, region, site_id)?;
+        self.sites.remove(site_id)
+    }
+
+    /// Every site of `region`, in the store's creation order — what `ListSites`
+    /// pages through. See [`RegionalRecord`].
+    pub fn sites_in<'a>(&'a self, region: &str) -> impl Iterator<Item = &'a SiteRecord> + 'a {
+        all_in_region(&self.sites, region)
+    }
+
+    /// The Outpost `outpost_id` names in `region`. See [`Self::site`].
+    pub fn outpost(&self, region: &str, outpost_id: &str) -> Option<&OutpostRecord> {
+        in_region(&self.outposts, region, outpost_id)
+    }
+
+    /// The same Outpost, to CHANGE. See [`Self::outpost`].
+    pub fn outpost_mut(&mut self, region: &str, outpost_id: &str) -> Option<&mut OutpostRecord> {
+        in_region_mut(&mut self.outposts, region, outpost_id)
+    }
+
+    /// Remove the Outpost `outpost_id` names in `region`. See [`Self::remove_site`].
+    pub fn remove_outpost(&mut self, region: &str, outpost_id: &str) -> Option<OutpostRecord> {
+        in_region(&self.outposts, region, outpost_id)?;
+        self.outposts.remove(outpost_id)
+    }
+
+    /// Every Outpost of `region`, in the store's creation order — what
+    /// `ListOutposts` pages through. See [`RegionalRecord`].
+    pub fn outposts_in<'a>(
+        &'a self,
+        region: &str,
+    ) -> impl Iterator<Item = &'a OutpostRecord> + 'a {
+        all_in_region(&self.outposts, region)
+    }
+
+    /// The quote `quote_id` names in `region`. See [`Self::site`].
+    pub fn quote(&self, region: &str, quote_id: &str) -> Option<&QuoteRecord> {
+        in_region(&self.quotes, region, quote_id)
+    }
+
+    /// The same quote, to CHANGE. See [`Self::quote`].
+    pub fn quote_mut(&mut self, region: &str, quote_id: &str) -> Option<&mut QuoteRecord> {
+        in_region_mut(&mut self.quotes, region, quote_id)
+    }
+
+    /// The connection `connection_id` names in `region`. See [`Self::site`].
+    pub fn connection(&self, region: &str, connection_id: &str) -> Option<&ConnectionRecord> {
+        in_region(&self.connections, region, connection_id)
+    }
+
+    /// The order `order_id` names in `region`. See [`Self::site`].
+    pub fn order(&self, region: &str, order_id: &str) -> Option<&OrderRecord> {
+        in_region(&self.orders, region, order_id)
+    }
+
     /// Materialise every Outpost lifecycle transition the clock has already made
     /// due.
     ///
@@ -1267,15 +1442,15 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             .find(|task| task.order_id.as_deref() == Some(order_id) && task.is_active())
     }
 
-    /// The Outpost that still belongs to `site_id`, if the store holds one.
+    /// The Outpost that still belongs to `site_id` in `region`, if the store holds
+    /// one.
     ///
     /// An Outpost names the site it lives at, so what this answers is whether that
     /// site still has hardware at it: the fact `DeleteSite` refuses a delete on and
     /// a change to the site's OPERATING address conflicts with. Stated once here so
     /// the two cannot disagree about what "the site still has an Outpost" means.
-    pub fn outpost_at_site(&self, site_id: &str) -> Option<&OutpostRecord> {
-        self.outposts
-            .values()
+    pub fn outpost_at_site(&self, region: &str, site_id: &str) -> Option<&OutpostRecord> {
+        self.outposts_in(region)
             .find(|record| record.outpost.site_id.as_deref() == Some(site_id))
     }
 
@@ -1321,9 +1496,9 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// Callers settle first (see [`Self::settle_quotes`] and [`Self::settle_orders`]),
     /// so the statuses read here are the ones the quotes and orders hold at that
     /// instant.
-    pub fn blocking_resource_types(&self, outpost_id: &str) -> Vec<String> {
+    pub fn blocking_resource_types(&self, region: &str, outpost_id: &str) -> Vec<String> {
         let mut blocking: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let quote_ordered_from = self.quotes.values().any(|record| {
+        let quote_ordered_from = all_in_region(&self.quotes, region).any(|record| {
             let quote_outpost = record
                 .quote
                 .outpost_arn
@@ -1332,15 +1507,14 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             quote_outpost.as_deref() == Some(outpost_id)
                 && record.quote.quote_status.as_deref() == Some(QUOTE_STATUS_ORDER_SUBMITTED)
         });
-        let order_outstanding = self.orders.values().any(|record| {
+        let order_outstanding = all_in_region(&self.orders, region).any(|record| {
             record.order.outpost_id.as_deref() == Some(outpost_id) && record.is_outstanding()
         });
         if quote_ordered_from || order_outstanding {
             blocking.insert(BLOCKING_OUTPOST_ORDER_CANCELLABLE.to_string());
         }
         let instance_running = self
-            .outposts
-            .get(outpost_id)
+            .outpost(region, outpost_id)
             .is_some_and(|record| !record.instances.is_empty());
         if instance_running {
             blocking.insert(BLOCKING_EC2_INSTANCE.to_string());
@@ -1349,7 +1523,7 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     }
 
     /// The tag map of the resource an Outposts resource ARN names, or `None` when
-    /// this store holds no such resource.
+    /// this region's inventory holds no such resource (see [`RegionalRecord`]).
     ///
     /// A resource's tags live ON that resource, so every tagging operation reads
     /// and writes them through the stored record the ARN names — and it does so
@@ -1357,10 +1531,15 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// between the operations that report tags and the ones that change them. A
     /// kind this store does not hold is `None`, which each of them answers as the
     /// not-found error it models.
-    pub fn tags(&self, resource_type: &str, resource_id: &str) -> Option<HashMap<String, String>> {
+    pub fn tags(
+        &self,
+        region: &str,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Option<HashMap<String, String>> {
         let tags = match resource_type {
-            SITE_RESOURCE_TYPE => &self.sites.get(resource_id)?.site.tags,
-            OUTPOST_RESOURCE_TYPE => &self.outposts.get(resource_id)?.outpost.tags,
+            SITE_RESOURCE_TYPE => &self.site(region, resource_id)?.site.tags,
+            OUTPOST_RESOURCE_TYPE => &self.outpost(region, resource_id)?.outpost.tags,
             _ => return None,
         };
         // `None` from this function means NO SUCH RESOURCE. A resource whose
@@ -1378,12 +1557,13 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// empty map either way.
     pub fn tags_mut(
         &mut self,
+        region: &str,
         resource_type: &str,
         resource_id: &str,
     ) -> Option<&mut HashMap<String, String>> {
         let tags = match resource_type {
-            SITE_RESOURCE_TYPE => &mut self.sites.get_mut(resource_id)?.site.tags,
-            OUTPOST_RESOURCE_TYPE => &mut self.outposts.get_mut(resource_id)?.outpost.tags,
+            SITE_RESOURCE_TYPE => &mut self.site_mut(region, resource_id)?.site.tags,
+            OUTPOST_RESOURCE_TYPE => &mut self.outpost_mut(region, resource_id)?.outpost.tags,
             _ => return None,
         };
         Some(tags.get_or_insert_with(HashMap::new))
@@ -1438,13 +1618,16 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             .clone()
     }
 
-    /// The Outpost holding the hardware asset `asset_id`, if this store holds one.
+    /// The Outpost of `region` holding the hardware asset `asset_id`, if this
+    /// store holds one.
     ///
     /// An `AssetId` names one physical unit of hardware, installed in one rack of
     /// one Outpost, so at most one Outpost holds it: an operation that acts on an
-    /// asset resolves it here rather than walking the store itself.
-    pub fn outpost_with_asset(&self, asset_id: &str) -> Option<&OutpostRecord> {
-        self.outposts.values().find(|record| {
+    /// asset resolves it here rather than walking the store itself. The hardware of
+    /// another region's Outpost is not this region's to act on (see
+    /// [`RegionalRecord`]).
+    pub fn outpost_with_asset(&self, region: &str, asset_id: &str) -> Option<&OutpostRecord> {
+        self.outposts_in(region).find(|record| {
             record
                 .assets
                 .iter()
