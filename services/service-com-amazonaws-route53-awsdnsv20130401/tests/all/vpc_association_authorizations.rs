@@ -615,25 +615,26 @@ async fn an_authorization_that_names_no_valid_vpc_is_refused() {
         },
         // `VPC$VPCRegion` targets the modelled `VPCRegion` enum, so a value
         // outside it is refused by the request boundary (which enforces every
-        // modelled constraint) before any handler runs: the refusal is the
-        // boundary's own `ValidationException`, still HTTP 400.
+        // modelled constraint) before any handler runs — and Route 53 states
+        // that refusal under the one input error its model declares,
+        // `InvalidInput`, HTTP 400.
         BadVpcRow {
             case: "an empty VPCRegion",
             vpc_id: Some("vpc-1a2b3c4d"),
             region: Some(""),
-            code: "ValidationException",
+            code: "InvalidInput",
         },
         BadVpcRow {
             case: "a region the VPCRegion enum does not name",
             vpc_id: Some("vpc-1a2b3c4d"),
             region: Some("mars-west-1"),
-            code: "ValidationException",
+            code: "InvalidInput",
         },
         BadVpcRow {
             case: "a modelled region in the wrong case",
             vpc_id: Some("vpc-1a2b3c4d"),
             region: Some("US-EAST-1"),
-            code: "ValidationException",
+            code: "InvalidInput",
         },
     ];
 

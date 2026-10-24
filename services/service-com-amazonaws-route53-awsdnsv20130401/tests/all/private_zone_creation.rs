@@ -359,9 +359,10 @@ async fn a_create_naming_a_region_no_vpc_can_exist_in_is_refused() {
     // zone is created for it. The rows walk that boundary: a well-formed region
     // name the enum does not carry, one differing from a member only in case,
     // and one past the member length. The REQUEST boundary refuses every
-    // modelled constraint before the handler runs, so the refusal is its own
-    // `ValidationException` (HTTP 400) rather than the handler's `InvalidInput`
-    // backstop — what matters to a client either way is the 400 and the zone
+    // modelled constraint before the handler runs, and this service states such
+    // a refusal under the one input error its model declares, `InvalidInput`
+    // (HTTP 400) — the same code the handler's own backstop names — so what a
+    // client branches on is the same whichever layer refused, beside the zone
     // that was not created.
     let rows = [
         ("a region name the enum does not carry", "xx-nowhere-1".to_string()),
@@ -385,8 +386,8 @@ async fn a_create_naming_a_region_no_vpc_can_exist_in_is_refused() {
         );
         assert_eq!(
             reply.error_code(),
-            "ValidationException",
-            "case {case:?}: expected ValidationException, got body {}",
+            "InvalidInput",
+            "case {case:?}: expected InvalidInput, got body {}",
             reply.body
         );
     }
