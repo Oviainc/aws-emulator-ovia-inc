@@ -132,6 +132,11 @@ mod lambda_signing_name_routing;
 mod lex_runtime_v2_sessions_through_the_router;
 #[path = "all/marketplace_signing_name_routing.rs"]
 mod marketplace_signing_name_routing;
+// Declared HERE, in the sorted list, rather than appended at the end of this file: the
+// tail is where every landing in the same window appends, so it is the contended region,
+// while this span of the sorted list is untouched by those appends.
+#[path = "all/mediaconvert_input_probe.rs"]
+mod mediaconvert_input_probe;
 #[path = "all/partnercentral_channel_target_routing.rs"]
 mod partnercentral_channel_target_routing;
 #[path = "all/personalize_signing_name_routing.rs"]

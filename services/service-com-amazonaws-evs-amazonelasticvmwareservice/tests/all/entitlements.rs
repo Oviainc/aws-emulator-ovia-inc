@@ -19,6 +19,11 @@
 //! * An entitlement belongs to the connector it was created through: "Returns existing
 //!   entitlements for virtual machines associated with the specified environment and
 //!   connector" (`ListVmEntitlements` doc).
+//! * Every entitlement here is created through a connector this environment really
+//!   holds, minted by `CreateEnvironmentConnector`: "using the provided vCenter Server
+//!   connector" (`CreateEntitlement` doc). The refusal of a `connectorId` the
+//!   environment holds no live vCenter connector for is owned by
+//!   `tests/all/entitlement_connector.rs`.
 //! * `maxResults` is a real page bound and `nextToken` resumes exactly where the page
 //!   stopped (`nextToken` doc).
 //! * An `environmentId` that names no live environment at this endpoint's Region is a
@@ -38,17 +43,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::environment_lifecycle::{call, create, emulator, error_type};
-
-/// A well-formed connector id, as the modelled `^(cnctr-[a-zA-Z0-9]{10})$` spells one.
-const CONNECTOR: &str = "cnctr-0123456789";
-
-/// A second well-formed connector id, so a test can tell one connector's entitlements
-/// from another's. Upper case, which that same pattern allows.
-const OTHER_CONNECTOR: &str = "cnctr-ABCDEFGHIJ";
-
-/// A third one, which no entitlement in these tests is created through.
-const UNUSED_CONNECTOR: &str = "cnctr-9999999999";
+use crate::entitlement_connector::{connector_in, environment_with_vcenter_connector};
+use crate::environment_lifecycle::{call, emulator, error_type};
 
 /// The only `EntitlementType` the model declares
 /// (`smithy_query(query="shape", shape="EntitlementType")`).
@@ -183,14 +179,15 @@ async fn an_entitlement_is_created_per_distinct_vm_and_read_back_by_list() {
     ];
 
     for (case, requested) in rows {
-        // A fresh environment per row, so each row reads back only its own records.
-        let environment = create(&router, None).await;
+        // A fresh environment, with its own vCenter connector, per row — so each row
+        // reads back only its own records and creates through a connector that exists.
+        let (environment, connector) = environment_with_vcenter_connector(&router, case).await;
         let distinct: BTreeSet<String> = requested.iter().cloned().collect();
 
         let (status, body) = call(
             &router,
             "CreateEntitlement",
-            &create_request(&environment, CONNECTOR, &requested),
+            &create_request(&environment, &connector, &requested),
         )
         .await;
         assert_eq!(
@@ -213,7 +210,7 @@ async fn an_entitlement_is_created_per_distinct_vm_and_read_back_by_list() {
         for entry in &created {
             for (member, expected) in [
                 ("environmentId", json!(environment)),
-                ("connectorId", json!(CONNECTOR)),
+                ("connectorId", json!(connector)),
                 ("type", json!(WINDOWS_SERVER)),
                 // Validation of the VM has not finished yet, so usage tracking has
                 // not started: the status is CREATING and there is no startedAt.
@@ -229,7 +226,7 @@ async fn an_entitlement_is_created_per_distinct_vm_and_read_back_by_list() {
         }
 
         // The read-back: ListVmEntitlements must report the records the create stored.
-        let listed = list_every_page(&router, case, &environment, CONNECTOR, None).await;
+        let listed = list_every_page(&router, case, &environment, &connector, None).await;
         assert_eq!(
             reported_vm_ids(case, &listed),
             distinct,
@@ -241,14 +238,15 @@ async fn an_entitlement_is_created_per_distinct_vm_and_read_back_by_list() {
 #[tokio::test]
 async fn a_repeat_create_reports_the_stored_entitlement_and_adds_nothing() {
     let router = emulator();
-    let environment = create(&router, None).await;
+    let (environment, connector) =
+        environment_with_vcenter_connector(&router, "the repeat create").await;
     let first = vec!["vm-1".to_string(), "vm-2".to_string()];
     let overlapping = vec!["vm-2".to_string(), "vm-3".to_string()];
 
     let (status, body) = call(
         &router,
         "CreateEntitlement",
-        &create_request(&environment, CONNECTOR, &first),
+        &create_request(&environment, &connector, &first),
     )
     .await;
     assert_eq!(
@@ -261,7 +259,7 @@ async fn a_repeat_create_reports_the_stored_entitlement_and_adds_nothing() {
     let (status, body) = call(
         &router,
         "CreateEntitlement",
-        &create_request(&environment, CONNECTOR, &overlapping),
+        &create_request(&environment, &connector, &overlapping),
     )
     .await;
     assert_eq!(
@@ -273,7 +271,7 @@ async fn a_repeat_create_reports_the_stored_entitlement_and_adds_nothing() {
         overlapping.iter().cloned().collect::<BTreeSet<String>>(),
         "case the overlapping create: it must report an entitlement for every vmId it named, got {body}"
     );
-    let listed = list_every_page(&router, "after the overlap", &environment, CONNECTOR, None).await;
+    let listed = list_every_page(&router, "after the overlap", &environment, &connector, None).await;
     assert_eq!(
         reported_vm_ids("after the overlap", &listed),
         ["vm-1", "vm-2", "vm-3"]
@@ -286,11 +284,11 @@ async fn a_repeat_create_reports_the_stored_entitlement_and_adds_nothing() {
     // Once the entitlements have settled, a repeat create must not restart them: the
     // stored record keeps its status and its startedAt.
     std::thread::sleep(PAST_THE_TRANSITION);
-    let settled = list_every_page(&router, "settled", &environment, CONNECTOR, None).await;
+    let settled = list_every_page(&router, "settled", &environment, &connector, None).await;
     let (status, body) = call(
         &router,
         "CreateEntitlement",
-        &create_request(&environment, CONNECTOR, &first),
+        &create_request(&environment, &connector, &first),
     )
     .await;
     assert_eq!(
@@ -314,7 +312,7 @@ async fn a_repeat_create_reports_the_stored_entitlement_and_adds_nothing() {
             stored["startedAt"], entry["startedAt"]
         );
     }
-    let after = list_every_page(&router, "after the repeat", &environment, CONNECTOR, None).await;
+    let after = list_every_page(&router, "after the repeat", &environment, &connector, None).await;
     assert_eq!(
         after.len(),
         settled.len(),
@@ -327,13 +325,14 @@ async fn a_repeat_create_reports_the_stored_entitlement_and_adds_nothing() {
 #[tokio::test]
 async fn an_entitlement_reaches_created_when_the_clock_owes_it_and_its_timestamps_hold() {
     let router = emulator();
-    let environment = create(&router, None).await;
+    let (environment, connector) =
+        environment_with_vcenter_connector(&router, "the clock").await;
     let requested = vec!["vm-10".to_string(), "vm-20".to_string()];
 
     let (status, body) = call(
         &router,
         "CreateEntitlement",
-        &create_request(&environment, CONNECTOR, &requested),
+        &create_request(&environment, &connector, &requested),
     )
     .await;
     assert_eq!(
@@ -350,8 +349,8 @@ async fn an_entitlement_reaches_created_when_the_clock_owes_it_and_its_timestamp
             entry["status"]
         );
     }
-    for entry in list_every_page(&router, "straight after the create", &environment, CONNECTOR, None)
-        .await
+    for entry in
+        list_every_page(&router, "straight after the create", &environment, &connector, None).await
     {
         assert_eq!(
             entry["status"],
@@ -362,7 +361,7 @@ async fn an_entitlement_reaches_created_when_the_clock_owes_it_and_its_timestamp
     }
 
     std::thread::sleep(PAST_THE_TRANSITION);
-    let settled = list_every_page(&router, "settled", &environment, CONNECTOR, None).await;
+    let settled = list_every_page(&router, "settled", &environment, &connector, None).await;
     for entry in &settled {
         assert_eq!(
             entry["status"],
@@ -377,7 +376,7 @@ async fn an_entitlement_reaches_created_when_the_clock_owes_it_and_its_timestamp
     }
 
     // A read never moves a stamp: the second read reports what the first did.
-    let again = list_every_page(&router, "read twice", &environment, CONNECTOR, None).await;
+    let again = list_every_page(&router, "read twice", &environment, &connector, None).await;
     assert_eq!(
         again, settled,
         "case read twice: a read must not change what a later caller sees, got {again:?}"
@@ -386,77 +385,100 @@ async fn an_entitlement_reaches_created_when_the_clock_owes_it_and_its_timestamp
 
 #[tokio::test]
 async fn entitlements_belong_to_the_connector_they_were_created_through() {
+    // An environment holds at most ONE live connector of each type ("You can create
+    // only one connector of each type per environment",
+    // `CreateEnvironmentConnector` doc), so two vCenter connectors mean two
+    // environments: each row is one environment, its own vCenter connector, and the
+    // VMs entitled through it.
     let router = emulator();
-    let environment = create(&router, None).await;
-    // Each row: the connector, and the VMs entitled through it.
-    let rows: [(&str, [&str; 2]); 2] = [
-        (CONNECTOR, ["vm-1", "vm-2"]),
-        (OTHER_CONNECTOR, ["vm-3", "vm-4"]),
-    ];
+    let mut rows: Vec<(&str, String, String, [&str; 2])> = Vec::new();
+    for (case, vms) in [("the first", ["vm-1", "vm-2"]), ("the second", ["vm-3", "vm-4"])] {
+        let (environment, connector) = environment_with_vcenter_connector(&router, case).await;
+        rows.push((case, environment, connector, vms));
+    }
 
-    for (connector, vms) in rows {
+    for (case, environment, connector, vms) in &rows {
         let requested: Vec<String> = vms.iter().map(|vm| (*vm).to_string()).collect();
         let (status, body) = call(
             &router,
             "CreateEntitlement",
-            &create_request(&environment, connector, &requested),
+            &create_request(environment, connector, &requested),
         )
         .await;
         assert_eq!(
             status, 200,
-            "case {connector:?}: create expected 200, got {status} {body}"
+            "case {case:?}: create expected 200, got {status} {body}"
         );
     }
 
-    for (connector, vms) in rows {
-        let listed = list_every_page(&router, connector, &environment, connector, None).await;
+    for (case, environment, connector, vms) in &rows {
+        let listed = list_every_page(&router, case, environment, connector, None).await;
         assert_eq!(
-            reported_vm_ids(connector, &listed),
+            reported_vm_ids(case, &listed),
             vms.iter().map(|vm| (*vm).to_string()).collect::<BTreeSet<String>>(),
-            "case {connector:?}: a list must report only this connector's entitlements, got {listed:?}"
+            "case {case:?}: a list must report only this connector's entitlements, got {listed:?}"
         );
         for entry in &listed {
             assert_eq!(
                 entry["connectorId"],
                 json!(connector),
-                "case {connector:?}: connectorId: expected {connector}, got {}",
+                "case {case:?}: connectorId: expected {connector}, got {}",
                 entry["connectorId"]
             );
         }
     }
 
-    // A connector with no entitlements in this environment is an empty page, not a
-    // refusal and not somebody else's records.
-    let (status, body) = call(
-        &router,
-        "ListVmEntitlements",
-        &list_request(&environment, UNUSED_CONNECTOR),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case an unused connector: expected 200, got {status} {body}"
-    );
-    assert!(
-        entitlements("an unused connector", &body).is_empty(),
-        "case an unused connector: expected no entitlements, got {body}"
-    );
-    assert_eq!(
-        body["nextToken"],
-        Value::Null,
-        "case an unused connector: an exhausted list carries no nextToken, got {body}"
+    // Each row: the case, the environment listed, and the connector id it is listed
+    // with — a connector that holds no entitlement IN that environment. Both are
+    // connectors this emulator really minted: a connector of another type in the first
+    // environment, and the other environment's vCenter connector. The list filters the
+    // environment's records by connector ("Returns existing entitlements for virtual
+    // machines associated with the specified environment and connector"), so each is an
+    // empty page and never somebody else's records.
+    let (_, first_environment, first_connector, _) = &rows[0];
+    let (_, _, other_connector, _) = &rows[1];
+    let unused_type_connector =
+        connector_in(&router, "an unused type", first_environment, "SDDC_MANAGER").await;
+    let empty_cases: [(&str, &str); 2] = [
+        ("a connector of another type", unused_type_connector.as_str()),
+        ("another environment's connector", other_connector.as_str()),
+    ];
+    for (case, connector) in empty_cases {
+        let (status, body) = call(
+            &router,
+            "ListVmEntitlements",
+            &list_request(first_environment, connector),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} {body}"
+        );
+        assert!(
+            entitlements(case, &body).is_empty(),
+            "case {case:?}: expected no entitlements, got {body}"
+        );
+        assert_eq!(
+            body["nextToken"],
+            Value::Null,
+            "case {case:?}: an exhausted list carries no nextToken, got {body}"
+        );
+    }
+    assert_ne!(
+        first_connector, other_connector,
+        "the two environments must hold distinct connectors, got {first_connector}"
     );
 }
 
 #[tokio::test]
 async fn max_results_bounds_the_page_and_next_token_resumes_where_it_stopped() {
     let router = emulator();
-    let environment = create(&router, None).await;
+    let (environment, connector) = environment_with_vcenter_connector(&router, "paging").await;
     let requested: Vec<String> = (1..=7).map(|ordinal| format!("vm-{ordinal}")).collect();
     let (status, body) = call(
         &router,
         "CreateEntitlement",
-        &create_request(&environment, CONNECTOR, &requested),
+        &create_request(&environment, &connector, &requested),
     )
     .await;
     assert_eq!(
@@ -479,7 +501,7 @@ async fn max_results_bounds_the_page_and_next_token_resumes_where_it_stopped() {
         let mut seen: Vec<String> = Vec::new();
         let mut next_token: Option<String> = None;
         loop {
-            let mut request = list_request(&environment, CONNECTOR);
+            let mut request = list_request(&environment, &connector);
             request["maxResults"] = json!(page);
             if let Some(token) = next_token.as_deref() {
                 request["nextToken"] = json!(token);
@@ -514,7 +536,7 @@ async fn max_results_bounds_the_page_and_next_token_resumes_where_it_stopped() {
     }
 
     // A token this service never issued is refused, not silently resumed.
-    let mut request = list_request(&environment, CONNECTOR);
+    let mut request = list_request(&environment, &connector);
     request["nextToken"] = json!("not-a-token-this-service-issued");
     let (status, body) = call(&router, "ListVmEntitlements", &request).await;
     assert_eq!(
@@ -531,7 +553,8 @@ async fn max_results_bounds_the_page_and_next_token_resumes_where_it_stopped() {
 #[tokio::test]
 async fn an_environment_that_has_reached_deleted_holds_no_new_entitlement() {
     let router = emulator();
-    let environment = create(&router, None).await;
+    let (environment, connector) =
+        environment_with_vcenter_connector(&router, "a DELETED environment").await;
     let requested = vec!["vm-1".to_string()];
 
     let (status, body) = call(
@@ -550,7 +573,7 @@ async fn an_environment_that_has_reached_deleted_holds_no_new_entitlement() {
     let (status, body) = call(
         &router,
         "CreateEntitlement",
-        &create_request(&environment, CONNECTOR, &requested),
+        &create_request(&environment, &connector, &requested),
     )
     .await;
     assert_eq!(
@@ -572,7 +595,7 @@ async fn an_environment_that_has_reached_deleted_holds_no_new_entitlement() {
         &router,
         "a DELETED environment",
         &environment,
-        CONNECTOR,
+        &connector,
         None,
     )
     .await;
@@ -585,7 +608,7 @@ async fn an_environment_that_has_reached_deleted_holds_no_new_entitlement() {
 #[tokio::test]
 async fn an_environment_holds_at_most_the_stores_bound_of_entitlements() {
     let router = emulator();
-    let environment = create(&router, None).await;
+    let (environment, connector) = environment_with_vcenter_connector(&router, "the bound").await;
 
     // Fill the environment to exactly the bound, 100 vmIds per call (the modelled
     // maximum of `vmIds`).
@@ -598,7 +621,7 @@ async fn an_environment_holds_at_most_the_stores_bound_of_entitlements() {
         let (status, body) = call(
             &router,
             "CreateEntitlement",
-            &create_request(&environment, CONNECTOR, &requested),
+            &create_request(&environment, &connector, &requested),
         )
         .await;
         assert_eq!(
@@ -616,7 +639,7 @@ async fn an_environment_holds_at_most_the_stores_bound_of_entitlements() {
         "CreateEntitlement",
         &create_request(
             &environment,
-            CONNECTOR,
+            &connector,
             &[format!("vm-{MAX_ENTITLEMENTS}")],
         ),
     )
@@ -639,7 +662,7 @@ async fn an_environment_holds_at_most_the_stores_bound_of_entitlements() {
     let (status, body) = call(
         &router,
         "CreateEntitlement",
-        &create_request(&environment, CONNECTOR, &["vm-0".to_string()]),
+        &create_request(&environment, &connector, &["vm-0".to_string()]),
     )
     .await;
     assert_eq!(
