@@ -53,6 +53,8 @@ mod revoke_flow_entitlement;
 mod router_input_deletion;
 #[path = "all/router_input_restart.rs"]
 mod router_input_restart;
+#[path = "all/router_network_interfaces.rs"]
+mod router_network_interfaces;
 #[path = "all/router_output_lifecycle.rs"]
 mod router_output_lifecycle;
 #[path = "all/router_outputs.rs"]

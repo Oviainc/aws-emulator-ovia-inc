@@ -283,10 +283,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // The two configurations that deliver into another AWS resource carry no
             // protocol member to reconcile. Neither variant's target is RESOLVED here: a
-            // MediaLive input belongs to another service, and the router network interface a
-            // STANDARD configuration names is created by an operation that is still
-            // scaffolded — and the model gives this create no `NotFoundException` to answer
-            // with — so referential checks belong with those operations.
+            // MediaLive input belongs to another service, and the model gives this create no
+            // `NotFoundException` to answer with for a router network interface this account
+            // does not hold — so referential checks belong with the operations that own
+            // those resources.
             other => other,
         };
 

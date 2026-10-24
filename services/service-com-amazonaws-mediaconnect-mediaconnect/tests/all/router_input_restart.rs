@@ -26,9 +26,9 @@ use crate::flow_lifecycle::{Emulator, REGION};
 /// A router network interface ARN, as the modelled `RouterNetworkInterfaceArn` pattern
 /// fixes it (`^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:routerNetworkInterface:[a-z0-9]{12}$`).
 ///
-/// CreateRouterNetworkInterface is still scaffolded, so no interface record exists to name;
-/// the member is a reference this emulator stores as given (CreateRouterInput models no
-/// `NotFoundException`, so a create cannot refuse an interface it cannot resolve).
+/// An ARN of that form no CreateRouterNetworkInterface minted, so this account holds no
+/// such interface: the member is a reference this emulator stores as given (CreateRouterInput
+/// models no `NotFoundException`, so a create cannot refuse an interface it cannot resolve).
 const NETWORK_INTERFACE_ARN: &str =
     "arn:aws:mediaconnect:us-east-1:000000000000:routerNetworkInterface:0000000000a1";
 
@@ -96,13 +96,15 @@ async fn create_router_output(emulator: &Emulator, name: &str, port: i64) -> Str
 /// both keys sets EXACTLY ONE member under either codec, because the key the codec does not
 /// match is skipped as an unknown member (restJson1's forward-compatible rule) — so the
 /// rows below assert the handler's own rule without depending on which key wins.
-fn union(member_name: &str, json_name: &str, value: Value) -> Value {
+///
+/// `pub(crate)` because `router_network_interfaces` builds its union payloads the same way.
+pub(crate) fn union(member_name: &str, json_name: &str, value: Value) -> Value {
     json!({ member_name: value.clone(), json_name: value })
 }
 
 /// The value of union member `member_name` / `json_name` in `payload`, whichever key the
 /// response carries (see [`union`]).
-fn union_member<'a>(payload: &'a Value, member_name: &str, json_name: &str) -> &'a Value {
+pub(crate) fn union_member<'a>(payload: &'a Value, member_name: &str, json_name: &str) -> &'a Value {
     payload
         .get(member_name)
         .or_else(|| payload.get(json_name))
