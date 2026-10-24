@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSyncJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSyncJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the sync jobs a workspace holds, one page at a time, read from
+//! [`crate::state`] — the very records `CreateSyncJob` wrote, each summarised the
+//! way [`crate::ops::get_sync_job`] reports the same job.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSyncJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A sync job is identified inside its workspace by its `syncSource`, which is
+//! the key of [`crate::state::Workspace::sync_jobs`], so iterating that map IS
+//! source order and a page resumes from a `nextToken` carrying the source it
+//! starts AT (inclusive) rather than an offset: a page boundary survives a job
+//! being created or deleted between two pages. The token is bound to the
+//! workspace it was minted for, so a token from another listing — or from this
+//! listing taken over another workspace — is refused rather than silently
+//! resumed. This operation models no `ResourceNotFoundException`, so a workspace
+//! this service does not hold is refused with the `ValidationException` it does
+//! model, exactly as `ListEntities` refuses the same miss.
+//!
+//! The page size is this operation's OWN documented one — "The default is 50 …
+//! Minimum value of 0. Maximum value of 200" — not the 25 the workspace, entity
+//! and component-type listings document; see [`DEFAULT_PAGE_SIZE`].
+//!
+//! Like `GetSyncJob`, this read WRITES exactly one thing: the lifecycle
+//! transition the CLOCK had already made due ([`crate::state::SyncJob::settle`]).
+//! The outcome was owed at the stored instant whether or not anybody called, so
+//! materialising it here makes the record say what was already true rather than
+//! moving a job because it was listed. Authorization is not emulated, so the
+//! modelled `AccessDeniedException` is never returned.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +165,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSyncJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSyncJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSyncJobs"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and a page served is a read of tenant state.
+        ::tracing::info!(
+            operation = "ListSyncJobs",
+            workspace_id = %input.workspace_id,
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSyncJobsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let invalid = |message: String| {
+            ListSyncJobsErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        };
+
+        // A sync job lives INSIDE a workspace, so a workspace this service does
+        // not hold holds no job to list. This operation models no
+        // `ResourceNotFoundException`, so the refusal is the
+        // `ValidationException` it does model — the same choice `ListEntities`
+        // makes for the same missing parent.
+        let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
+            return Err(invalid(crate::state::workspace_not_found_message(
+                &input.workspace_id,
+            ))
+            .into());
+        };
+
+        // A `nextToken` carries the `syncSource` the page resumes AT
+        // (inclusive), not an offset, so a page boundary survives a job being
+        // created or deleted between two pages. It is bound to the workspace it
+        // was minted for, so a token from another listing — or from this listing
+        // taken over another workspace — is refused rather than silently
+        // resumed.
+        let resume_at = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                decode_next_token(token, &input.workspace_id).ok_or_else(|| {
+                    // The token itself is NOT echoed back: it is opaque to the
+                    // caller and modelled up to 17880 characters, so the refusal
+                    // names the member and what is wrong with it rather than
+                    // copying an arbitrary request string into the response.
+                    invalid("nextToken is not a token this listing minted".to_string())
+                })?,
+            ),
+        };
+
+        // The page size served: the documented default when the request names
+        // none, otherwise what it asks for, capped at the most this service ever
+        // serves. Unlike the listings whose `maxResults` documents a minimum of
+        // 1, THIS member documents a minimum of 0 (see [`DEFAULT_PAGE_SIZE`]),
+        // so a zero is a page of no rows — the maximum number of results to
+        // return at one time, literally — and not a refusal; the `nextToken`
+        // then still names where the listing stands, so a caller that asked for
+        // nothing can resume. Anything outside the member's modelled range is
+        // refused by the boundary validator before this handler runs. The token
+        // such a page answers names the position the call STARTED from — a page
+        // of no rows consumed none — so a generated paginator must not be driven
+        // at zero: it would ask again from the same place forever.
+        let page_size = match input.max_results {
+            None => DEFAULT_PAGE_SIZE,
+            // The conversion can only fail on a NEGATIVE value, which the
+            // modelled range refuses before this handler runs — so this arm is
+            // belt-and-braces. It fails CLOSED (the modelled refusal, naming
+            // the member and the published range) rather than falling back to
+            // the largest page, so a page size nothing could have asked for can
+            // never resolve to the most permissive answer.
+            Some(requested) => usize::try_from(requested)
+                .map_err(|_| {
+                    invalid(format!(
+                        "maxResults must be between 0 and {MODELLED_MAX_RESULTS}, got {requested}"
+                    ))
+                })?
+                .min(crate::state::MAX_PAGE_SIZE),
+        };
+
+        // The clock, not this call, is what moves a sync job on: its outcome was
+        // due at `settles_at`, so reporting the stored state without
+        // materialising it would report a state that stopped being true before
+        // the request arrived. Done for every job of the workspace rather than
+        // only the reported page, so two callers reading different pages cannot
+        // disagree about one job's state — and this listing says about a job
+        // exactly what `GetSyncJob` says about it.
+        let now = ::std::time::SystemTime::now();
+        for job in workspace.sync_jobs.values_mut() {
+            job.settle(now);
+        }
+
+        // `sync_jobs` is keyed by `syncSource`, so iterating the map IS source
+        // order and resuming is a `range` from the token's key: the page starts
+        // at the first source at or past it without walking what came before.
+        let mut remaining = match &resume_at {
+            Some(from) => workspace.sync_jobs.range(from.clone()..),
+            None => workspace.sync_jobs.range::<String, _>(..),
+        }
+        .map(|(_, job)| job);
+
+        let mut sync_job_summaries = Vec::new();
+        for job in remaining.by_ref().take(page_size) {
+            sync_job_summaries.push(SyncJobSummary {
+                arn: Some(job.arn.clone()),
+                workspace_id: Some(job.workspace_id.clone()),
+                sync_source: Some(job.sync_source.clone()),
+                // Carries BOTH its modelled members: the stored state (settled
+                // above) and the `error` structure every reported status of this
+                // service carries, exactly as `GetSyncJob` reports them.
+                status: Some(job.status()),
+                creation_date_time: Some(crate::state::timestamp(job.creation_date_time)),
+                update_date_time: Some(crate::state::timestamp(job.update_date_time)),
+            });
+        }
+        // The token the next call resumes at: the first job this page left over.
+        // Absent on the last page, which is how a caller knows to stop.
+        let next_token = remaining
+            .next()
+            .map(|job| encode_next_token(&input.workspace_id, &job.sync_source));
+
+        Ok(ListSyncJobsOutput {
+            // Present, not omitted, for a workspace holding no sync job: the
+            // member is how a caller reads the set, and an empty list says there
+            // is none where an absent member cannot be told from an unanswered
+            // read.
+            sync_job_summaries: Some(sync_job_summaries),
+            next_token,
+        })
     }
+}
+
+/// The page size this listing serves when a request names no `maxResults`.
+///
+/// THIS operation's own documented default, not the service-wide
+/// [`crate::state::DEFAULT_PAGE_SIZE`]: the `maxResults` member of
+/// `ListSyncJobsRequest` documents "The maximum number of results to return at
+/// one time. The default is 50. Valid Range: Minimum value of 0. Maximum value
+/// of 200."
+/// (`smithy_query(query="doc",shape="ListSyncJobsRequest",member="maxResults")`),
+/// where the workspace, entity and component-type listings document a default of
+/// 25 and a minimum of 1 — so both the default and what a zero means are
+/// per-operation, each taken from that member's own documentation.
+pub const DEFAULT_PAGE_SIZE: usize = 50;
+
+/// The top of the `maxResults` member's modelled `range` (0..200), which is also
+/// the maximum its documentation publishes.
+///
+/// This listing never serves a page larger than
+/// [`crate::state::MAX_PAGE_SIZE`], so that ceiling must be EXACTLY what this
+/// operation's member admits — no larger, or a page could leave the range the
+/// model allows; no smaller, or a `maxResults` this member publishes would be
+/// silently narrowed — and the default may never exceed it. Checked at COMPILE
+/// time, so moving either past what the model allows fails the build instead of
+/// serving a page the member could not have asked for or quietly shortening one
+/// it did.
+const MODELLED_MAX_RESULTS: usize = 200;
+const _: () = assert!(crate::state::MAX_PAGE_SIZE == MODELLED_MAX_RESULTS);
+const _: () = assert!(DEFAULT_PAGE_SIZE <= crate::state::MAX_PAGE_SIZE);
+
+/// The envelope a `nextToken` of this listing carries, so a token minted
+/// elsewhere — by another listing of this service, for another workspace, or by
+/// hand — is recognisably not one of ours. The token itself is the shape every
+/// paginated operation of this service mints
+/// ([`crate::state::encode_page_token`]), scoped to the workspace whose page it
+/// is.
+const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:syncJobs:1:";
+
+/// The opaque `nextToken` for a page of `workspace_id` starting at
+/// `sync_source`.
+fn encode_next_token(workspace_id: &str, sync_source: &str) -> String {
+    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id], sync_source)
+}
+
+/// The sync source inside a `nextToken` minted for `workspace_id`, or `None`
+/// when the token is not one this listing minted for that workspace.
+fn decode_next_token(token: &str, workspace_id: &str) -> Option<String> {
+    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id], token)
 }

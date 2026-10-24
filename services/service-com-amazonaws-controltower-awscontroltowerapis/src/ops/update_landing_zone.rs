@@ -175,6 +175,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+
+        // The same two input rules a create is held to, because they are properties of a
+        // landing zone configuration rather than of one call: `version` must name a
+        // version the service OFFERS (the modelled pattern bounds the shape of the
+        // string, not the set of versions that exist), and a manifest the request carries
+        // must describe a configuration the service could deploy. An update that supplies
+        // no manifest changes nothing the manifest describes, so there is nothing to
+        // check.
+        if let Some(refusal) = crate::state::unsupported_version_message(&input.version) {
+            return Err(
+                UpdateLandingZoneErrorModeled::ValidationException(ValidationException {
+                    message: refusal,
+                })
+                .into(),
+            );
+        }
+        if let Some(defect) = input
+            .manifest
+            .as_ref()
+            .and_then(crate::state::manifest_defect)
+        {
+            return Err(
+                UpdateLandingZoneErrorModeled::ValidationException(ValidationException {
+                    message: defect,
+                })
+                .into(),
+            );
+        }
+
         let mut store = state.lock();
         store.settle(now);
 

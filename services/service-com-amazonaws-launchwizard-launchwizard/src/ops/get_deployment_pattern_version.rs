@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDeploymentPatternVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDeploymentPatternVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDeploymentPatternVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE version of one deployment pattern of the seeded catalogue in
+//! [`crate::state`]. This is the ONLY file to touch for this operation.
+//!
+//! A 501 from this operation would mean "nobody has written it yet"; this operation is
+//! implemented, so it answers no 501 — an absent workload, pattern or version is the
+//! modelled `ResourceNotFoundException` instead.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +147,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDeploymentPatternVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDeploymentPatternVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDeploymentPatternVersion"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetDeploymentPatternVersionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Launch Wizard state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // `@readonly`: the catalogue is read-only, so this is a pure read — nothing a
+        // later caller sees changes. The three names are resolved in the order they
+        // scope each other (a pattern belongs to a workload, a version to a pattern),
+        // each against the SAME records the pattern-reporting operations read, so the
+        // version reported here is one of the versions that pattern publishes. Every
+        // message is the fixed, identifier-free one a catalogue lookup carries, so a
+        // caller cannot probe the catalogue through the error channel.
+        let store = state.lock();
+        let Some(workload) = store.workloads.get(&input.workload_name) else {
+            return Err(
+                GetDeploymentPatternVersionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::WORKLOAD_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let Some(pattern) = workload.patterns.get(&input.deployment_pattern_name) else {
+            return Err(
+                GetDeploymentPatternVersionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let Some(summary) = pattern.version_summary(&input.deployment_pattern_version_name) else {
+            return Err(
+                GetDeploymentPatternVersionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::DEPLOYMENT_PATTERN_VERSION_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetDeploymentPatternVersionOutput {
+            deployment_pattern_version: Some(summary),
+        })
     }
 }

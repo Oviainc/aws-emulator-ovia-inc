@@ -17,6 +17,8 @@ mod create_deployment_validation;
 mod delete_deployment_status_sequence;
 #[path = "all/deployment_lifecycle.rs"]
 mod deployment_lifecycle;
+#[path = "all/deployment_pattern_versions.rs"]
+mod deployment_pattern_versions;
 #[path = "all/deployment_update.rs"]
 mod deployment_update;
 #[path = "all/harness.rs"]
