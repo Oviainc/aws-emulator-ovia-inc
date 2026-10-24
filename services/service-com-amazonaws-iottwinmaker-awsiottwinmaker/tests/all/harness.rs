@@ -174,6 +174,12 @@ impl Emulator {
         self.call("GET", "/pricingplan", None).await
     }
 
+    /// `UpdatePricingPlan`: POST /pricingplan, with `pricingMode` and any
+    /// `bundleNames` in the body (the request binds no label and no query).
+    pub(crate) async fn update_pricing_plan(&self, body: Value) -> Resp {
+        self.call("POST", "/pricingplan", Some(body)).await
+    }
+
     /// `ListWorkspaces`: POST /workspaces-list, with any page members
     /// (`maxResults`, `nextToken`) carried in the body.
     pub(crate) async fn list_workspaces(&self, request: Value) -> Resp {

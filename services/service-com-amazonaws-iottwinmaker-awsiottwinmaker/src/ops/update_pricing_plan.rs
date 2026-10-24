@@ -1,15 +1,51 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePricingPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePricingPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Sets the account's pricing plan in [`crate::state`], so `GetPricingPlan`
+//! reads back the plan this call persisted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePricingPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The pricing plan is ACCOUNT-wide: the request names no workspace, so there
+//! is one plan per account and region
+//! ([`crate::state::ComAmazonawsIottwinmakerAwsiottwinmakerState::pricing_plan`]),
+//! and this call replaces it WHOLE — the plan it records is the `pricingMode`
+//! and the `bundleNames` the request carries, not a patch over the plan in
+//! force.
+//!
+//! The change takes effect at once, so the `currentPricingPlan` this call
+//! answers is the plan it just recorded, with `effectiveDateTime` and
+//! `updateDateTime` both at the instant of the call. A change that had been
+//! accepted but had not taken effect is superseded, so `pendingPricingPlan` is
+//! absent from a successful response — see
+//! [`crate::state::ComAmazonawsIottwinmakerAwsiottwinmakerState::set_pricing_plan`],
+//! which also records the `updateReason` and says why `pricingTier` is left
+//! unset.
+//!
+//! `billableEntityCount` is reported on the plan the same way `GetPricingPlan`
+//! reports it: DERIVED from the entities the service holds
+//! ([`crate::state::ComAmazonawsIottwinmakerAwsiottwinmakerState::billable_entity_count`]),
+//! never a counter this call bumps.
+//!
+//! The refusals this handler owns, all the modelled `ValidationException`
+//! (HTTP 400), all naming the member and the constraint it broke:
+//!
+//! * `pricingMode` is not one of the modelled `PricingMode` values
+//!   ([`crate::ops::types::PRICING_MODE_VALUES`]);
+//! * `bundleNames` is named but does not hold 1 to 10 names, the
+//!   `@length(1..10)` the `PricingBundles` list carries;
+//! * `bundleNames` and `pricingMode` contradict each other: a bundled mode
+//!   ([`crate::state::pricing_mode_is_bundled`]) names no bundle, or the
+//!   pay-as-you-go mode names one. A bundled plan is reported through
+//!   `BundleInformation`, whose `bundleNames` is `@required` `@length(1..10)`,
+//!   so a bundled plan with no bundle is not representable; and the
+//!   pay-as-you-go plan is the one an untouched account is on, which carries no
+//!   bundle at all.
+//!
+//! A refused request changes nothing: every check runs before the store is
+//! written.
+//!
+//! Authorization is not emulated, so the modelled `AccessDeniedException` is
+//! never returned, and nothing here is rate limited, so neither is
+//! `ThrottlingException`.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +179,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePricingPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePricingPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePricingPlan"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one changes how the account is billed.
+        ::tracing::info!(
+            operation = "UpdatePricingPlan",
+            pricing_mode = %input.pricing_mode,
+            bundle_count = input.bundle_names.as_ref().map_or(0, Vec::len),
+            "serving a request"
+        );
+        let _ = ctx;
+
+        // Every refusal is decided BEFORE the store is touched, so a refused
+        // request leaves the account on the plan it was already on.
+        if !PRICING_MODE_VALUES.contains(&input.pricing_mode.as_str()) {
+            return Err(validation(format!(
+                "pricingMode must be one of {}, got {:?}",
+                PRICING_MODE_VALUES.join(", "),
+                input.pricing_mode
+            )));
+        }
+        if let Some(bundle_names) = &input.bundle_names {
+            // The `@length(1..10)` of `PricingBundles`, restated here because a
+            // plan is only reportable through `BundleInformation`, which carries
+            // the same bound on the same member.
+            if bundle_names.is_empty() || bundle_names.len() > MAX_PRICING_BUNDLES {
+                return Err(validation(format!(
+                    "bundleNames must name 1 to {MAX_PRICING_BUNDLES} bundles, got {}",
+                    bundle_names.len()
+                )));
+            }
+        }
+        let bundle_names = input.bundle_names.unwrap_or_default();
+        let bundled = crate::state::pricing_mode_is_bundled(&input.pricing_mode);
+        if bundled && bundle_names.is_empty() {
+            return Err(validation(format!(
+                "bundleNames is required for pricingMode {:?}, which names a bundled pricing \
+                 plan: a bundled plan is reported through bundleInformation, whose bundleNames \
+                 must hold 1 to {MAX_PRICING_BUNDLES} names",
+                input.pricing_mode
+            )));
+        }
+        if !bundled && !bundle_names.is_empty() {
+            return Err(validation(format!(
+                "bundleNames must be omitted for pricingMode {:?}, the pay-as-you-go mode, \
+                 which buys no bundle",
+                input.pricing_mode
+            )));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdatePricingPlanErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // One count for both reported plans, derived from the stored entities:
+        // `billableEntityCount` describes the ACCOUNT, not the plan.
+        let billable_entity_count = state.billable_entity_count();
+        let current_pricing_plan = state
+            .set_pricing_plan(
+                input.pricing_mode,
+                bundle_names,
+                ::std::time::SystemTime::now(),
+            )
+            .as_pricing_plan(billable_entity_count);
+
+        Ok(UpdatePricingPlanOutput {
+            current_pricing_plan,
+            // Reported from the store rather than assumed absent: the member is
+            // whatever change the store still holds as not yet in force, which
+            // after a change that takes effect at once is nothing.
+            pending_pricing_plan: state
+                .pending_pricing_plan
+                .as_ref()
+                .map(|pending| pending.as_pricing_plan(billable_entity_count)),
+        })
     }
+}
+
+/// The largest number of names `PricingBundles` admits (`@length(1..10)`), and
+/// so the largest a plan's `bundleInformation.bundleNames` can report.
+const MAX_PRICING_BUNDLES: usize = 10;
+
+/// This operation's modelled `ValidationException` (HTTP 400), carrying
+/// `message`.
+///
+/// The model declares the error for this operation, so the refusal goes out as
+/// the service's own shape rather than through the scaffold's synthetic one.
+fn validation(message: String) -> UpdatePricingPlanError {
+    UpdatePricingPlanErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }

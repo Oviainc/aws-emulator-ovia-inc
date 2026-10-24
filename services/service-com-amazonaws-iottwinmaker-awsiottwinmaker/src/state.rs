@@ -278,6 +278,35 @@ pub const PRICING_MODE_BASIC: &str = "BASIC";
 /// See [`PRICING_MODE_BASIC`].
 pub const UPDATE_REASON_DEFAULT: &str = "DEFAULT";
 
+/// The `UpdateReason` a plan change records when it replaces a plan whose
+/// `pricingMode` differs from the one in force
+/// (`ops::types::UPDATE_REASON_VALUES`).
+pub const UPDATE_REASON_PRICING_MODE_UPDATE: &str = "PRICING_MODE_UPDATE";
+/// The `UpdateReason` a plan change records when the mode is unchanged, so the
+/// bundles — and with them the tier the bundles place the account in — are all
+/// the change can have moved. See [`UPDATE_REASON_PRICING_MODE_UPDATE`].
+pub const UPDATE_REASON_PRICING_TIER_UPDATE: &str = "PRICING_TIER_UPDATE";
+/// The `UpdateReason` a plan change records when it supersedes a plan change
+/// that had been accepted but had not taken effect: that earlier change is
+/// overwritten and never becomes the plan in force. See
+/// [`UPDATE_REASON_PRICING_MODE_UPDATE`].
+pub const UPDATE_REASON_OVERWRITTEN: &str = "OVERWRITTEN";
+
+/// Whether `pricing_mode` names a BUNDLED pricing plan — one whose billing is
+/// described by the bundles it was set with — rather than the pay-as-you-go
+/// mode.
+///
+/// [`PRICING_MODE_BASIC`] is the pay-as-you-go mode, and it is the mode of the
+/// plan an untouched account is on, which names no bundle at all
+/// ([`PricingPlanRecord::default_plan`]). Every other `PricingMode` value
+/// (`ops::types::PRICING_MODE_VALUES`) names a plan bought as bundles, and a
+/// bundled plan is reported through `BundleInformation`, whose `bundleNames` is
+/// `@required` with `@length(1..10)` — so there is no form of a bundled plan
+/// that names no bundle, and no form of the pay-as-you-go plan that names one.
+pub fn pricing_mode_is_bundled(pricing_mode: &str) -> bool {
+    pricing_mode != PRICING_MODE_BASIC
+}
+
 /// Per-service state for com-amazonaws-iottwinmaker-awsiottwinmaker. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsIottwinmakerAwsiottwinmakerState {
@@ -302,7 +331,15 @@ pub struct ComAmazonawsIottwinmakerAwsiottwinmakerState {
     /// The plan change that is accepted but not yet in force — what
     /// `GetPricingPlan` reports as `pendingPricingPlan` — and `None` while
     /// nothing is pending, which is what an account whose plan nobody has
-    /// changed looks like. Written by `UpdatePricingPlan`.
+    /// changed looks like.
+    ///
+    /// Nothing in this emulator leaves a change pending: `UpdatePricingPlan`
+    /// applies one at once ([`Self::set_pricing_plan`]), so the only thing that
+    /// call does to this field is CLEAR it, superseding a change that had not
+    /// taken effect. The field stays because the plan in force and the plan
+    /// pending are two distinct members of the API's output, and a reader has
+    /// to report whichever the store holds rather than assume there is only
+    /// ever one.
     pub pending_pricing_plan: Option<PricingPlanRecord>,
     /// The metadata transfer jobs this account holds, keyed by
     /// `metadataTransferJobId`.
@@ -1217,6 +1254,66 @@ impl ComAmazonawsIottwinmakerAwsiottwinmakerState {
             .map(|workspace| workspace.entities.len())
             .sum();
         i64::try_from(count).unwrap_or(i64::MAX)
+    }
+
+    /// Set the account's pricing plan to `pricing_mode` with `bundle_names` at
+    /// `now`, and hand back the plan that is now in force.
+    ///
+    /// The change takes effect AT ONCE: the new plan's `effectiveDateTime` is
+    /// the instant of the call that set it, the same instant as its
+    /// `updateDateTime`. The service publishes no rule for deferring an accepted
+    /// change to some later instant, so this emulator defers none — which also
+    /// means a change that was accepted but had not taken effect
+    /// ([`ComAmazonawsIottwinmakerAwsiottwinmakerState::pending_pricing_plan`])
+    /// is SUPERSEDED here rather than left to land later, and after this call
+    /// nothing is pending.
+    ///
+    /// The `UpdateReason` recorded on the new plan says what this change was,
+    /// read off the plan it replaces — never off the request alone:
+    ///
+    /// * [`UPDATE_REASON_OVERWRITTEN`] when it superseded a pending change,
+    ///   which is the most specific thing that can be said about it;
+    /// * else [`UPDATE_REASON_PRICING_MODE_UPDATE`] when the mode differs from
+    ///   the mode in force;
+    /// * else [`UPDATE_REASON_PRICING_TIER_UPDATE`], the mode being unchanged,
+    ///   so the bundles — and the tier they place the account in — are all the
+    ///   change can have moved.
+    ///
+    /// The two remaining `UpdateReason` values are deliberately NOT produced
+    /// here, because neither describes a change a caller asked for:
+    /// [`UPDATE_REASON_DEFAULT`] marks the plan of an account nobody has
+    /// updated, and `ENTITY_COUNT_UPDATE` a tier the service moved on its own
+    /// when the account's entity count crossed a threshold.
+    ///
+    /// `pricingTier` is left unset. The tier a bundled plan sits in is a
+    /// function of AWS's published tiered-bundle thresholds, which this
+    /// service's model does not carry; the member is optional precisely so a
+    /// plan whose tier is not determined is representable, so the plan is
+    /// reported without one rather than with a threshold table this emulator
+    /// would have invented.
+    pub fn set_pricing_plan(
+        &mut self,
+        pricing_mode: String,
+        bundle_names: Vec<String>,
+        now: SystemTime,
+    ) -> &PricingPlanRecord {
+        let superseded_pending = self.pending_pricing_plan.take().is_some();
+        let update_reason = if superseded_pending {
+            UPDATE_REASON_OVERWRITTEN
+        } else if pricing_mode != self.pricing_plan.pricing_mode {
+            UPDATE_REASON_PRICING_MODE_UPDATE
+        } else {
+            UPDATE_REASON_PRICING_TIER_UPDATE
+        };
+        self.pricing_plan = PricingPlanRecord {
+            pricing_mode,
+            update_reason: update_reason.to_string(),
+            bundle_names,
+            pricing_tier: None,
+            effective_date_time: now,
+            update_date_time: now,
+        };
+        &self.pricing_plan
     }
 
     /// Resolve an `IdOrArn` input to a stored `workspaceId`.

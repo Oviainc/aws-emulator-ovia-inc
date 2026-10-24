@@ -21,9 +21,10 @@
 //!   it does not change what a later caller sees.
 //!
 //! A stored plan is seeded through the service's own store (the same store the
-//! handlers read) because `UpdatePricingPlan`, the only operation that writes one,
-//! is still a scaffold stub with an issue of its own; the entity counts, by
-//! contrast, are built with real `CreateEntity`/`DeleteEntity` calls.
+//! handlers read) so one case can pin a plan with exact instants and a tier,
+//! which `UpdatePricingPlan` does not mint; the plans `UpdatePricingPlan` does
+//! write are driven over HTTP in `pricing_plan_update.rs`, and the entity
+//! counts here are built with real `CreateEntity`/`DeleteEntity` calls.
 
 use std::time::{Duration, SystemTime};
 
@@ -155,8 +156,8 @@ fn at_secs(instant: SystemTime) -> f64 {
         .as_secs_f64()
 }
 
-/// Seed the account's stored plan (and pending plan) the way
-/// `UpdatePricingPlan` will once it is implemented.
+/// Seed the account's stored plan (and pending plan) directly in the store the
+/// handlers read, so a case can pin exact instants and a tier.
 fn seed(emulator: &Emulator, current: &PricingPlanRecord, pending: Option<&PricingPlanRecord>) {
     let state = emulator.state();
     let mut state = state.lock();

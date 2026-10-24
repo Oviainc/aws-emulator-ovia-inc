@@ -35,6 +35,9 @@ mod metadata_transfer_job;
 #[path = "all/pricing_plan.rs"]
 mod pricing_plan;
 
+#[path = "all/pricing_plan_update.rs"]
+mod pricing_plan_update;
+
 #[path = "all/reported_members.rs"]
 mod reported_members;
 
