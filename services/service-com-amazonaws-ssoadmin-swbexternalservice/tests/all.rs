@@ -19,6 +19,8 @@ mod account_instance_restriction;
 mod application_access_scopes;
 #[path = "all/application_assignments.rs"]
 mod application_assignments;
+#[path = "all/application_authentication_methods.rs"]
+mod application_authentication_methods;
 #[path = "all/application_provider_describe.rs"]
 mod application_provider_describe;
 #[path = "all/application_providers.rs"]

@@ -21,7 +21,7 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     AccessControlAttribute, AccountAssignment, AccountAssignmentOperationStatus,
-    ApplicationProvider, CustomerManagedPolicyReference, DisplayData,
+    ApplicationProvider, AuthenticationMethod, CustomerManagedPolicyReference, DisplayData,
     EncryptionConfigurationDetails, InstanceAccessControlAttributeConfiguration, InstanceMetadata,
     PermissionSet, PermissionsBoundary, PortalOptions, RegionMetadata, ResourceServerConfig,
     ResourceServerScopeDetails, Tag, TrustedTokenIssuerConfiguration,
@@ -405,6 +405,65 @@ pub fn access_scope_ceiling_message(application_arn: &str) -> String {
          {application_arn} already holds that many"
     )
 }
+
+/// The `AuthenticationMethodType` an [`AuthenticationMethod`] union value carries.
+///
+/// `AuthenticationMethodItem$AuthenticationMethod` documents the relationship — "The
+/// contents of this structure is determined by the `AuthenticationMethodType`" — so the
+/// type is a PROPERTY of the union value rather than an independent member, and this
+/// function is the single place the mapping lives. The model's `AuthenticationMethod`
+/// union carries one variant (`Iam`) and its `AuthenticationMethodType` enum one value
+/// (`IAM`), so today the mapping is total in both directions.
+pub fn authentication_method_type_of(method: &AuthenticationMethod) -> &'static str {
+    match method {
+        AuthenticationMethod::Iam(_) => AUTHENTICATION_METHOD_TYPE_IAM,
+    }
+}
+
+/// `AuthenticationMethodType::IAM` — the one value the model's `AuthenticationMethodType`
+/// enum admits (`types::AUTHENTICATION_METHOD_TYPE_VALUES`).
+pub const AUTHENTICATION_METHOD_TYPE_IAM: &str = "IAM";
+
+/// The refusal a `GetApplicationAuthenticationMethod` of a type the application carries
+/// no authentication method for earns, as the message of the modelled
+/// `ResourceNotFoundException`.
+///
+/// Built from the request, like [`access_scope_not_found_message`]: it names both the
+/// type and the application it was looked for on, because an unconfigured type on a known
+/// application is a different failure from an unknown application.
+pub fn authentication_method_not_found_message(
+    application_arn: &str,
+    authentication_method_type: &str,
+) -> String {
+    format!(
+        "Could not find authentication method {authentication_method_type} for \
+         application {application_arn}."
+    )
+}
+
+/// The refusal a put whose `AuthenticationMethodType` disagrees with the variant its
+/// `AuthenticationMethod` union carries earns, as the message of the modelled
+/// `ValidationException`.
+///
+/// Built from the request: it names both halves, since the caller has to learn which of
+/// the two to change.
+pub fn authentication_method_type_mismatch_message(declared: &str, carried: &str) -> String {
+    format!(
+        "AuthenticationMethod carries a {carried} method, which does not match the \
+         AuthenticationMethodType {declared} the request declares"
+    )
+}
+
+/// The refusal an `IamAuthenticationMethod$ActorPolicy` that is not a JSON OBJECT earns,
+/// as the message of the modelled `ValidationException`.
+///
+/// The rule is the member's own documentation — "An IAM policy document in JSON" — which
+/// an `@document` member cannot express: every JSON value deserializes into it, and a
+/// scalar, a list or a null is not a policy document. Nothing beyond that shape is
+/// checked here: the emulator stores the document the caller sent verbatim rather than
+/// judging the policy language inside it.
+pub const ACTOR_POLICY_NOT_AN_OBJECT_MESSAGE: &str =
+    "IamAuthenticationMethod.ActorPolicy must be a JSON object: an IAM policy document";
 
 /// The attribute-based access control (ABAC) configuration of an instance, as the
 /// `CreateInstanceAccessControlAttributeConfiguration` that enabled ABAC — and any later
@@ -1068,6 +1127,19 @@ pub struct ApplicationRecord {
     /// [`MAX_SCOPES_PER_APPLICATION`] scopes; a put that would add one beyond that
     /// ceiling is refused rather than grown into.
     pub access_scopes: BTreeMap<String, Option<Vec<String>>>,
+    /// The AUTHENTICATION METHODS of this application, by `AuthenticationMethodType`, as
+    /// `PutApplicationAuthenticationMethod` stored them.
+    ///
+    /// On the application record for the same reason as [`Self::access_scopes`]: an
+    /// application that no longer exists carries no authentication method, and the
+    /// method operations resolve the same application every other read resolves. Keyed
+    /// by the method's TYPE, which is what identifies it — a put of a type the
+    /// application already carries replaces that method and leaves any other type alone.
+    /// The key needs no memory ceiling beside [`MAX_SCOPES_PER_APPLICATION`]: the
+    /// model's `AuthenticationMethodType` enum admits exactly one value, which the
+    /// boundary validator enforces, so this map holds at most one entry per application.
+    /// A `BTreeMap` so an enumeration walks one stable order and can page by type.
+    pub authentication_methods: BTreeMap<String, AuthenticationMethod>,
 }
 
 /// A direct assignment of one principal to one application.

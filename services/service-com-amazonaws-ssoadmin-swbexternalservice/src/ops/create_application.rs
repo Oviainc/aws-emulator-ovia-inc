@@ -375,6 +375,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A fresh application carries no access scopes; `PutApplicationAccessScope`
             // is what adds them.
             access_scopes: ::std::collections::BTreeMap::new(),
+            // …and no authentication method; `PutApplicationAuthenticationMethod` is
+            // what configures one.
+            authentication_methods: ::std::collections::BTreeMap::new(),
         };
         // The response is built from the record that is about to be stored, so it cannot
         // differ from what the next `DescribeApplication` reads: both report these
