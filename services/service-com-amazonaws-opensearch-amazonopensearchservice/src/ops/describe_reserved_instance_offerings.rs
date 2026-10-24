@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReservedInstanceOfferings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReservedInstanceOfferings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReservedInstanceOfferings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Reserved Instance offerings this Region publishes, from the catalog
+//! the state is seeded with
+//! (`crate::state::ComAmazonawsOpensearchAmazonopensearchserviceState::reserved_instance_offerings`).
+//!
+//! An offering is published BY the service, never created by a caller, so this is a
+//! pure read: it writes nothing, and the catalog, the ids in it and the prices on it
+//! are the same for every caller and on every call.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +86,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page this operation answers with: `MaxResults` is `@range(max: 100)`.
+const MAX_PAGE_SIZE: i32 = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,18 +160,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReservedInstanceOfferings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReservedInstanceOfferingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReservedInstanceOfferings"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // `MaxResults` is `@range(max: 100)`, so a larger page size is a malformed
+        // request; the boundary validator refuses it before this handler runs, and the
+        // check is repeated here so the rule holds however the request reached us. A
+        // NEGATIVE page size is malformed for the same reason — it is not a page size
+        // at all — so it is refused rather than reinterpreted, while `@default(0)` (no
+        // page size sent) stays the unbounded case below.
+        if input.max_results < 0 || input.max_results > MAX_PAGE_SIZE {
+            return Err(
+                DescribeReservedInstanceOfferingsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "MaxResults must be between 0 and {MAX_PAGE_SIZE}: {}",
+                            input.max_results
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A pure read: the catalog is reported exactly as it is stored, so this call
+        // writes nothing at all — the next caller sees what this one saw.
+        let store = state.lock();
+
+        // "The Reserved Instance identifier filter value. Use this parameter to show
+        // only the available instance types that match the specified reservation
+        // identifier." The filter resolves ONE offering, so it narrows the listing to
+        // that offering — and an id the catalog publishes no offering for names no
+        // resource, which is the modelled not-found refusal rather than an empty page.
+        let selected: Vec<&ReservedInstanceOffering> =
+            match input.reserved_instance_offering_id.as_deref() {
+                Some(offering_id) => {
+                    // `GUID`'s own pattern is 8-4-4-4-12 hexadecimal groups. The
+                    // request boundary enforces the length bound but not the pattern,
+                    // so an id of the right length that is not a GUID is refused here
+                    // as malformed rather than treated as an id that names nothing.
+                    if !crate::state::is_guid(offering_id) {
+                        return Err(
+                            DescribeReservedInstanceOfferingsErrorModeled::ValidationException(
+                                crate::state::malformed_guid(
+                                    "ReservedInstanceOfferingId",
+                                    offering_id,
+                                ),
+                            )
+                            .into(),
+                        );
+                    }
+                    let offering = store
+                        .reserved_instance_offerings
+                        .get(offering_id)
+                        .ok_or_else(|| {
+                            DescribeReservedInstanceOfferingsErrorModeled::ResourceNotFoundException(
+                                crate::state::offering_not_found(offering_id),
+                            )
+                        })?;
+                    vec![offering]
+                }
+                None => store.reserved_instance_offerings.values().collect(),
+            };
+
+        // The token names the first offering of the page to answer with, so a caller
+        // resumes exactly where the previous page stopped. It is only ever a value
+        // this operation handed out, so one that names no offering of the listing is
+        // a malformed request rather than an empty page — and because the listing is
+        // what the filter selected, a token is scoped to the filter it was issued
+        // under: resuming an unfiltered walk inside a filtered one is refused rather
+        // than served by quietly dropping one of the two.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => selected
+                .iter()
+                .position(|offering| {
+                    offering.reserved_instance_offering_id.as_deref() == Some(token)
+                })
+                .ok_or_else(|| {
+                    DescribeReservedInstanceOfferingsErrorModeled::ValidationException(
+                        crate::state::invalid_next_token(),
+                    )
+                })?,
+        };
+
+        // "An optional parameter that specifies the maximum number of results to
+        // return." `MaxResults` is `@default(0)`, so a request that sends no page size
+        // reaches here as zero: nothing bounds the page but the catalog itself, which
+        // is finite. Every other value reaching here is in `1..=MAX_PAGE_SIZE`.
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|size| *size > 0)
+            .unwrap_or(selected.len());
+        let end = start.saturating_add(page_size).min(selected.len());
+        let page: Vec<ReservedInstanceOffering> = selected[start..end]
+            .iter()
+            .map(|offering| (*offering).clone())
+            .collect();
+
+        // "When nextToken is returned, there are more results available" — so the
+        // member is present only while the listing holds an offering this page did
+        // not report, and the last page carries none.
+        let next_token = selected
+            .get(end)
+            .and_then(|offering| offering.reserved_instance_offering_id.clone());
+
+        Ok(DescribeReservedInstanceOfferingsOutput {
+            next_token,
+            reserved_instance_offerings: Some(page),
+        })
     }
 }
+

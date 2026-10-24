@@ -162,12 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(change_id) = input.change_id.as_deref() {
             if !crate::state::is_guid(change_id) {
                 return Err(DescribeDomainChangeProgressErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(format!(
-                            "ChangeId must be a GUID of the form \
-                             xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx: {change_id}"
-                        )),
-                    },
+                    crate::state::malformed_guid("ChangeId", change_id),
                 )
                 .into());
             }
