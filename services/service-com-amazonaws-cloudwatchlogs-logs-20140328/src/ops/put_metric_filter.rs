@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutMetricFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutMetricFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutMetricFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: creates or updates the metric filter `filterName` names on the log group
+//! in the shared store, so `DescribeMetricFilters` reports it back.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -200,18 +194,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutMetricFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutMetricFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutMetricFilter"))
+        // `ctx` carries only request metadata: a metric filter is identified by the log
+        // group it is associated with and its own name, both of which are in `input`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutMetricFilterError::from(PutMetricFilterErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = state.lock();
+
+        let invalid = |message: String| {
+            PutMetricFilterError::from(PutMetricFilterErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            ))
+        };
+
+        // The filter pattern is parsed at configuration time, so a pattern that opens a
+        // bracketed form and never closes it is refused here rather than silently matching
+        // nothing once log events start flowing. Same rule, same checker, as a subscription
+        // filter's pattern: both members target the one `FilterPattern` syntax.
+        if let Err(message) = crate::state::validate_filter_pattern(&input.filter_pattern) {
+            return Err(invalid(message));
+        }
+
+        // "Using regular expressions in filter patterns is supported. For these filters,
+        // there is a quota of two regular expression patterns within a single filter
+        // pattern."
+        let pattern_regexes = crate::state::filter_pattern_regex_count(&input.filter_pattern);
+        if pattern_regexes > crate::state::MAX_REGEX_PATTERNS_PER_FILTER_PATTERN {
+            return Err(invalid(format!(
+                "a single filter pattern can contain at most {} regular expression patterns",
+                crate::state::MAX_REGEX_PATTERNS_PER_FILTER_PATTERN
+            )));
+        }
+
+        // "A list of system fields to emit as additional dimensions in the generated
+        // metrics. Valid values are @aws.account and @aws.region" — the modelled
+        // `SystemField` is a plain string, so the boundary validator does not hold the list
+        // to that catalogue. The refusal lists the documented set rather than only saying
+        // the value was wrong. An EMPTY list names no system field, so it is the same
+        // request as one that omits the member: the filter emits none, and a reader reports
+        // none.
+        let emitted_system_fields = input.emit_system_field_dimensions.as_deref().unwrap_or(&[]);
+        if emitted_system_fields
+            .iter()
+            .any(|field| !crate::state::METRIC_FILTER_SYSTEM_FIELDS.contains(&field.as_str()))
+        {
+            return Err(invalid(crate::state::invalid_value_message(
+                "emitSystemFieldDimensions",
+                crate::state::METRIC_FILTER_SYSTEM_FIELDS,
+            )));
+        }
+
+        // Every transformation this put names is held to the rules documented for one —
+        // the dimension budget it shares with the emitted system fields, the mutual
+        // exclusion of `dimensions` and `defaultValue`, and a dimension value naming a
+        // field of the log event. The modelled list is `length 1..1`, so the boundary walk
+        // has already refused a put that names none or several.
+        let mut transformations = Vec::with_capacity(input.metric_transformations.len());
+        for transformation in &input.metric_transformations {
+            match crate::state::check_metric_transformation(
+                transformation,
+                emitted_system_fields.len(),
+            ) {
+                Ok(record) => transformations.push(record),
+                Err(message) => return Err(invalid(message)),
+            }
+        }
+
+        // "Creates or updates a metric filter and associates it with the specified log
+        // group": there is nothing to associate it with until that group exists.
+        let Some(group) = store.log_groups.get_mut(&input.log_group_name) else {
+            return Err(PutMetricFilterErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message("log group")),
+                },
+            )
+            .into());
+        };
+
+        // "There is also a quota of five regular expression patterns per log group." A put
+        // over a filter the group already holds REPLACES that filter's pattern, so the
+        // patterns it carries today do not count against the budget this put needs.
+        if group
+            .metric_filter_regex_patterns(&input.filter_name)
+            .saturating_add(pattern_regexes)
+            > crate::state::MAX_REGEX_PATTERNS_PER_LOG_GROUP
+        {
+            return Err(PutMetricFilterErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "a log group's metric filters can contain at most {} regular \
+                         expression patterns",
+                        crate::state::MAX_REGEX_PATTERNS_PER_LOG_GROUP
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The maximum number of metric filters that can be associated with a log group is
+        // 100" — and a put under a name the group already holds is an UPDATE of that
+        // filter, so only a put that would ADD one can exceed the quota.
+        if !group.metric_filters.contains_key(&input.filter_name)
+            && group.metric_filters.len() >= crate::state::MAX_METRIC_FILTERS_PER_GROUP
+        {
+            return Err(PutMetricFilterErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "a log group can have up to {} metric filters associated with it",
+                        crate::state::MAX_METRIC_FILTERS_PER_GROUP
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An update keeps the filter's creation time: it is still the same filter, so only
+        // a filter this call creates is stamped with now.
+        let creation_time_ms = group
+            .metric_filters
+            .get(&input.filter_name)
+            .map_or_else(crate::state::now_ms, |existing| existing.creation_time_ms);
+
+        // Every other member is replaced by what this put names, so a member the request
+        // omits is absent afterwards rather than inherited from the previous put.
+        group.metric_filters.insert(
+            input.filter_name.clone(),
+            crate::state::MetricFilterRecord {
+                filter_name: input.filter_name,
+                filter_pattern: input.filter_pattern,
+                transformations,
+                apply_on_transformed_logs: input.apply_on_transformed_logs,
+                field_selection_criteria: input.field_selection_criteria,
+                emit_system_field_dimensions: input
+                    .emit_system_field_dimensions
+                    .filter(|fields| !fields.is_empty()),
+                creation_time_ms,
+            },
+        );
+
+        Ok(PutMetricFilterOutput)
     }
 }

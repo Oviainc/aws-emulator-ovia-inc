@@ -387,7 +387,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         arn: Some(group.arn.clone()),
                         retention_in_days: group.retention_in_days.filter(|_| !pattern_search),
                         metric_filter_count: (!pattern_search)
-                            .then_some(group.metric_filter_count),
+                            .then(|| group.metric_filter_count()),
                         stored_bytes: (!pattern_search).then_some(group.stored_bytes),
                         kms_key_id: group.kms_key_id.clone().filter(|_| !pattern_search),
                         data_protection_status: group
