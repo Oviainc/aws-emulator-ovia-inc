@@ -23,6 +23,8 @@ mod host_lifecycle;
 mod host_listing;
 #[path = "all/host_reads.rs"]
 mod host_reads;
+#[path = "all/host_reference_resolution.rs"]
+mod host_reference_resolution;
 #[path = "all/repository_link_lifecycle.rs"]
 mod repository_link_lifecycle;
 #[path = "all/repository_link_reads.rs"]
@@ -35,5 +37,7 @@ mod state_roundtrip;
 mod sync_blocker_resolution;
 #[path = "all/sync_blocker_summary.rs"]
 mod sync_blocker_summary;
+#[path = "all/target_prefix_forms.rs"]
+mod target_prefix_forms;
 #[path = "all/wire_target_routing.rs"]
 mod wire_target_routing;

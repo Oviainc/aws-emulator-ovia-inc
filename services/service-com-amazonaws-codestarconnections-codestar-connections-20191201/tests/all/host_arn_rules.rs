@@ -304,7 +304,7 @@ async fn an_in_account_host_arn_is_resolved_against_the_host_store() {
             .await;
         assert_eq!(
             (status, error_code(&response).as_str()),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
             "case {case:?}: expected CreateConnection to refuse {arn:?} as absent, got \
              {status} {response}"
         );
@@ -318,7 +318,7 @@ async fn an_in_account_host_arn_is_resolved_against_the_host_store() {
             .await;
         assert_eq!(
             (status, error_code(&response).as_str()),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
             "case {case:?}: expected ListConnections to refuse the filter {arn:?} as absent, \
              got {status} {response}"
         );
