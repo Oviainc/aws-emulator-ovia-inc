@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLookupTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLookupTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLookupTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: stores ONE lookup table under the name that identifies it, reads the CSV
+//! body it was handed to the header row and data rows it describes, and hands back the ARN
+//! it minted for the table and the instant it was created — refusing a request that names
+//! both content sources or neither, a CSV body it cannot read, a `queryId` naming no
+//! completed or cancelled query, a `kmsKeyId` that is not a KMS key's, a name the account
+//! already holds a table under, or a create that would grow the account's table store past
+//! the emulator's own ceilings — on the number of tables it holds, and on the bytes of CSV
+//! content they hold between them. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +170,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLookupTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLookupTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLookupTable"))
+        let region = crate::state::request_region(ctx.parts());
+
+        let invalid = |message: String| {
+            CreateLookupTableError::from(CreateLookupTableErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            ))
+        };
+
+        // "You must specify either tableBody or queryId, but not both" — a rule ACROSS two
+        // members, which no single member's constraint can express, so it is refused with
+        // the `ValidationException` this operation models rather than with its
+        // `InvalidParameterException`.
+        let source = crate::state::resolve_lookup_table_source(
+            input.table_body.as_deref(),
+            input.query_id.as_deref(),
+        )
+        .map_err(|message| {
+            CreateLookupTableError::from(CreateLookupTableErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            ))
+        })?;
+        // A create builds the table "by uploading CSV data or from CloudWatch Logs query
+        // results", so a request naming neither names nothing to build it from.
+        let Some(source) = source else {
+            return Err(
+                CreateLookupTableErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::LOOKUP_TABLE_SOURCE_REQUIRED.to_string()),
+                })
+                .into(),
+            );
+        };
+
+        // The table's content is read HERE, before anything is stored: the header row names
+        // the table's columns and the rows after it are its records, so a body those cannot
+        // be read from creates no table.
+        let (table_body, shape) = match source {
+            crate::state::LookupTableSource::TableBody(table_body) => {
+                let shape = crate::state::parse_table_body(&table_body).map_err(invalid)?;
+                (table_body, shape)
+            }
+            // `queryId` names "a completed or cancelled CloudWatch Logs query whose results
+            // populate the lookup table". `StartQuery` is still a scaffold stub, so this
+            // account holds no query and every id names one that is not there — refused with
+            // the message naming the id, never by inventing results nothing computed.
+            crate::state::LookupTableSource::QueryId(query_id) => {
+                return Err(invalid(crate::state::query_not_found_message(&query_id)));
+            }
+        };
+
+        // "The ARN of the KMS key to use to encrypt the lookup table data": a value that
+        // names no KMS key names nothing to encrypt with. The member carries no modelled
+        // pattern, so this is the service's own check, shared with `AssociateKmsKey` — and
+        // like there, a bare key id or alias is left to KMS to resolve; only a value that
+        // names another service's resource, or nothing at all, is refused here.
+        if let Some(kms_key_id) = input.kms_key_id.as_deref() {
+            if !crate::state::is_kms_key_id(kms_key_id) {
+                return Err(invalid(format!(
+                    "kmsKeyId must name a KMS key, got '{kms_key_id}'"
+                )));
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateLookupTableError::from(
+                CreateLookupTableErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // "The table name must be unique within your account and Region": a create under a
+        // name the account already holds a table under is refused rather than overwriting
+        // that table — which is also why the ARN is derived from the name.
+        if store.lookup_tables.contains_key(&input.lookup_table_name) {
+            return Err(
+                CreateLookupTableErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        // The wording `CreateLogGroup` already refuses a name the account
+                        // holds with, naming the resource kind that already exists.
+                        message: Some("The specified lookup table already exists".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Nothing expires a lookup table, so the account's store is held to the emulator's
+        // own ceiling: a create that would grow it past that is refused with the
+        // `LimitExceededException` this operation models, rather than growing the store on
+        // request. Every accepted create adds a table (a name already stored was refused
+        // above), so the check is on the count the store already holds.
+        if store.lookup_tables.len() >= crate::state::MAX_LOOKUP_TABLES {
+            return Err(CreateLookupTableErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the maximum of {} lookup tables per account has been reached",
+                        crate::state::MAX_LOOKUP_TABLES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The count ceiling alone would leave the store's memory bounded only by its product
+        // with the modelled 10 MB `tableBody`, so the BYTES the account's tables hold are
+        // held to their own budget: a create whose body would take the store past it is
+        // refused — with the same modelled `LimitExceededException`, and BEFORE the body is
+        // retained — rather than recorded.
+        let stored_bytes = store.lookup_table_bytes();
+        if stored_bytes.saturating_add(table_body.len()) > crate::state::MAX_LOOKUP_TABLE_BYTES_TOTAL
+        {
+            return Err(CreateLookupTableErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the maximum of {} bytes of lookup table content per account has been \
+                         reached: {stored_bytes} bytes are stored and this table adds {}",
+                        crate::state::MAX_LOOKUP_TABLE_BYTES_TOTAL,
+                        table_body.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let created_at = crate::state::now_ms();
+        let arn = crate::state::lookup_table_arn(&region, &input.lookup_table_name);
+        let mut table = crate::state::LookupTableRecord::new(
+            &input.lookup_table_name,
+            &arn,
+            table_body,
+            shape,
+            created_at,
+        );
+        table.description = input.description.clone();
+        table.kms_key_id = input.kms_key_id.clone();
+        if let Some(tags) = &input.tags {
+            table.tags = tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+        }
+        store
+            .lookup_tables
+            .insert(input.lookup_table_name.clone(), table);
+
+        Ok(CreateLookupTableOutput {
+            lookup_table_arn: Some(arn),
+            created_at: Some(created_at),
+        })
     }
 }

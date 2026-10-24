@@ -178,19 +178,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
 
-        // The one cross-member rule `UpdateLifecyclePolicy` inherits from the
-        // shapes it carries: a schedule's `CreateRule` states when to create
-        // EITHER as a cron expression OR as an interval, never both. It runs
-        // BEFORE the store is touched, so a refused update leaves the stored
-        // policy exactly as it was.
-        if let Some(schedule) =
-            crate::state::schedule_with_conflicting_create_rule(input.policy_details.as_ref())
+        // The either/or rules inside a schedule, which `UpdateLifecyclePolicy`
+        // inherits from the shapes it carries: a `CreateRule` states when to
+        // create in exactly one of its two documented forms, and a `RetainRule`
+        // retains by exactly one of its two documented modes. They run BEFORE
+        // the store is touched, so a refused update leaves the stored policy
+        // exactly as it was.
+        if let Some(refusal) =
+            crate::state::schedule_rule_violation(input.policy_details.as_ref())
         {
             return Err(
-                UpdateLifecyclePolicyErrorModeled::InvalidRequestException(
-                    crate::state::conflicting_create_rule(&schedule),
-                )
-                .into(),
+                UpdateLifecyclePolicyErrorModeled::InvalidRequestException(refusal).into(),
             );
         }
 
@@ -249,6 +247,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into(),
                 );
+            }
+
+            // A `PolicyDetails` on an update REPLACES the stored configuration
+            // wholesale, so the replacement must be as complete as the one a
+            // create would have had to state: the members the kind of policy it
+            // describes is built from. Judged after the lookup (the policy has
+            // to exist before its kind can be read) and before the first write,
+            // so a refused update leaves the stored policy exactly as it was.
+            if let Some(details) = input.policy_details.as_ref() {
+                let omitted = crate::state::omitted_configuration_members(details);
+                if !omitted.is_empty() {
+                    return Err(
+                        UpdateLifecyclePolicyErrorModeled::InvalidRequestException(
+                            crate::state::configuration_members_omitted(&omitted),
+                        )
+                        .into(),
+                    );
+                }
             }
         }
 

@@ -269,7 +269,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             updated_at: now,
             // Nothing has executed this report yet, so there is no execution time and no
-            // health to report: both stay unset until an execution sets them.
+            // REFRESHED health: both stay unset until an execution sets them. An unset
+            // health is what `ScheduledReportRecord::health` resolves to HEALTHY for
+            // every reader — the report this service just accepted is configured
+            // properly — so the readers never disagree about it.
             last_execution_at: None,
             health_status: None,
             // Persisted at create time, as the tag list every tagging operation
