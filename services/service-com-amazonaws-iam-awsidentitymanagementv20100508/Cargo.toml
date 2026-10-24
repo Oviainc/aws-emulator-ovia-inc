@@ -20,6 +20,11 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# Reads a SAML provider's metadata document (`CreateSAMLProvider$SAMLMetadataDocument`).
+roxmltree = "0.20"
+# `service-common` carries the ONE reading of the UTC offset an RFC 3339 / `xs:dateTime`
+# timestamp declares, which the metadata document's `validUntil` is read through.
+service-common = { path = "../common" }
 tracing = { workspace = true }
 
 [build-dependencies]
