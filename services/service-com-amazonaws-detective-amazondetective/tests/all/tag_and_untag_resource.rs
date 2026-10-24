@@ -21,15 +21,15 @@
 
 use std::sync::Arc;
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use service_com_amazonaws_detective_amazondetective::state::{
     GRAPH_NOT_FOUND_MESSAGE, MAX_TAGS_PER_GRAPH,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::support::{
-    call, call_with, create_graph_ok, emulator, error_code, error_message, tags_of, ACCOUNT,
-    REGION,
+    call, call_with, create_graph_ok, emulator, error_code, error_message, graph_arn_of, keys,
+    pairs, tag_map, tags_of, ACCOUNT, REGION,
 };
 
 /// The modelled success status both tag writers carry
@@ -66,31 +66,7 @@ const TAG_KEY_FORMS: &[&str] = &[
 /// A `GraphArn` that satisfies the modelled pattern and that nothing was ever stored
 /// under.
 fn never_created_arn(id_char: char) -> String {
-    format!(
-        "arn:aws:detective:{REGION}:{ACCOUNT}:graph:{}",
-        id_char.to_string().repeat(32)
-    )
-}
-
-/// Owned key/value pairs from a literal table row.
-fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
-    entries
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect()
-}
-
-/// Owned keys from a literal table row.
-fn keys(entries: &[&str]) -> Vec<String> {
-    entries.iter().map(|key| (*key).to_string()).collect()
-}
-
-/// A table row's expected tag map, in the shape `ListTagsForResource` reports.
-fn expected_tags(entries: &[(String, String)]) -> Map<String, Value> {
-    entries
-        .iter()
-        .map(|(key, value)| (key.clone(), json!(value)))
-        .collect()
+    graph_arn_of("aws", REGION, ACCOUNT, &id_char.to_string().repeat(32))
 }
 
 /// `TagResource` with `tags` on `graph_arn`.
@@ -99,14 +75,10 @@ async fn tag(
     graph_arn: &str,
     tags: &[(String, String)],
 ) -> (u16, Value) {
-    let map: Map<String, Value> = tags
-        .iter()
-        .map(|(key, value)| (key.clone(), json!(value)))
-        .collect();
     call(
         router,
         &format!("/tags/{graph_arn}"),
-        &json!({ "Tags": Value::Object(map) }),
+        &json!({ "Tags": Value::Object(tag_map(tags)) }),
     )
     .await
 }
@@ -282,7 +254,7 @@ async fn untag_resource_removes_exactly_the_keys_the_request_names() {
 
         let (status, answered) = tag(&router, &graph_arn, &case.stored).await;
         assert_no_content(&format!("{}: TagResource", case.name), status, &answered);
-        let stored = expected_tags(&case.stored);
+        let stored = tag_map(&case.stored);
         let visible = tags_of(&router, REGION, &graph_arn).await;
         assert_eq!(
             visible, stored,
@@ -293,7 +265,7 @@ async fn untag_resource_removes_exactly_the_keys_the_request_names() {
         let (status, answered) = untag(&router, &graph_arn, &case.remove).await;
         assert_no_content(&format!("{}: UntagResource", case.name), status, &answered);
 
-        let expected = expected_tags(&case.expected);
+        let expected = tag_map(&case.expected);
         let visible = tags_of(&router, REGION, &graph_arn).await;
         assert_eq!(
             visible, expected,
@@ -399,7 +371,7 @@ async fn tag_resource_merges_into_the_map_the_graph_already_holds() {
         let (status, answered) = tag(&router, &graph_arn, &case.update).await;
         assert_no_content(&format!("{}: second TagResource", case.name), status, &answered);
 
-        let expected = expected_tags(&case.expected);
+        let expected = tag_map(&case.expected);
         let visible = tags_of(&router, REGION, &graph_arn).await;
         assert_eq!(
             visible, expected,
