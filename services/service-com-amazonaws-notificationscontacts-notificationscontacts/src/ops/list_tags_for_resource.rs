@@ -4,9 +4,8 @@
 //!
 //! Reports the tags persisted on the email contact the `arn` label names. This is a
 //! REPORTING operation (`@readonly` in the model), so it only reads the store: the
-//! tag set it answers with is whatever is on the record — today that is what
-//! `CreateEmailContact` stored at creation, since `TagResource` and `UntagResource`
-//! are still scaffolded 501s in this crate and have their own issues.
+//! tag set it answers with is whatever is on the record — what `CreateEmailContact`
+//! stored at creation, as later changed by `TagResource` and `UntagResource`.
 //!
 //! ## Shape of an operation
 //!
