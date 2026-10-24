@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves a stored cluster to `ClusterState` `Cancelled`, which a later `DescribeCluster`
+//! observes, while that cluster's state is still `AwaitingQuorum`. The node jobs the
+//! cluster holds are cancelled with it: a cluster that is cancelled before it has its
+//! quorum never ships, so no device is prepared for any of its nodes.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +138,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelCluster"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STATE_UNAVAILABLE,
+            ));
+        };
+
+        let mut store = state.lock();
+        let Some(cluster) = store.clusters.get_mut(&input.cluster_id) else {
+            return Err(CancelClusterErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(format!(
+                        "The cluster ID {} can't be found. Check the information you provided \
+                         in your last request, and try again.",
+                        input.cluster_id
+                    )),
+                    resource_type: Some("cluster".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "You can only cancel a cluster job while it's in the AwaitingQuorum status": from
+        // any other state — including `Cancelled`, which a cluster that was already
+        // cancelled is in — the cluster's current state does not allow the action.
+        if !cluster.cluster_state.is_cancellable() {
+            return Err(CancelClusterErrorModeled::InvalidJobStateException(
+                InvalidJobStateException {
+                    message: Some(format!(
+                        "The cluster {} is in state {} and can't be cancelled. A cluster job \
+                         can only be cancelled while it's in the AwaitingQuorum status.",
+                        cluster.cluster_id,
+                        cluster.cluster_state.as_wire()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        cluster.cluster_state = crate::state::ClusterState::Cancelled;
+        // The cluster's node jobs go with it. A node job exists only as a node of its
+        // cluster ("you only need to provide the clusterId value; the other job attributes
+        // are inherited from the cluster"), and a cluster still awaiting its quorum has not
+        // shipped ("The cluster does not ship until these five node jobs have been
+        // created"), so cancelling the cluster is what stops every device it ordered — each
+        // node that is itself still within its own cancellation window.
+        let node_job_ids = cluster.node_job_ids.clone();
+        for job_id in node_job_ids {
+            if let Some(job) = store.jobs.get_mut(&job_id) {
+                if job.job_state.is_cancellable() {
+                    job.job_state = crate::state::JobState::Cancelled;
+                }
+            }
+        }
+
+        Ok(CancelClusterOutput {})
     }
 }
