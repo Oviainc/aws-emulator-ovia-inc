@@ -17,5 +17,7 @@ mod developer_identity_tokens;
 mod identity_pool_flow;
 #[path = "all/identity_pool_roles.rs"]
 mod identity_pool_roles;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

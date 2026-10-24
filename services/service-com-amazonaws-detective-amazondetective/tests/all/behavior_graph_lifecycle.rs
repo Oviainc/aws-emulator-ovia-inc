@@ -235,8 +235,18 @@ async fn created_graphs_are_listed_with_the_arn_and_created_time_they_were_creat
 async fn list_graphs_pages_through_every_stored_graph_in_arn_order() {
     let router = emulator();
     let mut expected: Vec<String> = Vec::new();
-    for _ in 0..7 {
-        expected.push(create_graph_ok(&router, REGION, &json!({})).await);
+    // One graph per Region: the account administers at most one behavior graph within a
+    // Region, so a store holding seven graphs is seven Regions' worth.
+    for region in [
+        "us-west-2",
+        "us-east-1",
+        "us-east-2",
+        "eu-west-1",
+        "eu-central-1",
+        "ap-south-1",
+        "sa-east-1",
+    ] {
+        expected.push(create_graph_ok(&router, region, &json!({})).await);
     }
     expected.sort();
 
@@ -636,7 +646,7 @@ async fn an_account_that_cannot_be_processed_is_reported_rather_than_stored() {
 }
 
 #[tokio::test]
-async fn a_membership_moves_from_verification_to_invited_once_the_clock_makes_it_due() {
+async fn a_membership_leaves_verification_for_a_terminal_status_once_the_clock_makes_it_due() {
     let router = emulator();
     let graph_arn = create_graph_ok(&router, REGION, &json!({})).await;
     let member = account_id(0);
@@ -661,8 +671,9 @@ async fn a_membership_moves_from_verification_to_invited_once_the_clock_makes_it
         "CreateMembers: expected the transient status, got {created:?}"
     );
 
-    // The move to INVITED is owed by the clock, not by any later call, so once the
-    // due instant has passed every read reports it — and keeps reporting it.
+    // The move out of VERIFICATION_IN_PROGRESS is owed by the clock, not by any later
+    // call, so once the due instant has passed every read reports the terminal status —
+    // and keeps reporting it.
     tokio::time::sleep(std::time::Duration::from_millis(
         (MEMBER_VERIFICATION_MILLIS as u64) + 250,
     ))
@@ -683,12 +694,14 @@ async fn a_membership_moves_from_verification_to_invited_once_the_clock_makes_it
             .and_then(|list| list.first())
             .cloned()
             .unwrap_or_else(|| panic!("read {read}: no MemberDetails in {got:?}"));
+        // No account in this emulator carries a registered root-user email address, so
+        // the pair cannot match and the verification resolves to VERIFICATION_FAILED.
         assert_eq!(
             detail.get("Status").and_then(Value::as_str),
-            Some("INVITED"),
-            "read {read}: expected Status INVITED once verification was due, got {detail:?}"
+            Some("VERIFICATION_FAILED"),
+            "read {read}: expected the terminal verification status, got {detail:?}"
         );
-        seen.push(assert_iso8601("invited", detail.get("UpdatedTime")));
+        seen.push(assert_iso8601("verified", detail.get("UpdatedTime")));
     }
     assert_eq!(
         seen[0], seen[1],
@@ -754,7 +767,8 @@ async fn an_unknown_or_malformed_graph_arn_is_refused_by_every_operation_that_ta
 #[tokio::test]
 async fn deleting_a_graph_removes_it_and_its_members_from_the_store() {
     let router = emulator();
-    let kept = create_graph_ok(&router, REGION, &json!({})).await;
+    // Two graphs means two Regions: one account administers one graph per Region.
+    let kept = create_graph_ok(&router, "us-east-1", &json!({})).await;
     let doomed = create_graph_ok(&router, REGION, &json!({ "Tags": { "Env": "test" } })).await;
     let member = account_id(0);
     let (status, _) = call(

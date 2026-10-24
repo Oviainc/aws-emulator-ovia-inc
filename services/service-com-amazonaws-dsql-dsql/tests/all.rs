@@ -15,6 +15,8 @@
 mod cluster_lifecycle;
 #[path = "all/cluster_policy.rs"]
 mod cluster_policy;
+#[path = "all/encryption_key_selection.rs"]
+mod encryption_key_selection;
 #[path = "all/error_contract.rs"]
 mod error_contract;
 #[path = "all/harness.rs"]

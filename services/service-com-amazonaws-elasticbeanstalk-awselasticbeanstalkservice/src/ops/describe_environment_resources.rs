@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEnvironmentResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEnvironmentResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEnvironmentResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the Amazon Web Services resources the named environment is made
+//! of, as the store holds them. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +67,109 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The resource inventory of `environment`, as the modelled description.
+///
+/// Every member comes from the inventory the store holds for that environment
+/// ([`crate::state::EnvironmentResources`]), which its launch provisioned and a
+/// rebuild replaces. An environment the clock has moved to `Terminated` holds
+/// none, and reports every list empty rather than the resources it used to run
+/// on.
+fn environment_resource_description(
+    environment: &crate::state::Environment,
+) -> EnvironmentResourceDescription {
+    let resources = environment.resources.as_ref();
+    EnvironmentResourceDescription {
+        // "The name of the environment."
+        environment_name: Some(environment.environment_name.clone()),
+        // "The `AutoScalingGroups` used by this environment" — the one group
+        // this environment's instances are launched by.
+        auto_scaling_groups: Some(
+            resources
+                .map(|resources| {
+                    vec![AutoScalingGroup {
+                        name: Some(resources.auto_scaling_group.clone()),
+                    }]
+                })
+                .unwrap_or_default(),
+        ),
+        // "The Amazon EC2 instances used by this environment."
+        instances: Some(
+            resources
+                .map(|resources| {
+                    resources
+                        .instances
+                        .iter()
+                        .map(|id| Instance { id: Some(id.clone()) })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        // "The Auto Scaling launch configurations in use by this environment."
+        // Amazon EC2 Auto Scaling no longer creates launch configurations, and
+        // the platform branches this service publishes are launched from a
+        // launch TEMPLATE, reported below — so no environment here is in use of
+        // one.
+        launch_configurations: Some(Vec::new()),
+        // "The Amazon EC2 launch templates in use by this environment."
+        launch_templates: Some(
+            resources
+                .map(|resources| {
+                    vec![LaunchTemplate {
+                        id: Some(resources.launch_template_id.clone()),
+                    }]
+                })
+                .unwrap_or_default(),
+        ),
+        // "The LoadBalancers in use by this environment" — the one a
+        // load-balanced web-server environment sits behind; a single-instance
+        // or a worker environment has none.
+        load_balancers: Some(
+            resources
+                .and_then(|resources| resources.load_balancer.as_ref())
+                .map(|name| {
+                    vec![LoadBalancer {
+                        name: Some(name.clone()),
+                    }]
+                })
+                .unwrap_or_default(),
+        ),
+        // "The `AutoScaling` triggers in use by this environment."
+        triggers: Some(
+            resources
+                .map(|resources| {
+                    resources
+                        .triggers
+                        .iter()
+                        .map(|name| Trigger {
+                            name: Some(name.clone()),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        // "The queues used by this environment" — the worker tier's own queue.
+        queues: Some(
+            resources
+                .map(|resources| {
+                    resources
+                        .queues
+                        .iter()
+                        .map(|queue| Queue {
+                            name: Some(queue.name.clone()),
+                            url: Some(queue.url.clone()),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        // "The Amazon EKS cluster that this environment runs on. This member is
+        // present only for environments in the Cluster tier." This service
+        // publishes no Amazon EKS-based platform, so no environment here runs
+        // in that tier and the member stays absent.
+        cluster: None,
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,18 +239,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEnvironmentResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEnvironmentResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEnvironmentResources"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeEnvironmentResourcesError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        // The only write this report performs: a status change the clock
+        // already made due is owed whether or not anybody called — and a
+        // termination it has completed is what leaves an environment with no
+        // resources to report.
+        store.materialize_due_transitions();
+
+        // "Condition: You must specify either this or an EnvironmentName, or
+        // both. If you do not specify either, Elastic Beanstalk returns
+        // MissingRequiredParameter error."
+        let environment_id = store
+            .environment_id_for(
+                input.environment_id.as_deref(),
+                input.environment_name.as_deref(),
+            )
+            .map_err(|refusal| match refusal {
+                crate::state::EnvironmentRefusal::NoIdentifier => {
+                    DescribeEnvironmentResourcesError::missing_required_parameter(
+                        "Must specify either EnvironmentId or EnvironmentName.",
+                    )
+                }
+                crate::state::EnvironmentRefusal::NotFound(message) => {
+                    DescribeEnvironmentResourcesError::invalid_parameter_value(message)
+                }
+            })?;
+        let environment = store.environments.get(&environment_id).ok_or_else(|| {
+            DescribeEnvironmentResourcesError::invalid_parameter_value(
+                crate::state::missing_environment_message(Some(environment_id.as_str()), None),
+            )
+        })?;
+
+        Ok(DescribeEnvironmentResourcesOutput {
+            // "A list of EnvironmentResourceDescription" — the model binds a
+            // single description, of the one environment the request named.
+            environment_resources: Some(environment_resource_description(environment)),
+        })
     }
 }
