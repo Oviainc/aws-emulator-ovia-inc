@@ -12,12 +12,12 @@
 //!
 //! The same holds for every other resource kind this store carries — a key value store, a
 //! response headers policy, an origin request policy, a cache policy, an origin access
-//! control, a CloudFront function: each record is put there by the call that creates it
-//! and is what every later read of that resource answers from. None of a response headers
-//! policy, an origin request policy, a cache policy or an origin access control has a
-//! status member or a propagation deadline, so nothing about one is owed by the clock;
-//! neither is anything about a function, which reaches its `LIVE` stage through a
-//! `PublishFunction` CALL rather than by waiting.
+//! control, a CloudFront function, a public key: each record is put there by the call that
+//! creates it and is what every later read of that resource answers from. None of a
+//! response headers policy, an origin request policy, a cache policy, an origin access
+//! control or a public key has a status member or a propagation deadline, so nothing about
+//! one is owed by the clock; neither is anything about a function, which reaches its `LIVE`
+//! stage through a `PublishFunction` CALL rather than by waiting.
 //!
 //! Two things in here are owed by the CLOCK rather than by a call:
 //!
@@ -61,7 +61,7 @@ use crate::ops::types::{
     NoSuchResponseHeadersPolicy, Origin, OriginAccessControl, OriginAccessControlConfig,
     OriginAccessControlSummary, OriginRequestPolicy, OriginRequestPolicyAlreadyExists,
     OriginRequestPolicyConfig, OriginSslProtocols, Parameter, ParameterDefinition, Paths,
-    ResponseHeadersPolicy,
+    PublicKey, PublicKeyConfig, PublicKeySummary, ResponseHeadersPolicy,
     ResponseHeadersPolicyAlreadyExists, ResponseHeadersPolicyConfig, Restrictions,
     SessionStickinessConfig, Signer, StringSchemaConfig, Tag, Tags, TrafficConfig,
     TrustedKeyGroups, TrustedSigners, ViewerCertificate,
@@ -416,6 +416,25 @@ pub const MAX_ORIGIN_REQUEST_POLICIES: usize = 1_000;
 /// can be raised and the model states no number, so this bound is the emulator's rather
 /// than a claim about the service.
 pub const MAX_CACHE_POLICIES: usize = 1_000;
+
+/// The prefix a public key id carries.
+///
+/// CloudFront answers a `CreatePublicKey` with an id like `K2K8NC4HVFE3MO` — a `K`
+/// followed by [`ID_BODY_LEN`] characters of the id alphabet — so the prefix is what
+/// separates the public key namespace from the `E`-prefixed one every other CloudFront
+/// entity id is drawn from.
+pub const PUBLIC_KEY_ID_PREFIX: char = 'K';
+
+/// The most public keys this emulator holds.
+///
+/// CHOSEN by this emulator, for the same reason as [`MAX_CACHE_POLICIES`]: a public key
+/// record is what a later read answers from, so it cannot be evicted, and the create path
+/// is refused at this entry count with the modelled `TooManyPublicKeys` ("The maximum
+/// number of public keys for field-level encryption have been created. To create a new
+/// public key, delete one of the existing keys.") instead of growing further. CloudFront's
+/// own ceiling is an account quota that can be raised and the model states no number, so
+/// this bound is the emulator's rather than a claim about the service.
+pub const MAX_PUBLIC_KEYS: usize = 1_000;
 
 /// The `PriceClass` reported for a distribution whose stored configuration names none:
 /// the class that covers every CloudFront edge location, which is what
@@ -1493,6 +1512,62 @@ impl StoredCachePolicy {
     }
 }
 
+/// One CloudFront public key, as this emulator persists it.
+///
+/// The record is the single source of truth for the key's id, the configuration it was
+/// uploaded with, the instant it was uploaded and its version token, so the create and
+/// every later read — `GetPublicKey` and every `ListPublicKeys` page — answer from it
+/// rather than from the request being served.
+///
+/// Nothing in here is owed by the CLOCK: the model's `PublicKey` is `Id`, `CreatedTime`
+/// and `PublicKeyConfig` only — a public key carries no status and no propagation
+/// deadline, so a key this service accepts is immediately complete.
+#[derive(Debug, Clone)]
+pub struct StoredPublicKey {
+    /// `PublicKey$Id` — "The identifier of the public key": the token minted at creation,
+    /// which is also the key this record is held under and the path segment its
+    /// `Location` names.
+    pub id: String,
+    /// `PublicKey$CreatedTime` — "The date and time when the public key was uploaded."
+    /// Written once, by the create, so every later read reports the same instant.
+    pub created_time: SystemTime,
+    /// The configuration as submitted — stored whole, so a read reports what was stored
+    /// rather than re-deriving anything from a request, down to the members the create
+    /// left out.
+    pub config: PublicKeyConfig,
+    /// The version token the last mutation handed back, and the single source of truth
+    /// for every `If-Match` check against this public key.
+    pub etag: String,
+}
+
+impl StoredPublicKey {
+    /// The `PublicKey` projection every public key operation returns, read from the one
+    /// stored record.
+    pub fn to_public_key(&self) -> PublicKey {
+        PublicKey {
+            id: self.id.clone(),
+            created_time: ::aws_smithy_types::DateTime::from(self.created_time),
+            public_key_config: self.config.clone(),
+        }
+    }
+
+    /// The `PublicKeySummary` a listing reports for this key.
+    ///
+    /// Every member is the stored record's: `PublicKeySummary` repeats the configuration's
+    /// `Name`, `EncodedKey` and `Comment` beside the identity the create minted, and
+    /// `Comment` is optional on both, so a key uploaded without one is summarised without
+    /// one rather than with an empty element invented by the read.
+    pub fn to_summary(&self) -> PublicKeySummary {
+        PublicKeySummary {
+            id: self.id.clone(),
+            name: self.config.name.clone(),
+            created_time: ::aws_smithy_types::DateTime::from(self.created_time),
+            encoded_key: self.config.encoded_key.clone(),
+            comment: self.config.comment.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-cloudfront-cloudfront2020-05-31. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudfrontCloudfront20200531State {
@@ -1555,6 +1630,11 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// every cache policy operation addresses one by. A `BTreeMap` for the same reason as
     /// `distributions`: one stable total order for a listing to page through.
     pub cache_policies: BTreeMap<String, StoredCachePolicy>,
+    /// Every public key this emulator holds, keyed by its minted id — the identifier every
+    /// public key operation addresses one by. A `BTreeMap` for the same reason as
+    /// `distributions`: one stable total order for `ListPublicKeys`'s `Marker` to index
+    /// into.
+    pub public_keys: BTreeMap<String, StoredPublicKey>,
 }
 
 impl ComAmazonawsCloudfrontCloudfront20200531State {
@@ -1756,6 +1836,26 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// The cache policy `id` names, or `None` when the store holds none.
     pub fn cache_policy(&self, id: &str) -> Option<&StoredCachePolicy> {
         self.cache_policies.get(id)
+    }
+
+    /// The public key `id` names, or `None` when the store holds none.
+    pub fn public_key(&self, id: &str) -> Option<&StoredPublicKey> {
+        self.public_keys.get(id)
+    }
+
+    /// The public key uploaded under `caller_reference`, or `None` when no key was.
+    ///
+    /// `PublicKeyConfig$CallerReference` is "A string included in the request to help make
+    /// sure that the request can't be replayed", so at most one key answers and this is
+    /// what tells a replayed create from a second key under a reference already taken.
+    ///
+    /// A scan over the keys rather than a second index beside them: the stored records are
+    /// the single source of truth for which references are taken, so a scan cannot drift
+    /// out of step with them, and the collection is bounded by [`MAX_PUBLIC_KEYS`].
+    pub fn public_key_by_caller_reference(&self, caller_reference: &str) -> Option<&StoredPublicKey> {
+        self.public_keys
+            .values()
+            .find(|key| key.config.caller_reference == caller_reference)
     }
 
     /// The cache policy whose STORED configuration carries `name`, or `None`.
@@ -2096,6 +2196,22 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         loop {
             let candidate = self.mint_uuid();
             if !self.origin_request_policies.contains_key(&candidate) {
+                break candidate;
+            }
+        }
+    }
+
+    /// Allocate a public key id no stored public key holds.
+    ///
+    /// `PublicKey$Id` is "The identifier of the public key", and CloudFront mints one in
+    /// the shape its own answers show (`K2K8NC4HVFE3MO`): a `K` followed by
+    /// [`ID_BODY_LEN`] uppercase alphanumerics, the id alphabet every other entity id here
+    /// is drawn from — so no two keys are minted the same id and the namespace is
+    /// distinguishable from a distribution's `E`-prefixed one.
+    pub fn allocate_public_key_id(&mut self) -> String {
+        loop {
+            let candidate = format!("{PUBLIC_KEY_ID_PREFIX}{}", self.mint(ID_BODY_LEN));
+            if !self.public_keys.contains_key(&candidate) {
                 break candidate;
             }
         }
@@ -2638,6 +2754,12 @@ pub fn cache_policy_path(id: &str) -> String {
     format!("/2020-05-31/cache-policy/{id}")
 }
 
+/// The path of a public key resource under this service's API version. The resource is
+/// addressed by ID, as `GetPublicKey`'s `{Id}` label is.
+pub fn public_key_path(id: &str) -> String {
+    format!("/2020-05-31/public-key/{id}")
+}
+
 /// The fully qualified URI a `Location` header reports for `path`.
 ///
 /// CloudFront's control API is GLOBAL and served on one endpoint
@@ -2706,6 +2828,17 @@ pub fn is_minted_uuid(value: &str) -> bool {
                         .bytes()
                         .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
             })
+}
+
+/// Whether `value` has the shape of a public key id this service mints
+/// ([`PUBLIC_KEY_ID_PREFIX`] followed by [`ID_BODY_LEN`] characters of the id alphabet).
+///
+/// `ListPublicKeys`'s `Marker` is a public key id — "set the Marker to the value of the
+/// NextMarker from the current page's response (which is also the ID of the last public
+/// key on that page)" — and the model constrains it no further than `string`, so this is
+/// what tells a resume point the service issued from a value a client made up.
+pub fn is_public_key_id(value: &str) -> bool {
+    is_prefixed_token(value, PUBLIC_KEY_ID_PREFIX)
 }
 
 /// Whether `value` is `prefix` followed by [`ID_BODY_LEN`] characters of the id
@@ -2889,6 +3022,18 @@ pub fn same_origin_access_identity_config(
     left: &CloudFrontOriginAccessIdentityConfig,
     right: &CloudFrontOriginAccessIdentityConfig,
 ) -> bool {
+    format!("{left:?}") == format!("{right:?}")
+}
+
+/// Whether two public key configurations ask for the same thing, which is what decides
+/// whether a repeated `CallerReference` is the same create again or a second public key
+/// under a reference that is already taken.
+///
+/// The same comparison [`same_origin_access_identity_config`] makes, for the same reasons:
+/// every member a caller can submit takes part — down to the members a request left out —
+/// and comparing the DESERIALIZED configurations is what makes it insensitive to the
+/// request document's whitespace and member order.
+pub fn same_public_key_config(left: &PublicKeyConfig, right: &PublicKeyConfig) -> bool {
     format!("{left:?}") == format!("{right:?}")
 }
 
@@ -4316,6 +4461,73 @@ pub fn cache_policy_already_exists(name: &str) -> CachePolicyAlreadyExists {
              provide a unique name. To modify an existing cache policy, use UpdateCachePolicy."
         )),
     }
+}
+
+/// The longest comment a public key carries.
+///
+/// `PublicKeyConfig$Comment`: "A comment to describe the public key. The comment cannot be
+/// longer than 128 characters." The SAME bound, stated in the same words, as
+/// [`MAX_ORIGIN_ACCESS_IDENTITY_COMMENT`] — so it is that constant rather than a second
+/// literal, and a comment past it is refused with the one [`comment_too_long`] sentence.
+pub const MAX_PUBLIC_KEY_COMMENT: usize = MAX_ORIGIN_ACCESS_IDENTITY_COMMENT;
+
+/// The modelled `NoSuchPublicKey` (HTTP 404) for a public key id the store does not hold.
+///
+/// The sentence is the one the model states on the shape itself — "The specified public
+/// key doesn't exist." — a property of the store rather than of the request, so nothing
+/// from the request belongs in the text.
+pub fn no_such_public_key() -> crate::ops::types::NoSuchPublicKey {
+    crate::ops::types::NoSuchPublicKey {
+        message: Some(NO_SUCH_PUBLIC_KEY_MESSAGE.to_string()),
+    }
+}
+
+/// `NoSuchPublicKey`'s message, as the model documents the shape.
+pub const NO_SUCH_PUBLIC_KEY_MESSAGE: &str = "The specified public key doesn't exist.";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a `ListPublicKeys` `Marker` that is no
+/// resume point this service handed out.
+///
+/// ONE CONSTANT for the condition rather than a sentence built from the request: what the
+/// refusal states is the CONSTRAINT on the parameter — a marker is a public key id — which
+/// is a property of the parameter and not of the value submitted, so nothing from the
+/// request belongs in the text. The value below is the WIRE text, what the recorded
+/// service answers this code with, exactly as
+/// [`MONITORING_SUBSCRIPTION_ALREADY_EXISTS_MESSAGE`] is; do not reword it into a sentence
+/// about the submitted value.
+pub fn invalid_public_key_marker() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(INVALID_PUBLIC_KEY_MARKER_MESSAGE.to_string()),
+    }
+}
+
+/// The message `ListPublicKeys` refuses an unusable `Marker` with, on the wire.
+pub const INVALID_PUBLIC_KEY_MARKER_MESSAGE: &str = "Marker must be a valid CF public key Id";
+
+/// The modelled `TooManyPublicKeys` (HTTP 400) for a create that would take the store past
+/// [`MAX_PUBLIC_KEYS`] — "The maximum number of public keys for field-level encryption have
+/// been created. To create a new public key, delete one of the existing keys."
+///
+/// The sentence states the CONSTRAINT and the number this emulator holds to, which is the
+/// rule the refusal is built from rather than text echoed out of the request; it lives here
+/// beside every other modelled error text of this service rather than in the handler.
+pub fn too_many_public_keys() -> crate::ops::types::TooManyPublicKeys {
+    crate::ops::types::TooManyPublicKeys {
+        message: Some(format!(
+            "The maximum number of public keys have been created ({MAX_PUBLIC_KEYS}). To \
+             create a new public key, delete one of the existing keys."
+        )),
+    }
+}
+
+/// The sentence `PublicKeyAlreadyExists` carries — "The specified public key already
+/// exists." — up to the key the caller reference is already associated with, which it
+/// names at the end: the one piece of store-derived detail in it, and the one a caller
+/// cannot work out for itself. The same shape
+/// [`origin_access_identity_already_exists_message`] takes, for the same rule applied to
+/// the other resource.
+pub fn public_key_already_exists_message(existing_id: &str) -> String {
+    format!("The specified public key already exists: {existing_id}")
 }
 
 /// Mint the request id ONE response names the request it answers with — the `RequestId`
