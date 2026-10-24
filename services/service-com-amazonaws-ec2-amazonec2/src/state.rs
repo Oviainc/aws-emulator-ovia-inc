@@ -591,6 +591,17 @@
 //! [`TRANSITION_DELAY`] as every other move this store owes, and
 //! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies them.
 //!
+//! A prefix list reference is a ROUTE of one of those route tables — "Creates a reference
+//! (route) to a prefix list in a specified transit gateway route table"
+//! (`CreateTransitGatewayPrefixListReference`) — and a route table has at most one route per
+//! prefix list, so [`ComAmazonawsEc2Amazonec2State::transit_gateway_prefix_list_references`]
+//! holds one [`TransitGatewayPrefixListReferenceRecord`] per (route table, prefix list) pair.
+//! Each record keeps the modelled [`TransitGatewayPrefixListReference`] every operation that
+//! reports one answers with, so the create and the read cannot describe one reference
+//! differently, plus the move the clock owes it: a create answers `pending`
+//! ([`PREFIX_LIST_REFERENCE_STATE_PENDING`]) and the clock owes it `available`
+//! [`TRANSITION_DELAY`] later, on the same clock as every other move above.
+//!
 //! ## Capacity Blocks
 //!
 //! [`ComAmazonawsEc2Amazonec2State::capacity_blocks`] holds the account's Capacity Blocks
@@ -807,7 +818,8 @@ use crate::ops::types::{
     TransitGateway, TransitGatewayClientVpnAttachment,
     TransitGatewayMulticastDomainAssociation, TransitGatewayOptions,
     TransitGatewayPeeringAttachment, TransitGatewayPolicyTable,
-    TransitGatewayPolicyTableAssociation, TransitGatewayPropagation,
+    TransitGatewayPolicyTableAssociation, TransitGatewayPrefixListAttachment,
+    TransitGatewayPrefixListReference, TransitGatewayPropagation,
     TransitGatewayRequestOptions,
     TransitGatewayRouteTable, TransitGatewayRouteTableAnnouncement,
     TransitGatewayRouteTablePropagation,
@@ -1956,6 +1968,14 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// a pair either propagates or does not; ordered by route table and then by attachment,
     /// which is the order `GetTransitGatewayRouteTablePropagations` reports and pages over.
     pub transit_gateway_propagations: BTreeMap<(String, String), TransitGatewayPropagationRecord>,
+    /// Which prefix list is referenced as a route of which transit gateway route table, by
+    /// (`TransitGatewayRouteTableId`, `PrefixListId`) — see
+    /// [`TransitGatewayPrefixListReferenceRecord`] and the module docs. One entry per pair,
+    /// because a route table has at most one route per prefix list; ordered by route table
+    /// and then by prefix list, which is the order `GetTransitGatewayPrefixListReferences`
+    /// reports and pages over.
+    pub transit_gateway_prefix_list_references:
+        BTreeMap<(String, String), TransitGatewayPrefixListReferenceRecord>,
     /// Every Dedicated Host the account holds, by `HostId`, as the modelled [`Host`]
     /// shape itself — so a member a writer sets round-trips through a describe without a
     /// field-by-field copy that can silently drop one. Ordered by id, which is the order
@@ -2294,6 +2314,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_available_at: BTreeMap::new(),
             transit_gateway_route_tables: BTreeMap::new(),
             transit_gateway_propagations: BTreeMap::new(),
+            transit_gateway_prefix_list_references: BTreeMap::new(),
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
             vpc_endpoint_connections: BTreeMap::new(),
@@ -4405,6 +4426,20 @@ impl ComAmazonawsEc2Amazonec2State {
             if self.transit_gateway_propagations.remove(&key).is_some() {
                 // Exactly what the enable charged for the record.
                 self.release_stored_bytes(STORED_RECORD_OVERHEAD_BYTES);
+            }
+        }
+        // The end of the `pending` a `CreateTransitGatewayPrefixListReference` answers with:
+        // the route is in the table once the move falls due, whether or not anybody called
+        // again, exactly like every other move above.
+        for record in self.transit_gateway_prefix_list_references.values_mut() {
+            if let Some(state) = record
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string)
+            {
+                record.view.state = Some(state);
+                record.pending = None;
             }
         }
         let connections = &mut self.vpc_endpoint_connections;
@@ -15354,6 +15389,28 @@ pub fn invalid_transit_gateway_route_table_id_not_found<E>(route_table_id: &str)
     )
 }
 
+/// Refuse a request that named something that is not a transit gateway route table id at
+/// all: HTTP 400 [`INVALID_ROUTE_TABLE_ID_MALFORMED`], BEFORE the id is looked up, so "not
+/// an id of this kind" is never reported as "no such route table".
+///
+/// The ONE place this resource's malformed refusal is worded, for every operation that
+/// resolves a `TransitGatewayRouteTableId`: like [`invalid_transit_gateway_route_table_id_not_found`]
+/// beside it, the message NAMES the resource and the id the request gave rather than using
+/// the resource-agnostic wording of [`require_well_formed_id`] — which is the wording EC2
+/// itself answers a malformed id of this resource with.
+pub fn require_well_formed_transit_gateway_route_table_id<E>(
+    route_table_id: &str,
+) -> Result<(), Scaffolded<E>> {
+    if prefixed_id_is_well_formed(TRANSIT_GATEWAY_ROUTE_TABLE_ID_PREFIX, route_table_id) {
+        return Ok(());
+    }
+    Err(Scaffolded::service_error(
+        INVALID_ROUTE_TABLE_ID_MALFORMED,
+        400,
+        format!("Invalid Transit Gateway Route Table id {route_table_id}."),
+    ))
+}
+
 /// A propagation whose enable is being carried out: the `TransitGatewayPropagationState`
 /// enum's `enabling` member ([`crate::ops::types::TRANSIT_GATEWAY_PROPAGATION_STATE_VALUES`]).
 pub const PROPAGATION_STATE_ENABLING: &str = "enabling";
@@ -15652,6 +15709,145 @@ impl ComAmazonawsEc2Amazonec2State {
         route_table_id: &'a str,
     ) -> impl Iterator<Item = &'a TransitGatewayPropagationRecord> {
         self.transit_gateway_propagations
+            .range((route_table_id.to_string(), String::new())..)
+            .take_while(move |((table, _), _)| table == route_table_id)
+            .map(|(_, record)| record)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transit gateway prefix list references
+// ---------------------------------------------------------------------------
+
+// The id prefix a prefix list carries lives beside the other resource-id prefixes as
+// `PREFIX_LIST_ID_PREFIX`; a reference's form check holds a `PrefixListResourceId` to the
+// EC2 resource-id form every other id of this module is held to
+// ([`prefixed_id_is_well_formed`]: `pl-` and 8 or 17 lowercase hexadecimal digits, the two
+// forms AWS's own prefix list ids take), since the model publishes no `@pattern` for that
+// shape (`smithy_query(query="shape",shape="PrefixListResourceId")` is a plain `String`).
+
+/// `InvalidPrefixListId.Malformed` (HTTP 400): the request named something that is not a
+/// prefix list id at all, so there is nothing to reference.
+///
+/// Spelled like [`INVALID_ROUTE_TABLE_ID_MALFORMED`], the sibling code the same requests
+/// answer for the route table they name, so one family of refusals reads one way.
+pub const INVALID_PREFIX_LIST_ID_MALFORMED: &str = "InvalidPrefixListId.Malformed";
+
+/// A prefix list reference the service is still putting into the route table: the
+/// `TransitGatewayPrefixListReferenceState` enum's `pending` member
+/// ([`crate::ops::types::TRANSIT_GATEWAY_PREFIX_LIST_REFERENCE_STATE_VALUES`]).
+pub const PREFIX_LIST_REFERENCE_STATE_PENDING: &str = "pending";
+
+/// A prefix list reference that is in force as a route of its route table: that enum's
+/// `available` member.
+pub const PREFIX_LIST_REFERENCE_STATE_AVAILABLE: &str = "available";
+
+/// One prefix list reference of one transit gateway route table: the modelled
+/// [`TransitGatewayPrefixListReference`] every operation that reports one answers with, plus
+/// the move the clock owes it.
+///
+/// The view is kept as the modelled shape rather than a parallel record, for the reason the
+/// attachment and announcement stores are: the create and the read answer the one stored
+/// item, so they cannot describe one reference differently.
+#[derive(Debug, Clone)]
+pub struct TransitGatewayPrefixListReferenceRecord {
+    /// The reference as the model shapes it, carrying the state reached so far.
+    pub view: TransitGatewayPrefixListReference,
+    /// The move the clock owes this reference, while one is owed.
+    pub pending: Option<PendingStateMove>,
+}
+
+/// What one stored prefix list reference costs against the crate's byte budget: the fixed
+/// [`STORED_RECORD_OVERHEAD_BYTES`] every record costs plus the two caller-supplied ids it
+/// holds.
+///
+/// The ONE definition of that cost, like [`capacity_block_payload_bytes`] is for a Capacity
+/// Block: a writer charges exactly it through
+/// [`ComAmazonawsEc2Amazonec2State::insert_transit_gateway_prefix_list_reference`], and a
+/// handler asking `would_exceed_stored_bytes` BEFORE the write asks about the same figure,
+/// so the pre-check and the charge cannot drift apart.
+pub fn transit_gateway_prefix_list_reference_payload_bytes(
+    route_table_id: &str,
+    prefix_list_id: &str,
+) -> usize {
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(route_table_id.len())
+        .saturating_add(prefix_list_id.len())
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another prefix list reference fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_attachment_capacity`].
+    pub fn has_transit_gateway_prefix_list_reference_capacity(&self) -> bool {
+        self.transit_gateway_prefix_list_references.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+
+    /// Store the reference to `prefix_list_id` in `route_table_id` and answer it as it now
+    /// stands — or `None` when the store is at [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING
+    /// was stored.
+    ///
+    /// The ONE place a prefix list reference is built, so every operation that reports one
+    /// reports the same member set: the owning account and the `pending` state come from
+    /// here rather than from a request, and the clock owes the reference
+    /// [`PREFIX_LIST_REFERENCE_STATE_AVAILABLE`] [`TRANSITION_DELAY`] later — the span is
+    /// never zero, so a caller acting straight after the create still sees it pending.
+    ///
+    /// The caller-chosen bytes the record holds are charged here on top of the fixed
+    /// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, so no path can store one
+    /// uncharged.
+    pub fn insert_transit_gateway_prefix_list_reference(
+        &mut self,
+        route_table_id: &str,
+        prefix_list_id: &str,
+        blackhole: bool,
+        attachment: Option<TransitGatewayPrefixListAttachment>,
+    ) -> Option<TransitGatewayPrefixListReference> {
+        if !self.has_transit_gateway_prefix_list_reference_capacity() {
+            return None;
+        }
+        let view = TransitGatewayPrefixListReference {
+            transit_gateway_route_table_id: Some(route_table_id.to_string()),
+            prefix_list_id: Some(prefix_list_id.to_string()),
+            // "The ID of the prefix list owner" (`$PrefixListOwnerId`): the account this
+            // emulator serves, which is the account every resource it stores belongs to.
+            prefix_list_owner_id: Some(::engine::emulator_account_id().to_string()),
+            state: Some(PREFIX_LIST_REFERENCE_STATE_PENDING.to_string()),
+            blackhole: Some(blackhole),
+            transit_gateway_attachment: attachment,
+        };
+        self.add_stored_bytes(transit_gateway_prefix_list_reference_payload_bytes(
+            route_table_id,
+            prefix_list_id,
+        ));
+        self.transit_gateway_prefix_list_references.insert(
+            (route_table_id.to_string(), prefix_list_id.to_string()),
+            TransitGatewayPrefixListReferenceRecord {
+                view: view.clone(),
+                pending: Some(PendingStateMove::starting_now(
+                    PREFIX_LIST_REFERENCE_STATE_AVAILABLE,
+                )),
+            },
+        );
+        Some(view)
+    }
+
+    /// The prefix list references of one transit gateway route table, in prefix-list-id
+    /// order — the stable order `GetTransitGatewayPrefixListReferences` reports and pages
+    /// over.
+    ///
+    /// The store is keyed by (route table, prefix list), so this is a RANGE over the keys of
+    /// one route table rather than a scan of every reference stored, exactly as
+    /// [`Self::transit_gateway_route_table_propagations`] is.
+    ///
+    /// A read, so it writes nothing: the caller applies the clock-owed moves
+    /// ([`Self::materialize_due_transitions`]) before asking.
+    pub fn transit_gateway_prefix_list_references_of<'a>(
+        &'a self,
+        route_table_id: &'a str,
+    ) -> impl Iterator<Item = &'a TransitGatewayPrefixListReferenceRecord> {
+        self.transit_gateway_prefix_list_references
             .range((route_table_id.to_string(), String::new())..)
             .take_while(move |((table, _), _)| table == route_table_id)
             .map(|(_, record)| record)
@@ -20882,6 +21078,7 @@ impl ComAmazonawsEc2Amazonec2State {
         }
     }
 }
+
 // ---------------------------------------------------------------------------
 // Network Access Scopes and their analyses
 // ---------------------------------------------------------------------------

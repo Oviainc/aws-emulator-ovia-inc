@@ -142,10 +142,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The request's own form first: an id that is not an id of its kind at all is
         // refused as malformed, so "not an id of this kind" never reads as "no such
         // resource" and is never answered by the DryRun arm below either.
-        state::require_well_formed_id(
-            state::TRANSIT_GATEWAY_ROUTE_TABLE_ID_PREFIX,
+        state::require_well_formed_transit_gateway_route_table_id(
             &input.transit_gateway_route_table_id,
-            state::INVALID_ROUTE_TABLE_ID_MALFORMED,
         )?;
         if let Some(attachment_id) = input.transit_gateway_attachment_id.as_deref() {
             state::require_well_formed_id(

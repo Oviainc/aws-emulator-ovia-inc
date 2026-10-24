@@ -322,8 +322,8 @@ impl SerializableStruct for WithReturnFlag<'_> {
 /// three parts of EC2's envelope the Smithy protocol definition does not
 /// describe.
 ///
-/// Request reading, routing and the error envelope's shape are the framework's
-/// unchanged — this only adds what EC2 writes on top.
+/// Request reading and routing are the framework's unchanged, and so is the shape of
+/// the error envelope down to `</Errors>` — this only adds what EC2 writes on top.
 #[derive(Debug)]
 pub struct Ec2QueryEnvelope {
     inner: QueryServerProtocol,

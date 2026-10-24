@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTransitGatewayPrefixListReferences
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTransitGatewayPrefixListReferences`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTransitGatewayPrefixListReferences::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the prefix list references [`crate::state`] holds for the transit
+//! gateway route table the request names, narrowed by `Filters` and paged by `MaxResults` /
+//! `NextToken`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +77,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::borrow::Cow;
+
+use crate::state::{
+    CompiledFilter, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES,
+    MatchBudget, TransitGatewayPrefixListReferenceRecord,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -150,18 +151,250 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTransitGatewayPrefixListReferences` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTransitGatewayPrefixListReferencesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTransitGatewayPrefixListReferences"))
+        // `ctx` carries request metadata only; this operation reads none of it — a route
+        // table is named by id. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // The request's own form first: an id that is not a transit gateway route table id
+        // at all is refused as malformed, so "not an id of this kind" never reads as "no
+        // such route table".
+        state::require_well_formed_transit_gateway_route_table_id(
+            &input.transit_gateway_route_table_id,
+        )?;
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation" (`$DryRun`). Every
+        // caller of this emulator is permitted, so a dry run reports that outcome and reads
+        // nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+
+        // "The token for the next page of results" (`NextToken`) — a token this service did
+        // not mint is refused rather than read as an id, and it is refused before the store
+        // is read, so whether a bogus token is caught never depends on what the store
+        // holds.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_page_token(token).ok_or_else(state::invalid_pagination_token)?,
+            ),
+        };
+
+        // Matching cost is filters x values x value length x stored references, and the
+        // model bounds none of them (`FilterList` and `Filter$Values` carry no `@length`),
+        // so every request-controlled factor is capped HERE, before any work proportional
+        // to it is done and before the store is locked — the same ceilings every other
+        // filtered report of this service enforces, from `crate::state`.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any
+        // reference would have matched it, so an unsupported filter can never read as "no
+        // results". Each value is compiled into its pattern ONCE here, rather than
+        // recompiled for every candidate reference.
+        let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !PREFIX_LIST_REFERENCE_FILTERS.contains(&name) {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so a value's size is bounded
+            // here too.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            compiled.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        let mut store = state_handle.lock();
+        // The clock-owed moves this read is allowed to apply — the same call every describe
+        // of this service makes: a reference a create answered as `pending` is `available`
+        // once its due instant has passed, whether or not anybody called, so applying them
+        // here changes nothing a later caller would not have seen anyway.
+        store.materialize_due_transitions();
+
+        // "The ID of the transit gateway route table": a route table this account does not
+        // hold is an error, not an empty page — otherwise a typo reads as "nothing is
+        // referenced".
+        if !store
+            .transit_gateway_route_tables
+            .contains_key(&input.transit_gateway_route_table_id)
+        {
+            return Err(state::invalid_transit_gateway_route_table_id_not_found(
+                &input.transit_gateway_route_table_id,
+            ));
+        }
+
+        // Every filter must hold ("If you specify multiple filters, the filters are joined
+        // with an AND" — `Filter`), and every comparison is charged to ONE budget, so the
+        // product of stored references, filters, values and value length is bounded however
+        // the caller combines them — which is also what bounds how long this holds the
+        // store's lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<&TransitGatewayPrefixListReferenceRecord> = Vec::new();
+        for record in
+            store.transit_gateway_prefix_list_references_of(&input.transit_gateway_route_table_id)
+        {
+            if budget.exhausted() {
+                break;
+            }
+            if state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(record, name)
+            }) {
+                selected.push(record);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                     comparisons to evaluate; narrow them or page with MaxResults"
+                ),
+            ));
+        }
+
+        // Page in `PrefixListId` order, which the cursor below names a position in. The
+        // store is an ordered map keyed by (route table, prefix list), so its iteration
+        // order already satisfies this sort; doing it here establishes the invariant the
+        // cursor depends on at the point of use rather than inheriting it from the container
+        // `crate::state` happens to hold.
+        selected.sort_by(|left, right| {
+            left.view
+                .prefix_list_id
+                .cmp(&right.view.prefix_list_id)
+        });
+
+        // That order is both the stable paging order and the cursor, so a token naming the
+        // prefix list the next page starts at always advances.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|record| {
+                record.view.prefix_list_id.as_deref().unwrap_or_default() < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of results to return with a single call" (`MaxResults`). A
+        // request that names none gets the largest page the model publishes, so the
+        // `NextToken` path behaves the same whether or not a page size was asked for. The
+        // model's `range 5..1000` has already refused anything outside it; the floor of
+        // [`MIN_MAX_RESULTS`] is applied anyway, because a page size of zero would mint a
+        // token for a page that carried nothing and leave a paging client in a loop that
+        // never advances.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .max(MIN_MAX_RESULTS);
+
+        // "This value is null when there are no more results to return" (`NextToken`): a
+        // token only when a reference follows this page.
+        let next_token = page.get(limit).map(|record| {
+            state::encode_page_token(record.view.prefix_list_id.as_deref().unwrap_or_default())
+        });
+
+        Ok(GetTransitGatewayPrefixListReferencesOutput {
+            transit_gateway_prefix_list_references: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|record| record.view.clone())
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The page size a request that names no `MaxResults` gets: the largest the model publishes
+/// (`TransitGatewayMaxResults`, `range 5..1000`), which is also the most EC2 returns in one
+/// page.
+const DEFAULT_MAX_RESULTS: usize = 1000;
+
+/// The smallest page this operation will serve: the minimum of the same published range
+/// (`TransitGatewayMaxResults`, `range 5..1000`). The boundary validator refuses anything
+/// below it, so this is the floor that keeps a page of zero — which would mint a token for a
+/// page carrying nothing — unreachable however the request is read.
+const MIN_MAX_RESULTS: usize = 5;
+
+/// The filter names this operation documents, from
+/// `GetTransitGatewayPrefixListReferencesRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="GetTransitGatewayPrefixListReferencesRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// No `tag:` filter: a prefix list reference is not a tagged resource. Every entry must be
+/// answered by [`filter_values`].
+const PREFIX_LIST_REFERENCE_FILTERS: [&str; 7] = [
+    "attachment.resource-id",
+    "attachment.resource-type",
+    "attachment.transit-gateway-attachment-id",
+    "is-blackhole",
+    "prefix-list-id",
+    "prefix-list-owner-id",
+    "state",
+];
+
+/// The values the EC2 filter `name` compares against this prefix list reference.
+///
+/// A filter naming an attribute this reference does not carry compares against NO values, so
+/// it selects nothing rather than everything — the answer for `attachment.resource-id` on a
+/// blackhole reference, which has no attachment at all.
+fn filter_values<'a>(
+    record: &'a TransitGatewayPrefixListReferenceRecord,
+    name: &str,
+) -> Vec<Cow<'a, str>> {
+    let attachment = record.view.transit_gateway_attachment.as_ref();
+    let member = |value: Option<&'a String>| -> Vec<Cow<'a, str>> {
+        value.map(|value| Cow::Borrowed(value.as_str())).into_iter().collect()
+    };
+    match name {
+        "attachment.resource-id" => member(attachment.and_then(|a| a.resource_id.as_ref())),
+        "attachment.resource-type" => member(attachment.and_then(|a| a.resource_type.as_ref())),
+        "attachment.transit-gateway-attachment-id" => {
+            member(attachment.and_then(|a| a.transit_gateway_attachment_id.as_ref()))
+        }
+        // "Whether traffic matching the route is blocked (true | false)": the booleans EC2
+        // compares a flag filter against, spelled the way the wire spells one.
+        "is-blackhole" => vec![Cow::Owned(
+            record.view.blackhole.unwrap_or(false).to_string(),
+        )],
+        "prefix-list-id" => member(record.view.prefix_list_id.as_ref()),
+        "prefix-list-owner-id" => member(record.view.prefix_list_owner_id.as_ref()),
+        "state" => member(record.view.state.as_ref()),
+        // Unreachable: [`PREFIX_LIST_REFERENCE_FILTERS`] has already refused every other
+        // name. An undefined name compares against nothing, so it could never widen a
+        // result even if that check were bypassed.
+        _ => Vec::new(),
     }
 }

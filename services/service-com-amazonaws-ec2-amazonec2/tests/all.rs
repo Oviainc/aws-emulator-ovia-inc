@@ -26,6 +26,14 @@ mod instance_attribute_reset;
 // neighbourhood of this suite is the contended region of this file.
 #[path = "all/local_gateway_routes.rs"]
 mod local_gateway_routes;
+// The transit gateway prefix list reference slice (create, then read it back) and the
+// error envelope's request id. Declared beside the suites above for the reason they
+// give: the sorted region is where every new ec2 suite inserts its lines, and these two
+// lines have already lost several serialized squash merges there.
+#[path = "all/transit_gateway_prefix_list_references.rs"]
+mod transit_gateway_prefix_list_references;
+#[path = "all/ec2_query_error_envelope.rs"]
+mod ec2_query_error_envelope;
 #[path = "all/address_transfers.rs"]
 mod address_transfers;
 #[path = "all/allowed_images_settings.rs"]

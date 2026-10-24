@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTransitGatewayPrefixListReference
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTransitGatewayPrefixListReference`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: adds the route to the prefix list the request names to the transit gateway
+//! route table it names, stores it as the modelled [`TransitGatewayPrefixListReference`]
+//! shape (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::transit_gateway_prefix_list_references`])
+//! and answers it in `pending`, with the clock owing it `available`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTransitGatewayPrefixListReference::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +138,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTransitGatewayPrefixListReference` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTransitGatewayPrefixListReferenceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it — every
+        // resource it acts on is named by id. The store is reached through the engine held
+        // on `self`.
+        let _ = ctx;
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // The request's own form first: an id that is not an id of its kind at all is
+        // refused as malformed, so "not an id of this kind" never reads as "no such
+        // resource" and is never answered by the DryRun arm below either.
+        state::require_well_formed_transit_gateway_route_table_id(
+            &input.transit_gateway_route_table_id,
+        )?;
+        state::require_well_formed_id(
+            state::PREFIX_LIST_ID_PREFIX,
+            &input.prefix_list_id,
+            state::INVALID_PREFIX_LIST_ID_MALFORMED,
+        )?;
+        // The prefix list is checked for FORM only, deliberately: "the prefix list that is
+        // used for destination matches" (`$PrefixListId`) may be one the account manages or
+        // one AWS publishes (an AWS-managed service prefix list, which no account creates),
+        // and this emulator holds no managed-prefix-list store to resolve either against. A
+        // well-formed id is therefore accepted and recorded as the route's destination,
+        // rather than refused as not found on the strength of a store that does not exist.
+        if let Some(attachment_id) = input.transit_gateway_attachment_id.as_deref() {
+            state::require_well_formed_id(
+                state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
+                attachment_id,
+                state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
+            )?;
+        }
+
+        // What the route DOES with the traffic that matches it: "the attachment to which
+        // traffic is routed" (`$TransitGatewayAttachmentId`) or "drop traffic that matches
+        // this route" (`$Blackhole`). A request that asks for neither has not said where
+        // that traffic goes, and one that asks for both has asked for two different things,
+        // so each is refused rather than silently resolved one way.
+        let blackhole = input.blackhole.unwrap_or(false);
+        match (blackhole, input.transit_gateway_attachment_id.as_deref()) {
+            (false, None) => {
+                return Err(Scaffolded::missing_parameter(
+                    "The request must name the attachment traffic matching this route is \
+                     routed to as transitGatewayAttachmentId, or set blackhole to drop it",
+                ));
+            }
+            (true, Some(attachment_id)) => {
+                return Err(Scaffolded::invalid_parameter_combination(format!(
+                    "A blackhole route drops the traffic that matches it, so it cannot also \
+                     route that traffic to the attachment '{attachment_id}'"
+                )));
+            }
+            _ => {}
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`$DryRun`): the flag asks about PERMISSION, not about the
+        // named resources, so it is answered before anything is resolved or written and
+        // every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first: whether this reference can be created is asked of the state the
+        // route table and its routes are ACTUALLY in rather than the one they were left in.
+        store.materialize_due_transitions();
+
+        // "The ID of the transit gateway route table" the reference is created in: a route
+        // table this account does not hold has no routes to add one to.
+        if !store
+            .transit_gateway_route_tables
+            .contains_key(&input.transit_gateway_route_table_id)
+        {
+            return Err(state::invalid_transit_gateway_route_table_id_not_found(
+                &input.transit_gateway_route_table_id,
+            ));
+        }
+
+        // "Information about the transit gateway attachment"
+        // (`TransitGatewayPrefixListReference$TransitGatewayAttachment`) is read off the
+        // STORED attachment, so the resource it attaches is the one the store holds rather
+        // than anything the request said about it.
+        let attachment = match input.transit_gateway_attachment_id.as_deref() {
+            None => None,
+            Some(attachment_id) => {
+                let stored = store
+                    .transit_gateway_attachments
+                    .get(attachment_id)
+                    .ok_or_else(|| {
+                        state::id_not_found(
+                            state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
+                            "transit gateway attachment ID",
+                            attachment_id,
+                        )
+                    })?;
+                Some(TransitGatewayPrefixListAttachment {
+                    transit_gateway_attachment_id: Some(attachment_id.to_string()),
+                    resource_type: Some(stored.view.resource_type().to_string()),
+                    resource_id: stored.view.resource_id().map(str::to_string),
+                })
+            }
+        };
+
+        // A route table carries at most one route per prefix list, so a prefix list it
+        // already references has nothing to create: the request is refused and nothing is
+        // written, which is how the first call's write is observable to a later one.
+        // Changing an existing reference is `ModifyTransitGatewayPrefixListReference`'s job.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTransitGatewayPrefixListReference"))
+        // `IncorrectState` is this service's choice of code: EC2's model declares no error
+        // shape for this operation at all
+        // (`smithy_query(query="operation",operation="CreateTransitGatewayPrefixListReference")`
+        // answers an empty `errors` list), and the EC2 API Reference documents no code of
+        // its own for a pair the table already routes, so the refusal is worded with the
+        // code this crate already answers for "the resource exists, in a state that does not
+        // admit this call" (`state::INCORRECT_STATE`). The status and the code are the
+        // contract; the message below is built from the request.
+        let key = (
+            input.transit_gateway_route_table_id.clone(),
+            input.prefix_list_id.clone(),
+        );
+        if let Some(existing) = store.transit_gateway_prefix_list_references.get(&key) {
+            return Err(state::incorrect_state(format!(
+                "The transit gateway route table '{route_table_id}' already references the \
+                 prefix list '{prefix_list_id}' in state '{state}'",
+                route_table_id = input.transit_gateway_route_table_id,
+                prefix_list_id = input.prefix_list_id,
+                state = existing.view.state.as_deref().unwrap_or_default(),
+            )));
+        }
+
+        // The bytes this record would add, charged against the crate's one byte budget
+        // BEFORE the write: a record count on its own admits ids of any length. The figure
+        // comes from the state's own helper, which is also what the write charges, so the
+        // pre-check and the charge cannot drift apart.
+        let payload_bytes = state::transit_gateway_prefix_list_reference_payload_bytes(
+            &input.transit_gateway_route_table_id,
+            &input.prefix_list_id,
+        );
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store another prefix list reference",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The record itself, built the one way this crate builds a prefix list reference —
+        // the owning account, the `pending` state and the clock-owed `available` move all
+        // come from the store, never from the request.
+        let Some(reference) = store.insert_transit_gateway_prefix_list_reference(
+            &input.transit_gateway_route_table_id,
+            &input.prefix_list_id,
+            blackhole,
+            attachment,
+        ) else {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {} prefix list references, which is as many as it \
+                 stores",
+                store.transit_gateway_prefix_list_references.len()
+            )));
+        };
+
+        // The answer is the record as it was stored, so this create and
+        // `GetTransitGatewayPrefixListReferences` cannot drift apart.
+        Ok(CreateTransitGatewayPrefixListReferenceOutput {
+            transit_gateway_prefix_list_reference: Some(reference),
+        })
     }
 }
