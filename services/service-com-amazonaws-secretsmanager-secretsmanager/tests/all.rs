@@ -19,6 +19,8 @@ mod secret_lifecycle;
 mod secret_resource_policy;
 #[path = "all/secret_rotation.rs"]
 mod secret_rotation;
+#[path = "all/secret_rotation_cancel.rs"]
+mod secret_rotation_cancel;
 #[path = "all/secret_tags_and_replication.rs"]
 mod secret_tags_and_replication;
 #[path = "all/secret_version_ids.rs"]
