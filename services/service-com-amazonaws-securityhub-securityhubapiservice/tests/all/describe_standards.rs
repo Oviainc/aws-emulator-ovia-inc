@@ -831,9 +831,10 @@ const ABBREVIATED_NAME_FORMS: [&str; 5] = ["NIST SP", "SP 800", " Rev.", " Rev "
 /// quoted in the two catalog divergence reports this suite was extended for. The
 /// rows span every description style the catalog uses — the "set of automated
 /// security checks" family (AI, both Foundational Security Best Practices entries,
-/// resource tagging), the CIS benchmark family, and the NIST publications — and
-/// include entries no report cited (AI, resource tagging) beside the ones that were.
-const VERBATIM_DESCRIPTIONS: [(&str, &str); 7] = [
+/// resource tagging), the CIS benchmark family, the NIST publications and both PCI DSS
+/// revisions — and include entries no report cited (AI, resource tagging, PCI DSS
+/// v3.2.1) beside the ones that were.
+const VERBATIM_DESCRIPTIONS: [(&str, &str); 9] = [
     (
         "AI Security Best Practices v1.0.0",
         "The AI Security Best Practices standard is a set of automated security checks that detect when deployed AI resources do not align with security best practices. The standard is defined by AWS security experts. This curated set of controls helps improve your security posture for most popular AI services.",
@@ -862,6 +863,20 @@ const VERBATIM_DESCRIPTIONS: [(&str, &str); 7] = [
         "NIST Special Publication 800-53 Revision 5",
         "NIST Special Publication 800-53 Revision 5 provides a catalog of security and privacy controls for information systems and organizations. This Security Hub standard automatically checks for your compliance readiness against a subset of NIST 800-53 R5 requirements.",
     ),
+    // The two PCI DSS revisions, whose published texts differ in more than the version
+    // token: the older names the requirement subset "a subset of PCI DSS
+    // requirements", the newer qualifies it "a subset of PCI DSS V4.0.1 requirements"
+    // (with the catalog's capital "V" there, beside the lowercase "v4.0.1" of the
+    // opening clause). A revision's description derived from its sibling's by swapping
+    // the version fails one of these two rows.
+    (
+        "PCI DSS v3.2.1",
+        "The Payment Card Industry Data Security Standard (PCI DSS) v3.2.1 is an information security standard for entities that store, process, and/or transmit cardholder data. This Security Hub standard automatically checks for your compliance readiness against a subset of PCI DSS requirements.",
+    ),
+    (
+        "PCI DSS v4.0.1",
+        "The Payment Card Industry Data Security Standard (PCI DSS) v4.0.1 is an information security standard for entities that store, process, and/or transmit cardholder data. This Security Hub standard automatically checks for your compliance readiness against a subset of PCI DSS V4.0.1 requirements.",
+    ),
 ];
 
 /// Wordings the published catalog does NOT use, each with the entry it would show up
@@ -875,7 +890,7 @@ const VERBATIM_DESCRIPTIONS: [(&str, &str); 7] = [
 /// (each of these is a difference the recording shows). Stated as forbidden
 /// SUBSTRINGS rather than whole strings, so a fresh rewording of the same entry
 /// fails here too.
-const PARAPHRASE_FORMS: [(&str, &str); 6] = [
+const PARAPHRASE_FORMS: [(&str, &str); 7] = [
     (
         "NIST Special Publication 800-171 Revision 2",
         "The National Institute of Standards and Technology (NIST)",
@@ -897,6 +912,10 @@ const PARAPHRASE_FORMS: [(&str, &str); 6] = [
         "CIS Azure Foundations Benchmark v4.0.0",
         "checks for your compliance readiness",
     ),
+    // The requirement-subset phrase of the OLDER PCI DSS revision, which is exactly
+    // what the newer entry serves when its description is the sibling's sentence with
+    // the version token swapped.
+    ("PCI DSS v4.0.1", "subset of PCI DSS requirements"),
 ];
 
 /// The entry a response reports under `name`, if any.
@@ -1199,4 +1218,107 @@ async fn every_catalog_entry_satisfies_the_modelled_constraints() {
         definitions.len(),
         "every catalog definition must be reported: {arns:?}"
     );
+}
+
+/// For each standard whose published description ends in the "...automatically
+/// checks(for) your compliance readiness against a subset of X requirements."
+/// sentence, the name X that entry's own published text uses for the requirement
+/// subset.
+///
+/// Source: the recorded AWS `DescribeStandards` response, as quoted in the catalog
+/// divergence reports this suite was extended for. The rows are deliberately NOT a
+/// family template: the four CIS AWS benchmark revisions and the CIS Azure benchmark
+/// all name the subset plainly "CIS" even though each entry's opening clause carries
+/// its own version, the NIST entries use the catalog's short publication form, and the
+/// two PCI DSS revisions disagree with each other — the older names it "PCI DSS", the
+/// newer qualifies it with the revision, "PCI DSS V4.0.1" (capital "V", beside the
+/// lowercase "v4.0.1" of that entry's opening clause).
+const REQUIREMENT_SUBSET_NAMES: [(&str, &str); 9] = [
+    ("CIS AWS Foundations Benchmark v1.2.0", "CIS"),
+    ("CIS AWS Foundations Benchmark v1.4.0", "CIS"),
+    ("CIS AWS Foundations Benchmark v3.0.0", "CIS"),
+    ("CIS AWS Foundations Benchmark v5.0.0", "CIS"),
+    ("CIS Azure Foundations Benchmark v4.0.0", "CIS"),
+    (
+        "NIST Special Publication 800-171 Revision 2",
+        "NIST 800-171 R2",
+    ),
+    (
+        "NIST Special Publication 800-53 Revision 5",
+        "NIST 800-53 R5",
+    ),
+    ("PCI DSS v3.2.1", "PCI DSS"),
+    ("PCI DSS v4.0.1", "PCI DSS V4.0.1"),
+];
+
+/// The catalog entries whose published text is the "set of automated security checks"
+/// form instead, which names no requirement subset at all.
+///
+/// Source: the same recorded response; these are the entries whose verbatim text is
+/// asserted in `VERBATIM_DESCRIPTIONS`.
+const NO_REQUIREMENT_SUBSET: [&str; 4] = [
+    "AI Security Best Practices v1.0.0",
+    "AWS Foundational Security Best Practices v1.0.0",
+    "AWS Resource Tagging Standard v1.0.0",
+    "Azure Foundational Security Best Practices v1.0.0",
+];
+
+/// RULE: a catalog entry's `Description` is the published text for THAT standard, so
+/// where that text names a requirement subset it names it exactly as published for that
+/// entry — the name is per entry and is not obtained by substituting a version token
+/// into a sibling revision's sentence (nor by dropping one from it).
+///
+/// The table spans every entry of the catalog that uses the requirement-subset
+/// sentence — three standard families, both providers, four revisions of one benchmark
+/// and both revisions of another, including entries no report cited — plus the four
+/// entries whose published text names no subset at all, which must not grow the phrase.
+#[tokio::test]
+async fn each_entry_names_its_requirement_subset_as_published() {
+    let region = "us-east-2";
+    let harness = Harness::new(region);
+    let (status, body) = harness.describe_standards("").await;
+    assert_eq!(status, 200, "expected 200, got {status} with {body}");
+
+    assert_eq!(
+        REQUIREMENT_SUBSET_NAMES.len() + NO_REQUIREMENT_SUBSET.len(),
+        STANDARDS_CATALOG.len(),
+        "between them the two tables must classify every catalog entry, got {} and {}",
+        REQUIREMENT_SUBSET_NAMES.len(),
+        NO_REQUIREMENT_SUBSET.len()
+    );
+
+    for (case, subset) in REQUIREMENT_SUBSET_NAMES {
+        let entry = entry_named(&body, case)
+            .unwrap_or_else(|| panic!("case {case:?}: the catalog must report this standard"));
+        let description = entry["Description"].as_str().unwrap_or_default();
+        let expected = format!("against a subset of {subset} requirements.");
+        assert!(
+            description.ends_with(expected.as_str()),
+            "case {case:?}: expected the description to end {expected:?}, got {description:?}"
+        );
+        // The subset name is matched case-sensitively above; this pins the one place
+        // the published texts of two revisions of a family differ, so an entry serving
+        // the sibling's phrase fails even if it ends with a longer sentence.
+        for (other_case, other_subset) in REQUIREMENT_SUBSET_NAMES {
+            if other_case == case || other_subset == subset {
+                continue;
+            }
+            assert!(
+                !description.ends_with(&format!("against a subset of {other_subset} requirements.")),
+                "case {case:?}: names {other_case:?}'s requirement subset \
+                 {other_subset:?}, got {description:?}"
+            );
+        }
+    }
+
+    for case in NO_REQUIREMENT_SUBSET {
+        let entry = entry_named(&body, case)
+            .unwrap_or_else(|| panic!("case {case:?}: the catalog must report this standard"));
+        let description = entry["Description"].as_str().unwrap_or_default();
+        assert!(
+            !description.contains("subset of"),
+            "case {case:?}: this entry's published text names no requirement subset, \
+             got {description:?}"
+        );
+    }
 }

@@ -18,22 +18,24 @@
 //!
 //! # What is served
 //!
-//! The two interactions the FHIR RESTful API defines over a resource's lifetime
-//! start:
+//! The interactions the FHIR RESTful API defines over a resource's lifetime start:
 //!
 //! * `create` — `POST [base]/{type}`, which assigns the logical id (FHIR requires the
 //!   server to assign one and to IGNORE any `id` the submitted resource carries), and
 //!   answers `201` with the stored resource and its `Location`;
 //! * `read` — `GET [base]/{type}/{id}`, which answers `200` with the stored resource,
 //!   byte-for-byte what the create stored, and `404` for an id the data store holds no
-//!   resource under.
+//!   resource under;
+//! * `update`, including `update-as-create` — `PUT [base]/{type}/{id}`, which stores the
+//!   submitted resource AT the caller-chosen id: `200` when it replaces the version
+//!   held there, `201` when it creates the resource at that id, and the resource is then
+//!   readable through `read`.
 //!
-//! Every other interaction on this path space (`update`, `delete`, `search`,
-//! `vread`, the batch/transaction endpoint) is answered `501` with an
-//! `OperationOutcome` of `not-supported`, which is this emulator's "not implemented
-//! yet" for a FHIR wire — never an empty `200` that would look like a successful
-//! interaction nothing performed. Each is its own gap, to be implemented against its
-//! own recorded behaviour.
+//! Every other interaction on this path space (`delete`, `search`, `vread`, the
+//! batch/transaction endpoint) is answered `501` with an `OperationOutcome` of
+//! `not-supported`, which is this emulator's "not implemented yet" for a FHIR wire —
+//! never an empty `200` that would look like a successful interaction nothing performed.
+//! Each is its own gap, to be implemented against its own recorded behaviour.
 //!
 //! # The error envelope
 //!
@@ -84,6 +86,14 @@ const EXCEPTION: &str = "exception";
 /// names are short UpperCamelCase tokens; the bound keeps a long path segment out of
 /// the store's keys and out of a message.
 const MAX_RESOURCE_TYPE_LEN: usize = 64;
+
+/// The longest FHIR logical id this endpoint accepts from a caller.
+///
+/// FHIR R4's `id` primitive type is `[A-Za-z0-9\-\.]{1,64}` ("Any combination of upper-
+/// or lower-case ASCII letters, numerals, '-' and '.', with a length limit of 64
+/// characters"), which is what [`is_logical_id`] enforces for the id an `update` places
+/// a resource at.
+const MAX_LOGICAL_ID_LEN: usize = 64;
 
 /// How many logical ids a create offers before it gives up.
 ///
@@ -154,13 +164,23 @@ impl<Eng: Send + Sync + 'static> FhirRestDataPlane<Eng> {
                 ),
             },
             ("GET", [resource_type, id]) => self.read(&route, resource_type, id),
+            ("PUT", [resource_type, id]) => match req.body().bytes() {
+                Some(body) => self.update(&route, resource_type, id, body),
+                // As for the create: the router buffers every request before dispatch,
+                // so a body it cannot hand back in memory is a server-side failure.
+                None => outcome(
+                    500,
+                    EXCEPTION,
+                    "The server could not read the submitted resource from the request body",
+                ),
+            },
             (method, _) => outcome(
                 501,
                 NOT_SUPPORTED,
                 &format!(
-                    "This data store endpoint implements the FHIR create (POST [base]/{{type}}) \
-                     and read (GET [base]/{{type}}/{{id}}) interactions; {} {} is not \
-                     implemented yet",
+                    "This data store endpoint implements the FHIR create (POST [base]/{{type}}), \
+                     read (GET [base]/{{type}}/{{id}}) and update (PUT [base]/{{type}}/{{id}}) \
+                     interactions; {} {} is not implemented yet",
                     bounded(method),
                     bounded(&format!("[base]/{}", route.interaction.join("/")))
                 ),
@@ -178,17 +198,8 @@ impl<Eng: Send + Sync + 'static> FhirRestDataPlane<Eng> {
         // ceiling alone would admit the count times whatever one body the transport
         // accepts, so the size of one resource is refused here and the retained totals
         // below.
-        if body.len() > crate::state::MAX_FHIR_RESOURCE_BYTES {
-            return outcome(
-                413,
-                TOO_LONG,
-                &format!(
-                    "A FHIR resource this endpoint stores is at most {} bytes; the submitted \
-                     one is {} bytes",
-                    crate::state::MAX_FHIR_RESOURCE_BYTES,
-                    body.len()
-                ),
-            );
+        if let Err(failure) = submitted_within_size(body) {
+            return failure.response();
         }
         let submitted = match submitted_resource(body, resource_type) {
             Ok(submitted) => submitted,
@@ -282,35 +293,10 @@ impl<Eng: Send + Sync + 'static> FhirRestDataPlane<Eng> {
                 ),
             );
         }
-        let held_bytes = store
-            .datastores
-            .get(&route.datastore_id)
-            .map_or(0, |datastore| datastore.fhir_resource_bytes);
-        if held_bytes.saturating_add(bytes) > crate::state::MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE {
-            return outcome(
-                507,
-                TOO_COSTLY,
-                &format!(
-                    "This data store already retains as many FHIR resource bytes as this \
-                     emulator holds for one data store ({})",
-                    crate::state::MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE
-                ),
-            );
-        }
-        if store
-            .fhir_resource_bytes_total()
-            .saturating_add(bytes)
-            > crate::state::MAX_FHIR_RESOURCE_BYTES_TOTAL
-        {
-            return outcome(
-                507,
-                TOO_COSTLY,
-                &format!(
-                    "This emulator already retains as many FHIR resource bytes as it holds \
-                     across every data store ({})",
-                    crate::state::MAX_FHIR_RESOURCE_BYTES_TOTAL
-                ),
-            );
+        // The retention budgets, charged the same way for a create and for an update:
+        // a create retains one more resource and releases none.
+        if let Err(failure) = admits(&store, &route.datastore_id, bytes, 0, true) {
+            return failure.response();
         }
         let resource = crate::state::FhirResource {
             resource_type: resource_type.to_string(),
@@ -333,6 +319,146 @@ impl<Eng: Send + Sync + 'static> FhirRestDataPlane<Eng> {
             .fhir_resources
             .insert((resource_type.to_string(), id), resource);
         let mut response = fhir_response(201, serialized);
+        response.headers_mut().insert("location", location);
+        response
+            .headers_mut()
+            .insert("etag", format!("W/\"{version}\""));
+        response
+    }
+
+    /// The FHIR `update` interaction, and with it `update-as-create`: store the
+    /// submitted resource AT the logical id the URL names.
+    ///
+    /// FHIR R4 §3.1.0.5 ("update"): the id is the CALLER's here, not the server's — the
+    /// opposite of `create` — and a server that supports update-as-create stores the
+    /// resource at that id when it holds none, answering `201`; replacing the version it
+    /// does hold answers `200`. Either way the stored version is the one a later `read`
+    /// answers, and `meta.versionId` advances with every write.
+    fn update(
+        &self,
+        route: &FhirEndpointPath,
+        resource_type: &str,
+        id: &str,
+        body: &[u8],
+    ) -> RtResponse {
+        if !is_resource_type_name(resource_type) {
+            return unknown_resource_type(resource_type);
+        }
+        // The id is the caller's, so unlike a minted one it has to be checked against
+        // the FHIR `id` type before it becomes a key of the store.
+        if !is_logical_id(id) {
+            return outcome(
+                400,
+                INVALID,
+                &format!(
+                    "'{}' is not a FHIR logical id: an id is 1 to {MAX_LOGICAL_ID_LEN} \
+                     characters of ASCII letters, digits, '-' and '.'",
+                    bounded(id)
+                ),
+            );
+        }
+        // The BYTES first, as the create does: a body larger than this endpoint stores
+        // is refused before it is parsed, let alone stored.
+        if let Err(failure) = submitted_within_size(body) {
+            return failure.response();
+        }
+        let submitted = match submitted_resource(body, resource_type) {
+            Ok(submitted) => submitted,
+            Err(failure) => return failure.response(),
+        };
+        // "If the request body includes an id, it SHALL match the id in the URL": the
+        // two naming different resources is a refusal, not a silent re-filing.
+        if let Some(carried) = submitted.get("id").and_then(::serde_json::Value::as_str) {
+            if carried != id {
+                return outcome(
+                    400,
+                    INVALID,
+                    &format!(
+                        "The submitted resource's id is '{}', but the request URL names '{}'",
+                        bounded(carried),
+                        bounded(id)
+                    ),
+                );
+            }
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return store_unavailable();
+        };
+        let mut store = state.lock();
+        // Writing to a data store means first letting the registry catch up with the
+        // clock, exactly as the create does.
+        store.settle_lifecycle();
+        if let Err(failure) = serving(&store, &route.datastore_id) {
+            return failure.response();
+        }
+
+        // What is held at this id already decides everything that differs between the
+        // two outcomes: the version the write lands on, the bytes it gives back to the
+        // budget, and the status.
+        let replaced = store
+            .datastores
+            .get(&route.datastore_id)
+            .and_then(|datastore| datastore.fhir_resource(resource_type, id))
+            .map(|resource| (resource.version, resource.bytes));
+
+        let now = SystemTime::now();
+        let stamp = ::aws_smithy_types::DateTime::from(now);
+        let Ok(last_updated) = stamp.fmt(::aws_smithy_types::date_time::Format::DateTime) else {
+            return outcome(
+                500,
+                EXCEPTION,
+                "The server could not render the resource's last-updated instant",
+            );
+        };
+        let version = replaced.map_or(1, |(held, _bytes)| held.saturating_add(1));
+        let content = stored_content(submitted, id, version, &last_updated);
+        let serialized = content.to_string();
+        let bytes = serialized.len();
+        // Exact per-resource ceiling on what is RETAINED, as the create applies it.
+        if bytes > crate::state::MAX_FHIR_RESOURCE_BYTES {
+            return outcome(
+                413,
+                TOO_LONG,
+                &format!(
+                    "A FHIR resource this endpoint stores is at most {} bytes; the one this \
+                     update would store is {bytes} bytes",
+                    crate::state::MAX_FHIR_RESOURCE_BYTES
+                ),
+            );
+        }
+        let released = replaced.map_or(0, |(_version, held_bytes)| held_bytes);
+        if let Err(failure) = admits(&store, &route.datastore_id, bytes, released, replaced.is_none())
+        {
+            return failure.response();
+        }
+
+        let resource = crate::state::FhirResource {
+            resource_type: resource_type.to_string(),
+            id: id.to_string(),
+            version,
+            last_updated: stamp,
+            content,
+            bytes,
+        };
+        let Some(datastore) = store.datastores.get_mut(&route.datastore_id) else {
+            // `serving` resolved the record under this same lock.
+            return store_unavailable();
+        };
+        let location = format!(
+            "{}{resource_type}/{id}/_history/{version}",
+            datastore.endpoint
+        );
+        // The replaced version's bytes go back to the budget before the new ones are
+        // charged, so repeatedly updating one resource does not accumulate.
+        datastore.fhir_resource_bytes = datastore
+            .fhir_resource_bytes
+            .saturating_sub(released)
+            .saturating_add(bytes);
+        datastore
+            .fhir_resources
+            .insert((resource_type.to_string(), id.to_string()), resource);
+        let status = if replaced.is_some() { 200 } else { 201 };
+        let mut response = fhir_response(status, serialized);
         response.headers_mut().insert("location", location);
         response
             .headers_mut()
@@ -437,10 +563,11 @@ fn submitted_resource(body: &[u8], resource_type: &str) -> Result<::serde_json::
 /// The submitted resource as it is STORED: its own content, with the two values the
 /// server owns written onto it.
 ///
-/// FHIR has the server assign the logical id and the version, so any `id`,
-/// `meta.versionId` or `meta.lastUpdated` the request carried is replaced rather than
-/// honoured. The REST of `meta` (a profile claim, a security label, a tag) is the
-/// caller's and is kept.
+/// The server owns the version and the last-updated instant, so any `meta.versionId` or
+/// `meta.lastUpdated` the request carried is replaced rather than honoured, and `id` is
+/// written to the id the resource is stored under — the one the server assigned on a
+/// `create`, the one the URL named on an `update`. The REST of `meta` (a profile claim,
+/// a security label, a tag) is the caller's and is kept.
 fn stored_content(
     submitted: ::serde_json::Value,
     id: &str,
@@ -540,6 +667,104 @@ fn store_unavailable() -> RtResponse {
         EXCEPTION,
         "The HealthLake data store registry is unavailable",
     )
+}
+
+/// `Ok` when a submitted body is small enough to store, before it is parsed.
+///
+/// Stated once for both writing interactions: a count ceiling alone would admit the
+/// count times whatever one body the transport accepts, so the size of ONE resource is
+/// refused here and the retained totals in [`admits`].
+fn submitted_within_size(body: &[u8]) -> Result<(), Failure> {
+    if body.len() <= crate::state::MAX_FHIR_RESOURCE_BYTES {
+        return Ok(());
+    }
+    Err(Failure::new(
+        413,
+        TOO_LONG,
+        format!(
+            "A FHIR resource this endpoint stores is at most {} bytes; the submitted one is \
+             {} bytes",
+            crate::state::MAX_FHIR_RESOURCE_BYTES,
+            body.len()
+        ),
+    ))
+}
+
+/// `Ok` when the data store `datastore_id` can RETAIN a resource of `bytes` that
+/// releases `released` bytes of a version it replaces, and whether that write adds a
+/// resource (`retains_one_more`) or replaces one.
+///
+/// The three ceilings this emulator holds the FHIR data plane to, in one place so a
+/// create and an update charge them identically: how many resources one data store
+/// holds, how many bytes one data store retains, and how many bytes every data store
+/// retains together. Each is checked BEFORE anything is written, and with
+/// `saturating_*`, so no product of caller-chosen factors can grow the heap and an
+/// arithmetic edge cannot wrap into an admission.
+fn admits(
+    store: &crate::state::ComAmazonawsHealthlakeHealthlakeState,
+    datastore_id: &str,
+    bytes: usize,
+    released: usize,
+    retains_one_more: bool,
+) -> Result<(), Failure> {
+    let datastore = store.datastores.get(datastore_id);
+    let held = datastore.map_or(0, |datastore| datastore.fhir_resources.len());
+    if retains_one_more && held >= crate::state::MAX_FHIR_RESOURCES_PER_DATASTORE {
+        return Err(Failure::new(
+            507,
+            TOO_COSTLY,
+            format!(
+                "This data store already holds the maximum number of FHIR resources this \
+                 emulator retains ({})",
+                crate::state::MAX_FHIR_RESOURCES_PER_DATASTORE
+            ),
+        ));
+    }
+    let held_bytes = datastore
+        .map_or(0, |datastore| datastore.fhir_resource_bytes)
+        .saturating_sub(released);
+    if held_bytes.saturating_add(bytes) > crate::state::MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE {
+        return Err(Failure::new(
+            507,
+            TOO_COSTLY,
+            format!(
+                "This data store already retains as many FHIR resource bytes as this \
+                 emulator holds for one data store ({})",
+                crate::state::MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE
+            ),
+        ));
+    }
+    if store
+        .fhir_resource_bytes_total()
+        .saturating_sub(released)
+        .saturating_add(bytes)
+        > crate::state::MAX_FHIR_RESOURCE_BYTES_TOTAL
+    {
+        return Err(Failure::new(
+            507,
+            TOO_COSTLY,
+            format!(
+                "This emulator already retains as many FHIR resource bytes as it holds \
+                 across every data store ({})",
+                crate::state::MAX_FHIR_RESOURCE_BYTES_TOTAL
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `segment` is a FHIR logical id.
+///
+/// FHIR R4's `id` primitive type: "Any combination of upper- or lower-case ASCII
+/// letters, numerals, '-' and '.', with a length limit of 64 characters" — so exactly
+/// `[A-Za-z0-9\-\.]{1,64}`. An `update` places a resource at a CALLER-chosen id, so this
+/// is the rule that id has to satisfy before it becomes a key of the store.
+fn is_logical_id(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() <= MAX_LOGICAL_ID_LEN
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
 }
 
 /// Whether `segment` names a FHIR resource type.

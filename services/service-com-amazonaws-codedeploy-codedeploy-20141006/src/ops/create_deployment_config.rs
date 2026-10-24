@@ -385,9 +385,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(routing) = &input.traffic_routing_config {
             let fault = if on_instance_fleet {
+                // A `Server` configuration deploys to instances rather than
+                // shifting traffic between function versions or task sets, so
+                // the member does not apply to it at all — the sentence names
+                // the member and the platform that will not take it.
                 Some(format!(
-                    "trafficRoutingConfig shifts traffic between function versions or task sets, \
-                     so it does not apply to a {compute_platform} deployment configuration"
+                    "Traffic routing configuration should be null for {compute_platform} \
+                     deployment configuration"
                 ))
             } else {
                 traffic_routing_fault(routing)
@@ -431,10 +435,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     CreateDeploymentConfigErrorModeled::DeploymentConfigAlreadyExistsException(
                         DeploymentConfigAlreadyExistsException {
-                            message: Some(format!(
-                                "A deployment configuration named {name} already exists with this \
-                                 account"
-                            )),
+                            message: Some(crate::state::deployment_config_already_exists(&name)),
                         },
                     ),
                 );

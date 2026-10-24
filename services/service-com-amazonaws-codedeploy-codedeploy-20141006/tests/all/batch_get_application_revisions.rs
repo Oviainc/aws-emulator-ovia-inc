@@ -6,8 +6,9 @@
 //! `RevisionLocation` the request carries, in the order the request named them,
 //! each holding exactly what `GetApplicationRevision` answers for that one
 //! revision of that application; it refuses a batch naming nothing with
-//! `RevisionRequiredException`, one past the documented maximum of 25 revisions
-//! with `BatchLimitExceededException`, a revision that names no location with
+//! `RevisionRequiredException`, one past the shared request-size quota its
+//! `BatchLimitExceededException` states (100)
+//! with that code, a revision that names no location with
 //! `InvalidRevisionException` and an application that is not stored with
 //! `ApplicationDoesNotExistException`.
 //!
@@ -21,15 +22,16 @@ use crate::codedeploy_lifecycle::{
     error_code, s3_revision, seeded_group, terminal_deployment, Emulator,
 };
 
-/// The maximum batch size CodeDeploy documents for this operation: "The maximum
-/// number of `RevisionLocation` objects you can specify is 25"
-/// (`smithy_query(query="doc",shape="BatchGetApplicationRevisionsInput",member="revisions")`;
-/// the operation models `BatchLimitExceededException` as the refusal past it).
+/// The request-size quota one `BatchGet*` request may carry, which is the one
+/// `BatchLimitExceededException` states for every batch reader of this service
+/// ("The maximum number of names or IDs allowed for this request (100) was
+/// exceeded"); the "25" the member's own prose carries is how many revisions a
+/// call reports on, not the size a request is accepted at.
 ///
 /// Deliberately a SECOND copy of the handler's constant: this suite asserts the
 /// bound AWS publishes, so importing the implementation's literal would make the
 /// test agree with whatever the handler happens to say.
-const MAX_BATCH_REVISIONS: usize = 25;
+const MAX_BATCH_SIZE: usize = 100;
 
 /// The `revisions` list of a successful answer.
 fn revisions(body: &Value, case: &str) -> Vec<Value> {
@@ -357,22 +359,24 @@ async fn a_batch_follows_the_registry_as_it_changes() {
     );
 }
 
-/// RULE: the documented batch maximum is 25 revisions — a batch of exactly 25 is
-/// answered, and one past it is refused with `BatchLimitExceededException` even
-/// when every revision it carries is registered.
+/// RULE: the batch request-size quota is the 100 names or ids
+/// `BatchLimitExceededException` states — a batch of up to that many is
+/// answered, and one past it is refused with that code even when every revision
+/// it carries is registered.
 #[tokio::test]
 async fn the_documented_batch_maximum_is_enforced() {
     let emulator = Emulator::new();
     let name = application(&emulator, "batch-bounded").await;
-    let locations: Vec<Value> = (0..=MAX_BATCH_REVISIONS)
+    let locations: Vec<Value> = (0..=MAX_BATCH_SIZE)
         .map(|index| s3_revision("artifacts", &format!("bounded-{index:03}.zip")))
         .collect();
     for (index, revision) in locations.iter().enumerate() {
         register(&emulator, &name, revision, &format!("bounded {index}")).await;
     }
 
-    // Each published bound, and one past it.
-    for size in [1usize, MAX_BATCH_REVISIONS - 1, MAX_BATCH_REVISIONS] {
+    // Sizes inside the quota: one, the figure the member's prose names, one past
+    // that, and the quota itself.
+    for size in [1usize, 25, 26, MAX_BATCH_SIZE] {
         let asked = &locations[..size];
         let body = emulator
             .ok(

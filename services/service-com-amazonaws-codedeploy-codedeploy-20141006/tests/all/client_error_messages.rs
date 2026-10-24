@@ -408,7 +408,7 @@ async fn an_unknown_deployment_configuration_is_named_after_the_delimiter() {
                 &case,
             )
             .await;
-            let expected = format!("No Deployment Configuration found for name: {ghost}");
+            let expected = format!("No deployment configuration found for name: {ghost}");
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"
