@@ -3587,6 +3587,28 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         alias_names_lens(alias, record).then_some(record)
     }
 
+    /// Drop an agent profile and everything keyed to it: every create token that
+    /// resolved to it, and the goals and contexts recorded against it with the create
+    /// tokens that resolved to those, so nothing outlives the profile it belongs to and
+    /// the next request carrying one of those tokens acts afresh.
+    ///
+    /// `DeleteAgentProfile` "deletes an optimization profile and its associated
+    /// configuration": the profile's own configuration — its pillars, aggregation
+    /// configuration and tags — lives on the record, and a goal or a context is reached
+    /// only through the profile it belongs to, so none of them can be left behind.
+    pub fn remove_agent_profile(&mut self, profile_arn: &str) -> Option<AgentProfileRecord> {
+        let record = self.agent_profiles.remove(profile_arn)?;
+        self.create_agent_profile_tokens
+            .retain(|token| token.profile_arn != profile_arn);
+        self.agent_goals.remove(profile_arn);
+        self.create_agent_goal_tokens
+            .retain(|token| token.profile_arn != profile_arn);
+        self.agent_contexts.remove(profile_arn);
+        self.create_agent_context_tokens
+            .retain(|token| token.profile_arn != profile_arn);
+        Some(record)
+    }
+
     /// The lens a `LensAlias` names, as of `now`: the whole catalog a lens name resolves
     /// against — the lenses Amazon Web Services publishes
     /// ([`AWS_OFFICIAL_LENS_ALIASES`]) and the custom lenses this account holds
@@ -4317,6 +4339,26 @@ pub fn agent_profile_not_found(profile_arn: &str) -> ResourceNotFoundException {
         AGENT_PROFILE_RESOURCE_TYPE,
         profile_arn.to_string(),
         &format!("agent profile with ARN {profile_arn}"),
+    )
+}
+
+/// [`conflict`] for a delete of an agent profile whose stored `deletionProtection` is
+/// enabled.
+///
+/// Deletion protection is the profile's own recorded answer to "may this resource be
+/// deleted" (`AgentProfileSummary$deletionProtection`, "Indicates whether deletion
+/// protection is enabled for the profile"), so a delete of a protected profile is
+/// refused by the resource's STATE rather than by anything wrong with the request — a
+/// 409 `ConflictException`, not a 400. The sentence names the ARN as sent and the member
+/// that has to change first, so a caller can clear the protection and retry.
+pub fn agent_profile_deletion_protected(profile_arn: &str) -> ConflictException {
+    conflict(
+        AGENT_PROFILE_RESOURCE_TYPE,
+        profile_arn.to_string(),
+        &format!(
+            "The agent profile with ARN {profile_arn} cannot be deleted while \
+             deletionProtection is enabled."
+        ),
     )
 }
 

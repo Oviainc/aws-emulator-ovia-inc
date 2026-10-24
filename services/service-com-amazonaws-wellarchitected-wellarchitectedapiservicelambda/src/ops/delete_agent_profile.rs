@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAgentProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAgentProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the stored agent profile the `profileArn` label names, together
+//! with the goals and contexts recorded against it and every create token that resolved
+//! to any of them, so a later `GetAgentProfile` or `DeleteAgentProfile` for that ARN
+//! answers `ResourceNotFoundException` (404). A profile whose stored `deletionProtection`
+//! is enabled is NOT removed: the delete is refused with `ConflictException` (409) and the
+//! profile stays readable.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAgentProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! That refusal is INFERRED from what the member means ("Indicates whether deletion
+//! protection is enabled for the profile"), not quoted from the operation's
+//! documentation, which says nothing about it; 409 is the modelled error for a request
+//! the resource's current state forbids. Because the member is `@default(true)`, a
+//! profile created without clearing it is undeletable until something clears it
+//! (`UpdateAgentProfile`, still a stub with its own issue) — which is what deletion
+//! protection is for.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +151,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAgentProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAgentProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAgentProfile"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAgentProfileErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool agent profile store is unavailable"
+                    .to_string(),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // The ARN is the profile's identity, so an ARN no stored profile carries — one of
+        // another account or Region, or one whose profile has already been deleted —
+        // resolves to nothing and is a 404.
+        let protected = store
+            .agent_profiles
+            .get(&input.profile_arn)
+            .ok_or_else(|| {
+                DeleteAgentProfileErrorModeled::ResourceNotFoundException(
+                    crate::state::agent_profile_not_found(&input.profile_arn),
+                )
+            })?
+            .deletion_protection;
+
+        // "Indicates whether deletion protection is enabled for the profile"
+        // (`AgentProfileSummary$deletionProtection`): the stored flag is what decides
+        // whether this call may remove the resource, so a protected profile is refused and
+        // left exactly as it was. The request itself is valid, so the refusal is the
+        // modelled 409 about the resource's state rather than a 400 about its input.
+        if protected {
+            return Err(DeleteAgentProfileErrorModeled::ConflictException(
+                crate::state::agent_profile_deletion_protected(&input.profile_arn),
+            )
+            .into());
+        }
+
+        // "This action cannot be undone": the profile and its configuration go, together
+        // with the goals and contexts recorded against it and every create token that
+        // resolved to any of them, so the ARN resolves to nothing afterwards and a create
+        // replaying that token acts afresh.
+        // The lookup above already proved the profile is there, so the removed record is
+        // deliberately discarded: this operation answers with nothing.
+        let _ = store.remove_agent_profile(&input.profile_arn);
+
+        Ok(DeleteAgentProfileOutput {})
     }
 }

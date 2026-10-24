@@ -17,6 +17,9 @@ mod agent_contexts;
 #[path = "all/agent_goals.rs"]
 mod agent_goals;
 
+#[path = "all/agent_profile_lifecycle.rs"]
+mod agent_profile_lifecycle;
+
 #[path = "all/custom_lens_import.rs"]
 mod custom_lens_import;
 
