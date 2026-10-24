@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeleteWorkloadEstimateUsage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeleteWorkloadEstimateUsage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the usage lines whose ids the request names from the workload estimate
+//! `workloadEstimateId` names, and lands the estimate's recomputed cost
+//! (`crate::state::WorkloadEstimate::recompute_cost`) — so a later read of the estimate
+//! and of its usage report the collection the delete left behind.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeleteWorkloadEstimateUsage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `workloadEstimateId` no live estimate carries is `ResourceNotFoundException` (HTTP
+//! 404) for the whole request. An `id` that estimate does not hold belongs to ONE entry,
+//! so it is reported in `errors` against that id while the other ids are still removed,
+//! which is what the per-entry `errors` list is modelled for.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +147,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeleteWorkloadEstimateUsage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteWorkloadEstimateUsageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeleteWorkloadEstimateUsage"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchDeleteWorkloadEstimateUsageErrorModeled::DataUnavailableException(
+                    DataUnavailableException {
+                        message: "the workload estimate store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = store.lock();
+        // Materialise what the clock has already made due, so this call does not operate
+        // on an estimate that is already past its `expiresAt`.
+        state.settle(crate::state::now_millis());
+
+        let Some(estimate) = state.workload_estimate_mut(&input.workload_estimate_id) else {
+            return Err(
+                BatchDeleteWorkloadEstimateUsageErrorModeled::ResourceNotFoundException(
+                    crate::state::workload_estimate_not_found(&input.workload_estimate_id),
+                )
+                .into(),
+            );
+        };
+
+        let mut errors = Vec::new();
+        for id in &input.ids {
+            let before = estimate.usage.len();
+            estimate.usage.retain(|line| &line.id != id);
+            if estimate.usage.len() == before {
+                // An id this estimate holds no line for is this ENTRY's failure, not the
+                // request's, reported against the id it named with the
+                // `WorkloadEstimateUpdateUsageErrorCode` value for a subject that is not
+                // there (smithy_query `shape="WorkloadEstimateUpdateUsageErrorCode"`:
+                // `BAD_REQUEST | NOT_FOUND | CONFLICT | INTERNAL_SERVER_ERROR`).
+                errors.push(BatchDeleteWorkloadEstimateUsageError2 {
+                    id: Some(id.clone()),
+                    error_code: Some("NOT_FOUND".to_string()),
+                    error_message: Some(format!(
+                        "this workload estimate holds no usage line {id}"
+                    )),
+                });
+            }
+        }
+
+        // The estimate's cost is the sum over the lines it holds, which this call just
+        // changed: an estimate left holding nothing costs nothing.
+        estimate.recompute_cost();
+        // The ids this call removed must not keep an idempotency record alive, exactly as
+        // deleting a whole estimate prunes the records naming it.
+        state.prune_idempotency();
+
+        Ok(BatchDeleteWorkloadEstimateUsageOutput {
+            errors: Some(errors),
+        })
     }
 }

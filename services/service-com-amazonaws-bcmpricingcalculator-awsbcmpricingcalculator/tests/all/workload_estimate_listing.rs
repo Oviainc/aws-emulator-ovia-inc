@@ -13,9 +13,7 @@
 //! drift from the front door that one exercises.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_bcmpricingcalculator_awsbcmpricingcalculator::{
-    state, ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState as ServiceState,
-};
+use service_com_amazonaws_bcmpricingcalculator_awsbcmpricingcalculator::state;
 
 use crate::bill_scenario_lifecycle::{error_code, Emulator};
 
@@ -29,6 +27,13 @@ const NAMES: [&str; 5] = [
     "BetaTwo9",
     "gamma-delta-epsilon",
 ];
+
+/// A usage this service publishes no rate for (`state::RATE_CARD` carries no row for
+/// this service code, usage type and operation), so a line modelling it has no cost and
+/// the estimate holding it needs the caller's attention.
+const UNPRICED_SERVICE_CODE: &str = "AWSLambda";
+const UNPRICED_USAGE_TYPE: &str = "Lambda-GB-Second";
+const UNPRICED_OPERATION: &str = "Invoke";
 
 /// Create every name in `names`, in order, and return their ids in that order.
 async fn seed(emulator: &Emulator, names: &[&str]) -> Vec<String> {
@@ -269,17 +274,17 @@ async fn a_filter_selects_on_the_attribute_it_names() {
             expected: vec![],
         },
         FilterCase {
-            case: "STATUS, the status every fresh estimate starts in",
-            name: "STATUS",
-            match_option: Some("EQUALS"),
-            values: vec![state::WORKLOAD_ESTIMATE_STATUS_UPDATING],
-            expected: vec!["alpha", "alpha-one", "alpha-two", "BetaTwo9"],
-        },
-        FilterCase {
-            case: "STATUS, the status only the settled estimate reached",
+            case: "STATUS, the status an estimate whose usage is all priced carries",
             name: "STATUS",
             match_option: Some("EQUALS"),
             values: vec![state::WORKLOAD_ESTIMATE_STATUS_VALID],
+            expected: vec!["alpha", "alpha-one", "alpha-two", "BetaTwo9"],
+        },
+        FilterCase {
+            case: "STATUS, the status only the estimate holding an unpriceable line carries",
+            name: "STATUS",
+            match_option: Some("EQUALS"),
+            values: vec![state::WORKLOAD_ESTIMATE_STATUS_ACTION_NEEDED],
             expected: vec!["gamma-delta-epsilon"],
         },
         FilterCase {
@@ -287,8 +292,8 @@ async fn a_filter_selects_on_the_attribute_it_names() {
             name: "STATUS",
             match_option: Some("EQUALS"),
             values: vec![
-                state::WORKLOAD_ESTIMATE_STATUS_UPDATING,
                 state::WORKLOAD_ESTIMATE_STATUS_VALID,
+                state::WORKLOAD_ESTIMATE_STATUS_ACTION_NEEDED,
             ],
             expected: vec![
                 "alpha",
@@ -302,18 +307,32 @@ async fn a_filter_selects_on_the_attribute_it_names() {
 
     let emulator = Emulator::new();
     let ids = seed(&emulator, &NAMES).await;
-    // The clock owes the LAST estimate its move out of the transient status: its
-    // recomputation window is backdated so the settlement is already due, which is what
-    // a caller who waited would have seen. Nothing else is touched, so the other four
-    // are still `UPDATING` and the STATUS rows above are deterministic.
+    // The LAST estimate is given one usage line this service publishes no rate for, so
+    // it is the only one in `ACTION_NEEDED` while the other four stay `VALID`, and the
+    // STATUS rows above are deterministic. Driven over the wire rather than poked into
+    // the store, so the status being filtered on is one the service itself assigned.
     {
-        let store = emulator.engine.state::<ServiceState>();
-        let mut guard = store.lock();
-        let settled = ids.last().expect("the store was seeded");
-        let estimate = guard
-            .workload_estimate_mut(settled)
-            .unwrap_or_else(|| panic!("{settled} was not stored"));
-        estimate.status_due_at_millis = state::now_millis() - 1;
+        let unpriceable = ids.last().expect("the store was seeded");
+        let (status, body) = emulator
+            .call(
+                "BatchCreateWorkloadEstimateUsage",
+                json!({
+                    "workloadEstimateId": unpriceable,
+                    "usage": [{
+                        "key": "k0",
+                        "serviceCode": UNPRICED_SERVICE_CODE,
+                        "usageType": UNPRICED_USAGE_TYPE,
+                        "operation": UNPRICED_OPERATION,
+                        "usageAccountId": "000000000000",
+                        "amount": 1.0,
+                    }],
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "seeding the unpriceable line: expected 200, got {status} with {body}"
+        );
     }
 
     for case in &cases {
@@ -346,12 +365,12 @@ async fn a_filter_selects_on_the_attribute_it_names() {
     for (case, status_value, expected) in [
         (
             "NAME and STATUS agreeing",
-            state::WORKLOAD_ESTIMATE_STATUS_VALID,
+            state::WORKLOAD_ESTIMATE_STATUS_ACTION_NEEDED,
             vec!["gamma-delta-epsilon"],
         ),
         (
             "NAME and STATUS disagreeing",
-            state::WORKLOAD_ESTIMATE_STATUS_UPDATING,
+            state::WORKLOAD_ESTIMATE_STATUS_VALID,
             vec![],
         ),
     ] {
