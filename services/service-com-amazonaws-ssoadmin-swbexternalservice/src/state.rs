@@ -300,6 +300,26 @@ pub const APPLICATION_URL_REQUIRED_MESSAGE: &str =
     "PortalOptions.SignInOptions.ApplicationUrl is required when \
      PortalOptions.SignInOptions.Origin is APPLICATION.";
 
+/// The refusal `CreateApplication` answers with when `ApplicationProviderArn` names a
+/// published provider that cannot back a CUSTOMER MANAGED OAuth 2.0 application, as the
+/// message of the modelled `ValidationException` (HTTP 400).
+///
+/// The rule is the operation's own documentation: it creates "an OAuth 2.0 customer
+/// managed application … for the given application provider" and "does not support
+/// creating SAML 2.0 customer managed applications or Amazon Web Services managed
+/// applications" — a SAML 2.0 application is set up in the console and an Amazon Web
+/// Services managed application is created by the service that owns its provider.
+///
+/// Built from the request: it names the provider ARN that cannot back the create, which
+/// is what tells this refusal from the one a provider ARN nothing publishes earns
+/// (`ResourceNotFoundException`).
+pub fn application_provider_unsupported_message(application_provider_arn: &str) -> String {
+    format!(
+        "Application provider {application_provider_arn} cannot be used to create an \
+         application. This operation creates OAuth 2.0 customer managed applications only."
+    )
+}
+
 /// `KmsKeyType::AWS_OWNED_KMS_KEY` — the instance is encrypted with an Amazon Web
 /// Services owned key, so no `KmsKeyArn` names it ("Cannot be specified when KeyType is
 /// AWS_OWNED_KMS_KEY", `EncryptionConfiguration$KmsKeyArn`).
@@ -404,6 +424,32 @@ pub fn access_scope_ceiling_message(application_arn: &str) -> String {
         "Cannot add another access scope: this emulator holds at most \
          {MAX_SCOPES_PER_APPLICATION} access scopes per application, and \
          {application_arn} already holds that many"
+    )
+}
+
+/// The maximum number of REGIONS this emulator keeps on any ONE instance
+/// ([`Instance::regions`]).
+///
+/// This is NOT an AWS quota — IAM Identity Center publishes none for the number of
+/// Regions an instance can be enabled in. It is the emulator's own MEMORY CEILING, the
+/// per-instance counterpart of [`MAX_SCOPES_PER_APPLICATION`]: enabling an instance in
+/// another Region adds one record per distinct `RegionName`, the model's `RegionName`
+/// pattern (`^([a-z]+-){2,3}\d$`) admits unboundedly many of them, and a Region record
+/// lives until a caller removes it — so without a ceiling a caller could grow the process
+/// until the host runs out of memory. [`Instance::add_region`] is the one place a record
+/// is appended, and it refuses an add that would cross this ceiling.
+pub const MAX_REGIONS_PER_INSTANCE: usize = 50;
+
+/// The message an add refuses a new Region with once an instance already holds
+/// [`MAX_REGIONS_PER_INSTANCE`] of them; built from the instance the ceiling was reached
+/// on, and worded as the modelled `ServiceQuotaExceededException` describes itself ("the
+/// principal has crossed the permitted number of resources that can be created"), so the
+/// refusal is one a real client already handles.
+pub fn region_ceiling_message(instance_arn: &str) -> String {
+    format!(
+        "The principal has crossed the permitted number of resources that can be \
+         created: this emulator holds at most {MAX_REGIONS_PER_INSTANCE} Regions per \
+         instance, and {instance_arn} already holds that many"
     )
 }
 
@@ -908,6 +954,21 @@ impl Instance {
     /// Whether the clock already owes this instance its REMOVAL from the store.
     pub fn removal_due(&self, now: SystemTime) -> bool {
         self.deleted_due.is_some_and(|due| due <= now)
+    }
+
+    /// Enable this instance in one MORE Region, or refuse the add when the instance
+    /// already holds [`MAX_REGIONS_PER_INSTANCE`] of them.
+    ///
+    /// The one place a Region record is appended to an instance, so the emulator's memory
+    /// ceiling cannot be bypassed by whatever enables a Region. The `Err` carries the
+    /// message the refusal reports ([`region_ceiling_message`]), which a caller sees as
+    /// the modelled `ServiceQuotaExceededException`.
+    pub fn add_region(&mut self, region: Region) -> Result<(), String> {
+        if self.regions.len() >= MAX_REGIONS_PER_INSTANCE {
+            return Err(region_ceiling_message(&self.instance_arn));
+        }
+        self.regions.push(region);
+        Ok(())
     }
 
     /// Apply what the CLOCK already owes this instance: an instance whose activation
@@ -1851,6 +1912,16 @@ pub struct BuiltInApplicationProvider {
     /// provider uses to perform federation", one of the model's `FederationProtocol`
     /// enum values `SAML | OAUTH`.
     pub federation_protocol: &'static str,
+    /// Whether the applications under this provider are managed by the CUSTOMER — set up
+    /// through this API — rather than by Amazon Web Services on the customer's behalf.
+    ///
+    /// True for the custom application provider alone: an application of an AWS managed
+    /// provider is created by the Amazon Web Services service that owns it, and a
+    /// pre-integrated catalog application is set up in the console. This is what
+    /// [`BuiltInApplicationProvider::accepts_customer_managed_application`] reads, and it
+    /// is NOT reported on the wire — no member of the modelled `ApplicationProvider`
+    /// carries it.
+    pub customer_managed: bool,
     /// `DisplayData$DisplayName` — "The name of the application provider that appears in
     /// the portal" (`Name`, 1..100).
     pub display_name: &'static str,
@@ -1986,6 +2057,20 @@ impl BuiltInApplicationProvider {
         format!("arn:aws:sso::aws:applicationProvider/{}", self.id)
     }
 
+    /// Whether an application can be CREATED under this provider through this service's
+    /// API.
+    ///
+    /// `CreateApplication` makes an OAuth 2.0 customer managed application, so a provider
+    /// backs one only when the customer manages the applications under it AND it federates
+    /// over OAuth 2.0: an application whose provider federates over SAML 2.0 is set up in
+    /// the console instead, and an application of an Amazon Web Services managed provider
+    /// is created by the service that owns it on the customer's behalf. Every other
+    /// operation of the provider surface is unaffected — a provider that backs no create
+    /// is still described and enumerated like any other entry of the catalog.
+    pub fn accepts_customer_managed_application(&self) -> bool {
+        self.customer_managed && self.federation_protocol == FEDERATION_OAUTH
+    }
+
     /// This provider as the modeled `ApplicationProvider` shape — the member-for-member
     /// projection `ListApplicationProviders` reports, holding exactly what
     /// `DescribeApplicationProvider` reports for the same entry.
@@ -2008,6 +2093,9 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 /// a propagated identity from IAM Identity Center, so it federates over OAuth 2.0 and
 /// carries its own portal description and — where it publishes one — its resource server's
 /// access scopes.
+///
+/// The applications under such a provider are created by the Amazon Web Services service
+/// that owns it, not by the customer, so none of them is customer managed.
 const fn aws_managed_provider(
     id: &'static str,
     display_name: &'static str,
@@ -2017,6 +2105,26 @@ const fn aws_managed_provider(
     BuiltInApplicationProvider {
         id,
         federation_protocol: FEDERATION_OAUTH,
+        customer_managed: false,
+        display_name,
+        description: Some(description),
+        scopes,
+    }
+}
+
+/// The CUSTOM application provider: the one provider whose applications the CUSTOMER
+/// creates and manages, over OAuth 2.0 — the provider `CreateApplication` mints an
+/// application under ([`BuiltInApplicationProvider::accepts_customer_managed_application`]).
+const fn customer_managed_provider(
+    id: &'static str,
+    display_name: &'static str,
+    description: &'static str,
+    scopes: &'static [BuiltInAccessScope],
+) -> BuiltInApplicationProvider {
+    BuiltInApplicationProvider {
+        id,
+        federation_protocol: FEDERATION_OAUTH,
+        customer_managed: true,
         display_name,
         description: Some(description),
         scopes,
@@ -2034,6 +2142,8 @@ const fn catalog_application(
     BuiltInApplicationProvider {
         id,
         federation_protocol: FEDERATION_SAML,
+        // A pre-integrated application is set up in the console, not through this API.
+        customer_managed: false,
         display_name,
         description: None,
         scopes: &[],
@@ -2045,10 +2155,11 @@ const fn catalog_application(
 /// SOURCE: the Smithy model carries no list of them — `ApplicationProviderArn` is only a
 /// pattern (`smithy_query(query="shape",shape="ApplicationProviderArn")`) and
 /// `ApplicationProvider` only the per-entry structure — so the catalog is written out
-/// here, from the two sets IAM Identity Center publishes:
+/// here, from the sets IAM Identity Center publishes:
 ///
-/// * the AWS MANAGED providers ([`aws_managed_provider`]) — `custom`, the provider a
-///   customer managed application connects through, and the Amazon Web Services
+/// * the CUSTOM provider ([`customer_managed_provider`]) — the one provider a customer
+///   managed application is created under;
+/// * the AWS MANAGED providers ([`aws_managed_provider`]) — the Amazon Web Services
 ///   applications that receive a propagated identity (trusted identity propagation),
 ///   whose id is the service slug its `arn:aws:sso::aws:applicationProvider/<slug>` ARN
 ///   carries, and whose published access scopes are reported as its resource server;
@@ -2067,13 +2178,14 @@ const fn catalog_application(
 /// A provider exists in every partition the ARN pattern admits, so the lookup
 /// ([`built_in_application_provider`]) matches on the id and not on the whole ARN.
 pub const BUILT_IN_APPLICATION_PROVIDERS: &[BuiltInApplicationProvider] = &[
-    // ---- AWS managed providers -------------------------------------------------------
-    aws_managed_provider(
+    // ---- The custom (customer managed) provider ---------------------------------------
+    customer_managed_provider(
         "custom",
         "SSO Custom Application Provider",
         "SSO Custom Application Provider",
         &[],
     ),
+    // ---- AWS managed providers -------------------------------------------------------
     aws_managed_provider(
         "athena",
         "Amazon Athena",

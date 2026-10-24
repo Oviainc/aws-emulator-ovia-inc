@@ -43,11 +43,6 @@ use crate::ssoadmin_permission_sets::{
 /// `ListApplicationProviders`.
 const CUSTOM_PROVIDER_ARN: &str = "arn:aws:sso::aws:applicationProvider/custom";
 
-/// A second published provider, to show the create is not keyed to one entry of the
-/// catalog: a pre-integrated catalog application, whose id carries the `/` that
-/// `ApplicationProviderArn`'s pattern (`applicationProvider/[a-zA-Z0-9-/]+`) admits.
-const CATALOG_PROVIDER_ARN: &str = "arn:aws:sso::aws:applicationProvider/catalog/Slack";
-
 /// One application to create: the parameters, as a row of the table.
 #[derive(Debug, Clone)]
 struct Application {
@@ -166,9 +161,9 @@ impl Application {
 /// `Name` (`len 1..100`, `^[\S\s]*$`, so whitespace and punctuation are in), whether
 /// `Description` is sent (`len 1..128`), both values of `ApplicationStatus`
 /// (`ENABLED | DISABLED`), the `PortalOptions` forms the model admits (absent, visibility
-/// only, each `SignInOrigin`), the number of `Tags`, whether a `ClientToken` is sent, and
-/// which published `ApplicationProviderArn` the application runs under. All constraints
-/// are from `smithy_query(query="operation",operation="CreateApplication")` and
+/// only, each `SignInOrigin`), the number of `Tags` and whether a `ClientToken` is sent.
+/// All constraints are from
+/// `smithy_query(query="operation",operation="CreateApplication")` and
 /// `smithy_query(query="shape",shape="PortalOptions,SignInOptions,ApplicationStatus")`.
 fn applications() -> Vec<Application> {
     vec![
@@ -202,7 +197,6 @@ fn applications() -> Vec<Application> {
             "SignInOrigin IDENTITY_CENTER and no Visibility, which takes the model default",
             "idp-initiated-app",
         )
-        .with_provider(CATALOG_PROVIDER_ARN)
         .with_portal_options(json!({"SignInOptions": {"Origin": "IDENTITY_CENTER"}}))
         .with_description("Description at the 128-character limit padded out here")
         .with_tags(&[("only", "one")]),
@@ -576,9 +570,10 @@ async fn a_replayed_client_token_mints_no_second_application_and_a_changed_param
             .tags
             .push(("extra".to_string(), "tag".to_string()));
         mutations.push(("Tags", re_tagged));
-        let mut re_providered = application.clone();
-        re_providered.provider_arn = CATALOG_PROVIDER_ARN.to_string();
-        mutations.push(("ApplicationProviderArn", re_providered));
+        // `ApplicationProviderArn` is not among the mutations: the one provider this API
+        // creates an application under is the custom one, so a row that changed it would
+        // be refused for the provider before the token is ever looked at — the provider
+        // rule has its own suite (`application_create_providers.rs`).
 
         for (member, mutated) in mutations {
             if mutated.provider_arn == application.provider_arn
@@ -716,8 +711,7 @@ async fn every_granted_assignment_reads_back_and_granting_it_twice_grants_it_onc
     let second = minted_application(
         &router,
         &instance_arn,
-        &Application::new("the second application", "assignable-two")
-            .with_provider(CATALOG_PROVIDER_ARN),
+        &Application::new("the second application", "assignable-two"),
     )
     .await;
 

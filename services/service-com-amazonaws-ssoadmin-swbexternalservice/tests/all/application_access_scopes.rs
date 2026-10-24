@@ -23,9 +23,11 @@
 //!    200, and the refusal stores nothing;
 //! 5. `CreateApplication` resolves both resources the request names: an
 //!    `ApplicationProviderArn` naming no published provider and an `InstanceArn` this
-//!    account holds no instance for are refused `ResourceNotFoundException`, and a
+//!    account holds no instance for are refused `ResourceNotFoundException`, a
 //!    `SignInOptions` whose `Origin` is `APPLICATION` with no `ApplicationUrl` is
-//!    refused `ValidationException`;
+//!    refused `ValidationException`, and so is a published provider that backs no
+//!    customer managed OAuth 2.0 application (`application_create_providers.rs` owns
+//!    that rule's own table);
 //! 6. the emulator's per-application access-scope ceiling
 //!    (`state::MAX_SCOPES_PER_APPLICATION`) bounds caller-driven growth: a put that
 //!    would ADD a scope past it is refused `ValidationException`, while a put that
@@ -49,14 +51,15 @@ use crate::ssoadmin_permission_sets::{
 /// is the "SSO Custom Application Provider" and federates over `OAUTH`.
 const CUSTOM_PROVIDER_ARN: &str = "arn:aws:sso::aws:applicationProvider/custom";
 
-/// A SAML 2.0 provider of the pre-integrated application catalog: a provider of the same
-/// published catalogue, which an application can equally be created under (AWS publishes
-/// no per-provider refusal for `CreateApplication`). A catalog entry the issue did not
-/// cite.
+/// A SAML 2.0 provider of the pre-integrated application catalog, which
+/// `CreateApplication` does NOT create an application under — the refusal rule has its
+/// own suite (`application_create_providers.rs`); here it only keeps a scope put from
+/// reaching an application that could not exist. A catalog entry the issue did not cite.
 const CATALOG_PROVIDER_ARN: &str = "arn:aws:sso::aws:applicationProvider/catalog/Zendesk";
 
-/// Another AWS managed provider that federates over OAuth 2.0, so an application can be
-/// created under it as well as under `custom`.
+/// An Amazon Web Services MANAGED provider: its applications are created by the service
+/// that owns it on the customer's behalf, so `CreateApplication` does not create one
+/// either.
 const REDSHIFT_PROVIDER_ARN: &str = "arn:aws:sso::aws:applicationProvider/redshift";
 
 /// One application to create: the parameters, as a row of the table.
@@ -84,11 +87,6 @@ impl Application {
             tags: Vec::new(),
             client_token: None,
         }
-    }
-
-    fn with_provider(mut self, provider_arn: &str) -> Self {
-        self.provider_arn = provider_arn.to_string();
-        self
     }
 
     fn with_description(mut self, description: &str) -> Self {
@@ -171,8 +169,8 @@ impl Application {
     }
 }
 
-/// The rows differ along what rule 1 generalises over: the provider the application runs
-/// under, the length and character class of `Name` (`len 1..100`, `^[\S\s]*$`, so spaces
+/// The rows differ along what rule 1 generalises over: the length and character class of
+/// `Name` (`len 1..100`, `^[\S\s]*$`, so spaces
 /// and punctuation are admitted), whether `Description` (`len 1..128`) and `Status`
 /// (`ENABLED | DISABLED`) are sent, the shape of `PortalOptions` (absent, `Visibility`
 /// only, either `SignInOrigin`, with and without an `ApplicationUrl`) and the number of
@@ -208,13 +206,9 @@ fn applications() -> Vec<Application> {
             }))
             .with_description(&"e".repeat(128))
             .with_tags(&[("single", "tag")]),
-        Application::new("another OAuth provider, a single tag", "redshift-app")
-            .with_provider(REDSHIFT_PROVIDER_ARN)
+        Application::new("a single tag and a ClientToken", "tokened-app")
             .with_tags(&[("team", "identity")])
             .with_client_token("apl-token-1"),
-        Application::new("a catalog provider of the same catalogue", "catalog-app")
-            .with_provider(CATALOG_PROVIDER_ARN)
-            .with_description("created under a pre-integrated catalog provider"),
     ]
 }
 
@@ -905,6 +899,24 @@ async fn creating_an_application_is_refused_where_the_request_cannot_be_served()
                 "ApplicationProviderArn": CUSTOM_PROVIDER_ARN,
                 "Name": "no-application-url",
                 "PortalOptions": {"SignInOptions": {"Origin": "APPLICATION"}},
+            }),
+            "ValidationException",
+        ),
+        (
+            "a provider of the pre-integrated SAML 2.0 catalog",
+            json!({
+                "InstanceArn": instance_arn,
+                "ApplicationProviderArn": CATALOG_PROVIDER_ARN,
+                "Name": "saml-provider",
+            }),
+            "ValidationException",
+        ),
+        (
+            "an Amazon Web Services managed provider",
+            json!({
+                "InstanceArn": instance_arn,
+                "ApplicationProviderArn": REDSHIFT_PROVIDER_ARN,
+                "Name": "aws-managed-provider",
             }),
             "ValidationException",
         ),

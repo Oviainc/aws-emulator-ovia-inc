@@ -25,6 +25,8 @@ mod application_assignments;
 mod application_authentication_methods;
 #[path = "all/application_create.rs"]
 mod application_create;
+#[path = "all/application_create_providers.rs"]
+mod application_create_providers;
 #[path = "all/application_grants.rs"]
 mod application_grants;
 #[path = "all/application_provider_describe.rs"]
