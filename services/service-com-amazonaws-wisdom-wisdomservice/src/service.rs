@@ -39,7 +39,29 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The content-upload plane
+//!
+//! `StartContentUpload` hands out a URL, and a URL is a promise that it can be
+//! FOLLOWED. The URL it mints (`crate::state::content_upload_url`) addresses the
+//! endpoint the caller reached, under the upload's own path
+//! (`/knowledgeBases/<knowledgeBaseId>/uploads/<uploadId>`) — a path the model binds no
+//! operation to, so it reaches this file twice:
+//!
+//! - [`Service::can_handle`] also claims a request to an upload path naming an upload
+//!   THIS store holds, so following the URL routes back here even when nothing else in
+//!   the request names a service (an upload URL is followed WITHOUT a signature, as a
+//!   presigned URL is, and a loopback endpoint host names no service at all).//! - [`Service::override_routing_error`] serves it: that seam is reached BEFORE
+//!   authentication precisely for requests that name no modelled operation, which is
+//!   what makes an unsigned `PUT` to a minted URL work.
+//!
+//! The plane writes ONLY the upload the URL names — the bytes, bounded by
+//! `crate::state::MAX_CONTENT_UPLOAD_BYTES` — and refuses a `PUT` that is late (the
+//! URL's `urlExpiry` has passed) or that does not carry the headers the start call
+//! published. Nothing else about the service is reachable through it.
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
+use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service, ViolationKind};
 use std::sync::Arc;
 
@@ -138,6 +160,13 @@ fn claims_own_registration_key(parts: &http::request::Parts) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the generated entry threads into every operation.
+    ///
+    /// Held here because the content-upload plane is served from
+    /// [`Service::can_handle`] and [`Service::override_routing_error`], neither of which
+    /// is an operation with a `self.engine` of its own; both must read the one store
+    /// `StartContentUpload` writes, not a second copy.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -146,8 +175,107 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
         }
+    }
+
+    /// Whether this request FOLLOWS an upload URL this service handed out: its path is
+    /// one the upload plane publishes and it names an upload THIS store holds.
+    ///
+    /// The id in the path is the receipt: it was minted by this store, is unguessable,
+    /// and expires. That is what makes the claim UNAMBIGUOUS — the Amazon Q in Connect
+    /// view of this one endpoint mints its upload ids into its own store, so exactly the
+    /// view that handed a URL out claims a request following it, whatever endpoint host
+    /// or credential scope that request carries. Claiming every path of this shape
+    /// instead would make both views claim it and the router refuse the request as
+    /// `500 AmbiguousService`; the cost is that an upload URL this emulator never handed
+    /// out is claimed by nobody and gets the router's own unknown-endpoint refusal.
+    fn holds_content_upload(&self, target: &crate::state::ContentUploadTarget) -> bool {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return false;
+        };
+        let store = state.lock();
+        store.content_upload(&target.upload_id).is_some()
+    }
+
+    /// Serve one request to a published upload URL.
+    ///
+    /// A `PUT` writes the asset into the upload the URL names — which is the only thing
+    /// the plane can touch — and is refused when the URL is no longer usable, when the
+    /// request does not carry the headers the start call published, or when the body is
+    /// larger than this emulator stores. The upload, the knowledge base it was started
+    /// under and the id in the path must all agree: a path that crosses one knowledge
+    /// base with another's upload names nothing.
+    fn serve_content_upload(
+        &self,
+        req: &RtRequest,
+        target: &crate::state::ContentUploadTarget,
+    ) -> RtResponse {
+        if req.method() != "PUT" {
+            return upload_error(
+                405,
+                "MethodNotAllowed",
+                "This upload URL is written by a single PUT",
+            );
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return upload_error(
+                500,
+                "InternalServerException",
+                "the wisdom content-upload store is unavailable",
+            );
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let resolved_knowledge_base = store.resolve_knowledge_base_id(&target.knowledge_base_label);
+        let names_this_upload = store
+            .content_upload(&target.upload_id)
+            .is_some_and(|upload| {
+                resolved_knowledge_base.as_deref() == Some(upload.knowledge_base_id.as_str())
+            });
+        if !names_this_upload {
+            return upload_error(404, "NoSuchUpload", UPLOAD_NOT_FOUND_MESSAGE);
+        }
+        // The URL stops being usable at its `urlExpiry`, so a late PUT is refused — and
+        // the slot it named is reclaimed here, because the clock already owed it back.
+        if store
+            .content_upload(&target.upload_id)
+            .is_some_and(|upload| upload.has_expired(now))
+        {
+            store.reclaim_expired_content_uploads(now);
+            return upload_error(403, "AccessDenied", UPLOAD_EXPIRED_MESSAGE);
+        }
+        // `headersToInclude` is what the start call told the caller to send, so a write
+        // that does not carry them is refused rather than stored.
+        let headers_satisfied = store
+            .content_upload(&target.upload_id)
+            .is_some_and(|upload| {
+                upload.headers_satisfied(|name| {
+                    req.headers().get(name).map(::std::string::ToString::to_string)
+                })
+            });
+        if !headers_satisfied {
+            return upload_error(403, "AccessDenied", UPLOAD_HEADERS_MESSAGE);
+        }
+        let body = req.body().bytes().unwrap_or_default();
+        if body.len() > crate::state::MAX_CONTENT_UPLOAD_BYTES {
+            return upload_error(413, "EntityTooLarge", UPLOAD_TOO_LARGE_MESSAGE);
+        }
+        let Some(upload) = store.content_upload_mut(&target.upload_id) else {
+            // Unreachable: the lookups above found it while this lock is held.
+            return upload_error(404, "NoSuchUpload", UPLOAD_NOT_FOUND_MESSAGE);
+        };
+        upload.body = Some(body.to_vec());
+        upload.received_at = Some(now);
+
+        let mut resp = RtResponse::new(
+            StatusCode::try_from(200u16).expect("200 is a valid status"),
+            SdkBody::empty(),
+        );
+        resp.headers_mut().insert("content-length", "0");
+        resp
     }
 }
 
@@ -168,6 +296,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the two apart. It is claimed by the QConnect crate — the endpoint's current API
         // and the superset — and this service answers under its own registration key
         // instead, so exactly one service claims every request.
+        // A request that FOLLOWS an upload URL this service handed out is claimed by
+        // the store that minted it, whatever else the request carries: it has no
+        // signature and its endpoint host may name no service at all, so the route key
+        // cannot route it. The upload path binds no modelled operation, so nothing
+        // modelled is diverted here. See [`Self::holds_content_upload`].
+        if let Some(target) = crate::state::parse_content_upload_path(parts.uri.path()) {
+            return self.holds_content_upload(&target);
+        }
         claims_own_registration_key(parts)
     }
 
@@ -228,10 +364,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501).
+        //
+        // A request to an upload URL this service handed out is exactly that case by
+        // construction — the model binds no operation to the upload path — so this is
+        // where `StartContentUpload`'s URL is served. Anything else keeps the framework's
+        // default.
+        let target = crate::state::parse_content_upload_path(request_path(req.uri()))?;
+        Some(self.serve_content_upload(req, &target))
     }
 
     fn override_framework_error(
@@ -246,5 +386,54 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+/// The body of an upload-plane refusal that found no upload: one sentence carrying
+/// nothing from the request, so a caller cannot probe for uploads it was not handed.
+const UPLOAD_NOT_FOUND_MESSAGE: &str = "The requested upload does not exist";
+
+/// The body of an upload-plane refusal of a write after the URL's `urlExpiry`.
+const UPLOAD_EXPIRED_MESSAGE: &str = "Request has expired";
+
+/// The body of an upload-plane refusal of a write that does not carry the headers the
+/// start call published in `headersToInclude`.
+const UPLOAD_HEADERS_MESSAGE: &str =
+    "The request does not include the headers the upload was started with";
+
+/// The body of an upload-plane refusal of a body larger than this emulator stores
+/// (`crate::state::MAX_CONTENT_UPLOAD_BYTES`).
+const UPLOAD_TOO_LARGE_MESSAGE: &str = "The upload is larger than this endpoint accepts";
+
+/// One upload-plane error response: the status, the code in `x-amzn-errortype`, and a
+/// JSON body carrying the reason.
+///
+/// The upload plane is plain HTTPS rather than a modelled operation, so it answers in
+/// its own small envelope instead of the service's restJson1 one. The message is built
+/// from constants, never from the request.
+fn upload_error(status: u16, code: &str, message: &str) -> RtResponse {
+    let body = ::serde_json::json!({ "message": message, "code": code }).to_string();
+    let mut resp = RtResponse::new(
+        StatusCode::try_from(status).expect("the status is a constant of this module"),
+        SdkBody::from(body),
+    );
+    resp.headers_mut().insert("content-type", "application/json");
+    resp.headers_mut()
+        .insert("x-amzn-errortype", code.to_string());
+    resp
+}
+
+/// The path component of a request URI, with any scheme, authority and query removed.
+fn request_path(uri: &str) -> &str {
+    // The query is dropped FIRST: a query VALUE may carry `://`, which a scheme scan over
+    // the whole URI would mistake for the authority.
+    let without_query = uri.split('?').next().unwrap_or(uri);
+    match without_query.split_once("://") {
+        Some((_scheme, authority_and_path)) => match authority_and_path.find('/') {
+            Some(path_start) => &authority_and_path[path_start..],
+            // Authority only, no path at all.
+            None => "/",
+        },
+        None => without_query,
     }
 }
