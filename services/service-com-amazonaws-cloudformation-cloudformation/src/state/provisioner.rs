@@ -1701,8 +1701,14 @@ async fn create_role(
         Ok(answer) => {
             // What IAM answered wins over the computed ARN: it is the role's real
             // identity.
-            if let Some(arn) = answer.role().map(::aws_sdk_iam::types::Role::arn) {
-                attributes.insert("Arn".to_string(), arn.to_string());
+            if let Some(role) = answer.role() {
+                attributes.insert("Arn".to_string(), role.arn().to_string());
+                // `RoleId` is the UNIQUE ID IAM mints for a role ("Returns the stable and
+                // unique string identifying the role"), which only IAM can know: without
+                // it the attribute keeps the value the uniform convention read off the
+                // role's NAME, and a client comparing the stack's output with IAM's own
+                // record sees two different ids for one role.
+                attributes.insert("RoleId".to_string(), role.role_id().to_string());
             }
         }
         Err(error) => {

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWorkspaceServiceAccountToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWorkspaceServiceAccountToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWorkspaceServiceAccountToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Releases one token of a workspace service account and reports the ids of the record
+//! it removed, which is what disables the key that token handed out.
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +119,18 @@ impl From<DeleteWorkspaceServiceAccountTokenErrorModeled> for DeleteWorkspaceSer
     }
 }
 
+/// The modelled server fault for a request this emulator could not serve from its own
+/// state: the service's store was not mounted, which is not something the caller can fix.
+fn server_unavailable() -> DeleteWorkspaceServiceAccountTokenError {
+    DeleteWorkspaceServiceAccountTokenErrorModeled::InternalServerException(
+        InternalServerException {
+            message: "the grafana workspace store is unavailable".to_string(),
+            retry_after_seconds: None,
+        },
+    )
+    .into()
+}
+
 /// The `DeleteWorkspaceServiceAccountToken` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -162,18 +167,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWorkspaceServiceAccountToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWorkspaceServiceAccountTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWorkspaceServiceAccountToken"))
+        // Every id this delete needs is modelled on the request, and the token is
+        // stored on the service account it names, so nothing here depends on request
+        // metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(server_unavailable());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A token hangs off a service account, which hangs off a workspace, so an id
+        // naming no workspace is a request against a resource that does not exist.
+        // `settled_mut` materialises only what the clock already owed that workspace by
+        // `now`; this delete adds nothing of its own.
+        let Some(workspace) = store.settled_mut(&input.workspace_id, now) else {
+            return Err(
+                DeleteWorkspaceServiceAccountTokenErrorModeled::ResourceNotFoundException(
+                    crate::state::workspace_not_found(&input.workspace_id),
+                )
+                .into(),
+            );
+        };
+        let workspace_id = workspace.id.clone();
+
+        // The account must be one this workspace holds: an id naming none holds no
+        // token either. A workspace below the documented Grafana floor for service
+        // accounts can hold no account at all, so this same refusal covers it.
+        let Some(account) = workspace.service_account_mut(&input.service_account_id) else {
+            return Err(
+                DeleteWorkspaceServiceAccountTokenErrorModeled::ResourceNotFoundException(
+                    crate::state::service_account_not_found(
+                        &workspace_id,
+                        &input.service_account_id,
+                    ),
+                )
+                .into(),
+            );
+        };
+        let service_account_id = account.id.clone();
+
+        // Removing the stored record is the whole effect: it is what "disable[s] the key
+        // associated with the token", because the workspace's own Grafana HTTP API
+        // recognises a presented key only by a digest a stored token carries. An id
+        // naming no token of this account — never created, or already deleted — has
+        // nothing to release, so it is refused rather than reported as a delete.
+        if account.remove_token(&input.token_id).is_none() {
+            return Err(
+                DeleteWorkspaceServiceAccountTokenErrorModeled::ResourceNotFoundException(
+                    crate::state::service_account_token_not_found(&input.token_id),
+                )
+                .into(),
+            );
+        }
+
+        // The ids reported are the ones read off the records the delete reached, not
+        // echoes of the request path.
+        Ok(DeleteWorkspaceServiceAccountTokenOutput {
+            token_id: input.token_id,
+            service_account_id,
+            workspace_id,
+        })
     }
 }

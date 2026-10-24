@@ -226,6 +226,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateStreamErrorModeled::AccessDeniedException(denial).into());
         }
 
+        // The `tags` a create carries are written exactly as `TagResource` writes
+        // them, so they are held to the same rule: a key under the prefix AWS
+        // reserves for its own tags is not the caller's to write, and the request is
+        // refused with the modelled 400 before any stream is minted.
+        if let Err(invalid) = crate::state::validate_tag_keys(
+            crate::state::TAGS_MEMBER,
+            input
+                .tags
+                .iter()
+                .flat_map(|tags| tags.keys().map(String::as_str)),
+        ) {
+            return Err(CreateStreamErrorModeled::ValidationException(invalid).into());
+        }
+
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
         state.settle(now);

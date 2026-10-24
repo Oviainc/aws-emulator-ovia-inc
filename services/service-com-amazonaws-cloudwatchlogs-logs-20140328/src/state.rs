@@ -35,6 +35,14 @@
 //! "applies to only the specified log group": one group holds at most one, and deleting
 //! the group takes its policy with it.
 //!
+//! A log group's own field index policy lives on the group too
+//! ([`LogGroupRecord::index_policy`]), because a log-group level index policy is named by
+//! nothing but the group it applies to — so one group holds at most one and deleting the
+//! group takes it with it. The account-wide field index policies that apply where a group
+//! holds none of its own are the account policies in
+//! [`ComAmazonawsCloudwatchlogsLogs20140328State::account_policies`], and which log groups
+//! one of those selects is [`account_policy_selects_log_group`].
+//!
 //! The account's saved CloudWatch Logs Insights query definitions live here
 //! ([`ComAmazonawsCloudwatchlogsLogs20140328State::query_definitions`]) rather than on a
 //! log group: a definition is identified only by its own `queryDefinitionId`, and the log
@@ -222,6 +230,17 @@ pub const POLICY_TYPE_TRANSFORMER: &str = "TRANSFORMER_POLICY";
 /// The account-level policy type that controls EMF metric creation. See
 /// [`POLICY_TYPE_DATA_PROTECTION`].
 pub const POLICY_TYPE_METRIC_EXTRACTION: &str = "METRIC_EXTRACTION_POLICY";
+
+/// The `IndexPolicy$source` of a policy that applies to a subset of the account's log
+/// groups rather than to the one group it is reported for, from the model's `IndexSource`
+/// enum (`ACCOUNT` | `LOG_GROUP`, the pair listed as
+/// [`crate::ops::types::INDEX_SOURCE_VALUES`]). The member "indicates whether this is an
+/// account-level index policy or an index policy that applies only to a single log group".
+pub const INDEX_SOURCE_ACCOUNT: &str = "ACCOUNT";
+
+/// The `IndexPolicy$source` of a policy stored on the one log group it applies to. See
+/// [`INDEX_SOURCE_ACCOUNT`].
+pub const INDEX_SOURCE_LOG_GROUP: &str = "LOG_GROUP";
 
 /// The scope an account-level policy carries when the put naming it specified none, from
 /// `PutAccountPolicy$scope`: "Currently the only valid value for this parameter is ALL,
@@ -2951,6 +2970,108 @@ fn criteria_conflict(
     }
 }
 
+/// Whether an account-level policy applies to one log group.
+///
+/// `PutAccountPolicy$selectionCriteria` is what narrows an account-level policy: "Use this
+/// parameter to apply the new policy to a subset of log groups in the account", and a policy
+/// put without one is the policy "that applies to all log groups in the account". So a
+/// policy holding no criteria selects every group, and one holding criteria selects the
+/// groups its filters name: a `LogGroupName` value names the group called that, a
+/// `LogGroupNamePrefix` value every group whose name starts with it, and the
+/// `DataSourceName` AND `DataSourceType` pair every group with a data source of that name
+/// and type. A `NOT IN` list selects every group its values do NOT name, and criteria
+/// written with more than one filter are joined by `AND`, so each of them must hold.
+///
+/// A stored criteria string went through [`check_selection_criteria`] when it was put, so
+/// one that no longer parses names no log groups rather than all of them.
+pub fn account_policy_selects_log_group(
+    policy: &AccountPolicyRecord,
+    group: &LogGroupRecord,
+) -> bool {
+    let Some(criteria) = policy.selection_criteria.as_deref() else {
+        return true;
+    };
+    let Ok(criteria) = check_selection_criteria(&policy.policy_type, criteria) else {
+        return false;
+    };
+    // The one documented form that joins two filters is the `DataSourceName` AND
+    // `DataSourceType` pair, and it names ONE data source: a group satisfies that pair only
+    // when a single data source of its own satisfies both of its filters. So the pair is ONE
+    // conjunct of the criteria rather than two, and any further filter written beside it is
+    // still a conjunct of its own.
+    let pair = match (
+        criteria.clause(SELECTION_FIELD_DATA_SOURCE_NAME),
+        criteria.clause(SELECTION_FIELD_DATA_SOURCE_TYPE),
+    ) {
+        (Some(names), Some(types)) => Some((names, types)),
+        _ => None,
+    };
+    if let Some((names, types)) = pair {
+        if !data_source_pair_selects_log_group(names, types, group) {
+            return false;
+        }
+    }
+    criteria
+        .clauses
+        .iter()
+        // The two filters of the pair are judged together above, so they are not judged
+        // again one at a time here.
+        .filter(|clause| pair.is_none() || !is_data_source_selection_field(&clause.field))
+        .all(|clause| selection_clause_selects_log_group(clause, group))
+}
+
+/// Whether a log group carries one data source satisfying BOTH filters of a
+/// `DataSourceName` AND `DataSourceType` pair; see [`account_policy_selects_log_group`].
+fn data_source_pair_selects_log_group(
+    names: &SelectionClause,
+    types: &SelectionClause,
+    group: &LogGroupRecord,
+) -> bool {
+    group.data_sources.iter().any(|source| {
+        let named = names.values.contains(&source.name) != names.negated;
+        let typed = source
+            .source_type
+            .as_ref()
+            .is_some_and(|source_type| types.values.contains(source_type))
+            != types.negated;
+        named && typed
+    })
+}
+
+/// Whether a `selectionCriteria` filter is one of the two that name a data source
+/// ([`SELECTION_FIELD_DATA_SOURCE_NAME`], [`SELECTION_FIELD_DATA_SOURCE_TYPE`]).
+fn is_data_source_selection_field(field: &str) -> bool {
+    matches!(
+        field,
+        SELECTION_FIELD_DATA_SOURCE_NAME | SELECTION_FIELD_DATA_SOURCE_TYPE
+    )
+}
+
+/// Whether one filter of a `selectionCriteria` string selects a log group; see
+/// [`account_policy_selects_log_group`] for what each field's values name. A filter on a
+/// field that names no property of a log group selects none of them.
+fn selection_clause_selects_log_group(clause: &SelectionClause, group: &LogGroupRecord) -> bool {
+    let named = match clause.field.as_str() {
+        SELECTION_FIELD_LOG_GROUP_NAME => clause.values.contains(&group.name),
+        SELECTION_FIELD_LOG_GROUP_NAME_PREFIX => clause
+            .values
+            .iter()
+            .any(|value| group.name.starts_with(value)),
+        SELECTION_FIELD_DATA_SOURCE_NAME => group
+            .data_sources
+            .iter()
+            .any(|source| clause.values.contains(&source.name)),
+        SELECTION_FIELD_DATA_SOURCE_TYPE => group.data_sources.iter().any(|source| {
+            source
+                .source_type
+                .as_ref()
+                .is_some_and(|source_type| clause.values.contains(source_type))
+        }),
+        _ => return false,
+    };
+    named != clause.negated
+}
+
 /// One log group's data protection policy — what `PutDataProtectionPolicy` stores — as
 /// it is stored.
 ///
@@ -2963,6 +3084,23 @@ pub struct DataProtectionPolicyRecord {
     pub policy_document: String,
     /// "The date and time that this policy was most recently updated."
     pub last_updated_time_ms: i64,
+}
+
+/// One log group's own field index policy — the log-group level policy `PutIndexPolicy`
+/// stores and `DeleteIndexPolicy` removes — as it is stored.
+///
+/// A log-group level policy is identified by nothing but the group it applies to ("Responses
+/// about log group-level field index policies don't have this field, because those policies
+/// don't have names"), so it lives ON the group and a later put replaces this record rather
+/// than adding another. The document is kept VERBATIM, exactly the bytes the request
+/// carried, the way [`DataProtectionPolicyRecord::policy_document`] is: the service reports
+/// a stored policy document back unchanged.
+#[derive(Debug, Clone)]
+pub struct IndexPolicyRecord {
+    /// `policyDocument`, byte-for-byte as the put carried it.
+    pub policy_document: String,
+    /// "The date and time that this index policy was most recently updated."
+    pub last_update_time_ms: i64,
 }
 
 /// The account's storage tier policy — what `PutStorageTierPolicy` stores and
@@ -3186,6 +3324,11 @@ pub struct LogGroupRecord {
     /// `ListSyslogConfigurations` enumerates them ASCII-sorted by endpoint id without
     /// re-sorting. Every configuration names an endpoint ([`VPC_ENDPOINT_ID_REQUIRED`]).
     pub syslog_configurations: BTreeMap<String, SyslogConfigurationRecord>,
+    /// The log-group level field index policy stored on this group, if one has been put:
+    /// such a policy is named by nothing but the group, so a group holds at most one and
+    /// deleting the group takes it away. `DescribeIndexPolicies` reports this policy for
+    /// the group ahead of any account-wide one ([`IndexPolicyRecord`]).
+    pub index_policy: Option<IndexPolicyRecord>,
 }
 
 impl LogGroupRecord {
@@ -3212,6 +3355,7 @@ impl LogGroupRecord {
             had_data_protection_policy: false,
             data_sources: Vec::new(),
             syslog_configurations: BTreeMap::new(),
+            index_policy: None,
         }
     }
 

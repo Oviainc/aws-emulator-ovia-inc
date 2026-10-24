@@ -164,6 +164,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // "The catalog in which the agreement was created": AWS Marketplace
+        // exposes exactly one catalog, so a `catalog` naming another one names
+        // nothing this service could hold and is refused before anything is
+        // selected, rather than reported as an empty page
+        // (`crate::state::selector_value_refusal`).
+        if let Some(refusal) = crate::state::selector_value_refusal(None, input.catalog.as_deref())
+        {
+            return Err(SearchAgreementsErrorModeled::ValidationException(refusal).into());
+        }
+
         let sort = input.sort.unwrap_or_default();
         let sort_by = sort
             .sort_by
@@ -217,9 +227,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let mut matched: Vec<&crate::state::Agreement> = Vec::new();
         for agreement in store.agreements.values() {
-            // "The catalog in which the agreement was created": every agreement
-            // is created in the one catalog AWS Marketplace exposes, so a search
-            // naming another one selects nothing.
+            // "The catalog in which the agreement was created": the selector is
+            // still matched against the agreement's own catalog, so it selects
+            // on the stored member rather than on the request's value — which
+            // the refusal above has already resolved to the one catalog.
             if input
                 .catalog
                 .as_deref()

@@ -41,7 +41,8 @@ use std::collections::BTreeMap;
 
 use crate::nested_resource_outputs::{is_lower_hex, is_upper_hex};
 use crate::stack_lifecycle::{
-    create_stack, describe_stack, router, wait_for_the_transition, xml_text, ACCOUNT_ID, REGION,
+    acknowledging_iam, create_stack, describe_stack, router, wait_for_the_transition, xml_text,
+    ACCOUNT_ID, REGION,
 };
 use crate::stack_outputs::wire_outputs;
 use crate::stack_resources::{resources_of, wire_resources};
@@ -684,8 +685,10 @@ async fn a_stack_reports_the_published_identifier_of_every_resource_it_declares(
     let router = router();
 
     for case in cases() {
+        // A row's template declares the task-execution role its ECS task definition runs
+        // as, so the request acknowledges the template's IAM resources.
         let (status_code, body) =
-            create_stack(&router, case.stack_name, &case.template, &[]).await;
+            create_stack(&router, case.stack_name, &case.template, &acknowledging_iam(&[])).await;
         assert_eq!(
             status_code, 200,
             "case {:?}: CreateStack must accept the template, got {status_code}: {body}",

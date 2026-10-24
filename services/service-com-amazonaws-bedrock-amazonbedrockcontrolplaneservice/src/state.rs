@@ -38,6 +38,12 @@
 //! `ops/get_marketplace_model_endpoint.rs` reads back, together with the instant each
 //! endpoint's non-terminal `endpointStatus` is owed its move to `InService`.
 //!
+//! And it holds the Provisioned Throughputs `ops/create_provisioned_model_throughput.rs`
+//! mints, `ops/get_provisioned_model_throughput.rs` reads back,
+//! `ops/list_provisioned_model_throughputs.rs` reports and
+//! `ops/delete_provisioned_model_throughput.rs` removes, together with the instant each
+//! one's non-terminal `status` is owed its move to `InService`.
+//!
 //! And it holds the published foundation model catalog — the base models
 //! `ops/list_foundation_models.rs` reports — which is seeded with the store and never
 //! written, because no operation of this service creates a foundation model.
@@ -66,8 +72,8 @@ use crate::ops::types::{
     GuardrailTopicPolicy, GuardrailTopicPolicyConfig, GuardrailTopicsTier,
     GuardrailTopicsTierConfig, GuardrailWord, GuardrailWordConfig, GuardrailWordPolicy,
     GuardrailWordPolicyConfig, LoggingConfig, MarketplaceModelEndpoint, ModelDataSource,
-    ModelEnforcement, PromptRouterTargetModel, RoutingCriteria, SelectiveContentGuarding, Tag,
-    VpcConfig,
+    ModelEnforcement, PromptRouterTargetModel, ProvisionedModelSummary, RoutingCriteria,
+    SelectiveContentGuarding, Tag, VpcConfig,
 };
 
 /// The working version every guardrail always has, as `GuardrailDraftVersion`
@@ -281,6 +287,123 @@ pub const EVALUATION_JOB_TYPE_HUMAN: &str = "Human";
 /// without a server-side cap a caller could grow this part of the store with nothing but
 /// fresh job names.
 pub const MAX_EVALUATION_JOBS_PER_ACCOUNT: usize = 100;
+
+/// `ProvisionedModelStatus` — the Provisioned Throughput is still being brought up by the
+/// create call.
+///
+/// The enum is `[Creating, InService, Updating, Failed]`
+/// (`smithy_query(query="shape",shape="ProvisionedModelStatus")`), which is also what
+/// `crate::ops::types::PROVISIONED_MODEL_STATUS_VALUES` carries.
+pub const PROVISIONED_MODEL_STATUS_CREATING: &str = "Creating";
+
+/// `ProvisionedModelStatus` once the Provisioned Throughput is serving — the terminal
+/// status the non-terminal one above is owed its move to. See
+/// [`PROVISIONED_MODEL_STATUS_CREATING`] for the value list.
+///
+/// `Updating` names a Provisioned Throughput whose association is being changed and
+/// `Failed` one that could not be provisioned; no call implemented here produces either,
+/// so neither is minted.
+pub const PROVISIONED_MODEL_STATUS_IN_SERVICE: &str = "InService";
+
+/// How long after `CreateProvisionedModelThroughput` a Provisioned Throughput's
+/// non-terminal `status` is owed its move to [`PROVISIONED_MODEL_STATUS_IN_SERVICE`].
+///
+/// CHOSEN, not documented: AWS publishes no duration for provisioning model units, so this
+/// is the emulator's span. It is non-zero, so a caller that reads the Provisioned
+/// Throughput straight after creating it still observes the `Creating` status the real
+/// service reports; and it is materialised from the stored due instant on the next call
+/// that touches the record rather than waited on, so no handler sleeps.
+pub const PROVISIONED_MODEL_SETTLE_AFTER: Duration = Duration::from_millis(500);
+
+/// The most Provisioned Throughputs this account may hold at once in one region, past
+/// which a create is refused with `ServiceQuotaExceededException`.
+///
+/// The emulator's own bound rather than a published quota (AWS publishes per-model
+/// model-unit quotas, not a count of Provisioned Throughputs an account may hold): without
+/// a server-side cap a caller could grow this part of the store with nothing but fresh
+/// names.
+pub const MAX_PROVISIONED_MODEL_THROUGHPUTS_PER_ACCOUNT: usize = 100;
+
+/// The model units an account has been granted for a Provisioned Throughput bought with
+/// `commitment_duration`, past which a create is refused with
+/// `ServiceQuotaExceededException`.
+///
+/// Amazon Bedrock grants model units by quota, and WHICH quota applies depends on whether
+/// the Provisioned Throughput carries a commitment:
+///
+/// * without one, the no-commitment model-unit quota applies, and its default is ZERO —
+///   an account has to have an increase granted before it can buy a Provisioned Throughput
+///   without a commitment. RECORDED behaviour: the corpus `simparity-behavioral-ga-prod-v1`
+///   records Amazon Bedrock refusing exactly such a create with
+///   `ServiceQuotaExceededException`, so `modelUnits` (itself `range 1..`) always exceeds
+///   what a fresh account has been granted there.
+/// * with one, the commitment quota applies instead, which this emulator grants up to
+///   [`MAX_COMMITTED_MODEL_UNITS`].
+#[must_use]
+pub fn granted_model_units(commitment_duration: Option<&str>) -> i32 {
+    match commitment_duration {
+        Some(_) => MAX_COMMITTED_MODEL_UNITS,
+        None => 0,
+    }
+}
+
+/// The most model units one Provisioned Throughput bought WITH a commitment may allocate.
+///
+/// CHOSEN, not published: AWS's per-model model-unit quotas differ per base model and are
+/// adjustable, so this is the emulator's grant. It is what makes
+/// [`granted_model_units`] a bound rather than an unbounded accept.
+pub const MAX_COMMITTED_MODEL_UNITS: i32 = 64;
+
+/// What `CreateProvisionedModelThroughput` answers as its `ServiceQuotaExceededException`
+/// message for a Provisioned Throughput bought over `model_id` in `region` with no
+/// commitment, which an account holds no granted model units for
+/// ([`granted_model_units`]).
+///
+/// RECORDED behaviour, and a message BUILT FROM THE REQUEST rather than a constant: the
+/// corpus `simparity-behavioral-ga-prod-v1` records Amazon Bedrock naming the base model
+/// the request asked for and the region it addressed, and pointing the caller at the
+/// support case that raises the quota. So the rule is "name the model the request named,
+/// in the region it addressed", not one recorded model id.
+#[must_use]
+pub fn no_commitment_model_units_message(model_id: &str, region: &str) -> String {
+    format!(
+        "Your account does not currently have any no commitment model units reserved for \
+         {model_id}. Please see \
+         https://support.console.aws.amazon.com/support/home?region={region}\
+         #/case/create to request model units."
+    )
+}
+
+/// `InferenceType` — the inference a Provisioned Throughput buys, as
+/// `crate::ops::types::INFERENCE_TYPE_VALUES` (`[ON_DEMAND, PROVISIONED]`) spells it.
+///
+/// A base model is offered under one or both, which is what
+/// [`FoundationModel::inference_types_supported`] reports, so it is also what decides
+/// whether a Provisioned Throughput can be created over that model at all.
+pub const INFERENCE_TYPE_PROVISIONED: &str = "PROVISIONED";
+
+/// How long one month of a Provisioned Throughput commitment term lasts.
+///
+/// `CommitmentDuration` is `[OneMonth, SixMonths]`
+/// (`smithy_query(query="shape",shape="CommitmentDuration")`), so the enum value itself
+/// states the term in months and [`commitment_term`] multiplies this by the months it
+/// names. AWS publishes no exact length for such a month, so 30 days is CHOSEN.
+pub const COMMITMENT_MONTH: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The term a `CommitmentDuration` names, or `None` for a value that is not one of its
+/// two.
+///
+/// The members this answers for are the whole enum, so a Provisioned Throughput created
+/// with a commitment always has an expiration instant to report
+/// ([`ProvisionedModelThroughputRecord::commitment_expiration_time`]).
+#[must_use]
+pub fn commitment_term(commitment_duration: &str) -> Option<Duration> {
+    match commitment_duration {
+        "OneMonth" => Some(COMMITMENT_MONTH),
+        "SixMonths" => Some(6 * COMMITMENT_MONTH),
+        _ => None,
+    }
+}
 
 /// The number of base-36 digits each half of a minted resource id carries.
 ///
@@ -659,6 +782,83 @@ pub struct EvaluationJobRecord {
     pub last_modified_at: SystemTime,
 }
 
+/// One stored Provisioned Throughput: the identity `CreateProvisionedModelThroughput`
+/// minted, the model units and commitment that request bought, the model it is associated
+/// with, and the lifecycle status a read reports.
+///
+/// `status` is `&'static str` for the same reason [`ModelImportJobRecord::status`] is: it
+/// is one of the two values this emulator mints
+/// ([`PROVISIONED_MODEL_STATUS_CREATING`], [`PROVISIONED_MODEL_STATUS_IN_SERVICE`])
+/// rather than anything a request chooses.
+#[derive(Debug, Clone)]
+pub struct ProvisionedModelThroughputRecord {
+    /// The `ProvisionedModelArn` this Provisioned Throughput is addressed by, minted by
+    /// [`provisioned_model_arn`].
+    pub arn: String,
+    /// `provisionedModelName`, as the create request spelled it. The other spelling of
+    /// `ProvisionedModelId`, so it is also what makes the name unique within the account
+    /// and region.
+    pub name: String,
+    /// The region the create addressed, which [`Self::arn`] also carries. Kept beside it
+    /// so the name index is per region without re-parsing an ARN, exactly as
+    /// [`EvaluationJobRecord::region`] is.
+    pub region: String,
+    /// `modelArn` — the model this Provisioned Throughput is associated with NOW.
+    pub model_arn: String,
+    /// `desiredModelArn` — the model it was last requested to be associated with. Equal to
+    /// [`Self::model_arn`] until an association change is in flight.
+    pub desired_model_arn: String,
+    /// `foundationModelArn` — the base model the Provisioned Throughput was created for,
+    /// as [`foundation_model_arn`] spells it.
+    pub foundation_model_arn: String,
+    /// `modelUnits` — the model units allocated now.
+    pub model_units: i32,
+    /// `desiredModelUnits` — the model units last requested. Equal to [`Self::model_units`]
+    /// until an allocation change is in flight.
+    pub desired_model_units: i32,
+    /// `ProvisionedModelStatus`.
+    pub status: &'static str,
+    /// When [`Self::status`] is owed its move to [`PROVISIONED_MODEL_STATUS_IN_SERVICE`],
+    /// or `None` once it is terminal.
+    ///
+    /// The due INSTANT, not a timer, for the same reason
+    /// [`MarketplaceModelEndpointRecord::in_service_due_at`] is one.
+    pub in_service_due_at: Option<SystemTime>,
+    /// `commitmentDuration`, as the create request carried it (absent for a no-commitment
+    /// Provisioned Throughput).
+    pub commitment_duration: Option<String>,
+    /// `commitmentExpirationTime` — when the commitment term ends: the creation instant
+    /// plus the term [`commitment_term`] reads off [`Self::commitment_duration`], and
+    /// `None` when there is no commitment.
+    pub commitment_expiration_time: Option<SystemTime>,
+    /// `tags` — the tags the create request attached.
+    ///
+    /// Kept with the record because it is part of the request that minted it; the
+    /// Provisioned Throughput read operations report no tag member, so nothing reads them
+    /// back until `ListTagsForResource` is implemented.
+    pub tags: Vec<Tag>,
+    pub created_at: SystemTime,
+    /// When the Provisioned Throughput last changed: the creation instant until something
+    /// changes it, and the instant a settle was owed once the status has moved.
+    pub last_modified_at: SystemTime,
+}
+
+impl ProvisionedModelThroughputRecord {
+    /// Materialise the move to [`PROVISIONED_MODEL_STATUS_IN_SERVICE`] the clock has
+    /// already made due at `now`.
+    ///
+    /// The only write a reporting operation on this resource makes: it was owed at the due
+    /// instant even if nobody had called, which is why that instant — not `now` — is the
+    /// one the record reports as its last modification.
+    pub fn settle(&mut self, now: SystemTime) {
+        if let Some(due) = self.in_service_due_at.filter(|due| now >= *due) {
+            self.status = PROVISIONED_MODEL_STATUS_IN_SERVICE;
+            self.in_service_due_at = None;
+            self.last_modified_at = due;
+        }
+    }
+}
+
 /// The account's enforced guardrail configuration: the guardrail revision every
 /// invocation in this account is guarded by, as `PutEnforcedGuardrailConfiguration` last
 /// installed it.
@@ -743,6 +943,14 @@ pub struct EnforcedGuardrailConfiguration {
 ///   endpoint for the same reason `create_tokens` does, and each endpoint's
 ///   [`MarketplaceModelEndpointRecord::last_update_token`] is ONE token rather than a map,
 ///   so repeated updates cannot grow the store either.
+///
+/// * `provisioned_model_throughputs` and `provisioned_model_names` hold one entry per
+///   live Provisioned Throughput, capped at
+///   [`MAX_PROVISIONED_MODEL_THROUGHPUTS_PER_ACCOUNT`] by the quota
+///   `CreateProvisionedModelThroughput` enforces, and `provisioned_model_create_tokens`
+///   holds at most one entry per live Provisioned Throughput for the same reason
+///   `create_tokens` does — including across a delete, which drops the entries naming the
+///   Provisioned Throughput it removed.
 ///
 /// * `foundation_models` is the PUBLISHED catalog, seeded once per store and never
 ///   written: no operation here creates or deletes a foundation model.
@@ -852,6 +1060,23 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many evaluation job ids this store has minted; the uniqueness half of a minted
     /// id.
     pub minted_evaluation_jobs: u64,
+    /// Every stored Provisioned Throughput, keyed by its `ProvisionedModelArn` — one of
+    /// the two spellings `ProvisionedModelId` admits.
+    pub provisioned_model_throughputs: HashMap<String, ProvisionedModelThroughputRecord>,
+    /// `(region, provisionedModelName)` -> `ProvisionedModelArn`, so the other
+    /// `ProvisionedModelId` spelling — the bare name — resolves to the Provisioned
+    /// Throughput it names, and a second create of a live name is refused.
+    ///
+    /// Keyed by the region too because the ARN carries one, so the same name in another
+    /// region names another Provisioned Throughput.
+    pub provisioned_model_names: HashMap<(String, String), String>,
+    /// `CreateProvisionedModelThroughput` idempotency: `(region, clientRequestToken)` ->
+    /// the `provisionedModelArn` that token minted. Scoped to that one operation, and to
+    /// the region the request addressed, the way the evaluation job index is.
+    pub provisioned_model_create_tokens: HashMap<(String, String), String>,
+    /// How many Provisioned Throughput ids this store has minted; the uniqueness half of
+    /// a minted id.
+    pub minted_provisioned_models: u64,
     /// The foundation models this service offers, seeded from [`FOUNDATION_MODELS`] by
     /// [`FoundationModelCatalog::default`].
     ///
@@ -1054,6 +1279,74 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         self.minted_evaluation_jobs += 1;
         minted_id(self.minted_evaluation_jobs, now)
     }
+
+    /// Mint a fresh Provisioned Throughput id: the resource half of a
+    /// `provisioned-model/<id>` ARN, unique within this store.
+    ///
+    /// Built like a guardrail id, and for the same two reasons; `ProvisionedModelArn`
+    /// admits exactly `[a-z0-9]{12}` there, which is what two [`ID_HALF_WIDTH`] base-36
+    /// halves spell.
+    pub fn mint_provisioned_model_id(&mut self, now: SystemTime) -> String {
+        self.minted_provisioned_models += 1;
+        minted_id(self.minted_provisioned_models, now)
+    }
+
+    /// The `ProvisionedModelArn` a `ProvisionedModelId` names: the identifier itself when
+    /// it is the ARN of a stored Provisioned Throughput, otherwise the ARN the
+    /// Provisioned Throughput of that NAME in `region` carries.
+    ///
+    /// The identifier's pattern is that ARN OR a bare `ProvisionedModelName`
+    /// (`smithy_query(query="operation",operation="GetProvisionedModelThroughput")`), so
+    /// both spellings address the same Provisioned Throughput.
+    #[must_use]
+    pub fn provisioned_model_arn_of(&self, identifier: &str, region: &str) -> Option<String> {
+        if self.provisioned_model_throughputs.contains_key(identifier) {
+            return Some(identifier.to_string());
+        }
+        self.provisioned_model_names
+            .get(&(region.to_string(), identifier.to_string()))
+            .cloned()
+    }
+
+    /// The Provisioned Throughput a `ProvisionedModelId` names, with any status transition
+    /// the clock has made due at `now` materialised first — so every caller reads the
+    /// status it holds at `now`, whichever operation asked.
+    pub fn provisioned_model_throughput(
+        &mut self,
+        identifier: &str,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<&mut ProvisionedModelThroughputRecord> {
+        let arn = self.provisioned_model_arn_of(identifier, region)?;
+        let record = self.provisioned_model_throughputs.get_mut(&arn)?;
+        record.settle(now);
+        Some(record)
+    }
+
+    /// Materialise every Provisioned Throughput status transition the clock has made due
+    /// at `now`, so a LISTING reports — and filters on — the status each record holds at
+    /// `now` exactly as a read of that one record would.
+    pub fn settle_provisioned_model_throughputs(&mut self, now: SystemTime) {
+        for record in self.provisioned_model_throughputs.values_mut() {
+            record.settle(now);
+        }
+    }
+
+    /// Forget the Provisioned Throughput `arn` names, together with its name index entry
+    /// and the idempotency tokens that minted it — so a delete leaves nothing behind for
+    /// a later create of the same name to collide with, and the token map stays bounded by
+    /// the LIVE Provisioned Throughputs.
+    pub fn remove_provisioned_model_throughput(
+        &mut self,
+        arn: &str,
+    ) -> Option<ProvisionedModelThroughputRecord> {
+        let record = self.provisioned_model_throughputs.remove(arn)?;
+        self.provisioned_model_names
+            .remove(&(record.region.clone(), record.name.clone()));
+        self.provisioned_model_create_tokens
+            .retain(|_, minted| minted != arn);
+        Some(record)
+    }
 }
 
 /// A minted resource id: `^[a-z0-9]+$`, the store's mint `ordinal` then the sub-second
@@ -1200,6 +1493,67 @@ pub fn evaluation_job_type_of(config: &EvaluationConfig) -> &'static str {
     match config {
         EvaluationConfig::Automated(_) => EVALUATION_JOB_TYPE_AUTOMATED,
         EvaluationConfig::Human(_) => EVALUATION_JOB_TYPE_HUMAN,
+    }
+}
+
+/// The ARN of a Provisioned Throughput in `region`:
+/// `arn:aws:bedrock:<region>:<account>:provisioned-model/<id>`, as `ProvisionedModelArn`
+/// (`^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:provisioned-model/[a-z0-9]{12}$`)
+/// spells it.
+pub fn provisioned_model_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn("bedrock", region, &format!("provisioned-model/{id}"))
+}
+
+/// The base model id inside a `ModelIdentifier`: the `modelId` of a
+/// `.../foundation-model/<modelId>` ARN, or the whole value when it is not one.
+///
+/// `ModelIdentifier` admits a model ARN or a bare model id
+/// (`smithy_query(query="operation",operation="CreateProvisionedModelThroughput")`), so
+/// both spellings name the same base model — built like [`guardrail_id_of`], and for the
+/// same reason.
+#[must_use]
+pub fn base_model_id_of(model_identifier: &str) -> &str {
+    match model_identifier.rsplit_once(":foundation-model/") {
+        Some((_, model_id)) => model_id,
+        None => model_identifier,
+    }
+}
+
+/// Whether `model` is offered with Provisioned Throughput, which is what decides whether
+/// a Provisioned Throughput can be created over it.
+///
+/// `InferenceType` is `[ON_DEMAND, PROVISIONED]` and
+/// [`FoundationModel::inference_types_supported`] reports the ones that model is offered
+/// under, so this reads the catalog rather than any property of the request.
+#[must_use]
+pub fn supports_provisioned_throughput(model: &FoundationModel) -> bool {
+    model
+        .inference_types_supported
+        .contains(&INFERENCE_TYPE_PROVISIONED)
+}
+
+/// The `ProvisionedModelSummary` a listing reports for a stored Provisioned Throughput.
+///
+/// Lives here rather than in `ops/list_provisioned_model_throughputs.rs` because every
+/// member it carries is also a member `GetProvisionedModelThroughput` reports, and the two
+/// must agree about them: a listed summary is the same record the read of that one
+/// Provisioned Throughput finds.
+pub fn provisioned_model_summary(
+    record: &ProvisionedModelThroughputRecord,
+) -> ProvisionedModelSummary {
+    ProvisionedModelSummary {
+        provisioned_model_name: record.name.clone(),
+        provisioned_model_arn: record.arn.clone(),
+        model_arn: record.model_arn.clone(),
+        desired_model_arn: record.desired_model_arn.clone(),
+        foundation_model_arn: record.foundation_model_arn.clone(),
+        model_units: record.model_units,
+        desired_model_units: record.desired_model_units,
+        status: record.status.to_string(),
+        commitment_duration: record.commitment_duration.clone(),
+        commitment_expiration_time: record.commitment_expiration_time.map(date_time),
+        creation_time: date_time(record.created_at),
+        last_modified_time: date_time(record.last_modified_at),
     }
 }
 

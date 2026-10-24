@@ -163,10 +163,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let store = state.lock();
         // A destination is regional, as every resource of this service is: only the region
         // that created it resolves it.
         let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
         let destination = store.destination_in(&region, &input.name).ok_or_else(|| {
             // A read reports WHICH KIND of resource was not found; the name the request
             // carried is reported on `ResourceId`.

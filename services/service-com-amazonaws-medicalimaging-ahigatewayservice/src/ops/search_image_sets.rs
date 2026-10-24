@@ -7,9 +7,9 @@
 //! ask for, one `maxResults`-sized page at a time with an opaque token that resumes the
 //! walk where the previous page stopped.
 //!
-//! A REPORTING operation, so it writes nothing of its own: `lastAccessedAt` stays absent,
-//! because recording when an image set was last searched would be a read changing what a
-//! later caller sees. Like every handler it calls
+//! A REPORTING operation, so it writes nothing of its own: a search reports each image
+//! set's `lastAccessedAt` from state without moving it, because searching an image set
+//! is not an access of the DICOM content it holds. Like every handler it calls
 //! [`crate::state::ComAmazonawsMedicalimagingAhigatewayserviceState::advance_clock`]
 //! first, which materialises only a transition the CLOCK already owed at that instant.
 //!
@@ -314,17 +314,18 @@ fn invalid_request(message: String) -> SearchImageSetsError {
 /// What one image set reports in a search result.
 ///
 /// Every member comes from the record: the version is the image set's LATEST, the
-/// timestamps are the image set's own creation and that version's last change, and the
-/// DICOM attributes are the ones the image set holds.
+/// timestamps are the image set's own creation, that version's last change and the last
+/// access of the content the image set holds, and the DICOM attributes are the ones the
+/// image set holds.
 fn summary_of(image_set: &ImageSet) -> ImageSetsMetadataSummary {
     ImageSetsMetadataSummary {
         image_set_id: image_set.image_set_id.clone(),
         version: i32::try_from(image_set.latest_version.version_id).ok(),
         created_at: Some(crate::state::to_date_time(image_set.created_at)),
         updated_at: Some(crate::state::to_date_time(image_set.latest_version.updated_at)),
-        // Absent, deliberately: recording when an image set was last searched would be a
-        // reporting operation writing a change no clock owed.
-        last_accessed_at: None,
+        // The same instant `GetImageSet` reports for this image set, read from state:
+        // a search does not touch the content it describes, so it records no access.
+        last_accessed_at: Some(crate::state::to_date_time(image_set.last_accessed_at)),
         storage_tier: Some(crate::state::DEFAULT_STORAGE_TIER.to_string()),
         dicom_tags: Some(image_set.dicom_tags.clone()),
         is_primary: Some(image_set.is_primary),

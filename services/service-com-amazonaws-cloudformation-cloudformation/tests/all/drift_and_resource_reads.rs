@@ -38,8 +38,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::provisioned_resources::s3;
 use crate::stack_lifecycle::{
-    call, create_stack, describe_stack, member, router, wait_for_the_transition, xml_text,
-    ACCOUNT_ID, REGION,
+    acknowledging_iam, call, create_stack, describe_stack, member, router,
+    wait_for_the_transition, xml_text, ACCOUNT_ID, REGION,
 };
 use crate::stack_resources::is_iso8601_instant;
 use service_com_amazonaws_cloudformation_cloudformation::state::{
@@ -54,7 +54,8 @@ async fn wait_for_the_detection() {
 
 /// Deploy a template and wait past the instant its create settles.
 async fn deploy(router: &MultiServiceRouter, name: &str, template: &str) {
-    let (status, body) = create_stack(router, name, template, &[]).await;
+    // A row's template may declare an IAM resource, so the deployment acknowledges them.
+    let (status, body) = create_stack(router, name, template, &acknowledging_iam(&[])).await;
     assert_eq!(
         status, 200,
         "CreateStack({name}) answered {status} with {body}"
