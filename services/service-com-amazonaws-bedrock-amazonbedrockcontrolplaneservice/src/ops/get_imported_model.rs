@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetImportedModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetImportedModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetImportedModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! Reports the imported model a `modelIdentifier` names — either spelling, the imported
+//! model's ARN or its bare name — out of the import job that holds it
+//! ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::imported_model`]),
+//! and refuses an identifier no imported
+//! model answers to with 404 `ResourceNotFoundException`. An import that has not finished
+//! has imported no model, so an identifier naming one is refused the same way.
+//!
+//! This operation is `@readonly`, and the ONE write it makes is the status transition the
+//! CLOCK already made due on the import job it reads
+//! ([`crate::state::ModelImportJobRecord::complete`]), exactly as `GetModelImportJob`
+//! materialises it: the import was owed its move to `Completed` at the stored due instant
+//! whether or not anybody called.
+//!
+//! `modelArchitecture`, `instructSupported` and `customModelUnits` are the three members
+//! Amazon Bedrock derives by INSPECTING the model artifacts an import reads — the
+//! architecture they declare, whether they support the converse form, and the hardware a
+//! single copy of them needs. This emulator never reads the bytes a request's
+//! `modelDataSource` points at, so it knows none of the three and reports none of them
+//! rather than inventing a value; every other member comes out of the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +181,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetImportedModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetImportedModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetImportedModel"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetImportedModelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "imported model state is not available on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some((job, ended_at)) = store.imported_model(&input.model_identifier, &region, now)
+        else {
+            return Err(GetImportedModelErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no imported model answers to {} in this account in {region}",
+                        input.model_identifier
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetImportedModelOutput {
+            model_arn: Some(job.imported_model_arn.clone()),
+            model_name: Some(job.imported_model_name.clone()),
+            job_arn: Some(job.arn.clone()),
+            job_name: Some(job.name.clone()),
+            model_data_source: Some(job.model_data_source.clone()),
+            // "Creation time of the imported model": the import is what creates the model,
+            // so the model came into being when that import ended — not when the job that
+            // runs it was accepted.
+            creation_time: Some(crate::state::date_time(ended_at)),
+            model_kms_key_arn: job.imported_model_kms_key_arn.clone(),
+            // The three members read off the model artifacts; see this module's header for
+            // why this emulator reports none of them.
+            model_architecture: None,
+            instruct_supported: None,
+            custom_model_units: None,
+        })
     }
 }
