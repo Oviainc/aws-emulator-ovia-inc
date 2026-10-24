@@ -57,7 +57,7 @@ use crate::ops::types::{
     InstanceHardware, InstanceHealthSummary, InstanceMetadataOptions, InstanceNetworking,
     InstancePortInfo, InstanceState, LoadBalancer, LoadBalancerTlsCertificateSummary,
     MonitoredResourceInfo, MonthlyTransfer, Operation, PrivateRegistryAccess, Region,
-    RelationalDatabaseBundle,
+    RelationalDatabaseBundle, RelationalDatabaseParameter,
     ResourceLocation, ResourceReceivingAccess, StaticIp, Tag, REGION_NAME_VALUES,
 };
 
@@ -2411,6 +2411,519 @@ pub fn relational_database_bundle_ids(specs: &[RelationalDatabaseBundleSpec]) ->
     specs
         .iter()
         .map(|spec| spec.bundle_id)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// ---------------------------------------------------------------------------
+// Relational database runtime parameters
+// ---------------------------------------------------------------------------
+
+// `GetRelationalDatabaseParameters` "returns all of the runtime parameters
+// offered by the underlying database software, or engine, for a specific
+// database" — so the parameter SET is the engine's, published data like the
+// blueprint and bundle catalogs above, while which set a database has and what
+// the memory-derived values in it come to are the database's own stored facts
+// (its blueprint's engine, its bundle's RAM). Nothing here is per-account state:
+// reporting it leaves every later caller the answer it would have had.
+
+/// The `applyType` of a parameter a running engine can take on without being
+/// restarted, as RDS and Lightsail report it.
+pub const PARAMETER_APPLY_TYPE_DYNAMIC: &str = "dynamic";
+
+/// The `applyType` of a parameter the engine only reads at startup, so a change
+/// to it takes effect at the next reboot.
+pub const PARAMETER_APPLY_TYPE_STATIC: &str = "static";
+
+/// The `applyMethod` of a parameter a change takes effect on at once: the
+/// modelled `RelationalDatabaseParameter$applyMethod` is "Indicates when
+/// parameter updates are applied. Can be `immediate` or `pending-reboot`", and a
+/// [dynamic](PARAMETER_APPLY_TYPE_DYNAMIC) parameter is exactly one a change can
+/// be applied to immediately.
+pub const PARAMETER_APPLY_METHOD_IMMEDIATE: &str = "immediate";
+
+/// The `applyMethod` of a parameter a change waits for the next reboot on: a
+/// [static](PARAMETER_APPLY_TYPE_STATIC) parameter, which is what this
+/// operation's own documentation means by "whether changes require a reboot".
+pub const PARAMETER_APPLY_METHOD_PENDING_REBOOT: &str = "pending-reboot";
+
+/// The `dataType` of a parameter that is on or off.
+pub const PARAMETER_DATA_TYPE_BOOLEAN: &str = "boolean";
+
+/// The `dataType` of a parameter that takes a whole number.
+pub const PARAMETER_DATA_TYPE_INTEGER: &str = "integer";
+
+/// The `dataType` of a parameter that takes a fractional number.
+pub const PARAMETER_DATA_TYPE_FLOAT: &str = "float";
+
+/// The `dataType` of a parameter that takes free text.
+pub const PARAMETER_DATA_TYPE_STRING: &str = "string";
+
+/// Bytes in a gibibyte: the unit a bundle's `ramSizeInGb` is measured in, which
+/// the memory-derived parameter values below are computed against.
+const BYTES_PER_GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// The memory, in bytes, of a database running on a bundle with `ram_size_in_gb`
+/// gibibytes of RAM.
+fn relational_database_memory_bytes(ram_size_in_gb: f32) -> i64 {
+    (f64::from(ram_size_in_gb) * BYTES_PER_GIB).round() as i64
+}
+
+/// What a runtime parameter's CURRENT value is on a database of a given size.
+///
+/// A managed database runs with the service's own parameter group, and a
+/// parameter in it is in one of exactly these three positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationalDatabaseParameterValue {
+    /// The group pins nothing: the parameter runs at the database engine's own
+    /// default. RDS reports such a parameter with no `ParameterValue` at all —
+    /// its source is the engine, not the group — and so does Lightsail: the
+    /// `get-relational-database-parameters` example in the AWS CLI reference
+    /// shows entries carrying every other member and no `parameterValue`.
+    EngineDefault,
+    /// The group pins a fixed value, the same on every database.
+    Fixed(&'static str),
+    /// The group derives the value from the memory of the database's own
+    /// hardware: `min(memory_bytes * numerator / denominator, cap)`.
+    ///
+    /// This is how RDS's default parameter groups express a memory-sized
+    /// parameter — as a formula over `DBInstanceClassMemory` rather than as a
+    /// number — and the formula is published per parameter (see the entries that
+    /// use it below). The formula's literal text is an RDS implementation detail
+    /// of its parameter-group format; what a database actually RUNS with is the
+    /// formula resolved against its own hardware, so that resolved number is
+    /// what this emulator reports, computed from the bundle the database is
+    /// stored with rather than from any canned body.
+    FromMemory {
+        /// The factor the memory is multiplied by.
+        numerator: i64,
+        /// The divisor the product is divided by — the unit of the parameter
+        /// (bytes, 8 kB pages, bytes per connection).
+        denominator: i64,
+        /// The ceiling the formula is capped at, where the published formula
+        /// carries one.
+        cap: Option<i64>,
+    },
+}
+
+impl RelationalDatabaseParameterValue {
+    /// This value on a database whose bundle carries `ram_size_in_gb` gibibytes
+    /// of RAM, or `None` when the parameter is left at the engine's own default
+    /// and so reports no value.
+    pub fn resolve(self, ram_size_in_gb: f32) -> Option<String> {
+        match self {
+            Self::EngineDefault => None,
+            Self::Fixed(value) => Some(value.to_string()),
+            Self::FromMemory {
+                numerator,
+                denominator,
+                cap,
+            } => {
+                let memory = relational_database_memory_bytes(ram_size_in_gb);
+                // A denominator of zero would be a malformed catalog entry, not
+                // a request the caller can make; clamping it keeps the reporting
+                // path total.
+                let value = memory.saturating_mul(numerator) / denominator.max(1);
+                Some(cap.map_or(value, |cap| value.min(cap)).to_string())
+            }
+        }
+    }
+}
+
+/// One runtime parameter of a database engine: everything the modelled
+/// `RelationalDatabaseParameter` reports about it except the value, which
+/// depends on the database ([`RelationalDatabaseParameterValue`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelationalDatabaseParameterSpec {
+    /// `RelationalDatabaseParameter$parameterName` — "the name of the
+    /// parameter", spelled as the engine itself spells it.
+    pub parameter_name: &'static str,
+    /// Where this parameter's current value comes from.
+    pub value: RelationalDatabaseParameterValue,
+    /// `RelationalDatabaseParameter$allowedValues` — "the valid range of values
+    /// for the parameter". `None` where the parameter admits any value of its
+    /// data type and the engine publishes no range, and then the member is left
+    /// out rather than reported empty.
+    pub allowed_values: Option<&'static str>,
+    /// `RelationalDatabaseParameter$applyType` — "the engine-specific parameter
+    /// type": [dynamic](PARAMETER_APPLY_TYPE_DYNAMIC) when the running engine
+    /// can take a change on, [static](PARAMETER_APPLY_TYPE_STATIC) when it only
+    /// reads the parameter at startup.
+    pub apply_type: &'static str,
+    /// `RelationalDatabaseParameter$dataType` — "the valid data type for the
+    /// parameter", one of the `PARAMETER_DATA_TYPE_*` values.
+    pub data_type: &'static str,
+    /// `RelationalDatabaseParameter$description` — "a description of the
+    /// parameter", from the engine's own documentation of it.
+    pub description: &'static str,
+    /// `RelationalDatabaseParameter$isModifiable` — "whether the parameter can
+    /// be modified". False for a parameter the managed service owns and does not
+    /// let the customer change.
+    pub is_modifiable: bool,
+}
+
+impl RelationalDatabaseParameterSpec {
+    /// When a change to this parameter takes effect.
+    ///
+    /// DERIVED from [`Self::apply_type`] rather than tracked beside it: a
+    /// dynamic parameter is one the running engine can take a change on
+    /// ([`PARAMETER_APPLY_METHOD_IMMEDIATE`]), and a static one is only read at
+    /// startup, so a change to it can only land at the next reboot
+    /// ([`PARAMETER_APPLY_METHOD_PENDING_REBOOT`]) — which is what this
+    /// operation's "whether changes require a reboot" reports. Keeping the two
+    /// apart would let them disagree.
+    pub fn apply_method(&self) -> &'static str {
+        if self.apply_type == PARAMETER_APPLY_TYPE_DYNAMIC {
+            PARAMETER_APPLY_METHOD_IMMEDIATE
+        } else {
+            PARAMETER_APPLY_METHOD_PENDING_REBOOT
+        }
+    }
+
+    /// This parameter as the modelled `RelationalDatabaseParameter`, on a
+    /// database whose bundle carries `ram_size_in_gb` gibibytes of RAM.
+    pub fn view(&self, ram_size_in_gb: f32) -> RelationalDatabaseParameter {
+        RelationalDatabaseParameter {
+            parameter_name: Some(self.parameter_name.to_string()),
+            parameter_value: self.value.resolve(ram_size_in_gb),
+            allowed_values: self.allowed_values.map(str::to_string),
+            apply_method: Some(self.apply_method().to_string()),
+            apply_type: Some(self.apply_type.to_string()),
+            data_type: Some(self.data_type.to_string()),
+            description: Some(self.description.to_string()),
+            is_modifiable: Some(self.is_modifiable),
+        }
+    }
+}
+
+/// The runtime parameters of the MySQL engine, as a Lightsail MySQL database
+/// reports them.
+///
+/// SOURCE: each entry's default, range and dynamic/static nature is the one the
+/// MySQL manual's "Server System Variables" publishes for that variable, and the
+/// description is that variable's own; the two memory-derived values and the
+/// pinned time zone are what the managed service's parameter group sets on top
+/// of the engine's defaults — RDS publishes `innodb_buffer_pool_size` as
+/// `{DBInstanceClassMemory*3/4}` and `max_connections` as
+/// `{DBInstanceClassMemory/12582880}` in its MySQL default parameter group, and
+/// documents that a DB instance's time zone is UTC unless the customer changes
+/// it. A parameter the group leaves alone reports no value
+/// ([`RelationalDatabaseParameterValue::EngineDefault`]).
+///
+/// The ORDER is this slice's own — by parameter name, as RDS lists a parameter
+/// group — and it is stable, so two reads answer identically and a page token
+/// names the same entry in both.
+pub const MYSQL_RELATIONAL_DATABASE_PARAMETERS: &[RelationalDatabaseParameterSpec] = &[
+    RelationalDatabaseParameterSpec {
+        parameter_name: "allow-suspicious-udfs",
+        value: RelationalDatabaseParameterValue::EngineDefault,
+        allowed_values: Some("0,1"),
+        apply_type: PARAMETER_APPLY_TYPE_STATIC,
+        data_type: PARAMETER_DATA_TYPE_BOOLEAN,
+        description: "Controls whether user-defined functions that have only an xxx symbol for the main function can be loaded",
+        // The managed service loads no such function and does not let the
+        // customer ask for one.
+        is_modifiable: false,
+    },
+    RelationalDatabaseParameterSpec {
+        parameter_name: "auto_increment_increment",
+        value: RelationalDatabaseParameterValue::EngineDefault,
+        allowed_values: Some("1-65535"),
+        apply_type: PARAMETER_APPLY_TYPE_DYNAMIC,
+        data_type: PARAMETER_DATA_TYPE_INTEGER,
+        description: "Controls the increment between successive AUTO_INCREMENT values",
+        is_modifiable: true,
+    },
+    RelationalDatabaseParameterSpec {
+        parameter_name: "autocommit",
+        value: RelationalDatabaseParameterValue::EngineDefault,
+        allowed_values: Some("0,1"),
+        apply_type: PARAMETER_APPLY_TYPE_DYNAMIC,
+        data_type: PARAMETER_DATA_TYPE_BOOLEAN,
+        description: "Sets the autocommit mode, in which every statement is committed as a transaction of its own",
+        is_modifiable: true,
+    },
+    RelationalDatabaseParameterSpec {
+        parameter_name: "innodb_buffer_pool_size",
+        // RDS: `{DBInstanceClassMemory*3/4}` — three quarters of the hardware's
+        // memory, in bytes.
+        value: RelationalDatabaseParameterValue::FromMemory {
+            numerator: 3,
+            denominator: 4,
+            cap: None,
+        },
+        allowed_values: Some("5242880-9223372036854775807"),
+        apply_type: PARAMETER_APPLY_TYPE_DYNAMIC,
+        data_type: PARAMETER_DATA_TYPE_INTEGER,
+        description: "The size in bytes of the buffer pool, the memory area where InnoDB caches table and index data",
+        is_modifiable: true,
+    },
+    RelationalDatabaseParameterSpec {
+        parameter_name: "long_query_time",
+        value: RelationalDatabaseParameterValue::EngineDefault,
+        allowed_values: Some("0-31536000"),
+        apply_type: PARAMETER_APPLY_TYPE_DYNAMIC,
+        data_type: PARAMETER_DATA_TYPE_FLOAT,
+        description: "The minimum execution time in seconds for a statement to be logged as slow",
+        is_modifiable: true,
+    },
+    RelationalDatabaseParameterSpec {
+        parameter_name: "max_allowed_packet",
+        value: RelationalDatabaseParameterValue::EngineDefault,
+        allowed_values: Some("1024-1073741824"),
+        apply_type: PARAMETER_APPLY_TYPE_DYNAMIC,
+        data_type: PARAMETER_DATA_TYPE_INTEGER,
+        description: "The maximum size in bytes of one packet, or of any generated or intermediate string",
+        is_modifiable: true,
+    },
+    RelationalDatabaseParameterSpec {
+        parameter_name: "max_connections",
+        // RDS: `{DBInstanceClassMemory/12582880}` — one connection per 12 MB of
+        // the hardware's memory.
+        value: RelationalDatabaseParameterValue::FromMemory {
+            numerator: 1,
+            denominator: 12_582_880,
+            cap: None,
+        },
+        allowed_values: Some("1-100000"),
+        apply_type: PARAMETER_APPLY_TYPE_DYNAMIC,
+        data_type: PARAMETER_DATA_TYPE_INTEGER,
+        description: "The maximum permitted number of simultaneous client connections",
+        is_modifiable: true,
+    },
+    RelationalDatabaseParameterSpec {
+        parameter_name: "slow_query_log",
+        value: RelationalDatabaseParameterValue::EngineDefault,
+        allowed_values: Some("0,1"),
+        apply_type: PARAMETER_APPLY_TYPE_DYNAMIC,
+        data_type: PARAMETER_DATA_TYPE_BOOLEAN,
+        description: "Enables or disables the slow query log",
+        is_modifiable: true,
+    },
+    RelationalDatabaseParameterSpec {
+        parameter_name: "time_zone",
+        // The managed service runs a database in UTC unless the customer
+        // changes it.
+        value: RelationalDatabaseParameterValue::Fixed("UTC"),
+        // A time zone name, not a range: the engine publishes none.
+        allowed_values: None,
+        apply_type: PARAMETER_APPLY_TYPE_DYNAMIC,
+        data_type: PARAMETER_DATA_TYPE_STRING,
+        description: "The time zone the server interprets and reports date and time values in",
+        is_modifiable: true,
+    },
+    RelationalDatabaseParameterSpec {
+        parameter_name: "wait_timeout",
+        value: RelationalDatabaseParameterValue::EngineDefault,
+        allowed_values: Some("1-31536000"),
+        apply_type: PARAMETER_APPLY_TYPE_DYNAMIC,
+        data_type: PARAMETER_DATA_TYPE_INTEGER,
+        description: "The number of seconds the server waits for activity on a noninteractive connection before closing it",
+        is_modifiable: true,
+    },
+];
+
+/// The runtime parameters of the PostgreSQL engine, as a Lightsail PostgreSQL
+/// database reports them.
+///
+/// SOURCE: each entry's range, unit and reset-required (static) nature is the
+/// one the PostgreSQL documentation's "Server Configuration" publishes for that
+/// parameter, and the description is that parameter's own; the two
+/// memory-derived values and the pinned time zone are what the managed service's
+/// parameter group sets on top of them — RDS publishes `shared_buffers` as
+/// `{DBInstanceClassMemory/32768}` (its unit is an 8 kB page, so that is a
+/// quarter of the hardware's memory) and `max_connections` as
+/// `LEAST({DBInstanceClassMemory/9531392},5000)` in its PostgreSQL default
+/// parameter group, and documents that a DB instance's time zone is UTC unless
+/// the customer changes it.
+///
+/// The ORDER is this slice's own, by parameter name, for the same reason as the
+/// MySQL catalog's.
+pub const POSTGRES_RELATIONAL_DATABASE_PARAMETERS: &[RelationalDatabaseParameterSpec] = &[
+    RelationalDatabaseParameterSpec {
+        parameter_name: "autovacuum",
+        value: RelationalDatabaseParameterValue::EngineDefault,
+        allowed_values: Some("0,1"),
+        apply_type: PARAMETER_APPLY_TYPE_DYNAMIC,
+        data_type: PARAMETER_DATA_TYPE_BOOLEAN,
+        description: "Controls whether the server runs the autovacuum launcher daemon",
+        is_modifiable: true,
+    },
+    RelationalDatabaseParameterSpec {
+        parameter_name: "client_encoding",
+        value: RelationalDatabaseParameterValue::EngineDefault,
+        // A character set name, not a range: the parameter admits every
+        // encoding the server was built with.
+        allowed_values: None,
+        apply_type: PARAMETER_APPLY_TYPE_DYNAMIC,
+        data_type: PARAMETER_DATA_TYPE_STRING,
+        description: "Sets the client-side character set encoding",
+        is_modifiable: true,
+    },
+    RelationalDatabaseParameterSpec {
+        parameter_name: "log_min_duration_statement",
+        value: RelationalDatabaseParameterValue::EngineDefault,
+        allowed_values: Some("-1-2147483647"),
+        apply_type: PARAMETER_APPLY_TYPE_DYNAMIC,
+        data_type: PARAMETER_DATA_TYPE_INTEGER,
+        description: "Sets the minimum execution time in milliseconds above which a statement is logged; -1 disables the logging",
+        is_modifiable: true,
+    },
+    RelationalDatabaseParameterSpec {
+        parameter_name: "maintenance_work_mem",
+        value: RelationalDatabaseParameterValue::EngineDefault,
+        allowed_values: Some("1024-2147483647"),
+        apply_type: PARAMETER_APPLY_TYPE_DYNAMIC,
+        data_type: PARAMETER_DATA_TYPE_INTEGER,
+        description: "Sets the maximum memory in kilobytes a maintenance operation such as VACUUM or CREATE INDEX may use",
+        is_modifiable: true,
+    },
+    RelationalDatabaseParameterSpec {
+        parameter_name: "max_connections",
+        // RDS: `LEAST({DBInstanceClassMemory/9531392},5000)` — one connection
+        // per about 9 MB of the hardware's memory, never more than 5000.
+        value: RelationalDatabaseParameterValue::FromMemory {
+            numerator: 1,
+            denominator: 9_531_392,
+            cap: Some(5000),
+        },
+        allowed_values: Some("1-262143"),
+        // PostgreSQL reads `max_connections` only at startup.
+        apply_type: PARAMETER_APPLY_TYPE_STATIC,
+        data_type: PARAMETER_DATA_TYPE_INTEGER,
+        description: "Sets the maximum number of concurrent connections to the database server",
+        is_modifiable: true,
+    },
+    RelationalDatabaseParameterSpec {
+        parameter_name: "shared_buffers",
+        // RDS: `{DBInstanceClassMemory/32768}`, in the parameter's own unit of
+        // 8 kB pages.
+        value: RelationalDatabaseParameterValue::FromMemory {
+            numerator: 1,
+            denominator: 32_768,
+            cap: None,
+        },
+        allowed_values: Some("16-1073741823"),
+        apply_type: PARAMETER_APPLY_TYPE_STATIC,
+        data_type: PARAMETER_DATA_TYPE_INTEGER,
+        description: "Sets the number of 8 kB shared memory buffers the server uses",
+        is_modifiable: true,
+    },
+    RelationalDatabaseParameterSpec {
+        parameter_name: "statement_timeout",
+        value: RelationalDatabaseParameterValue::EngineDefault,
+        allowed_values: Some("0-2147483647"),
+        apply_type: PARAMETER_APPLY_TYPE_DYNAMIC,
+        data_type: PARAMETER_DATA_TYPE_INTEGER,
+        description: "Sets the maximum allowed duration in milliseconds of any statement; 0 disables the timeout",
+        is_modifiable: true,
+    },
+    RelationalDatabaseParameterSpec {
+        parameter_name: "timezone",
+        value: RelationalDatabaseParameterValue::Fixed("UTC"),
+        allowed_values: None,
+        apply_type: PARAMETER_APPLY_TYPE_DYNAMIC,
+        data_type: PARAMETER_DATA_TYPE_STRING,
+        description: "Sets the time zone the server displays and interprets time stamps in",
+        is_modifiable: true,
+    },
+    RelationalDatabaseParameterSpec {
+        parameter_name: "work_mem",
+        value: RelationalDatabaseParameterValue::EngineDefault,
+        allowed_values: Some("64-2147483647"),
+        apply_type: PARAMETER_APPLY_TYPE_DYNAMIC,
+        data_type: PARAMETER_DATA_TYPE_INTEGER,
+        description: "Sets the maximum memory in kilobytes a query operation such as a sort or a hash table may use before writing to disk",
+        is_modifiable: true,
+    },
+];
+
+/// How many parameters one `GetRelationalDatabaseParameters` page carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that the
+/// response carries a `nextPageToken` when more parameters remain. It is above
+/// either engine's parameter set, so a database's whole set is answered in one
+/// page, and the paging walk still holds for a set that outgrows it.
+pub const RELATIONAL_DATABASE_PARAMETER_PAGE_SIZE: usize = 50;
+
+/// The runtime parameters the database engine `engine` offers: the catalog of
+/// the engine the database's blueprint names.
+///
+/// The engine is matched the way [`relational_database_port`] matches it — on
+/// the engine FAMILY — so a blueprint of any PostgreSQL major version resolves
+/// to the PostgreSQL set and everything else to the MySQL one, which is the
+/// engine the modelled `RelationalDatabaseEngine` enum names.
+pub fn relational_database_parameter_specs(
+    engine: &str,
+) -> &'static [RelationalDatabaseParameterSpec] {
+    if engine.to_ascii_lowercase().contains("postgres") {
+        POSTGRES_RELATIONAL_DATABASE_PARAMETERS
+    } else {
+        MYSQL_RELATIONAL_DATABASE_PARAMETERS
+    }
+}
+
+/// One page of a database's runtime parameters: the parameters it carries and
+/// the token that opens the page after it.
+#[derive(Debug, Clone)]
+pub struct RelationalDatabaseParameterPage {
+    /// The page's parameters, as the modelled view.
+    pub parameters: Vec<RelationalDatabaseParameter>,
+    /// The name of the first parameter of the NEXT page, present only while
+    /// parameters remain.
+    pub next_page_token: Option<String>,
+}
+
+/// One page of `specs` as a database with `ram_size_in_gb` gibibytes of RAM
+/// reports them: the slice from the parameter `page_token` names onward, at most
+/// `page_size` entries, with `next_page_token` naming the first parameter of the
+/// page after it.
+///
+/// `None` when `page_token` names no parameter of the set — the caller refuses it
+/// with the modelled `InvalidInputException`. A token names a PARAMETER rather
+/// than an index, so a set that gained or lost an entry between two pages cannot
+/// make the walk skip or repeat another one. An absent — or empty — token asks
+/// for the first page.
+pub fn relational_database_parameter_page(
+    specs: &[RelationalDatabaseParameterSpec],
+    ram_size_in_gb: f32,
+    page_token: Option<&str>,
+    page_size: usize,
+) -> Option<RelationalDatabaseParameterPage> {
+    // A page carries at least one entry: a zero-length page would name its own
+    // first entry as the next token and never advance.
+    let page_size = page_size.max(1);
+
+    let start = match page_token.filter(|token| !token.is_empty()) {
+        None => 0,
+        Some(token) => specs
+            .iter()
+            .position(|spec| spec.parameter_name == token)?,
+    };
+
+    let mut parameters = Vec::new();
+    let mut next_page_token = None;
+    for spec in &specs[start..] {
+        if parameters.len() == page_size {
+            next_page_token = Some(spec.parameter_name.to_string());
+            break;
+        }
+        parameters.push(spec.view(ram_size_in_gb));
+    }
+
+    Some(RelationalDatabaseParameterPage {
+        parameters,
+        next_page_token,
+    })
+}
+
+/// The parameter names a `GetRelationalDatabaseParameters` page token may name
+/// out of `specs`, for a refusal that has to tell the caller what to send
+/// instead.
+pub fn relational_database_parameter_names(specs: &[RelationalDatabaseParameterSpec]) -> String {
+    specs
+        .iter()
+        .map(|spec| spec.parameter_name)
         .collect::<Vec<_>>()
         .join(", ")
 }

@@ -19,7 +19,8 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    Graph as GraphDetail, MemberDetail, ResourceNotFoundException, UnprocessedAccount,
+    DatasourcePackageIngestDetail, Graph as GraphDetail, MemberDetail, ResourceNotFoundException,
+    TimestampForCollection, UnprocessedAccount,
 };
 
 /// Characters a behavior-graph id is built from.
@@ -290,13 +291,63 @@ impl Member {
 }
 
 /// One stored data source package of a behavior graph: whether Detective is ingesting
-/// it, and when that last changed.
+/// it, and when it last entered each ingest state it has been in.
 #[derive(Debug, Clone)]
 pub struct DatasourcePackageIngest {
     /// One of `DATASOURCE_PACKAGE_INGEST_STATE_VALUES`.
     pub state: String,
-    /// When the ingest state last changed, in epoch milliseconds.
-    pub last_state_change_millis: i64,
+    /// When this package last entered each ingest state, keyed by that state, in
+    /// epoch milliseconds — the record the modelled `LastIngestStateChange` map
+    /// (`map<DatasourcePackageIngestState, TimestampForCollection>`) reports, so a
+    /// package that has been started and later stopped keeps the instant of each.
+    pub last_state_change_millis: BTreeMap<String, i64>,
+}
+
+impl DatasourcePackageIngest {
+    /// A package that entered `state` at `now_millis`, for a graph that held no record
+    /// of it before.
+    pub fn entering(state: &str, now_millis: i64) -> Self {
+        Self {
+            state: state.to_string(),
+            last_state_change_millis: [(state.to_string(), now_millis)].into_iter().collect(),
+        }
+    }
+
+    /// Move this package into `state`, recording the instant it entered it.
+    ///
+    /// A package already in `state` keeps the instant it got there, so
+    /// `LastIngestStateChange` reports when ingest actually changed rather than when it
+    /// was last confirmed.
+    pub fn enter(&mut self, state: &str, now_millis: i64) {
+        if self.state == state {
+            return;
+        }
+        self.state = state.to_string();
+        self.last_state_change_millis
+            .insert(state.to_string(), now_millis);
+    }
+
+    /// This package as `ListDatasourcePackages`' `DatasourcePackageIngestDetail`
+    /// reports it: its ingest state, and the instant it entered each state it has been
+    /// in as a `date-time` timestamp.
+    pub fn detail(&self) -> DatasourcePackageIngestDetail {
+        DatasourcePackageIngestDetail {
+            datasource_package_ingest_state: Some(self.state.clone()),
+            last_ingest_state_change: Some(
+                self.last_state_change_millis
+                    .iter()
+                    .map(|(state, millis)| {
+                        (
+                            state.clone(),
+                            TimestampForCollection {
+                                timestamp: Some(millis_to_date_time(*millis)),
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+        }
+    }
 }
 
 /// One stored investigation of a behavior graph: everything `GetInvestigation`
