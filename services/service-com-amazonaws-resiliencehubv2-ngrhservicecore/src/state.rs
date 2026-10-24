@@ -521,11 +521,11 @@ impl TestTemplateCatalogEntry {
 /// id a service-owned template is minted as, enumerated in `name` order. It is a SUBSET of
 /// the published catalog, not the whole of it; adding a capability is adding a row.
 ///
-/// `description` is `@required` on `TestTemplateSummary`, so every row carries one. The
-/// first row's is the one AWS published for it; the others state the capability that
-/// template validates in the same form, because nothing AWS publishes gives their exact
-/// wording — the text is DESCRIPTIVE content, not a value a client branches on, and no row
-/// may carry an empty one just because its wording is not published.
+/// `description` is `@required` on `TestTemplateSummary`, so every row carries one, and
+/// each is the wording the service publishes for that template, carried VERBATIM: the
+/// catalog is service-owned static content (its ARNs name the `aws` account segment, not
+/// an account-scoped one), so its text is fixed AWS data a client may render, diff or
+/// select on — never re-worded here.
 ///
 /// Kept sorted by `name`, which is the order `ListTestTemplates` enumerates in, so two
 /// reads answer identically.
@@ -540,23 +540,24 @@ pub const TEST_TEMPLATE_CATALOG: &[TestTemplateCatalogEntry] = &[
     TestTemplateCatalogEntry {
         resource_id: "aws-dependency-validation:rtdep001",
         name: "Dependency validation",
-        // AUTHORED: states the capability this template validates; no published wording.
+        // PUBLISHED wording.
         description:
-            "Validate your service degrades gracefully when a dependency it calls is impaired.",
+            "Validate how your service responds when its dependencies within the Region are \
+             impaired.",
     },
     TestTemplateCatalogEntry {
         resource_id: "aws-multi-region-isolation:rtmr001",
         name: "Multi-Region: isolation",
-        // AUTHORED: states the capability this template validates; no published wording.
-        description: "Validate your service in one Region keeps serving when another Region it \
-                      shares resources with is isolated.",
+        // PUBLISHED wording.
+        description: "Validate your service can operate independently from a Region when \
+                      connectivity to another Region is unavailable.",
     },
     TestTemplateCatalogEntry {
         resource_id: "aws-multi-region-recovery:rtmr002",
         name: "Multi-Region: recovery",
-        // AUTHORED: states the capability this template validates; no published wording.
-        description:
-            "Validate your service can recover in another Region after a Regional impairment.",
+        // PUBLISHED wording.
+        description: "Validate your service can recover and serve clients from another Region \
+                      within your recovery objectives when a Region is impaired.",
     },
 ];
 
