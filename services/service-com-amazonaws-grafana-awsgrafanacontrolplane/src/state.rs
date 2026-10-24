@@ -92,6 +92,10 @@ pub const SAML_NOT_CONFIGURED: &str = "NOT_CONFIGURED";
 /// that names no workspace.
 pub const WORKSPACE_RESOURCE_TYPE: &str = "Workspace";
 
+/// `WorkspaceStatus$ACTIVE`: the status a workspace carries once it is up. Its
+/// native Grafana HTTP API serves requests only from then on.
+pub const WORKSPACE_ACTIVE: &str = "ACTIVE";
+
 /// The `resourceType` a `ResourceNotFoundException` or a `ConflictException`
 /// reports for a workspace API key.
 pub const API_KEY_RESOURCE_TYPE: &str = "ApiKey";
@@ -260,6 +264,12 @@ pub struct Workspace {
     pub status: String,
     /// The status change the clock owes this workspace, if any.
     pub pending: Option<PendingTransition>,
+    /// The URL this workspace's own Grafana HTTP API answers on, as
+    /// `WorkspaceDescription$endpoint` / `WorkspaceSummary$endpoint` report it:
+    /// the endpoint the create was reached at, plus this workspace's own path
+    /// ([`ServingEndpoint::workspace_endpoint`]). It is stored because it is the
+    /// address announced for the workspace's whole life, so every later read
+    /// reports the one a client was first handed.
     pub endpoint: String,
     pub grafana_version: String,
     pub data_sources: Vec<String>,
@@ -593,10 +603,12 @@ impl ServiceAccount {
 
 /// One token of a service account, as this emulator persists it.
 ///
-/// The token KEY is not here: it is a secret handed to the caller once, by
+/// The token KEY itself is not here: it is a secret handed to the caller once, by
 /// `CreateWorkspaceServiceAccountToken` ("Do not lose this key, as it will not be
-/// retrievable again"), and no operation reports it again — so nothing in the
-/// store needs to hold it.
+/// retrievable again"), and no operation reports it again. What is held is its
+/// [`bearer_token_digest`], because the workspace's own Grafana HTTP API has to
+/// recognise the bearer key a client presents among the tokens that workspace
+/// minted, without the store ever holding the key itself.
 ///
 /// An expired token stays on the record: `ServiceAccountTokenSummary$expiresAt`
 /// is what a report says about it ("When the service account token will expire"),
@@ -889,9 +901,17 @@ pub fn service_account_name_taken(
 
 /// The `ResourceNotFoundException` payload for a workspace id that names no
 /// workspace.
+///
+/// The message is built from the request and this emulator's own identity: the
+/// workspace id that was looked up, and the account it was looked up in — the
+/// two things that decide whether a workspace exists, so a caller holding an id
+/// from another account can tell why it was not found.
 pub fn workspace_not_found(id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("Workspace {id} not found"),
+        message: format!(
+            "Workspace with id={id} of account={} does not exist.",
+            ::engine::emulator_account_id()
+        ),
         resource_id: id.to_string(),
         resource_type: WORKSPACE_RESOURCE_TYPE.to_string(),
     }
@@ -1086,7 +1106,11 @@ pub fn not_a_workspace_arn(arn: &str) -> ValidationException {
 pub fn service_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<ComAmazonawsGrafanaAwsgrafanacontrolplaneState>> {
-    (engine as &dyn ::std::any::Any)
-        .downcast_ref::<::engine::InMemoryEngine>()
+    shared_engine(engine)
         .map(::engine::InMemoryEngine::state::<ComAmazonawsGrafanaAwsgrafanacontrolplaneState>)
+}
+
+/// The one shared engine behind a handler's `Eng`.
+fn shared_engine<Eng: Send + Sync + 'static>(engine: &Eng) -> Option<&::engine::InMemoryEngine> {
+    (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()
 }

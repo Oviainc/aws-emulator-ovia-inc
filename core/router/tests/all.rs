@@ -244,6 +244,8 @@ mod cloudformation_provisions_guardduty_detector;
 mod cloudformation_provisions_sns_topics;
 #[path = "all/cloudformation_provisions_waf_regional_ip_sets.rs"]
 mod cloudformation_provisions_waf_regional_ip_sets;
+#[path = "all/cloudformation_provisions_grafana_workspaces.rs"]
+mod cloudformation_provisions_grafana_workspaces;
 #[path = "all/mediapackagev2_published_data_plane_urls.rs"]
 mod mediapackagev2_published_data_plane_urls;
 #[path = "all/pi_resource_features.rs"]

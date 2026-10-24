@@ -49,7 +49,7 @@ use std::time::SystemTime;
 
 use crate::state::{
     ComAmazonawsGrafanaAwsgrafanacontrolplaneState as Store, Workspace,
-    WORKSPACE_API_PATH_PREFIX,
+    WORKSPACE_ACTIVE as ACTIVE, WORKSPACE_API_PATH_PREFIX,
 };
 
 /// The id of the one organization a workspace's Grafana has.
@@ -57,11 +57,6 @@ use crate::state::{
 /// Grafana numbers organizations from 1 and a workspace is a single Grafana
 /// server with a single organization, so that organization is organization 1.
 const WORKSPACE_ORG_ID: u64 = 1;
-
-/// The status a workspace carries once its Grafana server is serving:
-/// `WorkspaceStatus$ACTIVE`. Before it, the endpoint is announced but nothing is
-/// running behind it yet.
-const ACTIVE: &str = "ACTIVE";
 
 /// What one request to a workspace's Grafana HTTP API named.
 #[derive(Debug, Clone, PartialEq, Eq)]
