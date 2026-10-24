@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConfigurationSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConfigurationSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConfigurationSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the settings of the configuration set the request names — a
+//! stored configuration template, or the configuration deployed to a stored
+//! environment — from the store. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +155,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConfigurationSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConfigurationSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConfigurationSettings"))
+        // This operation reports what the store holds; nothing here is derived
+        // from the request's region.
+        let _ = ctx;
+
+        // "You must specify either this parameter or an EnvironmentName, but not
+        // both. If you specify both, Elastic Beanstalk returns an
+        // InvalidParameterCombination error. If you do not specify either,
+        // Elastic Beanstalk returns a MissingRequiredParameter error." Both are
+        // statements about the REQUEST, so both are answered before the
+        // application is resolved.
+        let wanted = match (
+            input.template_name.as_deref(),
+            input.environment_name.as_deref(),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    DescribeConfigurationSettingsError::invalid_parameter_combination(
+                        "You cannot specify both TemplateName and EnvironmentName.",
+                    ),
+                );
+            }
+            (None, None) => {
+                return Err(
+                    DescribeConfigurationSettingsError::missing_required_parameter(
+                        "Must specify either a TemplateName or an EnvironmentName.",
+                    ),
+                );
+            }
+            (Some(template_name), None) => ConfigurationSet::Template(template_name),
+            (None, Some(environment_name)) => ConfigurationSet::Environment(environment_name),
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeConfigurationSettingsError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        // This operation only REPORTS. The one write it performs is the clock's
+        // own — an environment status change or an application deletion the
+        // clock has already made due — which was owed at the same instant
+        // whether or not anybody called.
+        store.materialize_due_transitions();
+
+        let settings = match wanted {
+            // "The name of the configuration template to describe." A template
+            // name is unique per application, so the pair resolves one record.
+            ConfigurationSet::Template(template_name) => {
+                let Some(template) = store
+                    .configuration_templates
+                    .get(&(input.application_name.clone(), template_name.to_string()))
+                else {
+                    return Err(
+                        DescribeConfigurationSettingsError::invalid_parameter_value(
+                            crate::state::missing_configuration_template_message(template_name),
+                        ),
+                    );
+                };
+                crate::state::configuration_settings_description!(
+                    CreateConfigurationTemplateOutput,
+                    template
+                )
+            }
+            // "The name of the environment to describe" — the configuration set
+            // associated with a running environment. A terminated environment
+            // runs nothing, so it has no deployed configuration to report.
+            ConfigurationSet::Environment(environment_name) => {
+                let Some(environment) = store
+                    .environment_name_index
+                    .get(environment_name)
+                    .and_then(|environment_id| store.environments.get(environment_id))
+                    .filter(|environment| {
+                        !environment.is_terminated()
+                            && environment.application_name == input.application_name
+                    })
+                else {
+                    return Err(
+                        DescribeConfigurationSettingsError::invalid_parameter_value(
+                            crate::state::missing_environment_message(None, Some(environment_name)),
+                        ),
+                    );
+                };
+                CreateConfigurationTemplateOutput {
+                    solution_stack_name: environment.solution_stack_name.clone(),
+                    platform_arn: environment.platform_arn.clone(),
+                    application_name: Some(environment.application_name.clone()),
+                    // This configuration set belongs to an ENVIRONMENT, not to a
+                    // template: `TemplateName` is "if not null, the name of the
+                    // configuration template FOR THIS configuration set", which
+                    // the environment's own settings have none of, and
+                    // `EnvironmentName` is what names it instead.
+                    template_name: None,
+                    environment_name: Some(environment.environment_name.clone()),
+                    // "Describes this configuration set." The store holds no
+                    // description of its own for an environment's configuration
+                    // — only `UpdateEnvironment`/`DeleteEnvironmentConfiguration`
+                    // would create one, both still their own stubs — so the
+                    // environment's own description is what describes it, rather
+                    // than a sentence invented here.
+                    description: environment.description.clone(),
+                    // "deployed: This is the configuration that is currently
+                    // deployed to the associated running environment." The
+                    // second description the operation can report is a DRAFT
+                    // configuration (`pending`/`failed`) of an update in
+                    // flight, which this store holds none of.
+                    deployment_status: Some(DEPLOYMENT_STATUS_DEPLOYED.to_string()),
+                    date_created: Some(environment.date_created),
+                    date_updated: Some(environment.date_updated),
+                    option_settings: Some(environment.option_settings.clone()),
+                }
+            }
+        };
+
+        Ok(DescribeConfigurationSettingsOutput {
+            configuration_settings: Some(vec![settings]),
+        })
     }
+}
+
+/// The `ConfigurationDeploymentStatus` a running environment's configuration set
+/// reports, from [`CONFIGURATION_DEPLOYMENT_STATUS_VALUES`] — the modelled value
+/// set — read from the catalogue rather than written out a second time.
+const DEPLOYMENT_STATUS_DEPLOYED: &str = CONFIGURATION_DEPLOYMENT_STATUS_VALUES[0];
+
+/// Which configuration set the request named: "either a configuration template
+/// or the configuration set associated with a running environment". The request
+/// names exactly one of the two, so the pair of optional members is reduced to
+/// this choice once, before anything is resolved.
+enum ConfigurationSet<'a> {
+    /// `TemplateName`, resolved inside the request's application.
+    Template(&'a str),
+    /// `EnvironmentName`.
+    Environment(&'a str),
 }

@@ -251,6 +251,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store
             .application_versions
             .retain(|(application_name, _), _| *application_name != input.application_name);
+        store
+            .configuration_templates
+            .retain(|(application_name, _), _| *application_name != input.application_name);
 
         // The deletion has STARTED here; the event for its completion is recorded
         // when the clock makes that completion due.

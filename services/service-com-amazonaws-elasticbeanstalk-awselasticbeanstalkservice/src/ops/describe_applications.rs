@@ -163,7 +163,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_ref()
                     .is_none_or(|wanted| wanted.contains(&application.name))
             })
-            .map(|application| application.to_description(store.version_labels(&application.name)))
+            .map(|application| {
+                application.to_description(
+                    store.version_labels(&application.name),
+                    store.template_names(&application.name),
+                )
+            })
             .collect();
 
         Ok(DescribeApplicationsOutput {
