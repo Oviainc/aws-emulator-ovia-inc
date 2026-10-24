@@ -189,22 +189,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The HTTP status this service answers `ResourceNotFoundException` with.
-///
-/// The model annotates the shape `@httpError 404`, but every recorded response
-/// of this condition is an HTTP 400 carrying `__type`
-/// `ResourceNotFoundException`; the status a client reads is the recorded one, so
-/// that is what [`crate::scaffolded::Scaffolded::restated`] answers with while
-/// the shape, the body and the wire error code stay the modelled ones.
-const RESOURCE_NOT_FOUND_STATUS: u16 = 400;
-
 /// The modelled `ResourceNotFoundException` for an account the store holds no
 /// account-plan record for, naming the account whose data is missing.
+///
+/// Answered with the status this service sends for that shape
+/// ([`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`]), which is the service's own
+/// and not this operation's: the shape, the body and the wire error code stay the
+/// modelled ones.
 fn missing_plan_data(account_id: &str) -> GetAccountPlanStateError {
-    crate::scaffolded::Scaffolded::restated(
+    crate::scaffolded::resource_not_found(
         GetAccountPlanStateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
             message: format!("Missing data for account: {account_id}"),
         }),
-        RESOURCE_NOT_FOUND_STATUS,
     )
 }
