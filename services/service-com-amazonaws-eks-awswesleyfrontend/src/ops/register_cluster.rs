@@ -403,6 +403,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // server (`crate::state::CertificateAuthorityRecord`).
             certificate_authorities: ::std::collections::BTreeMap::new(),
             certificate_authorities_created: 0,
+            // A registration starts no insights refresh, and a connected cluster
+            // is not one `StartInsightsRefresh` acts on: it never reaches `ACTIVE`
+            // in this emulator.
+            insights_refresh: None,
         };
 
         let cluster = record.to_cluster();

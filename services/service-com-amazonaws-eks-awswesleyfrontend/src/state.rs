@@ -51,6 +51,12 @@
 //! back and `CancelUpdate` records its cancellation on it; deleting the cluster
 //! drops its updates with it rather than leaving them behind in a second map.
 //!
+//! The on-demand cluster insights refresh lives on the cluster too
+//! ([`ClusterRecord::insights_refresh`]): `StartInsightsRefresh` writes the
+//! [`InsightsRefreshRecord`] for the refresh it begins and
+//! `DescribeInsightsRefresh` reports that same record, so there is one place a
+//! cluster's latest refresh is held and deleting the cluster takes it with it.
+//!
 //! The identity-provider slice lives on the same record:
 //! `AssociateIdentityProviderConfig` writes an [`IdentityProviderConfigRecord`]
 //! into the owning cluster's [`ClusterRecord::identity_provider_configs`], and
@@ -302,6 +308,32 @@ pub const CAPABILITY_STATUS_DELETING: &str = "DELETING";
 /// be worth waiting for. The due instant is stored on the record; nothing sleeps for
 /// it.
 pub const CAPABILITY_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// The `InsightsRefreshStatus` members an insights refresh reports. The model's
+/// enum (`smithy_query query="shape" shape="InsightsRefreshStatus"`) is
+/// `IN_PROGRESS | FAILED | COMPLETED`, and the status is stored as the wire token,
+/// as every other status in this service is. `FAILED` is the terminal status of a
+/// refresh whose analysis did not finish; nothing in this emulator fails one, so no
+/// record is written with it — it is named here because it is what makes
+/// `IN_PROGRESS` the only NON-terminal status of the three.
+pub const INSIGHTS_REFRESH_IN_PROGRESS: &str = "IN_PROGRESS";
+/// See [`INSIGHTS_REFRESH_IN_PROGRESS`].
+pub const INSIGHTS_REFRESH_COMPLETED: &str = "COMPLETED";
+/// See [`INSIGHTS_REFRESH_IN_PROGRESS`].
+pub const INSIGHTS_REFRESH_FAILED: &str = "FAILED";
+
+/// How long an on-demand insights refresh reports `IN_PROGRESS` before the clock
+/// owes it `COMPLETED`.
+///
+/// `StartInsightsRefresh` publishes no duration for the analysis it starts
+/// ("Initiates an on-demand refresh operation for cluster insights, getting the
+/// latest analysis outside of the standard refresh schedule"), so this span is
+/// CHOSEN rather than cited, and matches [`CLUSTER_ACTIVATION_DELAY`]: long enough
+/// that a caller which describes the refresh straight after starting it still
+/// observes `IN_PROGRESS` — and the conflict that goes with it — short enough to be
+/// worth waiting for. The due instant is stored on the record; nothing sleeps for
+/// it.
+pub const INSIGHTS_REFRESH_DURATION: Duration = Duration::from_millis(500);
 
 /// The `CapabilityType` members whose `configuration` this service maps from the
 /// request shape to the response shape. The model's enum
@@ -1319,6 +1351,87 @@ pub struct ClusterRecord {
     /// a bound of its own rather than relying on its minters. With that cap per
     /// cluster, [`MAX_STORED_CLUSTERS`] bounds the whole store.
     pub updates: BTreeMap<String, UpdateRecord>,
+    /// The latest on-demand cluster insights refresh of this cluster, if one has
+    /// ever been started.
+    ///
+    /// It lives on the cluster record because a refresh is addressed only through
+    /// its cluster (`/clusters/{clusterName}/insights-refresh`) and a cluster runs
+    /// at most ONE on-demand refresh — "the status of the LATEST on-demand cluster
+    /// insights refresh operation" (`DescribeInsightsRefresh`) — so a single slot
+    /// is what the API exposes: starting another replaces the terminal one it
+    /// reports. Deleting the cluster takes it with it, and nothing else keeps a
+    /// second copy.
+    pub insights_refresh: Option<InsightsRefreshRecord>,
+}
+
+/// One on-demand cluster insights refresh, as this service stores it.
+///
+/// Everything `DescribeInsightsRefresh` reports is computed from here, so the
+/// status and the instants a caller reads back are the ones the call that started
+/// the refresh wrote plus the move the clock owed it — never recomputed per read.
+#[derive(Debug, Clone)]
+pub struct InsightsRefreshRecord {
+    /// One of [`INSIGHTS_REFRESH_IN_PROGRESS`], [`INSIGHTS_REFRESH_COMPLETED`] or
+    /// [`INSIGHTS_REFRESH_FAILED`], stored as the wire token.
+    pub status: String,
+    /// "The date and time when the insights refresh operation started"
+    /// (`DescribeInsightsRefreshResponse$startedAt`).
+    pub started_at: SystemTime,
+    /// "The date and time when the insights refresh operation ended" — unset while
+    /// the refresh is still `IN_PROGRESS`, because it has not ended yet.
+    pub ended_at: Option<SystemTime>,
+    /// When set, the instant at which the clock owes this refresh the move from
+    /// `IN_PROGRESS` to `COMPLETED` (see [`INSIGHTS_REFRESH_DURATION`]). Cleared
+    /// once the move is materialised.
+    pub completes_at: Option<SystemTime>,
+}
+
+impl InsightsRefreshRecord {
+    /// The record a refresh started at `now` begins as: in progress, with the move
+    /// to `COMPLETED` owed [`INSIGHTS_REFRESH_DURATION`] later.
+    pub fn started(now: SystemTime) -> Self {
+        Self {
+            status: INSIGHTS_REFRESH_IN_PROGRESS.to_string(),
+            started_at: now,
+            ended_at: None,
+            completes_at: Some(now + INSIGHTS_REFRESH_DURATION),
+        }
+    }
+
+    /// Whether this refresh is still running, i.e. in the one non-terminal
+    /// `InsightsRefreshStatus`. This is what a second `StartInsightsRefresh` is
+    /// refused on.
+    pub fn is_in_progress(&self) -> bool {
+        self.status == INSIGHTS_REFRESH_IN_PROGRESS
+    }
+
+    /// Materialise the clock-owed completion of this refresh.
+    ///
+    /// The analysis was finished at `completes_at` whether or not anybody called,
+    /// so `endedAt` is that DUE instant rather than the instant of the call that
+    /// noticed it: two callers reading the completed refresh see the same end time.
+    pub fn materialize_due_transitions(&mut self, now: SystemTime) {
+        if let Some(due) = self.completes_at.filter(|due| now >= *due) {
+            self.status = INSIGHTS_REFRESH_COMPLETED.to_string();
+            self.ended_at = Some(due);
+            self.completes_at = None;
+        }
+    }
+
+    /// "The message associated with the insights refresh operation"
+    /// (`DescribeInsightsRefreshResponse$message`): what this refresh is doing,
+    /// derived from its status so the message a caller reads never disagrees with
+    /// the status beside it. The model documents no text for it, so the sentence is
+    /// this emulator's own.
+    pub fn message(&self) -> String {
+        match self.status.as_str() {
+            INSIGHTS_REFRESH_COMPLETED => {
+                "The cluster insights refresh completed.".to_string()
+            }
+            INSIGHTS_REFRESH_FAILED => "The cluster insights refresh failed.".to_string(),
+            _ => "The cluster insights refresh is in progress.".to_string(),
+        }
+    }
 }
 
 /// One asynchronous update of a cluster, as this service stores it.
@@ -1522,6 +1635,12 @@ impl ClusterRecord {
 
         for config in self.identity_provider_configs.values_mut() {
             config.materialize_due_transitions(now);
+        }
+
+        // The on-demand insights refresh this cluster is running: its analysis was
+        // owed its completion at the stored instant whether or not anybody called.
+        if let Some(refresh) = self.insights_refresh.as_mut() {
+            refresh.materialize_due_transitions(now);
         }
 
         let due: Vec<String> = self
