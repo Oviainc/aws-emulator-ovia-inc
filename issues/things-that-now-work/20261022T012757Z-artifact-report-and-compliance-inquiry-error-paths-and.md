@@ -88,3 +88,16 @@ Model citations used: service Artifact (restJson1, sigv4), common errors AccessD
 5. Cause 4: replay artifact.get-report-term-token-cross-resource-rejected - pick two EXPLICIT/PUBLISHED reports with different term documents from ListReports, mint a termToken for each with GetTermForReport, confirm GetReport(A, tokenA) returns 200 with a documentPresignedUrl, then call GetReport(A, tokenB); expect 400 / ValidationException, observe ConflictException.
 6. Cause 5: replay artifact.get-report-download-roundtrip - find a PASSTHROUGH/PUBLISHED report whose uploadState is absent or COMPLETE, call GetTermForReport then GetReport, and HTTP GET the returned documentPresignedUrl; expect 200 with Content-Type application/pdf and a %PDF- body, observe HTTP 404.
 7. Cause 6: replay artifact.list-reports-max-results-out-of-range-rejected - call ListReports(maxResults=300) (must succeed) then ListReports(maxResults=301) and compare the 400 ValidationException message with the recorded rendering that omits the rejected value.
+
+## Resolution
+All six causes are closed in `services/service-com-amazonaws-artifact-artifact/`:
+
+1 and 2. The front door (`src/service.rs`'s `front_door`, reached through `Service::override_operation`) authorizes the resource a request targets ahead of the modelled member constraints and ahead of the state lookup, and every report and inquiry handler answers the same 401 `UnauthorizedException` for an identifier naming no resource the account holds. The modelled `ResourceNotFoundException` is kept for a VERSION a reachable report never published.
+3. The same front door refuses a request BODY that does not bind to the modelled shape with 400 `BadRequestException`, deciding body-versus-URI from the member's own HTTP binding traits; a URI-bound value stays the service's modelled 400 `ValidationException`.
+4. `GetReport` refuses a term token that does not cover the requested report's TERM with the modelled 400 `ValidationException`, through the single `grant_covers` predicate on this service's state that the document plane shares.
+5. Report and term documents are persisted beside the catalog record (`state::Document`, the report document a one-page PDF written with the `pdf-writer` crate) and served from `state::DOCUMENT_PATH_PREFIX` under the endpoint the caller reached, so the `documentPresignedUrl` both operations announce resolves to a 200 `application/pdf` document.
+6. `state::constraint_violation_message` renders a constraint violation as the AWS validation envelope naming the member and the requirement WITHOUT echoing the rejected value, for every constraint class this service refuses.
+
+Covered by `tests/all/front_door_errors.rs`, `tests/all/document_data_plane.rs`,
+`tests/all/validation_message_rendering.rs`, `tests/all/front_door.rs` and
+`tests/all/report_workflow.rs`.

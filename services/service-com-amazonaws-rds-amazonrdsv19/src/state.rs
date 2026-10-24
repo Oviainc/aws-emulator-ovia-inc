@@ -2916,18 +2916,42 @@ pub fn db_cluster_arn(region: &str, identifier: &str) -> String {
     emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("cluster:{identifier}"))
 }
 
-/// The DB cluster identifier `named` carries: `named` itself, or the resource part of it
-/// when it is a DB cluster ARN.
+/// The resource `named` names: `named` itself, or the RESOURCE part of it when it is an
+/// ARN.
 ///
-/// Several members accept either form — "the user-supplied DB cluster identifier or the
-/// Amazon Resource Name (ARN) of the DB cluster" — so both are folded to the identifier
-/// the store is keyed by. A value that is an ARN of something else keeps its last segment,
-/// which names no cluster and so resolves to nothing.
-pub fn db_cluster_identifier_of(named: &str) -> &str {
+/// An RDS resource ARN carries the resource it names in its last colon-separated field
+/// (`arn:<partition>:rds:<region>:<account>:db:<identifier>`,
+/// `…:cluster:<identifier>`), so one fold serves every member that accepts "the
+/// user-supplied identifier or the Amazon Resource Name (ARN)". A value that is an ARN of
+/// something else keeps its last segment, which names no resource of the type the caller
+/// looks it up in and so resolves to nothing.
+///
+/// The two per-resource names below read better at a call site, and keep the resource a
+/// handler is folding visible; they are aliases of this one fold, so a divergence in
+/// either ARN shape is a change to the alias rather than a silent change to both.
+pub fn arn_resource_name_of(named: &str) -> &str {
     match named.strip_prefix("arn:") {
         None => named,
         Some(rest) => rest.rsplit(':').next().unwrap_or(named),
     }
+}
+
+/// The DB cluster identifier `named` carries ([`arn_resource_name_of`]).
+///
+/// Several members accept either form — "the user-supplied DB cluster identifier or the
+/// Amazon Resource Name (ARN) of the DB cluster" — so both are folded to the identifier
+/// the store is keyed by.
+pub fn db_cluster_identifier_of(named: &str) -> &str {
+    arn_resource_name_of(named)
+}
+
+/// The DB instance identifier `named` carries ([`arn_resource_name_of`]).
+///
+/// `DescribeValidDBInstanceModificationsMessage$DBInstanceIdentifier` is "The customer
+/// identifier or the ARN of your DB instance", so both forms are folded to the identifier
+/// the store is keyed by.
+pub fn db_instance_identifier_of(named: &str) -> &str {
+    arn_resource_name_of(named)
 }
 
 /// The id one response reports as its own: the value of the `<RequestId>` element an

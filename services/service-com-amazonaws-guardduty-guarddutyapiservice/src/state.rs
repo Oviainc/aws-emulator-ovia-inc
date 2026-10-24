@@ -1357,8 +1357,10 @@ pub const RELATIONSHIP_CREATED: &str = "Created";
 /// from.
 pub const RELATIONSHIP_REMOVED: &str = "Removed";
 
-/// `Invitation.RelationshipStatus` for an invitation that has been delivered and
-/// not yet answered. See [`RELATIONSHIP_CREATED`] for where the values come from.
+/// The relationship status of an invitation that has been delivered and not yet
+/// answered: `Member.RelationshipStatus` once `InviteMembers` has sent the account
+/// an invitation, and `Invitation.RelationshipStatus` on the invitation itself. See
+/// [`RELATIONSHIP_CREATED`] for where the values come from.
 pub const RELATIONSHIP_INVITED: &str = "Invited";
 
 /// `Master.RelationshipStatus` once the member account has accepted the
@@ -1934,11 +1936,14 @@ pub struct Detector {
     /// models no way for another account to call `InviteMembers` against it, so no
     /// operation writes this map and it is EMPTY for every request the emulator
     /// answers — which is why `AcceptInvitation` refuses every well-formed pair.
-    /// It is state rather than a constant because the refusal is a lookup: an
-    /// invitation this store holds is accepted, and the operations that deliver
-    /// and report one (`InviteMembers`, `ListInvitations`,
-    /// `GetInvitationsCount`, `DeclineInvitations`, `DeleteInvitations`) are
-    /// scaffolds with issues of their own.
+    /// `InviteMembers` does not write it either: it is called BY the administrator
+    /// this emulator serves and delivers its invitation to the account it names,
+    /// which is another account and so has no detector here; what it writes is the
+    /// administrator side of the relationship ([`MemberRecord`]).
+    /// This is state rather than a constant because the refusal is a lookup: an
+    /// invitation this store holds is accepted, and the operations that report one
+    /// (`ListInvitations`, `GetInvitationsCount`, `DeclineInvitations`,
+    /// `DeleteInvitations`) are scaffolds with issues of their own.
     ///
     /// BOUNDED by [`MAX_INVITATIONS_PER_DETECTOR`], so a future writer cannot
     /// grow it without limit: the key is an account id, which is request-chosen.
@@ -2013,10 +2018,21 @@ pub struct MemberRecord {
     /// gave it.
     pub email: String,
     /// `Member.RelationshipStatus`: [`RELATIONSHIP_CREATED`],
-    /// [`RELATIONSHIP_DISABLED`] once `StopMonitoringMembers` has stopped
-    /// monitoring the account, or [`RELATIONSHIP_REMOVED`] once
+    /// [`RELATIONSHIP_INVITED`] once `InviteMembers` has sent the account an
+    /// invitation, [`RELATIONSHIP_DISABLED`] once `StopMonitoringMembers` has
+    /// stopped monitoring the account, or [`RELATIONSHIP_REMOVED`] once
     /// `DisassociateMembers` has ended the association.
     pub relationship_status: String,
+    /// When the invitation `InviteMembers` sent this account was sent, in epoch
+    /// milliseconds — the member's `InvitedAt`, "the timestamp when the invitation
+    /// was sent" (`smithy_query(shape="Member",member="InvitedAt")`) — or `None`
+    /// while the account has been recorded and not invited, which is why the member
+    /// is optional.
+    ///
+    /// Retained across a disassociation like the rest of the record: the invitation
+    /// WAS sent at that instant, and only `DeleteMembers` drops the record that says
+    /// so.
+    pub invited_at_millis: Option<i64>,
     /// When the relationship last changed, in epoch milliseconds — the member's
     /// `UpdatedAt`.
     pub updated_at_millis: i64,
@@ -2055,9 +2071,10 @@ pub fn member_view(
         administrator_id: Some(administrator.to_string()),
         email: member.email.clone(),
         relationship_status: member.relationship_status.clone(),
-        // No invitation is modelled yet (`InviteMembers` is still a scaffold), so
-        // there is no instant at which one was sent.
-        invited_at: None,
+        // Present only once an invitation has been sent to the account, which is
+        // what `InviteMembers` does; a recorded, un-invited member has no instant at
+        // which one was sent, so the optional member is absent rather than invented.
+        invited_at: member.invited_at_millis.map(iso8601),
         updated_at: iso8601(member.updated_at_millis),
     }
 }

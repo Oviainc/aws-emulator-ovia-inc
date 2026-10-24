@@ -489,6 +489,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // leaves the instance on. Resolved BEFORE the record is taken out of the
         // store, so a version this service cannot provision is refused with the
         // instance left exactly as it was.
+        //
+        // The STORAGE a modification asks for is resolved the same way, against the bounds
+        // `DescribeValidDBInstanceModifications` publishes for this instance: that report
+        // exists to be read before this call ("You can use this information when you call
+        // ModifyDBInstance"), so a storage type, size, provisioned IOPS or provisioned
+        // throughput it excludes is refused here rather than stored. The settings are
+        // judged against the engine and the storage type the modification LEAVES the
+        // instance on, since that is what the volume ends up being.
+        let current_engine = store.db_instances[&key].engine.clone();
+        let current_storage_type = store.db_instances[&key].storage_type.clone();
+        let current_allocated_storage = store.db_instances[&key].allocated_storage;
+        let current_iops = store.db_instances[&key].iops;
+        let resulting_engine = input.engine.clone().unwrap_or(current_engine);
+        let resulting_class = input
+            .db_instance_class
+            .clone()
+            .unwrap_or_else(|| store.db_instances[&key].db_instance_class.clone());
+        let resulting_storage_type = input
+            .storage_type
+            .clone()
+            .unwrap_or_else(|| current_storage_type.clone());
+        let requested_processor_features: Vec<(Option<String>, Option<String>)> = input
+            .processor_features
+            .iter()
+            .flatten()
+            .map(|feature| (feature.name.clone(), feature.value.clone()))
+            .collect();
+        if let Some(requested_type) = &input.storage_type {
+            // A type `StorageType` does not publish for this engine is the modelled
+            // unsupported-type fault; the legacy magnetic type the member still lists is
+            // published, and simply carries no bounds here.
+            if !crate::ops::describe_orderable_db_instance_options::publishes_storage_type(
+                &resulting_engine,
+                requested_type,
+            ) {
+                let published =
+                    crate::ops::describe_orderable_db_instance_options::storage_profiles(
+                        &resulting_engine,
+                    );
+                return Err(ModifyDBInstanceErrorModeled::StorageTypeNotSupportedFault(
+                    StorageTypeNotSupportedFault {
+                        message: Some(format!(
+                            "Invalid storage type {requested_type} for engine \
+                             {resulting_engine}: must be one of {}",
+                            published
+                                .iter()
+                                .map(|profile| profile.name)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        crate::ops::describe_valid_db_instance_modifications::check_storage_modification(
+            crate::ops::describe_valid_db_instance_modifications::RequestedStorage {
+                engine: &resulting_engine,
+                class_name: &resulting_class,
+                storage_type: &resulting_storage_type,
+                current_allocated_storage,
+                allocated_storage: input.allocated_storage,
+                max_allocated_storage: input.max_allocated_storage,
+                iops: input.iops,
+                current_iops,
+                storage_throughput: input.storage_throughput,
+                processor_features: &requested_processor_features,
+                dedicated_log_volume: input.dedicated_log_volume,
+                additional_storage_volumes: input
+                    .additional_storage_volumes
+                    .as_ref()
+                    .is_some_and(|volumes| !volumes.is_empty()),
+            },
+        )
+        .map_err(ModifyDBInstanceError::invalid_parameter_combination)?;
+
         let resolved_engine_version = match &input.engine_version {
             Some(requested) => {
                 let engine = input

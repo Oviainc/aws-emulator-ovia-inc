@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InviteMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InviteMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InviteMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sends the invitation that moves a recorded member account's relationship on from
+//! `Created`: every account id this call names that the administrator's detector holds
+//! a member record for becomes `Invited` and carries the instant the invitation was
+//! sent, and an account it holds no record for is REPORTED in `UnprocessedAccounts`
+//! rather than refusing the call.
+//!
+//! A member record outlives the association on purpose, so that a member a
+//! `DisassociateMembers` moved on can be invited again without a second
+//! `CreateMembers` (the documentation below states it): the condition this operation
+//! checks is the member RECORD, not the association.
+//!
+//! The invited account's own INBOX is not written: an invitation is delivered to the
+//! account it names, which is a different account from the one this emulator serves,
+//! so there is no detector here to deliver it to (see
+//! `crate::state::Detector::received_invitations`). What this operation persists is
+//! the ADMINISTRATOR side of the relationship, which `GetMembers` and `ListMembers`
+//! report.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +179,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InviteMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InviteMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InviteMembers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(InviteMembersErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let administrator = crate::state::administrator_account_id();
+
+        // Parameter failures first, before anything is looked up or written: a value
+        // that cannot be a value of its member at all is refused whatever the store
+        // holds. `UnprocessedAccounts` reports accounts that were not PROCESSED,
+        // never a request that was not understood, so a malformed account id refuses
+        // the whole call rather than landing in that list.
+        if !crate::state::is_detector_id(&input.detector_id) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::DETECTOR_ID_MEMBER),
+            ));
+        }
+        if input
+            .account_ids
+            .iter()
+            .any(|account_id| !crate::state::is_account_id(account_id))
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::ACCOUNT_ID_MEMBER),
+            ));
+        }
+
+        let mut state = state.lock();
+        // Members hang off the detector that administers them, so only the
+        // account/Region that owns it can invite them.
+        if state.detector_in(&region, &input.detector_id).is_none() {
+            return Err(not_owned(&input.detector_id));
+        }
+        // The invitations this call sends are sent NOW, so the clock advances once for
+        // the whole call: every member it invites carries the same `InvitedAt` and the
+        // same `UpdatedAt`.
+        let now = state.tick_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // Unreachable: the detector was resolved above and the lock has not been
+            // released since. Answered rather than panicked, because a handler owes
+            // the caller a modelled response on every path.
+            return Err(not_owned(&input.detector_id));
+        };
+
+        let mut unprocessed = Vec::new();
+        let mut seen = ::std::collections::BTreeSet::new();
+        for account_id in &input.account_ids {
+            // `AccountIds` names a SET of accounts: a repeated id is invited once, so
+            // it cannot be reported twice either.
+            if !seen.insert(account_id.as_str()) {
+                continue;
+            }
+            match detector.members.get_mut(account_id) {
+                // The condition is the member RECORD, not the association: the
+                // records of disassociated members are retained precisely so they can
+                // be invited again, so an invitation re-associates one rather than
+                // needing a second `CreateMembers`.
+                Some(member) => {
+                    // One invitation is pending per administrator/member pair, so
+                    // inviting an account whose invitation is still pending re-sends
+                    // that same invitation rather than issuing a second one: nothing
+                    // about the member moves, `InvitedAt` and `UpdatedAt` included.
+                    if member.relationship_status != crate::state::RELATIONSHIP_INVITED {
+                        member.relationship_status =
+                            crate::state::RELATIONSHIP_INVITED.to_string();
+                        member.invited_at_millis = Some(now);
+                        member.updated_at_millis = now;
+                    }
+                }
+                // An account this administrator holds no member record for cannot be
+                // invited — GuardDuty has to be enabled in the account and the
+                // account recorded first — so it is reported rather than refused, and
+                // nothing is persisted for it. The administrator's own account is one
+                // of these: it is never one of its own members.
+                None => unprocessed.push(UnprocessedAccount {
+                    account_id: account_id.clone(),
+                    result: crate::state::not_a_member_message(&administrator),
+                }),
+            }
+        }
+
+        // `Message` and `DisableEmailNotification` govern the EMAIL the invitation is
+        // announced by, which is not something this emulator sends and not something
+        // any read reports — the `Invitation` shape carries no message
+        // (`smithy_query(shape="Invitation")`) — so neither member is persisted.
+        Ok(InviteMembersOutput {
+            unprocessed_accounts: unprocessed,
+        })
     }
+}
+
+/// Refuse a well-formed `DetectorId` this account/Region does not own.
+///
+/// GuardDuty does not distinguish "never existed" from "belongs to someone else",
+/// which is also what keeps one account from probing another's detector ids.
+fn not_owned(detector_id: &str) -> InviteMembersError {
+    crate::scaffolded::Scaffolded::invalid_input(crate::state::detector_id_rejection(detector_id))
 }
