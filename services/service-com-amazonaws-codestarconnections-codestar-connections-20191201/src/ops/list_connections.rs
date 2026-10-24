@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConnections
-//! IMPLEMENTED: pages over the connections held in [`crate::state`] in creation order,
+//! IMPLEMENTED: resolves `HostArnFilter` against the caller's account and the host
+//! store, then pages over the connections held in [`crate::state`] in creation order,
 //! applying both filters. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -90,12 +91,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codestarconnections-cod
 // (see `types::shared_types`) but this operation does not list it, and it is the only
 // honest answer for "this service is mounted on an engine that holds no state" — a 400
 // would blame the caller's request and a 501 would claim the operation is unwritten.
+// `AccessDeniedException` (403) is widened in for the same reason: the SERVICE models it
+// and it is the answer the live service gives a `HostArnFilter` naming a host outside the
+// caller's account — an authorization refusal, which the operation's one modeled error
+// (an absence) does not state.
 #[smithy_macros::operation_error(
     "com.amazonaws.codestarconnections#ListConnections",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "AccessDeniedException"]
 )]
 #[derive(Debug)]
 pub enum ListConnectionsErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
@@ -178,6 +184,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
+        // `HostArnFilter` names ANOTHER resource, so it is read the way
+        // `CreateConnection` reads `HostArn`: AUTHORIZED before it is resolved. A host in
+        // another account is not the caller's to enumerate connections of — an
+        // authorization refusal (`AccessDeniedException`, 403), which is the recorded
+        // answer for this filter — and only an in-account ARN is resolved against the
+        // host store, where one naming no host is the modelled absence this operation
+        // declares (`ResourceNotFoundException`, 404): "this host is not there" is a
+        // different answer from "this host has no connections".
+        //
+        // That second half is not from a recording of THIS filter; what grounds it is the
+        // model plus the sibling service. `ResourceNotFoundException` is the ONLY error
+        // this operation declares, and a report over the caller's own connections has no
+        // other resource it could fail to find — the filter is the one thing a caller can
+        // name that may not exist — and the newer CodeConnections service, the same API
+        // under a new name, resolves its `HostArnFilter` by exactly this rule
+        // (`service-com-amazonaws-codeconnections-…/src/ops/list_connections.rs`). A
+        // recording of an absent in-account filter answering an empty page would overturn
+        // it; nothing weaker should.
+        if let Some(host_arn) = input.host_arn_filter.as_deref() {
+            if !crate::state::host_arn_is_in_caller_account(host_arn) {
+                return Err(ListConnectionsErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(crate::state::host_access_denied_message(host_arn)),
+                    },
+                )
+                .into());
+            }
+            if !store.hosts.contains_key(host_arn) {
+                return Err(ListConnectionsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::host_not_found_message(host_arn)),
+                    },
+                )
+                .into());
+            }
+        }
         let ordered = store.connections_in_creation_order();
         let mut matching = ordered
             .into_iter()

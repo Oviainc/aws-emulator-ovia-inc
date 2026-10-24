@@ -36,11 +36,9 @@ pub(crate) const TARGET_PREFIX: &str = "CodeStar_connections_20191201";
 /// with the model instead of drifting from it.
 const PROVIDER_TYPES: &[&str] = codestar::ops::types::shared_types::PROVIDER_TYPE_VALUES;
 
-/// A host ARN shaped like `CreateConnection.HostArn`'s modeled pattern
-/// `^arn:aws(-[\w]+)*:codestar-connections:.+:[0-9]{12}:host\/.+$`.
-fn host_arn(name: &str) -> String {
-    format!("arn:aws:codestar-connections:{REGION}:{ACCOUNT_ID}:host/{name}")
-}
+/// The `ProviderType` every host [`Emulator::create_host`] creates holds — a host's
+/// provider is what a connection created through that host reaches.
+pub(crate) const HOST_PROVIDER_TYPE: &str = "GitHubEnterpriseServer";
 
 /// One emulator: the router the production front door builds, with this service mounted
 /// on a single shared engine.
@@ -65,24 +63,65 @@ impl Emulator {
             .await
     }
 
+    /// `CreateHost`, asserting success, and return the host ARN it minted.
+    ///
+    /// A `HostArn` a connection is created with (or filtered by) is RESOLVED against the
+    /// host store, so a host-backed connection needs a host to exist; it is created
+    /// through the API, so what the connection names is a host this service minted.
+    pub(crate) async fn create_host(&self, name: &str) -> String {
+        let (status, response) = self
+            .call(
+                "CreateHost",
+                json!({
+                    "Name": name,
+                    "ProviderType": HOST_PROVIDER_TYPE,
+                    "ProviderEndpoint": format!("https://{name}.example.com"),
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "host {name:?}: expected CreateHost to answer 200, got {status} {response:?}"
+        );
+        response["HostArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("host {name:?}: no HostArn in {response:?}"))
+            .to_string()
+    }
+
     /// Dispatch one awsJson1_0 call naming `target` verbatim in `X-Amz-Target`, so a
     /// suite can drive the prefix forms a client writes as well as the operation.
     pub(crate) async fn call_target(&self, target: &str, body: Value) -> (u16, Value) {
-        let request = ::http::Request::builder()
+        self.dispatch(target, body, true).await
+    }
+
+    /// [`Self::call_target`] with NO SigV4 credential scope, so the request's only
+    /// routable signal is the target itself — the path a dotted target prefix is read on
+    /// before any `Host` or credential scope.
+    pub(crate) async fn call_target_unsigned(&self, target: &str, body: Value) -> (u16, Value) {
+        self.dispatch(target, body, false).await
+    }
+
+    /// The one dispatch every call above goes through.
+    async fn dispatch(&self, target: &str, body: Value, signed: bool) -> (u16, Value) {
+        let mut builder = ::http::Request::builder()
             .method("POST")
             .uri("https://codestar-connections.us-west-2.amazonaws.com/")
             .header("content-type", "application/x-amz-json-1.0")
-            .header("x-amz-target", target)
+            .header("x-amz-target", target);
+        if signed {
             // The SigV4 credential scope is what routes the request to this service and
             // what tells it which region to mint ARNs in.
-            .header(
+            builder = builder.header(
                 "authorization",
                 format!(
                     "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261021/{REGION}\
                      /codestar-connections/aws4_request, \
                      SignedHeaders=host;x-amz-target, Signature=0000"
                 ),
-            )
+            );
+        }
+        let request = builder
             .body(::bytes::Bytes::from(
                 serde_json::to_vec(&body).expect("the request body serializes"),
             ))
@@ -283,8 +322,10 @@ async fn each_connection_gets_its_own_arn_and_keeps_its_host_arn() {
 
     let cases = [
         ("no host", None),
-        ("host one", Some(host_arn("enterprise-one"))),
-        ("host two", Some(host_arn("enterprise-two"))),
+        // A host-backed connection resolves its `HostArn` against the host store, so
+        // each host is created before the connection that names it.
+        ("host one", Some(emulator.create_host("enterprise-one").await)),
+        ("host two", Some(emulator.create_host("enterprise-two").await)),
     ];
 
     let mut arns = Vec::new();
@@ -390,8 +431,10 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
 async fn list_filters_select_by_stored_member() {
     let emulator = Emulator::new();
 
-    let shared_host = host_arn("shared");
-    let lone_host = host_arn("lone");
+    // Both filters resolve against the host store, so the hosts the fixtures name
+    // are created before any connection is created or any filter is applied.
+    let shared_host = emulator.create_host("shared").await;
+    let lone_host = emulator.create_host("lone").await;
 
     // (name, provider type, host arn)
     let fixtures: [(&str, &str, Option<&str>); 4] = [

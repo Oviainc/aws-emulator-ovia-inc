@@ -13,11 +13,15 @@
 // points it into `tests/all/`.
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
+#[path = "all/host_arn_rules.rs"]
+mod host_arn_rules;
 #[path = "all/host_deletion.rs"]
 mod host_deletion;
 #[path = "all/host_lifecycle.rs"]
 mod host_lifecycle;
 #[path = "all/repository_link_lifecycle.rs"]
 mod repository_link_lifecycle;
+#[path = "all/sdk_target_dispatch.rs"]
+mod sdk_target_dispatch;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
