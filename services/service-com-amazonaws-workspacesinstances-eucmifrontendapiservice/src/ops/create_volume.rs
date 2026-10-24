@@ -433,6 +433,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags,
             client_token: input.client_token.clone(),
             created_at: std::time::SystemTime::now(),
+            // A new volume is attached to nothing: `AssociateVolume` is the only call
+            // that attaches one.
+            attachment: None,
         };
 
         if let Some(token) = input.client_token {
