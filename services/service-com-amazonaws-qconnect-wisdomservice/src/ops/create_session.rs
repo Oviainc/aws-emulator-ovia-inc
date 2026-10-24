@@ -455,6 +455,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             contact_arn: input.contact_arn.clone(),
             origin: crate::state::SESSION_ORIGIN_CUSTOMER.to_string(),
             created_at: now,
+            // A new session has nothing available yet: `GetRecommendations` reports this
+            // feed, and only a publish fills it.
+            recommendations: crate::state::RecommendationFeed::default(),
         };
         assistant.sessions.insert(session_id.clone(), session);
 

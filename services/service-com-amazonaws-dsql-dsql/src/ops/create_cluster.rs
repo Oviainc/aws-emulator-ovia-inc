@@ -265,16 +265,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let identifier = state.mint_cluster_identifier();
+        // The reserved `AWS_OWNED_KMS_KEY` names no customer key: it selects the
+        // key owned by Amazon Web Services, so the cluster is stored with no
+        // customer key, exactly as a request carrying no `kmsEncryptionKey` is.
+        let customer_key =
+            crate::state::customer_managed_key(input.kms_encryption_key.as_deref());
         let mut cluster = crate::state::Cluster {
             arn: crate::state::cluster_arn(&region, &identifier),
             status: crate::state::STATUS_CREATING.to_string(),
             creation_time: now,
             deletion_protection_enabled: input.deletion_protection_enabled,
-            encryption_details: Some(crate::state::encryption_details(
-                &region,
-                input.kms_encryption_key.as_deref(),
-            )),
-            kms_encryption_key: input.kms_encryption_key.clone(),
+            encryption_details: Some(crate::state::encryption_details(&region, customer_key)),
+            kms_encryption_key: customer_key.map(str::to_string),
             multi_region_properties: input.multi_region_properties.clone(),
             endpoint: Some(crate::state::cluster_endpoint(&region, &identifier)),
             tags: input.tags.clone().unwrap_or_default().into_iter().collect(),

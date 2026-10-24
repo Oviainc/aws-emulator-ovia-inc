@@ -16,8 +16,10 @@
 //! key, whether deprecated versions are asked for.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_secretsmanager_secretsmanager::state::FORCE_DELETE_PURGE_DELAY;
 use service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -417,7 +419,11 @@ async fn a_secret_id_that_names_nothing_is_a_resource_not_found() {
     let (arn, _) = create(&router, name, "setup").await;
     // The rows are the ways a `SecretId` can name no stored secret: a name
     // nothing was created under, an ARN of the right shape for another secret,
-    // and the ARN of a secret that has been force-deleted.
+    // and the ARN of a secret that has been force-deleted — which Secrets
+    // Manager removes with "an asynchronous background process, so there might
+    // be a short delay before the secret is permanently deleted"
+    // (`DeleteSecretRequest$ForceDeleteWithoutRecovery`, this service's Smithy
+    // model), so this row waits for the removal the clock owes.
     ok(
         &router,
         "DeleteSecret",
@@ -425,6 +431,7 @@ async fn a_secret_id_that_names_nothing_is_a_resource_not_found() {
         "setup",
     )
     .await;
+    tokio::time::sleep(FORCE_DELETE_PURGE_DELAY + Duration::from_millis(200)).await;
     for (case, secret_id) in [
         ("a name nothing was created under", "versions/never".to_string()),
         (

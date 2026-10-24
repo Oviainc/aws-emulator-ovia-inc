@@ -6,7 +6,7 @@
 //! `Resource`s under it (including the implicit root resource every API is created
 //! with), the `Method`s put on those resources, the API's `Stage`s and the gateway
 //! responses a developer has customized on it — beside the
-//! account's `ApiKey` and custom `DomainName` records. Every handler in `src/ops/`
+//! account's `ApiKey`, `UsagePlan` and custom `DomainName` records. Every handler in `src/ops/`
 //! computes its response from these records; nothing is synthesised per request.
 //!
 //! A few leaf values are stored as the modelled shapes from [`crate::ops::types`]
@@ -24,9 +24,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
-    CanarySettings, DocumentationPartLocation, EndpointConfiguration, GetGatewayResponseOutput,
-    GetIntegrationOutput, GetMethodResponseOutput, GetSdkTypeOutput, MethodSetting, MethodSnapshot,
-    MutualTlsAuthentication, SdkConfigurationProperty,
+    ApiStage, CanarySettings, DocumentationPartLocation, EndpointConfiguration,
+    GetGatewayResponseOutput, GetIntegrationOutput, GetMethodResponseOutput, GetSdkTypeOutput,
+    MethodSetting, MethodSnapshot, MutualTlsAuthentication, QuotaSettings,
+    SdkConfigurationProperty, ThrottleSettings,
 };
 
 /// Per-service state for com-amazonaws-apigateway-backplanecontrolservice. A handler reaches it through [`service_state`].
@@ -37,6 +38,9 @@ pub struct ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// Every created `ApiKey`, keyed by its API key id — the identifier `GetApiKey`
     /// and `DeleteApiKey` take in their `apiKey` path label, NOT the key's value.
     pub api_keys: BTreeMap<String, ApiKeyEntry>,
+    /// Every created `UsagePlan`, keyed by its usage plan id — the identifier
+    /// `GetUsagePlan` takes in its `usagePlanId` path label.
+    pub usage_plans: BTreeMap<String, UsagePlanEntry>,
     /// Every created custom `DomainName`, keyed by [`domain_name_key`]: the domain name
     /// itself, or `<domainName>+<domainNameId>` for a private one, which is addressed by
     /// both members because several private domain names may carry one name.
@@ -492,6 +496,39 @@ pub struct ApiKeyEntry {
     pub labels: Vec<String>,
     pub tags: BTreeMap<String, String>,
     /// This key's creation rank, from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
+    /// listing can report creation order rather than id order.
+    pub sequence: u64,
+}
+
+/// One stored `UsagePlan`: the throttle and quota limits a set of API keys is metered
+/// against, and the API stages those limits apply to.
+///
+/// `throttle`, `quota` and the per-method throttle map inside each `api_stages` entry are
+/// kept as the modelled shapes from [`crate::ops::types`] rather than as a second
+/// hand-written mirror of their members, for the reason the module docs give. Each is
+/// `Option` because a usage plan need not have one: a plan created without a `quota` has
+/// no quota at all, which is what distinguishes it from a plan whose quota limit is zero.
+///
+/// `product_code` is the Amazon Web Services Marketplace product a plan is sold as. No
+/// operation of this service sets it — it is not a member of `CreateUsagePlan`'s input —
+/// so it stays absent until one does, and a read reports none rather than a code this
+/// emulator would have to invent.
+#[derive(Debug, Clone, Default)]
+pub struct UsagePlanEntry {
+    pub id: String,
+    /// `CreateUsagePlanRequest$name` is `@required`, so a stored plan always has one.
+    pub name: String,
+    pub description: Option<String>,
+    /// The API stages the plan's limits apply to, each naming a stored stage of a stored
+    /// API at the instant the plan was created or last updated.
+    pub api_stages: Vec<ApiStage>,
+    pub throttle: Option<ThrottleSettings>,
+    pub quota: Option<QuotaSettings>,
+    /// See the struct docs: absent, because nothing writes it.
+    pub product_code: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    /// This plan's creation rank, from
     /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
     /// listing can report creation order rather than id order.
     pub sequence: u64,
@@ -1021,6 +1058,9 @@ pub const MAX_REST_APIS: usize = 600;
 /// API Gateway's default quota "API keys per account per Region: 10,000".
 pub const MAX_API_KEYS: usize = 10_000;
 
+/// API Gateway's default quota "Usage plans per account per Region: 300".
+pub const MAX_USAGE_PLANS: usize = 300;
+
 /// API Gateway's default quota "Custom domain names (regional or edge-optimized) per
 /// account per Region: 120".
 pub const MAX_DOMAIN_NAMES: usize = 120;
@@ -1144,15 +1184,14 @@ pub const MAX_TAG_VALUE_CHARS: usize = 256;
 const ARN_SERVICE: &str = "apigateway";
 
 /// The leading resource-portion segment of each taggable resource kind whose records
-/// this emulator does not keep: the operations that create a usage plan, a client
-/// certificate, a VPC link or a domain name access association are still scaffolds, so
-/// nothing can answer to one of these ARNs — while the ARN itself is a well-formed ARN
-/// of a taggable API Gateway resource and so is not a malformed request.
+/// this emulator does not keep: the operations that create a client certificate, a VPC
+/// link or a domain name access association are still scaffolds, so nothing can answer to
+/// one of these ARNs — while the ARN itself is a well-formed ARN of a taggable API
+/// Gateway resource and so is not a malformed request.
 ///
 /// The segments are the first path segment of each kind's read URI; see the section
 /// comment above for the `smithy_query` calls they come from.
 const UNSTORED_TAGGABLE_KINDS: &[&str] = &[
-    "usageplans",
     "clientcertificates",
     "vpclinks",
     "domainnameaccessassociations",
@@ -1171,6 +1210,8 @@ pub enum TaggedResource {
     },
     /// `/apikeys/{apiKey}` — an [`ApiKeyEntry`]'s tags.
     ApiKey { api_key_id: String },
+    /// `/usageplans/{usagePlanId}` — a [`UsagePlanEntry`]'s tags.
+    UsagePlan { usage_plan_id: String },
     /// `/domainnames/{domainName}` — a [`DomainNameEntry`]'s tags, where the path
     /// segment is the record's [`domain_name_key`].
     DomainName { domain_name_key: String },
@@ -1212,6 +1253,9 @@ pub fn parse_tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
         }),
         ["apikeys", api_key_id] => Some(TaggedResource::ApiKey {
             api_key_id: (*api_key_id).to_string(),
+        }),
+        ["usageplans", usage_plan_id] => Some(TaggedResource::UsagePlan {
+            usage_plan_id: (*usage_plan_id).to_string(),
         }),
         ["domainnames", domain_name_key] => Some(TaggedResource::DomainName {
             domain_name_key: (*domain_name_key).to_string(),
@@ -1954,6 +1998,11 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
                 .get(api_key_id)
                 .map(|key| &key.tags)
                 .ok_or_else(|| NO_SUCH_API_KEY.to_string()),
+            TaggedResource::UsagePlan { usage_plan_id } => self
+                .usage_plans
+                .get(usage_plan_id)
+                .map(|plan| &plan.tags)
+                .ok_or_else(|| NO_SUCH_USAGE_PLAN.to_string()),
             TaggedResource::DomainName { domain_name_key } => self
                 .domain_names
                 .get(domain_name_key)
@@ -1991,6 +2040,11 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
                 .get_mut(api_key_id)
                 .map(|key| &mut key.tags)
                 .ok_or_else(|| NO_SUCH_API_KEY.to_string()),
+            TaggedResource::UsagePlan { usage_plan_id } => self
+                .usage_plans
+                .get_mut(usage_plan_id)
+                .map(|plan| &mut plan.tags)
+                .ok_or_else(|| NO_SUCH_USAGE_PLAN.to_string()),
             TaggedResource::DomainName { domain_name_key } => self
                 .domain_names
                 .get_mut(domain_name_key)
@@ -2041,6 +2095,57 @@ pub fn bound_tag(key: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuse a `ThrottleSettings` whose limits are not a request rate API Gateway can
+/// meter.
+///
+/// `burstLimit` is a count of requests ("The API target request burst rate limit") and
+/// `rateLimit` a requests-per-second rate ("The API target request rate limit") —
+/// `ThrottleSettings`' own members — so neither can be negative, and a rate must be a
+/// finite number. Real AWS answers 400 `BadRequestException` for a negative or otherwise
+/// invalid throttle rate.
+///
+/// One check for every place this shape rides on a request — a usage plan's own
+/// `throttle`, the per-method throttle map on each of its `apiStages` entries, and any
+/// later operation that takes the shape — so one value is refused the same way wherever
+/// it appears. `member` is the path the message names, so the caller can see which one to
+/// fix.
+pub fn bound_throttle_settings(member: &str, throttle: &ThrottleSettings) -> Result<(), String> {
+    if throttle.burst_limit < 0 {
+        return Err(format!(
+            "{member}.burstLimit must not be negative, got {}",
+            throttle.burst_limit
+        ));
+    }
+    if !throttle.rate_limit.is_finite() || throttle.rate_limit < 0.0 {
+        return Err(format!(
+            "{member}.rateLimit must be a non-negative number, got {}",
+            throttle.rate_limit
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a `QuotaSettings` whose counts are not a quota API Gateway can meter.
+///
+/// `limit` is "The target maximum number of requests that can be made in a given time
+/// period" and `offset` "The number of requests subtracted from the given limit in the
+/// initial time period" (`QuotaSettings`' own members): both count requests, so neither
+/// can be negative, and real AWS answers 400 `BadRequestException` for a negative quota
+/// limit.
+///
+/// `period` is NOT checked here: it targets the modelled `QuotaPeriodType` enum, so a
+/// value outside that set is refused at the boundary before any handler runs.
+pub fn bound_quota_settings(member: &str, quota: &QuotaSettings) -> Result<(), String> {
+    for (count_member, count) in [("limit", quota.limit), ("offset", quota.offset)] {
+        if count < 0 {
+            return Err(format!(
+                "{member}.{count_member} must not be negative, got {count}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The `NotFoundException` message for a `restApiId` that names no stored API.
 ///
 /// API Gateway does not state a fixed sentence here: it names the identifier it could
@@ -2079,6 +2184,11 @@ pub const NO_SUCH_DEPLOYMENT: &str = "Invalid deployment identifier specified";
 
 /// The `NotFoundException` message for an `apiKey` that names no stored API key.
 pub const NO_SUCH_API_KEY: &str = "Invalid API Key identifier specified";
+
+/// The `NotFoundException` message for a `usagePlanId` that names no stored usage plan,
+/// in the shape of the sibling identifier messages above. Shared by every operation that
+/// resolves a usage plan, so all of them say the same thing about the same failure.
+pub const NO_SUCH_USAGE_PLAN: &str = "Invalid Usage Plan ID specified";
 
 /// The `NotFoundException` message for a `domainName` (with its `domainNameId`, for a
 /// private one) that names no stored custom domain name, in the shape of the sibling

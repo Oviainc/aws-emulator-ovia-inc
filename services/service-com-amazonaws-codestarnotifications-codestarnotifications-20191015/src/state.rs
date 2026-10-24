@@ -9,7 +9,7 @@
 //! the handlers share so no two operations keep their own copy of a resource.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 
 /// Per-service state for com-amazonaws-codestarnotifications-codestarnotifications-20191015. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -69,15 +69,14 @@ pub struct RuleTarget {
 
 /// One target of the account, and the rules subscribed to it. An entry exists exactly
 /// while at least one rule subscribes to the address, which is what bounds the registry
-/// at [`MAX_RULES_PER_REGION`] x [`MAX_TARGETS_PER_RULE`] per region however many
-/// subscribe / delete cycles a caller drives.
+/// at [`MAX_RULES_TOTAL`] x [`MAX_TARGETS_PER_RULE`] however many subscribe / delete
+/// cycles a caller drives.
 #[derive(Debug, Clone)]
 pub struct TargetRegistryEntry {
     pub target_type: String,
+    /// The target's `TargetStatus`. A subscription this service creates is reported
+    /// [`TARGET_STATUS_ACTIVE`] from the moment it exists — see that constant.
     pub status: String,
-    /// When the `PENDING` -> `ACTIVE` transition this target's subscription started
-    /// becomes due. See [`TARGET_ACTIVATION_DELAY`].
-    pub active_due: Instant,
     pub subscribed_rules: HashSet<String>,
 }
 
@@ -96,23 +95,32 @@ pub struct IdempotentRequest {
 /// AWS quota.
 pub const MAX_RULES_PER_REGION: usize = 1_000;
 
+/// The most notification rules the store holds across EVERY region at once.
+///
+/// [`MAX_RULES_PER_REGION`] is counted per REGION, and the region a rule lands in is
+/// the one the request was SIGNED for — a value the caller chooses and this service
+/// does not validate against a fixed list of regions, because a regional endpoint for
+/// any region must keep working. On its own that figure therefore bounds nothing: a
+/// client that varies its credential scope's region opens a fresh per-region budget
+/// each time. This second figure is keyed on NOTHING the request controls, so it is the
+/// one that actually bounds the store (and, with it, the target registry and the name
+/// index); it is CHOSEN for the same reason as the per-region figure, at a multiple of
+/// it so an ordinary multi-region caller never meets it first.
+pub const MAX_RULES_TOTAL: usize = 4 * MAX_RULES_PER_REGION;
+
 /// The most idempotency tokens the ledger remembers at once. Also CHOSEN, for the same
 /// reason: a caller must not be able to grow the ledger without limit.
 pub const MAX_IDEMPOTENCY_TOKENS: usize = 10_000;
 
-/// How long after a subscription is created its target stays `PENDING` before the
-/// clock makes it `ACTIVE`.
+/// The status a subscription this service creates reports.
 ///
-/// A target AWS has not confirmed yet is reported `PENDING`, a non-terminal status, so
-/// the transition is owed by the clock rather than by any later call. AWS does not
-/// document a duration for it, so this span is CHOSEN (inside the emulator's
-/// 250-750 ms convention for a transition it owes): it is never zero, so a caller that
-/// describes a rule immediately after creating it still observes `PENDING`.
-pub const TARGET_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
-
-/// The target status of a subscription whose activation is not due yet.
-pub const TARGET_STATUS_PENDING: &str = "PENDING";
-/// The target status of a subscription whose activation has come due.
+/// A subscription created through `CreateNotificationRule` / `Subscribe` is already
+/// usable when the call returns — the recorded AWS responses report `ACTIVE` on the
+/// describe that immediately follows the create — so there is no transition for the
+/// clock to owe and the status is terminal from the first read. The other
+/// `TargetStatus` values (`PENDING`, `UNREACHABLE`, `INACTIVE`, `DEACTIVATED`) describe
+/// a destination whose own confirmation state this emulator does not model, so nothing
+/// here invents them.
 pub const TARGET_STATUS_ACTIVE: &str = "ACTIVE";
 
 /// `NotificationRuleStatus`'s documented default: "The status of the notification
@@ -127,28 +135,15 @@ impl ComAmazonawsCodestarnotificationsCodestarnotifications20191015State {
         seq
     }
 
-    /// Materialise every target activation the clock has already made due.
-    ///
-    /// This is the one write a reporting operation may make: the transition was owed at
-    /// `now` whether or not anybody called.
-    pub fn apply_due_target_activations(&mut self, now: Instant) {
-        for entry in self.targets.values_mut() {
-            if entry.status == TARGET_STATUS_PENDING && now >= entry.active_due {
-                entry.status = TARGET_STATUS_ACTIVE.to_string();
-            }
-        }
-    }
-
     /// Subscribe `rule_arn` to `target`, creating the account-wide registry entry the
     /// first time this address is seen.
-    pub fn register_target(&mut self, rule_arn: &str, target: &RuleTarget, now: Instant) {
+    pub fn register_target(&mut self, rule_arn: &str, target: &RuleTarget) {
         let entry = self
             .targets
             .entry(target.target_address.clone())
             .or_insert_with(|| TargetRegistryEntry {
                 target_type: target.target_type.clone(),
-                status: TARGET_STATUS_PENDING.to_string(),
-                active_due: now + TARGET_ACTIVATION_DELAY,
+                status: TARGET_STATUS_ACTIVE.to_string(),
                 subscribed_rules: HashSet::new(),
             });
         entry.target_type = target.target_type.clone();
@@ -177,12 +172,28 @@ impl ComAmazonawsCodestarnotificationsCodestarnotifications20191015State {
         self.rules.get(arn).filter(|rule| rule.region == region)
     }
 
+    /// The same lookup for a handler that MUTATES the rule it found, so a write path
+    /// resolves the ARN and the region once rather than looking the rule up twice.
+    pub fn rule_in_region_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut NotificationRule> {
+        self.rules.get_mut(arn).filter(|rule| rule.region == region)
+    }
+
     /// How many rules this region already holds, for [`MAX_RULES_PER_REGION`].
     pub fn rule_count_in_region(&self, region: &str) -> usize {
         self.rules
             .values()
             .filter(|rule| rule.region == region)
             .count()
+    }
+
+    /// How many rules the store holds in TOTAL, for [`MAX_RULES_TOTAL`] — the bound
+    /// that does not depend on a request-controlled key.
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
     }
 
     /// Remove the rule `arn` names from this region, with everything that only existed
@@ -237,13 +248,14 @@ impl ComAmazonawsCodestarnotificationsCodestarnotifications20191015State {
         order.retain(|key| ledger.contains_key(key));
     }
 
-    /// The account-wide status of `address`, or `PENDING` for an address the registry
-    /// somehow does not hold (a rule always registers its targets, so this is the
-    /// conservative answer rather than an invented one).
+    /// The account-wide status of `address`: the registry's own value, and
+    /// [`TARGET_STATUS_ACTIVE`] for an address the registry somehow does not hold (a
+    /// rule always registers its targets, so this is the status every subscription this
+    /// service creates carries rather than an invented one).
     pub fn target_status(&self, address: &str) -> String {
         self.targets
             .get(address)
-            .map_or_else(|| TARGET_STATUS_PENDING.to_string(), |e| e.status.clone())
+            .map_or_else(|| TARGET_STATUS_ACTIVE.to_string(), |e| e.status.clone())
     }
 
     /// Every rule THIS REGION holds, in the stable creation order page tokens resume
@@ -443,82 +455,93 @@ pub fn rule_tags_from(
     Ok(stored)
 }
 
-/// One entry of the event-type catalog: an event type id, the service it belongs to and
-/// the resource type it fires on.
+/// One entry of the event-type catalog: an event type id, the service it belongs to,
+/// the resource type it fires on and its display NAME.
+///
+/// Every member is catalog DATA, recorded as the service publishes it. In particular the
+/// display name is not derivable from the id — AWS groups each event under a category
+/// ("Pull request", "Branches and tags", "Build state") whose word boundary the id's
+/// hyphenated slug does not mark — so it is stored here rather than computed.
 #[derive(Debug, Clone, Copy)]
 pub struct EventTypeCatalogEntry {
     pub event_type_id: &'static str,
     pub service_name: &'static str,
     pub resource_type: &'static str,
+    pub event_type_name: &'static str,
 }
 
 /// The seeded event-type catalog `EventTypeIds` resolve through.
 ///
-/// Source: the event type ids listed under "Notification concepts" in the Developer
+/// Source: the event types listed under "Notification concepts" in the Developer
 /// Tools Console User Guide, the page `EventTypeSummary$EventTypeId`'s own
 /// documentation links to
-/// (<https://docs.aws.amazon.com/codestar-notifications/latest/userguide/concepts.html#concepts-api>).
-/// It is a subset of that list, which is why an id the catalog does not hold is still
-/// accepted and stored (see [`resolve_event_type`]).
+/// (<https://docs.aws.amazon.com/codestar-notifications/latest/userguide/concepts.html#concepts-api>),
+/// whose "Event type" column is the `EventTypeName` the API reports and whose resource
+/// types are the capitalised singular nouns (`Repository`, `Project`, `Application`,
+/// `Pipeline`) `ListEventTypes` answers with. It is a subset of that list, which is why
+/// an id the catalog does not hold is still accepted and stored (see
+/// [`resolve_event_type`]).
 pub const EVENT_TYPE_CATALOG: &[EventTypeCatalogEntry] = &[
-    entry("codecommit-repository-comments-on-commits", "CodeCommit", "repository"),
-    entry("codecommit-repository-comments-on-pull-requests", "CodeCommit", "repository"),
-    entry("codecommit-repository-approvals-status-changed", "CodeCommit", "repository"),
-    entry("codecommit-repository-approvals-rule-override", "CodeCommit", "repository"),
-    entry("codecommit-repository-pull-request-created", "CodeCommit", "repository"),
-    entry("codecommit-repository-pull-request-status-changed", "CodeCommit", "repository"),
-    entry("codecommit-repository-pull-request-merged", "CodeCommit", "repository"),
-    entry("codecommit-repository-pull-request-source-updated", "CodeCommit", "repository"),
-    entry("codecommit-repository-branches-and-tags-created", "CodeCommit", "repository"),
-    entry("codecommit-repository-branches-and-tags-deleted", "CodeCommit", "repository"),
-    entry("codecommit-repository-branches-and-tags-updated", "CodeCommit", "repository"),
-    entry("codebuild-project-build-state-failed", "CodeBuild", "project"),
-    entry("codebuild-project-build-state-succeeded", "CodeBuild", "project"),
-    entry("codebuild-project-build-state-in-progress", "CodeBuild", "project"),
-    entry("codebuild-project-build-state-stopped", "CodeBuild", "project"),
-    entry("codebuild-project-build-phase-failure", "CodeBuild", "project"),
-    entry("codebuild-project-build-phase-success", "CodeBuild", "project"),
-    entry("codedeploy-application-deployment-failed", "CodeDeploy", "application"),
-    entry("codedeploy-application-deployment-succeeded", "CodeDeploy", "application"),
-    entry("codedeploy-application-deployment-started", "CodeDeploy", "application"),
-    entry("codepipeline-pipeline-pipeline-execution-failed", "CodePipeline", "pipeline"),
-    entry("codepipeline-pipeline-pipeline-execution-canceled", "CodePipeline", "pipeline"),
-    entry("codepipeline-pipeline-pipeline-execution-started", "CodePipeline", "pipeline"),
-    entry("codepipeline-pipeline-pipeline-execution-resumed", "CodePipeline", "pipeline"),
-    entry("codepipeline-pipeline-pipeline-execution-succeeded", "CodePipeline", "pipeline"),
-    entry("codepipeline-pipeline-pipeline-execution-superseded", "CodePipeline", "pipeline"),
-    entry("codepipeline-pipeline-manual-approval-failed", "CodePipeline", "pipeline"),
-    entry("codepipeline-pipeline-manual-approval-needed", "CodePipeline", "pipeline"),
-    entry("codepipeline-pipeline-manual-approval-succeeded", "CodePipeline", "pipeline"),
-    entry("codepipeline-pipeline-action-execution-succeeded", "CodePipeline", "pipeline"),
-    entry("codepipeline-pipeline-action-execution-failed", "CodePipeline", "pipeline"),
-    entry("codepipeline-pipeline-action-execution-canceled", "CodePipeline", "pipeline"),
-    entry("codepipeline-pipeline-action-execution-started", "CodePipeline", "pipeline"),
-    entry("codepipeline-pipeline-stage-execution-started", "CodePipeline", "pipeline"),
-    entry("codepipeline-pipeline-stage-execution-succeeded", "CodePipeline", "pipeline"),
-    entry("codepipeline-pipeline-stage-execution-resumed", "CodePipeline", "pipeline"),
-    entry("codepipeline-pipeline-stage-execution-canceled", "CodePipeline", "pipeline"),
-    entry("codepipeline-pipeline-stage-execution-failed", "CodePipeline", "pipeline"),
+    entry("codecommit-repository-comments-on-commits", "CodeCommit", "Repository", "Comments: On commits"),
+    entry("codecommit-repository-comments-on-pull-requests", "CodeCommit", "Repository", "Comments: On pull requests"),
+    entry("codecommit-repository-approvals-status-changed", "CodeCommit", "Repository", "Approvals: Status changed"),
+    entry("codecommit-repository-approvals-rule-override", "CodeCommit", "Repository", "Approvals: Rule override"),
+    entry("codecommit-repository-pull-request-created", "CodeCommit", "Repository", "Pull request: Created"),
+    entry("codecommit-repository-pull-request-status-changed", "CodeCommit", "Repository", "Pull request: Status changed"),
+    entry("codecommit-repository-pull-request-merged", "CodeCommit", "Repository", "Pull request: Merged"),
+    entry("codecommit-repository-pull-request-source-updated", "CodeCommit", "Repository", "Pull request: Source updated"),
+    entry("codecommit-repository-branches-and-tags-created", "CodeCommit", "Repository", "Branches and tags: Created"),
+    entry("codecommit-repository-branches-and-tags-deleted", "CodeCommit", "Repository", "Branches and tags: Deleted"),
+    entry("codecommit-repository-branches-and-tags-updated", "CodeCommit", "Repository", "Branches and tags: Updated"),
+    entry("codebuild-project-build-state-failed", "CodeBuild", "Project", "Build state: Failed"),
+    entry("codebuild-project-build-state-succeeded", "CodeBuild", "Project", "Build state: Succeeded"),
+    entry("codebuild-project-build-state-in-progress", "CodeBuild", "Project", "Build state: In progress"),
+    entry("codebuild-project-build-state-stopped", "CodeBuild", "Project", "Build state: Stopped"),
+    entry("codebuild-project-build-phase-failure", "CodeBuild", "Project", "Build phase: Failure"),
+    entry("codebuild-project-build-phase-success", "CodeBuild", "Project", "Build phase: Success"),
+    entry("codedeploy-application-deployment-failed", "CodeDeploy", "Application", "Deployment: Failed"),
+    entry("codedeploy-application-deployment-succeeded", "CodeDeploy", "Application", "Deployment: Succeeded"),
+    entry("codedeploy-application-deployment-started", "CodeDeploy", "Application", "Deployment: Started"),
+    entry("codepipeline-pipeline-pipeline-execution-failed", "CodePipeline", "Pipeline", "Pipeline execution: Failed"),
+    entry("codepipeline-pipeline-pipeline-execution-canceled", "CodePipeline", "Pipeline", "Pipeline execution: Canceled"),
+    entry("codepipeline-pipeline-pipeline-execution-started", "CodePipeline", "Pipeline", "Pipeline execution: Started"),
+    entry("codepipeline-pipeline-pipeline-execution-resumed", "CodePipeline", "Pipeline", "Pipeline execution: Resumed"),
+    entry("codepipeline-pipeline-pipeline-execution-succeeded", "CodePipeline", "Pipeline", "Pipeline execution: Succeeded"),
+    entry("codepipeline-pipeline-pipeline-execution-superseded", "CodePipeline", "Pipeline", "Pipeline execution: Superseded"),
+    entry("codepipeline-pipeline-manual-approval-failed", "CodePipeline", "Pipeline", "Manual approval: Failed"),
+    entry("codepipeline-pipeline-manual-approval-needed", "CodePipeline", "Pipeline", "Manual approval: Needed"),
+    entry("codepipeline-pipeline-manual-approval-succeeded", "CodePipeline", "Pipeline", "Manual approval: Succeeded"),
+    entry("codepipeline-pipeline-action-execution-succeeded", "CodePipeline", "Pipeline", "Action execution: Succeeded"),
+    entry("codepipeline-pipeline-action-execution-failed", "CodePipeline", "Pipeline", "Action execution: Failed"),
+    entry("codepipeline-pipeline-action-execution-canceled", "CodePipeline", "Pipeline", "Action execution: Canceled"),
+    entry("codepipeline-pipeline-action-execution-started", "CodePipeline", "Pipeline", "Action execution: Started"),
+    entry("codepipeline-pipeline-stage-execution-started", "CodePipeline", "Pipeline", "Stage execution: Started"),
+    entry("codepipeline-pipeline-stage-execution-succeeded", "CodePipeline", "Pipeline", "Stage execution: Succeeded"),
+    entry("codepipeline-pipeline-stage-execution-resumed", "CodePipeline", "Pipeline", "Stage execution: Resumed"),
+    entry("codepipeline-pipeline-stage-execution-canceled", "CodePipeline", "Pipeline", "Stage execution: Canceled"),
+    entry("codepipeline-pipeline-stage-execution-failed", "CodePipeline", "Pipeline", "Stage execution: Failed"),
 ];
 
 const fn entry(
     event_type_id: &'static str,
     service_name: &'static str,
     resource_type: &'static str,
+    event_type_name: &'static str,
 ) -> EventTypeCatalogEntry {
     EventTypeCatalogEntry {
         event_type_id,
         service_name,
         resource_type,
+        event_type_name,
     }
 }
 
 /// Resolve one stored `EventTypeId` into the summary the API reports.
 ///
-/// For a catalogued id every member is filled; the event NAME is rendered from the
-/// id's own event segment (the part after `<service>-<resourceType>-`), the only place
-/// the name is recorded. For an id the catalog does not hold, the id — the one fact the
-/// rule stores — is returned and nothing else is invented.
+/// For a catalogued id every member is reported from the catalog entry, verbatim: the
+/// name and resource type are the service's own published values, never rendered from
+/// the id. For an id the catalog does not hold, the id — the one fact the rule stores —
+/// is returned and nothing else is invented.
 pub fn resolve_event_type(event_type_id: &str) -> ResolvedEventType {
     let Some(found) = EVENT_TYPE_CATALOG
         .iter()
@@ -534,7 +557,7 @@ pub fn resolve_event_type(event_type_id: &str) -> ResolvedEventType {
     ResolvedEventType {
         event_type_id: event_type_id.to_string(),
         service_name: Some(found.service_name.to_string()),
-        event_type_name: Some(event_name_from_id(found)),
+        event_type_name: Some(found.event_type_name.to_string()),
         resource_type: Some(found.resource_type.to_string()),
     }
 }
@@ -546,27 +569,6 @@ pub struct ResolvedEventType {
     pub service_name: Option<String>,
     pub event_type_name: Option<String>,
     pub resource_type: Option<String>,
-}
-
-/// Render an event type's display name from its id: drop the `<service>-<resourceType>-`
-/// prefix the catalog already records, turn the remaining slug into words and
-/// capitalise the first one.
-fn event_name_from_id(entry: &EventTypeCatalogEntry) -> String {
-    let prefix = format!(
-        "{}-{}-",
-        entry.service_name.to_ascii_lowercase(),
-        entry.resource_type
-    );
-    let slug = entry
-        .event_type_id
-        .strip_prefix(&prefix)
-        .unwrap_or(entry.event_type_id);
-    let words = slug.replace('-', " ");
-    let mut chars = words.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => words,
-    }
 }
 
 #[cfg(test)]
@@ -592,14 +594,24 @@ mod tests {
     }
 
     #[test]
-    fn an_event_name_is_rendered_from_the_id() {
+    fn a_catalogued_event_type_reports_the_catalogs_own_values() {
         let resolved = resolve_event_type("codecommit-repository-comments-on-commits");
         assert_eq!(
             resolved.event_type_name.as_deref(),
-            Some("Comments on commits"),
+            Some("Comments: On commits"),
             "got {resolved:?}"
         );
-        assert_eq!(resolved.resource_type.as_deref(), Some("repository"));
+        assert_eq!(resolved.resource_type.as_deref(), Some("Repository"));
+        assert_eq!(resolved.service_name.as_deref(), Some("CodeCommit"));
+
+        // An id the catalog does not hold reports nothing but the id.
+        let unknown = resolve_event_type("codecommit-repository-not-in-the-catalog");
+        assert!(
+            unknown.event_type_name.is_none()
+                && unknown.resource_type.is_none()
+                && unknown.service_name.is_none(),
+            "an uncatalogued id resolves nothing but its id, got {unknown:?}"
+        );
     }
 
     #[test]
@@ -667,9 +679,8 @@ mod tests {
             target_address: "arn:aws:sns:us-east-1:123456789012:topic".to_string(),
             target_type: "SNS".to_string(),
         };
-        let now = Instant::now();
-        state.register_target("rule-a", &target, now);
-        state.register_target("rule-b", &target, now);
+        state.register_target("rule-a", &target);
+        state.register_target("rule-b", &target);
 
         state.unregister_target("rule-a", &target.target_address);
         assert!(

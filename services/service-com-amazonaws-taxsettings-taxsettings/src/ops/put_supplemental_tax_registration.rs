@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutSupplementalTaxRegistration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutSupplementalTaxRegistration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutSupplementalTaxRegistration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds or updates one supplemental tax registration (a supplemental TRN) of the
+//! account and reports the `authorityId` it is stored under together with the
+//! status its validation starts in.
+//!
+//! `SupplementalTaxRegistrationEntry` carries no `authorityId`, so the TRN
+//! itself — its `registrationType` and `registrationId` — is the identity a
+//! write addresses: writing the same TRN again UPDATES that record under the
+//! `authorityId` it already has, and a TRN the account does not hold yet gets a
+//! freshly minted one.
+//!
+//! WHICH JURISDICTIONS may hold a supplemental TRN is a separate rule, recorded
+//! and filed as its own issue
+//! (`issues/.../taxsettings-supplemental-trn-and-batch-tax-registration-write-paths.md`,
+//! cause 3: entries for some countries are refused with the modelled
+//! `ValidationException`). This handler applies the rules the model states for
+//! the entry and does not guess that country set; the refusal belongs in the
+//! check sequence below when that issue is fixed.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +156,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutSupplementalTaxRegistration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutSupplementalTaxRegistrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutSupplementalTaxRegistration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutSupplementalTaxRegistrationErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        let entry = &input.tax_registration_entry;
+
+        // `registrationId`, `legalName` and the address lines carry the model's
+        // non-blank pattern `^(?!\s*$)[\s\S]+$`, a negative lookahead the
+        // boundary validator's regex engine cannot compile, so a blank value
+        // reaches this handler having satisfied every constraint the boundary
+        // could check. Everything else on this input (the 1..=200 lengths, the
+        // required `address`, the closed `SupplementalTaxRegistrationType` value
+        // set) it already refused before this handler ran.
+        crate::state::check_not_blank(
+            "taxRegistrationEntry.registrationId",
+            &entry.registration_id,
+        )
+        .map_err(PutSupplementalTaxRegistrationErrorModeled::ValidationException)?;
+        crate::state::check_not_blank("taxRegistrationEntry.legalName", &entry.legal_name)
+            .map_err(PutSupplementalTaxRegistrationErrorModeled::ValidationException)?;
+        crate::state::check_address("taxRegistrationEntry.address", &entry.address)
+            .map_err(PutSupplementalTaxRegistrationErrorModeled::ValidationException)?;
+
+        let mut store = state.lock();
+        // The TRN the entry names is the identity of the record: a write of one
+        // the account already holds replaces it under the `authorityId` it was
+        // first stored with, so a repeated write adds nothing. Only a write that
+        // would ADD a record is refused once the store holds as many
+        // supplemental registrations as this emulator keeps resident.
+        let existing = store
+            .find_supplemental_authority(&entry.registration_type, &entry.registration_id);
+        let authority_id = match existing {
+            Some(authority_id) => authority_id,
+            None => {
+                if store.supplemental_registrations.len()
+                    >= crate::state::MAX_STORED_SUPPLEMENTAL_REGISTRATIONS
+                {
+                    return Err(PutSupplementalTaxRegistrationErrorModeled::ConflictException(
+                        crate::state::supplemental_store_full(),
+                    )
+                    .into());
+                }
+                store.mint_supplemental_authority_id()
+            }
+        };
+
+        let stored = crate::state::StoredSupplementalRegistration::from_entry(
+            entry,
+            ::std::time::Instant::now(),
+        );
+        let status = stored.status.clone();
+        store
+            .supplemental_registrations
+            .insert(authority_id.clone(), stored);
+
+        Ok(PutSupplementalTaxRegistrationOutput {
+            authority_id,
+            status,
+        })
     }
 }

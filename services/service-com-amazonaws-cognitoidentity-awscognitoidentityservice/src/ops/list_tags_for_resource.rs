@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags stored on the identity pool the request's `ResourceArn` names.
+//!
+//! The tags of a pool are the pool's own record (`IdentityPool::identity_pool_tags`, as
+//! `CreateIdentityPool`'s `IdentityPoolTags` wrote them), so this operation reads that one
+//! record and writes nothing: a pool with no tags stored answers an EMPTY tag map, and an
+//! ARN that names no stored pool is the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +147,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // A read: `ctx` carries only request metadata, and nothing here needs it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the identity-pool store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `ARNString` constrains only the length (20..2048), so the ARN's own form is
+        // this service's rule: a `ResourceArn` that is not an identity-pool ARN of this
+        // service names no resource at all, which is a bad input parameter rather than a
+        // missing resource.
+        let Some(identity_pool_id) = crate::state::identity_pool_id_from_arn(&input.resource_arn)
+        else {
+            return Err(ListTagsForResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "ResourceArn '{}' is not the ARN of an Amazon Cognito identity pool.",
+                        input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let Some(record) = store.identity_pools.get(identity_pool_id) else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("IdentityPool '{identity_pool_id}' not found.")),
+                },
+            )
+            .into());
+        };
+
+        // The tags ASSIGNED to the pool: a pool that was never tagged has none, which is
+        // an empty map and not an absent member — this operation reports a tag set, and a
+        // caller reads the same shape whether or not the set is empty.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(
+                record
+                    .identity_pool_tags
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+            ),
+        })
     }
 }
