@@ -113,7 +113,7 @@ pub(crate) fn seed_job(
         tags: HashMap::new(),
         client_token: None,
         request_fingerprint: identifier.to_string(),
-        next_status_due: None,
+        owed_statuses: std::collections::VecDeque::new(),
     });
 }
 

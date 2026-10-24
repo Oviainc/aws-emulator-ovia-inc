@@ -31,8 +31,8 @@
 //! `ListAgreementCharges` is the reader these assertions go through: it is what
 //! "allows acceptors to view charges and purchase orders that are associated
 //! with an agreement", so the association is checked against the service's own
-//! report rather than against handler internals. Its scaffold issue is
-//! `issues/things-that-do-not-work/20261024T010602Z-marketplace-agreement-listagreementcharges-stub.md`.
+//! report rather than against handler internals. That report has its own suite,
+//! `agreement_charges`, which pins what it carries and how it pages.
 
 use std::collections::BTreeMap;
 
@@ -59,7 +59,10 @@ const INITIAL_REVISION: i64 = 1;
 /// Create and accept a quote over `charges` charged terms, answering the
 /// agreement id and the ids of the charges that agreement holds, in the order
 /// its quote minted them.
-async fn agreement_holding(
+///
+/// `pub(crate)` because `agreement_charges` reports on the same agreements
+/// rather than standing up a second harness.
+pub(crate) async fn agreement_holding(
     router: &MultiServiceRouter,
     proposal: &str,
     charges: usize,
@@ -85,12 +88,12 @@ async fn update(router: &MultiServiceRouter, orders: Value) -> Answer {
 }
 
 /// `ListAgreementCharges` with the selectors `request` carries.
-async fn charges(router: &MultiServiceRouter, request: Value) -> Answer {
+pub(crate) async fn charges(router: &MultiServiceRouter, request: Value) -> Answer {
     call(router, "ListAgreementCharges", request).await
 }
 
 /// Every charge the report carries, as a list of its JSON objects.
-fn items(answer: &Answer) -> Vec<Value> {
+pub(crate) fn items(answer: &Answer) -> Vec<Value> {
     answer.body["items"]
         .as_array()
         .cloned()

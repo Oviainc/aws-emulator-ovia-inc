@@ -6,6 +6,20 @@
 //! containing contact, name, type, delivery address and activation status
 //! `CreateContactChannel` persisted. A read: it writes nothing.
 //!
+//! ## The account gate
+//!
+//! Incident Manager, whose contacts plane this service is, is fronted by a PER-ACCOUNT
+//! replication set. Until the account holds an active one it has no entry in Incident
+//! Manager's replication-set-scoped registry, so a call that must resolve a
+//! replication-set-scoped resource ARN is refused with the modelled `ValidationException`
+//! (HTTP 400) BEFORE that ARN is resolved — an un-onboarded account is never told instead
+//! that the resource it named does not exist. The gate is the service-wide one,
+//! [`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set_for`],
+//! the ARN-shaped phrasing the crate reserves for an operation whose whole subject is one
+//! resource ARN (the form `GetRotation` and `DescribeEngagement` answer with), so every
+//! ARN-addressed operation applies the same precondition in the same order and words it
+//! the same way as its peers.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -174,6 +188,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let state = state.lock();
+
+        // The account gate comes FIRST: it is evaluated before `ContactChannelId` is
+        // resolved, so a non-onboarded account is refused identically whether or not its
+        // channel exists. This operation's whole subject is one resource ARN, so the
+        // refusal is the ARN-shaped one the crate reserves for that case: with no
+        // replication set the account has no home region for the channel, so the ARN
+        // resolves to nothing.
+        state
+            .require_active_replication_set_for(&input.contact_channel_id)
+            .map_err(account_precondition_failed)?;
+
         let Some(channel) = state.contact_channels.get(&input.contact_channel_id) else {
             return Err(GetContactChannelErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -197,4 +222,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             activation_status: Some(channel.activation_status.clone()),
         })
     }
+}
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` because the failure is not a member-level one — the request's
+/// `ContactChannelId` is well formed; what cannot be resolved is the account's registry —
+/// and `fields` is present but EMPTY for the same reason. The same shape every gated
+/// operation in this service answers this precondition with.
+fn account_precondition_failed(message: String) -> GetContactChannelError {
+    GetContactChannelErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
 }

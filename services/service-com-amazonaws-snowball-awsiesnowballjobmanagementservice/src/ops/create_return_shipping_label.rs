@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReturnShippingLabel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateReturnShippingLabel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateReturnShippingLabel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts the task that creates the shipping label a job's Snow device is returned to
+//! Amazon Web Services with, and answers that task's status. The job must be one this
+//! service persisted, it must carry a device of its own, and that device must still be on
+//! the customer's side of its journey; the label becomes usable once the task finishes and
+//! stays usable until it expires, and a second call while the task is running or while a
+//! valid label exists is refused rather than starting another label.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +157,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateReturnShippingLabel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateReturnShippingLabelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateReturnShippingLabel"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STATE_UNAVAILABLE,
+            ));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(job) = store.jobs.get(&input.job_id) else {
+            return Err(
+                CreateReturnShippingLabelErrorModeled::InvalidResourceException(
+                    InvalidResourceException {
+                        message: Some(format!(
+                            "The job ID {} can't be found. Check the information you provided in \
+                             your last request, and try again.",
+                            input.job_id
+                        )),
+                        resource_type: Some("job".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let is_master = job.is_master();
+        let job_state = job.job_state;
+        let job_shipping_option = job.shipping_option.clone();
+
+        // "Main jobs aren't associated with any Snowballs. Instead, each main job will
+        // have at least one job part, and each job part is associated with a Snowball"
+        // (`JobListEntry$IsMaster`): a label returns a DEVICE, so the main job of an
+        // export order has none to return, and its label is a resource no record answers
+        // to, which is what `InvalidResourceException` states.
+        if is_master {
+            return Err(
+                CreateReturnShippingLabelErrorModeled::InvalidResourceException(
+                    InvalidResourceException {
+                        message: Some(format!(
+                            "The job {} is the main job of an export order and is associated with \
+                             no Snowball, so it has no device to return. Create the return \
+                             shipping label for one of its job parts instead.",
+                            input.job_id
+                        )),
+                        resource_type: Some("job".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A job whose device will never ship, or whose device is already back at Amazon
+        // Web Services, has nothing to return; unlike a main job that is a property of
+        // where the job GOT TO, which is what `InvalidJobStateException` states.
+        if !job_state.has_returnable_device() {
+            return Err(
+                CreateReturnShippingLabelErrorModeled::InvalidJobStateException(
+                    InvalidJobStateException {
+                        message: Some(format!(
+                            "The job {} is in state {} and has no device to return, so a return \
+                             shipping label can't be created for it.",
+                            input.job_id,
+                            job_state.as_wire()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        if let Some(label) = store.return_shipping_label(&input.job_id) {
+            // "You get this exception when you call CreateReturnShippingLabel more than
+            // once when other requests are not completed" (`ConflictException`): the
+            // request that is not completed is the label-creating task an earlier call
+            // started, which is still running.
+            if label.status(now) == crate::state::ShippingLabelStatus::InProgress {
+                return Err(CreateReturnShippingLabelErrorModeled::ConflictException(
+                    ConflictException {
+                        conflict_resource: Some(input.job_id.clone()),
+                        message: Some(format!(
+                            "A return shipping label for job {} is still being created. Use \
+                             DescribeReturnShippingLabel to get its status.",
+                            input.job_id
+                        )),
+                    },
+                )
+                .into());
+            }
+            // "You get this exception if you call CreateReturnShippingLabel and a valid
+            // return shipping label already exists. In this case, use
+            // DescribeReturnShippingLabel to get the URL." A label whose window has closed
+            // is not a valid one, so a create past the expiry starts a new label.
+            if label.is_valid(now) {
+                return Err(
+                    CreateReturnShippingLabelErrorModeled::ReturnShippingLabelAlreadyExistsException(
+                        ReturnShippingLabelAlreadyExistsException {
+                            message: Some(format!(
+                                "A valid return shipping label already exists for job {}. Use \
+                                 DescribeReturnShippingLabel to get the URL.",
+                                input.job_id
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Starting that task is what this operation DOES, so the store records the label
+        // it started and the response is read back out of that record. The return travels
+        // at the shipping speed this call asked for; a call that names none leaves it at
+        // the speed the job itself was created with.
+        let shipping_option = input.shipping_option.clone().or(job_shipping_option);
+        let label = store.start_return_shipping_label(&input.job_id, shipping_option, now);
+
+        Ok(CreateReturnShippingLabelOutput {
+            status: Some(label.status(now).as_wire().to_string()),
+        })
     }
 }

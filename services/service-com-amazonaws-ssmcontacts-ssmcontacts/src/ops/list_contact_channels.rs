@@ -11,6 +11,19 @@
 //! previous page ended on — which keeps the paging stable even if a channel inside an
 //! already-served page is deleted mid-scan.
 //!
+//! ## The account gate
+//!
+//! This listing is not account-wide: it must resolve the `ContactId` it names, which is a
+//! replication-set-scoped resource. Incident Manager is fronted by a PER-ACCOUNT
+//! replication set, and until the account holds an active one it has no entry in Incident
+//! Manager's replication-set-scoped registry, so the call is refused with the modelled
+//! `ValidationException` (HTTP 400) BEFORE that ARN is resolved — an un-onboarded account
+//! is never told instead that the contact it named does not exist. The gate is the
+//! service-wide one,
+//! [`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set_for`],
+//! the ARN-shaped phrasing the crate reserves for an operation addressed by one resource
+//! ARN (the form `GetContactChannel` and `DescribeEngagement` answer with).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -176,6 +189,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let state = state.lock();
+
+        // The account gate comes FIRST: before the token is decoded and before `ContactId`
+        // is resolved, so a non-onboarded account is refused identically whether or not the
+        // contact exists, and about its account rather than about the token it carried. The
+        // refusal names the ARN the request supplied, which is what cannot be resolved
+        // without a replication set.
+        state
+            .require_active_replication_set_for(&input.contact_id)
+            .map_err(account_precondition_failed)?;
+
         // The resume point: the creation sequence the previous page ended on.
         let after: Option<u64> = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
             Some(token) => Some(
@@ -186,7 +210,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        let state = state.lock();
         if !state.contacts.contains_key(&input.contact_id) {
             return Err(ListContactChannelsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -227,6 +250,21 @@ fn validation(message: impl Into<String>) -> ListContactChannelsError {
         message: message.into(),
         reason: Some("FIELD_VALIDATION_FAILED".to_string()),
         fields: None,
+    })
+    .into()
+}
+
+/// The account precondition's refusal: the same modelled `ValidationException`, which the
+/// model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` and `fields` is present but EMPTY: the failure is account
+/// level, so no field of the request is at fault. The same shape every gated operation in
+/// this service answers this precondition with.
+fn account_precondition_failed(message: String) -> ListContactChannelsError {
+    ListContactChannelsErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
     })
     .into()
 }

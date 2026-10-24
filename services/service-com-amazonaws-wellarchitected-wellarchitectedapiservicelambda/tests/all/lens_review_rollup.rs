@@ -48,14 +48,16 @@ const FRAMEWORK_QUESTIONS: i64 = 11 + 11 + 13 + 5 + 11 + 6;
 /// so a roll-up is checked for ALL its buckets rather than the one a case moved.
 const RISKS: [&str; 5] = ["HIGH", "MEDIUM", "NONE", "NOT_APPLICABLE", "UNANSWERED"];
 
-/// The alias of the one lens this emulator ships a question set for.
+/// The alias of the AWS Well-Architected Framework lens.
 const FRAMEWORK_LENS: &str = "wellarchitected";
 
 /// The published name of that lens, as `LensReview$LensName` reports it.
 const FRAMEWORK_LENS_NAME: &str = "Well-Architected Framework";
 
-/// A lens alias AWS publishes but this emulator ships no question set for.
-const UNSHIPPED_LENS: &str = "serverless";
+/// A lens alias AWS publishes that this emulator's AWS-official lens catalog carries no
+/// content for, so it asks no questions here (the catalog itself is pinned by
+/// `super::official_lens_catalog`).
+const UNSHIPPED_LENS: &str = "mergersandacquisitions";
 
 /// A well-formed `WorkloadId` (32 lowercase hex) that no workload carries.
 const ABSENT_HEX_ID: &str = "00000000000000000000000000000000";
