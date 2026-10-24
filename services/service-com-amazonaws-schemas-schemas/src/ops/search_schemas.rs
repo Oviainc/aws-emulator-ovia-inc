@@ -211,11 +211,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.registry_name, input.keywords
         );
 
-        // The scan is LAZY: `page_by_key` pulls from this filter only until the page
-        // is full plus one, so a search that finds its page early stops there.
-        let matching = registry
-            .schemas
-            .iter()
+        // The schemas are COLLATED first — a search of a registry reports its matches
+        // in the same order a listing of it does, the collation
+        // `crate::state::schema_name_order_key` defines — and the keyword match runs
+        // LAZILY over that order: `page_by_key` pulls from this filter only until the
+        // page is full plus one, so a search that finds its page early stops there and
+        // reads no further schema's documents.
+        let collated = crate::state::in_schema_name_order(registry.schemas.iter());
+        let matching = collated
+            .into_iter()
             .filter(|(_, schema)| matches_every_keyword(schema, &keywords));
         let page = crate::state::page_by_key(
             matching,

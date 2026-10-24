@@ -3,8 +3,9 @@
 //! End-to-end HTTP tests for WHAT the AWS-managed `aws.events` catalogue contains and
 //! what it reports about each member:
 //!
-//! 1. every AWS event source publishes the whole CloudTrail-delivered event family, not
-//!    the API-call event alone, and every member of it is named after its `detail-type`;
+//! 1. a source the catalogue publishes CloudTrail-delivered schemas for publishes the
+//!    whole family, not the API-call event alone, and every member of it is named
+//!    after its `detail-type`;
 //! 2. a published schema's `LastModified` is the SCHEMA's own instant — fixed, at
 //!    whole-second precision and the same in every store — not a reading of the clock;
 //! 3. a published schema's `VersionCount` is the number of versions the catalogue
@@ -81,9 +82,12 @@ fn timestamp_at(answer: &Answer, member: &str) -> String {
 
 /// The event sources the membership cases run over.
 ///
-/// Source: `crate::state::AWS_EVENT_SOURCES`. The first two rows are the sources the
-/// issue cited; the rest are sources it did not, including ones whose name is not a
-/// single dotted word (`aws.amazon.connect`) and ones that publish nothing beyond the
+/// Source: `crate::state::AWS_EVENT_SOURCES`, the sources the catalogue publishes
+/// CloudTrail-delivered schemas for — which is not every source it publishes anything
+/// for (`schema_name_collation.rs` covers a source that publishes its own event types
+/// and no CloudTrail-delivered schema). The first two rows are the sources the issue
+/// cited; the rest are sources it did not, including ones whose name is not a single
+/// dotted word (`aws.amazon.connect`) and ones that publish nothing beyond the
 /// CloudTrail family.
 fn source_rows() -> Vec<&'static str> {
     vec![
@@ -99,12 +103,12 @@ fn source_rows() -> Vec<&'static str> {
     ]
 }
 
-/// RULE: the catalogue holds a schema for EVERY kind of CloudTrail record EventBridge
-/// delivers — not the API call alone — for every AWS event source, each published under
-/// `<source>@<EventName>` where `<EventName>` is the event's `detail-type` with its
-/// spaces removed.
+/// RULE: for a source the catalogue publishes CloudTrail-delivered schemas for, it
+/// holds one per KIND of CloudTrail record EventBridge delivers — not the API call
+/// alone — each published under `<source>@<EventName>` where `<EventName>` is the
+/// event's `detail-type` with its spaces removed.
 #[tokio::test]
-async fn the_catalogue_publishes_the_whole_cloud_trail_family_of_every_source() {
+async fn the_catalogue_publishes_the_whole_cloud_trail_family_of_a_source_it_holds_it_for() {
     let emulator = Emulator::new();
 
     // The naming rule the table is held to: the catalogue names a schema after the
