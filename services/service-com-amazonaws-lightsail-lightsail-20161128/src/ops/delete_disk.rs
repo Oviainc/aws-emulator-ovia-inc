@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDisk
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDisk`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDisk::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +158,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDisk` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDiskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDisk"))
+        // `ctx` carries request metadata only, and nothing this operation reads or
+        // writes comes from it: the disk is addressed by the name the request
+        // names, and where it lived is the location its own record holds.
+        let _ = ctx;
+
+        let name = input.disk_name;
+        // `forceDeleteAddOns` asks for the disk's add-ons to go with it. An add-on
+        // lives on the disk record, so removing the record removes them whatever
+        // the flag says; the only thing a disk add-on leaves behind is the
+        // automatic snapshots it took, and those are not part of this slice, so
+        // there is nothing further for the flag to delete.
+        let _ = input.force_delete_add_ons;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // READ what the request addresses first, so a refused delete removes
+            // nothing: the disk must exist, and nothing may be holding it.
+            let (location, state) = {
+                let Some(disk) = store.disk(&name) else {
+                    return Err(not_found(&name));
+                };
+                (disk.location.clone(), disk.state)
+            };
+
+            // "The disk must be in the available state (not attached to a
+            // Lightsail instance)" — the modelled `DeleteDisk` documentation:
+            // `available` is the one `DiskState` value that means the disk exists
+            // and nothing holds it, so a disk in any other state — one still being
+            // provisioned, or one an instance has in use — is the service's
+            // operation-failure rejection, and the record is left exactly as it
+            // was.
+            if state != crate::state::DISK_STATE_AVAILABLE {
+                return Err(not_deletable(state));
+            }
+
+            let removed = store
+                .remove_disk(&name)
+                .expect("the disk was resolved from this same store above");
+            // The record is gone as this call returns — the modelled `DiskState`
+            // carries no value for a disk being deleted, so there is no state left
+            // for a read to report — which is why the operation this call logs is
+            // answered terminal.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DELETE_DISK,
+                crate::state::RESOURCE_TYPE_DISK,
+                &removed.name,
+                &location,
+                None,
+            );
+            // `operations` is a list because a Lightsail call can act on several
+            // resources at once; this one acts on exactly one disk, and a disk
+            // that is `available` holds no attachment whose release would be
+            // another record's own mutation, so it answers exactly one entry.
+            Ok(DeleteDiskOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// The disk the request names is not `available`, so it is not deletable yet:
+/// the modelled `OperationFailureException` — HTTP 400, "Lightsail throws this
+/// exception when an operation fails to execute" — whose message is built from
+/// the disk's own current `DiskState` value, the state that makes it
+/// undeletable.
+fn not_deletable(state: &str) -> DeleteDiskError {
+    DeleteDiskErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(format!(
+            "You can't delete this disk right now. The state of this disk is: {state}."
+        )),
+        // `code`, `docs` and `tip` are members this service fills from its own
+        // catalogue of failures, and no recorded response shows what it puts
+        // there for this one — so they are left absent rather than invented.
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No disk of that name is stored: Lightsail's `DoesNotExist` rejection — HTTP
+/// 400, wire error `NotFoundException`, body `code` `DoesNotExist` and a message
+/// naming the resource type and the requested name. Deleting a disk twice
+/// therefore fails the second time rather than reporting a deletion that did not
+/// happen.
+fn not_found(name: &str) -> DeleteDiskError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(crate::state::RESOURCE_TYPE_DISK, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> DeleteDiskError {
+    DeleteDiskErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail disk store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
