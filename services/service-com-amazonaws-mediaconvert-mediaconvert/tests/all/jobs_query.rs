@@ -67,6 +67,7 @@ fn settings_with_codecs(file_input: &str, audio_codec: &str, video_codec: &str) 
             "name": "File Group",
             "outputs": [{
                 "nameModifier": "_out",
+                "containerSettings": { "container": "MP4" },
                 "audioDescriptions": [{ "codecSettings": { "codec": audio_codec } }],
                 "videoDescription": { "codecSettings": { "codec": video_codec } }
             }],

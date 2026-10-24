@@ -118,7 +118,8 @@ fn policy_update(policy_id: &str) -> Value {
 }
 
 /// Not-found lookups that need NO administrator association: the two that are
-/// not-found precisely BECAUSE nothing is associated.
+/// not-found precisely BECAUSE nothing is associated, and the policy-id lookups,
+/// which are decided by the policy store alone.
 fn not_found_without_administrator() -> Vec<Row> {
     vec![
         Row {
@@ -133,15 +134,6 @@ fn not_found_without_administrator() -> Vec<Row> {
             body: json!({}),
             lookup: None,
         },
-    ]
-}
-
-/// Not-found lookups the administrator gate guards: these answer the refusal
-/// until an administrator is associated, and the modelled not-found after.
-fn not_found_with_administrator() -> Vec<Row> {
-    vec![
-        // Policy management is organisation-scoped too, so a policy lookup only
-        // reaches the store once an administrator is associated.
         Row {
             case: "GetPolicy with an unknown policy id",
             operation: "GetPolicy",
@@ -160,6 +152,16 @@ fn not_found_with_administrator() -> Vec<Row> {
             body: json!({ "PolicyId": UNKNOWN_POLICY_ID }),
             lookup: Some(UNKNOWN_POLICY_ID.to_string()),
         },
+    ]
+}
+
+/// Not-found lookups the administrator gate guards: these answer the refusal
+/// until an administrator is associated, and the modelled not-found after.
+fn not_found_with_administrator() -> Vec<Row> {
+    vec![
+        // Writing a policy is organisation-scoped, so an update of an id that
+        // names nothing only reaches the store once an administrator is
+        // associated.
         Row {
             case: "PutPolicy updating an unknown policy id",
             operation: "PutPolicy",
@@ -337,9 +339,6 @@ async fn resource_not_found_answers_one_constant_message_everywhere() {
 #[tokio::test]
 async fn resource_not_found_message_does_not_vary_with_the_region() {
     let router = emulator();
-    // The policy read is organisation-scoped, so the administrator association
-    // is what lets the lookup reach the store at all.
-    associate_admin(&router).await;
     for region in REGIONS {
         let (status, body) = call_in(
             &router,
@@ -377,11 +376,9 @@ async fn the_authorization_refusal_carries_a_message_built_from_the_request() {
         ("GetProtocolsList", json!({ "ListId": OTHER_UNKNOWN_LIST_ID, "DefaultList": false })),
         ("GetNotificationChannel", json!({})),
         ("GetResourceSet", json!({ "Identifier": UNKNOWN_RESOURCE_SET_ID })),
-        // The policy operations are organisation-scoped as well, so each of them
-        // answers this same refusal.
+        // Writing a policy and enumerating the organisation's policies are
+        // organisation-scoped as well, so each of them answers this same refusal.
         ("PutPolicy", json!({ "Policy": policy_update(UNKNOWN_POLICY_ID) })),
-        ("GetPolicy", json!({ "PolicyId": UNKNOWN_POLICY_ID })),
-        ("DeletePolicy", json!({ "PolicyId": OTHER_UNKNOWN_POLICY_ID })),
         ("ListPolicies", json!({})),
         (
             "ListTagsForResource",

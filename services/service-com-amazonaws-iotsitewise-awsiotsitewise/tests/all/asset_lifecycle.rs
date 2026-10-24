@@ -441,19 +441,28 @@ async fn the_asset_model_asset_and_property_value_slice_round_trips() {
         );
     }
 
-    // A property nothing was written to has no value, and that is not an error.
+    // An attribute property's model default value IS its current value, so the
+    // property nothing was written to reports that default rather than nothing.
+    // (The rule across data types is pinned by the `attribute_default_values`
+    // suite.)
     let serial = property_id(&asset["assetProperties"], "Serial");
-    let (status, empty) = call(
+    let (status, defaulted) = call(
         &router,
         "GET",
         &format!("/properties/latest?assetId={asset_id}&propertyId={serial}"),
         None,
     )
     .await;
-    assert_eq!(status, 200, "unwritten property: got {status} {empty}");
-    assert!(
-        empty.get("propertyValue").is_none_or(Value::is_null),
-        "unwritten property: expected no propertyValue, got {empty}"
+    assert_eq!(status, 200, "attribute property: got {status} {defaulted}");
+    assert_eq!(
+        defaulted["propertyValue"]["value"]["stringValue"].as_str(),
+        Some("unset"),
+        "attribute property: expected the model's default value, got {defaulted}"
+    );
+    assert_eq!(
+        defaulted["propertyValue"]["quality"].as_str(),
+        Some("GOOD"),
+        "attribute property: expected the quality of an ordinary reading, got {defaulted}"
     );
 
     // --- ListAssets -------------------------------------------------------

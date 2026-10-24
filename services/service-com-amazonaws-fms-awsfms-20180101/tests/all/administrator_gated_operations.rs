@@ -53,9 +53,6 @@ const UNKNOWN_RESOURCE_SET_ID: &str = "0123456789AbCdEfGhIjKl";
 /// matching `^[a-z0-9A-Z-]{36}$`) that names no policy.
 const UNKNOWN_POLICY_ID: &str = "109c24c6-0d5e-407e-98b5-8619b6cf4907";
 
-/// A second well-formed `PolicyId` that names no policy.
-const OTHER_UNKNOWN_POLICY_ID: &str = "7b1f0e52-3c44-4a90-8d61-0ac5e9f2b8d3";
-
 /// The `message` member of an awsJson1_1 error envelope, under either casing: the
 /// modelled error shapes of this service spell it `Message`, the synthetic
 /// authorization refusal `message`.
@@ -283,8 +280,11 @@ fn gated_calls() -> Vec<Gated> {
             operation: "ListResourceSets",
             body: json!({ "MaxResults": 5 }),
         },
-        // The policy operations: a create (no `PolicyId`), an update of an id
-        // that names nothing, the two id-keyed ones, and the unbounded list.
+        // The organisation-scoped policy operations: a create (no `PolicyId`),
+        // an update of an id that names nothing, and the unbounded list. The
+        // id-keyed `GetPolicy` and `DeletePolicy` are NOT here: they are decided
+        // by the policy-id lookup alone (see the `policy_identifier_lookup`
+        // suite).
         Gated {
             operation: "PutPolicy",
             body: json!({
@@ -311,14 +311,6 @@ fn gated_calls() -> Vec<Gated> {
                     "RemediationEnabled": false,
                 },
             }),
-        },
-        Gated {
-            operation: "GetPolicy",
-            body: json!({ "PolicyId": UNKNOWN_POLICY_ID }),
-        },
-        Gated {
-            operation: "DeletePolicy",
-            body: json!({ "PolicyId": OTHER_UNKNOWN_POLICY_ID, "DeleteAllPolicyResources": true }),
         },
         Gated {
             operation: "ListPolicies",

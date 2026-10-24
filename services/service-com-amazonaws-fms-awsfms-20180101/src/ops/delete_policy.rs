@@ -7,10 +7,14 @@
 //! longer reports it. Deleting an id no stored policy carries is
 //! `ResourceNotFoundException`.
 //!
-//! Policy management is organisation-scoped, so with no Firewall Manager
-//! administrator association in the account/Region the call is refused by
-//! [`crate::state::require_administrator`] BEFORE the identifier is looked up
-//! and before anything is removed.
+//! The answer is decided by the policy store alone: `PolicyId` is an opaque
+//! lookup key, so a value that satisfies the member's length/pattern constraint
+//! and names a stored policy is removed and one that names none is the modelled
+//! not-found — whether or not the account/Region has a Firewall Manager
+//! administrator association. This operation does NOT take
+//! [`crate::state::require_administrator`]: the only refusals it can answer are
+//! the ones its model declares, and an authorization code is declared for no
+//! operation of this service.
 //!
 //! `DeleteAllPolicyResources` asks the real service to clean up the protections
 //! and managed resources the policy created in member accounts. This emulator
@@ -182,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeletePolicyErrorModeled::InternalErrorException(
@@ -194,11 +198,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        // The authorization gate, BEFORE the identifier is looked up and before
-        // anything is removed, so a refused call deletes nothing and leaks
-        // nothing about what the organisation holds.
-        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
-
+        // `PolicyId` is an opaque lookup key: the store decides the answer, and
+        // an id no stored policy carries is the modelled not-found, so nothing
+        // is removed.
         let Some(removed) = store.policies.remove(&input.policy_id) else {
             return Err(DeletePolicyErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(),

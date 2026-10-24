@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the supplied tags onto the budget or budget action the `ResourceARN` names.
+//! The ARN is the only thing that identifies the resource here, so it is resolved
+//! through [`crate::state::parse_resource_arn`]: the account and the budget name (and,
+//! for an action, the action id below it) come out of the ARN and address the store the
+//! create operations already key by. A value that is not an ARN of a resource this
+//! service holds is an `InvalidParameterException`; a well-formed ARN naming a budget or
+//! action nobody created is a `NotFoundException`.
+//!
+//! A resource holds at most one tag per key, so a key it already carries takes the
+//! supplied value in place and a key it does not carry is added
+//! ([`crate::state::apply_tags`]); `ListTagsForResource` reads the result back.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +151,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalErrorException(InternalErrorException {
+                message: Some(
+                    "budgets is mounted on an engine that holds no state for it".to_string(),
+                ),
+            })
+        })?;
+
+        // Which resource the ARN names. A string the model accepts as an
+        // `AmazonResourceName` but that is not an ARN of a resource this service holds
+        // is an input value this operation cannot act on, which is what
+        // `InvalidParameterException` ("Typically, the cause is an invalid input value")
+        // names, not a missing resource.
+        let target = crate::state::parse_resource_arn(&input.resource_arn).map_err(|message| {
+            TagResourceErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+        })?;
+
+        // One key cannot be given two values in one call, since a resource holds at most
+        // one tag per key. Checked before the resource is looked up, so a request that is
+        // malformed in itself is refused the same way whichever resource it names.
+        if let Some(message) = crate::state::duplicate_tag_key_violation(&input.resource_tags) {
+            return Err(TagResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let held = crate::state::resource_tags_mut(&mut store, &target).ok_or_else(|| {
+            TagResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(match &target {
+                    crate::state::TaggedResource::Budget { .. } => {
+                        "Unable to tag resource: the budget the ResourceARN names doesn't exist."
+                            .to_string()
+                    }
+                    crate::state::TaggedResource::Action { .. } => {
+                        "Unable to tag resource: the budget action the ResourceARN names doesn't \
+                         exist."
+                            .to_string()
+                    }
+                }),
+            })
+        })?;
+
+        // The tag set a resource can hold is bounded by `ResourceTagList`'s own
+        // `@length` maximum, which this write must leave the resource inside. Counted
+        // before anything is written, so a refused call tags nothing.
+        if crate::state::tag_count_after(held, &input.resource_tags)
+            > crate::state::MAX_TAGS_PER_RESOURCE
+        {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "Unable to tag resource: a resource can hold at most {} tags.",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Each tag consists of a key and a value, and each key must be unique for the
+        // resource": a key the resource already carries is re-valued in place, and a key
+        // it does not carry is added.
+        crate::state::apply_tags(held, input.resource_tags);
+        Ok(TagResourceOutput {})
     }
 }

@@ -359,6 +359,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             associated_resources,
             creation_time_millis: now,
             last_modified_time_millis: now,
+            // The item's FIRST generation — the version a later
+            // `ListCustomLineItemVersions` reports as in effect from this create on —
+            // begins here, and nothing has superseded it yet.
+            version_start_time_millis: now,
+            superseded_versions: Vec::new(),
         };
         state.custom_line_items.insert(arn.clone(), record);
         state.record_idempotent_arn(Self::NAME, input.client_token.as_deref(), &arn);

@@ -41,7 +41,10 @@ fn job_body(inputs: &[&str]) -> Value {
             "inputs": inputs,
             "outputGroups": [{
                 "name": "File Group",
-                "outputs": [{ "nameModifier": "_out" }],
+                "outputs": [{
+                    "nameModifier": "_out",
+                    "containerSettings": { "container": "MP4" }
+                }],
                 "outputGroupSettings": {
                     "type": "FILE_GROUP_SETTINGS",
                     "fileGroupSettings": { "destination": "s3://a-bucket/out/" }

@@ -3124,24 +3124,36 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             // A stored model property without an id would make an unaddressable
             // asset property, so it is skipped rather than materialised with an
             // empty id — the same filter `CreateAsset` applies.
-            let properties: Vec<AssetProperty> = definitions
-                .iter()
-                .filter_map(|definition| {
-                    let id = definition.id.clone().filter(|id| !id.is_empty())?;
-                    let held = carried.iter().find(|property| property.id == id);
-                    Some(AssetProperty {
-                        id,
-                        external_id: definition.external_id.clone(),
-                        name: definition.name.clone(),
-                        alias: held.and_then(|property| property.alias.clone()),
-                        notification: held.and_then(|property| property.notification.clone()),
-                        data_type: definition.data_type.clone(),
-                        data_type_spec: definition.data_type_spec.clone(),
-                        unit: definition.unit.clone(),
-                        path: None,
-                    })
-                })
-                .collect();
+            //
+            // The same pass collects what a property this asset did not carry
+            // STARTS with: it is materialised HERE for the first time, so it takes
+            // the sample its definition declares exactly as a property materialised
+            // by a create does (see [`initial_property_sample`]). A property the
+            // asset already carried keeps the series written to it.
+            let mut properties: Vec<AssetProperty> = Vec::with_capacity(definitions.len());
+            let mut seeded: Vec<(String, AssetPropertyValue)> = Vec::new();
+            for definition in &definitions {
+                let Some(id) = definition.id.clone().filter(|id| !id.is_empty()) else {
+                    continue;
+                };
+                let held = carried.iter().find(|property| property.id == id);
+                if held.is_none() {
+                    if let Some(sample) = initial_property_sample(definition, now) {
+                        seeded.push((id.clone(), sample));
+                    }
+                }
+                properties.push(AssetProperty {
+                    id,
+                    external_id: definition.external_id.clone(),
+                    name: definition.name.clone(),
+                    alias: held.and_then(|property| property.alias.clone()),
+                    notification: held.and_then(|property| property.notification.clone()),
+                    data_type: definition.data_type.clone(),
+                    data_type_spec: definition.data_type_spec.clone(),
+                    unit: definition.unit.clone(),
+                    path: None,
+                });
+            }
             let hierarchies: Vec<AssetHierarchy> = hierarchy_definitions
                 .iter()
                 .map(|hierarchy| AssetHierarchy {
@@ -3198,6 +3210,9 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                     .retain(|(asset, hierarchy, _), _| {
                         asset != &asset_id || hierarchy != &hierarchy_id
                     });
+            }
+            for (property_id, value) in seeded {
+                self.record_property_value(&asset_id, &property_id, value);
             }
         }
     }
@@ -3686,6 +3701,84 @@ pub fn timestamp_key(timestamp: &TimeInNanos) -> (i64, i32) {
         timestamp.time_in_seconds,
         timestamp.offset_in_nanos.unwrap_or(0),
     )
+}
+
+/// A wall-clock instant as the modelled `TimeInNanos`: whole seconds since the
+/// Unix epoch, plus the nanosecond offset inside that second.
+///
+/// An instant before the epoch reports second 0 — no stored instant this service
+/// mints is one, since every one of them comes from the wall clock.
+pub fn time_in_nanos(at: SystemTime) -> TimeInNanos {
+    let since_epoch = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    TimeInNanos {
+        time_in_seconds: i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
+        offset_in_nanos: i32::try_from(since_epoch.subsec_nanos()).ok(),
+    }
+}
+
+/// The initial sample an asset property materialised from `definition` carries,
+/// or `None` when the definition declares none.
+///
+/// An `attribute` definition's `defaultValue` IS that property's value on every
+/// asset made from the model — "All assets that you create from the asset model
+/// contain this attribute value. You can update an attribute's value after you
+/// create an asset" (`smithy_query(query="doc", shape="Attribute",
+/// member="defaultValue")`) — so the property's series starts with that value at
+/// the instant the property was materialised, with the quality an ordinary
+/// reading carries ([`DEFAULT_QUALITY`]). A later write at a newer timestamp
+/// takes over as the property's current value, which is what "you can update an
+/// attribute's value" means.
+///
+/// `None` for every other property type (a measurement, transform or metric
+/// declares no default), for an attribute that declares no `defaultValue`, and
+/// for a default that does not read as the property's `PropertyDataType`: the
+/// declared text is then no value of that type, and nothing is invented for it.
+pub fn initial_property_sample(
+    definition: &AssetModelProperty,
+    at: SystemTime,
+) -> Option<AssetPropertyValue> {
+    let default = definition.r#type.attribute.as_ref()?.default_value.as_ref()?;
+    Some(AssetPropertyValue {
+        value: typed_variant(&definition.data_type, default)?,
+        timestamp: time_in_nanos(at),
+        quality: Some(DEFAULT_QUALITY.to_string()),
+    })
+}
+
+/// `text` read as the one `Variant` member the `PropertyDataType` `data_type`
+/// names, or `None` when it is no value of that type.
+///
+/// The pairing of data type to `Variant` member is the model's: the
+/// `PropertyDataType` values are STRING | INTEGER | DOUBLE | BOOLEAN | STRUCT |
+/// VIDEO | ANNOTATION | JSON (`smithy_query(query="shape",
+/// shape="PropertyDataType,Variant")`), of which only the first four have a
+/// `Variant` member to carry a scalar reading, so a default declared on any
+/// other type reads as no value at all.
+fn typed_variant(data_type: &str, text: &str) -> Option<Variant> {
+    let variant = match data_type {
+        "STRING" => Variant {
+            string_value: Some(text.to_string()),
+            ..Variant::default()
+        },
+        "INTEGER" => Variant {
+            integer_value: Some(text.parse().ok()?),
+            ..Variant::default()
+        },
+        // A non-finite reading (`inf`, `NaN`) parses as an `f64` but is no number
+        // the JSON wire can carry, so it is no value of this type either.
+        "DOUBLE" => Variant {
+            double_value: Some(text.parse().ok().filter(|value: &f64| value.is_finite())?),
+            ..Variant::default()
+        },
+        "BOOLEAN" => Variant {
+            boolean_value: Some(text.parse().ok()?),
+            ..Variant::default()
+        },
+        _ => return None,
+    };
+    Some(variant)
 }
 
 /// The opaque pagination token that resumes at the [`timestamp_key`] `resume`:

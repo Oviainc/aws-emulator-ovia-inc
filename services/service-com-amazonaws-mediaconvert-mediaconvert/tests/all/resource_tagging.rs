@@ -281,7 +281,10 @@ impl Emulator {
                         "inputs": [{ "fileInput": "s3://example-bucket/in/a.mp4" }],
                         "outputGroups": [{
                             "name": "File Group",
-                            "outputs": [{ "nameModifier": "_a" }],
+                            "outputs": [{
+                                "nameModifier": "_a",
+                                "containerSettings": { "container": "MP4" }
+                            }],
                             "outputGroupSettings": {
                                 "type": "FILE_GROUP_SETTINGS",
                                 "fileGroupSettings": {
