@@ -146,6 +146,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The HTTP status this service answers an event data store not-found refusal with is
+// stated once, beside the refusal text in `crate::state`, so every handler answers the
+// error with one status.
+use crate::state::EVENT_DATA_STORE_NOT_FOUND_STATUS;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -267,16 +272,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
     }
 }
-
-/// The HTTP status this service answers an event data store not-found refusal
-/// with.
-///
-/// The model annotates `EventDataStoreNotFoundException` `@httpError(404)` and
-/// CloudTrail answers 400 for it on the wire, which is what the recorded response
-/// for `GetEventDataStore` shows; `get_event_data_store` states the same status
-/// for the same reason. Only the status is stated here — the error code and the
-/// body stay the model's.
-const EVENT_DATA_STORE_NOT_FOUND_STATUS: u16 = 400;
 
 /// Refuse a request that does not address exactly one resource.
 ///
