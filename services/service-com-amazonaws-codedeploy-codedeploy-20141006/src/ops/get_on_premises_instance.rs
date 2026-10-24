@@ -138,7 +138,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`smithy_query(query="shape",shape="InstanceName")`), so the name's form
         // is checked here, by the same shared rule the registering operation uses.
         let name = input.instance_name;
-        match crate::state::check_instance_name(&name) {
+        match crate::state::check_on_premises_instance_name(&name) {
             Ok(()) => {}
             Err(crate::state::NameRefusal::Missing) => {
                 return Err(GetOnPremisesInstanceErrorModeled::InstanceNameRequiredException(
@@ -148,13 +148,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into())
             }
-            Err(crate::state::NameRefusal::Malformed) => {
+            Err(refusal) => {
                 return Err(GetOnPremisesInstanceErrorModeled::InvalidInstanceNameException(
                     InvalidInstanceNameException {
-                        message: Some(format!(
-                            "The on-premises instance name {name} was specified in an invalid \
-                             format"
-                        )),
+                        message: Some(
+                            crate::state::invalid_instance_name_message(refusal).to_string(),
+                        ),
                     },
                 )
                 .into())
@@ -185,9 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .ok_or_else(|| {
             GetOnPremisesInstanceErrorModeled::InstanceNotRegisteredException(
                 InstanceNotRegisteredException {
-                    message: Some(format!(
-                        "No on-premises instance found for name: {name}"
-                    )),
+                    message: Some(crate::state::host_does_not_exist(&name)),
                 },
             )
         })?;

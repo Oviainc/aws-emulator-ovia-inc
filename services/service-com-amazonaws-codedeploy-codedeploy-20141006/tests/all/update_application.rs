@@ -496,7 +496,9 @@ async fn a_refused_rename_names_the_modelled_code_and_changes_nothing() {
             "a new name another application already holds",
             json!({"applicationName": "occupied-a", "newApplicationName": "occupied-b"}),
             "ApplicationAlreadyExistsException",
-            Some("occupied-b already exists."),
+            // The RENAME names the member that conflicts: the name the request
+            // asked to become, not the one it asked to create.
+            Some("The application name: occupied-b you want to update to already exist"),
         ),
     ];
 

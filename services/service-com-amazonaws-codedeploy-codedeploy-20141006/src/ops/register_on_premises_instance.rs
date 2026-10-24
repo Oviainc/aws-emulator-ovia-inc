@@ -178,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // validator passes every string through and the name's form is decided
         // here, against the shared rule in `crate::state`.
         let name = input.instance_name;
-        match crate::state::check_instance_name(&name) {
+        match crate::state::check_on_premises_instance_name(&name) {
             Ok(()) => {}
             Err(crate::state::NameRefusal::Missing) => {
                 return Err(RegisterOnPremisesInstanceErrorModeled::InstanceNameRequiredException(
@@ -188,13 +188,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into())
             }
-            Err(crate::state::NameRefusal::Malformed) => {
+            Err(refusal) => {
                 return Err(RegisterOnPremisesInstanceErrorModeled::InvalidInstanceNameException(
                     InvalidInstanceNameException {
-                        message: Some(format!(
-                            "The on-premises instance name {name} was specified in an invalid \
-                             format"
-                        )),
+                        message: Some(
+                            crate::state::invalid_instance_name_message(refusal).to_string(),
+                        ),
                     },
                 )
                 .into())
@@ -278,9 +277,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     RegisterOnPremisesInstanceErrorModeled::InstanceNameAlreadyRegisteredException(
                         InstanceNameAlreadyRegisteredException {
-                            message: Some(format!(
-                                "The on-premises instance {name} is already registered"
-                            )),
+                            message: Some(
+                                crate::state::INSTANCE_NAME_ALREADY_REGISTERED.to_string(),
+                            ),
                         },
                     )
                     .into(),
@@ -332,9 +331,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // refuses only when every record it holds is still registered. That
             // refusal is not something CodeDeploy models, so it is stated as a
             // refusal rather than dressed up as one of the modelled errors.
+            //
+            // The registration's own id is minted here and kept in the ARN, so
+            // the ARN identifies THIS registration of the name rather than the
+            // name alone: registering a name again after a deregistration mints a
+            // new one, and every reader answers the ARN the registry minted.
+            let registration_id =
+                crate::state::mint_uuid_from(&mut state.next_id, "on-premises-registration");
             let recorded = state.register_on_premises_instance(crate::state::OnPremisesInstance {
                 instance_name: name.clone(),
-                instance_arn: crate::state::instance_arn(&region, &name),
+                instance_arn: crate::state::instance_arn(&region, &name, &registration_id),
                 iam_user_arn: identity.user_arn(),
                 iam_session_arn: identity.session_arn(),
                 register_time_ms: crate::state::now_ms(),

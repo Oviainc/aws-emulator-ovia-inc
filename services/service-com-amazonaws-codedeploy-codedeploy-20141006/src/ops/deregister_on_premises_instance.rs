@@ -154,7 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // form is decided here, by the same shared rule the registering and
         // reporting operations use.
         let name = input.instance_name;
-        match crate::state::check_instance_name(&name) {
+        match crate::state::check_on_premises_instance_name(&name) {
             Ok(()) => {}
             Err(crate::state::NameRefusal::Missing) => {
                 return Err(
@@ -166,14 +166,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 )
             }
-            Err(crate::state::NameRefusal::Malformed) => {
+            // A name outside the form an on-premises host may hold — including
+            // the reserved EC2-instance-id form — names a host that can never
+            // exist, so it is refused here rather than deregistered as the
+            // no-op below: a caller that passed an instance id by mistake has to
+            // learn that, not that the deregistration succeeded.
+            Err(refusal) => {
                 return Err(
                     DeregisterOnPremisesInstanceErrorModeled::InvalidInstanceNameException(
                         InvalidInstanceNameException {
-                            message: Some(format!(
-                                "The on-premises instance name {name} was specified in an invalid \
-                                 format"
-                            )),
+                            message: Some(
+                                crate::state::invalid_instance_name_message(refusal).to_string(),
+                            ),
                         },
                     )
                     .into(),

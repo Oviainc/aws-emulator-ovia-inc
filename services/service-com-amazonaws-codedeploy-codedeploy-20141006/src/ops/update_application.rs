@@ -196,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if new_name != name && state.applications.contains_key(&new_name) {
                 return Err(UpdateApplicationErrorModeled::ApplicationAlreadyExistsException(
                     ApplicationAlreadyExistsException {
-                        message: Some(crate::state::application_already_exists(&new_name)),
+                        message: Some(crate::state::application_rename_target_exists(&new_name)),
                     },
                 ));
             }
