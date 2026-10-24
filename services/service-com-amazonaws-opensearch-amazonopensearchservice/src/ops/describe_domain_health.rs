@@ -27,9 +27,9 @@
 //!
 //! Nothing a caller sends sizes this answer: the only count that could, the stored
 //! `ZoneAwarenessConfig$AvailabilityZoneCount`, is reported — and turned into zone
-//! information — only within the values that member publishes ([`ZONE_COUNT_RANGE`]),
-//! so the response holds at most three zones however large a `ClusterConfig` the
-//! domain was created with.
+//! information — only within the values that member publishes
+//! ([`crate::state::ZONE_COUNT_RANGE`]), so the response holds at most three zones
+//! however large a `ClusterConfig` the domain was created with.
 //!
 //! ## Shape of an operation
 //!
@@ -133,7 +133,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{Domain, PROCESSING_STATUS_CREATING};
+use crate::state::{
+    configured_zone_count, nodes_per_zone, standby_zone_count, zone_name, Domain,
+};
 
 /// The value every count member of this response (`NumberOfAZs`, `NumberOfNodes`,
 /// `NumberOfShards`) documents for information the service cannot fetch, and the
@@ -165,37 +167,6 @@ const ZONE_STATUS_ACTIVE: &str = "Active";
 /// domain keeps out of the rotation.
 const ZONE_STATUS_STANDBY: &str = "StandBy";
 
-/// The number of Availability Zones a domain sits in when `ZoneAwarenessEnabled` is
-/// off: one. `ClusterConfig$ZoneAwarenessEnabled` "Indicates whether multiple
-/// Availability Zones are enabled", so a domain without it occupies a single zone.
-const SINGLE_ZONE: i32 = 1;
-
-/// The numbers of Availability Zones a zone-aware domain can be configured in, from
-/// `ZoneAwarenessConfig$AvailabilityZoneCount`: "Valid values are `2` and `3`."
-///
-/// A stored count outside this range names no number of zones the service supports,
-/// so it is reported as [`NOT_AVAILABLE`] and no zone information is built for it.
-/// That is also what keeps this response BOUNDED: the count is a request field
-/// (`CreateDomain` and `UpdateDomainConfig` persist the caller's `ClusterConfig`
-/// verbatim, and `IntegerClass` carries no `@range`), and nothing a caller sends may
-/// size an allocation or a response here.
-const ZONE_COUNT_RANGE: ::std::ops::RangeInclusive<i32> = 2..=3;
-
-/// How many of a multi-AZ domain's zones are held in standby when
-/// `MultiAZWithStandbyEnabled` is on: one. From
-/// `ClusterConfig$MultiAZWithStandbyEnabled` — "whether a multi-AZ domain is turned
-/// on with a standby AZ" — the standby is a single zone.
-const STANDBY_ZONES: i32 = 1;
-
-/// The letters an Availability Zone name ends in, appended to the Region (`us-east-1`
-/// + `a` = `us-east-1a`).
-///
-/// WHICH of a Region's zones an account's domain lands in is an account-specific
-/// mapping AWS does not publish, so the emulator names a domain's zones in order from
-/// the Region's first zone letter. `AvailabilityZone` is capped at 15 characters,
-/// which `<region><letter>` stays inside for every published Region name.
-const ZONE_LETTERS: &[u8] = b"abcdefgh";
-
 /// A configured count as the modelled `NumberOfAZs`/`NumberOfNodes`/`NumberOfShards`
 /// string.
 ///
@@ -209,67 +180,6 @@ fn count(value: Option<i32>) -> String {
         .filter(|value| *value >= 0)
         .map(|value| value.to_string())
         .unwrap_or_else(|| NOT_AVAILABLE.to_string())
-}
-
-/// Whether the domain's cluster is up: its nodes are provisioned, so it has an
-/// elected master and a readable cluster.
-///
-/// A domain is `Creating` from the call that mints it until the provisioning the
-/// clock owes it falls due, and no node exists before then. A later configuration
-/// change leaves the running cluster in place, so a `Modifying` domain is up.
-fn cluster_is_up(domain: &Domain) -> bool {
-    domain.created && domain.processing_status != PROCESSING_STATUS_CREATING
-}
-
-/// The number of Availability Zones the domain's configuration places it in: the
-/// zone-awareness count when multiple zones are turned on
-/// (`ZoneAwarenessConfig$AvailabilityZoneCount` is "the number of zones that you want
-/// the domain to use"), and [`SINGLE_ZONE`] when they are not.
-///
-/// `None` when zone awareness is on and the record carries no count for it, or one
-/// outside [`ZONE_COUNT_RANGE`] — the configuration then names no supported number of
-/// zones, so there is none to report and nothing sized by it to build.
-fn configured_zone_count(cluster: &ClusterConfig) -> Option<i32> {
-    if cluster.zone_awareness_enabled == Some(true) {
-        cluster
-            .zone_awareness_config
-            .as_ref()
-            .and_then(|config| config.availability_zone_count)
-            .filter(|zones| ZONE_COUNT_RANGE.contains(zones))
-    } else {
-        Some(SINGLE_ZONE)
-    }
-}
-
-/// How the domain's data nodes sit across its `zones` Availability Zones: zone
-/// awareness spreads them evenly, so each zone holds `nodes / zones` of them and the
-/// first `nodes % zones` zones hold one more.
-///
-/// `zones` is the already-bounded count [`configured_zone_count`] answers — at most
-/// the top of [`ZONE_COUNT_RANGE`] — so the vector this builds is bounded too, and is
-/// capped again here rather than trusting its caller.
-///
-/// `None` for a node count the record does not carry: the nodes per zone are then
-/// unknown too.
-fn nodes_per_zone(nodes: Option<i32>, zones: i32) -> Vec<Option<i32>> {
-    let zones = zones.clamp(0, *ZONE_COUNT_RANGE.end());
-    let zone_count = usize::try_from(zones).unwrap_or(0);
-    let Some(nodes) = nodes
-        .filter(|nodes| *nodes >= 0)
-        .filter(|_| zone_count > 0)
-    else {
-        return vec![None; zone_count];
-    };
-    (0..zones)
-        .map(|zone| Some(nodes / zones + i32::from(zone < nodes % zones)))
-        .collect()
-}
-
-/// The name of the `index`-th Availability Zone of `region`; `None` once the zone
-/// index runs past [`ZONE_LETTERS`], since the zone then has no name to report.
-fn zone_name(region: &str, index: usize) -> Option<String> {
-    let letter = char::from(*ZONE_LETTERS.get(index)?);
-    Some(format!("{region}{letter}"))
 }
 
 /// The shard census of a domain: the total number of primary and replica shards, and
@@ -286,15 +196,11 @@ fn shard_census(_domain: &Domain) -> (i32, i32) {
 /// The health of the stored domain, as `DescribeDomainHealth` reports it.
 fn domain_health(domain: &Domain) -> DescribeDomainHealthOutput {
     let cluster = &domain.cluster_config;
-    let up = cluster_is_up(domain);
+    let up = domain.cluster_is_up();
 
     // Configured: read straight off the record, in whatever state the domain is.
     let configured_zones = configured_zone_count(cluster);
-    let standby_zones = if cluster.multi_az_with_standby_enabled == Some(true) {
-        STANDBY_ZONES
-    } else {
-        0
-    };
+    let standby_zones = standby_zone_count(cluster);
     let data_nodes = cluster.instance_count;
     let dedicated_master = cluster.dedicated_master_enabled.unwrap_or(false);
     // With dedicated master nodes on, exactly those nodes can be elected master;
