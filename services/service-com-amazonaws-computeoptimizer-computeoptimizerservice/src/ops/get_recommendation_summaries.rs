@@ -15,9 +15,13 @@
 //!
 //! `idleSummaries` and `idleSavingsOpportunity` describe a resource the analysis found
 //! IDLE, which is a record of its own (`crate::state::IdleRecommendationStore`, what
-//! `GetIdleRecommendations` reports) that no operation of this API writes, so a summary
-//! reports neither while that record is empty, and `aggregatedSavingsOpportunity`
-//! aggregates the rightsizing opportunity alone.
+//! `GetIdleRecommendations` reports). Summarising that record is NOT IMPLEMENTED here yet:
+//! this operation aggregates the findings catalog, so the summaries it builds carry neither
+//! member and `aggregatedSavingsOpportunity` aggregates the rightsizing opportunity alone,
+//! even though the service does hold idle resources. Reporting them is this operation's own
+//! work — it has to group the idle record by resource type and account the way it groups the
+//! catalog — and the two members stay absent until then rather than carrying a figure nothing
+//! computed.
 //!
 //! ## Shape of an operation
 //!
@@ -311,8 +315,8 @@ fn summarise(
     let inferred_workload_savings = inferred_workload_savings(resources);
     RecommendationSummary {
         summaries: Some(finding_summaries(resource_type, resources)),
-        // An idle resource is a record of its own, which nothing has written: see this
-        // module's header.
+        // Summarising the idle record is not implemented here yet: see this module's
+        // header. The members stay absent rather than carrying a figure nothing computed.
         idle_summaries: None,
         recommendation_resource_type: Some(resource_type.to_string()),
         account_id: Some(account_id.to_string()),
