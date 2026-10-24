@@ -487,6 +487,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             table.deletion_protection_enabled = protection;
         }
 
+
         Ok(UpdateTableOutput {
             table_description: Some(table.describe(now)),
         })
