@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetScene
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetScene`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one scene `CreateScene` persisted under its workspace in
+//! [`crate::state`] — the reader that closes the create's round trip.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetScene::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read: it computes its whole response from the stored record and
+//! writes nothing. A scene carries no lifecycle state anywhere in its API, so
+//! there is no transition for this read to materialise either.
+//!
+//! The refusals this handler owns: the workspace does not exist, and the
+//! workspace does not hold the scene — both the modelled
+//! `ResourceNotFoundException` (HTTP 404). Authorization is not emulated, so
+//! the modelled `AccessDeniedException` is never returned.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +166,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetScene` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSceneErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetScene"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one reads tenant state.
+        ::tracing::info!(
+            operation = "GetScene",
+            workspace_id = %input.workspace_id,
+            scene_id = %input.scene_id,
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetSceneErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        // A read, so the store is borrowed immutably: nothing a later caller
+        // sees changes because this scene was read.
+        let state = state.lock();
+
+        let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
+            return Err(GetSceneErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::workspace_not_found_message(
+                        &input.workspace_id,
+                    )),
+                },
+            )
+            .into());
+        };
+        let Some(scene) = workspace.scenes.get(&input.scene_id) else {
+            return Err(GetSceneErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::scene_not_found_message(
+                        &input.workspace_id,
+                        &input.scene_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetSceneOutput {
+            workspace_id: scene.workspace_id.clone(),
+            scene_id: scene.scene_id.clone(),
+            arn: scene.arn.clone(),
+            content_location: scene.content_location.clone(),
+            description: scene.description.clone(),
+            // Collections are materialised, not omitted when empty: the same
+            // choice `GetComponentType` makes, so a client that walks
+            // `capabilities` or `sceneMetadata` needs no null guard.
+            capabilities: Some(scene.capabilities.clone()),
+            scene_metadata: Some(
+                scene
+                    .scene_metadata
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+            ),
+            // "The generated scene metadata": metadata the SERVICE derives from
+            // the scene's content, which this emulator does not parse — it never
+            // reaches the caller's S3 object — so there is none, and an empty map
+            // says exactly that.
+            generated_scene_metadata: Some(::std::collections::HashMap::new()),
+            // The only code the modelled `SceneErrorCode` enum admits is
+            // `MATTERPORT_ERROR`, which belongs to a Matterport import this
+            // emulator never performs; a scene it stores has therefore failed at
+            // nothing, and inventing an error structure for it would report a
+            // failure that did not happen.
+            error: None,
+            creation_date_time: crate::state::timestamp(scene.creation_date_time),
+            update_date_time: crate::state::timestamp(scene.update_date_time),
+        })
     }
 }

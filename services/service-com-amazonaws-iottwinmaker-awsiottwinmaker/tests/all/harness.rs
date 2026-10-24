@@ -242,6 +242,28 @@ impl Emulator {
         .await
     }
 
+    /// `CreateScene`: POST /workspaces/{workspaceId}/scenes, with `sceneId` and
+    /// every other member in the body (only `workspaceId` is an `@httpLabel`).
+    pub(crate) async fn create_scene(&self, workspace_id: &str, body: Value) -> Resp {
+        self.call(
+            "POST",
+            &format!("/workspaces/{workspace_id}/scenes"),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `GetScene`: GET on the scene's own path, with both ids as `@httpLabel`s
+    /// and no body.
+    pub(crate) async fn get_scene(&self, workspace_id: &str, scene_id: &str) -> Resp {
+        self.call(
+            "GET",
+            &format!("/workspaces/{workspace_id}/scenes/{scene_id}"),
+            None,
+        )
+        .await
+    }
+
     /// `TagResource`: POST /tags with the ARN and the tag map in the body.
     pub(crate) async fn tag_resource(&self, resource_arn: &str, tags: Value) -> Resp {
         self.call(
@@ -285,6 +307,10 @@ pub(crate) fn component_type_arn(workspace_id: &str, component_type_id: &str) ->
         "arn:aws:iottwinmaker:{REGION}:{ACCOUNT}:workspace/{workspace_id}/componentType/\
          {component_type_id}"
     )
+}
+
+pub(crate) fn scene_arn(workspace_id: &str, scene_id: &str) -> String {
+    format!("arn:aws:iottwinmaker:{REGION}:{ACCOUNT}:workspace/{workspace_id}/scene/{scene_id}")
 }
 
 /// Percent-encode a value for use as a query-parameter value, the way an SDK

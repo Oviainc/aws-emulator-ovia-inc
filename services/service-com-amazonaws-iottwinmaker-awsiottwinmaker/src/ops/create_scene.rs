@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateScene
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateScene`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a scene in a workspace and persists it in [`crate::state`] under
+//! that workspace, so `GetScene` reads back what was created.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateScene::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The caller owns the `sceneId` (it is required), so this create mints nothing
+//! but the scene's ARN and its creation instant. A scene has no lifecycle
+//! `state` anywhere in its API, so it is ready as soon as it is created and
+//! there is no transition for the clock to owe.
+//!
+//! The refusals this handler owns:
+//!
+//! * the workspace does not exist — a `ValidationException`, because the model
+//!   declares no `ResourceNotFoundException` for this operation (the same
+//!   choice `CreateComponentType` makes);
+//! * `sceneId` is already taken in the workspace — a `ConflictException`;
+//! * the workspace already holds [`crate::state::MAX_SCENES_PER_WORKSPACE`]
+//!   scenes — a `ServiceQuotaExceededException`.
+//!
+//! Two deliberate gaps. `contentLocation` is stored WITHOUT checking that the
+//! S3 object it names exists: the content definition file lives in the
+//! caller's bucket, which this emulator does not reach, so refusing a path it
+//! cannot resolve would refuse legitimate scenes. Authorization is not
+//! emulated, so the modelled `AccessDeniedException` is never returned.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +171,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateScene` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSceneErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateScene"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one mutates tenant state.
+        ::tracing::info!(
+            operation = "CreateScene",
+            workspace_id = %input.workspace_id,
+            scene_id = %input.scene_id,
+            "serving a request"
+        );
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateSceneErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // A scene lives INSIDE a workspace (`/workspaces/{workspaceId}/scenes`),
+        // so a create naming a workspace this service does not hold is refused
+        // rather than allowed to orphan a record. This operation models no
+        // `ResourceNotFoundException`, so the refusal is the `ValidationException`
+        // it does model — the same choice `CreateComponentType` makes for the
+        // same missing parent.
+        let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
+            return Err(CreateSceneErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::workspace_not_found_message(
+                        &input.workspace_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The id is the caller's: `sceneId` is required, so there is nothing to
+        // mint and a taken id is a conflict.
+        if workspace.scenes.contains_key(&input.scene_id) {
+            return Err(CreateSceneErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "scene {} already exists in workspace {}",
+                    input.scene_id, input.workspace_id
+                )),
+            })
+            .into());
+        }
+
+        // The emulator's declared ceiling on the store, checked AFTER the
+        // identity conflict above so re-creating a taken id in a full workspace
+        // is still the ConflictException the id deserves.
+        if workspace.scenes.len() >= crate::state::MAX_SCENES_PER_WORKSPACE {
+            return Err(CreateSceneErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "workspace {} has reached the limit of {} scenes",
+                        input.workspace_id,
+                        crate::state::MAX_SCENES_PER_WORKSPACE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::scene_arn(&region, &input.workspace_id, &input.scene_id);
+        let now = ::std::time::SystemTime::now();
+        let scene = crate::state::Scene {
+            scene_id: input.scene_id.clone(),
+            arn: arn.clone(),
+            workspace_id: input.workspace_id.clone(),
+            content_location: input.content_location,
+            description: input.description,
+            capabilities: input.capabilities.unwrap_or_default(),
+            scene_metadata: input
+                .scene_metadata
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            creation_date_time: now,
+            // Nothing has updated the scene yet, so it was last updated when it
+            // was created: `GetScene` reports `updateDateTime` as required, and
+            // `UpdateScene` is what moves it on.
+            update_date_time: now,
+        };
+
+        // Store the record BEFORE indexing its ARN, so the index can never name
+        // a scene that was not stored: the workspace is re-borrowed mutably here
+        // (the lookup that validated the request held it immutably) and that
+        // re-borrow is the last fallible step.
+        let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
+            return Err(CreateSceneErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!("workspace {} vanished", input.workspace_id)),
+                },
+            )
+            .into());
+        };
+        workspace.scenes.insert(input.scene_id.clone(), scene);
+        state.arn_index.insert(
+            arn.clone(),
+            crate::state::ResourceRef::Scene {
+                workspace_id: input.workspace_id.clone(),
+                scene_id: input.scene_id.clone(),
+            },
+        );
+
+        Ok(CreateSceneOutput {
+            arn,
+            creation_date_time: crate::state::timestamp(now),
+        })
     }
 }

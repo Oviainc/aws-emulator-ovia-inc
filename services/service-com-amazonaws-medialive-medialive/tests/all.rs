@@ -32,6 +32,9 @@ mod cloud_watch_alarm_template_update;
 #[path = "all/cloud_watch_alarm_templates.rs"]
 mod cloud_watch_alarm_templates;
 
+#[path = "all/cluster_alerts.rs"]
+mod cluster_alerts;
+
 #[path = "all/deleted_resource_mutation.rs"]
 mod deleted_resource_mutation;
 

@@ -170,7 +170,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// No connector is stored under this ARN — HTTP 404 `ResourceNotFoundException`. A read
-/// after `DeleteConnector` lands here, because the delete removed the record.
+/// after `DeleteConnector` lands here once the teardown the delete scheduled has come due and
+/// the record is gone; until then the connector is reported with `Status` `DELETING`.
 fn not_found(connector_arn: &str) -> GetConnectorError {
     GetConnectorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: format!("Connector {connector_arn} could not be found"),

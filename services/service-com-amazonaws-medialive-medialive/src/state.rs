@@ -73,6 +73,13 @@
 //! [`event_bridge_rule_template_group_output`]) - no operation builds a response
 //! out of its own request.
 //!
+//! MediaLive Anywhere's CLUSTER lives here too: one [`ClusterRecord`] per
+//! created cluster, its own id counter and its own token map, carrying the
+//! alerts raised against that cluster. A cluster's `ChannelIds` is derived from
+//! the channels this store already holds, never recorded at create time, and so
+//! is its `State` — out of the `CREATING` -> `ACTIVE` transition the clock owes
+//! it.
+//!
 //! Tags are NOT a store of their own: every resource record above carries its
 //! own tag map, and the tag operations reach the map of the resource their
 //! `ResourceArn` names through
@@ -186,6 +193,22 @@ pub use event_bridge_rule_templates::{
 };
 
 pub(crate) use event_bridge_rule_templates::event_bridge_rule_template_output;
+
+/// The cluster slice: MediaLive Anywhere's `Cluster` record, its bounds, its
+/// refusals, the store's methods and its output projections, in one module of
+/// its own for the same reason as the multiplex slice above. The ALERTS raised
+/// against a cluster are part of that slice: they live on the cluster record
+/// that owns them. What stays in this file is the part the rest of the state
+/// needs: the store members on [`ComAmazonawsMedialiveMedialiveState`].
+pub mod clusters;
+
+pub use clusters::{
+    cluster_alert_output, cluster_alert_state, cluster_state, described_cluster_network_settings,
+    ClusterAlertRecord, ClusterRecord, ClusterRefusal, NewCluster, CLUSTER_ALERT_FILTERS,
+    CLUSTER_ALERT_FILTER_ALL, MAX_CLUSTERS, MAX_CLUSTER_ALERTS, MAX_CLUSTER_TOKENS,
+};
+
+pub(crate) use clusters::cluster_description_output;
 
 /// The `ChannelState` enum values this slice uses, spelled exactly as the model
 /// declares them (`smithy_query(query="shape", shape="ChannelState")`:
@@ -1206,6 +1229,15 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// its own name rather than by an id. PRIVATE for the same reason as
     /// [`Self::channel_tokens`].
     multiplex_program_tokens: IdempotencyTokens,
+    /// Every cluster that exists, keyed by its minted `Id`, in id order for the
+    /// same reason as [`Self::channels`]: a reader walks it in id order on every
+    /// call. The alerts raised against a cluster live on its own record.
+    pub clusters: BTreeMap<String, ClusterRecord>,
+    /// Mint counter behind the cluster slice's `mint_cluster_id`.
+    pub next_cluster_id: u64,
+    /// `CreateCluster`'s `RequestId` (`@idempotencyToken`) -> the cluster it
+    /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
+    cluster_tokens: IdempotencyTokens,
 }
 
 impl ComAmazonawsMedialiveMedialiveState {
@@ -1239,6 +1271,7 @@ impl ComAmazonawsMedialiveMedialiveState {
             signal_map.settle(now);
         }
         self.settle_multiplexes(now);
+        self.settle_clusters(now);
     }
 
     /// Whether the store is full, so `CreateChannel` must refuse rather than mint
@@ -2461,6 +2494,9 @@ impl ComAmazonawsMedialiveMedialiveState {
                 record.id.clone(),
             ));
         }
+        if let Some(record) = self.clusters.values().find(|record| record.arn == arn) {
+            return Some(TaggedResource::Cluster(record.id.clone()));
+        }
         None
     }
 
@@ -2485,6 +2521,7 @@ impl ComAmazonawsMedialiveMedialiveState {
                 .event_bridge_rule_template_groups
                 .get(&id)
                 .map(|record| &record.tags),
+            TaggedResource::Cluster(id) => self.clusters.get(&id).map(|record| &record.tags),
         }
     }
 
@@ -2542,6 +2579,10 @@ impl ComAmazonawsMedialiveMedialiveState {
                 .map(|record| &mut record.tags),
             TaggedResource::EventBridgeRuleTemplateGroup(id) => self
                 .event_bridge_rule_template_groups
+                .get_mut(&id)
+                .map(|record| &mut record.tags),
+            TaggedResource::Cluster(id) => self
+                .clusters
                 .get_mut(&id)
                 .map(|record| &mut record.tags),
         }
@@ -2649,6 +2690,7 @@ enum TaggedResource {
     Multiplex(String),
     AlarmTemplateGroup(String),
     EventBridgeRuleTemplateGroup(String),
+    Cluster(String),
 }
 
 /// One monitor deployment of one signal map, as `StartMonitorDeployment`

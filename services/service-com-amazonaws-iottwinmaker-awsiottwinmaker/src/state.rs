@@ -3,9 +3,9 @@
 //! Engine state for the com-amazonaws-iottwinmaker-awsiottwinmaker service.
 //!
 //! IoT TwinMaker's control plane is a two-level tree: a *workspace* owns the
-//! *entities* and *component types* (and, in a later slice, the scenes) created
-//! inside it. That containment is modelled literally here —
-//! `Workspace::entities` and `Workspace::component_types` — so neither can
+//! *entities*, *component types* and *scenes* created inside it. That
+//! containment is modelled literally here — `Workspace::entities`,
+//! `Workspace::component_types` and `Workspace::scenes` — so none of them can
 //! outlive its workspace and two operations cannot read two copies of one
 //! resource.
 //!
@@ -130,6 +130,8 @@ pub const MAX_WORKSPACES: usize = 50;
 pub const MAX_ENTITIES_PER_WORKSPACE: usize = 1000;
 /// See [`MAX_WORKSPACES`].
 pub const MAX_COMPONENT_TYPES_PER_WORKSPACE: usize = 1000;
+/// See [`MAX_WORKSPACES`].
+pub const MAX_SCENES_PER_WORKSPACE: usize = 1000;
 
 /// The `PricingMode` an account that has never changed its pricing plan is on,
 /// and the `UpdateReason` such a plan carries.
@@ -270,6 +272,11 @@ pub enum ResourceRef {
         workspace_id: String,
         component_type_id: String,
     },
+    /// A scene, by the workspace that owns it and its own id.
+    Scene {
+        workspace_id: String,
+        scene_id: String,
+    },
 }
 
 /// One stored workspace.
@@ -299,6 +306,12 @@ pub struct Workspace {
     /// cannot outlive the workspace that contains it, and two operations must
     /// not read two copies of one component type.
     pub component_types: BTreeMap<String, ComponentType>,
+    /// The scenes created in this workspace, keyed by `sceneId`. Owned by the
+    /// workspace for the same reason entities and component types are: a scene
+    /// is addressed as `/workspaces/{workspaceId}/scenes/{sceneId}`, so it
+    /// cannot outlive the workspace that contains it, and two operations must
+    /// not read two copies of one scene.
+    pub scenes: BTreeMap<String, Scene>,
 }
 
 impl Workspace {
@@ -426,6 +439,40 @@ impl Workspace {
         }
         ordered
     }
+}
+
+/// One stored scene.
+///
+/// A scene has no lifecycle `state` member anywhere in its API — `CreateScene`
+/// answers only the ARN and the creation instant, and `GetScene` reports no
+/// status — so a scene is READY as soon as it is created and there is no
+/// transition for the clock to owe. Its only reported failure channel is
+/// `GetScene`'s `error` (`SceneError`), whose single modelled code
+/// (`MATTERPORT_ERROR`) belongs to a Matterport import this emulator never
+/// performs, so a scene it stores carries none.
+#[derive(Debug, Clone)]
+pub struct Scene {
+    pub scene_id: String,
+    pub arn: String,
+    pub workspace_id: String,
+    /// The `s3://…` path of the scene's content definition file. Required on
+    /// both the create and the read, so it is stored, never derived.
+    pub content_location: String,
+    /// The scene's description, absent when the create named none:
+    /// `description` is optional on `CreateSceneRequest` AND on
+    /// `GetSceneResponse`, so unlike a workspace's it is carried as an option
+    /// rather than resolved to the empty string.
+    pub description: Option<String>,
+    /// The capabilities the scene renders itself with, in the order the create
+    /// gave them: `SceneCapabilities` is a LIST, so its order is part of the
+    /// value.
+    pub capabilities: Vec<String>,
+    /// The scene metadata the caller supplied (`sceneMetadata`), which
+    /// `GetScene` reports back as the response metadata.
+    pub scene_metadata: BTreeMap<String, String>,
+    pub tags: BTreeMap<String, String>,
+    pub creation_date_time: SystemTime,
+    pub update_date_time: SystemTime,
 }
 
 /// One stored entity.
@@ -790,6 +837,10 @@ impl ComAmazonawsIottwinmakerAwsiottwinmakerState {
                     .get(component_type_id)?
                     .tags,
             ),
+            ResourceRef::Scene {
+                workspace_id,
+                scene_id,
+            } => Some(&self.workspaces.get(workspace_id)?.scenes.get(scene_id)?.tags),
         }
     }
 
@@ -828,6 +879,17 @@ impl ComAmazonawsIottwinmakerAwsiottwinmakerState {
                     .get_mut(&component_type_id)?
                     .tags,
             ),
+            ResourceRef::Scene {
+                workspace_id,
+                scene_id,
+            } => Some(
+                &mut self
+                    .workspaces
+                    .get_mut(&workspace_id)?
+                    .scenes
+                    .get_mut(&scene_id)?
+                    .tags,
+            ),
         }
     }
 }
@@ -855,6 +917,13 @@ pub fn entity_not_found_message(workspace_id: &str, entity_id: &str) -> String {
 /// construction as [`entity_not_found_message`] one resource across.
 pub fn component_type_not_found_message(workspace_id: &str, component_type_id: &str) -> String {
     format!("ComponentType {component_type_id} in workspace {workspace_id} not found.")
+}
+
+/// The message for a scene the workspace the request named does not hold.
+/// Built from the request, naming what was looked for and where — the same
+/// construction as [`entity_not_found_message`] one resource across.
+pub fn scene_not_found_message(workspace_id: &str, scene_id: &str) -> String {
+    format!("Scene {scene_id} in workspace {workspace_id} not found.")
 }
 
 /// The message for a workspace this service does not hold: built from the
@@ -903,6 +972,16 @@ pub fn component_type_arn(region: &str, workspace_id: &str, component_type_id: &
         "iottwinmaker",
         region,
         &format!("workspace/{workspace_id}/componentType/{component_type_id}"),
+    )
+}
+
+/// The ARN of a scene, nested under its workspace's resource path the way
+/// [`entity_arn`] nests an entity's.
+pub fn scene_arn(region: &str, workspace_id: &str, scene_id: &str) -> String {
+    ::engine::emulator_arn(
+        "iottwinmaker",
+        region,
+        &format!("workspace/{workspace_id}/scene/{scene_id}"),
     )
 }
 

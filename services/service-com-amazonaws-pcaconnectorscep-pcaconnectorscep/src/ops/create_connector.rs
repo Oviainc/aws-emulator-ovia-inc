@@ -206,9 +206,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ClientToken` is how the caller says "this is a retry, not a second connector":
         // within its five-minute window the same token answers with the connector it
         // already created rather than minting another one. If that connector has since been
-        // deleted there is nothing to answer with, so the call falls through and creates one.
+        // deleted — gone, or accepted for teardown and reporting `DELETING` — there is
+        // nothing to answer with, so the call falls through and creates one.
         if let Some(existing) = store.connector_for_token(input.client_token.as_deref()) {
-            if store.connectors.contains_key(&existing.arn) {
+            if store
+                .connectors
+                .get(&existing.arn)
+                .is_some_and(|connector| !connector.is_deleting())
+            {
                 // Same token, different request: the caller is not retrying the call this
                 // token stands for, so answering with that connector would answer for a
                 // request nobody made.
@@ -292,7 +297,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // created carries none.
             status_reason: None,
             pending: Some(crate::state::PendingTransition {
-                to: crate::state::STATUS_ACTIVE.to_string(),
+                outcome: crate::state::PendingOutcome::Status(
+                    crate::state::STATUS_ACTIVE.to_string(),
+                ),
                 due_at: now + crate::state::TRANSITION_SPAN,
             }),
             endpoint,

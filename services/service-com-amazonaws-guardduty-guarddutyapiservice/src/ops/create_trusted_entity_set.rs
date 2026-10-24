@@ -215,8 +215,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         // "At any given time, you can have only one trusted entity set"
-        // (`smithy_query(query="doc",shape="CreateTrustedEntitySet")`).
-        if !detector.trusted_entity_sets.is_empty() {
+        // (`smithy_query(query="doc",shape="CreateTrustedEntitySet")`). The rule
+        // bounds the set GuardDuty is KEEPING, so a set whose delete has been
+        // accepted does not occupy the slot — its record is only still reported.
+        if detector.live_trusted_entity_set().is_some() {
             return Err(bad_request(
                 crate::state::TRUSTED_ENTITY_SET_ALREADY_EXISTS_MESSAGE,
             ));

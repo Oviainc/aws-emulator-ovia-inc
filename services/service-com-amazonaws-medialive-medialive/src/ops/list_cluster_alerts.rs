@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListClusterAlerts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListClusterAlerts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListClusterAlerts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Report the alerts raised against one stored cluster, filtered by alert state
+//! and paginated.
+//!
+//! REPORTING ONLY: the one write it makes is the `settle` every operation runs
+//! first, which materialises the `CREATING` -> `ACTIVE` transition the clock had
+//! already made due. The alerts come from the cluster's own log in state (the
+//! cluster slice, [`crate::state::clusters`]) — nothing here invents one, and
+//! nothing in this emulator raises one, because the real service raises a
+//! cluster alert from the Nodes and the encoding hardware it runs for a Cluster
+//! and this emulator runs neither. So a cluster whose log is empty reports an
+//! empty page, which is what it has.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +158,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListClusterAlerts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListClusterAlertsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListClusterAlerts"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // `MaxResults` is a page size, so a non-positive one asks for nothing and
+        // is a bad request. It is clamped to a finite ceiling, and an absent one
+        // uses that ceiling, so no single request can ask the service to project
+        // an unbounded number of alerts in one response.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(bad_request(&format!(
+                    "maxResults must be at least 1, got {max_results}"
+                )));
+            }
+            Some(max_results) => (max_results as usize).min(crate::state::MAX_LIST_PAGE_SIZE),
+            None => crate::state::MAX_LIST_PAGE_SIZE,
+        };
+
+        // `StateFilter` "Specifies the set of alerts to return based on their
+        // state. SET - Return only alerts with SET state. CLEARED - Return only
+        // alerts with CLEARED state. ALL - Return all alerts." The member targets
+        // bare `__string`, so the request boundary admits any string and a value
+        // outside that documented set — which names no set of alerts — is refused
+        // here, naming the member and the values it accepts.
+        let state_filter = input.state_filter.as_deref();
+        if let Some(filter) = state_filter {
+            if !crate::state::CLUSTER_ALERT_FILTERS.contains(&filter) {
+                return Err(bad_request(&format!(
+                    "stateFilter must be one of {}, got {filter}",
+                    crate::state::CLUSTER_ALERT_FILTERS.join(", ")
+                )));
+            }
+        }
+
+        // The token is how many of this cluster's admitted alerts the previous
+        // pages already reported. An alert has no id of its own that identifies
+        // it (`ClusterAlert$Id` is "The further subtype of this alert"), so its
+        // place in the log is what a page resumes from; a token that is not a
+        // whole-number position at all is refused rather than read as the first
+        // page. A position past the end is NOT refused: the log is bounded and
+        // drops its oldest entries, so a token handed out for a page that has
+        // since been dropped resumes at the end of the log instead of failing a
+        // walk that was valid when it began.
+        let already_reported = match input.next_token.as_deref() {
+            Some(token) => token.parse::<usize>().map_err(|_| {
+                bad_request(&format!("nextToken {token} is not an alert position"))
+            })?,
+            None => 0,
+        };
+
+        let mut state = state.lock();
+        // Reporting only: `settle` materialises what the clock already made due,
+        // so a cluster whose creation has come due is the one this read resolves.
+        state.settle(::std::time::SystemTime::now());
+        let state = &*state;
+
+        // The id names no cluster this store holds, which is this operation's
+        // modelled 404 — the only resolution it performs, and so the only thing
+        // its 404 can report.
+        let cluster = state.clusters.get(&input.cluster_id).ok_or_else(|| {
+            ListClusterAlertsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    "Cluster",
+                    &input.cluster_id,
+                )),
+            })
+        })?;
+
+        // The alerts the filter admits, oldest first — the order they were raised
+        // in, which is the sequence the pages walk.
+        let admitted: Vec<&crate::state::ClusterAlertRecord> = cluster
+            .alerts()
+            .iter()
+            .filter(|alert| alert.admitted_by(state_filter))
+            .collect();
+        let alerts: Vec<ClusterAlert> = admitted
+            .iter()
+            .skip(already_reported)
+            .take(page_size)
+            .map(|alert| crate::state::cluster_alert_output(alert))
+            .collect();
+        let reported = already_reported.saturating_add(alerts.len());
+        // Absent on the last page: a token is handed out only when an alert the
+        // filter admits is left over after this one.
+        let next_token = (reported < admitted.len()).then(|| reported.to_string());
+
+        Ok(ListClusterAlertsOutput {
+            alerts: Some(alerts),
+            next_token,
+        })
     }
+}
+
+/// A request this operation cannot read, as its modelled 400.
+fn bad_request(message: &str) -> ListClusterAlertsError {
+    ListClusterAlertsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to read the cluster's alerts from. A modelled server
+/// error, never a fresh engine (which would answer from an empty private store).
+fn unavailable() -> ListClusterAlertsError {
+    ListClusterAlertsErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

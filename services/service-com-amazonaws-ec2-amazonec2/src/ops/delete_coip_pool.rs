@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCoipPool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCoipPool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCoipPool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the customer-owned IP (CoIP) address pool `CoipPoolId` names and reports the
+//! pool it removed. The answer is the record the removal took out of the store, so a pool a
+//! later `DescribeCoipPools` no longer reports is exactly the pool this call answered with;
+//! a `CoipPoolId` that resolves to no pool of the account is refused rather than reported
+//! as a delete that did nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -134,18 +131,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCoipPool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCoipPoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A CoIP pool carries no Region member — its `PoolArn` was built when the pool was
+        // created — so nothing here depends on the Region the request was signed for.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`DeleteCoipPoolRequest$DryRun`). Every caller of this emulator is permitted, so a
+        // dry run reports that outcome and neither reads nor writes the store — the reading
+        // `DescribeCoipPools` and the rest of this crate's `DryRun` members get, so the
+        // answer does not depend on whether the pool the request names exists.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        // The store, with the "mounted on an engine that holds no state" case already turned
+        // into the server error every handler of this crate answers it with.
+        let state = crate::state::require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // "The ID of the CoIP pool that you want to delete" (`DeleteCoipPoolRequest`): the
+        // one resource this call acts on, so an id that resolves to no pool of the account is
+        // refused — a delete that removed nothing must never answer as though it had.
+        // Removing is also what RESOLVES the id, so the pool cannot be looked up by one
+        // lookup and removed by another: the record reported below is the record that left
+        // the store.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCoipPool"))
+        // The pool goes whatever it holds: nothing of this emulator can give a pool a CIDR or
+        // an address usage yet (`CreateCoipCidr` and `GetCoipPoolUsage` are still scaffold
+        // stubs with their own open issues), so there is no in-use state to refuse against,
+        // and inventing one would refuse deletes the real service allows. Whichever of those
+        // lands first owns the in-use refusal, and this is where it belongs.
+        let pool_id = input.coip_pool_id.as_str();
+        let removed = store
+            .remove_coip_pool(pool_id)
+            .ok_or_else(|| crate::state::coip_pool_id_does_not_exist(pool_id))?;
+
+        // "Information about the CoIP address pool" (`DeleteCoipPoolResult$CoipPool`): the
+        // pool as it was last stored, which is what the describes reported until this call.
+        Ok(DeleteCoipPoolOutput {
+            coip_pool: Some(removed),
+        })
     }
 }
