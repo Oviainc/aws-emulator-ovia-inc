@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateAccounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateAccounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateAccounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Associates every member account the request names with the
+//! organization's management account, by storing the association where the
+//! enrollment configuration of that account lives: its organization rule mode
+//! becomes `AnyAllowed` and, for an account that had not enabled the Automation
+//! feature, the association enables it (`Active`). Answers with the accounts the
+//! STORE reports as associated, never with the request's own list.
+//!
+//! The store is keyed by the account ids the request supplies, so the number of
+//! accounts it holds is capped at [`crate::state::MAX_ENROLLED_ACCOUNTS`]: an
+//! association that would bring in more new accounts than there is room for is
+//! refused and stores nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +176,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateAccounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateAccountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AssociateAccountsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service is not mounted on a state-bearing engine".into()),
+                },
+            )
+            .into());
+        };
+
+        // The one documented rule on `accountIds` the model's constraints cannot
+        // carry. Each account id itself matched `AccountId`'s `^[0-9]{12}$` at the
+        // protocol boundary, so reaching here means every entry is well formed.
+        if let Some(message) = invalid_parameter(&input) {
+            return Err(AssociateAccountsErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The accounts this request names, each ONCE and in the order the request
+        // first names them: an id repeated in the list names the same account,
+        // and an account is associated or it is not.
+        let mut seen: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
+        let requested: Vec<String> = input
+            .account_ids
+            .iter()
+            .filter(|account_id| seen.insert(account_id.as_str()))
+            .cloned()
+            .collect();
+
+        let mut probe = input.clone();
+        probe.client_token = None;
+        let request_fingerprint = crate::state::fingerprint(&probe);
+        let client_token = input.client_token.as_deref();
+
+        let mut guard = state.lock();
+
+        // The service-wide enrollment gate, AHEAD of the token ledger and of the
+        // store: an account that is not opted in may not associate anything, and
+        // a refused call must not consume its client token either. It reads the
+        // CALLER's enrollment — the accounts the request names are judged by
+        // nothing here, since an association is what enables them. See
+        // `crate::state::…::opt_in_required`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateAccounts"))
+        // `NotManagementAccountException` is the refusal for a caller that is
+        // neither the management account nor a delegated administrator. This
+        // emulator serves exactly one account (`state::caller_account_id`), which
+        // is the organization's management account, so no request can reach that
+        // refusal.
+        if let Some(refusal) = guard.opt_in_required() {
+            return Err(AssociateAccountsErrorModeled::OptInRequiredException(refusal).into());
+        }
+
+        match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
+            crate::state::TokenOutcome::Fresh => {
+                // The enrollment store is keyed by the account ids the REQUEST
+                // supplies, so the number of accounts it holds is capped: an
+                // association that would bring in more new accounts than there is
+                // room for is refused with the operation's own client-input error,
+                // BEFORE anything is stored, rather than letting the store grow
+                // with every distinct id a caller names. An account already in the
+                // store costs nothing, so re-associating is never refused.
+                if guard.would_exceed_account_limit(&requested) {
+                    return Err(AssociateAccountsErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(crate::state::account_limit_exceeded_message()),
+                        },
+                    )
+                    .into());
+                }
+                let associated_at = crate::state::now();
+                for account_id in &requested {
+                    guard.associate_account(account_id, associated_at);
+                }
+                guard.record_token(client_token, Self::NAME, &request_fingerprint, None);
+            }
+            // A retry of the same association: the accounts are already
+            // associated, so the answer is recomputed from the store and nothing
+            // is stored again — in particular no timestamp is re-stamped.
+            crate::state::TokenOutcome::Replay(_) => {}
+            crate::state::TokenOutcome::ParameterMismatch => {
+                return Err(
+                    AssociateAccountsErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(
+                                crate::state::IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE.into(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::TokenOutcome::TokenInUse => {
+                return Err(
+                    AssociateAccountsErrorModeled::IdempotencyTokenInUseException(
+                        IdempotencyTokenInUseException {
+                            message: Some("The specified client token is already in use.".into()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Answer from the store: `accountIds` is "The IDs of the member accounts
+        // that were successfully associated", so an account appears only while the
+        // store reports it associated.
+        let account_ids: Vec<String> = requested
+            .into_iter()
+            .filter(|account_id| guard.is_associated(account_id))
+            .collect();
+
+        Ok(AssociateAccountsOutput {
+            account_ids: Some(account_ids),
+            // `errors` is "Any errors that occurred during the association
+            // process" — one entry per account the service could not associate.
+            // This emulator holds no organization-membership directory to
+            // disagree with the request, and every id reaching here matched
+            // `AccountId`, so nothing fails per account and the list is empty.
+            errors: Some(Vec::new()),
+        })
     }
+}
+
+/// Why this request's parameter values are not valid, if they are not.
+///
+/// The clause is the documented size of `accountIds`, which the `AccountIdList`
+/// shape carries no `@length` for: the operation "Associates ONE OR MORE member
+/// accounts with your organization's management account" and the member reads
+/// "You can specify up to 50 account IDs", so a request naming none, and one
+/// naming more than [`crate::state::MAX_ACCOUNT_IDS_PER_REQUEST`], is refused
+/// with the operation's `InvalidParameterValueException` rather than associating
+/// a prefix of the list.
+fn invalid_parameter(input: &AssociateAccountsInput) -> Option<String> {
+    if input.account_ids.is_empty() {
+        return Some(crate::state::constraint_report(
+            "accountIds",
+            "Member must have length greater than or equal to 1",
+        ));
+    }
+    if input.account_ids.len() > crate::state::MAX_ACCOUNT_IDS_PER_REQUEST {
+        return Some(crate::state::constraint_report(
+            "accountIds",
+            &format!(
+                "Member must have length less than or equal to {}",
+                crate::state::MAX_ACCOUNT_IDS_PER_REQUEST
+            ),
+        ));
+    }
+    None
 }

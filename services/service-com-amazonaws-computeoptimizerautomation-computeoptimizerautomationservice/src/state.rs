@@ -59,6 +59,43 @@ pub const DEFAULT_ENROLLMENT_STATUS: &str = "Inactive";
 /// service's actions.
 pub const ENROLLED_STATUS: &str = "Active";
 
+/// The `OrganizationRuleMode` an ASSOCIATED member account carries.
+///
+/// `OrganizationRuleMode` is `AnyAllowed | NoneAllowed`
+/// (`smithy_query(query="shape",shape="OrganizationRuleMode")`) and it
+/// "Specifies whether the management account can create Automation rules that
+/// implement optimization actions for this account"
+/// (`smithy_query(query="doc",shape="AccountInfo",member="organizationRuleMode")`).
+/// `AssociateAccounts` documents which of the two an association leaves the
+/// account in: "When you associate a member account, its organization rule mode
+/// is automatically set to \"Any allowed,\" which permits the management account
+/// to create Automation rules that automatically apply actions to that account."
+pub const ORGANIZATION_RULE_MODE_ANY_ALLOWED: &str = "AnyAllowed";
+
+/// How many account ids one organization-association request may name.
+///
+/// DOCUMENTED, not chosen: `accountIds` reads "The IDs of the member accounts to
+/// associate. You can specify up to 50 account IDs."
+/// (`smithy_query(query="doc",shape="AssociateAccountsRequest",member="accountIds")`).
+/// The `AccountIdList` shape carries no `@length`, so the protocol boundary
+/// admits a longer list and the bound is enforced by the handler.
+pub const MAX_ACCOUNT_IDS_PER_REQUEST: usize = 50;
+
+/// How many accounts the enrollment store holds before an association that would
+/// bring in a new one is refused.
+///
+/// CHOSEN bound, for the same reason [`MAX_RULES_PER_ACCOUNT`] and
+/// [`MAX_STORED_EVENTS`] are: the organization's real account quota is in neither
+/// the model nor the operation docs, and this store lives in memory while
+/// `AssociateAccounts` takes the account ids it stores FROM THE REQUEST (any id
+/// matching `AccountId`'s `^[0-9]{12}$`). So the number of accounts the store
+/// holds is capped rather than left to grow with every distinct id a caller
+/// names: a request that would push it past the cap is refused and stores
+/// NOTHING. [`MAX_ACCOUNT_IDS_PER_REQUEST`] does not bound it on its own — it
+/// only caps ONE request — and an entry already in the store is re-associated
+/// freely, because that adds nothing.
+pub const MAX_ENROLLED_ACCOUNTS: usize = 1_000;
+
 /// The `description` a rule created without one carries.
 ///
 /// A rule's `description` is reported for every rule that exists — a create that
@@ -309,6 +346,16 @@ pub fn revision_mismatch_message(current_revision: i64) -> String {
 /// neither a key, a value nor the resource.
 pub fn tag_limit_exceeded_message() -> String {
     format!("The request would exceed the limit of {MAX_TAGS_PER_RESOURCE} tags per resource")
+}
+
+/// The `InvalidParameterValueException` message for an association that would
+/// leave the enrollment store holding more than [`MAX_ENROLLED_ACCOUNTS`]
+/// accounts.
+///
+/// States the BOUND, which is the one fact a caller past it needs, and echoes no
+/// account id the request carried.
+pub fn account_limit_exceeded_message() -> String {
+    format!("The request would exceed the limit of {MAX_ENROLLED_ACCOUNTS} accounts")
 }
 
 /// The `EnrollmentStatus` values `UpdateEnrollmentConfiguration` accepts from a
@@ -1654,6 +1701,75 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
         (!self.is_enrolled(&caller_account_id())).then(|| OptInRequiredException {
             message: Some(OPT_IN_REQUIRED_MESSAGE.to_string()),
         })
+    }
+
+    /// Is `account_id` ASSOCIATED with the organization's management account,
+    /// i.e. does its stored enrollment report
+    /// [`ORGANIZATION_RULE_MODE_ANY_ALLOWED`]?
+    ///
+    /// Association is what that rule mode records: `AssociateAccounts` sets it
+    /// to "Any allowed", which is what "permits the management account to create
+    /// Automation rules that automatically apply actions to that account". An
+    /// account that has never been associated has no rule mode at all, so it is
+    /// not associated.
+    pub fn is_associated(&self, account_id: &str) -> bool {
+        self.enrollment(account_id)
+            .organization_rule_mode
+            .as_deref()
+            == Some(ORGANIZATION_RULE_MODE_ANY_ALLOWED)
+    }
+
+    /// How many of `account_ids` the enrollment store does not hold an entry for
+    /// yet — i.e. how much an association of exactly those accounts would GROW
+    /// the store. An id already stored costs nothing, whatever its status.
+    pub fn accounts_not_stored(&self, account_ids: &[String]) -> usize {
+        account_ids
+            .iter()
+            .filter(|account_id| !self.enrollments.contains_key(*account_id))
+            .count()
+    }
+
+    /// Would storing an entry for each of `account_ids` leave the enrollment
+    /// store holding more than [`MAX_ENROLLED_ACCOUNTS`] accounts? The store is
+    /// in memory and `AssociateAccounts` keys it by request-supplied ids, so a
+    /// request past the cap is refused instead of applied.
+    pub fn would_exceed_account_limit(&self, account_ids: &[String]) -> bool {
+        self.enrollments
+            .len()
+            .saturating_add(self.accounts_not_stored(account_ids))
+            > MAX_ENROLLED_ACCOUNTS
+    }
+
+    /// Associate `account_id` with the organization's management account, as
+    /// `AssociateAccounts` documents the association: the account's organization
+    /// rule mode becomes [`ORGANIZATION_RULE_MODE_ANY_ALLOWED`], and an account
+    /// that "has not previously enabled the Automation feature" has it enabled —
+    /// which is [`ENROLLED_STATUS`] — by the association itself.
+    ///
+    /// Answers whether the stored configuration CHANGED. `at` is stamped as the
+    /// account's `lastUpdatedTimestamp` ("The timestamp when the account's
+    /// Automation enrollment status was last updated") only when it did, so
+    /// re-associating an account that is already associated and enrolled leaves
+    /// its stored configuration, timestamp included, exactly where it was.
+    pub fn associate_account(&mut self, account_id: &str, at: ::aws_smithy_types::DateTime) -> bool {
+        let enrollment = self.enrollments.entry(account_id.to_string()).or_default();
+        let mut changed = false;
+        if enrollment.status != ENROLLED_STATUS {
+            enrollment.status = ENROLLED_STATUS.to_string();
+            // The reason belongs to the status it explains, and the status this
+            // account now reports was not reached by a failure.
+            enrollment.status_reason = None;
+            changed = true;
+        }
+        if enrollment.organization_rule_mode.as_deref() != Some(ORGANIZATION_RULE_MODE_ANY_ALLOWED) {
+            enrollment.organization_rule_mode =
+                Some(ORGANIZATION_RULE_MODE_ANY_ALLOWED.to_string());
+            changed = true;
+        }
+        if changed {
+            enrollment.last_updated_timestamp = Some(at);
+        }
+        changed
     }
 
     /// A fresh `ruleId` matching the model's `^[0-9A-Za-z]{16}$`, retried in the
