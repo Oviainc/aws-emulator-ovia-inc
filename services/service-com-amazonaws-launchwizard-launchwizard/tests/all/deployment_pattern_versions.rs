@@ -13,8 +13,9 @@
 //! and one past it, and the versions an `UpdateDeployment` may name.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use service_com_amazonaws_launchwizard_launchwizard::state::CATALOGUE_PATTERN_VERSIONS;
 
 use crate::deployment_lifecycle::create;
@@ -23,6 +24,27 @@ use crate::deployment_update::{
     one_pattern_per_workload, pattern_data, update_body, with_member,
 };
 use crate::harness::Harness;
+
+/// Long enough for every clock-owed step a CREATE schedules to come due (the three
+/// `state::TRANSITION_SPAN`s it walks, plus slack): a deployment whose create is still
+/// in flight refuses an update.
+const CREATE_SETTLE: Duration = Duration::from_millis(2_100);
+
+/// Long enough for the one step an UPDATE schedules to come due, after which the
+/// deployment takes another update.
+const UPDATE_SETTLE: Duration = Duration::from_millis(1_200);
+
+/// One workload's version suite: a deployment per published version (each accepted
+/// update leaves its own deployment mid-update, a state that takes no further update),
+/// plus the one the refusals and the "keeps its version" pair run against.
+struct VersionSuite {
+    case: String,
+    workload: String,
+    pattern: String,
+    specifications: Map<String, Value>,
+    per_version: Vec<String>,
+    kept: String,
+}
 
 /// The route the model binds `GetDeploymentPatternVersion` to:
 /// `POST /getDeploymentPatternVersion`.
@@ -355,19 +377,63 @@ async fn a_version_the_read_reports_is_a_version_an_update_can_name() {
         .last()
         .copied()
         .expect("the catalogue publishes at least one version per pattern");
+    // Each accepted update needs a deployment whose lifecycle is at rest, so every row
+    // gets its own and all of them are created FIRST, then waited out with ONE sleep.
+    let mut suites: Vec<VersionSuite> = Vec::new();
     for (index, (workload, pattern)) in one_pattern_per_workload(&harness)
         .await
         .into_iter()
         .enumerate()
     {
         let case = format!("{workload}/{pattern}");
-        let id = create(&harness, &case, &workload, &pattern, &format!("ver-{index}")).await;
         let data = pattern_data(&harness, &case, &workload, &pattern).await;
         let specifications = conforming_specifications(&case, &data, false);
+        let mut per_version = Vec::new();
+        for (row, _) in CATALOGUE_PATTERN_VERSIONS.iter().enumerate() {
+            per_version.push(
+                create(
+                    &harness,
+                    &case,
+                    &workload,
+                    &pattern,
+                    &format!("ver-{index}-{row}"),
+                )
+                .await,
+            );
+        }
+        // The deployment the refusals and the "keeps its version" pair run against.
+        let kept = create(
+            &harness,
+            &case,
+            &workload,
+            &pattern,
+            &format!("ver-{index}-kept"),
+        )
+        .await;
+        suites.push(VersionSuite {
+            case,
+            workload,
+            pattern,
+            specifications,
+            per_version,
+            kept,
+        });
+    }
+    std::thread::sleep(CREATE_SETTLE);
 
-        // Every version the version read reports is a version the deployment can be
-        // moved onto, and the event the update appends records the one it now deploys.
-        for version in CATALOGUE_PATTERN_VERSIONS {
+    for VersionSuite {
+        case,
+        workload,
+        pattern,
+        specifications,
+        per_version,
+        kept,
+    } in suites
+    {
+        // Every version the version read reports is a version a deployment can be moved
+        // onto, and the event the update appends records the one it now deploys.
+        for (row, version) in CATALOGUE_PATTERN_VERSIONS.iter().enumerate() {
+            let id = &per_version[row];
             let summary = get_version(&harness, &case, &workload, &pattern, version).await;
             let name = summary["deploymentPatternVersionName"]
                 .as_str()
@@ -379,13 +445,13 @@ async fn a_version_the_read_reports_is_a_version_an_update_can_name() {
                     &case,
                     "/updateDeployment",
                     with_member(
-                        &update_body(&id, &specifications),
+                        &update_body(id, &specifications),
                         "deploymentPatternVersionName",
                         json!(name),
                     ),
                 )
                 .await;
-            let described = update_description(&harness, &case, &id).await;
+            let described = update_description(&harness, &case, id).await;
             assert!(
                 described.contains(&format!("'{name}'")),
                 "case {case:?}: the update event must name the version the deployment now \
@@ -411,7 +477,7 @@ async fn a_version_the_read_reports_is_a_version_an_update_can_name() {
                     &case,
                     "/updateDeployment",
                     with_member(
-                        &update_body(&id, &specifications),
+                        &update_body(&kept, &specifications),
                         "deploymentPatternVersionName",
                         json!(absent),
                     ),
@@ -429,20 +495,23 @@ async fn a_version_the_read_reports_is_a_version_an_update_can_name() {
                 &format!("{case}@{oldest} (back to the oldest)"),
                 "/updateDeployment",
                 with_member(
-                    &update_body(&id, &specifications),
+                    &update_body(&kept, &specifications),
                     "deploymentPatternVersionName",
                     json!(oldest),
                 ),
             )
             .await;
+        // The second update of the same deployment waits for the first to finish: a
+        // deployment that is still applying an update does not take another.
+        std::thread::sleep(UPDATE_SETTLE);
         harness
             .ok(
                 &format!("{case} with no version named"),
                 "/updateDeployment",
-                update_body(&id, &specifications),
+                update_body(&kept, &specifications),
             )
             .await;
-        let described = update_description(&harness, &case, &id).await;
+        let described = update_description(&harness, &case, &kept).await;
         assert!(
             described.contains(&format!("'{oldest}'")),
             "case {case:?}: an update naming no version must keep version {oldest:?}, got \

@@ -19,6 +19,8 @@ mod admin_respond_to_auth_challenge;
 mod admin_user_pool_lifecycle;
 #[path = "all/clock_dependent_state.rs"]
 mod clock_dependent_state;
+#[path = "all/delete_group.rs"]
+mod delete_group;
 #[path = "all/error_message_wording.rs"]
 mod error_message_wording;
 #[path = "all/group_lifecycle.rs"]

@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.tags_of_mut(&resource) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::no_such_tagged_resource(&input.resource_arn)),
+                    message: Some(crate::state::no_such_tagged_resource(&resource)),
                 },
             )
             .into());

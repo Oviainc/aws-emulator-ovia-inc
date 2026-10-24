@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteReplicator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteReplicator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes a replicator and reports the state the delete left it in. The record is
+//! removed from the store on the one removal path, so every later read of that ARN
+//! answers exactly as it does for an ARN nobody ever issued.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteReplicator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The `DELETING` this answers with is therefore the state of the call, not a
+//! window a later reader can observe: the record is gone when this returns, so a
+//! read one instant later is a `NotFoundException` rather than a replicator in
+//! `DELETING`. There is no asynchronous deletion span here, and nothing else in
+//! this service waits for one.
+//!
+//! The replicator is resolved as the readers resolve it: a value that is not shaped
+//! like a replicator ARN is a `BadRequestException`, and a well-formed one this
+//! endpoint's region holds no replicator for is a `NotFoundException` naming the
+//! input member at fault. A `CurrentVersion` the caller supplies must be the version
+//! the replicator is actually at, so a delete quoting a stale version is refused
+//! rather than applied to a replicator the caller has not seen.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +157,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteReplicator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteReplicatorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteReplicator"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteReplicatorErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        if !crate::state::is_replicator_arn(&input.replicator_arn) {
+            return Err(
+                DeleteReplicatorErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some(crate::state::REPLICATOR_ARN_MEMBER.to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK replicator ARN.",
+                        input.replicator_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        let mut state = state.lock();
+        // Resolved through the settling lookup, as the reader does: the version
+        // checked below is the replicator's own, so the delete must see the
+        // transition the clock already owed THIS replicator.
+        let Some(replicator) = state.settled_replicator_in(
+            &region,
+            &input.replicator_arn,
+            std::time::SystemTime::now(),
+        ) else {
+            return Err(
+                DeleteReplicatorErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some(crate::state::REPLICATOR_ARN_MEMBER.to_string()),
+                    // The refusal names the input member that resolved to nothing,
+                    // and nothing about this endpoint's own state.
+                    message: Some(crate::state::parameter_not_found_message(
+                        crate::state::REPLICATOR_ARN_MEMBER,
+                    )),
+                })
+                .into(),
+            );
+        };
+
+        // A supplied version must be the one the replicator is actually at; a
+        // stale one means the caller is deleting a replicator it has not seen the
+        // latest state of.
+        if let Some(requested) = input.current_version.as_deref() {
+            if requested != replicator.current_version {
+                return Err(DeleteReplicatorErrorModeled::BadRequestException(
+                    BadRequestException {
+                        invalid_parameter: Some("currentVersion".to_string()),
+                        message: Some(format!(
+                            "The replicator's current version is {}, not {requested}.",
+                            replicator.current_version
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        state.unregister_replicator(&input.replicator_arn);
+        Ok(DeleteReplicatorOutput {
+            replicator_arn: Some(input.replicator_arn),
+            replicator_state: Some(crate::state::REPLICATOR_STATE_DELETING.to_string()),
+        })
     }
 }

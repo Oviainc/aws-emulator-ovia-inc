@@ -150,3 +150,5 @@ mod usage_plan_collection;
 mod domain_name_access_associations;
 #[path = "all/stage_invoke_endpoint.rs"]
 mod stage_invoke_endpoint;
+#[path = "all/delete_integration_response.rs"]
+mod delete_integration_response;

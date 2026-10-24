@@ -1525,13 +1525,45 @@ pub fn remove_tags(stored: &mut Vec<Tag>, keys: &[String]) {
     stored.retain(|tag| !removed.contains(tag.key.as_str()));
 }
 
-/// What a tagging operation reports for a well-formed ARN naming a resource
-/// this store holds no record of.
+/// What any reader reports for a rule name that names no rule on the bus the
+/// lookup ran against.
 ///
-/// The message is built from the request: it names the ARN the caller sent,
-/// the way this service's other request-derived refusals do.
-pub fn no_such_tagged_resource(arn: &str) -> String {
-    format!("Resource {arn} does not exist.")
+/// The message is built from the request and names the resource the way this
+/// service names a missing rule: the RULE by name, and the EVENT BUS it was
+/// sought on — a rule name is only unique within its bus, so without the bus a
+/// caller cannot tell "no such rule anywhere" from "that rule lives on another
+/// bus". Written once, so every operation that resolves a rule — a read, a
+/// target write, a tagging call — refuses a missing one in the same words.
+pub fn no_such_rule(event_bus_name: &str, rule_name: &str) -> String {
+    format!("Rule {rule_name} does not exist on EventBus {event_bus_name}.")
+}
+
+/// What any reader reports for a bus name that names no event bus: the missing
+/// BUS by name, built from the request. Written once, for the reason
+/// [`no_such_rule`] gives.
+pub fn no_such_event_bus(bus_name: &str) -> String {
+    format!("Event bus {bus_name} does not exist.")
+}
+
+/// What a tagging path reports for a well-formed ARN naming a resource this
+/// store holds no record of.
+///
+/// The message is built from the request through the resource the ARN NAMED
+/// ([`parse_tagged_resource`]), so a missing resource is identified by its kind
+/// and its own name — a rule by name and by the bus it was sought on, a bus by
+/// name — in exactly the words every other reader of that kind uses, rather
+/// than by echoing the ARN text back at the caller. The tag paths therefore
+/// report the same refusal for a missing rule as `DescribeRule` does, whether
+/// the caller reached them through this service or through the tagging API that
+/// resolves an `events` ARN here.
+pub fn no_such_tagged_resource(resource: &TaggedResource) -> String {
+    match resource {
+        TaggedResource::EventBus(name) => no_such_event_bus(name),
+        TaggedResource::Rule {
+            event_bus_name,
+            name,
+        } => no_such_rule(event_bus_name, name),
+    }
 }
 
 /// Why a `LogConfig` is not one EventBridge accepts, or `None` when it is.
