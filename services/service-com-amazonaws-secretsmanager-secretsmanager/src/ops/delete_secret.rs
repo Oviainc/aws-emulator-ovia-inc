@@ -188,8 +188,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.recovery_window_in_days.is_some() && input.force_delete_without_recovery.is_some()
         {
             return Err(invalid_parameter(
-                "You can't use both RecoveryWindowInDays and ForceDeleteWithoutRecovery in the \
-                 same call.",
+                "You can't use ForceDeleteWithoutRecovery in conjunction with \
+                 RecoveryWindowInDays.",
             ));
         }
         // "The number of days from 7 to 30 that Secrets Manager waits before
@@ -199,11 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !(crate::state::MIN_RECOVERY_WINDOW_DAYS..=crate::state::MAX_RECOVERY_WINDOW_DAYS)
                 .contains(&window)
             {
-                return Err(invalid_parameter(format!(
-                    "RecoveryWindowInDays must be between {} and {} days, inclusive; got {window}.",
-                    crate::state::MIN_RECOVERY_WINDOW_DAYS,
-                    crate::state::MAX_RECOVERY_WINDOW_DAYS,
-                )));
+                return Err(invalid_parameter(
+                    crate::state::recovery_window_out_of_range_message(),
+                ));
             }
         }
         let force = input.force_delete_without_recovery.unwrap_or(false);
@@ -225,22 +223,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             return Err(DeleteSecretErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Secrets Manager can't find the specified secret: {}",
-                        input.secret_id
-                    )),
+                    message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
         };
 
         if force {
-            let removed = store.remove(&name).ok_or_else(state_unavailable)?;
+            // A forced deletion skips the recovery window, but it is not
+            // instantaneous: "Secrets Manager performs the actual deletion with
+            // an asynchronous background process, so there might be a short
+            // delay before the secret is permanently deleted." So the secret is
+            // marked for deletion as of this call — a caller acting straight
+            // after it still finds it, and is refused by its state — and the
+            // store owes its removal a short span later, which `expire_due`
+            // materialises. The repeat is allowed: "If you forcibly delete an
+            // already deleted or nonexistent secret, the operation does not
+            // return ResourceNotFoundException."
+            let secret = store.secrets.get_mut(&name).ok_or_else(state_unavailable)?;
+            let purge_at = now
+                .checked_add(crate::state::FORCE_DELETE_PURGE_DELAY)
+                .unwrap_or(now);
+            secret.schedule_deletion(now, purge_at);
+            secret.last_changed_date = now;
             return Ok(DeleteSecretOutput {
-                arn: Some(removed.arn),
-                name: Some(removed.name),
+                arn: Some(secret.arn.clone()),
+                name: Some(secret.name.clone()),
                 // With no recovery window there is nothing to wait for: the
-                // secret is gone as of this call.
+                // deletion is due as of this call.
                 deletion_date: Some(crate::state::timestamp(now)),
             });
         }
@@ -251,11 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if secret.scheduled_for_deletion() {
             return Err(DeleteSecretErrorModeled::InvalidRequestException(
                 InvalidRequestException {
-                    message: Some(
-                        "You can't perform this operation on the secret because it was marked \
-                         for deletion."
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -263,7 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "This value is the date and time of the delete request plus the number
         // of days in RecoveryWindowInDays."
         let deletion_date = crate::state::after_days(now, window);
-        secret.deleted_date = Some(deletion_date);
+        secret.schedule_deletion(deletion_date, deletion_date);
         secret.last_changed_date = now;
 
         Ok(DeleteSecretOutput {

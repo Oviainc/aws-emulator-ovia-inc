@@ -10,10 +10,11 @@
 //! row.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use serde_json::{json, Value};
+use service_com_amazonaws_secretsmanager_secretsmanager::state::FORCE_DELETE_PURGE_DELAY;
 use service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -956,7 +957,13 @@ async fn a_secret_scheduled_for_deletion_is_hidden_but_still_described() {
 }
 
 #[tokio::test]
-async fn a_forced_delete_removes_the_secret_outright() {
+async fn a_forced_delete_marks_the_secret_and_the_clock_then_removes_it() {
+    // "Secrets Manager performs the actual deletion with an asynchronous
+    // background process, so there might be a short delay before the secret is
+    // permanently deleted." (`DeleteSecretRequest$ForceDeleteWithoutRecovery`,
+    // this service's Smithy model.) So a forced delete skips the recovery window
+    // but is not instantaneous: the secret is marked for deletion as of the
+    // call, and the clock owes its removal a short span later.
     let router = emulator();
     let created = ok(
         &router,
@@ -966,6 +973,7 @@ async fn a_forced_delete_removes_the_secret_outright() {
     )
     .await;
     let arn = text(&created, "ARN", "create for the forced delete");
+    let started = Instant::now();
     let deleted = ok(
         &router,
         "DeleteSecret",
@@ -979,6 +987,39 @@ async fn a_forced_delete_removes_the_secret_outright() {
         "expected the deleted secret's ARN back, got {deleted}"
     );
 
+    // Straight after the call the secret is still THERE, marked for deletion:
+    // the value cannot be read, and the refusal is about its state, not about a
+    // secret that does not exist. Only asserted while the span cannot yet have
+    // elapsed, so a loaded machine never turns this into a false failure.
+    if started.elapsed() < FORCE_DELETE_PURGE_DELAY {
+        let case = "read the value straight after the forced delete";
+        let (status, body) = call(&router, "GetSecretValue", &json!({"SecretId": "forced"})).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a 400 client error, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body, case),
+            "InvalidRequestException",
+            "case {case:?}: expected InvalidRequestException for a secret marked for deletion, \
+             got {body}"
+        );
+        let described = ok(
+            &router,
+            "DescribeSecret",
+            json!({"SecretId": "forced"}),
+            "describe straight after the forced delete",
+        )
+        .await;
+        assert!(
+            described.get("DeletedDate").is_some(),
+            "case {case:?}: expected the secret to still be reported with a DeletedDate, got \
+             {described}"
+        );
+    }
+
+    // Once the span has elapsed the removal the clock owed has happened.
+    tokio::time::sleep(FORCE_DELETE_PURGE_DELAY + Duration::from_millis(200)).await;
     for (case, operation) in [
         ("read the value", "GetSecretValue"),
         ("describe it", "DescribeSecret"),
@@ -986,8 +1027,8 @@ async fn a_forced_delete_removes_the_secret_outright() {
         let code = err(&router, operation, json!({"SecretId": "forced"}), case).await;
         assert_eq!(
             code, "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException from {operation} after a forced \
-             delete, got {code}"
+            "case {case:?}: expected ResourceNotFoundException from {operation} once the forced \
+             delete has been materialised, got {code}"
         );
     }
     let listed = ok(
@@ -1460,7 +1501,8 @@ async fn the_store_is_bounded_and_refuses_growth_with_the_modelled_quota_error()
         refused, "LimitExceededException",
         "expected LimitExceededException once the store is full, got {refused}"
     );
-    // Releasing one record makes room again.
+    // Releasing one record makes room again — once the forced deletion the
+    // clock owes has been materialised, a short span after the call.
     ok(
         &router,
         "DeleteSecret",
@@ -1468,6 +1510,7 @@ async fn the_store_is_bounded_and_refuses_growth_with_the_modelled_quota_error()
         "release one record",
     )
     .await;
+    tokio::time::sleep(FORCE_DELETE_PURGE_DELAY + Duration::from_millis(200)).await;
     ok(
         &router,
         "CreateSecret",
