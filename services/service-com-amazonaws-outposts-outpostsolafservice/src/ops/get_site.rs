@@ -137,12 +137,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetSiteErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // The region this request is addressed to: a site is part of its own
+        // region's inventory and of no other's, so that is where the identifier is
+        // resolved.
+        let region = crate::state::request_region(ctx.parts());
         // `SiteId` accepts the bare id or the full site ARN; both name the same
         // stored record.
         let site_id = crate::state::resolve_site_id(&input.site_id).ok_or_else(|| {
@@ -153,13 +156,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let site = store
-            .sites
-            .get(&site_id)
+            .site(&region, &site_id)
             .map(|record| record.site.clone())
             .ok_or_else(|| {
                 GetSiteErrorModeled::NotFoundException(NotFoundException {
                     // The identifier echo, of the value AS SUPPLIED — not of
-                    // `site_id`, which is the bare id an ARN resolved to.
+                    // `site_id`, which is the bare id an ARN resolved to. A site of
+                    // another region is as absent here as one that never existed.
                     message: Some(crate::state::identifier_not_found(
                         crate::state::SITE_ID_MEMBER,
                         &input.site_id,

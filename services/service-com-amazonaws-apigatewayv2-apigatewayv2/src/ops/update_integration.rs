@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: patches the members the request names onto the
+//! [`crate::state::Integration`] its `IntegrationId` names under its parent api, holding
+//! the MERGED record to the same rules `CreateIntegration` holds a fresh one to, and
+//! reports the stored record back. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -331,18 +326,231 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIntegration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateIntegration",
+            ));
+        };
+        let mut store = state.lock();
+
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(UpdateIntegrationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::invalid_identifier_message(
+                        "API",
+                        &input.api_id,
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // The same members `CreateIntegration` gates, over the members THIS request
+        // configures: each is documented as supported only for APIs of one protocol, so
+        // a patch cannot put one on an integration of an api of the other. Checked
+        // BEFORE anything is written, so a refused patch leaves the record as it was.
+        let mut restricted = vec![
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "ContentHandlingStrategy",
+                input.content_handling_strategy.is_some(),
+            ),
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "PassthroughBehavior",
+                input.passthrough_behavior.is_some(),
+            ),
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "RequestTemplates",
+                input
+                    .request_templates
+                    .as_ref()
+                    .is_some_and(|templates| !templates.is_empty()),
+            ),
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "TemplateSelectionExpression",
+                input.template_selection_expression.is_some(),
+            ),
+            crate::state::ProtocolRestrictedMember::http_only(
+                "ConnectionId",
+                input.connection_id.is_some(),
+            ),
+            crate::state::ProtocolRestrictedMember::http_only(
+                "IntegrationSubtype",
+                input.integration_subtype.is_some(),
+            ),
+            crate::state::ProtocolRestrictedMember::http_only(
+                "ResponseParameters",
+                input
+                    .response_parameters
+                    .as_ref()
+                    .is_some_and(|parameters| !parameters.is_empty()),
+            ),
+            crate::state::ProtocolRestrictedMember::http_only(
+                "TlsConfig",
+                input.tls_config.is_some(),
+            ),
+        ];
+        // The restricted VALUES of `IntegrationType`: the member is accepted by either
+        // protocol, so what is gated is the value this request selected.
+        let integration_type_member = input
+            .integration_type
+            .as_deref()
+            .filter(|selected| {
+                crate::state::WEBSOCKET_ONLY_INTEGRATION_TYPES.contains(selected)
+            })
+            .map(|selected| format!("IntegrationType {selected}"));
+        if let Some(member) = integration_type_member.as_deref() {
+            restricted.insert(
+                0,
+                crate::state::ProtocolRestrictedMember::websocket_only(member, true),
+            );
+        }
+        if let Err(message) =
+            crate::state::validate_protocol_restricted_members(&api.protocol_type, &restricted)
+        {
+            return Err(bad_request(&message));
+        }
+
+        let Some(existing) = api.integrations.get(&input.integration_id) else {
+            return Err(UpdateIntegrationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::invalid_identifier_message(
+                        "Integration",
+                        &input.integration_id,
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // The update is a PATCH (`PATCH /v2/apis/{ApiId}/integrations/{IntegrationId}`):
+        // a member the request carries replaces the stored one, and a member it omits
+        // leaves the stored value exactly as it was. A map is a VALUE like any other, so
+        // one the request carries replaces the stored map wholesale. Nothing here is
+        // defaulted: a default belongs to the create, and applying one again would
+        // silently undo a value a later `GetIntegration` can still report.
+        let mut updated = existing.clone();
+        if let Some(integration_type) = input.integration_type {
+            updated.integration_type = integration_type;
+        }
+        if let Some(integration_uri) = input.integration_uri {
+            updated.integration_uri = Some(integration_uri);
+        }
+        if let Some(integration_method) = input.integration_method {
+            updated.integration_method = Some(integration_method);
+        }
+        if let Some(integration_subtype) = input.integration_subtype {
+            updated.integration_subtype = Some(integration_subtype);
+        }
+        if let Some(connection_type) = input.connection_type {
+            updated.connection_type = connection_type;
+        }
+        if let Some(connection_id) = input.connection_id {
+            updated.connection_id = Some(connection_id);
+        }
+        if let Some(strategy) = input.content_handling_strategy {
+            updated.content_handling_strategy = Some(strategy);
+        }
+        if let Some(credentials_arn) = input.credentials_arn {
+            updated.credentials_arn = Some(credentials_arn);
+        }
+        if let Some(description) = input.description {
+            updated.description = Some(description);
+        }
+        if let Some(behavior) = input.passthrough_behavior {
+            updated.passthrough_behavior = Some(behavior);
+        }
+        if let Some(version) = input.payload_format_version {
+            updated.payload_format_version = Some(version);
+        }
+        if let Some(parameters) = input.request_parameters {
+            updated.request_parameters = parameters.into_iter().collect();
+        }
+        if let Some(templates) = input.request_templates {
+            updated.request_templates = templates.into_iter().collect();
+        }
+        if let Some(parameters) = input.response_parameters {
+            updated.response_parameters = parameters
+                .into_iter()
+                .map(|(selection, parameters)| (selection, parameters.into_iter().collect()))
+                .collect();
+        }
+        if let Some(expression) = input.template_selection_expression {
+            updated.template_selection_expression = Some(expression);
+        }
+        if let Some(timeout_in_millis) = input.timeout_in_millis {
+            updated.timeout_in_millis = timeout_in_millis;
+        }
+        if let Some(config) = input.tls_config {
+            // `TlsConfigInput` carries exactly the one member `TlsConfig` reports.
+            updated.tls_config = Some(TlsConfig {
+                server_name_to_verify: config.server_name_to_verify,
+            });
+        }
+
+        // The MERGED record is what has to hold together, against the same rules the
+        // create applies (`crate::state::validate_integration`): an integration that
+        // drops its subtype has to name a URI again, and one that moves to another type
+        // has to carry a payload format that type supports.
+        if let Err(message) = crate::state::validate_integration(
+            &updated.integration_type,
+            updated.integration_subtype.as_deref(),
+            updated.integration_uri.as_deref(),
+            updated.payload_format_version.as_deref(),
+            &updated.connection_type,
+            updated.connection_id.as_deref(),
+            updated.template_selection_expression.as_deref(),
+        ) {
+            return Err(bad_request(&message));
+        }
+
+        // Read the response back out of the STORE, so what the caller gets is what a
+        // later GetIntegration will report. The integration exists (checked above), so
+        // this replaces its record rather than minting a second one, and its
+        // `IntegrationId` is carried over untouched by the clone.
+        api.integrations
+            .insert(input.integration_id.clone(), updated);
+        let stored = api
+            .integrations
+            .get(&input.integration_id)
+            .map(crate::state::Integration::to_wire)
+            .expect("the integration just written is in the store");
+        Ok(UpdateIntegrationOutput {
+            api_gateway_managed: stored.api_gateway_managed,
+            connection_id: stored.connection_id,
+            connection_type: stored.connection_type,
+            content_handling_strategy: stored.content_handling_strategy,
+            credentials_arn: stored.credentials_arn,
+            description: stored.description,
+            integration_id: stored.integration_id,
+            integration_method: stored.integration_method,
+            integration_response_selection_expression: stored
+                .integration_response_selection_expression,
+            integration_subtype: stored.integration_subtype,
+            integration_type: stored.integration_type,
+            integration_uri: stored.integration_uri,
+            passthrough_behavior: stored.passthrough_behavior,
+            payload_format_version: stored.payload_format_version,
+            request_parameters: stored.request_parameters,
+            request_templates: stored.request_templates,
+            response_parameters: stored.response_parameters,
+            template_selection_expression: stored.template_selection_expression,
+            timeout_in_millis: stored.timeout_in_millis,
+            tls_config: stored.tls_config,
+        })
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the member and the constraint. Takes
+/// the same `&str` the sibling helper in `create_integration` does.
+fn bad_request(message: &str) -> UpdateIntegrationError {
+    UpdateIntegrationErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

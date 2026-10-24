@@ -137,12 +137,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetOutpostErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // The region this request is addressed to: an Outpost is part of its own
+        // region's inventory and of no other's, so that is where the identifier is
+        // resolved.
+        let region = crate::state::request_region(ctx.parts());
         // `OutpostId` accepts the bare id or the full Outpost ARN; both name the
         // same stored record.
         let outpost_id = crate::state::resolve_outpost_id(&input.outpost_id).ok_or_else(|| {
@@ -157,13 +160,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // sees a provisioning Outpost become active exactly when it was owed.
         store.settle_outposts();
         let outpost = store
-            .outposts
-            .get(&outpost_id)
+            .outpost(&region, &outpost_id)
             .map(|record| record.outpost.clone())
             .ok_or_else(|| {
                 GetOutpostErrorModeled::NotFoundException(NotFoundException {
                     // The identifier echo, of the value AS SUPPLIED — not of
-                    // `outpost_id`, which is the bare id an ARN resolved to.
+                    // `outpost_id`, which is the bare id an ARN resolved to. An
+                    // Outpost of another region is as absent here as one that never
+                    // existed.
                     message: Some(crate::state::identifier_not_found(
                         crate::state::OUTPOST_ID_MEMBER,
                         &input.outpost_id,

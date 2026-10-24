@@ -160,19 +160,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartConnectionErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // The region this request is addressed to: the hardware a connection is
+        // started for belongs to an Outpost of its own region, and the connection
+        // the start mints belongs to that same region.
+        let region = crate::state::request_region(ctx.parts());
 
         let mut store = state.lock();
         // A connection installs one Outpost SERVER, named by the `AssetId` of that
         // unit of hardware, so an asset no Outpost of this store holds has no
         // connection to start: the not-found error this call models, worded by the
         // identifier echo of the value as supplied.
-        if store.outpost_with_asset(&input.asset_id).is_none() {
+        if store.outpost_with_asset(&region, &input.asset_id).is_none() {
             return Err(StartConnectionErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::identifier_not_found(
                     crate::state::ASSET_ID_MEMBER,
@@ -211,6 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             connection_id.clone(),
             crate::state::ConnectionRecord {
                 sequence,
+                region,
                 connection_id: connection_id.clone(),
                 asset_id: input.asset_id,
                 device_serial_number: crate::state::non_empty(input.device_serial_number),

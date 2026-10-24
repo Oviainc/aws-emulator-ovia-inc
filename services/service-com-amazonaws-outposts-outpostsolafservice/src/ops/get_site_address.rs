@@ -146,12 +146,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetSiteAddressErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // The region this request is addressed to: a site is part of its own
+        // region's inventory and of no other's, so that is where the identifier is
+        // resolved.
+        let region = crate::state::request_region(ctx.parts());
         // Which of the site's two addresses is being read. See the same step in
         // `UpdateSiteAddress`: the boundary has already refused an unmodelled
         // `AddressType`, and this states that constraint rather than guessing.
@@ -170,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let store = state.lock();
-        let record = store.sites.get(&site_id).ok_or_else(|| {
+        let record = store.site(&region, &site_id).ok_or_else(|| {
             GetSiteAddressErrorModeled::NotFoundException(NotFoundException {
                 // The identifier echo, of the value AS SUPPLIED — not of
                 // `site_id`, which is the bare id an ARN resolved to.

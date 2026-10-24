@@ -177,10 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        // Everything this report answers comes from `input` and the store: the same
-        // Outpost answers the same supported instance types to every caller, so
-        // nothing here reads the request's metadata.
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetOutpostSupportedInstanceTypesErrorModeled::InternalServerException(
@@ -189,6 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
+        // The region this request is addressed to: an Outpost is part of its own
+        // region's inventory and of no other's, so that is where the identifier is
+        // resolved. What the Outpost's hardware then supports is the same for every
+        // caller.
+        let region = crate::state::request_region(ctx.parts());
         // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
         // the same stored Outpost.
         let outpost_id =
@@ -228,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // does not hold is the not-found error this operation models, worded as the
         // identifier echo of the value AS SUPPLIED — not of the bare id an ARN
         // resolved to.
-        let record = store.outposts.get(&outpost_id).ok_or_else(|| {
+        let record = store.outpost(&region, &outpost_id).ok_or_else(|| {
             GetOutpostSupportedInstanceTypesErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::identifier_not_found(
                     crate::state::OUTPOST_IDENTIFIER_MEMBER,
@@ -247,8 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // naming both is answered about the coarser scope it could not resolve.
         if let Some(order_id) = input.order_id.as_deref().filter(|id| !id.is_empty()) {
             let places_this_outpost = store
-                .orders
-                .get(order_id)
+                .order(&region, order_id)
                 .is_some_and(|record| record.order.outpost_id.as_deref() == Some(&outpost_id));
             if !places_this_outpost {
                 return Err(

@@ -55,6 +55,7 @@ mod websocket;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
+use aws_smithy_schema_server::{Violation, ViolationKind};
 use std::sync::Arc;
 
 /// Whether this service serves the request these `parts` came from.
@@ -85,6 +86,41 @@ fn can_handle_parts(parts: &http::request::Parts) -> bool {
         crate::ROUTE_KEY,
         crate::ROUTE_PATH_SEGMENTS,
     )
+}
+
+/// This service's own sentence for one violated member, or `None` for a member it
+/// states no sentence of its own for.
+///
+/// API Gateway words the refusal of some members in the member's OWN terms rather than
+/// in the generic "value at path failed to satisfy constraint" form: an api's protocol
+/// is refused by listing the protocols there are, and an integration's timeout by naming
+/// the window it has to fall in. Each sentence is built from what the MODEL declares for
+/// that member — the enum's catalog, the range's bounds — so it cannot drift from the
+/// constraint it is explaining.
+fn stated_violation(violation: &Violation) -> Option<String> {
+    // Only the FIRST violation of a refusal is offered here, so a request that breaks
+    // several rules at once is stated in the framework's envelope, which lists them all.
+    match (violation.path.as_str(), &violation.kind) {
+        // `CreateApi$ProtocolType` / `ProtocolType`, the enum of the protocols this
+        // control plane serves. The catalog is the generated `PROTOCOL_TYPE_VALUES`
+        // rather than the violation's own list, because the sentence lists the protocols
+        // in the catalog's order and the violation carries them in the model's
+        // declaration order.
+        ("protocolType", ViolationKind::EnumValue(_)) => Some(format!(
+            "Invalid protocol specified. Must be one of [{}]",
+            crate::ops::types::PROTOCOL_TYPE_VALUES.join(", ")
+        )),
+        // `CreateIntegration$TimeoutInMillis`, whose shape declares the window
+        // (`IntegerWithLengthBetween50And30000`, range 50..30000).
+        ("timeoutInMillis", ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)) => {
+            Some(format!(
+                "Timeout should be between {} ms and {} ms",
+                crate::state::MIN_INTEGRATION_TIMEOUT_MILLIS,
+                crate::state::MAX_INTEGRATION_TIMEOUT_MILLIS
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// The `com-amazonaws-apigatewayv2-apigatewayv2` emulated service: the generated [`ServiceDefinition`] plus
@@ -166,16 +202,32 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) BEFORE any handler
+        // runs, so it is where this service names the error shape such a refusal
+        // carries. This model declares exactly one error for a request it cannot
+        // accept — `BadRequestException`, "The request is not valid, for example, the
+        // input is incomplete or incorrect", bound to HTTP 400 on every operation that
+        // writes — and declares no `ValidationException` anywhere, so the framework's
+        // default code names a shape no client of this service can resolve.
+        //
+        // The message is this service's own sentence for the member and the constraint
+        // that failed where the service has one ([`stated_violation`]), and otherwise
+        // the framework's, which already names both.
+        //
+        // A refusal of the caller's IDENTITY is not an invalid request and keeps the
+        // framework's 403 wording.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        let message = violations
+            .first()
+            .and_then(stated_violation)
+            .or_else(|| aws_smithy_schema_server::envelope(violations))
+            .unwrap_or_else(|| "The request is not valid.".to_string());
+        Some(Refused {
+            code: "BadRequestException".to_string(),
+            message,
+        })
     }
 
     fn override_routing_error(

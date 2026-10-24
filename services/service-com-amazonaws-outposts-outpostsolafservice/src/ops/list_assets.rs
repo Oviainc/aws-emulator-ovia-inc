@@ -161,12 +161,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListAssetsErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // The region this request is addressed to: an Outpost is part of its own
+        // region's inventory and of no other's, so that is where the parent is
+        // resolved — and with it the assets installed on it.
+        let region = crate::state::request_region(ctx.parts());
         // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
         // the same stored Outpost.
         let outpost_id =
@@ -198,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An Outpost's assets are listed OFF that Outpost, so one the store does not
         // hold is the not-found error this operation models, worded as the identifier
         // echo of the value AS SUPPLIED — not of the bare id an ARN resolved to.
-        let record = store.outposts.get(&outpost_id).ok_or_else(|| {
+        let record = store.outpost(&region, &outpost_id).ok_or_else(|| {
             ListAssetsErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::identifier_not_found(
                     crate::state::OUTPOST_IDENTIFIER_MEMBER,

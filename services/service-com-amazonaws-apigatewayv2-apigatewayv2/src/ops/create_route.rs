@@ -261,9 +261,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateRouteErrorModeled::ConflictException(ConflictException {
                 message: Some(format!(
-                    "Route with key {} already exists for this API.",
+                    "Route with key {} already exists for this API",
                     input.route_key
                 )),
+            })
+            .into());
+        }
+
+        // A key that is not a duplicate can still be incompatible with one the api
+        // already holds: a path position that is a variable has one name across the
+        // method's path space (see `crate::state::validate_route_key_variables`). Such a
+        // key conflicts with "the current state of a service resource associated with
+        // the request", which is `ConflictException`, the same error a duplicate key
+        // takes.
+        if let Err(message) = crate::state::validate_route_key_variables(
+            &input.route_key,
+            api.routes.values().map(|route| route.route_key.as_str()),
+        ) {
+            return Err(CreateRouteErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
             })
             .into());
         }
@@ -295,6 +311,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // BEFORE an id is minted, so a refused create consumes nothing.
         if let Err(message) = crate::state::validate_route_authorization(
             &authorization_type,
+            input.authorizer_id.as_deref(),
+        ) {
+            return Err(bad_request(&message));
+        }
+
+        // Both of the route's references name a resource of its OWN api, and neither may
+        // be stored unresolved. Checked BEFORE an id is minted, so a refused create
+        // leaves the api's routes exactly as they were.
+        if let Some(message) = api.unresolved_route_reference(
+            input.target.as_deref(),
             input.authorizer_id.as_deref(),
         ) {
             return Err(bad_request(&message));

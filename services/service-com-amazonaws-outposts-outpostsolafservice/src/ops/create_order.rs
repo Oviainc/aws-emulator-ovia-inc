@@ -160,16 +160,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        // Everything this order records comes from `input` and the store: an order
-        // carries no ARN and no region-dependent member, so nothing here reads the
-        // request's metadata.
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateOrderErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // The region this request is addressed to: the Outpost an order is placed on
+        // and the quote it is taken from are resolved in it, and the order the create
+        // records belongs to that same region.
+        let region = crate::state::request_region(ctx.parts());
 
         // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
         // the same stored Outpost, and `Order$OutpostId` is the bare id either way
@@ -214,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Outpost for cannot take one: the not-found error this operation models,
         // worded as the identifier echo of the value AS SUPPLIED — not of the bare id
         // an ARN resolved to.
-        if !store.outposts.contains_key(&outpost_id) {
+        if store.outpost(&region, &outpost_id).is_none() {
             return Err(CreateOrderErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::state::identifier_not_found(
@@ -234,8 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let (Some(quote_id), Some(supplied)) = (quote_id.as_deref(), quote_identifier.as_deref())
         {
             let status = store
-                .quotes
-                .get(quote_id)
+                .quote(&region, quote_id)
                 .map(|record| record.quote.quote_status.clone().unwrap_or_default())
                 .ok_or_else(|| {
                     CreateOrderErrorModeled::NotFoundException(NotFoundException {
@@ -332,6 +332,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             order_id.clone(),
             crate::state::OrderRecord {
                 sequence,
+                // The order belongs to the region this request was addressed to, the
+                // only one it is reachable through.
+                region: region.clone(),
                 order: order.clone(),
                 in_progress_at: Some(std::time::Instant::now() + crate::state::ORDER_PREPARATION),
             },
@@ -339,7 +342,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An order submitted from a quote is what makes that quote's status
         // `ORDER_SUBMITTED` and its `SubmittedOrderId` present — "An order has been
         // submitted for the quote", naming this one.
-        if let Some(record) = quote_id.and_then(|quote_id| store.quotes.get_mut(&quote_id)) {
+        if let Some(record) = quote_id.and_then(|quote_id| store.quote_mut(&region, &quote_id)) {
             record.quote.quote_status =
                 Some(crate::state::QUOTE_STATUS_ORDER_SUBMITTED.to_string());
             record.quote.submitted_order_id = Some(order_id);

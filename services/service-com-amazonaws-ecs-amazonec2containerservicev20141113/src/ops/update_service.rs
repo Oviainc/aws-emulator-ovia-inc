@@ -850,6 +850,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A NEW deployment is a new SERVICE DEPLOYMENT: "A service deployment happens when
+        // you release a software update for the service", which is what minting a
+        // deployment id above stands for, and it supersedes the rollout it replaces.
+        // Scaling the service is not one: the tasks change but the service revision the
+        // service runs does not.
+        if redeploy {
+            guard.start_service_deployment(&key, &region, updated_at);
+        }
+
         let stored = guard
             .services
             .get(&key)
