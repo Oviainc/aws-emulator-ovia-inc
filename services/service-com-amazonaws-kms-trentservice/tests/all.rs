@@ -27,6 +27,8 @@ mod key_deletion_cancellation;
 mod key_lifecycle;
 #[path = "all/key_policy.rs"]
 mod key_policy;
+#[path = "all/key_rotation_on_demand.rs"]
+mod key_rotation_on_demand;
 #[path = "all/key_specs.rs"]
 mod key_specs;
 #[path = "all/multi_region_primary.rs"]
