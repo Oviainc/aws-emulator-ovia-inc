@@ -19,12 +19,12 @@ use ::aws_smithy_schema_server::constraints::{validate, LengthTrait, PatternTrai
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    AutoParticipantRecordingConfiguration, ConflictException, IngestConfiguration,
-    InternalServerException, ParticipantRecordingHlsConfiguration, ParticipantReplica,
-    ParticipantSummary, ParticipantThumbnailConfiguration, ParticipantToken,
+    AutoParticipantRecordingConfiguration, ConflictException, EncoderConfiguration,
+    IngestConfiguration, InternalServerException, ParticipantRecordingHlsConfiguration,
+    ParticipantReplica, ParticipantSummary, ParticipantThumbnailConfiguration, ParticipantToken,
     RedundantIngestCredential, ResourceNotFoundException, S3StorageConfiguration,
     ServiceQuotaExceededException, Stage, StageEndpoints, StageSummary, StorageConfiguration,
-    StorageConfigurationSummary, ValidationException,
+    StorageConfigurationSummary, ValidationException, Video,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -313,6 +313,71 @@ pub const MAX_PARTICIPANT_TOKENS_PER_STAGE: usize = 1_000;
 /// set the same way [`MAX_STAGES`] is and answered with the same modelled
 /// `ServiceQuotaExceededException` (HTTP 402).
 pub const MAX_INGEST_CONFIGURATIONS: usize = 1_000;
+
+/// Encoder configurations this emulator keeps for one engine. Not an AWS quota — this
+/// emulator's own resource guard on the one store `CreateEncoderConfiguration` grows,
+/// set the same way [`MAX_STAGES`] is and answered with the same modelled
+/// `ServiceQuotaExceededException` (HTTP 402). A record is reclaimed only by an
+/// explicit `DeleteEncoderConfiguration`.
+pub const MAX_ENCODER_CONFIGURATIONS: usize = 1_000;
+
+// ---------------------------------------------------------------------------
+// The modelled defaults of an encoder configuration's video settings
+//
+// `EncoderConfiguration$video` is reported for every encoder configuration, and each
+// member of `Video` is optional with a documented default, so a request that supplies
+// none — or only some — still reads back a complete video configuration. Every constant
+// below cites the member doc it comes from; none is this emulator's choice.
+// ---------------------------------------------------------------------------
+
+/// Video-resolution width of an encoder configuration whose request did not set one.
+///
+/// Documented on `Video$width`: "Video-resolution width. This must be an even number.
+/// … Default: 1280."
+pub const DEFAULT_VIDEO_WIDTH: i32 = 1280;
+
+/// Video-resolution height of an encoder configuration whose request did not set one.
+///
+/// Documented on `Video$height`: "Video-resolution height. This must be an even number.
+/// … Default: 720."
+pub const DEFAULT_VIDEO_HEIGHT: i32 = 720;
+
+/// Frame rate of an encoder configuration whose request did not set one.
+///
+/// Documented on `Video$framerate`: "Video frame rate, in fps. Default: 30."
+pub const DEFAULT_VIDEO_FRAMERATE: f32 = 30.0;
+
+/// Output bitrate, in bps, of an encoder configuration whose request did not set one.
+///
+/// Documented on `Video$bitrate`: "Bitrate for generated output, in bps. Default:
+/// 2500000." — the "bitrate 2500 kbps" the `EncoderConfiguration$video` doc names.
+pub const DEFAULT_VIDEO_BITRATE: i32 = 2_500_000;
+
+/// Total pixels (`width` times `height`) a video configuration may reach.
+///
+/// Documented on both `Video$width` and `Video$height`: "Note that the maximum value is
+/// determined by `width` times `height`, such that the maximum total pixels is 2073600
+/// (1920x1080 or 1080x1920)." The model bounds each member on its own (`@range 2..1920`)
+/// and carries no trait for their product, so the handler enforces it and answers the
+/// modelled `ValidationException`.
+pub const MAX_VIDEO_PIXELS: i64 = 2_073_600;
+
+/// The video configuration an encoder configuration holds, given what its creating
+/// request supplied: each member the request left out filled in from the model's
+/// documented default for it.
+///
+/// Every member is reported, so a caller reading `video` back finds the resolution,
+/// frame rate and bitrate the encoder will actually use rather than the absence of the
+/// members it did not name.
+pub fn effective_video(requested: Option<Video>) -> Video {
+    let requested = requested.unwrap_or_default();
+    Video {
+        width: Some(requested.width.unwrap_or(DEFAULT_VIDEO_WIDTH)),
+        height: Some(requested.height.unwrap_or(DEFAULT_VIDEO_HEIGHT)),
+        framerate: Some(requested.framerate.unwrap_or(DEFAULT_VIDEO_FRAMERATE)),
+        bitrate: Some(requested.bitrate.unwrap_or(DEFAULT_VIDEO_BITRATE)),
+    }
+}
 
 /// Storage configurations this emulator keeps for one engine. Not an AWS quota — this
 /// emulator's own resource guard on the one store `CreateStorageConfiguration` grows,
@@ -625,6 +690,37 @@ impl IngestConfigurationRecord {
             // participant token's are: the member is optional, and an absent member is
             // how the model says "none".
             attributes: (!self.attributes.is_empty()).then(|| self.attributes.clone()),
+            // Always reported, empty map included: `tags` is how a caller reads the tags
+            // back, exactly as on a stage.
+            tags: Some(self.tags.clone()),
+        }
+    }
+}
+
+/// One encoder configuration, as `CreateEncoderConfiguration` persisted it and
+/// `GetEncoderConfiguration` reports it.
+#[derive(Debug, Clone)]
+pub struct EncoderConfigurationRecord {
+    /// The encoder-configuration ARN, and the single key every lookup and delete uses.
+    pub arn: String,
+    pub name: Option<String>,
+    /// The transcoding settings. Not optional: every encoder configuration has them,
+    /// with the modelled defaults where the creating request supplied none
+    /// ([`effective_video`]).
+    pub video: Video,
+    pub tags: HashMap<String, String>,
+    /// Creation order, the stable key a listing of encoder configurations pages over
+    /// (`ListEncoderConfigurations`, its own gap issue), set the way a stage's is.
+    pub sequence: u64,
+}
+
+impl EncoderConfigurationRecord {
+    /// The modelled `EncoderConfiguration` this record reports.
+    pub fn to_encoder_configuration(&self) -> EncoderConfiguration {
+        EncoderConfiguration {
+            arn: self.arn.clone(),
+            name: self.name.clone(),
+            video: Some(self.video.clone()),
             // Always reported, empty map included: `tags` is how a caller reads the tags
             // back, exactly as on a stage.
             tags: Some(self.tags.clone()),
@@ -1099,6 +1195,8 @@ pub struct ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
     pub stage_sessions: HashMap<String, Vec<StageSessionRecord>>,
     /// Every live ingest configuration, keyed by its ARN.
     pub ingest_configurations: HashMap<String, IngestConfigurationRecord>,
+    /// Every live encoder configuration, keyed by its ARN.
+    pub encoder_configurations: HashMap<String, EncoderConfigurationRecord>,
     /// Every live storage configuration, keyed by its ARN.
     pub storage_configurations: HashMap<String, StorageConfigurationRecord>,
     /// The started replications of a stage's participants, keyed by that SOURCE stage's
@@ -1224,6 +1322,11 @@ pub const PARTICIPANT_ID_LEN: usize = 12;
 /// `ingest-configuration/`, and caps the whole ARN at 128 characters.
 pub const INGEST_CONFIGURATION_ID_LEN: usize = 12;
 
+/// Characters in a minted encoder-configuration id. The model's
+/// `EncoderConfigurationArn` pattern allows `[a-zA-Z0-9-]+` after
+/// `encoder-configuration/`, and caps the whole ARN at 128 characters.
+pub const ENCODER_CONFIGURATION_ID_LEN: usize = 12;
+
 /// Characters in a minted storage-configuration id. The model's
 /// `StorageConfigurationArn` pattern allows `[a-zA-Z0-9-]+` after
 /// `storage-configuration/`, and caps the whole ARN at 128 characters.
@@ -1269,6 +1372,17 @@ pub fn ingest_configuration_arn(region: &str, ingest_configuration_id: &str) -> 
         "ivs",
         region,
         &format!("ingest-configuration/{ingest_configuration_id}"),
+    )
+}
+
+/// The encoder-configuration ARN for `encoder_configuration_id`, in the form the model's
+/// `EncoderConfigurationArn` pattern requires:
+/// `arn:aws:ivs:<region>:<account>:encoder-configuration/<id>`.
+pub fn encoder_configuration_arn(region: &str, encoder_configuration_id: &str) -> String {
+    ::engine::emulator_arn(
+        "ivs",
+        region,
+        &format!("encoder-configuration/{encoder_configuration_id}"),
     )
 }
 
@@ -2098,8 +2212,9 @@ pub fn arn_resource_type(arn: &str) -> Option<&str> {
 /// The tags attached to the resource `arn` names, or `None` when this store holds no
 /// such resource.
 ///
-/// A stage, an ingest configuration and a storage configuration are the resource types
-/// this store can hold: `CreateStage`, `CreateIngestConfiguration` and
+/// A stage, an ingest configuration, an encoder configuration and a storage
+/// configuration are the resource types this store can hold: `CreateStage`,
+/// `CreateIngestConfiguration`, `CreateEncoderConfiguration` and
 /// `CreateStorageConfiguration` are the creates this service implements, so every other
 /// resource type in its ARN shapes names nothing, and a well-formed ARN naming one is
 /// answered exactly as an ARN naming a deleted stage is — not found. Each such create is
@@ -2112,6 +2227,10 @@ pub fn resource_tags(
         "stage" => state.stages.get(arn).map(|stage| stage.tags.clone()),
         "ingest-configuration" => state
             .ingest_configurations
+            .get(arn)
+            .map(|configuration| configuration.tags.clone()),
+        "encoder-configuration" => state
+            .encoder_configurations
             .get(arn)
             .map(|configuration| configuration.tags.clone()),
         "storage-configuration" => state
@@ -2132,6 +2251,10 @@ pub fn resource_tags_mut<'a>(
         "stage" => state.stages.get_mut(arn).map(|stage| &mut stage.tags),
         "ingest-configuration" => state
             .ingest_configurations
+            .get_mut(arn)
+            .map(|configuration| &mut configuration.tags),
+        "encoder-configuration" => state
+            .encoder_configurations
             .get_mut(arn)
             .map(|configuration| &mut configuration.tags),
         "storage-configuration" => state

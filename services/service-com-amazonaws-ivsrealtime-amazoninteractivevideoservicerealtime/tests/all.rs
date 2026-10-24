@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/empty_response_framing.rs"]
 mod empty_response_framing;
+#[path = "all/encoder_configurations.rs"]
+mod encoder_configurations;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/ingest_configurations.rs"]
