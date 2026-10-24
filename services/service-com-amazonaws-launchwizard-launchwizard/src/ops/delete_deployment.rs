@@ -170,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !deployment.is_deleting_or_deleted() {
             deployment.status = crate::state::STATUS_DELETE_IN_PROGRESS.to_string();
             deployment.modified_at = now;
-            deployment.events.push(crate::state::DeploymentEvent::new(
+            deployment.append_event(crate::state::DeploymentEvent::new(
                 "DeleteInProgress",
                 format!(
                     "Deployment '{}' is deleting the resources it created.",
