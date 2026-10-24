@@ -1309,6 +1309,19 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
         self.catalogs.get(catalog)?.applications.get(&id)
     }
 
+    /// The benefit `identifier` names inside `catalog`, for a reporting operation.
+    ///
+    /// Resolved as [`Catalog::resolve_benefit_id`] does, so both forms the modelled
+    /// `GetBenefit$Identifier` pattern admits (`^(arn:.+|ben-[0-9a-z]{14})$`) name the same
+    /// record. `None` when the catalog does not exist or holds no such benefit — which is
+    /// also the answer for an ARN of another catalog, another service or another resource
+    /// type.
+    pub fn benefit(&self, catalog: &str, identifier: &str) -> Option<&Benefit> {
+        let stored = self.catalogs.get(catalog)?;
+        let id = stored.resolve_benefit_id(catalog, identifier)?;
+        stored.benefits.get(&id)
+    }
+
     /// The allocation `identifier` names inside `catalog`, for a reporting operation.
     ///
     /// Resolved as [`Catalog::resolve_allocation_id`] does, so both forms the modelled

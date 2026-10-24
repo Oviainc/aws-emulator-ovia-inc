@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBenefit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBenefit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the one benefit of one catalog from [`crate::state`], member for member from
+//! the stored record. A pure read: it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBenefit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The benefit catalog is service-owned — the API models no `CreateBenefit` — so the
+//! benefit this reports is one [`crate::state`] seeds at state init, exactly as
+//! `ListBenefits` reports them. `Identifier` accepts either form the modelled pattern
+//! admits (`^(arn:.+|ben-[0-9a-z]{14})$`), and an identifier that names no benefit OF THE
+//! CATALOG the request named — like a catalog the service does not serve — is a modelled
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -162,26 +162,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // The entitlement gate is a service-wide stage, so it sits ahead of this
-        // (unwritten) body too: a caller whose account holds no active AWS partner
-        // benefit is refused with the modelled `AccessDeniedException`, which is the
-        // WHOLE answer the service gives such a request — no unimplemented behaviour is
-        // involved. An entitled caller still gets the 501 below.
+        // The entitlement gate, ahead of everything else this handler does — see
+        // [`crate::state::entitlement_refusal`].
         if let Some(denied) = crate::state::entitlement_refusal(&*self.engine) {
             return Err(GetBenefitErrorModeled::AccessDeniedException(denied).into());
         }
-        // Implement `GetBenefit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBenefitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBenefit"))
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetBenefitErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `Catalog`'s and `Identifier`'s own patterns are refused by the centralized walk
+        // before this body runs.
+        let region = crate::state::request_region(ctx);
+
+        let store = state.lock();
+        if !store.catalogs.contains_key(&input.catalog) {
+            return Err(GetBenefitErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::not_found_message(
+                        crate::state::CATALOG_KIND,
+                        &input.catalog,
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Either form the modelled `Identifier` admits names the same record; an ARN of
+        // another catalog, service or resource type names none.
+        let Some(benefit) = store.benefit(&input.catalog, &input.identifier) else {
+            return Err(GetBenefitErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::not_found_message(
+                        crate::state::BENEFIT_KIND,
+                        &input.identifier,
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Every member is read off the stored record, except the ARN, which carries the
+        // region this request was signed for (the store keeps none), and `Catalog`, which
+        // is the catalog the record was found in. `BenefitRequestSchema` is absent for a
+        // benefit whose request needs no fields, rather than reported as an empty schema.
+        Ok(GetBenefitOutput {
+            id: Some(benefit.id.clone()),
+            catalog: Some(input.catalog.clone()),
+            arn: Some(crate::state::benefit_arn(
+                &region,
+                &input.catalog,
+                &benefit.id,
+            )),
+            name: Some(benefit.name.clone()),
+            description: Some(benefit.description.clone()),
+            programs: Some(benefit.programs.clone()),
+            fulfillment_types: Some(benefit.fulfillment_types.clone()),
+            benefit_request_schema: benefit.benefit_request_schema.clone(),
+            status: Some(benefit.status.clone()),
+        })
     }
 }
