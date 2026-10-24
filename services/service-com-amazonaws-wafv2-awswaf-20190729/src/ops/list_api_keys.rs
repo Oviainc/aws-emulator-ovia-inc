@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAPIKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAPIKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Enumerates the API keys stored under the requested `Scope`, in the order they were
+//! created, one page at a time: at most `Limit` summaries, resuming after
+//! `NextMarker`. Each summary carries the key as it was stored — its value, the token
+//! domains it was defined with, when it was created and its version — so a listing
+//! reports persisted keys and never a value recomputed from the listing's own request.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAPIKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Like the sibling listings of this service, EVERY non-empty page answers a
+//! `NextMarker` (the cursor of its LAST summary, whether or not the page is full) and
+//! only the empty page that follows the last one carries none, which is what ends a
+//! paginator's loop. The marker is this service's own opaque cursor
+//! ([`crate::state::api_key_cursor`]): `ListAPIKeysResponse$NextMarker` is
+//! `length 1..256` while an `APIKey` is up to 2048 characters, so the key value itself
+//! cannot be a marker.
+//!
+//! A listing REPORTS: nothing here writes to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +177,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAPIKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAPIKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAPIKeys"))
+        // A read: `ctx` carries only request metadata, which this operation does not
+        // need, and nothing here writes to the store.
+        let _ = ctx;
+        // `Scope`'s enum membership is refused at the request boundary, which words
+        // the member's own constraint, so this is the handler's own guard: a scope
+        // that ever reaches it unchecked is reported as WAF's own invalid-parameter
+        // refusal rather than silently listing the keys of no namespace.
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(ListAPIKeysErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_SCOPE_VALUE,
+                    &input.scope,
+                    "the scope names the namespace the API keys live in, and is one of CLOUDFRONT or REGIONAL",
+                ),
+            )
+            .into());
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAPIKeysErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // Only this scope's keys, in creation order — the order a marker names a
+        // position in.
+        let mut entries = state.api_keys_in_scope(&input.scope);
+
+        // `NextMarker` is the cursor of the last summary of the previous page, so
+        // this page starts at the first key created after it.
+        if let Some(marker) = input.next_marker.as_deref() {
+            entries.retain(|entry| entry.cursor.as_str() > marker);
+        }
+
+        // Absent `Limit`, a page holds as many as the model's `PaginationLimit`
+        // range allows; a `Limit` outside it is refused rather than clamped — at the
+        // boundary, by the member's own modelled range, and here through the one
+        // reading of that range every paginated operation of this service shares.
+        let page_size = crate::state::page_size(input.limit, "summaries")
+            .map_err(ListAPIKeysErrorModeled::WAFInvalidParameterException)?;
+        entries.truncate(page_size);
+
+        // The cursor of the page's LAST summary, so a client resumes from it and
+        // learns it reached the end from the empty page that follows. An empty page
+        // has no last cursor and so carries no marker, which is also what
+        // `NextMarker`'s own `length 1..256` requires.
+        let next_marker = entries.last().map(|entry| entry.cursor.clone());
+        let api_key_summaries = entries
+            .into_iter()
+            .map(|entry| APIKeySummary {
+                api_key: Some(entry.api_key.clone()),
+                token_domains: Some(entry.token_domains.clone()),
+                creation_timestamp: Some(::aws_smithy_types::DateTime::from_millis(
+                    entry.created_at_millis,
+                )),
+                version: entry.version,
+            })
+            .collect();
+
+        Ok(ListAPIKeysOutput {
+            next_marker,
+            api_key_summaries: Some(api_key_summaries),
+            // WAF answers an application integration URL for the CAPTCHA JavaScript
+            // integration it hosts, which this emulator does not host — the same
+            // stance `GetWebACL` takes on the member.
+            application_integration_url: None,
+        })
     }
 }
