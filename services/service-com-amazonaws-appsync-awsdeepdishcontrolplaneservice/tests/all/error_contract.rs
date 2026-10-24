@@ -50,18 +50,21 @@ const AUTHENTICATION_TYPES: &[&str] = &[
 ];
 
 /// One answer from the emulator: the parts a client branches on.
+///
+/// Shared with the other suites that assert this service's error contract, so every
+/// one of them reads the status, the error shape and the message the same way.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     /// The `x-amzn-errortype` header restJson1 resolves the error shape from.
-    error_type: String,
+    pub(crate) error_type: String,
     /// The error body's `message`, or the empty string when there is none.
-    message: String,
-    body: Value,
+    pub(crate) message: String,
+    pub(crate) body: Value,
 }
 
 /// A router with only this service mounted, over a fresh engine.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -70,7 +73,7 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Send one request and return what the emulator answered.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -132,7 +135,7 @@ fn create_graphql_api_body(name: &str) -> Value {
 }
 
 /// Create one GraphQL API and return the `apiId` the service minted for it.
-async fn create_api(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn create_api(router: &MultiServiceRouter, name: &str) -> String {
     let answer = call(
         router,
         "POST",

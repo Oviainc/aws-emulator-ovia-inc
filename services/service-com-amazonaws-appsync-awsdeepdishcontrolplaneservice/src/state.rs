@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AdditionalAuthenticationProvider, ApiKey, DataSource, DynamodbDataSourceConfig,
+    AdditionalAuthenticationProvider, ApiCache, ApiKey, DataSource, DynamodbDataSourceConfig,
     ElasticsearchDataSourceConfig, EnhancedMetricsConfig, EventBridgeDataSourceConfig, GraphqlApi,
     HttpDataSourceConfig, LambdaAuthorizerConfig, LambdaDataSourceConfig, LogConfig,
     OpenIDConnectConfig, OpenSearchServiceDataSourceConfig, RelationalDatabaseDataSourceConfig,
@@ -59,6 +59,10 @@ pub struct GraphqlApiRecord {
     pub created_at: SystemTime,
     /// The API keys created under this API, keyed by key id.
     pub api_keys: BTreeMap<String, ApiKeyRecord>,
+    /// The API's cache, or `None` while it has none: an API holds at most one
+    /// `ApiCache` (`CreateApiCache` "Creates a cache for the GraphQL API", and
+    /// `GetApiCache` resolves it from the `apiId` alone).
+    pub api_cache: Option<ApiCacheRecord>,
     /// The data sources created under this API, keyed by their caller-supplied
     /// name — the name is what every data-source operation addresses one by, so it
     /// identifies the data source within its API and no second key is needed.
@@ -110,6 +114,59 @@ impl GraphqlApiRecord {
             query_depth_limit: self.query_depth_limit,
             resolver_count_limit: self.resolver_count_limit,
             enhanced_metrics_config: self.enhanced_metrics_config.clone(),
+        }
+    }
+}
+
+/// One stored `ApiCache` of a `GraphqlApiRecord`.
+///
+/// Every member of the modelled `ApiCache` shape the create call can set is kept, so
+/// the create and `GetApiCache` project exactly what was created rather than a subset.
+#[derive(Debug, Clone)]
+pub struct ApiCacheRecord {
+    pub ttl: i64,
+    pub api_caching_behavior: String,
+    pub r#type: String,
+    pub transit_encryption_enabled: bool,
+    pub at_rest_encryption_enabled: bool,
+    pub health_metrics_config: Option<String>,
+    /// The `ApiCacheStatus` the cache instance is in.
+    pub status: String,
+    /// The instant the cache the clock is provisioning (or re-provisioning) becomes
+    /// available, or `None` once nothing is owed. Stored rather than slept on: see
+    /// [`CACHE_SPAN`].
+    pub available_at: Option<SystemTime>,
+}
+
+impl ApiCacheRecord {
+    /// Materialise the transition to [`CACHE_AVAILABLE`] the CLOCK already made due
+    /// at `now`.
+    ///
+    /// Owed by the clock alone: the due instant was recorded by the call that started
+    /// the provisioning, so the same transition is applied whether or not anybody read
+    /// the cache in between.
+    pub fn settle(&mut self, now: SystemTime) {
+        let Some(due) = self.available_at else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.available_at = None;
+        self.status = CACHE_AVAILABLE.to_string();
+    }
+
+    /// This record as the modelled `ApiCache` shape — the single projection the
+    /// create and the read both answer with.
+    pub fn to_api_cache(&self) -> ApiCache {
+        ApiCache {
+            ttl: self.ttl,
+            api_caching_behavior: Some(self.api_caching_behavior.clone()),
+            transit_encryption_enabled: self.transit_encryption_enabled,
+            at_rest_encryption_enabled: self.at_rest_encryption_enabled,
+            r#type: Some(self.r#type.clone()),
+            status: Some(self.status.clone()),
+            health_metrics_config: self.health_metrics_config.clone(),
         }
     }
 }
@@ -239,11 +296,14 @@ pub fn data_source_resource(api_id: &str, name: &str) -> String {
 }
 
 /// The text a `NotFoundException` (HTTP 404) carries for a data source the named API
-/// does not hold. No recording pins AppSync's own wording, so the requirement this
-/// answers is the status and the error shape; the text names the absent data source,
-/// which is what the caller has to act on.
+/// does not hold: the absent data source, which is what the caller has to act on.
+///
+/// The requirement the refusal answers is the status and the error shape; the wording
+/// is the one a recorded `GetDataSource` on a name no create left behind answers with,
+/// which is a fixed template over the requested name rather than anything of the
+/// request's own values.
 pub fn data_source_not_found_message(name: &str) -> String {
-    format!("No data source found named {name}.")
+    format!("Data source {name} not found")
 }
 
 /// The text a `BadRequestException` (HTTP 400) carries for a create whose name is
@@ -364,6 +424,16 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
     pub fn settle_associations(&mut self, now: SystemTime) {
         for association in self.source_api_associations.values_mut() {
             association.settle(now);
+        }
+    }
+
+    /// Apply every cache transition the clock owes at `now`, so a cache reports the
+    /// same status to every caller whether or not another call touched it first.
+    pub fn settle_api_caches(&mut self, now: SystemTime) {
+        for api in self.graphql_apis.values_mut() {
+            if let Some(cache) = api.api_cache.as_mut() {
+                cache.settle(now);
+            }
         }
     }
 
@@ -549,6 +619,125 @@ pub const MERGE_SUCCESS_DETAIL: &str = "The source API was merged into the Merge
 /// still observes it. Nothing sleeps for it — the due instant is stored on the record
 /// and [`SourceApiAssociationRecord::settle`] applies it.
 pub const MERGE_SPAN: Duration = Duration::from_millis(500);
+
+/// The smallest `ttl` an API cache accepts, in seconds.
+///
+/// Source: `CreateApiCacheRequest$ttl` and `UpdateApiCacheRequest$ttl`, both
+/// documented "TTL in seconds for cache entries. Valid values are 1–3,600 seconds".
+/// The members target an unconstrained `Long`, so the window is the service's to
+/// enforce rather than the request boundary's.
+pub const CACHE_TTL_MIN_SECONDS: i64 = 1;
+
+/// The largest `ttl` an API cache accepts, in seconds
+/// ([`CACHE_TTL_MIN_SECONDS`] states the source).
+pub const CACHE_TTL_MAX_SECONDS: i64 = 3_600;
+
+/// Whether `ttl` is inside the documented cache-entry window
+/// ([`CACHE_TTL_MIN_SECONDS`]..=[`CACHE_TTL_MAX_SECONDS`]).
+pub fn is_cache_ttl(ttl: i64) -> bool {
+    (CACHE_TTL_MIN_SECONDS..=CACHE_TTL_MAX_SECONDS).contains(&ttl)
+}
+
+/// AppSync's refusal text for a `ttl` outside the documented window
+/// ([`is_cache_ttl`]): the window itself, built from the two bounds, so the caller can
+/// correct the value from the message alone.
+pub fn invalid_cache_ttl_message() -> String {
+    format!(
+        "TTL value cannot be smaller than {CACHE_TTL_MIN_SECONDS} second and larger than \
+         {CACHE_TTL_MAX_SECONDS} seconds."
+    )
+}
+
+/// The `ApiCacheStatus` a cache being provisioned carries: "The instance is currently
+/// creating."
+pub const CACHE_CREATING: &str = "CREATING";
+
+/// The `ApiCacheStatus` a cache whose settings are being applied carries.
+pub const CACHE_MODIFYING: &str = "MODIFYING";
+
+/// The `ApiCacheStatus` a provisioned cache carries: "The instance is available for
+/// use."
+pub const CACHE_AVAILABLE: &str = "AVAILABLE";
+
+/// How long after a cache is created or updated the instance becomes available.
+///
+/// A chosen span, inside the emulator's 250-750 ms band for a transition the clock
+/// owes: AppSync reports a fresh cache in the non-terminal [`CACHE_CREATING`] status,
+/// so the span is never zero and a caller reading straight after the create still
+/// observes it. Nothing sleeps for it — the due instant is stored on the record and
+/// [`ApiCacheRecord::settle`] applies it.
+pub const CACHE_SPAN: Duration = Duration::from_millis(500);
+
+/// The text `NotFoundException` (HTTP 404) carries for an API that holds no cache: the
+/// absent resource and the call that would create it.
+pub const CACHE_NOT_FOUND_MESSAGE: &str =
+    "Unable to get the cache as it doesn't exist, please create the cache first.";
+
+/// The text `BadRequestException` (HTTP 400) carries for a create on an API that
+/// already holds a cache: an API holds at most one.
+pub const CACHE_ALREADY_EXISTS_MESSAGE: &str =
+    "The API already has a cache. Delete the existing cache before creating another one.";
+
+/// The `DataSourceType` of an HTTP endpoint, the one type whose need for a service
+/// role depends on how the endpoint is authorized ([`data_source_needs_service_role`]).
+pub const HTTP_DATA_SOURCE_TYPE: &str = "HTTP";
+
+/// The `AuthorizationType` an `HttpDataSourceConfig` selects to have AppSync sign its
+/// requests to the endpoint with IAM credentials — which it can only do by assuming a
+/// role. Source: the `AuthorizationType` enum, whose only value this is.
+pub const IAM_AUTHORIZATION_TYPE: &str = "AWS_IAM";
+
+/// Every `DataSourceType` AppSync reaches by assuming the data source's service role.
+///
+/// Source: `DataSource$type`, which says what each type IS (a Lambda function, a
+/// DynamoDB table, an OpenSearch domain, an EventBridge configuration, the Bedrock
+/// runtime, a relational database), and `serviceRoleArn` — "The system assumes this
+/// role when accessing the data source". The two types left out are the two AppSync
+/// reaches without credentials of its own: `NONE` ("There is no data source") and
+/// [`HTTP_DATA_SOURCE_TYPE`] (a plain endpoint), the latter only while its
+/// `authorizationConfig` does not select [`IAM_AUTHORIZATION_TYPE`].
+pub const ROLE_ASSUMING_DATA_SOURCE_TYPES: &[&str] = &[
+    "AMAZON_BEDROCK_RUNTIME",
+    "AMAZON_DYNAMODB",
+    "AMAZON_ELASTICSEARCH",
+    "AMAZON_EVENTBRIDGE",
+    "AMAZON_OPENSEARCH_SERVICE",
+    "AWS_LAMBDA",
+    "RELATIONAL_DATABASE",
+];
+
+/// Whether these HTTP endpoint settings have AppSync sign its calls to the endpoint
+/// with IAM credentials, which it can only do by assuming the data source's service
+/// role ([`data_source_needs_service_role`]).
+///
+/// `false` for a data source that carries no `httpConfig`, and for one whose
+/// `authorizationConfig` names another authorization type. Shared by the create and
+/// the update, so the two cannot disagree about one configuration.
+pub fn selects_iam_authorization(http_config: Option<&HttpDataSourceConfig>) -> bool {
+    http_config
+        .and_then(|config| config.authorization_config.as_ref())
+        .is_some_and(|authorization| {
+            authorization.authorization_type == IAM_AUTHORIZATION_TYPE
+        })
+}
+
+/// Whether AppSync must assume a role to reach a data source of this `type`, i.e.
+/// whether `serviceRoleArn` has to be present for the data source to be invocable.
+///
+/// `iam_authorized` says whether the request's `httpConfig` selects
+/// [`IAM_AUTHORIZATION_TYPE`], which is what makes an otherwise credential-free HTTP
+/// endpoint need a role; it is ignored for every other type.
+pub fn data_source_needs_service_role(data_source_type: &str, iam_authorized: bool) -> bool {
+    if data_source_type == HTTP_DATA_SOURCE_TYPE {
+        return iam_authorized;
+    }
+    ROLE_ASSUMING_DATA_SOURCE_TYPES.contains(&data_source_type)
+}
+
+/// The text `BadRequestException` (HTTP 400) carries for a data source whose type
+/// needs a service role ([`data_source_needs_service_role`]) and whose request carried
+/// none: the absent member.
+pub const SERVICE_ROLE_NOT_SPECIFIED_MESSAGE: &str = "Service role arn not specified.";
 
 /// Whether `candidate` could identify an API at all: an API id ([`is_api_id`]) or a
 /// full resource ARN.

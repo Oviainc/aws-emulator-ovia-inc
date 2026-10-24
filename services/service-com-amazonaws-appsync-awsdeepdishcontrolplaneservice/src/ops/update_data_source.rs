@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDataSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDataSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDataSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: enforces the same service-role requirement as the create, then
+//! replaces the stored `DataSource`'s settings in [`crate::state`]. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +166,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDataSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDataSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDataSource"))
+        // The new settings come from the deserialized input; the stored ARN is kept,
+        // so no request metadata takes part and `ctx` is unused.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateDataSourceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(UpdateDataSourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // The same requirement as the create: a data source of a type AppSync can
+        // only reach by assuming a role cannot be left without one, so an update that
+        // would do so is refused before the stored record is touched.
+        if crate::state::data_source_needs_service_role(
+            &input.r#type,
+            crate::state::selects_iam_authorization(input.http_config.as_ref()),
+        ) && input
+            .service_role_arn
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            return Err(UpdateDataSourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::SERVICE_ROLE_NOT_SPECIFIED_MESSAGE.to_string()),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        let mut guard = state.lock();
+        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
+            return Err(UpdateDataSourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+        let Some(data_source) = api.data_sources.get_mut(&input.name) else {
+            return Err(UpdateDataSourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::data_source_not_found_message(&input.name)),
+            })
+            .into());
+        };
+
+        // Every settable member of the request is "the new …" value, so the update
+        // REPLACES what was stored rather than merging into it: a configuration the
+        // request omits is gone from the data source. The name and the ARN identify
+        // the record and are not settable.
+        data_source.description = input.description;
+        data_source.r#type = input.r#type;
+        data_source.service_role_arn = input.service_role_arn;
+        data_source.dynamodb_config = input.dynamodb_config;
+        data_source.lambda_config = input.lambda_config;
+        data_source.elasticsearch_config = input.elasticsearch_config;
+        data_source.open_search_service_config = input.open_search_service_config;
+        data_source.http_config = input.http_config;
+        data_source.relational_database_config = input.relational_database_config;
+        data_source.event_bridge_config = input.event_bridge_config;
+        data_source.metrics_config = input.metrics_config;
+
+        // Answer from the STORED record, so this body is the one `GetDataSource` and
+        // `ListDataSources` answer with next.
+        Ok(UpdateDataSourceOutput {
+            data_source: Some(data_source.to_data_source()),
+        })
     }
 }

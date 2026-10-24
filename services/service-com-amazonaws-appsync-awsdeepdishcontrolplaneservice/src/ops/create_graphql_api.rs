@@ -379,8 +379,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             environment_variables: std::collections::BTreeMap::new(),
             created_at: std::time::SystemTime::now(),
             api_keys: std::collections::BTreeMap::new(),
-            // Data sources are created by `CreateDataSource`, so a fresh API holds
-            // none.
+            // A fresh API holds no cache and no data source: `CreateApiCache` and
+            // `CreateDataSource` are what create them.
+            api_cache: None,
             data_sources: std::collections::BTreeMap::new(),
         };
 
