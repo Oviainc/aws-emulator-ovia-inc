@@ -15,7 +15,12 @@
 //! `CreateConfiguration` stores a [`ConfigurationRecord`] and both
 //! `ListConfigurations` and `DescribeConfiguration` render it with
 //! [`ConfigurationRecord::to_configuration`], so the writer and every reader
-//! agree on one record.
+//! agree on one record. A configuration's revisions are an append-only history
+//! on that record: `UpdateConfiguration` adds the next one with
+//! [`ConfigurationRecord::append_revision`] and
+//! `DescribeConfigurationRevision` reports a stored one through
+//! [`ConfigurationRecord::revision`], so no update rewrites a revision an
+//! earlier call already stored.
 //!
 //! The topic registry lives beside it, keyed by (cluster ARN, topic name): a topic
 //! belongs to exactly one cluster, so `CreateTopic`, `DescribeTopic`, `ListTopics`
@@ -850,6 +855,44 @@ pub const MAX_CONFIGURATIONS_PER_REGION: usize = 100;
 /// still let a caller grow the store by naming new regions.
 pub const MAX_CONFIGURATIONS_IN_REGISTRY: usize = MAX_CONFIGURATIONS_PER_REGION * 64;
 
+/// How many revisions this emulator keeps for one configuration.
+///
+/// CHOSEN as a process-safety backstop, not an AWS quota: every update call
+/// appends a revision holding the body the request submitted, so an unbounded
+/// history would grow the store with the number of calls. Sized well past any
+/// realistic client script's update count, and enforced by refusing the append
+/// rather than evicting a revision, because a stored revision is immutable: a
+/// reader of an earlier revision must still see the body it was stored with.
+pub const MAX_REVISIONS_PER_CONFIGURATION: usize = 100;
+
+/// How many bytes of `server.properties` one stored configuration revision may
+/// hold.
+///
+/// CHOSEN as a process-safety backstop, not an AWS quota: the modelled member is
+/// a blob with no length constraint, so without a ceiling a single call could
+/// store an arbitrarily large body. Sized far past any realistic
+/// `server.properties` file, which holds at most a few hundred short properties.
+pub const MAX_SERVER_PROPERTIES_BYTES: usize = 256 * 1024;
+
+/// Whether a submitted `server.properties` body is longer than this emulator
+/// stores for one revision. The one test both paths that store a body (a create
+/// and an update) apply, so a stored body is bounded whichever call stored it.
+pub fn server_properties_too_large(body: &[u8]) -> bool {
+    body.len() > MAX_SERVER_PROPERTIES_BYTES
+}
+
+/// Why an append to a configuration's revision history was refused. Decided on
+/// the one append path ([`ConfigurationRecord::append_revision`]) rather than by
+/// each caller, and leaving the history exactly as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionRejected {
+    /// The configuration already holds [`MAX_REVISIONS_PER_CONFIGURATION`]
+    /// revisions.
+    HistoryFull,
+    /// The submitted body is longer than [`MAX_SERVER_PROPERTIES_BYTES`].
+    BodyTooLarge,
+}
+
 /// One MSK VPC connection: a client VPC's private (PrivateLink) connection to a
 /// cluster, as `CreateVpcConnection` requested it. The whole submitted
 /// configuration is held here so every reader computes its answer from the
@@ -1656,6 +1699,20 @@ impl ComAmazonawsKafkaKafkaState {
     pub fn configuration_in(&self, region: &str, arn: &str) -> Option<&ConfigurationRecord> {
         self.configurations
             .get(arn)
+            .filter(|configuration| configuration.region == region)
+    }
+
+    /// The configuration `arn` names, mutably, as an endpoint for `region` sees
+    /// it — the write counterpart of [`Self::configuration_in`], following the
+    /// same regional rule, so an update and a read resolve a configuration
+    /// identically.
+    pub fn configuration_in_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut ConfigurationRecord> {
+        self.configurations
+            .get_mut(arn)
             .filter(|configuration| configuration.region == region)
     }
 
@@ -2616,6 +2673,51 @@ impl ConfigurationRecord {
             .expect("a configuration always holds at least revision 1")
     }
 
+    /// Store `server_properties` as this configuration's next revision and hand
+    /// the stored revision back.
+    ///
+    /// A configuration's revision history is append-only: the submitted body
+    /// becomes the revision one past the current latest and no stored revision
+    /// is ever rewritten, which is what lets a reader of an earlier revision see
+    /// the body that revision was created with. `description` is that revision's
+    /// own description — empty when the request named none, since
+    /// `ConfigurationRevision$Description` reports it.
+    ///
+    /// This is the one append path, so it is also the one place the history's
+    /// ceilings are enforced: it refuses, storing nothing, a body past
+    /// [`MAX_SERVER_PROPERTIES_BYTES`] and an append past
+    /// [`MAX_REVISIONS_PER_CONFIGURATION`].
+    pub fn append_revision(
+        &mut self,
+        now: SystemTime,
+        description: String,
+        server_properties: Vec<u8>,
+    ) -> Result<&ConfigurationRevisionRecord, RevisionRejected> {
+        if server_properties_too_large(&server_properties) {
+            return Err(RevisionRejected::BodyTooLarge);
+        }
+        if self.revisions.len() >= MAX_REVISIONS_PER_CONFIGURATION {
+            return Err(RevisionRejected::HistoryFull);
+        }
+        let revision = self.latest_revision().revision + 1;
+        self.revisions.push(ConfigurationRevisionRecord {
+            revision,
+            creation_time: now,
+            description,
+            server_properties,
+        });
+        Ok(self.latest_revision())
+    }
+
+    /// The stored revision numbered `revision`, or `None` when this
+    /// configuration holds no such revision — the distinction between a revision
+    /// number a reader reports and one it must refuse as absent.
+    pub fn revision(&self, revision: i64) -> Option<&ConfigurationRevisionRecord> {
+        self.revisions
+            .iter()
+            .find(|stored| stored.revision == revision)
+    }
+
     /// The configuration as the `Configuration` shape `ListConfigurations` and
     /// `DescribeConfiguration` report, so every reader of this record renders it
     /// the same way.
@@ -2626,13 +2728,21 @@ impl ConfigurationRecord {
             creation_time: ::aws_smithy_types::DateTime::from(self.creation_time),
             description: self.description.clone(),
             kafka_versions: self.kafka_versions.clone(),
-            latest_revision: ConfigurationRevision {
-                creation_time: ::aws_smithy_types::DateTime::from(latest.creation_time),
-                description: Some(latest.description.clone()),
-                revision: latest.revision,
-            },
+            latest_revision: latest.to_configuration_revision(),
             name: self.name.clone(),
             state: self.state.clone(),
+        }
+    }
+}
+
+impl ConfigurationRevisionRecord {
+    /// This revision as the modelled `ConfigurationRevision` shape, so the
+    /// writer and every reader of a stored revision render it the same way.
+    pub fn to_configuration_revision(&self) -> ConfigurationRevision {
+        ConfigurationRevision {
+            creation_time: ::aws_smithy_types::DateTime::from(self.creation_time),
+            description: Some(self.description.clone()),
+            revision: self.revision,
         }
     }
 }

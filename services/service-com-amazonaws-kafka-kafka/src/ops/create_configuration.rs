@@ -192,6 +192,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // `ServerProperties` is stored verbatim as this configuration's first
+        // revision, so the body this emulator will keep for one revision is
+        // bounded here too — the same test the append path applies, so a stored
+        // body is bounded whichever call stored it. Checked before the lock is
+        // taken: it depends on the request alone.
+        if crate::state::server_properties_too_large(&input.server_properties) {
+            return Err(
+                CreateConfigurationErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("serverProperties".to_string()),
+                    message: Some(format!(
+                        "ServerProperties must be at most {} bytes.",
+                        crate::state::MAX_SERVER_PROPERTIES_BYTES
+                    )),
+                })
+                .into(),
+            );
+        }
+
         // `KafkaVersions` enumerates the Apache Kafka versions this configuration
         // may be applied to, so every entry has to BE one of the versions this
         // service publishes — the one catalogue `ListKafkaVersions` reports and
@@ -256,11 +274,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time: Some(::aws_smithy_types::DateTime::from(
                 configuration.creation_time,
             )),
-            latest_revision: Some(ConfigurationRevision {
-                creation_time: ::aws_smithy_types::DateTime::from(latest.creation_time),
-                description: Some(latest.description.clone()),
-                revision: latest.revision,
-            }),
+            // Rendered through the ONE rendering of a stored revision, so this
+            // writer and every reader of the record report a revision the same
+            // way.
+            latest_revision: Some(latest.to_configuration_revision()),
             name: Some(configuration.name.clone()),
             state: Some(configuration.state.clone()),
         };

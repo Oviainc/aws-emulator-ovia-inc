@@ -14,6 +14,9 @@ Issue-Commit: 6b8dcd825499bdd91675cbbb3bc6eaac525bf5b8
 DescribeConfigurationRevision
 
 ## Description
+
+> _Status update: `DescribeConfigurationRevision` is NO LONGER a stub. It was implemented, and its `//! SCAFFOLDED, NOT IMPLEMENTED:` census line deleted, by the fix for `20261024T113950Z-kafka-updateconfiguration-stub.md`: the revision reader is what proves an appended revision persisted, so the update fix could not be verified without it. The handler now reports a stored revision's ARN, instant, description, number and `server.properties` body from the service's state (see `services/service-com-amazonaws-kafka-kafka/src/ops/describe_configuration_revision.rs` and the suites in `services/service-com-amazonaws-kafka-kafka/tests/all/configuration_revisions.rs`). What remains for whoever picks this report up is to confirm the recorded unit below now replays, and then to move this report to `issues/things-that-now-work/`._
+
 `DescribeConfigurationRevision` is an unmodified scaffold stub, so it answers HTTP 501 and persists nothing. Implement it in `services/service-com-amazonaws-kafka-kafka/src/ops/describe_configuration_revision.rs`: replace the `Err(crate::scaffolded::Scaffolded::not_implemented(..))` with a real handler that reads and writes the service's state, then DELETE that file's `//! SCAFFOLDED, NOT IMPLEMENTED:` header line.
 
 That header line is the stub census — the one record of which operations are still scaffolds. Deleting it without implementing the handler, or leaving it in place on a handler you did implement, corrupts that record rather than closing this issue. A stub's 501 is also CORRECT for a stub: this issue asks you to implement the operation, never to change the error it returns while unimplemented.

@@ -23,6 +23,8 @@ mod cluster_lifecycle;
 mod compatible_kafka_versions;
 #[path = "all/configuration_lifecycle.rs"]
 mod configuration_lifecycle;
+#[path = "all/configuration_revisions.rs"]
+mod configuration_revisions;
 #[path = "all/connectivity_update.rs"]
 mod connectivity_update;
 #[path = "all/describe_cluster_v2.rs"]
