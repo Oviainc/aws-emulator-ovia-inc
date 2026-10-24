@@ -324,7 +324,7 @@ async fn a_scaffolded_operation_still_answers_501() {
     // plane (`grep -l 'SCAFFOLDED, NOT IMPLEMENTED' src/ops/`).
     let cases: Vec<(&str, Value)> = vec![
         ("ListResourceTags", json!({"KeyId": key_id})),
-        ("GetKeyPolicy", json!({"KeyId": key_id, "PolicyName": "default"})),
+        ("ListKeyPolicies", json!({"KeyId": key_id})),
         ("EnableKeyRotation", json!({"KeyId": key_id})),
         (
             "GenerateDataKey",

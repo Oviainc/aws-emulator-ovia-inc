@@ -40,6 +40,11 @@ const SCHEMA_MAPPING_ALREADY_EXISTS: &str = "SchemaMapping already exists.";
 const MATCHING_WORKFLOW_DELETED: &str = "MatchingWorkflow Deleted.";
 const MATCHING_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
 const MATCHING_WORKFLOW_ALREADY_EXISTS: &str = "MatchingWorkflow already exists.";
+/// The not-found text every ID-namespace path answers, as the recorded corpus shows
+/// it: a CONSTANT that names no namespace, in the same `<ResourceType> Not Found` form
+/// as [`MATCHING_WORKFLOW_NOT_FOUND`].
+const ID_NAMESPACE_NOT_FOUND: &str = "IdNamespace Not Found";
+const ID_NAMESPACE_DELETED: &str = "IdNamespace Deleted.";
 
 /// `DeleteMatchingWorkflow` is the one path whose text is a template over the
 /// request: the `workflowName` `@httpLabel` the caller asked for is substituted in.
@@ -335,6 +340,95 @@ async fn delete_matching_workflow_not_found_substitutes_the_requested_name() {
              answer the same not-found text"
         );
     }
+}
+
+#[tokio::test]
+async fn every_id_namespace_path_answers_the_same_constant_not_found_text() {
+    let emulator = Emulator::new();
+    let mut texts = BTreeSet::new();
+    // The whole configuration `UpdateIdNamespace` models is optional, so an empty body
+    // is a legitimate update and the 404 below is about the namespace, not the body.
+    let update = json!({});
+
+    for case in name_cases() {
+        let label = case.case;
+
+        // The three operations that address an ID namespace by its name: all three are
+        // lookups of the SAME resource by the SAME key, and the recorded text names no
+        // namespace, so none of them composes its message from the request.
+        for (operation, reply) in [
+            ("GetIdNamespace", emulator.get_id_namespace(&case.name).await),
+            (
+                "UpdateIdNamespace",
+                emulator.update_id_namespace(&case.name, &update).await,
+            ),
+            (
+                "DeleteIdNamespace",
+                emulator.delete_id_namespace(&case.name).await,
+            ),
+        ] {
+            assert_error(
+                label,
+                &reply,
+                404,
+                "ResourceNotFoundException",
+                ID_NAMESPACE_NOT_FOUND,
+            );
+            texts.insert((operation, string_member(&reply.body, "message")));
+        }
+    }
+
+    assert_eq!(
+        texts.len(),
+        3,
+        "each ID-namespace path must answer ONE text, invariant over the name it was \
+         asked for, saw {texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_id_namespace_answers_the_operations_constant_success_message() {
+    let emulator = Emulator::new();
+    let mut seen = BTreeSet::new();
+
+    for case in name_cases() {
+        let label = case.case;
+        // The record's SIZE is what the rule says the text does not depend on, so each
+        // row carries as many `inputSourceConfig` entries as its workflow would.
+        let sources: Vec<Value> = (0..case.sources)
+            .map(|index| json!({ "inputSourceARN": glue_table_arn(&format!("t{index}")) }))
+            .collect();
+        let created = emulator
+            .create_id_namespace(&json!({
+                "idNamespaceName": case.name,
+                "type": "SOURCE",
+                "inputSourceConfig": Value::Array(sources),
+            }))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {label:?}: expected HTTP 200 from CreateIdNamespace, got {created:?}"
+        );
+
+        let deleted = emulator.delete_id_namespace(&case.name).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {label:?}: expected HTTP 200 from DeleteIdNamespace, got {deleted:?}"
+        );
+        let message = string_member(&deleted.body, "message");
+        assert_eq!(
+            message, ID_NAMESPACE_DELETED,
+            "case {label:?}: expected the success message {ID_NAMESPACE_DELETED:?}, got {:?}",
+            deleted.body
+        );
+        seen.insert(message);
+    }
+
+    assert_eq!(
+        seen.len(),
+        1,
+        "the success message must not depend on the namespace that was deleted, saw {seen:?}"
+    );
 }
 
 #[tokio::test]
