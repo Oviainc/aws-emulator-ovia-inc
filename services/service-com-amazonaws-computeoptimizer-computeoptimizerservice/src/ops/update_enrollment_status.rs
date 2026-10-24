@@ -5,6 +5,8 @@
 //! IMPLEMENTED: writes the account's enrollment record in this service's store — the
 //! status, whether member accounts are included, the reason, and when it was written —
 //! and answers with the status and reason it stored, which `GetEnrollmentStatus` reports.
+//! A call that includes member accounts writes that same status to every member account the
+//! organization holds, which `GetEnrollmentStatusesForOrganization` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -206,33 +208,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut guard = state.lock();
+        let now = crate::state::now_secs();
         let enrollment = &mut guard.enrollment;
         enrollment.status = input.status.clone();
         enrollment.member_accounts_enrolled = input.include_member_accounts;
-        enrollment.status_reason = Some(status_reason(&input.status));
-        enrollment.last_updated_timestamp = Some(::aws_smithy_types::DateTime::from_secs_f64(
-            crate::state::now_secs(),
-        ));
-        // The opted-in member-account count is not moved by this call: "the count of
-        // organization member accounts that are opted in to the service" is zero whatever
-        // this request enrolls, because this emulator's organization holds no member
-        // accounts (`Enrollment::number_of_member_accounts_opted_in`, which starts there
-        // and has nothing to count up from).
+        enrollment.status_reason = Some(crate::state::enrollment_status_reason(&input.status));
+        enrollment.last_updated_timestamp = Some(::aws_smithy_types::DateTime::from_secs_f64(now));
+        let status = enrollment.status.clone();
+        let status_reason = enrollment.status_reason.clone();
+        // `includeMemberAccounts` "Indicates whether to enroll member accounts of the
+        // organization", so a call that includes them writes this status to every member
+        // account the organization holds as well; a call that does not leaves their
+        // enrollment exactly as it was. Their enrollment takes a moment to reach them, which
+        // is the `Pending` each row reports until then
+        // (`crate::state::MEMBER_ENROLLMENT_DELAY`), and the opted-in count
+        // `GetEnrollmentStatus` reports is counted over those same records.
+        if input.include_member_accounts {
+            guard.organization_members.enroll_all(&status, now);
+        }
 
         Ok(UpdateEnrollmentStatusOutput {
-            status: Some(enrollment.status.clone()),
-            status_reason: enrollment.status_reason.clone(),
+            status: Some(status),
+            status_reason,
         })
-    }
-}
-
-/// Why the account is in the status it was just put into — the `statusReason` both this
-/// operation and `GetEnrollmentStatus` report. Derived from the stored status, so the two
-/// operations cannot disagree.
-fn status_reason(status: &str) -> String {
-    if status == crate::state::STATUS_ACTIVE {
-        "The account is opted in to Compute Optimizer.".to_string()
-    } else {
-        "The account is opted out of Compute Optimizer.".to_string()
     }
 }
