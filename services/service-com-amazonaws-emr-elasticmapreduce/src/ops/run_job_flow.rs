@@ -297,8 +297,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
             cluster_state, implied_instance_group_configs, validate_instance_group_config,
-            ClusterRecord, ClusterStatusRecord, InstanceFleetRecord, InstanceGroupRecord,
-            InstancesRecord, StepRecord, DEFAULT_STEP_CONCURRENCY_LEVEL,
+            AuditOutcome, ClusterRecord, ClusterStatusRecord, InstanceFleetRecord,
+            InstanceGroupRecord, InstancesRecord, StepRecord, DEFAULT_STEP_CONCURRENCY_LEVEL,
             MAX_INSTANCE_FLEETS_PER_CLUSTER, MAX_INSTANCE_GROUPS_PER_CLUSTER,
             MAX_STEPS_PER_JOB_FLOW, MAX_STEP_CONCURRENCY_LEVEL, TRANSITION_SPAN,
         };
@@ -306,6 +306,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut input = input;
+
+        // Launching a cluster CHANGES this service's state, so every branch that returns
+        // from this call leaves one structured audit record naming the operation, the
+        // resource, the presented access key id, the request target and the outcome
+        // (`crate::state::audit`). A refusal has no minted id to name yet, so it records
+        // the name the request asked for; the success path records the id EMR minted.
+        // Nothing of the cluster's own configuration is logged.
+        let requested_name = input.name.clone();
+        let refuse = |message: String| -> Self::Error {
+            crate::state::audit(
+                Self::NAME,
+                &requested_name,
+                ctx,
+                AuditOutcome::ValidationRefused,
+            );
+            crate::scaffolded::Scaffolded::validation(message)
+        };
 
         // "The RunJobFlow request can contain InstanceFleets parameters or
         // InstanceGroups parameters, but not both." (RunJobFlow doc.) The model cannot
@@ -321,8 +338,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .is_some_and(|fleets| !fleets.is_empty());
         if has_groups && has_fleets {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "Instances may carry InstanceGroups or InstanceFleets, but not both",
+            return Err(refuse(
+                "Instances may carry InstanceGroups or InstanceFleets, but not both".to_string(),
             ));
         }
 
@@ -335,7 +352,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .map_or(0, Vec::len);
         if requested_fleet_count > MAX_INSTANCE_FLEETS_PER_CLUSTER {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(refuse(format!(
                 "Instances carries {requested_fleet_count} instance fleets; a cluster carries \
                  at most {MAX_INSTANCE_FLEETS_PER_CLUSTER}"
             )));
@@ -353,7 +370,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .take()
             .unwrap_or_default();
         if requested_group_configs.len() > MAX_INSTANCE_GROUPS_PER_CLUSTER {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(refuse(format!(
                 "Instances carries {} instance groups; a cluster carries at most \
                  {MAX_INSTANCE_GROUPS_PER_CLUSTER}",
                 requested_group_configs.len()
@@ -361,14 +378,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         for config in &requested_group_configs {
             if let Err(message) = validate_instance_group_config(config) {
-                return Err(crate::scaffolded::Scaffolded::validation(message));
+                return Err(refuse(message));
             }
         }
 
         // "A maximum of 256 steps are allowed in each job flow." (RunJobFlow doc.)
         let step_configs = input.steps.take().unwrap_or_default();
         if step_configs.len() > MAX_STEPS_PER_JOB_FLOW {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(refuse(format!(
                 "Steps carries {} steps; a maximum of {MAX_STEPS_PER_JOB_FLOW} steps are \
                  allowed in each job flow",
                 step_configs.len(),
@@ -383,7 +400,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !(DEFAULT_STEP_CONCURRENCY_LEVEL..=MAX_STEP_CONCURRENCY_LEVEL)
             .contains(&step_concurrency_level)
         {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(refuse(format!(
                 "StepConcurrencyLevel {step_concurrency_level} is outside \
                  {DEFAULT_STEP_CONCURRENCY_LEVEL}..{MAX_STEP_CONCURRENCY_LEVEL}"
             )));
@@ -395,11 +412,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record `GetManagedScalingPolicy` reads — and is held to the same limits.
         if let Some(policy) = input.managed_scaling_policy.as_ref() {
             if let Err(message) = crate::state::validate_managed_scaling_policy(policy) {
-                return Err(crate::scaffolded::Scaffolded::validation(message));
+                return Err(refuse(message));
             }
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(
+                Self::NAME,
+                &requested_name,
+                ctx,
+                AuditOutcome::StoreUnavailable,
+            );
             return Err(RunJobFlowErrorModeled::InternalServerError(InternalServerError {}).into());
         };
         let mut store = state.lock();
@@ -505,6 +528,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         store.clusters.insert(id.clone(), record);
         drop(store);
+
+        // The cluster is persisted: the record names the id it was minted under, which is
+        // what attributes the change after the fact.
+        crate::state::audit(Self::NAME, &id, ctx, AuditOutcome::ClusterLaunched);
 
         Ok(RunJobFlowOutput {
             job_flow_id: Some(id),

@@ -1,20 +1,46 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The `DataQuery` a submitted `Export` carries: the tables its `QueryStatement` names,
-//! and the refusals for a query this service cannot serve.
+//! the columns it selects and filters on, and the refusals for a query this service cannot
+//! serve.
 //!
 //! `CreateExport`'s own modelled documentation states what a query may say: "The
 //! QueryStatement is an SQL statement. Data Exports only supports a limited subset of the
 //! SQL syntax. … To view the available tables and columns, see the Data Exports table
 //! dictionary" (smithy_query shape `CreateExportRequest`, member `Export`, quoted in
-//! `src/ops/create_export.rs`). The tables that dictionary publishes are exactly
-//! [`super::TABLE_CATALOG`] — the catalog `ListTables` lists and `GetTable` describes — so
-//! a statement whose `FROM` names anything else selects data this service does not hold,
+//! `src/ops/create_export.rs`). The tables AND COLUMNS that dictionary publishes are
+//! exactly [`super::TABLE_CATALOG`] — the catalog `ListTables` lists and `GetTable`
+//! describes — so a statement whose `FROM` names anything else, or which selects or
+//! filters on a name no table it reads publishes, selects data this service does not hold,
 //! and is refused rather than persisted.
 //!
 //! The statement is READ, not matched: it is parsed with the `sqlparser` crate and the
-//! relations are taken off the parsed statement, so a table named in a join, a sub-query
-//! or behind an alias is found exactly as one named in a bare `FROM` is.
+//! relations and the column references are taken off the parsed statement, so a table or
+//! column named in a join, a sub-query or behind an alias is found exactly as one named in
+//! a bare `FROM` or select list is.
+//!
+//! # Which columns a statement may name
+//!
+//! A table's published column set is not fixed: a table property "[changes] the data and
+//! schema of a table" (the modelled doc for `GetTableRequest$TableProperties`), so the
+//! columns a table publishes are the ones in force under the table configuration THE
+//! REQUEST states — [`super::TableSpec::columns_in_force`], the same filter `GetTable`
+//! reports a schema through. A statement may therefore name a column exactly when some
+//! table it reads publishes that column under the properties this request puts in force:
+//! a name no such table publishes selects a column the export could never deliver (and a
+//! name a table publishes only at another value of a gating property is such a name), so
+//! it is refused with the modelled `ValidationException` like an unpublished table is.
+//!
+//! Two kinds of name are NOT column references, and neither is checked:
+//!
+//! * a name the statement ITSELF defines — the alias of a select item, which a later
+//!   clause of the same statement can name;
+//! * the parts of a qualified reference other than the one that resolves: the parts before
+//!   the column qualify a relation (by table name or by alias) and the parts after index
+//!   into the column's own value, and the catalog publishes neither. A qualified reference
+//!   resolves when ONE of its parts is a published column, which is also why a qualifier is
+//!   not resolved to a single relation: data exports publishes one catalog, and a statement
+//!   may qualify by an alias of a derived relation the catalog never names.
 //!
 //! # What the published subset is, and what that makes of a CTE
 //!
@@ -69,7 +95,9 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{visit_relations, Statement};
+use sqlparser::ast::{
+    Expr, Ident, ObjectName, Query, SelectItem, SetExpr, Statement, Visit, Visitor,
+};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
@@ -221,7 +249,40 @@ fn nesting_depth(statement: &str) -> usize {
     deepest
 }
 
-/// Every relation `statement` names, in the order the parse walk finds them, each once.
+/// Every relation `statement` names, in the order the parse walk finds them, each once —
+/// [`QueryShape::tables`] of the shape [`query_shape`] reads.
+pub fn query_tables(statement: &str) -> Result<Vec<String>, QueryRefusal> {
+    Ok(query_shape(statement)?.tables)
+}
+
+/// What one `QueryStatement` NAMES: the relations it reads, the column references it
+/// makes, and the names it defines itself.
+///
+/// Read off the PARSED statement rather than its text, so a name in a join, a sub-query or
+/// behind an alias is reported exactly as one in a bare `FROM` or select list is.
+#[derive(Debug, Default)]
+pub struct QueryShape {
+    /// Every relation the statement names, in walk order, each once.
+    pub tables: Vec<String>,
+    /// Every column reference the statement makes, in walk order, each once.
+    columns: Vec<ColumnReference>,
+    /// The names the statement itself DEFINES: the alias of a select item, which a later
+    /// clause of the same statement may name although no table publishes it.
+    defined: BTreeSet<String>,
+}
+
+/// One column reference a statement makes.
+#[derive(Debug)]
+struct ColumnReference {
+    /// Every identifier part of the reference, in order: one part for a bare column name,
+    /// and for a qualified one the relation (or the alias) it is qualified by, the column,
+    /// and whatever indexes into the column's value.
+    parts: Vec<String>,
+    /// The reference as the statement writes it, which is what a refusal names.
+    written: String,
+}
+
+/// The relations and column references of `statement`.
 ///
 /// `Err` is [`QueryRefusal::Invalid`] — the modelled 400 — for a statement past one of the
 /// structural bounds (its bracketing deeper than [`MAX_QUERY_NESTING_DEPTH`] or its token
@@ -231,7 +292,7 @@ fn nesting_depth(statement: &str) -> usize {
 /// which selects rows this service could ever deliver — and for one naming more distinct
 /// relations than [`MAX_QUERY_RELATIONS`]; and [`QueryRefusal::Internal`] — the modelled
 /// 500 — when this process could not run the parse at all.
-pub fn query_tables(statement: &str) -> Result<Vec<String>, QueryRefusal> {
+pub fn query_shape(statement: &str) -> Result<QueryShape, QueryRefusal> {
     // Both structural bounds are applied to the TEXT, so no descent over this statement
     // has begun when it is refused.
     if nesting_depth(statement) > MAX_QUERY_NESTING_DEPTH {
@@ -254,10 +315,10 @@ pub fn query_tables(statement: &str) -> Result<Vec<String>, QueryRefusal> {
         let spawned = ::std::thread::Builder::new()
             .name(QUERY_PARSE_THREAD_NAME.to_string())
             .stack_size(QUERY_PARSE_STACK_BYTES)
-            .spawn_scoped(scope, || relations_of(statement));
+            .spawn_scoped(scope, || shape_of(statement));
         match spawned {
-            // The parse ran: its own answer stands, whether that is the relations or the
-            // 400 for a statement it could not read.
+            // The parse ran: its own answer stands, whether that is the shape it read or
+            // the 400 for a statement it could not read.
             Ok(handle) => handle.join().unwrap_or_else(|_| {
                 // The parse PANICKED. That is this process failing, not the caller's
                 // statement being wrong, so it is the modelled server error.
@@ -273,9 +334,9 @@ pub fn query_tables(statement: &str) -> Result<Vec<String>, QueryRefusal> {
     })
 }
 
-/// The relations of `statement`, parsed and walked. Called on the sized stack
-/// [`query_tables`] sets up; the bounds it states are already applied.
-fn relations_of(statement: &str) -> Result<Vec<String>, QueryRefusal> {
+/// The shape of `statement`, parsed and walked. Called on the sized stack
+/// [`query_shape`] sets up; the bounds it states are already applied.
+fn shape_of(statement: &str) -> Result<QueryShape, QueryRefusal> {
     let parsed = Parser::parse_sql(&GenericDialect {}, statement)
         .map_err(|_| unreadable_query(statement))?;
     // THE PUBLISHED SUBSET, checked on the parsed statement: a data query says which rows
@@ -288,14 +349,43 @@ fn relations_of(statement: &str) -> Result<Vec<String>, QueryRefusal> {
     let [Statement::Query(query)] = parsed.as_slice() else {
         return Err(not_a_single_query(statement).into());
     };
-    let mut tables: Vec<String> = Vec::new();
-    // Membership is a set lookup rather than a scan of `tables`, so de-duplicating the
-    // relations costs O(relations log relations) and not O(relations^2).
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    // The walk reports every relation of the statement — `FROM`, each join, and each
-    // sub-query's own `FROM` — so nothing is read out of the statement's text. It
-    // stops at the relation bound, and the statement is then refused.
-    let walked: ControlFlow<()> = visit_relations(query.as_ref(), |relation| {
+    // ONE walk over the parsed tree reports the relations, the column references and the
+    // names the statement defines itself, so nothing is read out of the statement's text.
+    let mut walk = QueryWalk::default();
+    if query.as_ref().visit(&mut walk).is_break() {
+        return Err(too_many_relations().into());
+    }
+    // A query reading NO relation (`SELECT 1`, `VALUES (1)`) is a query over the request's
+    // own literals, not over the catalog: there is no table for the export to deliver, so
+    // it is outside the subset too.
+    if walk.shape.tables.is_empty() {
+        return Err(reads_no_table(statement).into());
+    }
+    Ok(walk.shape)
+}
+
+/// The walk that reads a parsed query's shape.
+///
+/// It stops at [`MAX_QUERY_RELATIONS`] — the only thing that breaks the walk, which is why
+/// [`shape_of`] reads a break as that refusal.
+#[derive(Debug, Default)]
+struct QueryWalk {
+    /// What the walk has read so far.
+    shape: QueryShape,
+    /// The relations already reported, so de-duplicating them costs
+    /// O(relations log relations) and not O(relations^2).
+    seen_tables: BTreeSet<String>,
+    /// The column references already reported, for the same reason.
+    seen_columns: BTreeSet<String>,
+}
+
+impl Visitor for QueryWalk {
+    /// The walk stops only at the relation bound.
+    type Break = ();
+
+    /// Every relation of the statement — `FROM`, each join, and each sub-query's own
+    /// `FROM`.
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<()> {
         // A relation's name is its single identifier's VALUE, so a quoted name
         // (`"COST_AND_USAGE_REPORT"`) resolves like a bare one. A QUALIFIED name
         // (`other_db.COST_AND_USAGE_REPORT`) keeps every part, so it does not resolve
@@ -307,27 +397,80 @@ fn relations_of(statement: &str) -> Result<Vec<String>, QueryRefusal> {
                 .map_or_else(|| single.to_string(), |ident| ident.value.clone()),
             _ => relation.to_string(),
         };
-        if seen.insert(named.clone()) {
-            if tables.len() >= MAX_QUERY_RELATIONS {
+        if self.seen_tables.insert(named.clone()) {
+            if self.shape.tables.len() >= MAX_QUERY_RELATIONS {
                 return ControlFlow::Break(());
             }
-            tables.push(named);
+            self.shape.tables.push(named);
         }
         ControlFlow::Continue(())
-    });
-    if walked.is_break() {
-        return Err(too_many_relations().into());
     }
-    // A query reading NO relation (`SELECT 1`, `VALUES (1)`) is a query over the request's
-    // own literals, not over the catalog: there is no table for the export to deliver, so
-    // it is outside the subset too.
-    if tables.is_empty() {
-        return Err(reads_no_table(statement).into());
+
+    /// Every column reference of the statement: an identifier used as a value, wherever it
+    /// stands — a select item, a predicate, a join condition, a function argument, a
+    /// grouping or an ordering. A function's NAME, a type name, an alias and a relation are
+    /// not identifier expressions, so none of them is read here.
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        let parts: Vec<&Ident> = match expr {
+            Expr::Identifier(ident) => vec![ident],
+            Expr::CompoundIdentifier(idents) => idents.iter().collect(),
+            _ => return ControlFlow::Continue(()),
+        };
+        let reference = ColumnReference {
+            parts: parts.iter().map(|ident| ident.value.clone()).collect(),
+            written: parts
+                .iter()
+                .map(|ident| ident.value.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
+        };
+        if self.seen_columns.insert(reference.written.clone()) {
+            self.shape.columns.push(reference);
+        }
+        ControlFlow::Continue(())
     }
-    Ok(tables)
+
+    /// The names each query of the statement DEFINES for itself.
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        collect_defined_names(&query.body, &mut self.shape.defined);
+        ControlFlow::Continue(())
+    }
 }
 
-/// Refuse `query` unless every table it names is one this service publishes.
+/// The names `body` defines itself: the alias of each select item, which a later clause of
+/// the same statement may name although no table publishes it.
+///
+/// Recurses with the set expression's own structure, which [`MAX_QUERY_TOKENS`] bounds the
+/// depth of, on the stack [`query_shape`] sized for that bound.
+fn collect_defined_names(body: &SetExpr, into: &mut BTreeSet<String>) {
+    match body {
+        SetExpr::Select(select) => {
+            for item in &select.projection {
+                if let SelectItem::ExprWithAlias { alias, .. } = item {
+                    into.insert(alias.value.clone());
+                }
+            }
+        }
+        SetExpr::Query(query) => collect_defined_names(&query.body, into),
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_defined_names(left, into);
+            collect_defined_names(right, into);
+        }
+        _ => {}
+    }
+}
+
+/// Refuse `query` unless every table it names is one this service publishes AND every
+/// column it names is one a table it reads publishes under the table configuration the
+/// request states.
+///
+/// Both halves are the same published dictionary — "To view the available tables and
+/// columns, see the Data Exports table dictionary" (the modelled doc for `CreateExport`'s
+/// `Export`) — and the column half is read under the properties IN FORCE, because a table
+/// property "[changes] the data and schema of a table" (the modelled doc for
+/// `GetTableRequest$TableProperties`): a column the request's own configuration switches
+/// off is as unservable as one no table publishes at all. See this module's header for the
+/// names that are not column references.
 ///
 /// `require_table_configurations` additionally demands, for each named table that
 /// publishes table properties, that `TableConfigurations` carries that table's entry —
@@ -339,17 +482,33 @@ pub fn validate_data_query(
     query: &DataQuery,
     require_table_configurations: bool,
 ) -> Result<(), QueryRefusal> {
-    for table in query_tables(&query.query_statement)? {
-        let spec = table_spec(&table).ok_or_else(|| invalid_query_table(&table))?;
-        if !require_table_configurations || spec.properties.is_empty() {
-            continue;
+    let shape = query_shape(&query.query_statement)?;
+    let requested = query.table_configurations.as_ref();
+    // The columns the statement may name: every column in force for the tables it reads,
+    // under the properties THIS request puts in force.
+    let mut published: BTreeSet<&'static str> = BTreeSet::new();
+    for table in &shape.tables {
+        let spec = table_spec(table).ok_or_else(|| invalid_query_table(table))?;
+        if require_table_configurations && !spec.properties.is_empty() {
+            let configured =
+                requested.is_some_and(|configurations| configurations.contains_key(spec.name));
+            if !configured {
+                return Err(missing_table_configurations(spec.name).into());
+            }
         }
-        let configured = query
-            .table_configurations
-            .as_ref()
-            .is_some_and(|configurations| configurations.contains_key(spec.name));
-        if !configured {
-            return Err(missing_table_configurations(spec.name).into());
+        let properties =
+            spec.effective_properties(requested.and_then(|configured| configured.get(table)))?;
+        published.extend(spec.columns_in_force(&properties).map(|column| column.name));
+    }
+    for reference in &shape.columns {
+        // A reference resolves when one of its parts is a published column or a name the
+        // statement defines: the other parts qualify a relation or index into the column's
+        // value, and the catalog publishes neither.
+        let resolved = reference.parts.iter().any(|part| {
+            published.contains(part.as_str()) || shape.defined.contains(part.as_str())
+        });
+        if !resolved {
+            return Err(invalid_query_column(&reference.written).into());
         }
     }
     Ok(())
@@ -513,6 +672,27 @@ fn invalid_query_table(table: &str) -> ValidationException {
         fields: Some(vec![ValidationExceptionField {
             name: QUERY_STATEMENT_FIELD.to_string(),
             message: "Must name a table data exports publishes; call ListTables for them."
+                .to_string(),
+        }]),
+    }
+}
+
+/// The modelled 400 for a `QueryStatement` naming a column no table it reads publishes
+/// under the table configuration the request states.
+///
+/// The sentence is built from the request and names the offending column, which is the
+/// only part of the request the caller has to change; the columns it must be one of are
+/// what `GetTable` reports for the queried table under the same table properties. It is
+/// worded as the unpublished-table refusal beside it, whose recorded AWS form is `Table
+/// name <name> is invalid`.
+fn invalid_query_column(column: &str) -> ValidationException {
+    ValidationException {
+        message: format!("Column name {} is invalid", clip_for_message(column)),
+        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: QUERY_STATEMENT_FIELD.to_string(),
+            message: "Must name a column the queried table publishes under the table \
+                      properties the request states; call GetTable for them."
                 .to_string(),
         }]),
     }

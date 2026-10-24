@@ -975,13 +975,13 @@ async fn creation_instants_are_current_and_reads_leave_them_alone() {
 
 /// One captured `tracing` event: its target and its fields, rendered as strings.
 #[derive(Clone, Debug)]
-struct CapturedEvent {
+pub(crate) struct CapturedEvent {
     target: String,
     fields: BTreeMap<String, String>,
 }
 
 impl CapturedEvent {
-    fn field(&self, name: &str) -> Option<&str> {
+    pub(crate) fn field(&self, name: &str) -> Option<&str> {
         self.fields.get(name).map(String::as_str)
     }
 }
@@ -1018,16 +1018,19 @@ impl Visit for FieldCollector<'_> {
 /// cache the handler's audit callsite as "nobody is listening". Nothing is written to
 /// disk.
 #[derive(Clone, Default)]
-struct Capture {
+pub(crate) struct Capture {
     events: Arc<Mutex<Vec<CapturedEvent>>>,
 }
 
 impl Capture {
-    /// Take the audit records `akid` signed for, oldest first, and forget the rest.
+    /// Take the audit records `akid` signed for, oldest first, and forget everything that
+    /// is not another access key id's audit record.
     ///
-    /// Filtering on the presented access key id is what keeps a sibling suite's calls
-    /// out of this one's assertions, since the capture is process-wide.
-    fn drain_audit_records(&self, akid: &str) -> Vec<CapturedEvent> {
+    /// Filtering on the presented access key id is what keeps a sibling suite's calls out
+    /// of this one's assertions, since the capture is process-wide — and what another
+    /// access key id signed is KEPT rather than cleared, so two suites draining their own
+    /// records in parallel cannot drop each other's.
+    pub(crate) fn drain_audit_records(&self, akid: &str) -> Vec<CapturedEvent> {
         let mut events = self.events.lock().expect("the capture buffer");
         let drained: Vec<CapturedEvent> = events
             .iter()
@@ -1036,7 +1039,9 @@ impl Capture {
             })
             .cloned()
             .collect();
-        events.clear();
+        events.retain(|event| {
+            event.target == AUDIT_TARGET && event.field("access_key_id") != Some(akid)
+        });
         drained
     }
 }
@@ -1044,7 +1049,12 @@ impl Capture {
 /// This binary's one capture, installed as the global `tracing` subscriber on first use.
 static AUDIT_CAPTURE: std::sync::OnceLock<Capture> = std::sync::OnceLock::new();
 
-fn audit_capture() -> &'static Capture {
+/// This binary's one capture, installed as the global `tracing` subscriber on first use.
+///
+/// `pub(crate)` so every suite that asserts on the audit stream shares this one
+/// subscriber: `tracing` takes a single global default per process, so a second capture
+/// would silently see nothing.
+pub(crate) fn audit_capture() -> &'static Capture {
     AUDIT_CAPTURE.get_or_init(|| {
         let capture = Capture::default();
         // Installing the global subscriber also rebuilds `tracing`'s callsite interest
