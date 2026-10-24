@@ -25,6 +25,8 @@ mod harness;
 mod key_deletion_cancellation;
 #[path = "all/key_lifecycle.rs"]
 mod key_lifecycle;
+#[path = "all/key_policy.rs"]
+mod key_policy;
 #[path = "all/key_specs.rs"]
 mod key_specs;
 #[path = "all/state_roundtrip.rs"]

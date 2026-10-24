@@ -6144,9 +6144,11 @@ pub fn instance_metric_unit(metric_name: &str) -> Option<&'static str> {
 ///
 /// It is also where an alarm of this store STAYS until something moves it: the
 /// store holds no metric datapoints at all (this emulator runs no instance,
-/// load balancer or database workload and receives no measurement of one, which
-/// is why `GetInstanceMetricData` answers an empty `metricData`; the other
-/// `Get*MetricData` operations are still scaffolds with their own issues), and
+/// container, load balancer or database workload and receives no measurement of
+/// one, which is why `GetInstanceMetricData` and
+/// `GetContainerServiceMetricData` both answer an empty `metricData`; the
+/// remaining `Get*MetricData` operations are still scaffolds with their own
+/// issues), and
 /// the modelled `Alarm$state`
 /// documentation defines `INSUFFICIENT_DATA` as exactly that — "the metric is not
 /// available, or not enough data is available for the metric to determine the
