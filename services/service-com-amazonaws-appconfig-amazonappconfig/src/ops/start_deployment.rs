@@ -319,10 +319,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         environment.materialize(started_at);
         if let Some(in_flight) = environment.deployment_in_flight() {
             return Err(StartDeploymentErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Deployment number {} is still {} in environment {}; only one deployment \
-                     at a time can be in progress for an environment.",
-                    in_flight.deployment_number, in_flight.state, environment.id
+                message: Some(crate::state::environment_not_ready_for_deployment(
+                    &environment.id,
+                    &in_flight.state,
                 )),
             })
             .into());

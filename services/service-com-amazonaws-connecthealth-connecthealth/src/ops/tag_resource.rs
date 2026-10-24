@@ -195,7 +195,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.holds_resource_arn(&input.resource_arn) {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Resource {} was not found", input.resource_arn)),
+                    message: Some(crate::service::error_detail::resource_not_found_message(
+                        &input.resource_arn,
+                    )),
                 },
             )
             .into());

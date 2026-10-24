@@ -157,7 +157,30 @@ async fn every_not_found_names_the_requested_identifiers_in_the_message_member()
         "sub-000000000000000000001",
     ];
 
+    // A domain this service allocated and has since deleted: its id names a domain that
+    // is GONE, so every reader of it — including the repeated delete — names it in the
+    // modelled not-found. (`DeleteDomain` of an id with NO allocation history is not a
+    // not-found at all; see `domain_account_cap_and_lookup_semantics`.)
+    let deleted_domain = string_at(
+        &emulator
+            .create_domain(&json!({ "name": "clinic-deleted" }))
+            .await,
+        "domainId",
+    );
+    let (status, deleted) = emulator
+        .send("DELETE", &format!("/domain/{deleted_domain}"), None)
+        .await;
+    assert_eq!(status, 200, "DeleteDomain of a live domain: {deleted}");
+
     let mut rows: Vec<NotFound> = Vec::new();
+    for (operation, method) in [("GetDomain", "GET"), ("DeleteDomain", "DELETE")] {
+        rows.push(NotFound {
+            case: format!("{operation} of the deleted domain {deleted_domain}"),
+            method,
+            path: format!("/domain/{deleted_domain}"),
+            named: vec![deleted_domain.clone()],
+        });
+    }
     for absent_subscription in absent_subscriptions {
         // A subscription that is not in a domain that EXISTS: the answer must tell the
         // two identifiers apart, so it names both.
@@ -180,7 +203,6 @@ async fn every_not_found_names_the_requested_identifiers_in_the_message_member()
         // The domain itself is the missing one: every operation addressed to it names it.
         for (operation, method, path) in [
             ("GetDomain", "GET", format!("/domain/{absent_domain}")),
-            ("DeleteDomain", "DELETE", format!("/domain/{absent_domain}")),
             (
                 "ListSubscriptions",
                 "GET",

@@ -41,12 +41,15 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000";
 
 /// The emulated HealthLake service behind the production router.
-struct HealthLake {
+///
+/// `pub(crate)` so the sibling suites of this test target drive the service exactly the
+/// way this one does, rather than each growing its own copy of the harness.
+pub(crate) struct HealthLake {
     router: MultiServiceRouter,
 }
 
 impl HealthLake {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(
@@ -95,7 +98,7 @@ impl HealthLake {
 
     /// Dispatch a FHIR interaction, returning the status, the parsed body and the
     /// response headers a FHIR client reads.
-    async fn fhir(
+    pub(crate) async fn fhir(
         &self,
         method: &str,
         uri: &str,
@@ -131,7 +134,7 @@ impl HealthLake {
 
     /// Create a data store, wait out its lifecycle transition, and return the FHIR
     /// endpoint PATH `DescribeFHIRDatastore` advertises for it.
-    async fn active_datastore(&self, name: &str) -> (String, String) {
+    pub(crate) async fn active_datastore(&self, name: &str) -> (String, String) {
         let (status, created) = self
             .rpc(
                 "CreateFHIRDatastore",
@@ -193,7 +196,7 @@ fn endpoint_path(endpoint: &str) -> String {
 }
 
 /// The `issue[0].code` of an `OperationOutcome` body.
-fn outcome_code(body: &Value) -> String {
+pub(crate) fn outcome_code(body: &Value) -> String {
     assert_eq!(
         body["resourceType"].as_str(),
         Some("OperationOutcome"),
@@ -535,12 +538,20 @@ async fn a_fhir_interaction_states_its_refusals_as_an_operation_outcome() {
             "not-found",
         ),
         (
-            "an update, which this endpoint does not implement yet",
+            "an update whose body names a different id from the URL",
             "PUT",
             format!("{path}Patient/{id}"),
-            json!({ "resourceType": "Patient", "id": id }),
-            501,
-            "not-supported",
+            json!({ "resourceType": "Patient", "id": "some-other-id" }),
+            400,
+            "invalid",
+        ),
+        (
+            "an update at an id outside the FHIR id type",
+            "PUT",
+            format!("{path}Patient/patient_1"),
+            json!({ "resourceType": "Patient" }),
+            400,
+            "invalid",
         ),
         (
             "a delete, which this endpoint does not implement yet",

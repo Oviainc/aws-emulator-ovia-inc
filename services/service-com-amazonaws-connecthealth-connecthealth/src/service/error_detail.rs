@@ -116,6 +116,29 @@ pub fn range_violation_message(member_path: &str, value: i32, min: i32, max: i32
     )
 }
 
+/// The detail text of the `ResourceNotFoundException` answered when a domain cannot be
+/// resolved — because no domain of that id is held, or because the one held is already
+/// on its way out.
+///
+/// Built from the REQUEST: the requested `domainId`, verbatim, is what tells one 404
+/// from another. ConnectHealth words it `<resource kind> not found: <identifier>` — the
+/// same form [`subscription_not_found_message`] carries for a subscription — so the
+/// text is stated ONCE here rather than in each of the handlers that resolve a domain.
+pub fn domain_not_found_message(domain_id: &str) -> String {
+    format!("Domain not found: {domain_id}")
+}
+
+/// The detail text of the `ResourceNotFoundException` answered when a Medical Scribe
+/// listening session cannot be resolved under the (`domainId`, `subscriptionId`) scope
+/// the request named.
+///
+/// Built from the REQUEST, and in the form ConnectHealth reports for a scoped
+/// identifier it cannot resolve: the member that could not be resolved and the value
+/// the request gave it.
+pub fn scribe_session_not_found_message(session_id: &str) -> String {
+    format!("Resource not found: sessionId with ID {session_id} does not exist")
+}
+
 /// The detail text of the `ResourceNotFoundException` answered when a subscription cannot
 /// be resolved — because the subscription is absent, or because its parent domain is.
 ///
@@ -126,6 +149,16 @@ pub fn range_violation_message(member_path: &str, value: i32, min: i32, max: i32
 /// subscription — the reader and the two status transitions — cannot word it three ways.
 pub fn subscription_not_found_message(domain_id: &str, subscription_id: &str) -> String {
     format!("Subscription not found: {domain_id}/{subscription_id}")
+}
+
+/// The detail text of the `ResourceNotFoundException` answered when the ARN a tagging
+/// call names resolves to no resource this service holds.
+///
+/// The same `<resource kind> not found: <identifier>` form as the two constructors
+/// above, with the identifier the request used — here a resource ARN, since that is
+/// what the tagging operations address a resource by.
+pub fn resource_not_found_message(resource_arn: &str) -> String {
+    format!("Resource not found: {resource_arn}")
 }
 
 /// The operation the generated routing table names for this request.
@@ -240,6 +273,13 @@ mod tests {
     fn a_body_with_nothing_to_rename_is_left_alone() {
         for (label, body) in [
             ("no detail member", r#"{"__type":"ThrottlingException"}"#),
+            // The front door's authorizer failure, which `DeleteDomain` answers for an
+            // id with no allocation history: it carries no detail text at all, so there
+            // is nothing to rename and nothing may be invented.
+            (
+                "the front door's authorizer failure",
+                r#"{"__type":"AuthorizerConfigurationException"}"#,
+            ),
             ("already renamed", r#"{"__type":"ThrottlingException","Message":"slow down"}"#),
             ("not an object", r#"["ResourceNotFoundException"]"#),
             ("not JSON", "<Error/>"),

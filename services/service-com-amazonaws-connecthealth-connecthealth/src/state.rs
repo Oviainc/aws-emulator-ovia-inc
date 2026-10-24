@@ -12,12 +12,16 @@
 //! into each `src/ops/*.rs`: `src/lib.rs` is generated, so this module is the crate's
 //! one shared, editable home.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::SubscriptionDescription;
+use crate::ops::types::{
+    MedicalScribeChannelDefinition, MedicalScribeListeningSessionDetails,
+    MedicalScribePostStreamActionSettingsResponse, MedicalScribePostStreamActionsResult,
+    SubscriptionDescription,
+};
 
 /// The region an emulated ARN carries when the request names none.
 const DEFAULT_REGION: &str = "us-east-1";
@@ -37,11 +41,36 @@ const ARN_NAMESPACE: &str = "health-agent";
 /// [`Domain::deletion_completes_in_call`].
 pub const DOMAIN_DELETION_SPAN: Duration = Duration::from_millis(500);
 
-/// The most `Domain` records this store holds. Every growth site is capped so a caller
-/// looping a create cannot grow the shared store without limit; the cap is the
-/// EMULATOR's own ceiling, refused through the operations' own modelled
-/// `ServiceQuotaExceededException`, not an AWS-published quota.
-pub const MAX_DOMAINS: usize = 100;
+/// The most `Domain` records ONE ACCOUNT holds at a time — the account-wide Domain cap
+/// `CreateDomain` is subject to.
+///
+/// RECORDED behaviour: `CreateDomain` past the cap is refused with a
+/// `ValidationException` whose text names the account and this number
+/// ("Account <accountId> has reached the maximum limit of 10 domains."). The cap is a
+/// LIVE count of the domains the account currently holds, not a monotonic counter, so a
+/// `DeleteDomain` frees a slot for the next create.
+///
+/// It is also what bounds this store's growth: every `Domain` carries the account that
+/// owns it, so the records held are at most this many per account and a caller looping
+/// a create cannot grow the shared store without limit.
+pub const MAX_DOMAINS_PER_ACCOUNT: usize = 10;
+
+/// How many `domainId`s this service remembers having allocated, beyond the domains it
+/// currently holds.
+///
+/// A delete needs to tell an id this service once allocated — whose domain is simply
+/// gone — from one that was never allocated to anybody, because the two answer
+/// DIFFERENT errors (see `DeleteDomain`'s handler, which cites the recording for each).
+/// The history is therefore kept past the domain's own purge, and BOUNDED here: a caller
+/// looping create/delete would otherwise grow the store without limit, which is the one
+/// thing every ceiling in this module exists to prevent.
+///
+/// The bound is the EMULATOR's retention, not a rule of the service: once the history is
+/// full the oldest id is dropped, and a delete of that id then answers as it did before
+/// the id was ever minted. It is set two orders of magnitude above
+/// [`MAX_DOMAINS_PER_ACCOUNT`], so an account has to create and delete this many domains
+/// before its first id is forgotten.
+pub const MAX_DOMAIN_ALLOCATION_HISTORY: usize = 1024;
 
 /// The most `Subscription` records one `Domain` holds, so the product
 /// (domains x subscriptions) is bounded too.
@@ -223,6 +252,85 @@ pub struct Subscription {
     pub last_updated_at: SystemTime,
     pub activated_at: Option<SystemTime>,
     pub deactivated_at: Option<SystemTime>,
+    /// The Medical Scribe listening sessions started on this subscription, by
+    /// `sessionId`. Held HERE rather than in a map beside the registry, so a session is
+    /// scoped to its own subscription and goes away with it. See [`ScribeSession`] for
+    /// why nothing in this crate writes it yet.
+    pub scribe_sessions: BTreeMap<String, ScribeSession>,
+}
+
+/// A Medical Scribe listening session's stream status, as the model's
+/// `MedicalScribeStreamStatus` enum declares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScribeStreamStatus {
+    InProgress,
+    Paused,
+    Failed,
+    Completed,
+}
+
+impl ScribeStreamStatus {
+    /// The wire value — one of `types::MEDICAL_SCRIBE_STREAM_STATUS_VALUES`.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::InProgress => "IN_PROGRESS",
+            Self::Paused => "PAUSED",
+            Self::Failed => "FAILED",
+            Self::Completed => "COMPLETED",
+        }
+    }
+}
+
+/// A persisted Medical Scribe listening session, stored under the `Subscription` it was
+/// started on — which is what SCOPES it: a session is reachable only through the
+/// (`domainId`, `subscriptionId`) pair it belongs to, so one subscription's session
+/// cannot be read through another's (see [`ComAmazonawsConnecthealthConnecthealthState::live_scribe_session`]).
+///
+/// A session is written by the operation that starts one,
+/// `StartMedicalScribeListeningSession`, which this emulator does not serve: the
+/// generator skips it (`src/ops/SKIPPED_STUBS.md` — its input carries a `@streaming`
+/// event-stream member, which needs wire framing the generator does not emit), so this
+/// crate has no handler for it and no growth site to bound. `GetMedicalScribeListeningSession`
+/// nevertheless resolves a session out of this map rather than answering a constant, so
+/// a stored session is reported from state and an absent one is the modelled 404.
+#[derive(Debug, Clone)]
+pub struct ScribeSession {
+    pub session_id: String,
+    pub domain_id: String,
+    pub subscription_id: String,
+    pub language_code: String,
+    pub media_sample_rate_hertz: i32,
+    pub media_encoding: String,
+    pub channel_definitions: Vec<MedicalScribeChannelDefinition>,
+    pub post_stream_action_settings: Option<MedicalScribePostStreamActionSettingsResponse>,
+    pub post_stream_action_result: Option<MedicalScribePostStreamActionsResult>,
+    pub encounter_context_provided: bool,
+    pub stream_status: ScribeStreamStatus,
+    pub stream_creation_time: SystemTime,
+    /// When the stream ENDED; `None` while it is still running, so a session in a
+    /// non-terminal status carries no end instant.
+    pub stream_end_time: Option<SystemTime>,
+}
+
+impl ScribeSession {
+    /// This record as the modelled `MedicalScribeListeningSessionDetails`.
+    pub fn details(&self) -> MedicalScribeListeningSessionDetails {
+        MedicalScribeListeningSessionDetails {
+            session_id: Some(self.session_id.clone()),
+            domain_id: Some(self.domain_id.clone()),
+            subscription_id: Some(self.subscription_id.clone()),
+            language_code: Some(self.language_code.clone()),
+            media_sample_rate_hertz: Some(self.media_sample_rate_hertz),
+            media_encoding: Some(self.media_encoding.clone()),
+            channel_definitions: Some(self.channel_definitions.clone()),
+            post_stream_action_settings: self.post_stream_action_settings.clone(),
+            post_stream_action_result: self.post_stream_action_result.clone(),
+            encounter_context_provided: Some(self.encounter_context_provided),
+            stream_status: Some(self.stream_status.as_wire().to_string()),
+            stream_creation_time: Some(to_timestamp(self.stream_creation_time)),
+            stream_end_time: self.stream_end_time.map(to_timestamp),
+        }
+    }
 }
 
 impl Subscription {
@@ -260,6 +368,13 @@ pub struct ComAmazonawsConnecthealthConnecthealthState {
     /// work. `CreateDomain` seeds it and `TagResource` merges into it;
     /// `UntagResource`/`ListTagsForResource` (still scaffolded) share it.
     pub tags_by_arn: BTreeMap<String, BTreeMap<String, String>>,
+    /// Every `domainId` this service has allocated and still remembers, whether or not
+    /// the domain itself is still held — the ALLOCATION HISTORY a delete consults to
+    /// tell "this domain is gone" from "this id was never valid anywhere".
+    pub allocated_domain_ids: BTreeSet<String>,
+    /// The same ids in allocation order, so the bound in
+    /// [`MAX_DOMAIN_ALLOCATION_HISTORY`] drops the oldest first.
+    pub allocation_order: VecDeque<String>,
     /// Monotonic per-process sequence folded into every minted id, so two ids minted
     /// in the same nanosecond still differ.
     pub next_id_seq: u64,
@@ -275,14 +390,50 @@ impl ComAmazonawsConnecthealthConnecthealthState {
 
     /// Mint an unused `domainId`: `dom-` plus 16 lowercase hex characters, which is 20
     /// characters long and matches `^(hai-|dom-)[a-z0-9]+$` (len 20..25).
+    ///
+    /// Unused means unused by a domain this store holds AND by one it remembers
+    /// allocating, so an id never names two domains and the allocation history cannot
+    /// be made ambiguous by a re-mint.
     pub fn mint_domain_id(&mut self) -> String {
         loop {
             let seq = self.next_seq();
             let candidate = mint_id("dom-", 16, seq);
-            if !self.domains.contains_key(&candidate) {
+            if !self.domains.contains_key(&candidate)
+                && !self.allocated_domain_ids.contains(&candidate)
+            {
                 return candidate;
             }
         }
+    }
+
+    /// How many `Domain` records `account_id` currently holds — the LIVE count the
+    /// account-wide cap is measured against, which a purge of a deleted domain lowers
+    /// again. Every record carries its owning account, so the count is of that
+    /// account's domains alone.
+    pub fn domains_held_by(&self, account_id: &str) -> usize {
+        self.domains
+            .values()
+            .filter(|domain| domain.account_id == account_id)
+            .count()
+    }
+
+    /// Remember that `domain_id` was allocated, dropping the oldest remembered id once
+    /// the history is at [`MAX_DOMAIN_ALLOCATION_HISTORY`].
+    pub fn record_domain_allocation(&mut self, domain_id: &str) {
+        if !self.allocated_domain_ids.insert(domain_id.to_string()) {
+            return;
+        }
+        self.allocation_order.push_back(domain_id.to_string());
+        while self.allocation_order.len() > MAX_DOMAIN_ALLOCATION_HISTORY {
+            if let Some(evicted) = self.allocation_order.pop_front() {
+                self.allocated_domain_ids.remove(&evicted);
+            }
+        }
+    }
+
+    /// Whether `domain_id` was ever allocated to a domain this service created.
+    pub fn has_allocated_domain(&self, domain_id: &str) -> bool {
+        self.allocated_domain_ids.contains(domain_id)
     }
 
     /// Mint a `subscriptionId` unused within `domain_id`: `sub-` plus 21 hex
@@ -427,6 +578,24 @@ impl ComAmazonawsConnecthealthConnecthealthState {
             .subscriptions
             .get(subscription_id)
             .filter(|subscription| subscription.is_live())
+    }
+
+    /// The Medical Scribe listening session `session_id` names under EXACTLY this
+    /// (`domain_id`, `subscription_id`) scope.
+    ///
+    /// `None` when any link of that chain is missing — the domain, the subscription, or
+    /// the session under that subscription — so a session started on one subscription is
+    /// never reachable through another, and every miss is the one answer
+    /// `GetMedicalScribeListeningSession` gives: `ResourceNotFoundException`.
+    pub fn live_scribe_session(
+        &self,
+        domain_id: &str,
+        subscription_id: &str,
+        session_id: &str,
+    ) -> Option<&ScribeSession> {
+        self.live_subscription(domain_id, subscription_id)?
+            .scribe_sessions
+            .get(session_id)
     }
 
     /// The live subscription `subscription_id` carries under `domain_id`, for writing.
