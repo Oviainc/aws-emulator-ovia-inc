@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePartnerInput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePartnerInput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePartnerInput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +141,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePartnerInput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePartnerInputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePartnerInput"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut state = state.lock();
+        // The transitions the clock had already made due decide both whether the
+        // input this partner is created for is still live and what the pair
+        // reports, so materialise them first: each was owed at that instant
+        // whether or not this create ran.
+        state.settle(::std::time::SystemTime::now());
+
+        // A retried create (same `@idempotencyToken` `RequestId`) must return the
+        // partner input the first one created, not a second one. The token map is
+        // the input store's, shared with `CreateInput`, so a replay counts only
+        // when the input that token created is a partner OF THE INPUT THIS
+        // REQUEST NAMES: a token spent on some other create names an input this
+        // call was not asked for, and answering with it would report a resource
+        // the request did not ask to exist.
+        if let Some(existing) = input
+            .request_id
+            .as_deref()
+            .and_then(|token| state.input_for_token(token))
+            .filter(|existing| {
+                state
+                    .inputs
+                    .get(*existing)
+                    .is_some_and(|stored| stored.partner_of.as_deref() == Some(&input.input_id))
+            })
+            .map(str::to_string)
+        {
+            let created = state.input_description(&existing).ok_or_else(unavailable)?;
+            return Ok(CreatePartnerInputOutput {
+                input: Some(created),
+            });
+        }
+
+        // The partner is created FOR the input the path named, so that input must
+        // be one this account still holds and may still change: a delete this
+        // service has accepted leaves the record readable, but the id no longer
+        // names an input a caller may give a partner. This operation models no
+        // not-found error (`smithy_query(query="operation",
+        // operation="CreatePartnerInput")` lists only BadRequest, Forbidden,
+        // TooManyRequests and the server-side three), so the refusal is its own
+        // modelled client error. The message tells the two cases apart; the
+        // status and the code do not.
+        let Some(primary) = state.live_input(&input.input_id).cloned() else {
+            let message = if state.inputs.contains_key(&input.input_id) {
+                crate::state::already_deleted_message(&crate::state::deleted_input_subject(
+                    &input.input_id,
+                ))
+            } else {
+                crate::state::not_found_message("Input", &input.input_id)
+            };
+            return Err(bad_request(&message));
+        };
+
+        // The store is bounded, so a create loop cannot grow the emulator's heap
+        // without limit: once it is full the operation's own modelled throttle is
+        // the answer, not another input. A partner input is an input, so it is
+        // the ceiling `CreateInput` answers at too.
+        if state.inputs_are_full() {
+            return Err(CreatePartnerInputErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "This emulator stores at most {} inputs; delete one before creating another",
+                        crate::state::MAX_INPUTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.mint_input_id();
+        let arn = ::engine::emulator_arn("medialive", &region, &format!("input:{id}"));
+        let record = crate::state::new_partner_input(
+            &primary,
+            id.clone(),
+            arn,
+            input.tags.unwrap_or_default(),
+        );
+
+        state.inputs.insert(id.clone(), record);
+        if let Some(token) = input.request_id {
+            // Bounded, evicting write: a caller-chosen token can neither
+            // accumulate past the cap nor outlive the input it created.
+            state.record_input_idempotency_token(token, &id);
+        }
+
+        // The partner's OWN ingest endpoints are allocated here, where its
+        // destinations are written, not on the read path.
+        state.allocate_input_ingest_addresses(&id);
+
+        // Read back out of the store, so the response reports the input that was
+        // written — its `InputPartnerIds` included — rather than one this handler
+        // assembled from the request.
+        let created = state.input_description(&id).ok_or_else(unavailable)?;
+        Ok(CreatePartnerInputOutput {
+            input: Some(created),
+        })
     }
+}
+
+/// A request this operation refuses, as its own modelled client error.
+fn bad_request(message: &str) -> CreatePartnerInputError {
+    CreatePartnerInputErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to create the partner input in. A modelled server error,
+/// never a fresh engine (which would drop the write when this request returns).
+fn unavailable() -> CreatePartnerInputError {
+    CreatePartnerInputErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }
