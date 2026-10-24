@@ -172,20 +172,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(message) => return Err(bad_request(&message)),
         };
 
-        // Each configuration's defaults and enum checks live in one place, so a create
-        // and a later update resolve an entry identically.
-        let mut configurations = ::std::vec::Vec::new();
-        for (index, requested) in input
-            .domain_name_configurations
-            .iter()
-            .flatten()
-            .enumerate()
-        {
-            match crate::state::resolve_domain_name_endpoint(index, requested) {
-                Ok(endpoint) => configurations.push(endpoint),
-                Err(message) => return Err(bad_request(&message)),
-            }
-        }
+        // A custom domain name is served only through the endpoints its
+        // `DomainNameConfigurations` describe, so a create that names none — whether it
+        // omits the member or sends an empty list — asks for a resource no request could
+        // ever reach, and is refused rather than stored. Each entry's defaults and enum
+        // checks live in one place, so a create and a later update resolve an entry
+        // identically.
+        let configurations = match crate::state::resolve_domain_name_endpoints(
+            input.domain_name_configurations.as_deref().unwrap_or(&[]),
+        ) {
+            Ok(configurations) => configurations,
+            Err(message) => return Err(bad_request(&message)),
+        };
 
         let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
