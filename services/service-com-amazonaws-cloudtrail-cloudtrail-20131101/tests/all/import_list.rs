@@ -102,6 +102,10 @@ fn import_record(n: u32, status: &str, region: &str, store_id: &str) -> ImportRe
         status: status.to_string(),
         created_timestamp: created,
         updated_timestamp: created,
+        // Nothing is owed this record by the clock: a listing reports the status the
+        // row seeded rather than materialising an `INITIALIZING` -> `IN_PROGRESS`
+        // move, whose own cases live in `tests/all/import_start.rs`.
+        ingests_at: UNIX_EPOCH + Duration::from_secs(4_000_000_000),
         statistics: None,
     }
 }

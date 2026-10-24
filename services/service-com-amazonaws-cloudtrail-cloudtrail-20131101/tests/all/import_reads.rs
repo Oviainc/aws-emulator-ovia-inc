@@ -111,6 +111,10 @@ fn record(id: &str, region: &str, status: &str) -> ImportRecord {
         status: status.to_string(),
         created_timestamp: at(1_700_000_000),
         updated_timestamp: at(1_700_000_000),
+        // Nothing is owed this record by the clock: a read reports the status the
+        // row seeded rather than materialising an `INITIALIZING` -> `IN_PROGRESS`
+        // move, whose own cases live in `tests/all/import_start.rs`.
+        ingests_at: at(4_000_000_000),
         statistics: None,
     }
 }

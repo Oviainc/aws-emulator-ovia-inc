@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartImport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartImport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartImport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts — or retries — an import of logged trail events into a destination event
+//! data store, and records the job in this service's import registry, where
+//! `GetImport`, `StopImport` and `ListImports` read it back.
+//!
+//! What this handler decides, and why:
+//!
+//! * which import the call drives. "When you start a new import, the Destinations
+//!   and ImportSource parameters are required... When you retry an import, the
+//!   ImportID parameter is required" (the model doc, above): a request naming an
+//!   `ImportId` RETRIES that stored job, one that does not STARTS a new one, and a
+//!   new import missing either required member is refused with the modelled
+//!   `InvalidParameterException`.
+//! * where the events would land. Every destination is read as an event data store
+//!   ARN or the bare id suffix of one and resolved against the registry, so an
+//!   unreadable identifier is `EventDataStoreARNInvalidException`, one naming no
+//!   store in the Region it addresses is `EventDataStoreNotFoundException`, and one
+//!   naming a store awaiting deletion is `InactiveEventDataStoreException`.
+//! * that the source is an S3 location at all — `InvalidImportSourceException` is
+//!   "thrown when the provided source S3 bucket is not valid for import".
+//! * that only one import runs at a time: "This exception is thrown when you start a
+//!   new import and a previous import is still in progress"
+//!   (`AccountHasOngoingImportException`). A retry starts a stored job again, so it
+//!   is refused on the same terms — including when the job it names is the one still
+//!   running, which is why a retry never answers success while quietly dropping the
+//!   parameters it restated.
+//!
+//! The job itself moves on the clock, not on a read: a new import answers
+//! `INITIALIZING` and the registry owes it `IN_PROGRESS`
+//! ([`crate::state::ImportRecord::settle`]). Nothing here reads the source bucket,
+//! so no status claims the import finished and no statistics are invented; the
+//! caller ends a running import with `StopImport`.
 //!
 //! ## Shape of an operation
 //!
@@ -213,18 +236,303 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartImport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartImportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartImport"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartImportErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+                message: Some(
+                    "StartImport needs the CloudTrail import registry, which this engine \
+                     does not carry"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // An `ImportId` names the job to RETRY, and an import belongs to the Region
+        // it was created in, so an id naming no import THIS Region holds is not
+        // found — the same answer `GetImport` and `StopImport` give it.
+        let retried = match input.import_id.as_deref() {
+            Some(import_id) => match store.import(import_id, &region) {
+                Some(record) => Some(record.clone()),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                        StartImportErrorModeled::ImportNotFoundException(ImportNotFoundException {
+                            message: Some(crate::state::import_not_found_message(import_id)),
+                        }),
+                        crate::state::IMPORT_NOT_FOUND_HTTP_STATUS,
+                    ));
+                }
+            },
+            None => None,
+        };
+
+        // What the import will run with: whatever this request states, falling back
+        // — only for a retry — to what the stored job was started with. A new
+        // import has nothing to fall back to, so a missing required member is
+        // refused here; the modelled length and pattern constraints were already
+        // applied at the boundary.
+        let Some(destinations) = input
+            .destinations
+            .clone()
+            .or_else(|| retried.as_ref().map(|record| record.destinations.clone()))
+        else {
+            return Err(missing_member("Destinations"));
+        };
+        let import_source = input
+            .import_source
+            .clone()
+            .or_else(|| retried.as_ref().and_then(|r| r.import_source.clone()));
+        if import_source.is_none() {
+            // No source anywhere — neither restated nor stored — is nothing to import
+            // from, whether this call starts a new job or retries one.
+            return Err(missing_member("ImportSource"));
+        }
+
+        // The destinations are checked for every call that will use them — a new
+        // import and a retry alike — because the store they name has to exist and
+        // be active for events to land in it.
+        for destination in &destinations {
+            let identifier = crate::state::parse_event_data_store_identifier(destination)
+                .map_err(|rejection| {
+                    StartImportErrorModeled::EventDataStoreARNInvalidException(
+                        EventDataStoreARNInvalidException {
+                            message: Some(rejection.message(&region)),
+                        },
+                    )
+                })?;
+            let Some(record) = store.addressed_event_data_store(&identifier, &region) else {
+                return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                    StartImportErrorModeled::EventDataStoreNotFoundException(
+                        EventDataStoreNotFoundException {
+                            message: Some(crate::state::event_data_store_not_found_message(
+                                &identifier.arn(&region),
+                            )),
+                        },
+                    ),
+                    crate::state::EVENT_DATA_STORE_NOT_FOUND_STATUS,
+                ));
+            };
+            if !record.status.is_active() {
+                return Err(StartImportErrorModeled::InactiveEventDataStoreException(
+                    InactiveEventDataStoreException {
+                        message: Some(format!(
+                            "The event data store {} is inactive: its status is {}",
+                            record.arn(),
+                            record.status.as_wire()
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "Starts an import of logged trail events from a source S3 bucket": a
+        // location that is not an S3 URI names no bucket to import from.
+        if let Some(source) = import_source.as_ref() {
+            if let Err(message) = check_s3_location_uri(&source.s3.s3_location_uri) {
+                return Err(
+                    StartImportErrorModeled::InvalidImportSourceException(
+                        InvalidImportSourceException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "Use with EndEventTime to bound a StartImport request, and limit imported
+        // trail events to only those events logged within a specified time period":
+        // the two bounds are one period, so they have to be orderable and ordered.
+        let start_event_time = read_instant(input.start_event_time, "StartEventTime")?
+            .or_else(|| retried.as_ref().and_then(|record| record.start_event_time));
+        let end_event_time = read_instant(input.end_event_time, "EndEventTime")?
+            .or_else(|| retried.as_ref().and_then(|record| record.end_event_time));
+        if let (Some(start), Some(end)) = (start_event_time, end_event_time) {
+            if start > end {
+                return Err(StartImportErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            "StartEventTime must be at or before EndEventTime: the two bound \
+                             one time period of logged events"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(stored) = retried else {
+            // A NEW import: only one may run at a time, and the registry is
+            // bounded, because it holds state for the life of the process and
+            // every request may add to it.
+            if let Some(ongoing) = store.ongoing_import_in(&region) {
+                return Err(ongoing_import_refusal(&ongoing.import_id));
+            }
+            if store.imports.len() >= crate::state::IMPORT_QUOTA {
+                return Err(StartImportErrorModeled::OperationNotPermittedException(
+                    OperationNotPermittedException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} import jobs",
+                            crate::state::IMPORT_QUOTA
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // The id is the service's to mint, in the form the modelled `UUID`
+            // pins (36 characters of `^[a-f0-9\-]+$`), which is what a hyphenated
+            // v4 UUID renders as.
+            let record = crate::state::ImportRecord {
+                import_id: ::uuid::Uuid::new_v4().to_string(),
+                destinations,
+                import_source,
+                start_event_time,
+                end_event_time,
+                // CloudTrail starts an import asynchronously, so a new one reads
+                // INITIALIZING until the clock owes it IN_PROGRESS.
+                status: crate::state::IMPORT_STATUS_INITIALIZING.to_string(),
+                created_timestamp: now,
+                updated_timestamp: now,
+                ingests_at: now + crate::state::IMPORT_INGESTION_STARTS_AFTER,
+                // Nothing has been imported yet, and this emulator reads no S3
+                // bucket, so the job reports no counts rather than counts nothing
+                // produced.
+                statistics: None,
+            };
+            let output = report(&record);
+            store
+                .imports
+                .insert((record.import_id.clone(), region.clone()), record);
+            return Ok(output);
+        };
+
+        // A RETRY runs a stored job again, from the request's own parameters where it
+        // restates them. It puts that import back in progress, so it is subject to the
+        // same one-at-a-time rule as a new import: a job that is ITSELF still running
+        // has nothing to retry — accepting the call there would take the restated
+        // parameters and drop them — and any other running import in the Region blocks
+        // the restart just the same. Running is read from the records as stored
+        // because the only transition settling can apply (`INITIALIZING` ->
+        // `IN_PROGRESS`) leaves a job running either way.
+        if let Some(ongoing) = store.ongoing_import_in(&region) {
+            return Err(ongoing_import_refusal(&ongoing.import_id));
+        }
+        let record = store
+            .import_mut(&stored.import_id, &region)
+            .expect("the retried import was just read from this registry");
+        // No clock-owed transition is materialised here: a retry is only reached once
+        // no import in the Region is running, so this record cannot still be
+        // `INITIALIZING`, and the restart below states every member it writes.
+        record.destinations = destinations;
+        record.import_source = import_source;
+        record.start_event_time = start_event_time;
+        record.end_event_time = end_event_time;
+        record.status = crate::state::IMPORT_STATUS_INITIALIZING.to_string();
+        record.updated_timestamp = now;
+        record.ingests_at = now + crate::state::IMPORT_INGESTION_STARTS_AFTER;
+        record.statistics = None;
+        Ok(report(record))
+    }
+}
+
+/// Refuse a start or a restart while an import in the caller's Region is still
+/// running — including the job the request asks to retry.
+///
+/// "This exception is thrown when you start a new import and a previous import is
+/// still in progress" (the model doc for `AccountHasOngoingImportException`); the
+/// text names the job that holds the Region so the caller knows what to stop.
+fn ongoing_import_refusal(import_id: &str) -> StartImportError {
+    StartImportErrorModeled::AccountHasOngoingImportException(AccountHasOngoingImportException {
+        message: Some(format!(
+            "The import job {import_id} is still in progress; stop it before starting or \
+             retrying an import"
+        )),
+    })
+    .into()
+}
+
+/// Refuse a new import that left out a member it requires.
+///
+/// `InvalidParameterException` is "the request includes a parameter that is not
+/// valid", and the text names the member so the caller can fix the request from it.
+fn missing_member(member: &str) -> StartImportError {
+    StartImportErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(format!(
+            "{member} is required to start a new import; ImportId is required to retry one"
+        )),
+    })
+    .into()
+}
+
+/// Check that an `S3LocationUri` names a source S3 bucket at all:
+/// `s3://<bucket>[/<prefix>]` with a non-empty bucket segment.
+///
+/// The model pins NO pattern on this member, so only what the operation's own words
+/// require is checked — "an import of logged trail events from a source S3 bucket",
+/// which a value that names no bucket cannot address. The bucket NAME is left to S3's
+/// own naming rules rather than re-stated here: this service's other S3 URI members
+/// carry a stricter pattern (`StartQueryRequest$DeliveryS3Uri`), and applying that
+/// one here would refuse locations AWS accepts (a legacy bucket with upper-case
+/// letters, say) in an error AWS would not return.
+///
+/// `Err` carries the refusal text, naming the value and the rule it broke.
+fn check_s3_location_uri(uri: &str) -> Result<(), String> {
+    let rejection = || {
+        format!(
+            "ImportSource.S3.S3LocationUri '{uri}' is not a valid import source: the URI of a \
+             source S3 bucket is s3://<bucket>[/<prefix>]"
+        )
+    };
+    let rest = uri.strip_prefix("s3://").ok_or_else(rejection)?;
+    if rest.split('/').next().unwrap_or_default().is_empty() {
+        return Err(rejection());
+    }
+    Ok(())
+}
+
+/// Read a modelled `Date` as the instant the registry stores.
+///
+/// A timestamp outside the range an instant can hold is refused with
+/// `InvalidParameterException` naming the member, rather than silently dropped.
+fn read_instant(
+    at: Option<::aws_smithy_types::DateTime>,
+    member: &str,
+) -> Result<Option<::std::time::SystemTime>, StartImportError> {
+    match at {
+        None => Ok(None),
+        Some(at) => match ::std::time::SystemTime::try_from(at) {
+            Ok(instant) => Ok(Some(instant)),
+            Err(_) => Err(StartImportErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!("{member} is not a representable timestamp")),
+                },
+            )
+            .into()),
+        },
+    }
+}
+
+/// Project a stored import job onto this operation's response.
+///
+/// Every member comes from the record, so the reply and every later read of the
+/// import are the same values. `StartImportResponse` models no `ImportStatistics`
+/// member, which is why none is reported here.
+fn report(record: &crate::state::ImportRecord) -> StartImportOutput {
+    StartImportOutput {
+        import_id: Some(record.import_id.clone()),
+        destinations: Some(record.destinations.clone()),
+        import_source: record.import_source.clone(),
+        start_event_time: record
+            .start_event_time
+            .map(::aws_smithy_types::DateTime::from),
+        end_event_time: record.end_event_time.map(::aws_smithy_types::DateTime::from),
+        import_status: Some(record.status.clone()),
+        created_timestamp: Some(::aws_smithy_types::DateTime::from(record.created_timestamp)),
+        updated_timestamp: Some(::aws_smithy_types::DateTime::from(record.updated_timestamp)),
     }
 }
