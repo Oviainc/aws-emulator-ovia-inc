@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopDBInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopDBInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation stops the stored DB instance — it goes to `stopping` and
+//! the clock owes it `stopped`, keeping every piece of metadata the operation documents
+//! as retained (its endpoint, its DB parameter group and its option group membership) —
+//! and takes the DB snapshot the request asked for "immediately before the DB instance is
+//! stopped". This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopDBInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -98,6 +97,38 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The status a DB instance reports once a stop has been accepted for it, and the one it
+/// reaches when the stop has run.
+///
+/// Stopping is not instantaneous on the real service — the instance reports `stopping`
+/// while it shuts down and `stopped` once it is down — so the accepted stop reports the
+/// transient status and the clock owes the settled one
+/// ([`crate::state::STATUS_TRANSITION_DELAY`] later). A caller that reads straight after
+/// this call therefore still sees `stopping`, exactly as it would against RDS.
+const DB_INSTANCE_STATUS_STOPPING: &str = "stopping";
+
+/// The status of a DB instance whose stop has run its course. `StartDBInstance` is what
+/// takes it back out of this status.
+const DB_INSTANCE_STATUS_STOPPED: &str = "stopped";
+
+/// The one status a stop is accepted from: stopping shuts the database engine down, so
+/// there has to be a running engine to shut down. Every other status — one the clock has
+/// yet to settle included — is the modelled state fault.
+const DB_INSTANCE_STATUS_AVAILABLE: &str = "available";
+
+/// The engine prefixes this operation does not apply to, from its own documentation:
+/// "This command doesn't apply to RDS Custom, Aurora MySQL, and Aurora PostgreSQL. For
+/// Aurora clusters, use StopDBCluster instead." RDS Custom is every `custom-` engine of
+/// [`crate::state::DB_INSTANCE_ENGINES`], and Aurora MySQL and Aurora PostgreSQL are its
+/// two `aurora-` engines, so the rule is carried as the two prefixes rather than as a
+/// list a further engine of either family would fall out of.
+const ENGINE_PREFIXES_WITHOUT_AN_INSTANCE_STOP: [&str; 2] = ["aurora-", "custom-"];
+
+/// The longest a `DBSnapshotIdentifier` may be, as the member's own constraints state
+/// ("Must contain from 1 to 255 letters, numbers, or hyphens") — the same bound
+/// `CreateDBSnapshot` and `DeleteDBInstance`'s final snapshot are held to.
+const MAX_SNAPSHOT_IDENTIFIER_LEN: usize = 255;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -171,18 +202,167 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopDBInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopDBInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopDBInstance"))
+        let region = crate::state::request_region(ctx).map_err(StopDBInstanceError::validation)?;
+        // `DBInstanceIdentifier` names "the user-supplied instance identifier", which RDS
+        // stores as a lowercase string, so the lookup folds the way the stored key does.
+        let identifier = input.db_instance_identifier.to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all; 501 is the honest answer, never a stop
+        // nothing performed.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due — owed at this instant whether or not
+        // anybody called — so the state this stop is judged against is the current one.
+        store.settle_due_transitions(&region);
+
+        // The instance this call ADDRESSES is resolved FIRST: a resource that does not
+        // exist has no stop for the other members to qualify, and the operation models
+        // `DBInstanceNotFoundFault` for exactly this. RDS is regional, so only the region
+        // the request was signed for is in scope.
+        let key = (region.clone(), identifier.clone());
+        let Some(instance) = store.db_instances.get(&key) else {
+            return Err(StopDBInstanceErrorModeled::DBInstanceNotFoundFault(
+                DBInstanceNotFoundFault {
+                    message: Some(format!("DBInstance not found: {identifier}")),
+                },
+            )
+            .into());
+        };
+
+        // `DBSnapshotIdentifier` names a snapshot this call would MINT, so its form is
+        // checked before anything is written. The model carries no pattern for it, so the
+        // member's documented constraints are refused here as a 400 `ValidationException`.
+        if let Some(snapshot_identifier) = &input.db_snapshot_identifier {
+            crate::state::check_identifier(
+                "DBSnapshotIdentifier",
+                snapshot_identifier,
+                MAX_SNAPSHOT_IDENTIFIER_LEN,
+            )
+            .map_err(StopDBInstanceError::validation)?;
+        }
+
+        // "This command doesn't apply to RDS Custom, Aurora MySQL, and Aurora
+        // PostgreSQL": an instance of one of those engines has no individual stop at all,
+        // whatever status it is in, so it is the modelled instance state fault rather than
+        // a stop this emulator invented for it.
+        if ENGINE_PREFIXES_WITHOUT_AN_INSTANCE_STOP
+            .iter()
+            .any(|prefix| instance.engine.starts_with(prefix))
+        {
+            let engine = instance.engine.clone();
+            return Err(StopDBInstanceErrorModeled::InvalidDBInstanceStateFault(
+                InvalidDBInstanceStateFault {
+                    message: Some(format!(
+                        "DB instance {identifier} runs engine {engine}, which can't be \
+                         stopped with StopDBInstance"
+                    )),
+                },
+            )
+            .into());
+        }
+        // "For Aurora clusters, use StopDBCluster instead": an instance that BELONGS to a
+        // DB cluster has no running state of its own to stop — the cluster's stop is what
+        // stops its members — so stopping one individually is refused with the cluster
+        // state fault this operation models.
+        if let Some(cluster_identifier) = instance.db_cluster_identifier.clone() {
+            return Err(StopDBInstanceErrorModeled::InvalidDBClusterStateFault(
+                InvalidDBClusterStateFault {
+                    message: Some(format!(
+                        "DB instance {identifier} is a member of DB cluster \
+                         {cluster_identifier} and can't be stopped individually; stop the \
+                         DB cluster instead"
+                    )),
+                },
+            )
+            .into());
+        }
+        // Stopping shuts the database engine down, so there has to be an engine running:
+        // an instance still coming up, on its way out, or already stopped cannot take a
+        // stop. The status the clock has yet to settle is real.
+        if instance.status != DB_INSTANCE_STATUS_AVAILABLE {
+            let status = instance.status.clone();
+            return Err(StopDBInstanceErrorModeled::InvalidDBInstanceStateFault(
+                InvalidDBInstanceStateFault {
+                    message: Some(format!(
+                        "DB instance {identifier} is not available for a stop (status \
+                         {status})"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The snapshot the request asked for is "created immediately before the DB
+        // instance is stopped", so it is minted from the instance as it stands now — and
+        // its own preconditions are settled before the instance is touched, so a refused
+        // snapshot leaves the instance running rather than half-stopped.
+        if let Some(snapshot_identifier) = &input.db_snapshot_identifier {
+            let snapshot_key = (region.clone(), snapshot_identifier.clone());
+            if store.db_snapshots.contains_key(&snapshot_key) {
+                return Err(StopDBInstanceErrorModeled::DBSnapshotAlreadyExistsFault(
+                    DBSnapshotAlreadyExistsFault {
+                        message: Some(format!(
+                            "DB snapshot already exists: {snapshot_identifier}"
+                        )),
+                    },
+                )
+                .into());
+            }
+            // The region's manual DB snapshot quota applies to this snapshot like any
+            // other, and the modelled fault says exactly this.
+            if store.snapshots_in(&region).len() >= crate::state::DB_SNAPSHOT_QUOTA_PER_REGION
+                || !store.has_room_for_region(&region)
+            {
+                return Err(StopDBInstanceErrorModeled::SnapshotQuotaExceededFault(
+                    SnapshotQuotaExceededFault {
+                        message: Some(format!(
+                            "the request would exceed the allowed number of manual DB \
+                             snapshots ({} per region, in at most {} regions)",
+                            crate::state::DB_SNAPSHOT_QUOTA_PER_REGION,
+                            crate::state::MAX_REGIONS
+                        )),
+                    },
+                )
+                .into());
+            }
+            let source = &store.db_instances[&key];
+            // Every setting the snapshot reports is COPIED from the instance record, the
+            // same projection `CreateDBSnapshot` and `DeleteDBInstance`'s final snapshot
+            // use, so a later change to the instance does not rewrite history.
+            let snapshot = crate::state::DbSnapshotRecord::from_instance(
+                source,
+                snapshot_identifier,
+                source.tags.clone(),
+            );
+            store.db_snapshots.insert(snapshot_key, snapshot);
+        }
+
+        // `DetachFromDBCapacityReservation` "controls the reservation that the DB instance
+        // belongs to", and "if the DB instance uses no DB capacity reservation, this
+        // parameter has no effect". No operation of this emulator mints a DB capacity
+        // reservation (`CreateDBCapacityReservation` is still a scaffold), so no stored
+        // instance uses one and the parameter has no effect for either of its values —
+        // which is also why `InvalidDBCapacityReservationStateFault` is unreachable here.
+        let _ = input.detach_from_db_capacity_reservation;
+
+        let record = store
+            .db_instances
+            .get_mut(&key)
+            .expect("the instance was found above and the store is locked");
+        // The stop is accepted: the instance reports `stopping` now and the clock owes it
+        // `stopped`. Nothing else about the record changes — "Amazon RDS retains the DB
+        // instance's metadata, including its endpoint, DB parameter group, and option
+        // group membership" — so the stopped instance reads back exactly as it was, bar
+        // its status.
+        record.status = DB_INSTANCE_STATUS_STOPPING.to_string();
+        record.pending_status = Some(crate::state::PendingStatus::in_a_moment(
+            DB_INSTANCE_STATUS_STOPPED,
+        ));
+        Ok(StopDBInstanceOutput {
+            db_instance: Some(record.to_wire()),
+        })
     }
 }
