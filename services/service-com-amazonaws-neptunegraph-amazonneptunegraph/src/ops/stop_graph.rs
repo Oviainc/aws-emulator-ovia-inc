@@ -161,9 +161,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `graphIdentifier` is the whole request; nothing here depends on request
-        // metadata.
-        let _ = ctx;
+        // `graphIdentifier` is the whole request body; the Region it was signed for is
+        // part of the lookup below.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StopGraphErrorModeled::InternalServerException(
                 InternalServerException {
@@ -173,11 +172,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
         // The lookup settles the transitions the clock has already made due first, so a
-        // graph whose provisioning has come due is stoppable.
-        let Some(graph) = store.settled_graph_mut(&input.graph_identifier, now) else {
+        // graph whose provisioning has come due is stoppable. A graph lives in exactly
+        // one Region, so one of another Region is not found here.
+        let Some(graph) = store.settled_graph_mut(&input.graph_identifier, &region, now) else {
             return Err(StopGraphErrorModeled::ResourceNotFoundException(
                 crate::state::graph_not_found(&input.graph_identifier),
             )

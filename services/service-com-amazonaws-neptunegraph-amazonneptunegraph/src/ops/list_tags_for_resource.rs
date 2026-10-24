@@ -134,7 +134,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -144,6 +143,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A taggable resource of this service lives in exactly one Region, so the
+        // Region the request was signed for is part of the lookup beside the ARN.
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
         // Reporting in the strict sense: the tags answered are the ones stored on the
         // resource — supplied at create time or written later by
@@ -152,7 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a resource this service holds, so its record is reclaimed before the ARN is
         // resolved.
         store.reap_deleted_graphs(::std::time::Instant::now());
-        let Some(tags) = store.tags_of(&input.resource_arn) else {
+        let Some(tags) = store.tags_of(&input.resource_arn, &region) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(&input.resource_arn),
             )

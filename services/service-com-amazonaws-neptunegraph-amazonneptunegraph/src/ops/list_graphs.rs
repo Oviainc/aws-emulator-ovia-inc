@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGraphs
-//! IMPLEMENTED: pages over the stored graphs in the shared store.
+//! IMPLEMENTED: pages over the stored graphs of the Region the request was signed for.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -143,7 +143,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListGraphsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -169,6 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|requested| usize::try_from(requested).ok())
             .unwrap_or(DEFAULT_PAGE_SIZE);
 
+        // A graph lives in exactly one Region, so this listing reports the graphs of
+        // the Region the request was signed for and no others.
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
         // Reporting only: the sole write is materialising the CREATING/UPDATING ->
@@ -177,17 +179,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `graphs` is a BTreeMap, so one stable total order underlies every page and a
         // token can name a position in it.
-        let lower = match start_after.as_deref() {
-            Some(id) => ::std::ops::Bound::Excluded(id),
-            None => ::std::ops::Bound::Unbounded,
-        };
-        let mut remaining = store
-            .graphs
-            .range::<str, _>((lower, ::std::ops::Bound::Unbounded));
+        let mut remaining = store.graphs_in(&region, start_after.as_deref());
         let graphs: Vec<GraphSummary> = remaining
             .by_ref()
             .take(page_size)
-            .map(|(_, graph)| GraphSummary::from(graph))
+            .map(GraphSummary::from)
             .collect();
         // A token only when graphs remain, and it resumes after the last one reported,
         // so a resumed page returns the remainder without repeats.

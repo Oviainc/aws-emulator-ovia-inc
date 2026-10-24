@@ -33,6 +33,8 @@ mod import_task_minting;
 mod private_graph_endpoint_lifecycle;
 #[path = "all/query_cancellation.rs"]
 mod query_cancellation;
+#[path = "all/region_scoping.rs"]
+mod region_scoping;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]

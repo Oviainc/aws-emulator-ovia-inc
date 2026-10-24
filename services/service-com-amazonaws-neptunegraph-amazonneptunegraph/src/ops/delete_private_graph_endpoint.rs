@@ -145,9 +145,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The deletion is addressed by the request's two identifiers alone, so nothing
-        // here reads `ctx`.
-        let _ = ctx;
+        // The deletion is addressed by the request's two identifiers, resolved through
+        // the GRAPH it names, which lives in exactly one Region.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 DeletePrivateGraphEndpointErrorModeled::InternalServerException(
@@ -160,13 +159,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
 
         // An endpoint is addressed as the endpoint of one graph, so a request naming no
-        // stored graph is reported as the missing GRAPH rather than as a missing
-        // endpoint.
-        if store.settled_graph(&input.graph_identifier, now).is_none() {
+        // stored graph IN THIS REGION is reported as the missing GRAPH rather than as a
+        // missing endpoint.
+        if store
+            .settled_graph(&input.graph_identifier, &region, now)
+            .is_none()
+        {
             return Err(
                 DeletePrivateGraphEndpointErrorModeled::ResourceNotFoundException(
                     crate::state::graph_not_found(&input.graph_identifier),

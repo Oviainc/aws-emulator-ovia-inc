@@ -164,9 +164,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The graph and the query the request names are the whole request; nothing here
-        // depends on request metadata.
-        let _ = ctx;
+        // The graph and the query the request names are the whole request body; the
+        // Region it was signed for is part of resolving the graph below.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CancelQueryErrorModeled::InternalServerException(
                 InternalServerException {
@@ -176,14 +175,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
 
         // A query is addressed as a query OF a graph, so the graph is resolved first:
-        // an identifier no graph holds names no queries either. The lookup settles the
-        // transitions the clock has already made due, so a graph whose provisioning has
-        // come due is a graph queries can be cancelled on.
-        if store.settled_graph(&input.graph_identifier, now).is_none() {
+        // an identifier no graph holds names no queries either. A graph lives in
+        // exactly one Region, so one of another Region is not found here. The lookup
+        // settles the transitions the clock has already made due, so a graph whose
+        // provisioning has come due is a graph queries can be cancelled on.
+        if store
+            .settled_graph(&input.graph_identifier, &region, now)
+            .is_none()
+        {
             return Err(CancelQueryErrorModeled::ResourceNotFoundException(
                 crate::state::graph_not_found(&input.graph_identifier),
             )

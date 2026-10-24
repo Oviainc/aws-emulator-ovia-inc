@@ -154,9 +154,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The record this call stores is built from the request alone: an endpoint
-        // carries no ARN and no region-scoped identifier, so nothing here reads `ctx`.
-        let _ = ctx;
+        // The endpoint record is built from the request alone (it carries no ARN), but
+        // the GRAPH it reaches is resolved in the Region this request was signed for:
+        // an endpoint is addressed as an endpoint of one graph, and a graph lives in
+        // exactly one Region.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 CreatePrivateGraphEndpointErrorModeled::InternalServerException(
@@ -188,13 +189,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refuses the rest before this handler runs.
         let security_group_ids = input.vpc_security_group_ids.unwrap_or_default();
 
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
 
         // A private graph endpoint is the private route INTO a graph, so the graph has
-        // to exist. The lookup settles the transitions the clock already made due
-        // first, so a graph whose provisioning has come due can take an endpoint.
-        let Some(graph) = store.settled_graph(&input.graph_identifier, now) else {
+        // to exist IN THE REGION this request was signed for. The lookup settles the
+        // transitions the clock already made due first, so a graph whose provisioning
+        // has come due can take an endpoint.
+        let Some(graph) = store.settled_graph(&input.graph_identifier, &region, now) else {
             return Err(
                 CreatePrivateGraphEndpointErrorModeled::ResourceNotFoundException(
                     crate::state::graph_not_found(&input.graph_identifier),
