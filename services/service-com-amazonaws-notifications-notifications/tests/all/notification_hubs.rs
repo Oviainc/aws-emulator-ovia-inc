@@ -451,6 +451,11 @@ async fn deregister_moves_the_hub_to_deregistering_and_the_clock_removes_it() {
             error_code(&missing).contains("ResourceNotFoundException"),
             "case {case:?}: that refusal is a ResourceNotFoundException, got {missing:?}"
         );
+        assert_eq!(
+            missing["message"].as_str(),
+            Some(format!("notification hub with region {region} not found").as_str()),
+            "case {case:?}: the refusal names the resource and the Region asked for, got {missing:?}"
+        );
 
         // And the Region can be registered again, as a new hub.
         let (status, again) = emulator.register_hub(region).await;

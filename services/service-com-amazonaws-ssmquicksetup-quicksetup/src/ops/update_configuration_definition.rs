@@ -3,9 +3,10 @@
 //! @op UpdateConfigurationDefinition
 //! Mutates the ONE stored configuration definition the `{ManagerArn}/{Id}` pair names:
 //! every member the request carries replaces the stored one, every member it omits is
-//! left exactly as it was stored, and the configuration the service deploys from that
-//! definition is re-deployed with the new values — so a later `GetConfigurationManager`
-//! and `ListConfigurations` report them. The modelled 404 when no manager has that ARN
+//! left exactly as it was stored, and the configurations the service deploys from that
+//! definition are re-deployed with the new values — one per account and Region the
+//! definition's parameters now target — so a later `GetConfigurationManager` and
+//! `ListConfigurations` report them. The modelled 404 when no manager has that ARN
 //! or that manager holds no definition with that id; an empty body on success.
 //!
 //! ## Shape of an operation
@@ -106,6 +107,22 @@ fn update_rejection(input: &UpdateConfigurationDefinitionInput) -> Option<String
              definition may hold",
             crate::state::MAX_PARAMETERS
         ));
+    }
+    // A parameter set the request replaces also names where the definition is
+    // deployed, so the targets it names are checked the way a create's are —
+    // `crate::state` is the one place that rule lives.
+    if let Some(why) = input.parameters.as_ref().and_then(|parameters| {
+        crate::state::deployment_targets_rejection(
+            "Parameters",
+            parameters
+                .get(crate::state::PARAMETER_TARGET_REGIONS)
+                .map(String::as_str),
+            parameters
+                .get(crate::state::PARAMETER_TARGET_ACCOUNTS)
+                .map(String::as_str),
+        )
+    }) {
+        return Some(why);
     }
     input
         .local_deployment_administration_role_arn
@@ -283,8 +300,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(role_arn) = input.local_deployment_administration_role_arn {
             definition.local_deployment_administration_role_arn = Some(role_arn);
         }
-        let type_version = definition.type_version.clone();
-        let parameters = definition.parameters.clone();
+        let definition = definition.clone();
+        let manager_region = manager.region.clone();
 
         // Monotonic: the stamp never moves backwards, whatever the host clock does.
         manager.last_modified_at = now.max(manager.last_modified_at);
@@ -293,21 +310,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // did — the one clock-owed transition this service models.
         crate::state::restart_deployment(&mut manager.status_summaries, now);
 
-        // A configuration IS the deployment of one definition, so the definition's new
-        // values are what that configuration now carries: leaving the two copies to
-        // disagree would let `ListConfigurations` report a parameter set no definition
-        // holds. `Type` is not an input of this operation, so it is untouched.
-        for configuration in store.configurations.values_mut() {
-            if configuration.manager_arn != input.manager_arn
-                || configuration.configuration_definition_id != input.id
-            {
-                continue;
-            }
-            configuration.type_version = type_version.clone();
-            configuration.parameters = parameters.clone();
-            configuration.last_modified_at = now.max(configuration.last_modified_at);
-            crate::state::restart_deployment(&mut configuration.status_summaries, now);
-        }
+        // A configuration IS the deployment of one definition in one account and
+        // Region, and the definition's parameters name those targets, so the update's
+        // parameters decide both what each deployed configuration carries and which
+        // ones are deployed at all: leaving the two copies to disagree would let
+        // `ListConfigurations` report a parameter set no definition holds, or a
+        // deployment in an account or Region the definition no longer targets. `Type`
+        // is not an input of this operation, so it is untouched.
+        let targets = crate::state::deployment_targets(
+            definition
+                .parameters
+                .get(crate::state::PARAMETER_TARGET_REGIONS)
+                .map(String::as_str),
+            definition
+                .parameters
+                .get(crate::state::PARAMETER_TARGET_ACCOUNTS)
+                .map(String::as_str),
+            ::engine::emulator_account_id(),
+            &manager_region,
+        );
+        store.deploy_definition(&input.manager_arn, &definition, &targets, now);
 
         Ok(UpdateConfigurationDefinitionOutput)
     }

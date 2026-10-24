@@ -8,14 +8,28 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
-/// `ACTIVE`, the status a freshly created `NotificationConfiguration` carries.
+/// `ACTIVE`, the `NotificationConfigurationStatus` of a configuration every one
+/// of whose `EventRule`s is `ACTIVE`: "All of the EventRules are in ACTIVE
+/// Status."
 ///
 /// One of `NotificationConfigurationStatus`'s four modelled values
-/// (`crate::ops::types::NOTIFICATION_CONFIGURATION_STATUS_VALUES`). It is a
-/// terminal status — the model has no `CREATING` — so a configuration this
-/// emulator mints is readable as `ACTIVE` immediately and stays there until a
-/// caller changes it.
+/// (`crate::ops::types::NOTIFICATION_CONFIGURATION_STATUS_VALUES`). The status is
+/// DERIVED from the rules a configuration owns rather than stored on it — see
+/// [`ComAmazonawsNotificationsNotificationsState::configuration_status`] — so no
+/// operation sets it.
 pub const CONFIGURATION_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `PARTIALLY_ACTIVE`, the status of a configuration some of whose `EventRule`s
+/// are `ACTIVE` and some are not: "Some EventRules are in ACTIVE Status and some
+/// are INACTIVE." See [`CONFIGURATION_STATUS_ACTIVE`].
+pub const CONFIGURATION_STATUS_PARTIALLY_ACTIVE: &str = "PARTIALLY_ACTIVE";
+
+/// `INACTIVE`, the status of a configuration none of whose `EventRule`s is
+/// `ACTIVE`: "All of the EventRules are in INACTIVE Status." It is therefore also
+/// the status of a configuration that owns NO EventRule at all — the state a
+/// freshly created one is in, since `CreateNotificationConfiguration` creates no
+/// rule — because no rule of it is ACTIVE. See [`CONFIGURATION_STATUS_ACTIVE`].
+pub const CONFIGURATION_STATUS_INACTIVE: &str = "INACTIVE";
 
 /// `ACCOUNT`, the subtype of a configuration an account created for itself, as
 /// opposed to `ADMIN_MANAGED` (one an organization's management account owns).
@@ -55,6 +69,12 @@ pub const MAX_NOTIFICATION_CONFIGURATIONS: usize = 500;
 /// `DeleteNotificationConfiguration` removes it. `tags` is persisted here (not
 /// in a second map beside it) so `TagResource`/`UntagResource`/
 /// `ListTagsForResource` can be implemented against the same record.
+///
+/// `status` is NOT a field here: the model defines every reportable
+/// `NotificationConfigurationStatus` in terms of the configuration's `EventRule`
+/// set, so it is derived from the stored rules by
+/// [`ComAmazonawsNotificationsNotificationsState::configuration_status`] rather
+/// than carried as a second copy of them.
 #[derive(Debug, Clone)]
 pub struct NotificationConfigurationRecord {
     /// The minted arn — the single key for lookup, update and delete.
@@ -66,8 +86,6 @@ pub struct NotificationConfigurationRecord {
     /// `aggregationDuration` (`LONG` | `NONE` | `SHORT`), absent when the
     /// create call omitted it and no update has set it.
     pub aggregation_duration: Option<String>,
-    /// `status`, one of `NotificationConfigurationStatus`'s values.
-    pub status: String,
     /// `subtype`, one of `NotificationConfigurationSubtype`'s values.
     pub subtype: Option<String>,
     /// `creationTime`, set once when the record is inserted and never rewritten.
@@ -281,6 +299,22 @@ impl EventRuleRecord {
             .iter()
             .map(|(region, summary)| (region.clone(), summary.clone()))
             .collect()
+    }
+
+    /// Whether this rule is `ACTIVE` as a whole: every Region it carries reports
+    /// `EventRuleStatus` `ACTIVE`.
+    ///
+    /// `statusSummaryByRegion` is per-Region, while the status of the
+    /// `NotificationConfiguration` that owns the rule is not, so one answer per
+    /// rule is what that derivation needs. A rule with a Region still coming up
+    /// is not processing events everywhere it was asked to, so it is not ACTIVE;
+    /// a rule carrying no Region at all cannot be processing events either.
+    pub fn is_active(&self) -> bool {
+        !self.status_by_region.is_empty()
+            && self
+                .status_by_region
+                .values()
+                .all(|summary| summary.status == EVENT_RULE_STATUS_ACTIVE)
     }
 
     /// `eventPattern` as the wire reports it: the stored pattern, or the empty
@@ -726,6 +760,61 @@ impl ComAmazonawsNotificationsNotificationsState {
         records
     }
 
+    /// The `NotificationConfigurationStatus` of `configuration_arn`, DERIVED from
+    /// the `EventRule`s the store holds for it.
+    ///
+    /// The model defines the three reportable values in terms of exactly that set
+    /// — `ACTIVE` is "All of the EventRules are in ACTIVE Status",
+    /// `PARTIALLY_ACTIVE` is "Some EventRules are in ACTIVE Status and some are
+    /// INACTIVE", `INACTIVE` is "All of the EventRules are in INACTIVE Status" —
+    /// so the status is a VIEW of the rules rather than a field an operation
+    /// writes, and a configuration owning no rule at all has none of them ACTIVE
+    /// and so reports `INACTIVE`. (The fourth value, `DELETING`, names a
+    /// configuration on its way out, which this store removes outright.)
+    ///
+    /// A rule counts as ACTIVE when every Region it carries is
+    /// ([`EventRuleRecord::is_active`]). Call
+    /// [`Self::settle_due_event_rules`] first, or a rule the clock has already
+    /// activated still counts as not ACTIVE.
+    ///
+    /// `INACTIVE` for an arn the store does not hold: a configuration that does
+    /// not exist owns no ACTIVE rule either, and every caller establishes that it
+    /// exists before reporting its status.
+    pub fn configuration_status(&self, configuration_arn: &str) -> String {
+        let mut rules = 0_usize;
+        let mut active = 0_usize;
+        for rule in self.event_rules.values() {
+            if rule.notification_configuration_arn != configuration_arn {
+                continue;
+            }
+            rules += 1;
+            if rule.is_active() {
+                active += 1;
+            }
+        }
+        if active == 0 {
+            CONFIGURATION_STATUS_INACTIVE.to_string()
+        } else if active == rules {
+            CONFIGURATION_STATUS_ACTIVE.to_string()
+        } else {
+            CONFIGURATION_STATUS_PARTIALLY_ACTIVE.to_string()
+        }
+    }
+
+    /// Every stored configuration in creation order, each beside the status
+    /// [`Self::configuration_status`] derives for it — what
+    /// `ListNotificationConfigurations` filters, pages and reports over, computed
+    /// once per listing rather than per filter test.
+    pub fn configurations_with_status(&self) -> Vec<(&NotificationConfigurationRecord, String)> {
+        self.configurations_in_creation_order()
+            .into_iter()
+            .map(|record| {
+                let status = self.configuration_status(&record.arn);
+                (record, status)
+            })
+            .collect()
+    }
+
     /// Associate `channel_arn` with `configuration_arn`, and report whether that
     /// changed the stored record.
     ///
@@ -775,6 +864,20 @@ impl ComAmazonawsNotificationsNotificationsState {
             .collect();
         channels.sort_by_key(|(_, sequence)| *sequence);
         channels
+    }
+
+    /// The `EventRule`s of `configuration_arn` in creation order — the order
+    /// `ListEventRules` reverses into "reverse chronological order (newest
+    /// first)" and pages through. Empty for a configuration the store does not
+    /// hold, which the caller refuses before it gets here.
+    pub fn event_rules_in_creation_order(&self, configuration_arn: &str) -> Vec<&EventRuleRecord> {
+        let mut rules: Vec<&EventRuleRecord> = self
+            .event_rules
+            .values()
+            .filter(|rule| rule.notification_configuration_arn == configuration_arn)
+            .collect();
+        rules.sort_by_key(|rule| rule.sequence);
+        rules
     }
 
     /// How many `EventRule`s one configuration holds.
@@ -1165,6 +1268,49 @@ pub fn decode_page_token(token: &str) -> Option<u64> {
 /// The wall-clock instant a record is stamped with, as the modelled timestamp type.
 pub fn now() -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(std::time::SystemTime::now())
+}
+
+/// `notification hub`, the resource label [`not_found_message`] names a
+/// `NotificationHub` by.
+pub const HUB_RESOURCE_LABEL: &str = "notification hub";
+
+/// `region`, the identifier label [`not_found_message`] names a hub's
+/// `notificationHubRegion` by.
+pub const HUB_IDENTIFIER_LABEL: &str = "region";
+
+/// `notification configuration`, the resource label [`not_found_message`] names a
+/// `NotificationConfiguration` by.
+pub const CONFIGURATION_RESOURCE_LABEL: &str = "notification configuration";
+
+/// `event rule`, the resource label [`not_found_message`] names an `EventRule` by.
+pub const EVENT_RULE_RESOURCE_LABEL: &str = "event rule";
+
+/// `arn`, the identifier label [`not_found_message`] names an arn-keyed resource
+/// by — the `arn` member every one of those operations takes.
+pub const ARN_IDENTIFIER_LABEL: &str = "arn";
+
+/// How this service states a reference to a resource that does not exist: the
+/// `message` of a `ResourceNotFoundException` (HTTP 404).
+///
+/// ONE template for every not-found path of this service, built from the request:
+/// the kind of resource that was looked up, the member that identified it, and
+/// the value the request carried there. The recorded refusal of a deregister
+/// naming a Region no hub is registered in reads `notification hub with region
+/// <notificationHubRegion> not found`, so the resource and the identifier are
+/// named in lower case prose and the value is quoted bare.
+///
+/// The identifier is named by the member's own noun with the resource's name
+/// dropped from it, which is what that recording shows: `notificationHubRegion`
+/// is stated as `region` beside `notification hub`. By the same reading
+/// `notificationConfigurationArn` is stated as `arn` beside `notification
+/// configuration`, so an operation naming a configuration in `arn` and one
+/// naming it in `notificationConfigurationArn` state the same sentence about the
+/// same missing resource.
+///
+/// Spelled once so the whole family reads the same way rather than one sentence
+/// per handler; the labels are the constants above.
+pub fn not_found_message(resource: &str, identifier: &str, value: &str) -> String {
+    format!("{resource} with {identifier} {value} not found")
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

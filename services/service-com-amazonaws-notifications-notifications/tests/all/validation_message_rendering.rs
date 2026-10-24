@@ -4,13 +4,22 @@
 //! driven over HTTP through the same multi-service router the emulator boots in
 //! production.
 //!
-//! The rule under test: a numeric-bound (`@range`) violation names the member that
-//! failed and the bound it broke and NEVER renders the number that was submitted, so
-//! two different rejected values at one member produce the SAME message; every other
-//! violation class keeps the framework's wording, which does quote the submitted value
-//! (and `Value null at '<member>'` for an absent one).
+//! Three rules are under test here, each in its own table:
 //!
-//! The table spans every operation of this service that binds a `maxResults` with a
+//! * a numeric-bound (`@range`) violation names the member that failed and the bound it
+//!   broke and NEVER renders the number that was submitted, so two different rejected
+//!   values at one member produce the SAME message;
+//! * a `@pattern` violation names the member and the expression a value has to satisfy,
+//!   also WITHOUT the submitted value, and quotes the expression without the `^`/`$`
+//!   anchors the model wraps it in;
+//! * a MAP member carrying more entries than its `@length` maximum is stated as the
+//!   schema layer's property-count finding over the count submitted and the modelled
+//!   maximum, not as a member-length clause.
+//!
+//! Every other violation class keeps the framework's wording, which does quote the
+//! submitted value (and `Value null at '<member>'` for an absent one).
+//!
+//! The range table spans every operation of this service that binds a `maxResults` with a
 //! modelled `@range`, so the rows differ in the bounds themselves (`3..3`, `1..100`,
 //! `1..1000`), in whether the operation is implemented or still answers the scaffold's
 //! 501, and in whether it carries required members beside the page size. Each row is
@@ -19,12 +28,20 @@
 //! ListNotificationConfigurations,ListChannels,ListEventRules",
 //! model_path="services/service-com-amazonaws-notifications-notifications/smithy-model/com-amazonaws-notifications-notifications.json")`,
 //! whose `input.maxResults` carries `{"httpQuery":"maxResults","range":{...}}` for each.
+//!
+//! The pattern table spans the patterned members of this service that an implemented
+//! operation can be refused on alone, so the rows differ in the expression (an ARN, a
+//! name alphabet, a dotted source, a Region, a pagination token), in where the member
+//! travels (a URI label, a query parameter, a request body) and in what makes the value
+//! fail it. Catalog source: `smithy_query(query="shape",shape="NotificationConfigurationArn,
+//! NotificationConfigurationName,Source,ChannelArn,NextToken,Region,EventRuleArn",
+//! model_path="services/service-com-amazonaws-notifications-notifications/smithy-model/com-amazonaws-notifications-notifications.json")`.
 
 use serde_json::Value;
 
 // The HTTP harness this suite drives the service through, shared with every other
 // suite in this crate.
-use crate::harness::{error_code, Emulator};
+use crate::harness::{encode_path_label, error_code, Emulator};
 
 /// The member every row's page size is bound to, which is also the path the validating
 /// walk reports a violation of it at.
@@ -226,35 +243,46 @@ async fn the_one_permitted_page_size_of_the_hub_listing_is_served() {
     }
 }
 
-/// RULE: only the numeric-bound clause withholds the submitted value. Every other
-/// violation class keeps the framework's wording — a present-but-invalid value is quoted
-/// back as `Value '<value>' at '<member>'`, and an absent required member reads
-/// `Value null at '<member>'`.
+/// The clause this service states for one violated `@pattern`: the member and the
+/// expression a value has to satisfy, with nothing of the submitted value.
+fn pattern_clause(member: &str, expression: &str) -> String {
+    format!(
+        "Value at '{member}' failed to satisfy constraint: Member must satisfy regular \
+         expression pattern: {expression}"
+    )
+}
+
+/// RULE: the numeric-bound and `@pattern` clauses withhold the submitted value; the
+/// remaining violation classes keep the framework's wording — a present-but-invalid
+/// value is quoted back as `Value '<value>' at '<member>'`, and an absent required
+/// member reads `Value null at '<member>'`.
 #[tokio::test]
-async fn other_violation_classes_still_quote_the_value_they_refused() {
+async fn the_remaining_violation_classes_still_quote_the_value_they_refused() {
     let emulator = Emulator::new();
 
-    // A `nextToken` that satisfies no `@pattern`: the clause quotes it back. The
-    // asterisks are what the modelled `^[\w+-/=]+$` refuses — its `+-/` is a range over
-    // `+,-.` and `/`, so `*` sits just below it — and they survive the query string as
-    // sent, so the value the message echoes is comparable with the value submitted.
-    let offending = "not*a*token";
+    // A `description` longer than its `@length` maximum: a scalar length clause is not
+    // one of the classes this service rewords, so it quotes the value back (the
+    // framework elides a long echo, so only the opening and the requirement are pinned).
+    let case = "a description past its length maximum";
     let (status, refused) = emulator
-        .send("GET", &format!("/notification-hubs?nextToken={offending}"), None)
+        .send(
+            "POST",
+            "/notification-configurations",
+            Some(serde_json::json!({ "name": "lengthy", "description": "d".repeat(257) })),
+        )
         .await;
-    let case = "a nextToken outside its pattern";
     assert_eq!(
         status, 400,
-        "case {case:?}: a value outside its pattern is refused with 400, got {refused:?}"
+        "case {case:?}: a value past its length maximum is refused with 400, got {refused:?}"
     );
     let stated = message(case, &refused);
-    let expected = format!(
-        "1 validation error detected: Value '{offending}' at 'nextToken' failed to satisfy \
-         constraint: Member must satisfy regular expression pattern:"
-    );
     assert!(
-        stated.starts_with(&expected),
-        "case {case:?}: expected a message starting {expected:?}, got {stated:?}"
+        stated.starts_with("1 validation error detected: Value 'dddd")
+            && stated.ends_with(
+                "at 'description' failed to satisfy constraint: Member must have length less \
+                 than or equal to 256"
+            ),
+        "case {case:?}: the length clause still quotes the submitted value, got {stated:?}"
     );
 
     // An absent required member: there is no submitted value to state. Asserted on
@@ -276,8 +304,12 @@ async fn other_violation_classes_still_quote_the_value_they_refused() {
         "case {case:?}: the absent-member form is unchanged, got {stated:?}"
     );
 
-    // Both classes in one request: one envelope, each clause worded by its own class.
+    // Two reworded classes in one request: one envelope, each clause worded by its own
+    // class, neither quoting what was submitted. The asterisks are what the modelled
+    // `^[\w+-/=]+$` refuses — its `+-/` is a range over `+,-.` and `/`, so `*` sits just
+    // below it — and they survive the query string as sent.
     let case = "a page size out of range beside a token outside its pattern";
+    let offending = "not*a*token";
     let (status, refused) = emulator
         .send(
             "GET",
@@ -302,12 +334,12 @@ async fn other_violation_classes_still_quote_the_value_they_refused() {
         "case {case:?}: the range clause withholds the submitted value, got {stated:?}"
     );
     assert!(
-        stated.contains(&format!("Value '{offending}' at 'nextToken'")),
-        "case {case:?}: the pattern clause quotes the submitted value, got {stated:?}"
+        stated.contains(&pattern_clause("nextToken", r"[\w+-/=]+")),
+        "case {case:?}: the pattern clause withholds the submitted value, got {stated:?}"
     );
     assert!(
-        !stated.contains("'7'"),
-        "case {case:?}: the rejected page size is nowhere in the message, got {stated:?}"
+        !stated.contains("'7'") && !stated.contains(offending),
+        "case {case:?}: neither rejected value is anywhere in the message, got {stated:?}"
     );
 }
 
@@ -327,5 +359,276 @@ async fn a_refused_page_size_changes_nothing_the_listing_reports() {
     assert_eq!(
         before, after,
         "a refused request must not change what the next listing reports, got {after:?}"
+    );
+}
+
+/// One request refused for ONE patterned member, and how that refusal must read.
+struct PatternedMember {
+    case: &'static str,
+    method: &'static str,
+    /// The request URI, with the offending value already in it where the member is a
+    /// `@httpLabel` or an `@httpQuery`.
+    uri: String,
+    /// The request body, where the member travels in it.
+    body: Option<Value>,
+    /// The path the validating walk reports the violation at.
+    member: &'static str,
+    /// The `@pattern` the model declares, as written — anchors included.
+    modelled: &'static str,
+    /// The value the request carries at `member`, which the message must NOT contain.
+    offending: &'static str,
+}
+
+/// The expression a clause for this member must quote: the model's pattern with the
+/// leading `^` and trailing `$` dropped, and nothing else changed.
+fn unanchored(modelled: &str) -> &str {
+    modelled
+        .strip_prefix('^')
+        .and_then(|body| body.strip_suffix('$'))
+        .unwrap_or(modelled)
+}
+
+/// The patterned-member table. Rows differ in the expression, in where the member
+/// travels (URI label, query parameter, request body), and in what makes the value fail
+/// it — a shape that is not an ARN at all, an ARN of the wrong service, an ARN of the
+/// wrong resource depth, a character outside a name's alphabet, a source missing its
+/// `aws.` prefix, an upper-cased Region, a token outside its word-character class.
+/// Catalog source: the shapes named in this module's header.
+fn patterned_members() -> Vec<PatternedMember> {
+    const CONFIGURATION_ARN_PATTERN: &str =
+        r"^arn:[a-z-]{3,10}:notifications::[0-9]{12}:configuration/[a-z0-9]{27}$";
+    const EVENT_RULE_ARN_PATTERN: &str = r"^arn:[a-z-]{3,10}:notifications::[0-9]{12}:configuration/[a-z0-9]{27}/rule/[a-z0-9]{27}$";
+    const CHANNEL_ARN_PATTERN: &str = r"^arn:[a-z-]{3,10}:(chatbot|consoleapp|notifications-contacts):[a-zA-Z0-9-]*:[0-9]{12}:[a-zA-Z0-9-_.@]+/[a-zA-Z0-9/_.@:-]+$";
+    const NAME_PATTERN: &str = r"^[A-Za-z0-9_\-]+$";
+    const SOURCE_PATTERN: &str = r"^aws.([a-z0-9\-])+$";
+    const REGION_PATTERN: &str = r"^([a-z]{1,4})-([a-z]{1,15}-)+([0-9])$";
+    const NEXT_TOKEN_PATTERN: &str = r"^[\w+-/=]+$";
+
+    // A configuration ARN that satisfies its pattern, for the rows whose refusal must
+    // come from another member.
+    const VALID_CONFIGURATION_ARN: &str =
+        "arn:aws:notifications::123456789012:configuration/abcdefghij0123456789abcdefg";
+
+    let mut rows = Vec::new();
+
+    for (case, offending) in [
+        ("a configuration arn that is not an arn at all", "not-a-valid-arn"),
+        (
+            "a configuration arn naming another service",
+            "arn:aws:sns::123456789012:configuration/abcdefghij0123456789abcdefg",
+        ),
+        (
+            "a configuration arn whose id segment is too short",
+            "arn:aws:notifications::123456789012:configuration/tooshort",
+        ),
+    ] {
+        rows.push(PatternedMember {
+            case,
+            method: "GET",
+            uri: format!("/notification-configurations/{}", encode_path_label(offending)),
+            body: None,
+            member: "arn",
+            modelled: CONFIGURATION_ARN_PATTERN,
+            offending,
+        });
+    }
+
+    for (case, offending) in [
+        ("a name carrying spaces and punctuation", "sim2real behav 1!"),
+        ("a name carrying dots", "name.with.dots"),
+    ] {
+        rows.push(PatternedMember {
+            case,
+            method: "POST",
+            uri: "/notification-configurations".to_string(),
+            body: Some(serde_json::json!({ "name": offending, "description": "x" })),
+            member: "name",
+            modelled: NAME_PATTERN,
+            offending,
+        });
+    }
+
+    for (case, offending) in [
+        ("a source missing the aws. prefix", "ec2"),
+        ("a source whose prefix is upper-cased", "AWS.ec2"),
+    ] {
+        rows.push(PatternedMember {
+            case,
+            method: "POST",
+            uri: "/event-rules".to_string(),
+            body: Some(serde_json::json!({
+                "notificationConfigurationArn": VALID_CONFIGURATION_ARN,
+                "source": offending,
+                "eventType": "Demo Event",
+                "regions": ["us-east-1"],
+            })),
+            member: "source",
+            modelled: SOURCE_PATTERN,
+            offending,
+        });
+    }
+
+    for (case, offending) in [
+        (
+            "a channel arn of a service that is no channel type",
+            "arn:aws:sns:us-west-2:123456789012:not-a-supported-channel-type",
+        ),
+        (
+            "a channel arn of a supported type with no resource path",
+            "arn:aws:chatbot:us-west-2:123456789012:channel",
+        ),
+    ] {
+        rows.push(PatternedMember {
+            case,
+            method: "POST",
+            uri: format!("/channels/associate/{}", encode_path_label(offending)),
+            body: Some(
+                serde_json::json!({ "notificationConfigurationArn": VALID_CONFIGURATION_ARN }),
+            ),
+            member: "arn",
+            modelled: CHANNEL_ARN_PATTERN,
+            offending,
+        });
+    }
+
+    rows.push(PatternedMember {
+        case: "an event-rule arn that stops at its configuration",
+        method: "GET",
+        uri: format!(
+            "/event-rules/{}",
+            encode_path_label(VALID_CONFIGURATION_ARN)
+        ),
+        body: None,
+        member: "arn",
+        modelled: EVENT_RULE_ARN_PATTERN,
+        offending: VALID_CONFIGURATION_ARN,
+    });
+
+    rows.push(PatternedMember {
+        case: "an upper-cased Region",
+        method: "POST",
+        uri: "/notification-hubs".to_string(),
+        body: Some(serde_json::json!({ "notificationHubRegion": "US-EAST-1" })),
+        member: "notificationHubRegion",
+        modelled: REGION_PATTERN,
+        offending: "US-EAST-1",
+    });
+
+    rows.push(PatternedMember {
+        case: "a pagination token outside its word-character class",
+        method: "GET",
+        uri: "/notification-hubs?nextToken=not*a*token".to_string(),
+        body: None,
+        member: "nextToken",
+        modelled: NEXT_TOKEN_PATTERN,
+        offending: "not*a*token",
+    });
+
+    rows
+}
+
+/// RULE: a value outside the `@pattern` its member declares is refused with the modelled
+/// `ValidationException` (HTTP 400) whose message names the member and the expression the
+/// value had to satisfy — the model's pattern WITHOUT the `^`/`$` anchors that make the
+/// match total — and nothing of the value that was submitted.
+#[tokio::test]
+async fn a_value_outside_its_pattern_is_refused_naming_the_unanchored_expression_only() {
+    let emulator = Emulator::new();
+
+    for row in patterned_members() {
+        let case = row.case;
+        let (status, refused) = emulator.send(row.method, &row.uri, row.body.clone()).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a value outside its pattern is refused with the modelled 400, got {refused:?}"
+        );
+        assert!(
+            error_code(&refused).contains("ValidationException"),
+            "case {case:?}: that refusal is a ValidationException, got {refused:?}"
+        );
+        let stated = message(case, &refused);
+        let expected = format!(
+            "1 validation error detected: {}",
+            pattern_clause(row.member, unanchored(row.modelled))
+        );
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected message {expected:?}, got {stated:?}"
+        );
+        assert!(
+            !stated.contains(row.offending),
+            "case {case:?}: the message must not render the submitted value, got {stated:?}"
+        );
+        assert!(
+            !stated.contains("pattern: ^") && !stated.ends_with('$'),
+            "case {case:?}: the expression must carry neither anchor, got {stated:?}"
+        );
+    }
+}
+
+/// RULE: a member modelled as a MAP carrying more entries than its `@length` maximum is
+/// refused as a schema finding about the object's property count — the count the request
+/// submitted and the maximum the model declares — rather than as a member-length clause,
+/// and nothing is written.
+#[tokio::test]
+async fn a_tag_map_past_its_maximum_is_refused_as_an_object_with_too_many_properties() {
+    let emulator = Emulator::new();
+
+    // Catalog source: `TagMap`, `@length(min 0, max 200)` — see the module header's
+    // `smithy_query`. The rows differ in how far past the maximum the request goes.
+    const MAX_ENTRIES: usize = 200;
+    let arn = "arn:aws:notifications::123456789012:configuration/abcdefghij0123456789abcdefg";
+
+    for submitted in [MAX_ENTRIES + 1, MAX_ENTRIES + 2, MAX_ENTRIES * 3] {
+        let case = format!("{submitted} tag entries against a maximum of {MAX_ENTRIES}");
+        let tags: serde_json::Map<String, Value> = (0..submitted)
+            .map(|index| (format!("key-{index}"), Value::String(index.to_string())))
+            .collect();
+        let (status, refused) = emulator
+            .send(
+                "POST",
+                &format!("/tags/{}", encode_path_label(arn)),
+                Some(serde_json::json!({ "tags": tags })),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a map past its maximum is refused with the modelled 400, got {refused:?}"
+        );
+        assert!(
+            error_code(&refused).contains("ValidationException"),
+            "case {case:?}: that refusal is a ValidationException, got {refused:?}"
+        );
+        let stated = message(&case, &refused);
+        let expected = format!(
+            "[object has too many properties (found {submitted} but schema requires at most \
+             {MAX_ENTRIES})]"
+        );
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected message {expected:?}, got {stated:?}"
+        );
+        assert!(
+            !stated.contains("validation error") && !stated.contains("entries'"),
+            "case {case:?}: the member-length clause must not be stated, got {stated:?}"
+        );
+    }
+
+    // A map AT the maximum is not a schema failure: the request gets as far as the
+    // handler, which answers the modelled 404 for an arn no configuration is stored
+    // under.
+    let at_bound: serde_json::Map<String, Value> = (0..MAX_ENTRIES)
+        .map(|index| (format!("key-{index}"), Value::String(index.to_string())))
+        .collect();
+    let (status, response) = emulator
+        .send(
+            "POST",
+            &format!("/tags/{}", encode_path_label(arn)),
+            Some(serde_json::json!({ "tags": at_bound })),
+        )
+        .await;
+    assert_eq!(
+        status, 404,
+        "case at the maximum: a map AT the bound is no schema failure, got {status} {response:?}"
     );
 }

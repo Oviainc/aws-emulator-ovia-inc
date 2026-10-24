@@ -169,16 +169,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = store.configurations.get_mut(&input.arn).ok_or_else(|| {
             UpdateNotificationConfigurationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("no NotificationConfiguration exists with arn {}", input.arn),
+                    message: crate::state::not_found_message(
+                        crate::state::CONFIGURATION_RESOURCE_LABEL,
+                        crate::state::ARN_IDENTIFIER_LABEL,
+                        &input.arn,
+                    ),
                     resource_id: input.arn.clone(),
                 },
             )
         })?;
 
         // An absent member is "leave this as it is", not "clear it": only the
-        // members the request carries are written. `creationTime`, `status`,
-        // `subtype` and `tags` are not updatable members of this operation, so
-        // they keep the values the record already holds.
+        // members the request carries are written. `creationTime`, `subtype` and
+        // `tags` are not updatable members of this operation, so they keep the
+        // values the record already holds, and `status` is derived from the
+        // configuration's EventRules rather than stored, so nothing here moves it.
         if let Some(name) = input.name {
             record.name = name;
         }

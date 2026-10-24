@@ -1,22 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InferICD10CM
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InferICD10CM`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InferICD10CM::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. The ontology linking runs in-process: the submitted text is tokenized,
+//! every mention of a medical condition the lexicon below names is placed from the
+//! characters the text itself carries, the context around each mention licenses its
+//! traits and attributes, and each mention is linked to the ICD-10-CM codes its lexicon
+//! entry lists. Nothing is matched out of a particular request, and no value is carried
+//! over from one call to the next.
 //!
-//! ## Shape of an operation
+//! No maintained crates.io crate ships a clinical-text model that can be loaded
+//! in-process without an external runtime, so the engine here is rule- and
+//! lexicon-based — the same class of engine as the recognisers in the sibling
+//! `comprehend` crate — and the rule each table applies is stated on that table.
 //!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `InferICD10CM::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! The operation holds NO state: the answer is a function of the submitted text alone,
+//! so repeating the call returns the same entities and nothing a later caller reads is
+//! changed by calling it.
 //!
 //! ## Reaching this service's state
 //!
@@ -91,6 +91,1646 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::OnceLock;
+
+/// The version this emulator reports for the model behind the ontology linking.
+///
+/// The modelled `ModelVersion` member documents the SHAPE of the value ("in the format
+/// n.n.n"), not a particular version, so one constant is the single source for every
+/// response this operation serves.
+const MODEL_VERSION: &str = "0.1.0";
+
+// The modelled enum values this pass can produce, named once so no rule below can
+// invent a value outside the enum: `ICD10CMEntityCategory`, `ICD10CMEntityType`,
+// `ICD10CMTraitName`, `ICD10CMAttributeType` and `ICD10CMRelationshipType` (see
+// `super::types::I_C_D10_C_M_*_VALUES`, generated from the model).
+const CATEGORY_MEDICAL_CONDITION: &str = "MEDICAL_CONDITION";
+const TYPE_DX_NAME: &str = "DX_NAME";
+const TYPE_TIME_EXPRESSION: &str = "TIME_EXPRESSION";
+const TRAIT_DIAGNOSIS: &str = "DIAGNOSIS";
+const TRAIT_SIGN: &str = "SIGN";
+const TRAIT_SYMPTOM: &str = "SYMPTOM";
+const TRAIT_NEGATION: &str = "NEGATION";
+const TRAIT_PERTAINS_TO_FAMILY: &str = "PERTAINS_TO_FAMILY";
+const TRAIT_HYPOTHETICAL: &str = "HYPOTHETICAL";
+const TRAIT_LOW_CONFIDENCE: &str = "LOW_CONFIDENCE";
+const ATTRIBUTE_ACUITY: &str = "ACUITY";
+const ATTRIBUTE_DIRECTION: &str = "DIRECTION";
+const ATTRIBUTE_QUALITY: &str = "QUALITY";
+const ATTRIBUTE_QUANTITY: &str = "QUANTITY";
+const ATTRIBUTE_SYSTEM_ORGAN_SITE: &str = "SYSTEM_ORGAN_SITE";
+const ATTRIBUTE_TIME_TO_DX_NAME: &str = "TIME_TO_DX_NAME";
+const RELATIONSHIP_OVERLAP: &str = "OVERLAP";
+const RELATIONSHIP_QUALITY: &str = "QUALITY";
+const RELATIONSHIP_SYSTEM_ORGAN_SITE: &str = "SYSTEM_ORGAN_SITE";
+
+/// Confidence of a condition mention named by a ONE-token lexicon entry.
+///
+/// A longer written form is a more specific mention of the same concept ("diabetes"
+/// names several ICD-10-CM chapters, "type 2 diabetes mellitus" names one), so the
+/// confidence of a mention rises with the number of tokens its lexicon entry spans and
+/// stops rising at [`TERM_TOKENS_AT_FULL_CONFIDENCE`].
+const WEIGHT_TERM_ONE_TOKEN: f32 = 0.84;
+
+/// How much each further token of the matched written form adds to that confidence.
+const WEIGHT_TERM_PER_TOKEN: f32 = 0.04;
+
+/// The token count past which a longer written form adds no more confidence.
+const TERM_TOKENS_AT_FULL_CONFIDENCE: usize = 4;
+
+/// Confidence of a span a closed-form pattern placed — a time expression, whose own
+/// characters are the whole of the evidence, so nothing but the form can be wrong.
+const WEIGHT_PATTERN: f32 = 0.95;
+
+/// Confidence of a trait a context cue licensed (a negation, a family reference): the
+/// cue is a single word standing next to the mention, which is weaker evidence than the
+/// mention's own written form.
+const WEIGHT_CUE: f32 = 0.90;
+
+/// Confidence of an attribute a one-word modifier lexicon placed.
+const WEIGHT_MODIFIER: f32 = 0.90;
+
+/// Confidence that a modifier STANDING NEXT to the mention modifies it, which is what
+/// the modelled `RelationshipScore` reports.
+const WEIGHT_RELATIONSHIP: f32 = 0.95;
+
+/// How much each token between the modifier and the mention lowers that relationship
+/// confidence: a modifier further from the mention is less likely to belong to it.
+const RELATIONSHIP_DISTANCE_PENALTY: f32 = 0.08;
+
+/// How much of the previous candidate's confidence the next ICD-10-CM candidate keeps.
+///
+/// The candidates of one lexicon entry are ordered most-likely-first, and the modelled
+/// `ICD10CMConcept$Score` reports "the likelihood of the match", so each successive
+/// candidate reports this share of the one in front of it and the list is strictly
+/// descending.
+const CONCEPT_RANK_DECAY: f32 = 0.72;
+
+/// The most ICD-10-CM candidates one entity reports.
+const CONCEPT_CANDIDATE_LIMIT: usize = 5;
+
+/// How far from a mention, in tokens, a modifier or a time expression is still read as
+/// belonging to it. A clause boundary stops the search whatever this allows.
+const ATTRIBUTE_WINDOW_TOKENS: usize = 4;
+
+/// How far BEFORE a mention, in tokens, a negation, hypothetical or low-confidence cue
+/// is still read as scoping it. A family reference scopes its whole clause instead, so
+/// it is searched for without this window.
+const CUE_WINDOW_TOKENS: usize = 6;
+
+/// One ICD-10-CM concept: the code and the long description the ontology gives it.
+#[derive(Debug)]
+struct Concept {
+    code: &'static str,
+    description: &'static str,
+}
+
+/// One lexicon entry: a written form of a medical condition, the trait a bare mention
+/// of it licenses, and the ICD-10-CM concepts that mention could refer to.
+///
+/// `term` is the written form already normalized the way [`tokenize`] normalizes the
+/// submitted text — lowercase tokens separated by single spaces — so a mention written
+/// with different case, spacing or hyphenation still matches it.
+#[derive(Debug)]
+struct Condition {
+    term: &'static str,
+    base_trait: &'static str,
+    concepts: &'static [Concept],
+}
+
+// The candidate lists. Source: the ICD-10-CM tabular list published by the Centers for
+// Disease Control and Prevention (NCHS), whose codes and long descriptions are what the
+// modelled `ICD10CMConcept` reports. Each list is ordered most-likely-first: the code
+// for the unspecified form of the condition, then the nearby codes a coder picks between
+// for the same mention. Lists are shared by the synonyms that name the same concept.
+
+const CONCEPTS_DIABETES_UNSPECIFIED: &[Concept] = &[
+    Concept {
+        code: "E11.9",
+        description: "Type 2 diabetes mellitus without complications",
+    },
+    Concept {
+        code: "E10.9",
+        description: "Type 1 diabetes mellitus without complications",
+    },
+    Concept {
+        code: "E13.9",
+        description: "Other specified diabetes mellitus without complications",
+    },
+    Concept {
+        code: "E08.9",
+        description: "Diabetes mellitus due to underlying condition without complications",
+    },
+    Concept {
+        code: "E11.8",
+        description: "Type 2 diabetes mellitus with unspecified complications",
+    },
+];
+
+const CONCEPTS_DIABETES_TYPE_2: &[Concept] = &[
+    Concept {
+        code: "E11.9",
+        description: "Type 2 diabetes mellitus without complications",
+    },
+    Concept {
+        code: "E11.8",
+        description: "Type 2 diabetes mellitus with unspecified complications",
+    },
+    Concept {
+        code: "E11.65",
+        description: "Type 2 diabetes mellitus with hyperglycemia",
+    },
+    Concept {
+        code: "E11.69",
+        description: "Type 2 diabetes mellitus with other specified complication",
+    },
+];
+
+const CONCEPTS_DIABETES_TYPE_1: &[Concept] = &[
+    Concept {
+        code: "E10.9",
+        description: "Type 1 diabetes mellitus without complications",
+    },
+    Concept {
+        code: "E10.8",
+        description: "Type 1 diabetes mellitus with unspecified complications",
+    },
+    Concept {
+        code: "E10.65",
+        description: "Type 1 diabetes mellitus with hyperglycemia",
+    },
+];
+
+const CONCEPTS_KETOACIDOSIS: &[Concept] = &[
+    Concept {
+        code: "E11.10",
+        description: "Type 2 diabetes mellitus with ketoacidosis without coma",
+    },
+    Concept {
+        code: "E10.10",
+        description: "Type 1 diabetes mellitus with ketoacidosis without coma",
+    },
+];
+
+const CONCEPTS_HYPERTENSION: &[Concept] = &[
+    Concept {
+        code: "I10",
+        description: "Essential (primary) hypertension",
+    },
+    Concept {
+        code: "I15.9",
+        description: "Secondary hypertension, unspecified",
+    },
+    Concept {
+        code: "I16.9",
+        description: "Hypertensive crisis, unspecified",
+    },
+];
+
+const CONCEPTS_HYPERLIPIDEMIA: &[Concept] = &[
+    Concept {
+        code: "E78.5",
+        description: "Hyperlipidemia, unspecified",
+    },
+    Concept {
+        code: "E78.00",
+        description: "Pure hypercholesterolemia, unspecified",
+    },
+];
+
+const CONCEPTS_MYOCARDIAL_INFARCTION: &[Concept] = &[
+    Concept {
+        code: "I21.9",
+        description: "Acute myocardial infarction, unspecified",
+    },
+    Concept {
+        code: "I21.4",
+        description: "Non-ST elevation (NSTEMI) myocardial infarction",
+    },
+    Concept {
+        code: "I25.2",
+        description: "Old myocardial infarction",
+    },
+];
+
+const CONCEPTS_ATRIAL_FIBRILLATION: &[Concept] = &[
+    Concept {
+        code: "I48.91",
+        description: "Unspecified atrial fibrillation",
+    },
+    Concept {
+        code: "I48.0",
+        description: "Paroxysmal atrial fibrillation",
+    },
+    Concept {
+        code: "I48.11",
+        description: "Longstanding persistent atrial fibrillation",
+    },
+];
+
+const CONCEPTS_HEART_FAILURE: &[Concept] = &[
+    Concept {
+        code: "I50.9",
+        description: "Heart failure, unspecified",
+    },
+    Concept {
+        code: "I50.22",
+        description: "Chronic systolic (congestive) heart failure",
+    },
+    Concept {
+        code: "I50.32",
+        description: "Chronic diastolic (congestive) heart failure",
+    },
+];
+
+const CONCEPTS_CORONARY_ARTERY_DISEASE: &[Concept] = &[Concept {
+    code: "I25.10",
+    description: "Atherosclerotic heart disease of native coronary artery without angina pectoris",
+}];
+
+const CONCEPTS_STROKE: &[Concept] = &[
+    Concept {
+        code: "I63.9",
+        description: "Cerebral infarction, unspecified",
+    },
+    Concept {
+        code: "I64",
+        description: "Stroke, not specified as hemorrhage or infarction",
+    },
+];
+
+const CONCEPTS_ASTHMA: &[Concept] = &[
+    Concept {
+        code: "J45.909",
+        description: "Unspecified asthma, uncomplicated",
+    },
+    Concept {
+        code: "J45.901",
+        description: "Unspecified asthma with (acute) exacerbation",
+    },
+];
+
+const CONCEPTS_COPD: &[Concept] = &[
+    Concept {
+        code: "J44.9",
+        description: "Chronic obstructive pulmonary disease, unspecified",
+    },
+    Concept {
+        code: "J44.1",
+        description: "Chronic obstructive pulmonary disease with (acute) exacerbation",
+    },
+];
+
+const CONCEPTS_PNEUMONIA: &[Concept] = &[
+    Concept {
+        code: "J18.9",
+        description: "Pneumonia, unspecified organism",
+    },
+    Concept {
+        code: "J15.9",
+        description: "Unspecified bacterial pneumonia",
+    },
+    Concept {
+        code: "J12.9",
+        description: "Viral pneumonia, unspecified",
+    },
+];
+
+const CONCEPTS_BRONCHITIS: &[Concept] = &[
+    Concept {
+        code: "J40",
+        description: "Bronchitis, not specified as acute or chronic",
+    },
+    Concept {
+        code: "J20.9",
+        description: "Acute bronchitis, unspecified",
+    },
+];
+
+const CONCEPTS_COUGH: &[Concept] = &[
+    Concept {
+        code: "R05.9",
+        description: "Cough, unspecified",
+    },
+    Concept {
+        code: "R05.1",
+        description: "Acute cough",
+    },
+    Concept {
+        code: "R05.3",
+        description: "Chronic cough",
+    },
+];
+
+const CONCEPTS_DYSPNEA: &[Concept] = &[
+    Concept {
+        code: "R06.02",
+        description: "Shortness of breath",
+    },
+    Concept {
+        code: "R06.00",
+        description: "Dyspnea, unspecified",
+    },
+];
+
+const CONCEPTS_WHEEZING: &[Concept] = &[Concept {
+    code: "R06.2",
+    description: "Wheezing",
+}];
+
+const CONCEPTS_FEVER: &[Concept] = &[
+    Concept {
+        code: "R50.9",
+        description: "Fever, unspecified",
+    },
+    Concept {
+        code: "R50.81",
+        description: "Fever presenting with conditions classified elsewhere",
+    },
+];
+
+const CONCEPTS_CHILLS: &[Concept] = &[Concept {
+    code: "R68.83",
+    description: "Chills (without fever)",
+}];
+
+const CONCEPTS_FATIGUE: &[Concept] = &[
+    Concept {
+        code: "R53.83",
+        description: "Other fatigue",
+    },
+    Concept {
+        code: "R53.1",
+        description: "Weakness",
+    },
+];
+
+const CONCEPTS_HEADACHE: &[Concept] = &[
+    Concept {
+        code: "R51.9",
+        description: "Headache, unspecified",
+    },
+    Concept {
+        code: "R51.0",
+        description: "Headache with orthostatic component, not elsewhere classified",
+    },
+];
+
+const CONCEPTS_MIGRAINE: &[Concept] = &[Concept {
+    code: "G43.909",
+    description: "Migraine, unspecified, not intractable, without status migrainosus",
+}];
+
+const CONCEPTS_NAUSEA: &[Concept] = &[
+    Concept {
+        code: "R11.0",
+        description: "Nausea",
+    },
+    Concept {
+        code: "R11.2",
+        description: "Nausea with vomiting, unspecified",
+    },
+];
+
+const CONCEPTS_VOMITING: &[Concept] = &[
+    Concept {
+        code: "R11.10",
+        description: "Vomiting, unspecified",
+    },
+    Concept {
+        code: "R11.11",
+        description: "Vomiting without nausea",
+    },
+];
+
+const CONCEPTS_DIARRHEA: &[Concept] = &[
+    Concept {
+        code: "R19.7",
+        description: "Diarrhea, unspecified",
+    },
+    Concept {
+        code: "K59.1",
+        description: "Functional diarrhea",
+    },
+];
+
+const CONCEPTS_CONSTIPATION: &[Concept] = &[Concept {
+    code: "K59.00",
+    description: "Constipation, unspecified",
+}];
+
+const CONCEPTS_ABDOMINAL_PAIN: &[Concept] = &[
+    Concept {
+        code: "R10.9",
+        description: "Unspecified abdominal pain",
+    },
+    Concept {
+        code: "R10.84",
+        description: "Generalized abdominal pain",
+    },
+];
+
+const CONCEPTS_CHEST_PAIN: &[Concept] = &[
+    Concept {
+        code: "R07.9",
+        description: "Chest pain, unspecified",
+    },
+    Concept {
+        code: "R07.89",
+        description: "Other chest pain",
+    },
+    Concept {
+        code: "I20.9",
+        description: "Angina pectoris, unspecified",
+    },
+];
+
+const CONCEPTS_BACK_PAIN: &[Concept] = &[
+    Concept {
+        code: "M54.9",
+        description: "Dorsalgia, unspecified",
+    },
+    Concept {
+        code: "M54.50",
+        description: "Low back pain, unspecified",
+    },
+];
+
+const CONCEPTS_LOW_BACK_PAIN: &[Concept] = &[
+    Concept {
+        code: "M54.50",
+        description: "Low back pain, unspecified",
+    },
+    Concept {
+        code: "M54.51",
+        description: "Vertebrogenic low back pain",
+    },
+];
+
+const CONCEPTS_DIZZINESS: &[Concept] = &[Concept {
+    code: "R42",
+    description: "Dizziness and giddiness",
+}];
+
+const CONCEPTS_SYNCOPE: &[Concept] = &[Concept {
+    code: "R55",
+    description: "Syncope and collapse",
+}];
+
+const CONCEPTS_RASH: &[Concept] = &[Concept {
+    code: "R21",
+    description: "Rash and other nonspecific skin eruption",
+}];
+
+const CONCEPTS_WEIGHT_LOSS: &[Concept] = &[Concept {
+    code: "R63.4",
+    description: "Abnormal weight loss",
+}];
+
+const CONCEPTS_EDEMA: &[Concept] = &[
+    Concept {
+        code: "R60.9",
+        description: "Edema, unspecified",
+    },
+    Concept {
+        code: "R60.0",
+        description: "Localized edema",
+    },
+];
+
+const CONCEPTS_SEIZURE: &[Concept] = &[
+    Concept {
+        code: "R56.9",
+        description: "Unspecified convulsions",
+    },
+    Concept {
+        code: "G40.909",
+        description:
+            "Epilepsy, unspecified, not intractable, without status epilepticus",
+    },
+];
+
+const CONCEPTS_SORE_THROAT: &[Concept] = &[Concept {
+    code: "J02.9",
+    description: "Acute pharyngitis, unspecified",
+}];
+
+const CONCEPTS_URINARY_TRACT_INFECTION: &[Concept] = &[Concept {
+    code: "N39.0",
+    description: "Urinary tract infection, site not specified",
+}];
+
+const CONCEPTS_ANEMIA: &[Concept] = &[
+    Concept {
+        code: "D64.9",
+        description: "Anemia, unspecified",
+    },
+    Concept {
+        code: "D50.9",
+        description: "Iron deficiency anemia, unspecified",
+    },
+];
+
+const CONCEPTS_OBESITY: &[Concept] = &[
+    Concept {
+        code: "E66.9",
+        description: "Obesity, unspecified",
+    },
+    Concept {
+        code: "E66.01",
+        description: "Morbid (severe) obesity due to excess calories",
+    },
+];
+
+const CONCEPTS_DEPRESSION: &[Concept] = &[
+    Concept {
+        code: "F32.9",
+        description: "Major depressive disorder, single episode, unspecified",
+    },
+    Concept {
+        code: "F33.9",
+        description: "Major depressive disorder, recurrent, unspecified",
+    },
+];
+
+const CONCEPTS_ANXIETY: &[Concept] = &[
+    Concept {
+        code: "F41.9",
+        description: "Anxiety disorder, unspecified",
+    },
+    Concept {
+        code: "F41.1",
+        description: "Generalized anxiety disorder",
+    },
+];
+
+const CONCEPTS_HYPOTHYROIDISM: &[Concept] = &[Concept {
+    code: "E03.9",
+    description: "Hypothyroidism, unspecified",
+}];
+
+const CONCEPTS_REFLUX: &[Concept] = &[Concept {
+    code: "K21.9",
+    description: "Gastro-esophageal reflux disease without esophagitis",
+}];
+
+const CONCEPTS_CHRONIC_KIDNEY_DISEASE: &[Concept] = &[
+    Concept {
+        code: "N18.9",
+        description: "Chronic kidney disease, unspecified",
+    },
+    Concept {
+        code: "N18.30",
+        description: "Chronic kidney disease, stage 3 unspecified",
+    },
+];
+
+const CONCEPTS_OSTEOARTHRITIS: &[Concept] = &[Concept {
+    code: "M19.90",
+    description: "Unspecified osteoarthritis, unspecified site",
+}];
+
+const CONCEPTS_COVID_19: &[Concept] = &[Concept {
+    code: "U07.1",
+    description: "COVID-19",
+}];
+
+const CONCEPTS_INFLUENZA: &[Concept] = &[Concept {
+    code: "J11.1",
+    description:
+        "Influenza due to unidentified influenza virus with other respiratory manifestations",
+}];
+
+/// Every written form this pass places, with the trait a bare mention licenses and the
+/// ICD-10-CM candidates it links to.
+///
+/// The base trait follows what the modelled `ICD10CMTraitName` values mean: a named
+/// disease mentioned in a record is a `DIAGNOSIS`, a complaint the patient reports is a
+/// `SYMPTOM`, and a finding an examiner observes is a `SIGN`. The context cues below
+/// then add the traits the surrounding words license.
+const CONDITIONS: &[Condition] = &[
+    // Endocrine and metabolic.
+    Condition {
+        term: "diabetes",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_DIABETES_UNSPECIFIED,
+    },
+    Condition {
+        term: "diabetes mellitus",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_DIABETES_UNSPECIFIED,
+    },
+    Condition {
+        term: "type 2 diabetes",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_DIABETES_TYPE_2,
+    },
+    Condition {
+        term: "type 2 diabetes mellitus",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_DIABETES_TYPE_2,
+    },
+    Condition {
+        term: "type ii diabetes",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_DIABETES_TYPE_2,
+    },
+    Condition {
+        term: "t2dm",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_DIABETES_TYPE_2,
+    },
+    Condition {
+        term: "type 1 diabetes",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_DIABETES_TYPE_1,
+    },
+    Condition {
+        term: "type 1 diabetes mellitus",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_DIABETES_TYPE_1,
+    },
+    Condition {
+        term: "diabetic ketoacidosis",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_KETOACIDOSIS,
+    },
+    Condition {
+        term: "hyperlipidemia",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_HYPERLIPIDEMIA,
+    },
+    Condition {
+        term: "hypothyroidism",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_HYPOTHYROIDISM,
+    },
+    Condition {
+        term: "obesity",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_OBESITY,
+    },
+    // Circulatory.
+    Condition {
+        term: "hypertension",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_HYPERTENSION,
+    },
+    Condition {
+        term: "htn",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_HYPERTENSION,
+    },
+    Condition {
+        term: "high blood pressure",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_HYPERTENSION,
+    },
+    Condition {
+        term: "myocardial infarction",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_MYOCARDIAL_INFARCTION,
+    },
+    Condition {
+        term: "heart attack",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_MYOCARDIAL_INFARCTION,
+    },
+    Condition {
+        term: "atrial fibrillation",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_ATRIAL_FIBRILLATION,
+    },
+    Condition {
+        term: "congestive heart failure",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_HEART_FAILURE,
+    },
+    Condition {
+        term: "heart failure",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_HEART_FAILURE,
+    },
+    Condition {
+        term: "chf",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_HEART_FAILURE,
+    },
+    Condition {
+        term: "coronary artery disease",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_CORONARY_ARTERY_DISEASE,
+    },
+    Condition {
+        term: "stroke",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_STROKE,
+    },
+    // Respiratory.
+    Condition {
+        term: "asthma",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_ASTHMA,
+    },
+    Condition {
+        term: "chronic obstructive pulmonary disease",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_COPD,
+    },
+    Condition {
+        term: "copd",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_COPD,
+    },
+    Condition {
+        term: "pneumonia",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_PNEUMONIA,
+    },
+    Condition {
+        term: "bronchitis",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_BRONCHITIS,
+    },
+    Condition {
+        term: "cough",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_COUGH,
+    },
+    Condition {
+        term: "shortness of breath",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_DYSPNEA,
+    },
+    Condition {
+        term: "dyspnea",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_DYSPNEA,
+    },
+    Condition {
+        term: "wheezing",
+        base_trait: TRAIT_SIGN,
+        concepts: CONCEPTS_WHEEZING,
+    },
+    Condition {
+        term: "sore throat",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_SORE_THROAT,
+    },
+    Condition {
+        term: "influenza",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_INFLUENZA,
+    },
+    Condition {
+        term: "covid 19",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_COVID_19,
+    },
+    // General symptoms and signs.
+    Condition {
+        term: "fever",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_FEVER,
+    },
+    Condition {
+        term: "chills",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_CHILLS,
+    },
+    Condition {
+        term: "fatigue",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_FATIGUE,
+    },
+    Condition {
+        term: "headache",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_HEADACHE,
+    },
+    Condition {
+        term: "migraine",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_MIGRAINE,
+    },
+    Condition {
+        term: "nausea",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_NAUSEA,
+    },
+    Condition {
+        term: "vomiting",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_VOMITING,
+    },
+    Condition {
+        term: "diarrhea",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_DIARRHEA,
+    },
+    Condition {
+        term: "constipation",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_CONSTIPATION,
+    },
+    Condition {
+        term: "abdominal pain",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_ABDOMINAL_PAIN,
+    },
+    Condition {
+        term: "chest pain",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_CHEST_PAIN,
+    },
+    Condition {
+        term: "back pain",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_BACK_PAIN,
+    },
+    Condition {
+        term: "low back pain",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_LOW_BACK_PAIN,
+    },
+    Condition {
+        term: "dizziness",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_DIZZINESS,
+    },
+    Condition {
+        term: "syncope",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_SYNCOPE,
+    },
+    Condition {
+        term: "rash",
+        base_trait: TRAIT_SIGN,
+        concepts: CONCEPTS_RASH,
+    },
+    Condition {
+        term: "edema",
+        base_trait: TRAIT_SIGN,
+        concepts: CONCEPTS_EDEMA,
+    },
+    Condition {
+        term: "weight loss",
+        base_trait: TRAIT_SYMPTOM,
+        concepts: CONCEPTS_WEIGHT_LOSS,
+    },
+    Condition {
+        term: "seizure",
+        base_trait: TRAIT_SIGN,
+        concepts: CONCEPTS_SEIZURE,
+    },
+    // Digestive, genitourinary, blood, mental and musculoskeletal.
+    Condition {
+        term: "gastroesophageal reflux disease",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_REFLUX,
+    },
+    Condition {
+        term: "gerd",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_REFLUX,
+    },
+    Condition {
+        term: "urinary tract infection",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_URINARY_TRACT_INFECTION,
+    },
+    Condition {
+        term: "uti",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_URINARY_TRACT_INFECTION,
+    },
+    Condition {
+        term: "chronic kidney disease",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_CHRONIC_KIDNEY_DISEASE,
+    },
+    Condition {
+        term: "anemia",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_ANEMIA,
+    },
+    Condition {
+        term: "depression",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_DEPRESSION,
+    },
+    Condition {
+        term: "anxiety",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_ANXIETY,
+    },
+    Condition {
+        term: "osteoarthritis",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_OSTEOARTHRITIS,
+    },
+];
+
+/// Words that mark the mention after them as NOT present in the patient.
+///
+/// Source: the negation cues of clinical text ("no", "denies", "negative for",
+/// "without"), which is what the modelled `NEGATION` trait reports.
+const NEGATION_CUES: &[&str] = &[
+    "no", "not", "none", "never", "denies", "denied", "denying", "negative", "without", "absent",
+    "free", "nor", "neither", "resolved",
+];
+
+/// Words that mark the mention as belonging to a relative rather than the patient.
+const FAMILY_CUES: &[&str] = &[
+    "family", "familial", "mother", "father", "mom", "dad", "parent", "parents", "sister",
+    "brother", "sibling", "siblings", "grandmother", "grandfather", "aunt", "uncle", "cousin",
+    "maternal", "paternal",
+];
+
+/// Words that mark the mention as a condition that has not happened — something to
+/// avoid, screen for or act on if it appears.
+const HYPOTHETICAL_CUES: &[&str] = &[
+    "if", "risk", "prevent", "prevention", "prophylaxis", "prophylactic", "avoid", "develops",
+    "should",
+];
+
+/// Words that hedge the mention: the writer is not asserting the condition.
+const LOW_CONFIDENCE_CUES: &[&str] = &[
+    "possible",
+    "possibly",
+    "probable",
+    "probably",
+    "suspected",
+    "suspect",
+    "questionable",
+    "likely",
+    "apparent",
+    "apparently",
+    "concern",
+    "concerning",
+    "versus",
+];
+
+/// One-word modifiers and the modelled `ICD10CMAttributeType` each one reports.
+///
+/// Source: the attribute types the operation's own documentation names for
+/// InferICD10CM — "Direction, System, Organ or Site, and Acuity" — plus the `QUALITY`
+/// and `QUANTITY` members of the modelled enum. Each row is the vocabulary that type
+/// is written with in clinical text: how far the condition has progressed (acuity),
+/// which side or part of the body it is on (direction), the body system or site it
+/// affects, and how it presents (quality).
+const ACUITY_MODIFIERS: &[&str] = &[
+    "acute",
+    "chronic",
+    "subacute",
+    "sudden",
+    "abrupt",
+    "persistent",
+    "intermittent",
+    "recurrent",
+    "episodic",
+    "progressive",
+    "longstanding",
+    "worsening",
+    "new",
+];
+
+const DIRECTION_MODIFIERS: &[&str] = &[
+    "left",
+    "right",
+    "bilateral",
+    "unilateral",
+    "upper",
+    "lower",
+    "medial",
+    "lateral",
+    "proximal",
+    "distal",
+    "anterior",
+    "posterior",
+];
+
+const QUALITY_MODIFIERS: &[&str] = &[
+    "severe",
+    "mild",
+    "moderate",
+    "sharp",
+    "dull",
+    "burning",
+    "stabbing",
+    "throbbing",
+    "crushing",
+    "radiating",
+    "productive",
+    "nonproductive",
+    "dry",
+    "diffuse",
+    "localized",
+    "generalized",
+];
+
+const SYSTEM_ORGAN_SITE_MODIFIERS: &[&str] = &[
+    "chest",
+    "abdomen",
+    "abdominal",
+    "head",
+    "neck",
+    "back",
+    "lung",
+    "lungs",
+    "pulmonary",
+    "heart",
+    "cardiac",
+    "kidney",
+    "renal",
+    "liver",
+    "hepatic",
+    "stomach",
+    "gastric",
+    "bladder",
+    "brain",
+    "cerebral",
+    "skin",
+    "throat",
+    "eye",
+    "ear",
+    "arm",
+    "leg",
+    "hand",
+    "foot",
+    "knee",
+    "hip",
+    "shoulder",
+    "ankle",
+    "wrist",
+    "elbow",
+];
+
+/// The units a time expression is counted in.
+const TIME_UNITS: &[&str] = &[
+    "second", "seconds", "minute", "minutes", "hour", "hours", "day", "days", "night", "nights",
+    "week", "weeks", "month", "months", "year", "years", "decade", "decades",
+];
+
+/// Counting words a time expression or a quantity can be written with, beside digits.
+const NUMBER_WORDS: &[&str] = &[
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
+    "twelve", "several", "few", "couple", "many",
+];
+
+/// Words that name a time on their own.
+const RELATIVE_DAY_WORDS: &[&str] = &["yesterday", "today", "tonight", "tomorrow", "overnight"];
+
+/// Words that name a time when they stand in front of a unit ("last year", "past week").
+const RELATIVE_QUALIFIERS: &[&str] = &["last", "past", "previous", "this", "next", "recent"];
+
+/// The lexicon, indexed by written form, with the longest form it holds.
+struct Lexicon {
+    terms: HashMap<&'static str, &'static Condition>,
+    max_tokens: usize,
+}
+
+/// The lexicon, built once per process rather than per request.
+fn lexicon() -> &'static Lexicon {
+    static LEXICON: OnceLock<Lexicon> = OnceLock::new();
+    LEXICON.get_or_init(|| {
+        let mut terms = HashMap::with_capacity(CONDITIONS.len());
+        let mut max_tokens = 1;
+        for condition in CONDITIONS {
+            max_tokens = max_tokens.max(condition.term.split(' ').count());
+            terms.insert(condition.term, condition);
+        }
+        Lexicon { terms, max_tokens }
+    })
+}
+
+/// One token of the submitted text: where it is written, how it compares, and which
+/// clause it belongs to.
+#[derive(Debug)]
+struct Token {
+    /// Byte offset of the token's first character in the submitted text.
+    start: usize,
+    /// Byte offset one past the token's last character.
+    end: usize,
+    /// The token lowercased, which is what every table above is matched against.
+    lower: String,
+    /// Which clause of the text the token is in. A cue only scopes the mentions of its
+    /// own clause, so a sentence boundary stops every context rule below.
+    clause: usize,
+}
+
+/// The submitted text as tokens: each maximal run of alphanumeric characters is one
+/// token, and every other character separates tokens — so case, hyphenation and
+/// punctuation do not change what is matched. The clause number advances at sentence
+/// and clause punctuation.
+fn tokenize(text: &str) -> Vec<Token> {
+    let mut tokens: Vec<Token> = Vec::new();
+    let mut clause = 0usize;
+    let mut run: Option<(usize, usize)> = None;
+    for (index, character) in text.char_indices() {
+        if character.is_alphanumeric() {
+            match run {
+                Some((_, ref mut end)) => *end = index + character.len_utf8(),
+                None => run = Some((index, index + character.len_utf8())),
+            }
+            continue;
+        }
+        if let Some((start, end)) = run.take() {
+            tokens.push(Token {
+                start,
+                end,
+                lower: text[start..end].to_lowercase(),
+                clause,
+            });
+        }
+        if matches!(character, '.' | '!' | '?' | ';' | ':' | '\n' | '\r') {
+            clause += 1;
+        }
+    }
+    if let Some((start, end)) = run {
+        tokens.push(Token {
+            start,
+            end,
+            lower: text[start..end].to_lowercase(),
+            clause,
+        });
+    }
+    tokens
+}
+
+/// A stretch of the submitted text the pass placed, in TOKEN indices and in BYTE
+/// offsets into that text.
+#[derive(Debug, Clone)]
+struct Span {
+    tokens: Range<usize>,
+    start: usize,
+    end: usize,
+}
+
+impl Span {
+    /// The span covering `tokens[range]`.
+    fn of(tokens: &[Token], range: Range<usize>) -> Self {
+        Self {
+            start: tokens[range.start].start,
+            end: tokens[range.end - 1].end,
+            tokens: range,
+        }
+    }
+}
+
+/// One attribute of a condition mention: a stretch of text beside the mention that says
+/// something about it, and which modelled attribute type it reports.
+#[derive(Debug)]
+struct Attribute {
+    span: Span,
+    attribute_type: &'static str,
+    category: &'static str,
+    relationship_type: &'static str,
+    /// Tokens between the attribute and the mention, which is what the relationship
+    /// confidence falls off with.
+    distance: usize,
+}
+
+/// What the pass placed at one stretch of text.
+#[derive(Debug)]
+enum Placed {
+    /// A medical-condition mention, with the attributes read as belonging to it.
+    Condition {
+        span: Span,
+        condition: &'static Condition,
+        attributes: Vec<Attribute>,
+    },
+    /// A time expression that belongs to no single mention.
+    Time { span: Span },
+}
+
+impl Placed {
+    fn span(&self) -> &Span {
+        match self {
+            Self::Condition { span, .. } | Self::Time { span } => span,
+        }
+    }
+}
+
+/// Whether `token` counts a quantity: a run of digits, or a counting word.
+fn is_count(token: &Token) -> bool {
+    (!token.lower.is_empty() && token.lower.chars().all(|character| character.is_ascii_digit()))
+        || NUMBER_WORDS.contains(&token.lower.as_str())
+}
+
+/// The confidence of a mention its lexicon entry spans `term_tokens` tokens of.
+fn term_confidence(term_tokens: usize) -> f32 {
+    let extra = term_tokens.clamp(1, TERM_TOKENS_AT_FULL_CONFIDENCE) - 1;
+    (WEIGHT_TERM_ONE_TOKEN + WEIGHT_TERM_PER_TOKEN * extra as f32).clamp(0.0, 1.0)
+}
+
+/// Every condition mention in `tokens`, longest written form first, left to right.
+///
+/// A mention never overlaps another: the tokens of a placed mention are marked covered,
+/// so the longest written form that starts at a token is the one reported and the scan
+/// resumes past it.
+fn condition_mentions(
+    tokens: &[Token],
+    covered: &mut [bool],
+) -> Vec<(Span, &'static Condition)> {
+    let lexicon = lexicon();
+    let mut placed = Vec::new();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let longest = lexicon.max_tokens.min(tokens.len() - index);
+        let mut matched = None;
+        for length in (1..=longest).rev() {
+            let range = index..index + length;
+            // A written form is never read across a clause boundary.
+            if tokens[range.clone()]
+                .iter()
+                .any(|token| token.clause != tokens[index].clause)
+            {
+                continue;
+            }
+            let phrase = tokens[range.clone()]
+                .iter()
+                .map(|token| token.lower.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if let Some(condition) = lexicon.terms.get(phrase.as_str()) {
+                matched = Some((range, *condition));
+                break;
+            }
+        }
+        match matched {
+            Some((range, condition)) => {
+                for token in &mut covered[range.clone()] {
+                    *token = true;
+                }
+                index = range.end;
+                placed.push((Span::of(tokens, range), condition));
+            }
+            None => index += 1,
+        }
+    }
+    placed
+}
+
+/// Every time expression in the tokens no mention covers: a count followed by a unit
+/// ("3 days", "two weeks", optionally "… ago"), a qualifier in front of a unit ("last
+/// year"), or a word that names a time on its own ("yesterday").
+fn time_expressions(tokens: &[Token], covered: &mut [bool]) -> Vec<Span> {
+    let mut placed = Vec::new();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        if covered[index] {
+            index += 1;
+            continue;
+        }
+        let clause = tokens[index].clause;
+        // Whether the token at `next` is still available and still in this clause.
+        let open = |next: usize, covered: &[bool]| {
+            next < tokens.len() && !covered[next] && tokens[next].clause == clause
+        };
+        let counted_unit = (is_count(&tokens[index])
+            || RELATIVE_QUALIFIERS.contains(&tokens[index].lower.as_str()))
+            && open(index + 1, covered)
+            && TIME_UNITS.contains(&tokens[index + 1].lower.as_str());
+        let mut end = if counted_unit {
+            index + 2
+        } else if RELATIVE_DAY_WORDS.contains(&tokens[index].lower.as_str()) {
+            index + 1
+        } else {
+            index += 1;
+            continue;
+        };
+        // "three days ago" is one time expression, not a time expression and a word.
+        if open(end, covered) && tokens[end].lower == "ago" {
+            end += 1;
+        }
+        let range = index..end;
+        for token in &mut covered[range.clone()] {
+            *token = true;
+        }
+        placed.push(Span::of(tokens, range));
+        index = end;
+    }
+    placed
+}
+
+/// The modelled attribute type a one-word modifier reports, or `None` when the word
+/// modifies nothing.
+fn modifier_type(token: &Token) -> Option<&'static str> {
+    let word = token.lower.as_str();
+    if ACUITY_MODIFIERS.contains(&word) {
+        return Some(ATTRIBUTE_ACUITY);
+    }
+    if DIRECTION_MODIFIERS.contains(&word) {
+        return Some(ATTRIBUTE_DIRECTION);
+    }
+    if QUALITY_MODIFIERS.contains(&word) {
+        return Some(ATTRIBUTE_QUALITY);
+    }
+    if SYSTEM_ORGAN_SITE_MODIFIERS.contains(&word) {
+        return Some(ATTRIBUTE_SYSTEM_ORGAN_SITE);
+    }
+    if is_count(token) {
+        return Some(ATTRIBUTE_QUANTITY);
+    }
+    None
+}
+
+/// How the entity and an attribute of that type are related, as the modelled
+/// `ICD10CMRelationshipType` names it: a body system or site relates to the condition as
+/// the site of it, a quality as the quality of it, and anything else overlaps the
+/// mention in the text.
+fn relationship_type(attribute_type: &str) -> &'static str {
+    match attribute_type {
+        ATTRIBUTE_SYSTEM_ORGAN_SITE => RELATIONSHIP_SYSTEM_ORGAN_SITE,
+        ATTRIBUTE_QUALITY => RELATIONSHIP_QUALITY,
+        _ => RELATIONSHIP_OVERLAP,
+    }
+}
+
+/// Where the FIRST family reference of each clause is written, by clause.
+///
+/// One pass over the text, so the family rule costs the same whether the text carries
+/// one mention or hundreds.
+fn first_family_cues(tokens: &[Token]) -> HashMap<usize, usize> {
+    let mut first: HashMap<usize, usize> = HashMap::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if FAMILY_CUES.contains(&token.lower.as_str()) {
+            first.entry(token.clause).or_insert(index);
+        }
+    }
+    first
+}
+
+/// The traits the words around `span` license, beside the one its lexicon entry carries.
+///
+/// A negation, hedge or hypothetical cue scopes the mentions that follow it within
+/// [`CUE_WINDOW_TOKENS`] tokens of the same clause; a family reference scopes the rest of
+/// its clause, because it names whose record the rest of the clause is about.
+fn cue_traits(
+    tokens: &[Token],
+    span: &Span,
+    first_family_cues: &HashMap<usize, usize>,
+) -> Vec<ICD10CMTrait> {
+    let clause = tokens[span.tokens.start].clause;
+    let mut traits = Vec::new();
+    let window_start = span.tokens.start.saturating_sub(CUE_WINDOW_TOKENS);
+    let near = tokens[window_start..span.tokens.start]
+        .iter()
+        .filter(|token| token.clause == clause);
+    let mut negated = false;
+    let mut hypothetical = false;
+    let mut hedged = false;
+    for token in near {
+        let word = token.lower.as_str();
+        negated |= NEGATION_CUES.contains(&word);
+        hypothetical |= HYPOTHETICAL_CUES.contains(&word);
+        hedged |= LOW_CONFIDENCE_CUES.contains(&word);
+    }
+    let family = first_family_cues
+        .get(&clause)
+        .is_some_and(|&cue| cue < span.tokens.start);
+    for (licensed, name) in [
+        (negated, TRAIT_NEGATION),
+        (family, TRAIT_PERTAINS_TO_FAMILY),
+        (hypothetical, TRAIT_HYPOTHETICAL),
+        (hedged, TRAIT_LOW_CONFIDENCE),
+    ] {
+        if licensed {
+            traits.push(ICD10CMTrait {
+                name: Some(name.to_string()),
+                score: Some(WEIGHT_CUE),
+            });
+        }
+    }
+    traits
+}
+
+/// The attributes of the mention at `span`: the modifiers standing within
+/// [`ATTRIBUTE_WINDOW_TOKENS`] tokens of it, in its own clause, that no other span has
+/// taken. Mentions are served in document order, so a modifier between two mentions
+/// belongs to the first that reaches it.
+fn modifier_attributes(tokens: &[Token], span: &Span, covered: &mut [bool]) -> Vec<Attribute> {
+    let clause = tokens[span.tokens.start].clause;
+    let before = span.tokens.start.saturating_sub(ATTRIBUTE_WINDOW_TOKENS)..span.tokens.start;
+    let after = span.tokens.end..(span.tokens.end + ATTRIBUTE_WINDOW_TOKENS).min(tokens.len());
+    let mut attributes = Vec::new();
+    for index in before.chain(after) {
+        if covered[index] || tokens[index].clause != clause {
+            continue;
+        }
+        let Some(attribute_type) = modifier_type(&tokens[index]) else {
+            continue;
+        };
+        let distance = if index < span.tokens.start {
+            span.tokens.start - index - 1
+        } else {
+            index - span.tokens.end
+        };
+        covered[index] = true;
+        attributes.push(Attribute {
+            span: Span::of(tokens, index..index + 1),
+            attribute_type,
+            category: TYPE_DX_NAME,
+            relationship_type: relationship_type(attribute_type),
+            distance,
+        });
+    }
+    attributes
+}
+
+/// The ICD-10-CM entities the submitted text carries.
+///
+/// The answer is a function of `text` alone: the mentions are placed from the text's own
+/// characters, so the same text always yields the same entities and no value from any
+/// other request can appear. `BeginOffset`/`EndOffset` are 0-based CHARACTER offsets, as
+/// the modelled members document, so an entity's `Text` is exactly the characters they
+/// delimit.
+pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
+    let tokens = tokenize(text);
+    let mut covered = vec![false; tokens.len()];
+    let family_cues = first_family_cues(&tokens);
+    let mentions = condition_mentions(&tokens, &mut covered);
+    let times = time_expressions(&tokens, &mut covered);
+
+    // A time expression is reported only in a clause that also carries a condition
+    // mention: it is the time of a condition, which is what makes it part of an
+    // ICD-10-CM analysis. One standing within the attribute window of a mention is an
+    // attribute of that mention (the modelled `TIME_TO_DX_NAME`); one further away in the
+    // same clause is its own `TIME_EXPRESSION` entity.
+    let mut placed: Vec<Placed> = mentions
+        .iter()
+        .map(|(span, condition)| Placed::Condition {
+            span: span.clone(),
+            condition,
+            attributes: Vec::new(),
+        })
+        .collect();
+    let mut loose_times: Vec<Span> = Vec::new();
+    for time in times {
+        let clause = tokens[time.tokens.start].clause;
+        let nearest = mentions
+            .iter()
+            .filter(|(span, _)| tokens[span.tokens.start].clause == clause)
+            .map(|(span, _)| {
+                let distance = if span.tokens.end <= time.tokens.start {
+                    time.tokens.start - span.tokens.end
+                } else {
+                    // The spans overlap only when a time expression IS the mention's
+                    // neighbour-less self, which cannot happen: a covered token is never
+                    // placed twice. The saturating form keeps that impossible case at
+                    // distance 0 rather than wrapping.
+                    span.tokens.start.saturating_sub(time.tokens.end)
+                };
+                (distance, span.start)
+            })
+            .min();
+        match nearest {
+            Some((distance, mention_start)) if distance <= ATTRIBUTE_WINDOW_TOKENS => {
+                if let Some(Placed::Condition { attributes, .. }) =
+                    placed.iter_mut().find(|entry| match entry {
+                        Placed::Condition { span, .. } => span.start == mention_start,
+                        Placed::Time { .. } => false,
+                    })
+                {
+                    attributes.push(Attribute {
+                        span: time,
+                        attribute_type: ATTRIBUTE_TIME_TO_DX_NAME,
+                        category: TYPE_TIME_EXPRESSION,
+                        relationship_type: RELATIONSHIP_OVERLAP,
+                        distance,
+                    });
+                }
+            }
+            Some(_) => loose_times.push(time),
+            // No mention in the clause: nothing an ICD-10-CM analysis would date.
+            None => {}
+        }
+    }
+    for time in loose_times {
+        placed.push(Placed::Time { span: time });
+    }
+
+    // The modifiers come last, so a token a mention or a time expression already covers
+    // is never read as a modifier too.
+    let mention_spans: Vec<Span> = mentions.into_iter().map(|(span, _)| span).collect();
+    for span in &mention_spans {
+        let found = modifier_attributes(&tokens, span, &mut covered);
+        if let Some(Placed::Condition { attributes, .. }) =
+            placed.iter_mut().find(|entry| match entry {
+                Placed::Condition { span: placed, .. } => placed.start == span.start,
+                Placed::Time { .. } => false,
+            })
+        {
+            attributes.extend(found);
+        }
+    }
+
+    placed.sort_by_key(|entry| entry.span().start);
+
+    // Character offsets, as both modelled offset members document, from the byte offsets
+    // the pass works in.
+    let character_starts: Vec<usize> = text.char_indices().map(|(index, _)| index).collect();
+    let character_offset =
+        |byte: usize| i32::try_from(character_starts.partition_point(|&start| start < byte)).unwrap_or(i32::MAX);
+
+    // `Id` is "a monotonically increasing id unique within this response": every entity
+    // and every attribute takes the next one, in the order they are written.
+    let mut next_id = 0i32;
+    let mut entities = Vec::with_capacity(placed.len());
+    for entry in placed {
+        match entry {
+            Placed::Condition {
+                span,
+                condition,
+                mut attributes,
+            } => {
+                let score = term_confidence(condition.term.split(' ').count());
+                let id = next_id;
+                next_id += 1;
+                let mut traits = vec![ICD10CMTrait {
+                    name: Some(condition.base_trait.to_string()),
+                    score: Some(score),
+                }];
+                traits.extend(cue_traits(&tokens, &span, &family_cues));
+                attributes.sort_by_key(|attribute| attribute.span.start);
+                let attributes = attributes
+                    .into_iter()
+                    .map(|attribute| {
+                        let attribute_id = next_id;
+                        next_id += 1;
+                        let relationship_score = (WEIGHT_RELATIONSHIP
+                            - RELATIONSHIP_DISTANCE_PENALTY * attribute.distance as f32)
+                            .clamp(0.0, 1.0);
+                        ICD10CMAttribute {
+                            r#type: Some(attribute.attribute_type.to_string()),
+                            score: Some(if attribute.attribute_type == ATTRIBUTE_TIME_TO_DX_NAME {
+                                WEIGHT_PATTERN
+                            } else {
+                                WEIGHT_MODIFIER
+                            }),
+                            relationship_score: Some(relationship_score),
+                            relationship_type: Some(attribute.relationship_type.to_string()),
+                            id: Some(attribute_id),
+                            begin_offset: Some(character_offset(attribute.span.start)),
+                            end_offset: Some(character_offset(attribute.span.end)),
+                            text: Some(text[attribute.span.start..attribute.span.end].to_string()),
+                            traits: Some(cue_traits(&tokens, &attribute.span, &family_cues)),
+                            category: Some(attribute.category.to_string()),
+                        }
+                    })
+                    .collect();
+                let concepts = condition
+                    .concepts
+                    .iter()
+                    .take(CONCEPT_CANDIDATE_LIMIT)
+                    .enumerate()
+                    .map(|(rank, concept)| ICD10CMConcept {
+                        code: Some(concept.code.to_string()),
+                        description: Some(concept.description.to_string()),
+                        score: Some(score * CONCEPT_RANK_DECAY.powi(
+                            i32::try_from(rank).unwrap_or(i32::MAX),
+                        )),
+                    })
+                    .collect();
+                entities.push(ICD10CMEntity {
+                    id: Some(id),
+                    text: Some(text[span.start..span.end].to_string()),
+                    category: Some(CATEGORY_MEDICAL_CONDITION.to_string()),
+                    r#type: Some(TYPE_DX_NAME.to_string()),
+                    score: Some(score),
+                    begin_offset: Some(character_offset(span.start)),
+                    end_offset: Some(character_offset(span.end)),
+                    attributes: Some(attributes),
+                    traits: Some(traits),
+                    icd10_cm_concepts: Some(concepts),
+                });
+            }
+            Placed::Time { span } => {
+                let id = next_id;
+                next_id += 1;
+                entities.push(ICD10CMEntity {
+                    id: Some(id),
+                    text: Some(text[span.start..span.end].to_string()),
+                    category: Some(CATEGORY_MEDICAL_CONDITION.to_string()),
+                    r#type: Some(TYPE_TIME_EXPRESSION.to_string()),
+                    score: Some(WEIGHT_PATTERN),
+                    begin_offset: Some(character_offset(span.start)),
+                    end_offset: Some(character_offset(span.end)),
+                    attributes: Some(Vec::new()),
+                    traits: Some(cue_traits(&tokens, &span, &family_cues)),
+                    // A time expression names no medical condition, so there is no
+                    // ICD-10-CM concept for it to be linked to.
+                    icd10_cm_concepts: None,
+                });
+            }
+        }
+    }
+    entities
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,18 +1804,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InferICD10CM` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InferICD10CMErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InferICD10CM"))
+        // Ontology linking holds NO state: the answer is a function of the submitted
+        // text alone, so repeating the call returns the same entities and nothing a
+        // later caller reads is changed by calling it.
+        let _ = (ctx, &self.engine);
+
+        // `Text` carries the modelled 1..10000 length, which the boundary validator
+        // enforces before this handler runs — reaching here means the text is present,
+        // non-empty and within the size limit — and it arrives as a Rust `String`, so
+        // it is valid UTF-8 and the modelled `InvalidEncodingException` is unreachable.
+        let entities = infer_icd10_cm(input.text.as_str());
+
+        Ok(InferICD10CMOutput {
+            entities,
+            // Every entity of the submitted text is in this one response: nothing was
+            // truncated, so there is no page for the caller to resume from.
+            pagination_token: None,
+            model_version: Some(MODEL_VERSION.to_string()),
+        })
     }
 }

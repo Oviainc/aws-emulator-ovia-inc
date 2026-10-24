@@ -200,7 +200,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name,
             description: input.description,
             aggregation_duration: input.aggregation_duration,
-            status: crate::state::CONFIGURATION_STATUS_ACTIVE.to_string(),
             // A configuration an account creates for itself is `ACCOUNT`;
             // `ADMIN_MANAGED` belongs to one an organization's management
             // account owns, which this call is not.
@@ -216,6 +215,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         store.configurations.insert(arn.clone(), record);
 
+        // `status` is DERIVED from the EventRules the configuration owns, not
+        // carried on the record: a create makes none, so none of them is ACTIVE
+        // and the new configuration reports `INACTIVE` until a rule of it is.
+        let status = store.configuration_status(&arn);
+
         // Read the response back out of the stored record rather than echoing the
         // value just built, so this response can only report what a later Get does.
         let stored = store.configurations.get(&arn).ok_or_else(|| {
@@ -227,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         Ok(CreateNotificationConfigurationOutput {
             arn: stored.arn.clone(),
-            status: stored.status.clone(),
+            status,
         })
     }
 }

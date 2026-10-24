@@ -3,8 +3,9 @@
 //! @op CreateConfigurationManager
 //!
 //! Mints one configuration manager: an ARN, a service-assigned `Id` per supplied
-//! configuration definition, and one configuration record per definition, all
-//! persisted in [`crate::state`] so every later read answers from them.
+//! configuration definition, and one configuration record per account and Region each
+//! definition's parameters target, all persisted in [`crate::state`] so every later
+//! read answers from them.
 //!
 //! ## Shape of an operation
 //!
@@ -120,7 +121,10 @@ impl From<CreateConfigurationManagerErrorModeled> for CreateConfigurationManager
 /// its definitions, so one with none to deploy is refused. Each definition's `Type`
 /// must name a configuration type this service offers, because that is what selects
 /// the service-owned template the definition deploys
-/// (`crate::state::quick_setup_type_rejection`). The remaining checks are
+/// (`crate::state::quick_setup_type_rejection`). The deployment targets a definition's
+/// parameters name must be servable, because each targeted account and Region pair
+/// becomes a stored configuration (`crate::state::deployment_targets_rejection`). The
+/// remaining checks are
 /// the store's own bounds on collections the model gives no length (see
 /// `crate::state`'s `MAX_*` constants), and the `IAMRoleArn` form of
 /// `LocalDeploymentAdministrationRoleArn`, which the model states as an
@@ -169,6 +173,22 @@ fn definitions_rejection(input: &CreateConfigurationManagerInput) -> Option<Stri
             })
     })
     .or_else(|| {
+        // A definition's parameters name where it is deployed, and the service
+        // deploys one configuration per targeted account and Region, so the targets
+        // are checked before anything is stored; `crate::state` is the one place that
+        // rule lives, shared with `UpdateConfigurationDefinition`.
+        input
+            .configuration_definitions
+            .iter()
+            .find_map(|definition| {
+                crate::state::deployment_targets_rejection(
+                    "ConfigurationDefinitions.Parameters",
+                    parameter(&definition.parameters, crate::state::PARAMETER_TARGET_REGIONS),
+                    parameter(&definition.parameters, crate::state::PARAMETER_TARGET_ACCOUNTS),
+                )
+            })
+    })
+    .or_else(|| {
         too_many(
             "Tags",
             input.tags.as_ref().map_or(0, std::collections::HashMap::len),
@@ -193,6 +213,15 @@ fn definitions_rejection(input: &CreateConfigurationManagerInput) -> Option<Stri
                 )
             })
     })
+}
+
+/// The value one configuration parameter carries, or `None` when the definition names
+/// no such parameter.
+fn parameter<'p>(
+    parameters: &'p std::collections::HashMap<String, String>,
+    key: &str,
+) -> Option<&'p str> {
+    parameters.get(key).map(String::as_str)
 }
 
 /// The `CreateConfigurationManager` operation.
@@ -282,28 +311,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut definitions = Vec::with_capacity(input.configuration_definitions.len());
         for definition in input.configuration_definitions {
             let definition_id = store.fresh_definition_id();
-            let configuration_id = store.fresh_uuid();
             let parameters = crate::state::to_btree_map(Some(definition.parameters));
-            // One configuration per definition, because the service deploys one per
-            // definition. Its id is service-generated and distinct from the
-            // definition id it names.
-            let configuration = crate::state::ConfigurationRecord {
-                id: configuration_id,
-                manager_arn: manager_arn.clone(),
-                configuration_definition_id: definition_id.clone(),
-                type_: definition.r#type.clone(),
-                type_version: definition.type_version.clone(),
-                account: account.clone(),
-                region: region.clone(),
-                created_at,
-                last_modified_at: created_at,
-                parameters: parameters.clone(),
-                status_summaries: vec![crate::state::StatusSummaryRecord::deployment(created_at)],
-            };
-            store
-                .configurations
-                .insert(configuration.id.clone(), configuration);
-            definitions.push(crate::state::ConfigurationDefinitionRecord {
+            let record = crate::state::ConfigurationDefinitionRecord {
                 id: definition_id,
                 type_: definition.r#type,
                 type_version: definition.type_version,
@@ -312,13 +321,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .local_deployment_execution_role_name,
                 local_deployment_administration_role_arn: definition
                     .local_deployment_administration_role_arn,
-            });
+            };
+            // The definition's parameters name where it is deployed, so one
+            // configuration is deployed per targeted account and Region — the account
+            // and Region each of them then reports. A definition naming no target
+            // deploys in this manager's own account and Region. Every configuration id
+            // is service-generated and distinct from the definition id it names.
+            let targets = crate::state::deployment_targets(
+                record
+                    .parameters
+                    .get(crate::state::PARAMETER_TARGET_REGIONS)
+                    .map(String::as_str),
+                record
+                    .parameters
+                    .get(crate::state::PARAMETER_TARGET_ACCOUNTS)
+                    .map(String::as_str),
+                &account,
+                &region,
+            );
+            store.deploy_definition(&manager_arn, &record, &targets, created_at);
+            definitions.push(record);
         }
 
         store.managers.insert(
             manager_arn.clone(),
             crate::state::ConfigurationManagerRecord {
                 manager_arn: manager_arn.clone(),
+                region: region.clone(),
                 name: input.name,
                 description: input.description,
                 created_at,
