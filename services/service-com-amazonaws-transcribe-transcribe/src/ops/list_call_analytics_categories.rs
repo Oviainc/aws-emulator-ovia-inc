@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCallAnalyticsCategories
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCallAnalyticsCategories`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCallAnalyticsCategories::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the Call Analytics categories this account holds, reporting each one as
+//! the same `CategoryProperties` record the read reports (see
+//! [`ListCallAnalyticsCategories::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -155,23 +149,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_CALL_ANALYTICS_CATEGORIES_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report one page of the stored Call Analytics categories.
+    ///
+    /// REPORTING ONLY: a category has no status member and so no clock-owed
+    /// transition (see [`crate::state::CallAnalyticsCategoryRecord`]), which leaves
+    /// this handler with nothing at all to write — it takes a shared read of the
+    /// store and answers from it.
+    ///
+    /// The page is taken in the store's own key order, which is the category name
+    /// ascending: the model documents no order for this listing (unlike
+    /// `ListTranscriptionJobs`/`ListVocabularies`, whose docs say "newest first"), and
+    /// a category record carries no creation sequence, so the total order it is paged
+    /// in is the one the names themselves give. That keeps paging stable — a category
+    /// created or deleted between two pages cannot make the next page repeat or skip a
+    /// name — and the cursor is the last name of the page
+    /// ([`crate::state::name_page_cursor`]), so the next page resumes strictly past it
+    /// even when that category has since been deleted.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCallAnalyticsCategories` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCallAnalyticsCategoriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCallAnalyticsCategories"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListCallAnalyticsCategoriesErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A page cursor: the name of the last category of the previous page, read
+        // through this service's own token codec, so a token this service never handed
+        // out is refused rather than silently restarting from the top.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(parse_next_token(token)?.to_string()),
+        };
+
+        // "If you do not specify a value, a default of 5 is used" (model doc for
+        // `ListCallAnalyticsCategoriesRequest$MaxResults`). `MaxResults` is modelled
+        // `@range(min: 1, max: 100)`, so the boundary validator has already refused
+        // anything outside it; the clamp states that dependency rather than relying on
+        // it silently.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::DEFAULT_CATEGORY_LIST_MAX_RESULTS),
+        )
+        .unwrap_or(crate::state::MAX_LIST_MAX_RESULTS)
+        .clamp(1, crate::state::MAX_LIST_MAX_RESULTS);
+
+        let store = state.lock();
+        let start = match resume_after.as_deref() {
+            Some(name) => ::std::ops::Bound::Excluded(name),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        // One past the page, so "is there a further category?" is answered by the
+        // store rather than by counting the whole map.
+        let mut page: Vec<&crate::state::CallAnalyticsCategoryRecord> = store
+            .call_analytics_categories
+            .range::<str, _>((start, ::std::ops::Bound::Unbounded))
+            .map(|(_, record)| record)
+            .take(page_size + 1)
+            .collect();
+        // A cursor only when a further category exists: "If NextToken is present in
+        // your response, it indicates that not all results are displayed" (model doc
+        // for `ListCallAnalyticsCategoriesResponse$NextToken`).
+        let mut next_token = None;
+        if page.len() > page_size {
+            page.truncate(page_size);
+            next_token = page
+                .last()
+                .map(|record| crate::state::name_page_cursor(&record.name));
+        }
+
+        Ok(ListCallAnalyticsCategoriesOutput {
+            next_token,
+            // Each category is reported as the record it was stored as — the same
+            // projection `GetCallAnalyticsCategory` answers with. An account holding no
+            // category gets an empty list, which is a page of nothing rather than a
+            // missing member.
+            categories: Some(page.iter().map(|record| record.to_properties()).collect()),
+        })
     }
+}
+
+/// The category name a `NextToken` resumes after, or this operation's own modelled
+/// refusal for a token this service never handed out.
+///
+/// The token format and what counts as one of this service's own is
+/// `state::parse_name_page_cursor`; this lifts its `None` into the error channel
+/// `ListCallAnalyticsCategories` models.
+fn parse_next_token(token: &str) -> Result<&str, ListCallAnalyticsCategoriesError> {
+    crate::state::parse_name_page_cursor(token).ok_or_else(|| {
+        ListCallAnalyticsCategoriesErrorModeled::BadRequestException(BadRequestException {
+            message: Some(
+                "The NextToken in your request is not valid. Use the NextToken returned \
+                 by your previous ListCallAnalyticsCategories request."
+                    .to_string(),
+            ),
+        })
+        .into()
+    })
 }

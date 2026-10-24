@@ -1719,6 +1719,303 @@ fn check_protocol(
     }
 }
 
+/// How many `CORSRule`s one bucket's cors configuration may carry.
+///
+/// The published limit, from `CORSConfiguration$CORSRules`'s own documentation: "A set of
+/// origins and methods (cross-origin access that you want to allow). You can add up to 100
+/// rules to the configuration." The model bounds the list at neither end
+/// (`smithy_query(query="shape",shape="CORSRules")`), so this check is what enforces it —
+/// and it also bounds what one bucket's record parks in this process's memory. A put past
+/// it is refused rather than recorded.
+pub const MAX_CORS_RULES: usize = 100;
+
+/// The longest `CORSRule$ID` a stored rule may carry, in characters.
+///
+/// That member's own documentation: "Unique identifier for the rule. The value cannot be
+/// longer than 255 characters." `ID` is a plain string with no `@length` in the model
+/// (`smithy_query(query="shape",shape="ID")`), so nothing refuses a longer id before this
+/// check does.
+pub const MAX_CORS_RULE_ID_CHARS: usize = 255;
+
+/// The HTTP methods a `CORSRule$AllowedMethods` entry may name.
+///
+/// That member's own documentation: "An HTTP method that you allow the origin to execute.
+/// Valid values are `GET`, `PUT`, `HEAD`, `POST`, and `DELETE`." `AllowedMethod` is a plain
+/// string in the model (`smithy_query(query="shape",shape="AllowedMethods")`), not an enum,
+/// so this catalog is what refuses a method S3 does not support — including one that names
+/// a supported method in another case, since the published values are upper case.
+pub const CORS_ALLOWED_METHODS: [&str; 5] = ["GET", "PUT", "HEAD", "POST", "DELETE"];
+
+/// The most bytes a bucket's cors configuration document may carry.
+///
+/// `PutBucketCors`'s own documentation: "The cors subresource is an XML document in which
+/// you configure rules that identify origins and the HTTP methods that can be executed on
+/// your bucket. The document is limited to 64 KB in size." Measured over the stored rules by
+/// [`cors_configuration_bytes`], which is also what keeps one bucket's record from parking
+/// an arbitrarily large configuration in this process's memory.
+pub const MAX_CORS_CONFIGURATION_BYTES: usize = 64 * 1024;
+
+/// One `CORSRule` of a bucket's cors configuration: "Specifies a cross-origin access rule
+/// for an Amazon S3 bucket."
+///
+/// Every member is optional exactly where the model makes it so
+/// (`smithy_query(query="shape",shape="CORSRule")`): `AllowedMethods` and `AllowedOrigins`
+/// are REQUIRED, the other three are not. The two optional lists are plain `Vec`s rather
+/// than `Option`s for the reason [`BucketWebsite::routing_rules`] is: both are
+/// `xmlFlattened`, so the XML boundary parses a document naming no `AllowedHeader` to the
+/// same absent list as one naming none at all, and there is nothing for a `None` to mean
+/// that an empty list does not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BucketCorsRule {
+    /// `CORSRule$ID`, or `None` when the rule names none.
+    pub id: Option<String>,
+    /// `CORSRule$AllowedHeaders`: "Headers that are specified in the
+    /// `Access-Control-Request-Headers` header", in the order the document named them.
+    pub allowed_headers: Vec<String>,
+    /// `CORSRule$AllowedMethods`, a REQUIRED member: each one of
+    /// [`CORS_ALLOWED_METHODS`], in the order the document named them.
+    pub allowed_methods: Vec<String>,
+    /// `CORSRule$AllowedOrigins`, a REQUIRED member: "One or more origins you want
+    /// customers to be able to access the bucket from", in the order the document named
+    /// them.
+    pub allowed_origins: Vec<String>,
+    /// `CORSRule$ExposeHeaders`: "One or more headers in the response that you want
+    /// customers to be able to access from their applications", in document order.
+    pub expose_headers: Vec<String>,
+    /// `CORSRule$MaxAgeSeconds`: "The time in seconds that your browser is to cache the
+    /// preflight response for the specified resource", or `None` when the rule names none.
+    pub max_age_seconds: Option<i32>,
+}
+
+/// The size of the smallest `CORSConfiguration` document that carries `rules`, in bytes.
+///
+/// A LOWER bound on the document the request carried — the markup of each element plus the
+/// text inside it, with no attributes, namespace or whitespace — so a configuration this
+/// reports more than [`MAX_CORS_CONFIGURATION_BYTES`] for could not have arrived in a
+/// document within the published 64 KB. Element names are the `xmlName`s the model puts on
+/// the members (`smithy_query(query="shape",shape="CORSRule")`), which is also how
+/// `GetBucketCors` spells them on the way out.
+pub fn cors_configuration_bytes(rules: &[BucketCorsRule]) -> usize {
+    /// The bytes `<name>text</name>` takes.
+    fn element(name: &str, text: &str) -> usize {
+        name.len() * 2 + "<></>".len() + text.len()
+    }
+    /// The bytes every entry of a flattened list named `name` takes.
+    fn elements(name: &str, texts: &[String]) -> usize {
+        texts.iter().map(|text| element(name, text)).sum()
+    }
+
+    let mut bytes = element("CORSConfiguration", "");
+    for rule in rules {
+        bytes += element("CORSRule", "");
+        if let Some(id) = &rule.id {
+            bytes += element("ID", id);
+        }
+        bytes += elements("AllowedHeader", &rule.allowed_headers);
+        bytes += elements("AllowedMethod", &rule.allowed_methods);
+        bytes += elements("AllowedOrigin", &rule.allowed_origins);
+        bytes += elements("ExposeHeader", &rule.expose_headers);
+        if let Some(max_age_seconds) = rule.max_age_seconds {
+            bytes += element("MaxAgeSeconds", &max_age_seconds.to_string());
+        }
+    }
+    bytes
+}
+
+/// Why a cors configuration is not one S3 would apply to a bucket.
+///
+/// Each variant names the member that is wrong and the published constraint it breaks, so
+/// the refusal's message states the rule the caller has to satisfy rather than one request's
+/// wording. [`Self::code`] is the wire error code each one goes out with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CorsConfigurationRejection {
+    /// A `CORSConfiguration` naming no `CORSRule` at all: `CORSConfiguration$CORSRules` is
+    /// a REQUIRED member, so a document naming none does not validate against the schema
+    /// S3 publishes.
+    NoRules,
+    /// More rules than [`MAX_CORS_RULES`].
+    TooManyRules {
+        /// How many the document carried.
+        count: usize,
+    },
+    /// A rule naming no `AllowedMethod`: `CORSRule$AllowedMethods` is a REQUIRED member.
+    NoAllowedMethods {
+        /// Which rule carries it, counted from 1 as the document orders them.
+        rule: usize,
+    },
+    /// A rule naming no `AllowedOrigin`: `CORSRule$AllowedOrigins` is a REQUIRED member.
+    NoAllowedOrigins {
+        /// Which rule carries it, counted from 1.
+        rule: usize,
+    },
+    /// An `AllowedMethod` outside [`CORS_ALLOWED_METHODS`].
+    UnsupportedMethod {
+        /// Which rule carries it, counted from 1.
+        rule: usize,
+        /// The value that is not a published method.
+        method: String,
+    },
+    /// An `ID` longer than [`MAX_CORS_RULE_ID_CHARS`] characters.
+    IdTooLong {
+        /// Which rule carries it, counted from 1.
+        rule: usize,
+        /// How many characters it carried.
+        length: usize,
+    },
+    /// A `MaxAgeSeconds` below zero, which is no cache time: the member is "the time in
+    /// seconds that your browser is to cache the preflight response".
+    NegativeMaxAgeSeconds {
+        /// Which rule carries it, counted from 1.
+        rule: usize,
+        /// The value that is not a time in seconds.
+        seconds: i32,
+    },
+    /// A configuration whose document could not fit in
+    /// [`MAX_CORS_CONFIGURATION_BYTES`]. See [`cors_configuration_bytes`].
+    DocumentTooLarge {
+        /// The size of the smallest document carrying these rules.
+        bytes: usize,
+    },
+}
+
+impl CorsConfigurationRejection {
+    /// The wire error code S3 answers this refusal with.
+    ///
+    /// Two codes from S3's published "Error responses" list, both HTTP 400: a document that
+    /// does not satisfy the schema the API publishes is [`MALFORMED_XML_CODE`] ("The XML
+    /// provided does not match the schema"), and a document that satisfies the schema but
+    /// carries a value or a count the API does not accept — an HTTP method outside the
+    /// published set above all — is [`INVALID_REQUEST_CODE`].
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoRules | Self::NoAllowedMethods { .. } | Self::NoAllowedOrigins { .. } => {
+                MALFORMED_XML_CODE
+            }
+            Self::TooManyRules { .. }
+            | Self::UnsupportedMethod { .. }
+            | Self::IdTooLong { .. }
+            | Self::NegativeMaxAgeSeconds { .. }
+            | Self::DocumentTooLarge { .. } => INVALID_REQUEST_CODE,
+        }
+    }
+}
+
+impl std::fmt::Display for CorsConfigurationRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoRules => write!(
+                f,
+                "CORSConfiguration.CORSRules names no CORSRule; a cors configuration \
+                 carries at least one rule"
+            ),
+            Self::TooManyRules { count } => write!(
+                f,
+                "CORSConfiguration.CORSRules carries {count} rules, more than the \
+                 {MAX_CORS_RULES} rules one cors configuration may hold"
+            ),
+            Self::NoAllowedMethods { rule } => write!(
+                f,
+                "CORSRule {rule}: AllowedMethods names no AllowedMethod; a cors rule \
+                 allows at least one method"
+            ),
+            Self::NoAllowedOrigins { rule } => write!(
+                f,
+                "CORSRule {rule}: AllowedOrigins names no AllowedOrigin; a cors rule \
+                 allows at least one origin"
+            ),
+            Self::UnsupportedMethod { rule, method } => write!(
+                f,
+                "CORSRule {rule}: AllowedMethod must be one of {}, got {method:?}",
+                CORS_ALLOWED_METHODS.join(", ")
+            ),
+            Self::IdTooLong { rule, length } => write!(
+                f,
+                "CORSRule {rule}: ID is {length} characters long, more than the \
+                 {MAX_CORS_RULE_ID_CHARS} characters a rule identifier may carry"
+            ),
+            Self::NegativeMaxAgeSeconds { rule, seconds } => write!(
+                f,
+                "CORSRule {rule}: MaxAgeSeconds is a time in seconds to cache the \
+                 preflight response and cannot be negative, got {seconds}"
+            ),
+            Self::DocumentTooLarge { bytes } => write!(
+                f,
+                "the cors configuration takes {bytes} bytes, more than the \
+                 {MAX_CORS_CONFIGURATION_BYTES} bytes a cors document may carry"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CorsConfigurationRejection {}
+
+/// Whether `rules` may be stored as a bucket's cors configuration, reporting the first
+/// published rule they break.
+///
+/// Checked BEFORE anything is written, so a refused put leaves the bucket's current cors
+/// configuration exactly as it was — the order every other bucket subresource put keeps.
+/// The counts are judged before the per-rule values so an oversized document is refused for
+/// what it is rather than for whichever rule happens to come first.
+///
+/// Two of the rules here (both required lists being non-empty) are ALSO what the modelled
+/// `@required` traits express, and the boundary validator refuses a payload missing either
+/// member before any handler runs. They are still checked here because this function, not
+/// the wire, is what guards the STORE: a configuration no reader could report back is never
+/// recorded, whoever writes it.
+pub fn validate_cors_configuration(
+    rules: &[BucketCorsRule],
+) -> Result<(), CorsConfigurationRejection> {
+    if rules.is_empty() {
+        return Err(CorsConfigurationRejection::NoRules);
+    }
+    if rules.len() > MAX_CORS_RULES {
+        return Err(CorsConfigurationRejection::TooManyRules { count: rules.len() });
+    }
+    let bytes = cors_configuration_bytes(rules);
+    if bytes > MAX_CORS_CONFIGURATION_BYTES {
+        return Err(CorsConfigurationRejection::DocumentTooLarge { bytes });
+    }
+
+    for (index, rule) in rules.iter().enumerate() {
+        // Counted the way the document orders the rules, so the message names the rule a
+        // caller can find.
+        let position = index + 1;
+        if rule.allowed_methods.is_empty() {
+            return Err(CorsConfigurationRejection::NoAllowedMethods { rule: position });
+        }
+        if rule.allowed_origins.is_empty() {
+            return Err(CorsConfigurationRejection::NoAllowedOrigins { rule: position });
+        }
+        for method in &rule.allowed_methods {
+            if !CORS_ALLOWED_METHODS.contains(&method.as_str()) {
+                return Err(CorsConfigurationRejection::UnsupportedMethod {
+                    rule: position,
+                    method: method.clone(),
+                });
+            }
+        }
+        if let Some(id) = rule.id.as_deref() {
+            let length = id.chars().count();
+            if length > MAX_CORS_RULE_ID_CHARS {
+                return Err(CorsConfigurationRejection::IdTooLong {
+                    rule: position,
+                    length,
+                });
+            }
+        }
+        if let Some(seconds) = rule.max_age_seconds {
+            if seconds < 0 {
+                return Err(CorsConfigurationRejection::NegativeMaxAgeSeconds {
+                    rule: position,
+                    seconds,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// One general purpose bucket this emulator holds.
 #[derive(Debug, Clone, Default)]
 pub struct Bucket {
@@ -1823,6 +2120,20 @@ pub struct Bucket {
     ///
     /// Private, like `tags`, so the accessor pair below is the only way in or out.
     website: Option<BucketWebsite>,
+    /// The bucket's cors configuration — one entry per `CORSRule` the last
+    /// `PutBucketCors` carried, in that order — or `None` while no cors configuration is
+    /// associated with the bucket.
+    ///
+    /// `None` is the state a bucket is created in: a bucket services cross-origin requests
+    /// only once "you add the cors subresource to the bucket" (`PutBucketCors`'s own
+    /// documentation), and it is what makes a read answer
+    /// [`NO_SUCH_CORS_CONFIGURATION_CODE`] rather than report a configuration that does not
+    /// exist. An `Option` rather than a plain `Vec` for the reason `ownership_controls` is
+    /// one: `CORSConfiguration$CORSRules` is REQUIRED, so a bucket either has a
+    /// configuration naming at least one rule or has none at all.
+    ///
+    /// Private, like `tags`, so the accessor pair below is the only way in or out.
+    cors: Option<Vec<BucketCorsRule>>,
     /// The objects the bucket holds, by key, as `PutObject` last recorded each.
     ///
     /// The CURRENT version of each key, and so the whole of a bucket that was never
@@ -2118,6 +2429,22 @@ impl Bucket {
     /// full — the way [`Bucket::set_ownership_controls`] replaces the ownership controls.
     pub fn set_website(&mut self, configuration: BucketWebsite) {
         self.website = Some(configuration);
+    }
+
+    /// The bucket's cors configuration, or `None` when no cors configuration is associated
+    /// with the bucket.
+    pub fn cors(&self) -> Option<&[BucketCorsRule]> {
+        self.cors.as_deref()
+    }
+
+    /// Associate `rules` with the bucket as its whole cors configuration.
+    ///
+    /// A replacement, not a merge: `PutBucketCors` "sets the cors configuration for your
+    /// bucket. If the configuration exists, Amazon S3 replaces it" (that operation's own
+    /// documentation), so what the request names becomes the bucket's configuration in full
+    /// — the way [`Bucket::set_website`] replaces the website configuration.
+    pub fn set_cors(&mut self, rules: Vec<BucketCorsRule>) {
+        self.cors = Some(rules);
     }
 
     /// The object stored at `key`, or `None` when the bucket holds no such key.
@@ -3360,6 +3687,24 @@ pub const INVALID_ARGUMENT_CODE: &str = "InvalidArgument";
 
 /// The HTTP status [`INVALID_ARGUMENT_CODE`] is rendered with: 400, from the same list.
 pub const INVALID_ARGUMENT_STATUS: u16 = 400;
+
+/// The code S3 answers a request whose content is not one it can carry out as given:
+/// "InvalidRequest", HTTP 400 (Amazon S3 "Error responses", list of error codes).
+///
+/// What a cors configuration breaking one of the limits its API publishes is refused with
+/// — see [`CorsConfigurationRejection::code`] — where [`INVALID_ARGUMENT_CODE`] is the
+/// code for a value that is wrong for the PARAMETER carrying it.
+pub const INVALID_REQUEST_CODE: &str = "InvalidRequest";
+
+/// "The CORS configuration does not exist": the code `GetBucketCors` answers for a bucket
+/// no cors configuration has been set on, with HTTP 404 (Amazon S3 "Error responses").
+///
+/// The subresource-not-there case, answered the way [`NO_SUCH_WEBSITE_CONFIGURATION_CODE`]
+/// answers it for a website configuration, because `GetBucketCors` reports the rules as its
+/// WHOLE output document and so has no way to report "there are none" in a 200.
+pub const NO_SUCH_CORS_CONFIGURATION_CODE: &str = "NoSuchCORSConfiguration";
+/// See [`NO_SUCH_CORS_CONFIGURATION_CODE`] — the text that same list publishes for it.
+pub const NO_SUCH_CORS_CONFIGURATION_MESSAGE: &str = "The CORS configuration does not exist";
 
 /// The code S3 answers a request it could not carry out at all: "InternalError - We
 /// encountered an internal error. Please try again" (same list) — what a handler answers

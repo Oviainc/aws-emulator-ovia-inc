@@ -217,7 +217,14 @@ async fn describe_config(router: &MultiServiceRouter, id: &str) -> Answer {
 /// handlers wrote.
 fn stored_config_ids(engine: &engine::InMemoryEngine) -> Vec<String> {
     let store = vod::service_state(engine).expect("the service state store");
-    let ids = store.lock().packaging_configurations.keys().cloned().collect();
+    // The store is keyed by (Region, `Id`) — this suite signs for one Region, so the
+    // `Id` half is what it compares.
+    let ids = store
+        .lock()
+        .packaging_configurations
+        .keys()
+        .map(|(_, id)| id.clone())
+        .collect();
     ids
 }
 

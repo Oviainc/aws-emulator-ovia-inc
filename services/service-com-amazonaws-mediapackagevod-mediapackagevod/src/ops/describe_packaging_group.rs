@@ -2,9 +2,11 @@
 
 //! @op DescribePackagingGroup
 //! IMPLEMENTED: the read-back for `CreatePackagingGroup`. Returns the stored
-//! PackagingGroup, with `ApproximateAssetCount` COUNTED from the assets currently
-//! stored in the group rather than read from a stored field, and
-//! `NotFoundException` (404) for an `Id` no group is stored under.
+//! PackagingGroup OF THE REGION THIS REQUEST WAS SERVED IN, with
+//! `ApproximateAssetCount` COUNTED from the assets currently stored in the group
+//! rather than read from a stored field, and `NotFoundException` (404) for an `Id`
+//! that Region stores no group under — including an `Id` only another Region holds,
+//! which does not exist here.
 //!
 //! Reporting only: it writes nothing, so a describe never changes what a later
 //! caller sees.
@@ -151,7 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(DescribePackagingGroupErrorModeled::InternalServerErrorException(
@@ -161,8 +163,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // MediaPackage VOD is regional: this request resolves only the groups of the
+        // Region its SigV4 credential scope names.
+        let region = crate::state::request_region(ctx.parts());
         let state = store.lock();
-        let Some(stored) = state.packaging_groups.get(&input.id) else {
+        let Some(stored) = state.packaging_group(&region, &input.id) else {
             return Err(DescribePackagingGroupErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::scaffolded::not_found_message(
@@ -176,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DescribePackagingGroupOutput {
             // Counted from the asset map on every read, so creating or deleting an
             // asset changes it without rewriting the group record.
-            approximate_asset_count: Some(state.asset_count(&stored.id)),
+            approximate_asset_count: Some(state.asset_count(&region, &stored.id)),
             arn: Some(stored.arn.clone()),
             authorization: stored.authorization.clone(),
             created_at: Some(stored.created_at.clone()),

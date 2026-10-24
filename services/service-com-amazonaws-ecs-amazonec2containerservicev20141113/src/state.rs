@@ -39,12 +39,13 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    Attachment, Attribute, CapacityProviderStrategyItem, Cluster, ClusterConfiguration,
-    ClusterServiceConnectDefaults, ClusterSetting, Container, ContainerDefinition,
-    ContainerInstance, Deployment, DeploymentCircuitBreaker, DeploymentConfiguration,
-    DeploymentController, EphemeralStorage, Failure, KeyValuePair, LoadBalancer,
-    NetworkConfiguration, PlacementConstraint, PlacementStrategy, PlatformDevice, PortMapping,
-    ProxyConfiguration, Resource, RuntimePlatform, Service, ServiceConnectConfiguration,
+    Attachment, Attribute, AutoScalingGroupProvider, CapacityProvider,
+    CapacityProviderStrategyItem, Cluster, ClusterConfiguration, ClusterServiceConnectDefaults,
+    ClusterSetting, Container, ContainerDefinition, ContainerInstance, Deployment,
+    DeploymentCircuitBreaker, DeploymentConfiguration, DeploymentController, EphemeralStorage,
+    Failure, KeyValuePair, LoadBalancer, ManagedInstancesProvider, NetworkConfiguration,
+    PlacementConstraint, PlacementStrategy, PlatformDevice, PortMapping, ProxyConfiguration,
+    Resource, RuntimePlatform, Service, ServiceConnectConfiguration,
     ServiceCurrentRevisionSummary, ServiceEvent, ServiceRegistry, ServiceVolumeConfiguration,
     Setting, Tag, Task, TaskDefinition, TaskDefinitionPlacementConstraint, TaskOverride,
     ThresholdConfiguration, VersionInfo, Volume, VpcLatticeConfiguration,
@@ -366,6 +367,41 @@ pub const CLUSTER_BUSY_MESSAGE: &str = "The specified cluster is in a busy state
 /// factors.
 pub const MAX_CLUSTER_CAPACITY_PROVIDERS: usize = 20;
 
+/// `CapacityProvider$status` for a provider that can be used in a cluster — that
+/// member's doc: "Only capacity providers in an `ACTIVE` state can be used in a
+/// cluster." `CreateCapacityProvider` answers with the provider already usable, so this
+/// is the status a create reports and no clock-owed transition leads to it.
+pub const CAPACITY_PROVIDER_ACTIVE: &str = "ACTIVE";
+
+/// `CapacityProvider$status` for a deleted provider — that member's doc: "When a capacity
+/// provider is successfully deleted, it has an `INACTIVE` status." A tombstone under that
+/// status holds neither its name nor its Auto Scaling group against a new provider.
+pub const CAPACITY_PROVIDER_INACTIVE: &str = "INACTIVE";
+
+/// `CapacityProvider$type` for a provider that manages EC2 instances itself — that
+/// member's doc: "For Amazon ECS Managed Instances, this value is `MANAGED_INSTANCES`".
+/// A provider built on a caller's own Auto Scaling group carries no type.
+pub const CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES: &str = "MANAGED_INSTANCES";
+
+/// The prefixes a capacity-provider name may not start with, from the
+/// `CreateCapacityProvider$name` doc: "The name can't be prefixed with \"aws\", \"ecs\",
+/// or \"fargate\"." Matched case-insensitively, since the name itself accepts both cases
+/// and the reservation is on the word rather than on its spelling.
+pub const CAPACITY_PROVIDER_RESERVED_PREFIXES: [&str; 3] = ["aws", "ecs", "fargate"];
+
+/// How many capacity providers one `DescribeCapacityProviders` page carries when the
+/// request names no `maxResults`, and the most it accepts: the member's own doc, "This
+/// value can be between 1 and 10. If this parameter is not used, then
+/// DescribeCapacityProviders returns up to 10 results".
+pub const DESCRIBE_CAPACITY_PROVIDERS_PAGE_SIZE: usize = 10;
+
+/// How many capacity providers this emulator holds. EMULATOR-CHOSEN, for the same
+/// reason as [`MAX_CLUSTERS`]: the store is in memory and a single caller must not be
+/// able to grow it without bound. A create past it is refused with the modelled
+/// `LimitExceededException` ("The limit for the resource was exceeded"), which is what a
+/// client's quota handling keys on.
+pub const MAX_CAPACITY_PROVIDERS: usize = 64;
+
 /// The values `ClusterSetting$value` accepts, from that member's own doc: "The supported
 /// values are `enhanced`, `enabled`, and `disabled`." The setting NAME is a closed enum
 /// the boundary validator already refuses outside, but the value is a free string the
@@ -638,6 +674,11 @@ pub const SCHEDULING_DAEMON: &str = "DAEMON";
 /// the default value of ECS is used."
 pub const DEPLOYMENT_CONTROLLER_ECS: &str = "ECS";
 
+/// The deployment controller CodeDeploy drives, from the `DeploymentControllerType` enum.
+/// Named here because the service it controls must carry a load balancer: CodeDeploy
+/// shifts traffic between two target groups, which only a listener can reach.
+pub const DEPLOYMENT_CONTROLLER_CODE_DEPLOY: &str = "CODE_DEPLOY";
+
 /// `propagateTags` when the request names none. The member's doc: "If no value is
 /// specified, the tags aren't propagated. ... The default is NONE."
 pub const PROPAGATE_TAGS_NONE: &str = "NONE";
@@ -736,6 +777,80 @@ pub const CLUSTER_CONTAINS_TASKS_MESSAGE: &str = "You can't delete a cluster tha
 /// so the sentence names no resource either.
 pub const SERVICE_SCALED_ABOVE_ZERO_MESSAGE: &str =
     "The service cannot be stopped while it is scaled above 0.";
+
+/// `InvalidParameterException$message` for a launch of an `awsvpc` task definition that
+/// carries no `networkConfiguration`. The condition names no resource — it is a property
+/// of the pair (network mode, network configuration) — so every refusal of it, from
+/// whichever operation launches the task, carries this one sentence.
+pub const AWSVPC_NETWORK_CONFIGURATION_REQUIRED_MESSAGE: &str =
+    "Network Configuration must be provided when networkMode 'awsvpc' is specified.";
+
+/// `InvalidParameterException$message` for a `CODE_DEPLOY`-controlled service that names
+/// no load balancer. The `DeploymentController$type` doc describes the blue/green
+/// deployment CodeDeploy drives by shifting traffic between two target groups, which
+/// needs a load balancer in front of them.
+pub const CODE_DEPLOY_LOAD_BALANCER_REQUIRED_MESSAGE: &str =
+    "When specifying the CODE_DEPLOY deployment controller type, the service requires an \
+     Application Load Balancer or Network Load Balancer.";
+
+/// One capacity provider, as `CreateCapacityProvider` created it.
+///
+/// A provider is a named binding onto the capacity that runs tasks: either a caller's
+/// own Auto Scaling group (`autoScalingGroupProvider`) or capacity Amazon ECS manages
+/// (`managedInstancesProvider`). It is what a `capacityProviderStrategy` entry names,
+/// and what `PutClusterCapacityProviders` associates with a cluster.
+#[derive(Debug, Clone)]
+pub struct CapacityProviderRecord {
+    pub name: String,
+    pub arn: String,
+    /// `CapacityProvider$status`: [`CAPACITY_PROVIDER_ACTIVE`] for a provider that was
+    /// created and not deleted.
+    pub status: String,
+    /// `CapacityProvider$cluster`: the cluster a MANAGED-INSTANCES provider is scoped to
+    /// ("Managed instances capacity providers are cluster-scoped"). `None` for an Auto
+    /// Scaling group provider, which the account holds rather than one cluster.
+    pub cluster: Option<String>,
+    pub auto_scaling_group_provider: Option<AutoScalingGroupProvider>,
+    pub managed_instances_provider: Option<ManagedInstancesProvider>,
+    /// `CapacityProvider$type`: [`CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES`] for a
+    /// managed-instances provider, and nothing for an Auto Scaling group one.
+    pub provider_type: Option<String>,
+    pub tags: Vec<Tag>,
+}
+
+impl CapacityProviderRecord {
+    /// The `CapacityProvider` every capacity-provider operation reports, built from what
+    /// is stored. `include_tags` is what `DescribeCapacityProviders$include` gates
+    /// (`CapacityProviderField` declares exactly `TAGS`); a create reports the tags it
+    /// was given, having no `include` member to narrow them with.
+    ///
+    /// `updateStatus`/`updateStatusReason` stay unset: they report an update or delete in
+    /// flight, and nothing is in flight for a stored, created provider.
+    pub fn view(&self, include_tags: bool) -> CapacityProvider {
+        CapacityProvider {
+            capacity_provider_arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            cluster: self.cluster.clone(),
+            status: Some(self.status.clone()),
+            auto_scaling_group_provider: self.auto_scaling_group_provider.clone(),
+            managed_instances_provider: self.managed_instances_provider.clone(),
+            update_status: None,
+            update_status_reason: None,
+            tags: include_tags.then(|| self.tags.clone()),
+            r#type: self.provider_type.clone(),
+        }
+    }
+
+    /// The Auto Scaling group this provider scales, as the ARN or the group name its
+    /// `autoScalingGroupProvider` named ("The Amazon Resource Name (ARN) that identifies
+    /// the Auto Scaling group, or the Auto Scaling group name"). `None` for a provider
+    /// built on managed instances, which has no group of the caller's to collide with.
+    pub fn auto_scaling_group(&self) -> Option<&str> {
+        self.auto_scaling_group_provider
+            .as_ref()
+            .map(|provider| provider.auto_scaling_group_arn.as_str())
+    }
+}
 
 /// A cluster, as `CreateCluster` created it and every cluster-mutating operation
 /// (`UpdateCluster`, `UpdateClusterSettings`, `PutClusterCapacityProviders`) has left it.
@@ -1500,6 +1615,12 @@ pub struct ServiceTally {
 pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// `clusterName` -> the cluster.
     pub clusters: HashMap<String, ClusterRecord>,
+    /// `capacityProviderName` -> the capacity provider. Provider names are unique within
+    /// the account ("The name of the capacity provider" identifies it, and a
+    /// `capacityProviderStrategy` entry names one by that name alone), which is exactly
+    /// this key. Distinct from `ClusterRecord::capacity_providers`, which only records
+    /// WHICH of these a cluster is associated with.
+    pub capacity_providers: HashMap<String, CapacityProviderRecord>,
     /// `(family, revision)` -> the registered revision.
     pub task_definitions: HashMap<(String, i32), TaskDefinitionRecord>,
     /// `family` -> the revision the next `RegisterTaskDefinition` for it will take.
@@ -2806,6 +2927,35 @@ pub fn needs_registered_capacity(launch_type: Option<&str>) -> bool {
     launch_type.is_some_and(|launch_type| REGISTERED_CAPACITY_LAUNCH_TYPES.contains(&launch_type))
 }
 
+/// Whether a task placed through `provider` needs a container instance registered to its
+/// cluster ALREADY — which is the other half of [`needs_registered_capacity`], for the
+/// placement that carries a capacity provider instead of a launch type.
+///
+/// An Auto Scaling group provider's capacity is the container instances its group
+/// registers into the cluster, so a cluster with none has nowhere to place the task —
+/// unless the provider scales that group itself. `ManagedScaling`'s doc: "When managed
+/// scaling is turned on, Amazon ECS manages the scale-in and scale-out actions of the
+/// Auto Scaling group", so such a request is one Amazon ECS satisfies by adding capacity;
+/// "If managed scaling is off, the user must manage the scaling of the Auto Scaling
+/// group", so then nothing is coming. A managed-instances provider manages its own
+/// instances, so it never needs capacity to be there first.
+pub fn needs_registered_capacity_now(provider: &CapacityProviderRecord) -> bool {
+    let Some(group) = provider.auto_scaling_group_provider.as_ref() else {
+        return false;
+    };
+    group
+        .managed_scaling
+        .as_ref()
+        .and_then(|scaling| scaling.status.as_deref())
+        != Some(MANAGED_SCALING_ENABLED)
+}
+
+/// `ManagedScaling$status` when Amazon ECS scales the Auto Scaling group itself, from the
+/// `ManagedScalingStatus` enum (`ENABLED` / `DISABLED`). The member is optional and the
+/// doc states the default is off ("the default is off"), so an absent or `DISABLED`
+/// status is managed scaling OFF.
+pub const MANAGED_SCALING_ENABLED: &str = "ENABLED";
+
 /// Check the `ClusterSettings` of a request against [`CLUSTER_SETTING_VALUES`],
 /// answering the message an `InvalidParameterException` carries when one is outside it.
 ///
@@ -3227,6 +3377,278 @@ pub fn is_valid_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// The ARN of a capacity provider: `arn:aws:ecs:<region>:<account>:capacity-provider/<name>`.
+pub fn capacity_provider_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("capacity-provider/{name}"))
+}
+
+/// The refusal a capacity-provider `name` earns, or `Ok(())` when it is one AWS accepts.
+///
+/// The `CreateCapacityProvider$name` doc: "Up to 255 characters are allowed. They include
+/// letters (both upper and lowercase letters), numbers, underscores (_), and hyphens (-).
+/// The name can't be prefixed with \"aws\", \"ecs\", or \"fargate\"." The character rule is
+/// [`is_valid_name`]'s, shared with every other ECS name; the reserved prefixes are this
+/// member's own, and are what keeps a caller from shadowing `FARGATE`/`FARGATE_SPOT`.
+pub fn validate_capacity_provider_name(name: &str) -> Result<(), String> {
+    if !is_valid_name(name) {
+        return Err(format!(
+            "name must be 1 to {MAX_NAME_LENGTH} letters, numbers, underscores or hyphens; \
+             got {name:?}"
+        ));
+    }
+    let lowered = name.to_ascii_lowercase();
+    if let Some(prefix) = CAPACITY_PROVIDER_RESERVED_PREFIXES
+        .iter()
+        .find(|prefix| lowered.starts_with(**prefix))
+    {
+        return Err(format!(
+            "name must not be prefixed with {prefix:?}, which Amazon ECS reserves; got \
+             {name:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The refusal a launch earns when its `networkConfiguration` does not agree with the
+/// network mode of the task definition it runs, or `None` when the two agree.
+///
+/// The rule, which the model cannot express because `networkConfiguration` is optional on
+/// every launch: a task definition in the `awsvpc` network mode gets its own elastic
+/// network interface, so the launch has to say which subnets and security groups that
+/// interface takes — and a task definition in any other mode has no interface of its own
+/// to configure, so a network configuration is not a thing that launch can carry.
+///
+/// Shared by every operation that launches a task from a stored revision, so `RunTask`
+/// and `CreateService` cannot answer differently about the same pair.
+pub fn network_configuration_violation(
+    network_mode: &str,
+    network_configuration: Option<&NetworkConfiguration>,
+) -> Option<String> {
+    // `NetworkConfiguration` carries exactly one member, `awsvpcConfiguration`, so a
+    // configuration without it configures no interface and is not one.
+    let configured = network_configuration
+        .is_some_and(|configuration| configuration.awsvpc_configuration.is_some());
+    match (network_mode == NETWORK_MODE_AWSVPC, configured) {
+        (true, false) => Some(AWSVPC_NETWORK_CONFIGURATION_REQUIRED_MESSAGE.to_string()),
+        (false, true) => Some(format!(
+            "Network Configuration must not be provided when networkMode \
+             '{network_mode}' is specified."
+        )),
+        _ => None,
+    }
+}
+
+/// The refusal an exec-enabled launch earns when the task definition it runs declares no
+/// `taskRoleArn`, or `None` when it declares one (or when the launch does not enable ECS
+/// Exec at all).
+///
+/// The rule: ECS Exec runs through the SSM agent inside the task, which signs its calls
+/// with the task's own IAM role — so a launch that turns `enableExecuteCommand` on
+/// requires the revision to carry a task role. `subject` names what the refusal is about
+/// ("The service couldn't be created", "The task couldn't be launched"), since the
+/// sentence AWS words is the one the calling operation's own answer carries.
+pub fn execute_command_violation(
+    enabled: bool,
+    definition: Option<&TaskDefinitionRecord>,
+    subject: &str,
+) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let has_role = definition.is_some_and(|found| {
+        found
+            .task_role_arn
+            .as_deref()
+            .is_some_and(|arn| !arn.trim().is_empty())
+    });
+    (!has_role).then(|| {
+        format!(
+            "{subject} because a valid taskRoleArn is not being used. Specify a valid \
+             task IAM role and try again."
+        )
+    })
+}
+
+/// What [`execute_command_violation`] names in a `CreateService` refusal.
+pub const EXECUTE_COMMAND_SERVICE_SUBJECT: &str = "The service couldn't be created";
+
+/// What [`execute_command_violation`] names in a `RunTask` refusal: the launch of the
+/// task itself, which is what ECS Exec attaches to.
+pub const EXECUTE_COMMAND_TASK_SUBJECT: &str = "The task couldn't be launched";
+
+/// What [`execute_command_violation`] names in an `UpdateService` refusal.
+pub const EXECUTE_COMMAND_SERVICE_UPDATE_SUBJECT: &str = "The service couldn't be updated";
+
+/// The refusal a `loadBalancers` list earns when one of its bindings names a container,
+/// or a container port, the task definition it is bound to does not declare — or `None`
+/// when every binding resolves.
+///
+/// The rule: a load-balancer binding attaches ONE container port of the task to a target
+/// group, so the container it names must be one of the revision's `containerDefinitions`
+/// and the port must be one that container declares in its `portMappings` (as a single
+/// `containerPort`, or inside a `containerPortRange`). The refusal names the container and
+/// the port at fault, because it is derived from the request.
+pub fn load_balancer_binding_violation(
+    definition: Option<&TaskDefinitionRecord>,
+    load_balancers: &[LoadBalancer],
+) -> Option<String> {
+    let definition = definition?;
+    for binding in load_balancers {
+        let Some(container_name) = binding.container_name.as_deref() else {
+            return Some(
+                "A load balancer configuration must specify the containerName it \
+                 attaches."
+                    .to_string(),
+            );
+        };
+        let Some(container) = definition
+            .container_definitions
+            .iter()
+            .find(|container| container.name.as_deref() == Some(container_name))
+        else {
+            return Some(format!(
+                "The container {container_name} does not exist in the task definition."
+            ));
+        };
+        let Some(container_port) = binding.container_port else {
+            return Some(format!(
+                "The container {container_name} load balancer configuration must specify \
+                 a containerPort."
+            ));
+        };
+        let declared = container
+            .port_mappings
+            .iter()
+            .flatten()
+            .any(|mapping| port_mapping_covers(mapping, container_port));
+        if !declared {
+            return Some(format!(
+                "The container {container_name} did not have a container port \
+                 {container_port} defined."
+            ));
+        }
+    }
+    None
+}
+
+/// Whether one `portMapping` declares `port` as a container port: either as its own
+/// `containerPort`, or inside the `containerPortRange` it declares instead ("The port
+/// number range on the container that's bound to the dynamically mapped host port
+/// range", written `<start>-<end>`).
+fn port_mapping_covers(mapping: &PortMapping, port: i32) -> bool {
+    if mapping.container_port == Some(port) {
+        return true;
+    }
+    mapping
+        .container_port_range
+        .as_deref()
+        .and_then(|range| range.split_once('-'))
+        .and_then(|(start, end)| {
+            Some((start.trim().parse::<i32>().ok()?, end.trim().parse::<i32>().ok()?))
+        })
+        .is_some_and(|(start, end)| (start..=end).contains(&port))
+}
+
+/// The target groups of `arns` that NO load balancer forwards to, read from the Elastic
+/// Load Balancing v2 service's OWN store through the one shared engine — the same
+/// one-directional, guard-free read [`target_group_target_types`] makes, and under the
+/// same LOCK ORDER: it takes the ELBv2 store's lock, holds no other while it does, and
+/// hands back owned values, so it is called with NO guard of this service's store held.
+///
+/// An ARN that names no stored target group is NOT reported here: whether a group exists
+/// at all is [`load_balancer_refusal`]'s answer, and reporting it twice would give one
+/// condition two sentences.
+///
+/// `None` when that store is unreachable (the engine is not the shared in-memory one),
+/// which a handler answers with the same modelled server error it uses for its own store
+/// being unreachable.
+pub fn unattached_target_groups<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    arns: &[String],
+) -> Option<Vec<String>> {
+    let state =
+        ::service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::service_state(
+            engine,
+        )?;
+    let store = state.lock();
+    Some(
+        arns.iter()
+            .filter(|arn| {
+                store
+                    .target_groups
+                    .get(*arn)
+                    .is_some_and(|group| group.load_balancer_arns.is_empty())
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
+/// The refusal a `loadBalancers` list earns when one of the target groups it names has no
+/// load balancer forwarding to it — or `None` when every named group is attached to one.
+///
+/// The rule: a service registers its tasks as TARGETS of the group, and only a listener
+/// on a load balancer can send traffic to a group — so a group no load balancer forwards
+/// to can never reach the tasks, and ECS refuses the binding at create time. The
+/// association is LIVE: `unattached_target_groups` reads it at request time out of the
+/// records the ELBv2 service holds (`TargetGroupRecord::load_balancer_arns`, which its own
+/// `DescribeTargetGroups` reports as `LoadBalancerArns` and its listeners maintain), so
+/// the same group is refused before a listener forwards to it and accepted after.
+///
+/// `arns` fixes the order the bindings are reported in, so a request naming two
+/// unattached groups is always refused on the same one.
+pub fn orphan_target_group_refusal(arns: &[String], unattached: &[String]) -> Option<String> {
+    arns.iter()
+        .find(|arn| unattached.contains(*arn))
+        .map(|arn| {
+            format!(
+                "The target group with targetGroupArn {arn} does not have an associated \
+                 load balancer."
+            )
+        })
+}
+
+/// Whether an `include` list asks for the resource's TAGS.
+///
+/// Every ECS `include` member targets a closed `…Field` enum that declares `TAGS`
+/// (`CapacityProviderField`, `ClusterField`, `ContainerInstanceField`, `ServiceField`,
+/// `TaskField`), and a field outside the enum cannot reach a handler — the boundary
+/// validator refuses it — so the question is only whether `TAGS` is among them.
+pub fn include_requests_tags(include: Option<&Vec<String>>) -> bool {
+    include
+        .into_iter()
+        .flatten()
+        .any(|field| field == INCLUDE_FIELD_TAGS)
+}
+
+/// The `include` field every ECS describe gates its tag set on.
+pub const INCLUDE_FIELD_TAGS: &str = "TAGS";
+
+/// The capacity-provider NAME a `capacityProviders` entry refers to: the value as given
+/// when it is a short name, and the name out of a capacity-provider ARN
+/// (`arn:aws:ecs:<region>:<account>:capacity-provider/<name>`) when it is one — the
+/// member's doc, "The short name or full Amazon Resource Name (ARN) of one or more
+/// capacity providers".
+pub fn capacity_provider_name_from_reference(reference: &str) -> String {
+    match reference.rsplit_once(":capacity-provider/") {
+        Some((_, name)) => name.to_string(),
+        None => reference.to_string(),
+    }
+}
+
+/// The Auto Scaling group an `autoScalingGroupArn` member names, as the key two
+/// capacity providers are compared on: the group NAME, which is the last segment of an
+/// Auto Scaling group ARN
+/// (`arn:aws:autoscaling:<region>:<account>:autoScalingGroup:<id>:autoScalingGroupName/<name>`)
+/// and the value itself when the member carries the name ("The Amazon Resource Name
+/// (ARN) that identifies the Auto Scaling group, or the Auto Scaling group name").
+///
+/// Naming one group by ARN and by name is naming the SAME group, so the reuse rule
+/// cannot be slipped by spelling it the other way.
+pub fn auto_scaling_group_key(reference: &str) -> &str {
+    reference.rsplit('/').next().unwrap_or(reference)
 }
 
 /// The `family` and optional `revision` a `taskDefinition` request member names.

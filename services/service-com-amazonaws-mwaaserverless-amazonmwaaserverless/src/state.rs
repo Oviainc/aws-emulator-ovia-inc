@@ -17,6 +17,10 @@
 //! key per stored workflow, released by the delete that removes the record; and the
 //! idempotency ledger is capped and evicted on its own terms (see [`IdempotencyLedger`]).
 //! A listing's response is bounded too, by the modelled `MaxResults` range.
+//! A run's `task_instances` ([`TaskInstance`]) is NOT caller-driven growth: no modelled
+//! operation creates a task instance — only executing a workflow definition does, and
+//! this emulator has no Apache Airflow engine ([`NO_AIRFLOW_ENGINE`]) — so the map is
+//! bounded by the number of runs that hold it.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::LazyLock;
@@ -144,13 +148,25 @@ pub struct WorkflowRun {
     pub modified_at: SystemTime,
     pub duration: Option<i32>,
     pub error_message: Option<String>,
-    pub task_instances: Vec<String>,
+    /// The task instances this run produced, keyed by `TaskInstanceId` — a
+    /// `BTreeMap` so a reader walks them in one total order. Empty for every run
+    /// this emulator starts: a task instance exists only once something executed
+    /// the workflow definition, and nothing here does (see [`NO_AIRFLOW_ENGINE`]),
+    /// so `GetTaskInstance` answers the modelled `ResourceNotFoundException`
+    /// rather than reporting a task nothing ran.
+    pub task_instances: BTreeMap<String, TaskInstance>,
     /// The instant the clock owes this run's exit from its initial non-terminal
     /// status. Stored, never slept on.
     pub settles_at: SystemTime,
 }
 
 impl WorkflowRun {
+    /// The `TaskInstanceId`s this run holds, in the store's order — what
+    /// `GetWorkflowRun` reports as `RunDetail.TaskInstances`.
+    pub fn task_instance_ids(&self) -> Vec<String> {
+        self.task_instances.keys().cloned().collect()
+    }
+
     /// Apply the status change the clock already made due, and report whether
     /// anything changed.
     ///
@@ -172,6 +188,66 @@ impl WorkflowRun {
         true
     }
 }
+
+/// One task instance of a run: the execution record of a single task in the
+/// workflow definition.
+///
+/// The fields are exactly what the modelled task-instance shapes report
+/// (`smithy_query(query="shape", shape="GetTaskInstanceResponse,TaskInstanceSummary")`),
+/// minus the three a reader takes from the run that owns it (`WorkflowArn`, `RunId`,
+/// `WorkflowVersion`) and the `DurationInSeconds` a reader DERIVES from
+/// `started_at`/`ended_at` ([`TaskInstance::duration_in_seconds`]).
+///
+/// Written only by whatever executes a workflow definition; this emulator has no
+/// Apache Airflow engine, so nothing writes one and no stored run holds one.
+#[derive(Debug, Clone)]
+pub struct TaskInstance {
+    /// `TaskInstanceId`: this instance's own identifier, the key it is stored under.
+    pub task_instance_id: String,
+    /// `TaskId`: the task in the workflow definition this instance executes.
+    pub task_id: Option<String>,
+    /// `Status`: a `TaskInstanceStatus` value (see [`TASK_INSTANCE_STATUS_NONE`]).
+    pub status: String,
+    /// `OperatorName`: the Apache Airflow operator the task uses.
+    pub operator_name: Option<String>,
+    /// `AttemptNumber`: which attempt this instance is.
+    pub attempt_number: Option<i32>,
+    /// `StartedAt`: `None` until the task starts, per the member's docs.
+    pub started_at: Option<SystemTime>,
+    /// `EndedAt`: `None` until the task completes, per the member's docs.
+    pub ended_at: Option<SystemTime>,
+    /// `ModifiedAt`: when this record last changed.
+    pub modified_at: SystemTime,
+    /// `ErrorMessage`: `None` when the task did not fail, per the member's docs.
+    pub error_message: Option<String>,
+    /// `LogStream`: the CloudWatch log stream this instance logs to.
+    pub log_stream: Option<String>,
+    /// `Xcom`: the cross-task data this instance exchanged. A `BTreeMap` so the
+    /// entries have one order in the store.
+    pub xcom: BTreeMap<String, String>,
+}
+
+impl TaskInstance {
+    /// `DurationInSeconds`, derived rather than stored: the wall time between
+    /// `started_at` and `ended_at`, and `None` while the task is not complete —
+    /// "This value is null if the task is not complete"
+    /// (`smithy_query(query="shape", shape="GetTaskInstanceResponse")`,
+    /// `DurationInSeconds`).
+    pub fn duration_in_seconds(&self) -> Option<i32> {
+        let (started, ended) = (self.started_at?, self.ended_at?);
+        Some(duration_in_seconds(
+            ended.duration_since(started).unwrap_or_default(),
+        ))
+    }
+}
+
+/// The `TaskInstanceStatus` value for an instance that has no status yet, as the
+/// model spells it (`smithy_query(query="shape", shape="TaskInstanceStatus")`).
+///
+/// Nothing in `src/ops/` writes a task instance (no Apache Airflow engine executes a
+/// definition here), so this is the value a seeded record starts from in
+/// `tests/all/task_instance_reads.rs` rather than one a handler assigns.
+pub const TASK_INSTANCE_STATUS_NONE: &str = "NONE";
 
 /// A run duration in whole seconds, rounded up so a sub-second run still reports
 /// the second it occupied, and clamped into the modelled `Integer`.
@@ -477,6 +553,8 @@ pub enum UnresolvedEntity {
     NamedWorkflowVersion,
     /// The run a `RunId` names.
     WorkflowRun,
+    /// The task instance a `TaskInstanceId` names, inside the run that holds it.
+    TaskInstance,
 }
 
 impl UnresolvedEntity {
@@ -497,6 +575,10 @@ impl UnresolvedEntity {
             Self::LatestWorkflowVersion => "Unable to find latest version",
             Self::NamedWorkflowVersion => "Unable to find the requested version",
             Self::WorkflowRun => "Workflow run not found",
+            // Not in any recording of this service (no fixture reads a task
+            // instance); entity-level and free of request values, like the others,
+            // so a client can tell which entity failed to resolve.
+            Self::TaskInstance => "Task instance not found",
         }
     }
 
@@ -506,6 +588,7 @@ impl UnresolvedEntity {
             Self::Workflow => "workflow",
             Self::LatestWorkflowVersion | Self::NamedWorkflowVersion => "workflow-version",
             Self::WorkflowRun => "workflow-run",
+            Self::TaskInstance => "task-instance",
         }
     }
 }

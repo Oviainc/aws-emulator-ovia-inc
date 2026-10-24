@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(DeletePackagingGroupErrorModeled::InternalServerErrorException(
@@ -185,14 +185,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         // The `Id` addresses the resource (it is an `@httpLabel`), so one this service
-        // holds no group under is the addressed resource missing — 404. Looked up, NOT
-        // removed: the referential check below can still refuse the delete, and a
-        // refused delete must leave the group exactly as it was.
+        // holds no group under IN THIS REGION is the addressed resource missing — 404.
+        // Looked up, NOT removed: the referential check below can still refuse the
+        // delete, and a refused delete must leave the group exactly as it was.
         let Some(arn) = state
-            .packaging_groups
-            .get(&input.id)
+            .packaging_group(&region, &input.id)
             .map(|group| group.arn.clone())
         else {
             return Err(DeletePackagingGroupErrorModeled::NotFoundException(
@@ -205,18 +205,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // Referential integrity: a configuration still names this group in its
-        // `PackagingGroupId`, so removing the group would orphan it. Refused with the
-        // modelled 422 before anything is written, so neither the group nor its tags
-        // are touched on this path.
-        if state.configuration_count(&input.id) > 0 {
+        // Referential integrity: a configuration of this same Region still names this
+        // group in its `PackagingGroupId`, so removing the group would orphan it.
+        // Refused with the modelled 422 before anything is written, so neither the
+        // group nor its tags are touched on this path.
+        if state.configuration_count(&region, &input.id) > 0 {
             return Err(crate::scaffolded::UnprocessableEntity::member(
                 "id",
                 "cannot be deleted because it has attached packaging configurations",
             )
             .into());
         }
-        state.packaging_groups.remove(&input.id);
+        state.remove_packaging_group(&region, &input.id);
         // The tag store is keyed by ARN, so a deleted group must not leave its tags
         // behind for a later resource that happens to reuse the id.
         state.forget_tags(&arn);

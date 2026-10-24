@@ -144,7 +144,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(ListPackagingGroupsErrorModeled::InternalServerErrorException(
@@ -162,12 +162,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
         let page_size = crate::state::page_size(input.max_results)?;
 
+        let region = crate::state::request_region(ctx.parts());
         let state = store.lock();
-        // `packaging_groups` is a `BTreeMap`, so this is one stable id order across
-        // pages: a cursor can resume strictly after the id the previous page ended on.
+        // One Region's groups are a contiguous `Id`-ordered range of the store, so
+        // this is one stable id order across pages: a cursor can resume strictly after
+        // the id the previous page ended on. A group of another Region is not reported
+        // here at all.
         let matching: Vec<&crate::state::PackagingGroupRecord> = state
-            .packaging_groups
-            .values()
+            .packaging_groups_in(&region)
             .filter(|group| {
                 resume_after
                     .as_deref()
@@ -182,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|group| PackagingGroup {
                 // Counted from the asset map on every read, exactly as
                 // `DescribePackagingGroup` reports it.
-                approximate_asset_count: Some(state.asset_count(&group.id)),
+                approximate_asset_count: Some(state.asset_count(&region, &group.id)),
                 arn: Some(group.arn.clone()),
                 authorization: group.authorization.clone(),
                 created_at: Some(group.created_at.clone()),

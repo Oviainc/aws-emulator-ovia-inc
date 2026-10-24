@@ -158,14 +158,18 @@ fn leaves(document: &str) -> Vec<(String, String)> {
 }
 
 /// The CONTENT of an XML document: its leaves sorted by path. See [`leaves`].
-fn content(document: &str) -> Vec<(String, String)> {
+///
+/// `pub(crate)`, with [`reported`] beside it: the cors suite in this same test crate
+/// compares a stored subresource with the document that put it the same way, rather than
+/// standing up a second XML reader.
+pub(crate) fn content(document: &str) -> Vec<(String, String)> {
     let mut leaves = leaves(document);
     leaves.sort_by(|left, right| left.0.cmp(&right.0));
     leaves
 }
 
 /// The content of what a request answered, as a document.
-fn reported(answer: &Answer) -> Vec<(String, String)> {
+pub(crate) fn reported(answer: &Answer) -> Vec<(String, String)> {
     content(&String::from_utf8_lossy(&answer.body))
 }
 

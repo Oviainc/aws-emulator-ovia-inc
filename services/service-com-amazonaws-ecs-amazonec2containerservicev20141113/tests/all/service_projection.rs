@@ -90,6 +90,10 @@ struct ProjectionCase {
     grace_period: Option<i64>,
     /// The `deploymentConfiguration` the request names, if any.
     configuration: Option<Value>,
+    /// The `loadBalancers` the request names, if any. A CODE_DEPLOY-controlled service
+    /// REQUIRES one (CodeDeploy shifts traffic between two target groups), so that row
+    /// carries a binding — onto the revision that declares the container port it names.
+    load_balancers: Option<Value>,
     /// The controller the stored service must report.
     expect_controller: &'static str,
     /// The `roleArn` the stored service must report, if any.
@@ -104,7 +108,9 @@ struct ProjectionCase {
 
 #[tokio::test]
 async fn a_created_service_materialises_its_documented_defaults_and_reads_them_back() {
-    let router = service();
+    // BOTH stores: the CODE_DEPLOY row below must carry a load-balancer binding, and a
+    // binding names a target group the Elastic Load Balancing v2 service has to hold.
+    let router = crate::load_balancer_target_groups::emulator();
     ok(
         &router,
         "CreateCluster",
@@ -113,6 +119,35 @@ async fn a_created_service_materialises_its_documented_defaults_and_reads_them_b
     )
     .await;
     let definition_arn = register_definition(&router, "projectedfamily", "setup").await;
+    // A revision whose container declares a container PORT, for the row that binds the
+    // service to a load balancer: a binding may only name a port the revision declares.
+    let bound_definition_arn = {
+        let body = ok(
+            &router,
+            "RegisterTaskDefinition",
+            json!({
+                "family": "projectedboundfamily",
+                "containerDefinitions": [{
+                    "name": "web",
+                    "image": "public.ecr.aws/nginx/nginx:latest",
+                    "memory": 128,
+                    "portMappings": [{ "containerPort": 80 }],
+                }],
+            }),
+            "setup",
+        )
+        .await;
+        string(&body["taskDefinition"], "taskDefinitionArn", "setup")
+    };
+    // The `instance` target group the CODE_DEPLOY row binds to, created through the ELBv2
+    // service's own API on the same engine.
+    let code_deploy_target_group = crate::load_balancer_target_groups::create_target_group(
+        &router,
+        "projected-tg",
+        "instance",
+        "setup",
+    )
+    .await;
 
     // The service-linked role ARN, from the `role` doc: "If your account has already
     // created the Amazon ECS service-linked role, that role is used for your service
@@ -134,6 +169,7 @@ async fn a_created_service_materialises_its_documented_defaults_and_reads_them_b
             role: None,
             grace_period: None,
             configuration: None,
+            load_balancers: None,
             expect_controller: "ECS",
             expect_role_arn: None,
             expect_grace_period: 0,
@@ -147,6 +183,7 @@ async fn a_created_service_materialises_its_documented_defaults_and_reads_them_b
             role: None,
             grace_period: None,
             configuration: None,
+            load_balancers: None,
             expect_controller: "EXTERNAL",
             expect_role_arn: Some(service_linked_role.clone()),
             expect_grace_period: 0,
@@ -161,6 +198,15 @@ async fn a_created_service_materialises_its_documented_defaults_and_reads_them_b
             role: None,
             grace_period: Some(0),
             configuration: None,
+            // CodeDeploy drives the deployment by shifting traffic between two target
+            // groups, so the service it controls has to be behind a load balancer. The
+            // group is a real `instance` one: the revision is in the `bridge` network
+            // mode, whose tasks register by the container instance that runs them.
+            load_balancers: Some(json!([{
+                "targetGroupArn": code_deploy_target_group,
+                "containerName": "web",
+                "containerPort": 80,
+            }])),
             expect_controller: "CODE_DEPLOY",
             expect_role_arn: Some(service_linked_role.clone()),
             expect_grace_period: 0,
@@ -174,6 +220,7 @@ async fn a_created_service_materialises_its_documented_defaults_and_reads_them_b
             role: Some("ecsServiceRole"),
             grace_period: Some(120),
             configuration: None,
+            load_balancers: None,
             expect_controller: "ECS",
             expect_role_arn: Some(format!("arn:aws:iam::{ACCOUNT}:role/ecsServiceRole")),
             expect_grace_period: 120,
@@ -187,6 +234,7 @@ async fn a_created_service_materialises_its_documented_defaults_and_reads_them_b
             role: Some("/team/ecsServiceRole"),
             grace_period: Some(2_147_483_647),
             configuration: None,
+            load_balancers: None,
             expect_controller: "ECS",
             expect_role_arn: Some(format!("arn:aws:iam::{ACCOUNT}:role/team/ecsServiceRole")),
             expect_grace_period: 2_147_483_647,
@@ -200,6 +248,7 @@ async fn a_created_service_materialises_its_documented_defaults_and_reads_them_b
             role: Some("arn:aws:iam::123456789012:role/custom"),
             grace_period: None,
             configuration: None,
+            load_balancers: None,
             expect_controller: "ECS",
             expect_role_arn: Some("arn:aws:iam::123456789012:role/custom".to_string()),
             expect_grace_period: 0,
@@ -217,6 +266,7 @@ async fn a_created_service_materialises_its_documented_defaults_and_reads_them_b
                 "bakeTimeInMinutes": 15,
                 "deploymentCircuitBreaker": { "enable": true, "rollback": true },
             })),
+            load_balancers: None,
             expect_controller: "ECS",
             expect_role_arn: None,
             expect_grace_period: 0,
@@ -249,6 +299,12 @@ async fn a_created_service_materialises_its_documented_defaults_and_reads_them_b
         }
         if let Some(configuration) = test.configuration.clone() {
             request["deploymentConfiguration"] = configuration;
+        }
+        if let Some(load_balancers) = test.load_balancers.clone() {
+            request["loadBalancers"] = load_balancers;
+            // The binding names a container port, so the service runs the revision that
+            // declares one.
+            request["taskDefinition"] = json!(bound_definition_arn);
         }
 
         let created = ok(&router, "CreateService", request, case).await;

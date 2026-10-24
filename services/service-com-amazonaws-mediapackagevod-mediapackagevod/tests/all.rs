@@ -29,6 +29,8 @@ mod packaging_group_deletion;
 mod packaging_group_update;
 #[path = "all/packaging_lifecycle.rs"]
 mod packaging_lifecycle;
+#[path = "all/region_scoping.rs"]
+mod region_scoping;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/success_path_projections.rs"]

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestartConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestartConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestartConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the asynchronous restart of a stored connector: the connector moves to
+//! `RESTARTING` and the clock returns it to `RUNNING`, and a `RESTART_CONNECTOR`
+//! connector operation is stored, starting `PENDING` and walking the model's restart
+//! states on the clock. The answer carries the connector's ARN and the new operation's
+//! ARN, which `DescribeConnectorOperation` and `ListConnectorOperations` report from.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +158,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestartConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestartConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestartConnector"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(RestartConnectorErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the kafkaconnect store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = store.lock();
+        state.settle_due();
+
+        let Some(connector) = state.connectors.get(&input.connector_arn) else {
+            return Err(RestartConnectorErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::invalid_parameter_because(
+                    "connectorArn",
+                    crate::state::RESOURCE_DOES_NOT_EXIST,
+                )),
+            })
+            .into());
+        };
+
+        // "Restarts the specified connector [and] all of its tasks": only a
+        // connector that is running HAS tasks to restart — one still being
+        // created, one already restarting, or one being deleted has none — so
+        // the request is refused rather than recorded against work that cannot
+        // happen. The same shape of refusal `CreateConnector` answers for a
+        // custom plugin that is not `ACTIVE` yet.
+        if connector.state != crate::state::CONNECTOR_RUNNING {
+            return Err(RestartConnectorErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_parameter_because(
+                    "connectorArn",
+                    &format!(
+                        "The connector is not {}.",
+                        crate::state::CONNECTOR_RUNNING
+                    ),
+                )),
+            })
+            .into());
+        }
+
+        let connector_arn = connector.arn.clone();
+        let connector_name = connector.name.clone();
+
+        // The operations stored against one connector are metered, so a
+        // connector restarted without end does not grow this store without end.
+        if state.connector_operation_quota_reached(&connector_arn) {
+            return Err(RestartConnectorErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "Limit exceeded. Resource limit reached: this connector already holds {} operations.",
+                        crate::state::RESOURCE_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.mint_resource_id("connector-operation", &connector_name);
+        // The operation's ARN is derived from the connector's, so it names the
+        // same partition, region and account the connector itself lives in. The
+        // fallback covers only a connector ARN of a shape this service did not
+        // mint, which keeps the handler total without a panic.
+        let arn = crate::state::connector_operation_arn(&connector_arn, &id).unwrap_or_else(|| {
+            ::engine::emulator_arn(
+                crate::state::ARN_SERVICE,
+                &region,
+                &format!("connector-operation/{connector_name}/{id}"),
+            )
+        });
+
+        // The connector itself is restarting until the clock brings it back:
+        // `settle_due` moves it to `RUNNING` once that is due, so a caller that
+        // reads it straight away still sees the transient state.
+        if let Some(connector) = state.connectors.get_mut(&connector_arn) {
+            connector.state = crate::state::CONNECTOR_RESTARTING.to_string();
+            connector.pending = Some(crate::state::PendingChange::in_a_moment(
+                crate::state::PendingKind::Settle,
+            ));
+        }
+
+        let operation = crate::state::ConnectorOperationRecord::restart(
+            arn.clone(),
+            connector_arn.clone(),
+            input.only_failed_tasks,
+        );
+        let output = RestartConnectorOutput {
+            connector_arn: Some(connector_arn),
+            connector_operation_arn: Some(operation.arn.clone()),
+        };
+        state.connector_operations.insert(arn, operation);
+        Ok(output)
     }
 }

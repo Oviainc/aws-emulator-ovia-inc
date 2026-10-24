@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCallAnalyticsCategory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCallAnalyticsCategory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCallAnalyticsCategory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the rules of one stored Call Analytics category: "the
+//! UpdateCallAnalyticsCategory operation overwrites all existing rules contained in
+//! the specified category. You cannot append additional rules onto an existing
+//! category." The category's name, its input type and its tags are not changed by it,
+//! and the answer is the stored record as `CategoryProperties`.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +160,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCallAnalyticsCategory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCallAnalyticsCategoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCallAnalyticsCategory"))
+        // A category carries no region-dependent value, so the request's credential
+        // scope reaches nothing this operation stores or reports.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateCallAnalyticsCategoryErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some(
+                            "this service is mounted on an engine that holds no Transcribe \
+                             state"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(record) = store
+            .call_analytics_categories
+            .get_mut(&input.category_name)
+        else {
+            return Err(not_found());
+        };
+
+        // "The input type you specify must match the input type specified when the
+        // category was created" (model doc for the request's `InputType`): a request
+        // that names the other one is refused rather than silently retyping the
+        // category, whose input type decides which kind of transcription it can be
+        // applied to at all. A request that names NO input type leaves the stored one
+        // as it is — the member is optional here, and this operation updates the rules.
+        if let Some(requested) = input
+            .input_type
+            .as_deref()
+            .filter(|requested| *requested != record.input_type)
+        {
+            return Err(bad_request(&format!(
+                "The InputType {requested} in your request doesn't match the {stored} input \
+                 type this category was created with. Specify {stored} and try your request \
+                 again.",
+                stored = record.input_type,
+            )));
+        }
+
+        // The overwrite: the rules the request carries REPLACE the stored ones, so the
+        // stored set is exactly this request's — never the two appended.
+        record.rules = input.rules;
+        record.last_update_time = now;
+
+        ::tracing::info!(
+            operation = "UpdateCallAnalyticsCategory",
+            category = %record.name,
+            input_type = %record.input_type,
+            rules = record.rules.len(),
+            "Call Analytics category rules replaced"
+        );
+
+        // The answer is the record as it now stands, never the request echoed back.
+        Ok(UpdateCallAnalyticsCategoryOutput {
+            category_properties: Some(record.to_properties()),
+        })
     }
+}
+
+/// A refusal of a category this account does not hold.
+///
+/// The same shape the rest of this family answers for a lookup that finds nothing —
+/// `GetCallAnalyticsCategory` and `DeleteCallAnalyticsCategory` both answer
+/// `BadRequestException`, whose own documentation covers an entity that "doesn't
+/// exist" and which is the shape this service's recorded not-found responses carry —
+/// so one family does not answer two different shapes for one condition. (The model
+/// also declares `NotFoundException` on this operation; it is not what the wire
+/// shows.) The message names the kind of resource, not the name the caller asked
+/// about, as every other refusal of this service does
+/// ([`crate::state::not_found_message`]); the wire status is this protocol's client
+/// status — see [`crate::scaffolded::wire_status`].
+fn not_found() -> UpdateCallAnalyticsCategoryError {
+    bad_request(&crate::state::not_found_message(
+        crate::state::KIND_CATEGORY,
+    ))
+}
+
+/// A `BadRequestException` refusing a request this operation cannot serve: one naming
+/// a category this account does not hold ([`not_found`]), or one whose `InputType`
+/// contradicts the stored category's — neither of which the model's own constraint
+/// traits can express.
+fn bad_request(message: &str) -> UpdateCallAnalyticsCategoryError {
+    UpdateCallAnalyticsCategoryErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

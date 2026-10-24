@@ -15,6 +15,8 @@
 mod assistant_association;
 #[path = "all/assistant_lifecycle.rs"]
 mod assistant_lifecycle;
+#[path = "all/content_upload.rs"]
+mod content_upload;
 #[path = "all/knowledge_base_lifecycle.rs"]
 mod knowledge_base_lifecycle;
 #[path = "all/session_recommendations.rs"]

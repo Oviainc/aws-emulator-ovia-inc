@@ -42,17 +42,23 @@ const REGION: &str = "us-east-1";
 /// The access-key id standing for the account's own published credential: STS resolves an
 /// id it never minted to the account's ambient identity, which holds no IAM policies and
 /// is allowed, exactly as AWS account root credentials are.
-const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
+///
+/// `pub(crate)` so another suite in this target drives the SAME harness rather than
+/// growing its own copy of it.
+pub(crate) const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
 
 /// The emulator these tests drive: one shared engine carrying this service beside the IAM
 /// and STS services the principals and their policies are made with — the same set
 /// `core/router`'s `build_router` assembles, narrowed to what this rule touches.
-struct Emulator {
+///
+/// `pub(crate)` so every suite in this target that needs a REAL principal — one made with
+/// IAM's and STS's own operations — authorizes against the same harness.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing: the `Authorization` header carries only the credential
@@ -77,7 +83,7 @@ impl Emulator {
     }
 
     /// One call to this service, with `access_key_id` in the SigV4 credential scope.
-    async fn call(&self, access_key_id: &str, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, access_key_id: &str, operation: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -144,7 +150,7 @@ impl Emulator {
 
     /// Create an IAM role with `policy` as its inline policy (when one is given), assume
     /// it through STS, and answer the session's access key id.
-    async fn assumed_role_key(&self, role_name: &str, policy: Option<&str>) -> String {
+    pub(crate) async fn assumed_role_key(&self, role_name: &str, policy: Option<&str>) -> String {
         let trust = format!(
             "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
              \"Principal\":{{\"AWS\":\"arn:aws:iam::{}:root\"}},\
@@ -211,7 +217,7 @@ impl Emulator {
 
     /// Create an IAM user with `policy` as its inline policy (when one is given) and
     /// answer the access key id of a long-term key minted for it.
-    async fn user_key(&self, user_name: &str, policy: Option<&str>) -> String {
+    pub(crate) async fn user_key(&self, user_name: &str, policy: Option<&str>) -> String {
         let (status, body) = self
             .query(
                 "iam",
@@ -284,7 +290,7 @@ fn xml_element(body: &str, name: &str) -> Option<String> {
 }
 
 /// A policy document allowing `action` on `resource`.
-fn allow(action: &str, resource: &str) -> String {
+pub(crate) fn allow(action: &str, resource: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
          \"Action\":\"{action}\",\"Resource\":\"{resource}\"}}]}}"
@@ -293,7 +299,7 @@ fn allow(action: &str, resource: &str) -> String {
 
 /// A policy document allowing every data-exports action on everything, and explicitly
 /// denying `denied`.
-fn allow_all_but(denied: &str) -> String {
+pub(crate) fn allow_all_but(denied: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[\
          {{\"Effect\":\"Allow\",\"Action\":\"bcm-data-exports:*\",\"Resource\":\"*\"}},\
@@ -302,7 +308,7 @@ fn allow_all_but(denied: &str) -> String {
 }
 
 /// The `CreateExport` request for the export called `name`.
-fn create_request(name: &str) -> Value {
+pub(crate) fn create_request(name: &str) -> Value {
     let mut request = cases().remove(0).create_request();
     request["Export"]
         .as_object_mut()
@@ -312,7 +318,7 @@ fn create_request(name: &str) -> Value {
 }
 
 /// The ARN this service mints for the export called `name` in [`REGION`].
-fn export_arn(name: &str) -> String {
+pub(crate) fn export_arn(name: &str) -> String {
     ::engine::emulator_arn("bcm-data-exports", REGION, &format!("export/{name}"))
 }
 

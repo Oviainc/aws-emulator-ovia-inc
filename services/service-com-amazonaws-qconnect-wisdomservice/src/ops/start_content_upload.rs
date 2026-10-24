@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartContentUpload
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartContentUpload`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartContentUpload::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Opens a content upload against a knowledge base this account holds: it mints an
+//! `uploadId`, persists the upload in [`crate::state`] under it, and reports the URL the
+//! asset is written to, when that URL stops being usable, and the headers the write must
+//! carry. Nothing in the response is invented — the URL names the record this call just
+//! stored, and the upload plane in `crate::service` serves a `PUT` to it out of that
+//! record, so an upload URL this service hands out can be followed.
+//!
+//! `CreateContent`/`UpdateContent` then name the same `uploadId` to finalize the asset;
+//! both are still scaffold stubs with their own issues, and neither is reached from here.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +159,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartContentUpload` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartContentUploadErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartContentUpload"))
+        // Modeled constraints — `contentType`'s pattern, `knowledgeBaseId`'s `UuidOrArn`
+        // pattern, `presignedUrlTimeToLive`'s `range 1..60` — are already refused BEFORE
+        // this handler runs, so reaching here means the input satisfies every one of
+        // them.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("StartContentUpload")
+        })?;
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let host = crate::state::request_endpoint_host(&ctx.parts().headers, &region);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // An expired URL cannot be used by anyone, so the slots those uploads held came
+        // back at the instant they expired, whether or not anybody called: reclaim them
+        // before this start is measured against the store's ceiling.
+        store.reclaim_expired_content_uploads(now);
+
+        // An upload is opened INSIDE a knowledge base this account holds, in either
+        // label form the model's `UuidOrArn` admits. A label that names none is the
+        // modelled not-found rather than a URL into nothing.
+        let Some(knowledge_base) = store.knowledge_base(&input.knowledge_base_id) else {
+            return Err(StartContentUploadErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND.to_string()),
+                    resource_name: Some(input.knowledge_base_id.clone()),
+                },
+            )
+            .into());
+        };
+        // The operation's own documentation: "You can only upload content to a knowledge
+        // base of type CUSTOM." A start against a knowledge base of any other modelled
+        // type is refused here rather than answered with a URL that could not be used.
+        if knowledge_base.knowledge_base_type != crate::state::KNOWLEDGE_BASE_TYPE_CUSTOM {
+            return Err(StartContentUploadErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Content can only be uploaded to a knowledge base of type {}.",
+                        crate::state::KNOWLEDGE_BASE_TYPE_CUSTOM
+                    )),
+                },
+            )
+            .into());
+        }
+        let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
+        // The headers the write must carry, computed from what the upload is FOR and
+        // from the stored knowledge base: the one media type this upload accepts, and —
+        // when the knowledge base is encrypted under a customer-managed key — the
+        // encryption the asset is written with. They are stored with the upload, so the
+        // headers the caller is told to include are the ones the `PUT` is held to.
+        let mut headers_to_include = ::std::collections::BTreeMap::new();
+        headers_to_include.insert(
+            crate::state::CONTENT_TYPE_HEADER.to_string(),
+            input.content_type.clone(),
+        );
+        if let Some(kms_key_id) = knowledge_base
+            .server_side_encryption_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.kms_key_id.clone())
+        {
+            headers_to_include.insert(
+                crate::state::SERVER_SIDE_ENCRYPTION_HEADER.to_string(),
+                crate::state::SERVER_SIDE_ENCRYPTION_AWS_KMS.to_string(),
+            );
+            headers_to_include.insert(
+                crate::state::SERVER_SIDE_ENCRYPTION_KEY_ID_HEADER.to_string(),
+                kms_key_id,
+            );
+        }
+
+        let Some(upload_id) = store.mint_content_upload_id() else {
+            return Err(StartContentUploadErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "could not mint a unique uploadId; retry the request".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        // `presignedUrlTimeToLive` is the caller's own expectation, in minutes, and is
+        // used as given; a request that names none gets this emulator's default.
+        let time_to_live_minutes = input
+            .presigned_url_time_to_live
+            .and_then(|minutes| u64::try_from(minutes).ok())
+            .unwrap_or(crate::state::DEFAULT_PRESIGNED_URL_TIME_TO_LIVE_MINUTES);
+        let url_expiry = now + ::std::time::Duration::from_secs(time_to_live_minutes * 60);
+        let url = crate::state::content_upload_url(&host, &knowledge_base_id, &upload_id);
+        let stored = store.insert_content_upload(crate::state::ContentUpload {
+            upload_id: upload_id.clone(),
+            knowledge_base_id,
+            content_type: input.content_type,
+            url,
+            url_expiry,
+            headers_to_include,
+            started_at: now,
+            // No bytes yet: they arrive when something follows the URL.
+            body: None,
+            received_at: None,
+        });
+        if !stored {
+            // The store holds as many open uploads as this emulator keeps
+            // (`state::MAX_CONTENT_UPLOADS`); the operation models no quota error, so
+            // the refusal is its modelled input failure.
+            return Err(StartContentUploadErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "The maximum number of open content uploads ({}) has been reached. \
+                         Wait for an upload URL to expire before starting another.",
+                        crate::state::MAX_CONTENT_UPLOADS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Answer out of the record that was just persisted, so this response and the
+        // upload plane that serves the URL cannot disagree about the upload.
+        let Some(upload) = store.content_upload(&upload_id) else {
+            // Unreachable: the insert above put this id in the map while the lock is
+            // held.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StartContentUpload",
+            ));
+        };
+        Ok(StartContentUploadOutput {
+            upload_id: upload.upload_id.clone(),
+            url: upload.url.clone(),
+            url_expiry: ::aws_smithy_types::DateTime::from(upload.url_expiry),
+            headers_to_include: upload
+                .headers_to_include
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        })
     }
 }

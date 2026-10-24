@@ -397,6 +397,9 @@ pub const OPERATION_TYPE_UPDATE_RELATIONAL_DATABASE_PARAMETERS: &str =
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_LOAD_BALANCER: &str = "CreateLoadBalancer";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_ATTACH_INSTANCES_TO_LOAD_BALANCER: &str =
+    "AttachInstancesToLoadBalancer";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK_SNAPSHOT: &str = "CreateDiskSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK_FROM_SNAPSHOT: &str = "CreateDiskFromSnapshot";
@@ -448,10 +451,12 @@ pub const OPERATION_TYPE_EXPORT_SNAPSHOT: &str = "ExportSnapshot";
 /// refused with the modelled `InvalidInputException`.
 pub const MAX_INSTANCES: usize = 500;
 
-/// The most names one `CreateInstances` call may carry.
+/// The most instance names ONE request may carry — `CreateInstances`'
+/// `instanceNames`, or `AttachInstancesToLoadBalancer`'s.
 ///
-/// Emulator resource guard: the modelled `StringList` declares no length, so this
-/// is where the bound on a caller-sized list lives.
+/// Emulator resource guard: neither the modelled `StringList` nor the modelled
+/// `ResourceNameList` declares a length, so this is where the bound on a
+/// caller-sized list of instance names lives.
 pub const MAX_INSTANCE_NAMES_PER_REQUEST: usize = 50;
 
 /// The most domain recordsets this emulator will hold.
@@ -7192,6 +7197,21 @@ impl ComAmazonawsLightsailLightsail20161128State {
             .filter(|((balancer_region, _), _)| balancer_region == region)
             .map(|(_, balancer)| balancer)
             .collect()
+    }
+
+    /// The load balancer `name` names in `region`, for an operation the spec says
+    /// mutates it — registering an instance with it, or releasing one.
+    ///
+    /// The `(region, name)` pair is this record's store key, so neither may be
+    /// reassigned through this handle; no operation in this slice renames a load
+    /// balancer or moves one between Regions.
+    pub fn load_balancer_mut(
+        &mut self,
+        region: &str,
+        name: &str,
+    ) -> Option<&mut StoredLoadBalancer> {
+        self.load_balancers
+            .get_mut(&(region.to_string(), name.to_string()))
     }
 
     /// Store a newly created load balancer.

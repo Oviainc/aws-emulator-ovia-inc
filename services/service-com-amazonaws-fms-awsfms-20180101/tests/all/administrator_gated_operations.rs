@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_fms_awsfms_20180101::ops::types::{
-    AppsListData, DiscoveredResource, ProtocolsListData,
+    App, AppsListData, DiscoveredResource, ProtocolsListData,
 };
 use service_com_amazonaws_fms_awsfms_20180101::state;
 use smithy_server_runtime::MultiServiceRouter;
@@ -124,29 +124,45 @@ pub(crate) fn seed_protocols_list(
     );
 }
 
-/// One stored applications list, as `PutAppsList` will write it.
-fn seed_apps_list(
+/// One stored applications list, as `PutAppsList` will write it: the record
+/// `GetAppsList` and `DeleteAppsList` read, seeded directly because that
+/// writer is still a stub tracked by its own issue.
+///
+/// The ARN carries `region`, so a suite can assert a reader reports the ARN of
+/// the Region the record was stored under; `default_list` picks the namespace
+/// (a Firewall Manager MANAGED list, which no API creates, or a customer one).
+/// The seeded record is handed back so a caller can assert against the
+/// service-owned members it minted.
+///
+/// `pub(crate)` so a sibling suite in this test target seeds an applications
+/// list through the same seam rather than growing a second copy of it.
+pub(crate) fn seed_apps_list(
     store: &mut state::ComAmazonawsFmsAwsfms20180101State,
+    region: &str,
     list_id: &str,
     list_name: &str,
-) {
+    apps: &[App],
+    default_list: bool,
+) -> state::AppsListRecord {
     let now = SystemTime::now();
-    store.apps_lists.insert(
-        list_id.to_string(),
-        state::AppsListRecord {
-            list_id: list_id.to_string(),
-            list_arn: state::apps_list_arn(REGION, list_id),
-            update_token: state::mint_identifier(),
-            default_list: false,
-            list: AppsListData {
-                list_name: list_name.to_string(),
-                ..AppsListData::default()
-            },
-            tags: Vec::new(),
-            created_at: now,
-            updated_at: now,
+    let record = state::AppsListRecord {
+        list_id: list_id.to_string(),
+        list_arn: state::apps_list_arn(region, list_id),
+        update_token: state::mint_identifier(),
+        default_list,
+        list: AppsListData {
+            list_name: list_name.to_string(),
+            apps_list: apps.to_vec(),
+            ..AppsListData::default()
         },
-    );
+        tags: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    };
+    store
+        .apps_lists
+        .insert(list_id.to_string(), record.clone());
+    record
 }
 
 /// One row of the gated-operation table: the operation, and a request for it.
@@ -178,6 +194,10 @@ fn gated_calls() -> Vec<Gated> {
         },
         Gated {
             operation: "DeleteProtocolsList",
+            body: json!({ "ListId": OTHER_UNKNOWN_LIST_ID }),
+        },
+        Gated {
+            operation: "GetAppsList",
             body: json!({ "ListId": OTHER_UNKNOWN_LIST_ID }),
         },
         Gated {
@@ -1072,7 +1092,7 @@ async fn the_lists_are_read_and_deleted_from_state() {
         for (list_id, list_name, protocols) in &customer_lists {
             seed_protocols_list(store, list_id, list_name, protocols, false);
         }
-        seed_apps_list(store, UNKNOWN_LIST_ID, "an-apps-list");
+        seed_apps_list(store, REGION, UNKNOWN_LIST_ID, "an-apps-list", &[], false);
     });
 
     for (list_id, list_name, protocols) in &customer_lists {

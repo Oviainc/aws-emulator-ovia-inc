@@ -16,6 +16,14 @@
 //! `MonitorDeployment` and its summary's `MonitorDeploymentStatus` are reported
 //! out of state.
 //!
+//! The INPUT DEVICES this account has claimed live here as well: one
+//! [`InputDeviceRecord`] per claimed device, keyed by the device id the claim
+//! named rather than by an id this service mints, because a Link unit's id is
+//! its own. A device's `DeviceUpdateStatus` comes out of the maintenance window
+//! `StartInputDeviceMaintenanceWindow` opens on it, and its `OutputType` and
+//! `MedialiveInputArns` out of the inputs this store holds — see
+//! [`input_devices`].
+//!
 //! The input security group lifecycle lives here too: one
 //! [`InputSecurityGroupRecord`] per created group and the counter that mints its
 //! `Id`. A group's `Inputs` and `Channels` are derived from the rest of the
@@ -193,6 +201,21 @@ pub use event_bridge_rule_templates::{
 };
 
 pub(crate) use event_bridge_rule_templates::event_bridge_rule_template_output;
+
+/// The input device slice: the record `ClaimDevice` registers, the device-id
+/// form it accepts, the maintenance window
+/// `StartInputDeviceMaintenanceWindow` opens and the projection every operation
+/// that reports a device reads, in one module of its own for the same reason as
+/// the slices above. What stays in this file is the part the rest of the state
+/// needs: the store member on [`ComAmazonawsMedialiveMedialiveState`] and the
+/// ARN resolution the tag operations share.
+pub mod input_devices;
+
+pub use input_devices::{
+    input_device_type_for_id, not_a_device_id_message, InputDeviceRecord, MAX_INPUT_DEVICES,
+};
+
+pub(crate) use input_devices::input_device_output;
 
 /// The cluster slice: MediaLive Anywhere's `Cluster` record, its bounds, its
 /// refusals, the store's methods and its output projections, in one module of
@@ -1229,6 +1252,12 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// its own name rather than by an id. PRIVATE for the same reason as
     /// [`Self::channel_tokens`].
     multiplex_program_tokens: IdempotencyTokens,
+    /// Every input device this account has claimed, keyed by the device id the
+    /// claim named. A `BTreeMap` for the same reason as [`Self::channels`]: a
+    /// reader walks it in id order on every call. There is no mint counter
+    /// beside it, because a device id is the unit's own, not one this service
+    /// assigns.
+    pub input_devices: BTreeMap<String, InputDeviceRecord>,
     /// Every cluster that exists, keyed by its minted `Id`, in id order for the
     /// same reason as [`Self::channels`]: a reader walks it in id order on every
     /// call. The alerts raised against a cluster live on its own record.
@@ -1271,6 +1300,7 @@ impl ComAmazonawsMedialiveMedialiveState {
             signal_map.settle(now);
         }
         self.settle_multiplexes(now);
+        self.settle_input_devices(now);
         self.settle_clusters(now);
     }
 
@@ -2478,6 +2508,9 @@ impl ComAmazonawsMedialiveMedialiveState {
         if let Some(record) = self.multiplexes.values().find(|record| record.arn == arn) {
             return Some(TaggedResource::Multiplex(record.id.clone()));
         }
+        if let Some(record) = self.input_devices.values().find(|record| record.arn == arn) {
+            return Some(TaggedResource::InputDevice(record.id.clone()));
+        }
         if let Some(record) = self
             .alarm_template_groups
             .values()
@@ -2513,6 +2546,9 @@ impl ComAmazonawsMedialiveMedialiveState {
             TaggedResource::SdiSource(id) => self.sdi_sources.get(&id).map(|record| &record.tags),
             TaggedResource::SignalMap(id) => self.signal_maps.get(&id).map(|record| &record.tags),
             TaggedResource::Multiplex(id) => self.multiplexes.get(&id).map(|record| &record.tags),
+            TaggedResource::InputDevice(id) => {
+                self.input_devices.get(&id).map(|record| &record.tags)
+            }
             TaggedResource::AlarmTemplateGroup(id) => self
                 .alarm_template_groups
                 .get(&id)
@@ -2571,6 +2607,12 @@ impl ComAmazonawsMedialiveMedialiveState {
                 .map(|record| &mut record.tags),
             TaggedResource::Multiplex(id) => self
                 .multiplexes
+                .get_mut(&id)
+                .map(|record| &mut record.tags),
+            // A claimed device is never deleted — nothing in this service
+            // un-claims one — so there is no dead id to filter out here.
+            TaggedResource::InputDevice(id) => self
+                .input_devices
                 .get_mut(&id)
                 .map(|record| &mut record.tags),
             TaggedResource::AlarmTemplateGroup(id) => self
@@ -2688,6 +2730,7 @@ enum TaggedResource {
     SdiSource(String),
     SignalMap(String),
     Multiplex(String),
+    InputDevice(String),
     AlarmTemplateGroup(String),
     EventBridgeRuleTemplateGroup(String),
     Cluster(String),

@@ -992,6 +992,15 @@ async fn create_service(
             "taskDefinition": family,
             "desiredCount": 1,
             "launchType": launch_type,
+            // The revision above is in the `awsvpc` network mode, whose tasks each get
+            // their own elastic network interface, so the launch says which subnets and
+            // security groups that interface takes.
+            "networkConfiguration": {
+                "awsvpcConfiguration": {
+                    "subnets": ["subnet-0123456789abcdef0"],
+                    "securityGroups": ["sg-0123456789abcdef0"],
+                }
+            },
             "tags": [{ "key": "env", "value": "test" }],
         }),
         case,

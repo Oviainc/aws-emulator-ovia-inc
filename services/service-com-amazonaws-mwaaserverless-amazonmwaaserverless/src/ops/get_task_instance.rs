@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTaskInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTaskInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTaskInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE task instance of ONE run of ONE workflow, entirely from the store: the
+//! record `crate::state::WorkflowRun::task_instances` holds under the requested
+//! `TaskInstanceId`, with the `WorkflowArn`, `RunId` and `WorkflowVersion` taken from
+//! the run that owns it and `DurationInSeconds` derived from the record's
+//! `StartedAt`/`EndedAt`. A reference that resolves to nothing — an absent workflow, an
+//! absent run, or a run that holds no such task instance — is the modelled
+//! `ResourceNotFoundException`, the way every other lookup of this service refuses one
+//! (`crate::state::unresolved` / `crate::state::lookup_miss`).
+//!
+//! A task instance comes into being only when something executes the workflow
+//! definition, and this emulator has no Apache Airflow engine to execute one with
+//! (`crate::state::NO_AIRFLOW_ENGINE`), so no run it starts holds a task instance and
+//! this operation reports the refusal rather than a task nothing ran.
+//!
+//! This operation is REPORTING: it writes nothing, not even the run's clock-owed
+//! settle, because nothing it reports depends on the run's status.
 //!
 //! ## Shape of an operation
 //!
@@ -202,30 +210,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (ctx, &self.engine);
+        // `ctx` carries only request metadata; the task instance is identified by
+        // its input.
+        let _ = ctx;
 
-        // A member value that fails the constraint its model declares is refused
-        // first, with the modelled `ValidationException` — `Message`,
-        // `Reason: fieldValidationFailed` and a `FieldList` entry naming each
-        // offending member. A well-formed request still reaches the 501 below:
-        // the operation itself is not implemented yet.
+        // Every member whose declared constraint this operation's input struct
+        // hands over (`skip_validation`) is checked here, so a bad value is
+        // refused with the modelled `ValidationException` — `Message`,
+        // `Reason: fieldValidationFailed` and a `FieldList` entry per offending
+        // member — rather than the framework's generic 400.
         validate_input(&input).map_err(|refusal| {
             GetTaskInstanceError::from(GetTaskInstanceErrorModeled::ValidationException(refusal))
         })?;
 
-        // Implement `GetTaskInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTaskInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". The members listed in `skip_validation` on
-        // `GetTaskInstanceInput` are checked by `validate_input` below; every other
-        // modeled constraint is refused BEFORE this handler runs.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTaskInstance"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTaskInstanceError::from(GetTaskInstanceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the com.amazonaws.mwaaserverless workflow store is unavailable"
+                        .to_string(),
+                    retry_after_seconds: None,
+                },
+            ))
+        })?;
+        let store = state.lock();
+
+        // The TASK INSTANCE is what this operation resolves, so an absent workflow,
+        // an absent run and a run holding no such instance are one failure to the
+        // caller — the same convention `GetWorkflowRun` follows for its run.
+        let unresolved_task_instance = || {
+            crate::state::lookup_miss(GetTaskInstanceErrorModeled::ResourceNotFoundException(
+                crate::state::unresolved(
+                    crate::state::UnresolvedEntity::TaskInstance,
+                    &input.task_instance_id,
+                ),
+            ))
+        };
+        let run = store
+            .workflows
+            .get(&input.workflow_arn)
+            .and_then(|workflow| workflow.runs.get(&input.run_id))
+            .ok_or_else(unresolved_task_instance)?;
+        let task = run
+            .task_instances
+            .get(&input.task_instance_id)
+            .ok_or_else(unresolved_task_instance)?;
+
+        Ok(GetTaskInstanceOutput {
+            // The run the instance belongs to owns these three, so they are read
+            // from it and never echoed from the request.
+            workflow_arn: run.workflow_arn.clone(),
+            run_id: run.run_id.clone(),
+            workflow_version: Some(run.workflow_version.clone()),
+            task_instance_id: task.task_instance_id.clone(),
+            task_id: task.task_id.clone(),
+            status: Some(task.status.clone()),
+            operator_name: task.operator_name.clone(),
+            attempt_number: task.attempt_number,
+            // Null until the task starts / completes, per the member docs.
+            started_at: task.started_at.map(crate::state::timestamp),
+            ended_at: task.ended_at.map(crate::state::timestamp),
+            modified_at: Some(crate::state::timestamp(task.modified_at)),
+            // Derived from the two timestamps above, so it is null for exactly the
+            // instances that have not completed.
+            duration_in_seconds: task.duration_in_seconds(),
+            error_message: task.error_message.clone(),
+            log_stream: task.log_stream.clone(),
+            // Absent, like every other unset optional member, for an instance that
+            // exchanged no cross-task data.
+            xcom: (!task.xcom.is_empty()).then(|| {
+                task.xcom
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+        })
     }
 }
 

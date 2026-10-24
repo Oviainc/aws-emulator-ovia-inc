@@ -125,7 +125,12 @@ async fn an_agreement_id_naming_no_agreement_is_not_found() {
             id, stored,
             "case {case:?}: the unknown id must differ from the stored agreement"
         );
-        for operation in ["DescribeAgreement", "GetAgreementTerms", "CancelAgreement"] {
+        for operation in [
+            "DescribeAgreement",
+            "GetAgreementTerms",
+            "GetAgreementEntitlements",
+            "CancelAgreement",
+        ] {
             let answer = call(&router, operation, json!({"agreementId": id})).await;
             assert_not_found(
                 &format!("{case} via {operation}"),

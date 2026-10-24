@@ -38,7 +38,11 @@ const CLIENT_ERROR_STATUS: u16 = 400;
 /// One `NonTalkTimeFilter` rule, from the union's own member list
 /// (`smithy_query(query="closure", operation="CreateCallAnalyticsCategory")`).
 /// `Threshold` is a `TimestampMilliseconds`, modelled `@range(min: 0, max: 14400000)`.
-fn non_talk_time_rule(threshold: i64) -> Value {
+///
+/// `pub(crate)`, like the three rule builders below it: the listing suite
+/// (`crate::call_analytics_category_listing`) builds its categories from the same four
+/// members of the `Rule` union rather than spelling a second set.
+pub(crate) fn non_talk_time_rule(threshold: i64) -> Value {
     json!({
         "NonTalkTimeFilter": {
             "Threshold": threshold,
@@ -50,7 +54,7 @@ fn non_talk_time_rule(threshold: i64) -> Value {
 
 /// One `InterruptionFilter` rule. `ParticipantRole` is the modelled enum
 /// `AGENT | CUSTOMER`.
-fn interruption_rule(threshold: i64) -> Value {
+pub(crate) fn interruption_rule(threshold: i64) -> Value {
     json!({
         "InterruptionFilter": {
             "Threshold": threshold,
@@ -63,7 +67,7 @@ fn interruption_rule(threshold: i64) -> Value {
 
 /// One `TranscriptFilter` rule. `TranscriptFilterType` is the modelled enum whose only
 /// value is `EXACT`, and `Targets` is required with `@length(min: 1)`.
-fn transcript_rule(target: &str) -> Value {
+pub(crate) fn transcript_rule(target: &str) -> Value {
     json!({
         "TranscriptFilter": {
             "TranscriptFilterType": "EXACT",
@@ -76,7 +80,7 @@ fn transcript_rule(target: &str) -> Value {
 
 /// One `SentimentFilter` rule. `SentimentValueList` is modelled
 /// `@length(min: 1, max: 1)`, so exactly one of `POSITIVE | NEGATIVE | NEUTRAL | MIXED`.
-fn sentiment_rule(sentiment: &str) -> Value {
+pub(crate) fn sentiment_rule(sentiment: &str) -> Value {
     json!({
         "SentimentFilter": {
             "Sentiments": [sentiment],

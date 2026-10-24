@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAwsNetworkPerformanceMetricSubscriptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAwsNetworkPerformanceMetricSubscriptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAwsNetworkPerformanceMetricSubscriptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Infrastructure Performance metric subscriptions the account has enabled out
+//! of [`crate::state`]: the whole store by default, or the subset the request's `Filters`
+//! select, one `MaxResults`-sized page at a time. A pure READ — a subscription has no
+//! clock-owed move (`EnableAwsNetworkPerformanceMetricSubscription` answers it enabled), so
+//! this handler writes NOTHING and two calls report the same set.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +69,13 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::borrow::Cow;
+
+use crate::state::{
+    CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES, MAX_FILTERS,
+    MatchBudget,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -140,18 +144,213 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAwsNetworkPerformanceMetricSubscriptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAwsNetworkPerformanceMetricSubscriptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it — a
+        // subscription names its own Regions and zones, so the Region the request was
+        // signed for selects nothing. The store is reached through the engine held on
+        // `self`.
+        let _ = ctx;
+
+        // The store, with the "mounted on an engine that holds no state" case already
+        // turned into the server error every handler of this crate answers it with.
+        let subscriptions = crate::state::require_service_state(&*self.engine)?;
+
+        // "The token for the next page of results" (`NextToken`) — anything else is refused
+        // rather than read as a cursor, and it is refused before any other member of the
+        // request is looked at, so whether a bogus token is caught never depends on the
+        // rest of it.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // Matching cost is filters x values x value length x stored subscriptions, and the
+        // model bounds none of them (`FilterList` and `Filter$Values` carry no `@length`),
+        // so every request-controlled factor is capped HERE, before any work proportional
+        // to it is done and before the store is locked — the same ceilings every other
+        // filtered describe of this crate enforces, from `crate::state`.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not define is refused whether or not any
+        // subscription would have matched it, so an unsupported filter can never read as
+        // "no results". Each value is compiled into its pattern ONCE here, rather than
+        // recompiled for every candidate subscription.
+        let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !SUBSCRIPTION_FILTERS.contains(&name) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so a value's size is bounded
+            // here too.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            compiled.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // Every member of the request has now been checked, so this is a request that would
+        // have succeeded: "Checks whether you have the required permissions for the action,
+        // without actually making the request, and provides an error response. If you have
+        // the required permissions, the error response is DryRunOperation" (`DryRun`). Every
+        // caller of this emulator is permitted, so a dry run reports that outcome — AFTER
+        // the refusals above, so a dry run of a request carrying a bogus token or an
+        // undefined filter is told what is wrong with it rather than that it would have
+        // succeeded — and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let store = subscriptions.lock();
+
+        // "Describes the current Infrastructure Performance metric subscriptions": the
+        // store, narrowed by the filters the request names ("If you specify multiple
+        // filters, the filters are joined with an AND" — `Filter`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAwsNetworkPerformanceMetricSubscriptions"))
+        // Every comparison is charged to ONE budget, so the product of stored
+        // subscriptions, filters, values and value length is bounded however the caller
+        // combines them — which is also what bounds how long this holds the store's lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<(&String, &Subscription)> = Vec::new();
+        for (key, subscription) in &store.network_performance_subscriptions {
+            if budget.exhausted() {
+                break;
+            }
+            if crate::state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(subscription, name)
+            }) {
+                selected.push((key, subscription));
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                     comparisons to evaluate; narrow them or page with MaxResults"
+                ),
+            ));
+        }
+
+        // The store is keyed by `crate::state::subscription_key`, so its iteration order is
+        // already the stable paging order, and that key is the cursor: a token names the
+        // subscription the next page starts at, so paging always advances.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|(key, _)| key.as_str() < cursor),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of results to return with a single call" (`MaxResults`). A
+        // request that names none gets the largest page the model publishes, so the
+        // `NextToken` path below behaves the same whether or not a page size was asked for.
+        // The model's `range 0..100` has already refused anything outside it, so the only
+        // value that cannot convert is one the boundary validator would have rejected.
+        //
+        // Its published minimum, zero, names NO page size: a page of zero items would carry
+        // a token pointing at the item the page starts at, so a caller paging until the
+        // token is null would walk empty pages for ever and never advance. A maximum of zero
+        // results is therefore read as "no maximum given" — the same page the request would
+        // have got carrying no `MaxResults` at all — which keeps the invariant every token
+        // this operation mints advances the cursor.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .filter(|max_results| *max_results > 0)
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        // "This value is null when there are no more results to return" (`NextToken`): a
+        // token only when a subscription follows this page.
+        let next_token = page
+            .get(limit)
+            .map(|(key, _)| crate::state::encode_page_token(key));
+
+        Ok(DescribeAwsNetworkPerformanceMetricSubscriptionsOutput {
+            subscriptions: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|(_, subscription)| (*subscription).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The page size a request that names no `MaxResults` gets: the largest the model publishes
+/// (`MaxResultsParam`, `range 0..100`), which is also the most EC2 returns in one page.
+const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// The filter names this operation defines.
+///
+/// Its own `Filters` member documents only "One or more filters"
+/// (`smithy_query(query="doc",shape="DescribeAwsNetworkPerformanceMetricSubscriptionsRequest",member="Filters")`),
+/// naming none, so the names are the members the reported shape carries — `Subscription`'s
+/// `Source`, `Destination`, `Metric`, `Statistic` and `Period` — spelled the way every EC2
+/// filter spells a member: lowercase, hyphenated. Each entry must be answered by
+/// [`filter_values`], and any other name is refused: "Filter names are case-sensitive"
+/// (`Filter$Name`), so the comparison is exact. There is no `tag:` filter, because a
+/// subscription carries no tags.
+///
+/// Spelled in alphabetical order for reading only: the lookup below is a linear
+/// `contains`, so nothing here depends on the order.
+const SUBSCRIPTION_FILTERS: [&str; 5] = [
+    "destination",
+    "metric",
+    "period",
+    "source",
+    "statistic",
+];
+
+/// The values the EC2 filter `name` compares against this subscription.
+///
+/// A filter naming a member this subscription does not carry compares against NO values, so
+/// it selects nothing — the same answer AWS gives for any absent attribute. The AND/OR
+/// evaluation of these values, and the budget that bounds it, live in
+/// [`crate::state::matches_every_filter`], which every filtered describe of this crate
+/// shares: "If you specify multiple filters, the filters are joined with an AND" (`Filter`),
+/// and within one filter "if you specify multiple values for a filter, the values are joined
+/// with an OR" (`Filter$Values`). So a filter carrying NO value matches nothing.
+fn filter_values<'a>(subscription: &'a Subscription, name: &str) -> Vec<Cow<'a, str>> {
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "destination" => text(subscription.destination.as_deref()),
+        "metric" => text(subscription.metric.as_deref()),
+        "period" => text(subscription.period.as_deref()),
+        "source" => text(subscription.source.as_deref()),
+        "statistic" => text(subscription.statistic.as_deref()),
+        // Unreachable: the handler has already refused every other name. An undefined name
+        // compares against nothing, so it could never widen a result even if that check
+        // were bypassed.
+        _ => Vec::new(),
     }
 }

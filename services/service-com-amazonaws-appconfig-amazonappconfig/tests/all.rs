@@ -51,3 +51,5 @@ mod state_roundtrip;
 mod update_application;
 #[path = "all/update_configuration_profile.rs"]
 mod update_configuration_profile;
+#[path = "all/update_deployment_strategy.rs"]
+mod update_deployment_strategy;

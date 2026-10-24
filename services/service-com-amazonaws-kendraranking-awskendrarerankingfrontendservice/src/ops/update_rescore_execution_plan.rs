@@ -250,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             plan.description = Some(description);
         }
         if let Some(capacity_units) = input.capacity_units {
-            plan.capacity_units = Some(capacity_units);
+            plan.capacity_units = capacity_units;
         }
         plan.updated_at_millis = now;
         // The plan is re-provisioned after this call returns: it leaves `ACTIVE` for

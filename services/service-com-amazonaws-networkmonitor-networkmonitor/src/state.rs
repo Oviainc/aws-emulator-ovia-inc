@@ -312,12 +312,14 @@ pub fn address_family_of(destination: &str) -> Option<&'static str> {
     }
 }
 
-/// The `aggregationPeriod` a create request asks for, checked against the
-/// documented value list.
+/// The `aggregationPeriod` a create or update request asks for, checked against
+/// the documented value list.
 ///
 /// `None` means the request named none, which is the documented default
-/// ([`DEFAULT_AGGREGATION_PERIOD`]). `Err` carries a message naming the member
-/// and the values it admits, for the caller to fix the request from.
+/// ([`DEFAULT_AGGREGATION_PERIOD`]). `Err` carries the sentence the service
+/// states for this rule ([`aggregation_period_message`]): the rule is an
+/// allow-list the model publishes, so what the refusal states is that list and
+/// nothing of the value that missed it.
 pub fn resolve_aggregation_period(requested: Option<i64>) -> Result<i64, String> {
     let Some(period) = requested else {
         return Ok(DEFAULT_AGGREGATION_PERIOD);
@@ -325,9 +327,20 @@ pub fn resolve_aggregation_period(requested: Option<i64>) -> Result<i64, String>
     if AGGREGATION_PERIODS.contains(&period) {
         return Ok(period);
     }
-    Err(format!(
-        "aggregationPeriod must be one of {AGGREGATION_PERIODS:?}, got {period}"
-    ))
+    Err(aggregation_period_message())
+}
+
+/// What the service states when an `aggregationPeriod` is outside the documented
+/// allow-list: the list itself, rendered from [`AGGREGATION_PERIODS`] so the
+/// sentence cannot drift from the values the handlers actually admit.
+///
+/// One sentence for the whole rule, shared by every operation that applies it
+/// (`CreateMonitor`, `UpdateMonitor`), rather than one per handler. The list is
+/// joined explicitly rather than `Debug`-formatted, so the sentence's shape is
+/// this function's and not a formatting detail of the constant's type.
+pub fn aggregation_period_message() -> String {
+    let values: Vec<String> = AGGREGATION_PERIODS.iter().map(i64::to_string).collect();
+    format!("The aggregation period must be one of [{}].", values.join(", "))
 }
 
 /// What a caller asks for when it asks for a probe: the members
