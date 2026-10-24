@@ -65,3 +65,5 @@ mod package_version_asset_download;
 mod package_group_allowed_repositories;
 #[path = "all/package_version_asset_listing.rs"]
 mod package_version_asset_listing;
+#[path = "all/sub_package_group_listing.rs"]
+mod sub_package_group_listing;
