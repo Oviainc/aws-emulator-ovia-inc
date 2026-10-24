@@ -170,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service reads a `resourceArn`.
         let resource = crate::state::parse_tagged_resource(&input.resource_arn).ok_or_else(|| {
             UntagResourceErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::invalid_tagged_resource_arn(&input.resource_arn)),
+                message: Some(crate::state::invalid_arn(&input.resource_arn)),
             })
         })?;
         crate::state::bound_entries("tagKeys", input.tag_keys.len(), crate::state::MAX_TAGS)

@@ -14,7 +14,7 @@
 //! The RULES under test, asserted over SETS of inputs rather than one recorded call:
 //!
 //! * the modelled `@required` `name` must be present, else the request is refused before
-//!   the handler runs (400 `ValidationException`, the refusal this service states every
+//!   the handler runs (400 `BadRequestException`, the refusal this service states every
 //!   modelled-constraint violation with — see `validation_message_rules`);
 //! * every caller-sized member of the request is accepted at this service's bound for it
 //!   and refused one past it with 400 `BadRequestException`, whether the member is a
@@ -161,7 +161,7 @@ async fn the_required_name_must_be_present() {
             case,
             request,
             400,
-            "ValidationException",
+            "BadRequestException",
         )
         .await;
     }
