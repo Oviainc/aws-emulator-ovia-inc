@@ -382,7 +382,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with the original request's result, and over a list the lens quota above has
         // already bounded, so the work it costs is bounded too.
         let now = std::time::SystemTime::now();
-        match store.unapplicable_lenses_refusal(&input.lenses, now) {
+        match store.unapplicable_lenses_refusal(&input.lenses, crate::state::LENSES_MEMBER, now) {
             Some(crate::state::LensesRefusal::NotFound(exception)) => {
                 return Err(
                     CreateWorkloadErrorModeled::ResourceNotFoundException(exception).into(),

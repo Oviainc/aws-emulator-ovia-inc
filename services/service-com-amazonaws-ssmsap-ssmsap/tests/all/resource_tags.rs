@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 
-use crate::application_lifecycle::{tag_pairs, valid_registration, Emulator, Reply};
+use crate::application_lifecycle::{settle, tag_pairs, valid_registration, Emulator, Reply};
 use crate::validation_message_rendering::message;
 
 /// The region the suite signs for; it is the region every expected ARN carries.
@@ -342,6 +342,9 @@ async fn an_arn_naming_no_resource_here_is_refused_as_not_found() {
         reply.status, 200,
         "expected 200 from DeregisterApplication, got {reply:?}"
     );
+    // Deregistration is asynchronous: the tags held for the application's ARN go with it
+    // when the removal the clock owes it falls due.
+    settle().await;
 
     // (label, the region the read is made in, the ARN it names)
     let rows: Vec<(&str, &str, String)> = vec![

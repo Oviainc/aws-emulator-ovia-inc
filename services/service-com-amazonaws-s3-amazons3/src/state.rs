@@ -4103,6 +4103,15 @@ pub const INVALID_REQUEST_STATUS: u16 = 400;
 pub const NO_SUCH_BUCKET_POLICY_CODE: &str = "NoSuchBucketPolicy";
 /// See [`NO_SUCH_BUCKET_POLICY_CODE`].
 pub const NO_SUCH_BUCKET_POLICY_MESSAGE: &str = "The bucket policy does not exist";
+/// The code `GetBucketTagging` answers for a bucket no tag set has been stored on, with
+/// HTTP 404 — the subresource-not-there case, answered the way
+/// [`NO_SUCH_BUCKET_POLICY_CODE`] answers it for a bucket policy, because `TagSet` is a
+/// required output member and so a 200 has no way to report "there is none".
+pub const NO_SUCH_TAG_SET_CODE: &str = "NoSuchTagSet";
+/// See [`NO_SUCH_TAG_SET_CODE`] — the fixed text S3 publishes for that code in its "Error
+/// responses" list of error codes, which is what the service sends for this condition:
+/// nothing in it comes from the request.
+pub const NO_SUCH_TAG_SET_MESSAGE: &str = "The TagSet does not exist";
 /// The code S3 answers a `PutBucketVersioning` whose `VersioningConfiguration` is not
 /// one it can apply: "Indicates that the versioning configuration specified in the
 /// request is invalid", HTTP 400 (Amazon S3 "Error responses", list of error codes).
