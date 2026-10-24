@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetQuote
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetQuote`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetQuote::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored quote the `QuoteIdentifier` names, resolved from
+//! either the bare id or the full ARN the modelled label pattern accepts. A read: the
+//! only thing it writes is the expiry the clock already owed the quote, which the
+//! next caller would have seen anyway.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +138,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetQuote` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetQuoteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetQuote"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetQuoteErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+        // `QuoteIdentifier` accepts the bare id or the full quote ARN; both name the
+        // same stored record.
+        let quote_id = crate::state::resolve_quote_id(&input.quote_identifier).ok_or_else(|| {
+            GetQuoteErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::quote_identifier_pattern_report()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // Report the status the quote holds NOW: a quote whose own
+        // `ExpirationDate` has passed is expired, and that transition is
+        // materialised before the record is read, so a caller reading a quote past
+        // its expiry is told so rather than being handed a stale `CREATED`.
+        store.settle_quotes();
+        let quote = store
+            .quotes
+            .get(&quote_id)
+            .map(|record| record.quote.clone())
+            .ok_or_else(|| {
+                GetQuoteErrorModeled::NotFoundException(NotFoundException {
+                    // The identifier echo, of the value AS SUPPLIED — not of
+                    // `quote_id`, which is the bare id an ARN resolved to.
+                    message: Some(crate::state::identifier_not_found(
+                        crate::state::QUOTE_IDENTIFIER_MEMBER,
+                        &input.quote_identifier,
+                    )),
+                })
+            })?;
+
+        Ok(GetQuoteOutput { quote: Some(quote) })
     }
 }

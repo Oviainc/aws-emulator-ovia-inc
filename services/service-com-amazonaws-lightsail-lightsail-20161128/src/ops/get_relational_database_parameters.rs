@@ -18,6 +18,11 @@
 //! account does not hold is refused with the service's `DoesNotExist` envelope.
 //! Reporting it is a READ: nothing a later caller can see changes.
 //!
+//! An entry an `UpdateRelationalDatabaseParameters` call has set on THIS
+//! database carries the value it set and the apply method it was set with
+//! ([`crate::state::StoredRelationalDatabase::applied_parameters`]); every other
+//! entry is the engine's published one.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -180,9 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Reporting only: the answer is the engine's parameter set, sized by the
-        // stored database's own hardware, and nothing about the request changes
-        // either. A database is addressed by name alone, so `ctx`'s request
-        // metadata takes no part in it.
+        // stored database's own hardware and carrying the values an
+        // `UpdateRelationalDatabaseParameters` call has set on that database, and
+        // nothing about the request changes any of it. A database is addressed by
+        // name alone, so `ctx`'s request metadata takes no part in it.
         let _ = ctx;
 
         // `relationalDatabaseName` is a modelled `@required` member carrying the
@@ -192,29 +198,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = input.relational_database_name;
         let page_token = input.page_token.as_deref();
 
-        // The database's blueprint picks WHICH parameter set it has, and its
-        // bundle's RAM is what the memory-sized values in that set come to — so
-        // both are read out of the one stored record, under the one lock.
-        let (specs, ram_size_in_gb) = crate::state::with_state(&*self.engine, |store| {
-            store
+        // The database's blueprint picks WHICH parameter set it has, its bundle's
+        // RAM is what the memory-sized values in that set come to, and its own
+        // parameter group is what an `UpdateRelationalDatabaseParameters` call has
+        // set on it — all three are read out of the one stored record, under the
+        // one lock.
+        let page = crate::state::with_state(&*self.engine, |store| {
+            let database = store
                 .relational_database(&name)
-                .map(|database| {
-                    (
-                        crate::state::relational_database_parameter_specs(database.blueprint.engine),
-                        database.bundle.ram_size_in_gb,
-                    )
-                })
-                .ok_or_else(|| not_found(&name))
+                .ok_or_else(|| not_found(&name))?;
+            let specs =
+                crate::state::relational_database_parameter_specs(database.blueprint.engine);
+            let page = crate::state::relational_database_parameter_page(
+                specs,
+                database.bundle.ram_size_in_gb,
+                page_token,
+                crate::state::RELATIONAL_DATABASE_PARAMETER_PAGE_SIZE,
+            )
+            .ok_or_else(|| invalid_page_token(page_token.unwrap_or_default(), specs))?;
+            Ok::<_, Self::Error>(crate::state::RelationalDatabaseParameterPage {
+                parameters: database.applied_parameters(page.parameters),
+                next_page_token: page.next_page_token,
+            })
         })
         .ok_or_else(unavailable)??;
-
-        let page = crate::state::relational_database_parameter_page(
-            specs,
-            ram_size_in_gb,
-            page_token,
-            crate::state::RELATIONAL_DATABASE_PARAMETER_PAGE_SIZE,
-        )
-        .ok_or_else(|| invalid_page_token(page_token.unwrap_or_default(), specs))?;
 
         Ok(GetRelationalDatabaseParametersOutput {
             // A page always reports a list, empty or not: the caller asked what
