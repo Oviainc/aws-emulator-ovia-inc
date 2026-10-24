@@ -25,6 +25,8 @@ mod procurement_portal_error_message_key;
 mod procurement_portal_preference_lifecycle;
 #[path = "all/procurement_portal_preference_reads.rs"]
 mod procurement_portal_preference_reads;
+#[path = "all/procurement_portal_preference_status.rs"]
+mod procurement_portal_preference_status;
 #[path = "all/procurement_portal_preferences.rs"]
 mod procurement_portal_preferences;
 #[path = "all/retired_units_and_portal_validation.rs"]

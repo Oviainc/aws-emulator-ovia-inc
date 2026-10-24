@@ -25,15 +25,16 @@ use crate::wire::{at, call, emulator, ok};
 /// `smithy_query(query="digest", model_path="services/service-com-amazonaws-ecr-amazonec2containerregistry-v20150921/smithy-model/com-amazonaws-ecr-amazonec2containerregistry-v20150921.json")`
 const INVALID_PARAMETER: &str = "InvalidParameterException";
 
-/// The clause a refused `repositoryName` states: the `@pattern` the member declares,
-/// without the `^` / `$` anchoring the model spells it with — AWS states the expression
-/// a value must satisfy, not how the model makes the match total. Spelled out literally
-/// rather than computed, so a change in how the handler renders an expression shows up
-/// here as a failure.
+/// The clause a refused `repositoryName` states: the `@pattern` the member declares, as
+/// AWS states it — without the `^` / `$` anchoring the model spells it with (AWS states
+/// the expression a value must satisfy, not how the model makes the match total) and with
+/// the namespace separator bare, because `/` is no regular-expression metacharacter and
+/// `\/` matches exactly what `/` does. Spelled out literally rather than computed, so a
+/// change in how the service renders an expression shows up here as a failure.
 ///
 /// `smithy_query(query="shape", shape="RepositoryName", model_path="services/service-com-amazonaws-ecr-amazonec2containerregistry-v20150921/smithy-model/com-amazonaws-ecr-amazonec2containerregistry-v20150921.json")`
 /// gives `^[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(\/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*$`.
-const REPOSITORY_NAME_CLAUSE: &str = r"must satisfy regular expression '[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(\/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*'";
+const REPOSITORY_NAME_CLAUSE: &str = r"must satisfy regular expression '[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*'";
 
 /// The same clause for `RegistryId`, whose `@pattern` is `^[0-9]{12}$` (same
 /// `smithy_query` call, `shape="RegistryId"`).
@@ -140,10 +141,18 @@ async fn a_value_outside_a_modelled_constraint_is_refused_as_an_invalid_paramete
             "Member must have length less than or equal to 5".to_string(),
         ),
         (
+            // The refusal names the MEMBER at fault, not the validating walk's path to
+            // the element that carried the value, so a refused element is reported
+            // against its list. The recorded evidence for that is a member inside a list
+            // of structures (`signingProfileArn`, not
+            // `signingConfiguration.rules.1.member.signingProfileArn`); the element step
+            // is recognised through `service_common::validation::list_of_element`, whose
+            // own documentation states the same precedent — "a service that states a
+            // clause at the LIST member when one of its ELEMENTS failed".
             "an invalid name inside a describe's name list",
             "DescribeRepositories",
             json!({"repositoryNames": ["well-formed", "ALSO-Upper"]}),
-            "repositoryNames.2.member",
+            "repositoryNames",
             REPOSITORY_NAME_CLAUSE.to_string(),
         ),
         (

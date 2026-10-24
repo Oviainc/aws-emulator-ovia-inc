@@ -2230,24 +2230,56 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     }
 }
 
-/// The wording ECR uses when no pull through cache rule answers to a prefix. The first
-/// sentence is `PullThroughCacheRuleNotFoundException`'s own documentation.
+/// The wording ECR uses when no pull through cache rule answers to a prefix: the kind of
+/// thing that is missing, the identifier the request named it by, and the registry it was
+/// looked for in — `A pull-through cache rule with repository prefix '<prefix>' does not
+/// exist in the registry with id '<registry id>'`.
+///
+/// `PullThroughCacheRuleNotFoundException`'s own documentation ("The pull through cache
+/// rule was not found. Specify a valid pull through cache rule and try again.") describes
+/// the SHAPE; the sentence the API answers with is built from the request, the same
+/// construction [`repository_not_found_message`] follows.
 pub fn pull_through_cache_rule_not_found_message(prefix: &str) -> String {
     format!(
-        "The pull through cache rule was not found. Specify a valid pull through cache \
-         rule and try again. No rule with ecrRepositoryPrefix '{prefix}' exists in the \
+        "A pull-through cache rule with repository prefix '{prefix}' does not exist in \
+         the registry with id '{}'",
+        registry_id()
+    )
+}
+
+/// The wording ECR uses when no repository creation template answers to a prefix: the
+/// kind of thing that is missing, the prefix the request named it by, and the registry it
+/// was looked for in. `TemplateNotFoundException`'s own documentation describes the shape,
+/// not the sentence the API answers with — see
+/// [`pull_through_cache_rule_not_found_message`].
+pub fn template_not_found_message(prefix: &str) -> String {
+    format!(
+        "A repository creation template with prefix '{prefix}' is not found in the \
          registry with id '{}'",
         registry_id()
     )
 }
 
-/// The wording ECR uses when no repository creation template answers to a prefix. The
-/// first sentence is `TemplateNotFoundException`'s own documentation.
-pub fn template_not_found_message(prefix: &str) -> String {
+/// The wording ECR uses when the registry holds no pull time update exclusion for a
+/// principal — the state `ExclusionNotFoundException` documents ("The specified pull time
+/// update exclusion was not found"), phrased from the request: the principal ARN that was
+/// asked for and the registry it was looked for in.
+pub fn pull_time_update_exclusion_not_found_message(principal_arn: &str) -> String {
     format!(
-        "The specified repository creation template can't be found. Verify the registry \
-         ID and prefix and try again. No template with prefix '{prefix}' exists in the \
-         registry with id '{}'",
+        "The pull time update exclusion for principal arn '{principal_arn}' was not \
+         found in registry with id '{}'",
+        registry_id()
+    )
+}
+
+/// The wording ECR uses when the registry ALREADY holds a pull time update exclusion for
+/// a principal — `ExclusionAlreadyExistsException`. The same construction as
+/// [`pull_time_update_exclusion_not_found_message`], so the two halves of one record's
+/// lifecycle name the principal and the registry the same way.
+pub fn pull_time_update_exclusion_already_exists_message(principal_arn: &str) -> String {
+    format!(
+        "The pull time update exclusion for principal arn '{principal_arn}' already \
+         exists in registry with id '{}'",
         registry_id()
     )
 }
@@ -2624,6 +2656,20 @@ pub fn lifecycle_policy_not_found_message(name: &str) -> String {
     format!(
         "Lifecycle policy does not exist for the repository with name '{name}' in the \
          registry with id '{}'",
+        registry_id()
+    )
+}
+
+/// The wording ECR uses when a repository's lifecycle policy preview is still running —
+/// `LifecyclePolicyPreviewInProgressException`. Built from the request, so a caller
+/// previewing policies across many repositories at once can tell WHICH repository
+/// refused and target its retry: the repository the preview is running in, the registry
+/// that holds it, and what the caller has to wait for.
+pub fn lifecycle_preview_in_progress_message(name: &str) -> String {
+    format!(
+        "Lifecycle policy preview is already in progress in the repository with name \
+         '{name}' in the registry with id '{}', please wait until it completes to start \
+         a new one",
         registry_id()
     )
 }

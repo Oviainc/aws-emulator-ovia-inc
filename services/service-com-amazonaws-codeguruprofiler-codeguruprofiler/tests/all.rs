@@ -19,6 +19,8 @@ mod notification_channels;
 mod notification_configuration;
 #[path = "all/permission_writes.rs"]
 mod permission_writes;
+#[path = "all/policy_surface.rs"]
+mod policy_surface;
 #[path = "all/profile_times.rs"]
 mod profile_times;
 #[path = "all/profiling_group_lifecycle.rs"]

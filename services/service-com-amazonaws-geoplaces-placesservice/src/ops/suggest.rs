@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Suggest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Suggest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers a partially typed free-form query out of the seeded place catalog in
+//! [`crate::state`] — the same records Autocomplete, Geocode, GetPlace,
+//! ReverseGeocode, SearchNearby and SearchText answer from — with three kinds of
+//! suggestion the model distinguishes:
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Suggest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! * a `Place` result item per record the query's words name, matched over
+//!   everything a record is FOUND by (the text it reports and the category, food
+//!   type and business-chain vocabulary it carries), because Suggest answers
+//!   "relevant places, points of interest, query terms or search category";
+//! * a `Query` result item per category or business chain those records carry whose
+//!   own words account for the whole query, carrying the opaque `QueryId` that
+//!   SearchText resolves back to that term — the "follow on query" the docs name;
+//! * a `QueryRefinements` entry per word the caller typed only in part, replacing
+//!   that span with the catalog word it completes to.
+//!
+//! Three request members this catalog cannot distinguish on:
+//!
+//! * `TravelMode` "is used to improve the relevance of search results". The catalog
+//!   holds no road network, so no mode of mobility reaches a record the others do
+//!   not, and every mode reports the same suggestions.
+//! * `AdditionalFeatures` values `Phonemes` and `CrossReferences` ask for data no
+//!   record holds (no transcription, no other data source's id), so those members
+//!   stay absent whether or not they are asked for; `Core` is the core fields every
+//!   suggestion carries, and `TimeZone` and `Access` report what the records hold.
+//! * `IntendedUse` models only `SingleUse` ("currently, Suggest does not support
+//!   storage of results"), so every call is charged in the default pricing tier.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +211,271 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Suggest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SuggestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Suggest"))
+        // `ctx` carries request metadata only; this operation reads none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SuggestErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Geo Places catalog is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // Modeled input constraints, enforced here too so an in-process caller is
+        // held to the same contract as a client on the wire.
+        for invalid in [
+            crate::state::check_max_results(input.max_results),
+            crate::state::check_max_query_refinements(input.max_query_refinements),
+            crate::state::check_language(input.language.as_deref()),
+            crate::state::check_political_view(input.political_view.as_deref()),
+            crate::state::check_query_text(Some(input.query_text.as_str()), "QueryText"),
+        ] {
+            if let Err(invalid) = invalid {
+                return Err(SuggestErrorModeled::ValidationException(invalid).into());
+            }
+        }
+
+        // `QueryText` is `@required` and modeled `len 1..200`, both enforced at the
+        // boundary. A query that satisfies that length but spells no word at all
+        // (separators only) names nothing to suggest, so it matches no record and
+        // suggests nothing — an empty `ResultItems`, never a refusal the model does
+        // not declare nor the catalog unfiltered.
+        let query_text = input.query_text.trim();
+
+        let filter = input.filter.as_ref();
+        let bounding_box = filter.and_then(|filter| filter.bounding_box.as_deref());
+        let circle = filter.and_then(|filter| filter.circle.as_ref());
+        // A bias that is not a WGS 84 two-element position is refused, not ignored.
+        let bias = match input.bias_position.as_deref() {
+            None => None,
+            Some(values) => match crate::state::position(values) {
+                Some(bias) => Some(bias),
+                None => {
+                    return Err(SuggestErrorModeled::ValidationException(
+                        crate::state::validation_exception(
+                            crate::state::REASON_FIELD_VALIDATION_FAILED,
+                            "BiasPosition",
+                            crate::state::must_be_length("BiasPosition", values.len(), 2),
+                        ),
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // "The fields BiasPosition, FilterBoundingBox, and FilterCircle are
+        // mutually exclusive" (`SuggestRequest$BiasPosition`): they are alternative
+        // ways to say WHERE, so two of them cannot hold at once. Unlike SearchText,
+        // Suggest does not require one of them, so a request that sets none is
+        // answered over the whole catalog.
+        let areas = usize::from(input.bias_position.is_some())
+            + usize::from(bounding_box.is_some())
+            + usize::from(circle.is_some());
+        if areas > 1 {
+            return Err(SuggestErrorModeled::ValidationException(
+                crate::state::validation_exception_for(
+                    crate::state::REASON_OTHER,
+                    &["BiasPosition", "Filter.BoundingBox", "Filter.Circle"],
+                    crate::state::only_one_of(&[
+                        "BiasPosition",
+                        "Filter.BoundingBox",
+                        "Filter.Circle",
+                    ]),
+                ),
+            )
+            .into());
+        }
+
+        // Suggest is "designed to help users find places or point of interests
+        // candidates or identify a follow on query based on incomplete or
+        // misspelled queries", and what it may suggest includes a "search
+        // category" — so the candidates are the records the typed words name over
+        // everything a record is FOUND by, which is the same index a text search
+        // uses (`PlaceRecord::text_score`), partially typed words included.
+        let mut candidates = state.text_candidates(query_text);
+
+        if let Some(countries) = crate::state::non_empty(
+            filter.and_then(|filter| filter.include_countries.as_deref()),
+        ) {
+            candidates.retain(|candidate| state.places[candidate.index].in_countries(countries));
+        }
+        if let Some(values) = bounding_box {
+            let Some(area) = crate::state::bounding_box(values) else {
+                return Err(SuggestErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        crate::state::REASON_FIELD_VALIDATION_FAILED,
+                        "Filter.BoundingBox",
+                        crate::state::must_be_length("Filter.BoundingBox", values.len(), 4),
+                    ),
+                )
+                .into());
+            };
+            candidates.retain(|candidate| state.places[candidate.index].within_bounding_box(area));
+        }
+        if let Some(circle) = circle {
+            let Some(center) = crate::state::position(&circle.center) else {
+                return Err(SuggestErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        crate::state::REASON_FIELD_VALIDATION_FAILED,
+                        "Filter.Circle.Center",
+                        crate::state::must_be_length(
+                            "Filter.Circle.Center",
+                            circle.center.len(),
+                            2,
+                        ),
+                    ),
+                )
+                .into());
+            };
+            candidates.retain(|candidate| {
+                crate::state::distance_metres(center, state.places[candidate.index].position)
+                    <= circle.radius
+            });
+        }
+
+        // `Distance` is measured from the position the caller biased towards; with
+        // no bias there is no reference point, so it keeps its modeled default of 0.
+        if let Some(bias) = bias {
+            for candidate in &mut candidates {
+                candidate.distance =
+                    crate::state::distance_metres(bias, state.places[candidate.index].position);
+            }
+        }
+        state.order_by_relevance(&mut candidates);
+
+        let features = input.additional_features.as_deref().unwrap_or_default();
+        let wants = |feature: &str| features.iter().any(|asked| asked == feature);
+        // "A list of BCP 47 compliant language codes for the results to be rendered
+        // in. If there is no data for the result in the requested language, data
+        // will be returned in the default language for the entry."
+        let language = input.language.as_deref();
+        let political_view = match crate::state::resolve_political_view(
+            input.political_view.as_deref(),
+        ) {
+            Ok(political_view) => political_view,
+            Err(invalid) => return Err(SuggestErrorModeled::ValidationException(invalid).into()),
+        };
+        let view = political_view.as_deref();
+        let pricing_bucket = state.pricing_bucket(Self::NAME, input.intended_use.as_deref());
+
+        // "An optional limit for the number of results returned in a single call.
+        // Default value: 20" (`SuggestRequest$MaxResults`), bounded by the modeled
+        // `range 1..100` which is also `SuggestResultItemList`'s own maximum
+        // length. Suggest models no `NextToken`, so the suggestions past the limit
+        // are not resumable: they are simply not suggestions this call reports.
+        let limit = input
+            .max_results
+            .unwrap_or(crate::state::DEFAULT_MAX_RESULTS)
+            .clamp(1, crate::state::MAX_RESULTS_CEILING) as usize;
+
+        // The query is normalized ONCE for the whole response, not once per item:
+        // the sections a suggestion marks are the sections of ITS OWN text that
+        // these terms accounted for.
+        let query_tokens = crate::state::normalize_tokens(query_text);
+
+        // The places the query names come first — Suggest is asked for "places or
+        // point of interests candidates" — and the query terms that generalise them
+        // follow, with the whole list bounded by `MaxResults`.
+        let mut result_items: Vec<SuggestResultItem> = candidates
+            .iter()
+            .take(limit)
+            .map(|candidate| {
+                let place = &state.places[candidate.index];
+                // The suggestion's text is rendered in the requested `Language`,
+                // falling back to the entry's own.
+                let title = place.title_modeled_in(view, language);
+                let address = place.address_modeled_in(view, language);
+                let label = address.label.clone().unwrap_or_default();
+                SuggestResultItem {
+                    suggest_result_item_type: crate::state::SUGGEST_ITEM_PLACE.to_string(),
+                    place: Some(SuggestPlaceResult {
+                        place_id: Some(place.place_id.clone()),
+                        place_type: Some(place.place_type.clone()),
+                        position: Some(place.position_modeled()),
+                        distance: candidate.distance,
+                        map_view: Some(place.map_view_modeled()),
+                        categories: place.categories_modeled(),
+                        food_types: place.food_types_modeled(),
+                        business_chains: place.business_chains_modeled(),
+                        // An additional feature is reported only when the request
+                        // asks for it.
+                        access_points: wants(crate::state::FEATURE_ACCESS)
+                            .then(|| place.access_points_modeled())
+                            .flatten(),
+                        time_zone: wants(crate::state::FEATURE_TIME_ZONE)
+                            .then(|| place.time_zone_modeled())
+                            .flatten(),
+                        political_view: political_view.clone(),
+                        address: Some(address),
+                        ..SuggestPlaceResult::default()
+                    }),
+                    highlights: highlights(&title, &label, &query_tokens),
+                    title,
+                    ..SuggestResultItem::default()
+                }
+            })
+            .collect();
+
+        for term in state.query_terms(query_text, &candidates) {
+            if result_items.len() >= limit {
+                break;
+            }
+            result_items.push(SuggestResultItem {
+                suggest_result_item_type: crate::state::SUGGEST_ITEM_QUERY.to_string(),
+                query: Some(SuggestQueryResult {
+                    query_id: Some(crate::state::encode_query_id(term.query_type, &term.term)),
+                    query_type: Some(term.query_type.to_string()),
+                }),
+                highlights: highlights(&term.term, "", &query_tokens),
+                title: term.term,
+                ..SuggestResultItem::default()
+            });
+        }
+
+        // "Maximum number of query terms to be returned for use with a search text
+        // query" (`SuggestRequest$MaxQueryRefinements`, modeled `range 1..10`): a
+        // refinement replaces one span of the query with the catalog word it
+        // completes to, so a query whose every word is already a whole catalog term
+        // is refined no further.
+        let refinements = state.query_refinements(
+            query_text,
+            &candidates,
+            input
+                .max_query_refinements
+                .unwrap_or(crate::state::QUERY_REFINEMENTS_CEILING)
+                .clamp(1, crate::state::QUERY_REFINEMENTS_CEILING) as usize,
+        );
+
+        Ok(SuggestOutput {
+            pricing_bucket,
+            result_items: Some(result_items),
+            query_refinements: Some(
+                refinements
+                    .into_iter()
+                    .map(|refinement| QueryRefinement {
+                        refined_term: refinement.refined_term,
+                        original_term: refinement.original_term,
+                        start_index: refinement.start_index,
+                        end_index: refinement.end_index,
+                    })
+                    .collect(),
+            ),
+        })
     }
+}
+
+/// `Highlights`: the sections of the text THIS suggestion reports that the query's
+/// terms accounted for — its `Title` and, for a place suggestion, the `Label` of
+/// the address it reports, which are the only two pieces `SuggestHighlights` and
+/// `SuggestAddressHighlights` model. `None` when the query named none of them (a
+/// match on a category name the suggestion's own text does not spell, say).
+fn highlights(title: &str, label: &str, query_tokens: &[String]) -> Option<SuggestHighlights> {
+    let highlights = SuggestHighlights {
+        title: crate::state::modeled_highlights(title, query_tokens),
+        address: crate::state::modeled_highlights(label, query_tokens)
+            .map(|label| SuggestAddressHighlights { label: Some(label) }),
+    };
+    (highlights.title.is_some() || highlights.address.is_some()).then_some(highlights)
 }

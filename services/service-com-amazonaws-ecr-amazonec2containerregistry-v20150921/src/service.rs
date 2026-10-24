@@ -69,13 +69,14 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// constraint it failed.
 ///
 /// ECR words a parameter it will not accept as `Invalid parameter at '<member>' failed
-/// to satisfy constraint: '<requirement>'`, and for a `@pattern` failure the requirement
-/// names the regular expression the member declares. Both halves are built from the
-/// request and the model — the member's dotted path and the constraint the walk found it
-/// outside of — so they are reproduced from the violation here rather than written out
-/// per member. A violation kind this list does not know (the enum is `#[non_exhaustive]`)
-/// keeps the framework's own clause, which states the same two facts in its own words.
+/// to satisfy constraint: '<requirement>'`. Both halves are built from the request and
+/// the model — the member the walk found at fault ([`member_at_fault`]) and the
+/// constraint it fell outside of — so they are reproduced from the violation here rather
+/// than written out per member. A violation kind this list does not know (the enum is
+/// `#[non_exhaustive]`) keeps the framework's own clause, which states the same two facts
+/// in its own words.
 fn clause(violation: &Violation) -> String {
+    let member = member_at_fault(&violation.path);
     let requirement = match &violation.kind {
         ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
         ViolationKind::MinLength(min) => {
@@ -91,10 +92,13 @@ fn clause(violation: &Violation) -> String {
             format!("Member must have value less than or equal to {max}")
         }
         // The one requirement NOT worded "Member must …": ECR states a pattern failure
-        // by naming the expression, which is the form the recorded refusal carries.
-        // Deliberate — do not "align" it with the arms around it.
+        // by naming the expression a value has to satisfy — except for an ARN-valued
+        // member, which it states in prose instead ([`arn_constraint`]). Deliberate — do
+        // not "align" either with the arms around it.
         ViolationKind::Pattern(pattern) => {
-            format!("must satisfy regular expression '{}'", unanchored(pattern))
+            arn_constraint(member, pattern, violation.value.as_deref()).unwrap_or_else(|| {
+                format!("must satisfy regular expression '{}'", as_stated(pattern))
+            })
         }
         ViolationKind::EnumValue(allowed) => {
             format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
@@ -102,10 +106,121 @@ fn clause(violation: &Violation) -> String {
         ViolationKind::UniqueItems => "Member must have unique values".to_string(),
         _ => return violation.message(),
     };
-    format!(
-        "Invalid parameter at '{}' failed to satisfy constraint: '{requirement}'",
-        violation.path
-    )
+    format!("Invalid parameter at '{member}' failed to satisfy constraint: '{requirement}'")
+}
+
+/// The member a refusal names: the member at fault ITSELF, not the path the validating
+/// walk descended to reach it.
+///
+/// The framework builds a dotted path — `signingConfiguration.rules.1.member.signingProfileArn`
+/// for the signing profile of a rule — because it has to say which element carried the
+/// value. ECR names the member alone: `Invalid parameter at 'signingProfileArn' …`. So
+/// the steps from a collection into an element are dropped off the end first, which leaves
+/// the COLLECTION named when the refused value is itself an element (`repositoryNames`
+/// rather than `repositoryNames.2.member`), and what remains is the last named member.
+///
+/// The element step is recognised through [`::service_common::validation::list_of_element`],
+/// the one place in the tree that spells it, so this cannot disagree with the walk about
+/// the shape of a path. The other step that spelling covers, a map entry, cannot arise
+/// here: this service's model declares no map shape at all, and a map key is a value the
+/// CALLER chose rather than a member name.
+///
+/// A path with no named member left in it keeps its own spelling: there is nothing in it
+/// to prefer.
+fn member_at_fault(path: &str) -> &str {
+    let mut remaining = path;
+    while let Some(collection) = ::service_common::validation::list_of_element(remaining) {
+        remaining = collection;
+    }
+    remaining.rsplit('.').next().unwrap_or(remaining)
+}
+
+/// A `@pattern` expression as AWS STATES it, which differs from how the model spells it
+/// in two ways — both of them about spelling the same expression, neither about what it
+/// matches:
+///
+/// * the `^` / `$` the model anchors with are dropped ([`unanchored`]): AWS states the
+///   expression a value must satisfy, not the anchoring that makes the match total;
+/// * a `/` carries no backslash. A slash is not a regular-expression metacharacter, so
+///   `\/` and `/` match the same character and AWS states the bare one. Every other
+///   escape is kept — `\.`, `\w`, and `\\` included — because dropping one WOULD change
+///   what the expression matches.
+fn as_stated(pattern: &str) -> String {
+    let body = unanchored(pattern);
+    let mut stated = String::with_capacity(body.len());
+    let mut characters = body.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            stated.push(character);
+            continue;
+        }
+        match characters.next() {
+            // The one escape that is not part of the expression AWS states.
+            Some('/') => stated.push('/'),
+            // Every other escape is: keep the pair exactly as the model spells it.
+            Some(escaped) => {
+                stated.push('\\');
+                stated.push(escaped);
+            }
+            // A trailing backslash escapes nothing; it stands as it is.
+            None => stated.push('\\'),
+        }
+    }
+    stated
+}
+
+/// The suffix the name of a member holding an Amazon Resource Name ends in.
+const ARN_MEMBER_SUFFIX: &str = "Arn";
+
+/// The anchorless opening of a `@pattern` that describes an ARN.
+const ARN_PREFIX: &str = "arn:";
+
+/// The constraint ECR states for an ARN-valued member refused against its `@pattern`:
+/// prose naming the kind of ARN and the value that is not one, rather than the
+/// expression.
+///
+/// ECR does not quote an ARN member's expression back at the caller — it says the ARN is
+/// not well formed: `The signing profile ARN '<value>' must be well formed`. The kind of
+/// ARN comes from the member's own name with its [`ARN_MEMBER_SUFFIX`] removed and its
+/// lowerCamel words separated (`signingProfileArn` -> `signing profile`), so every
+/// ARN-valued member this service models is worded by the one rule and none is written
+/// out here.
+///
+/// `None` — so the expression itself is stated — when the member is not ARN-valued: its
+/// name does not end in `Arn`, or the expression it failed does not describe an ARN. Also
+/// `None` when the violation carries no value, which a `@pattern` failure always does
+/// (only an absent member has none) but which is not this function's to assume.
+fn arn_constraint(member: &str, pattern: &str, value: Option<&str>) -> Option<String> {
+    let kind = member
+        .strip_suffix(ARN_MEMBER_SUFFIX)
+        .filter(|kind| !kind.is_empty())?;
+    if !unanchored(pattern).starts_with(ARN_PREFIX) {
+        return None;
+    }
+    let value = value?;
+    Some(format!(
+        "The {} ARN '{value}' must be well formed",
+        in_words(kind)
+    ))
+}
+
+/// A lowerCamel member name as the words it is made of: `signingProfile` -> `signing
+/// profile`, `credential` -> `credential`.
+///
+/// Every member this service models is lowerCamel with no acronym RUN (`smithy_query`
+/// digest), so each capital opens a word. A name carrying a run (`sourceKMSKey`) would
+/// be worded letter by letter; it is spelled out here rather than guessed at, because a
+/// run-aware split would have to decide where the run ends with nothing in the model to
+/// decide it from.
+fn in_words(name: &str) -> String {
+    let mut words = String::with_capacity(name.len() + name.len() / 4);
+    for character in name.chars() {
+        if character.is_uppercase() && !words.is_empty() {
+            words.push(' ');
+        }
+        words.extend(character.to_lowercase());
+    }
+    words
 }
 
 /// A `@pattern` expression without the anchors a model may spell it with: AWS states

@@ -178,12 +178,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ExclusionNotFoundException {
                         // Built from the request, so it names the principal that was
                         // asked for — the register handler words its symmetric
-                        // already-exists refusal the same way, in place.
-                        message: Some(format!(
-                            "The pull time update exclusion for principal '{principal_arn}' \
-                             does not exist in the registry with id '{}'",
-                            crate::state::registry_id()
-                        )),
+                        // already-exists refusal through the sibling helper.
+                        message: Some(
+                            crate::state::pull_time_update_exclusion_not_found_message(
+                                &principal_arn,
+                            ),
+                        ),
                     },
                 )
                 .into(),

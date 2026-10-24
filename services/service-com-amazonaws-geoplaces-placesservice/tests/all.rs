@@ -25,3 +25,5 @@ mod result_item_composition;
 mod reverse_geocode_positions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/suggest_suggestions.rs"]
+mod suggest_suggestions;

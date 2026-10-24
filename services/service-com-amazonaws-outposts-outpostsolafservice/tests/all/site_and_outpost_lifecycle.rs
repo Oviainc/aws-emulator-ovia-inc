@@ -76,7 +76,8 @@ pub(crate) struct Outposts {
     ///
     /// Kept so a case can reach this service's own records through
     /// `state::service_state`, which is the only way to age a stored resource whose
-    /// clock-owed transition falls further out than a test may sleep for. Nothing
+    /// clock-owed transition falls further out than a test may sleep for, or to put
+    /// the store at an entry ceiling a test cannot fill one call at a time. Nothing
     /// else reads it: every assertion about behaviour goes over the wire.
     engine: Arc<engine::InMemoryEngine>,
 }
