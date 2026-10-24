@@ -173,15 +173,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
 
-        // `workspaceName` scopes the listing to one SiteWise workspace. Workspaces are
-        // created by `CreateWorkspace`, which is still a scaffold stub here, so no
-        // workspace exists for a request to name and the one it names is absent — the
-        // same answer `DescribeTimeSeries` gives a workspace-scoped lookup.
+        // `workspaceName` scopes the listing to one SiteWise workspace: a workspace
+        // the store does not hold is the same absence `DescribeTimeSeries` reports
+        // for a workspace-scoped lookup. A workspace it DOES hold holds no time
+        // series — nothing that ingests one records a workspace for it — so the
+        // listing is empty rather than refused, and reports the workspace it was
+        // scoped to.
         if let Some(workspace) = input.workspace_name.as_deref() {
-            return Err(not_found(crate::state::not_found_message(
-                crate::state::RESOURCE_WORKSPACE,
-                workspace,
-            )));
+            if !store.workspaces.contains_key(workspace) {
+                return Err(not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_WORKSPACE,
+                    workspace,
+                )));
+            }
+            return Ok(ListTimeSeriesOutput {
+                time_series_summaries: Vec::new(),
+                next_token: None,
+                workspace_name: Some(workspace.to_string()),
+            });
         }
 
         // The label is either the raw UUID or the `externalId:<externalId>` alias form.
@@ -278,7 +287,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(ListTimeSeriesOutput {
             time_series_summaries: summaries[start..end].to_vec(),
             next_token,
-            // Reported only for a listing scoped to a workspace, which is refused above.
+            // Reported only for a listing scoped to a workspace, which returns above.
             workspace_name: None,
         })
     }

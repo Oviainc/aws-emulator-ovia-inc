@@ -116,6 +116,12 @@ mod iam_role_id_agrees_with_sts;
 mod iam_signing_name_routing;
 #[path = "all/iot_command_execution_lifecycle.rs"]
 mod iot_command_execution_lifecycle;
+// Declared HERE, beside the command-execution suite it is the sibling of, rather than
+// appended at the end of this file: the tail is where every suite landing in the same
+// window appends, so it is the contended region, while these neighbouring lines are
+// stable.
+#[path = "all/iot_command_executions_are_listed_across_planes.rs"]
+mod iot_command_executions_are_listed_across_planes;
 #[path = "all/iot_job_execution_reaches_the_device.rs"]
 mod iot_job_execution_reaches_the_device;
 #[path = "all/iot_jobs_data_endpoint_discovery.rs"]

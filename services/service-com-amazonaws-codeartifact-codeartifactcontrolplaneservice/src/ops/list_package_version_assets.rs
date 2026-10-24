@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPackageVersionAssets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPackageVersionAssets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPackageVersionAssets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the assets a stored package version holds: the version's own `assets` map,
+//! projected to `AssetSummary` in asset-name order and paginated with the service's
+//! opaque cursor ([`crate::state::page_of`]). Every component of the coordinate is
+//! resolved against the store — domain, repository, the `(format, namespace, package)`
+//! triple and the version — and an unresolvable one is a 404 naming it.
+//!
+//! A READ: the store guard is taken immutably, so nothing a later caller sees moves
+//! because a version's assets were listed. The version's `status` is reported by
+//! `DescribePackageVersion`, not here, and no status hides a version's assets — an
+//! unfinished version lists the assets it has accepted so far, and a disposed one lists
+//! none because disposal deleted them.
 //!
 //! ## Shape of an operation
 //!
@@ -190,20 +193,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPackageVersionAssets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPackageVersionAssetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPackageVersionAssets"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPackageVersionAssetsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        // A read: the guard is taken immutably, so no later caller sees anything move
+        // because this version's assets were listed.
+        let store = state.lock();
+
+        let Some(domain) = store.domain(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(not_found(
+                crate::state::domain_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                ),
+                &input.domain,
+                crate::state::DOMAIN_RESOURCE_TYPE,
+            ));
+        };
+        let Some(repository) = domain.repositories.get(&input.repository) else {
+            return Err(not_found(
+                crate::state::repository_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                    &input.repository,
+                ),
+                &input.repository,
+                crate::state::REPOSITORY_RESOURCE_TYPE,
+            ));
+        };
+        // A package is identified by its whole `(format, namespace, name)` triple: the
+        // same name in another format, or under another namespace, is another package.
+        let Some(package) =
+            repository.package(&input.format, input.namespace.as_deref(), &input.package)
+        else {
+            return Err(not_found(
+                crate::state::package_coordinate_not_found_message(
+                    &input.format,
+                    input.namespace.as_deref(),
+                    &input.package,
+                    &input.repository,
+                ),
+                &input.package,
+                crate::state::PACKAGE_RESOURCE_TYPE,
+            ));
+        };
+        // The package exists; the version it was asked for may not. Reported as the
+        // package-version that is missing, by its fully-qualified identity inside the
+        // repository, so a client can tell this from an unknown package name.
+        let Some(version) = package.versions.get(&input.package_version) else {
+            return Err(not_found(
+                crate::state::package_version_not_found_message(
+                    &input.package,
+                    &input.package_version,
+                    &input.repository,
+                ),
+                &crate::state::package_version_resource_id(
+                    input.namespace.as_deref(),
+                    &input.package,
+                    &input.package_version,
+                ),
+                crate::state::PACKAGE_VERSION_RESOURCE_TYPE,
+            ));
+        };
+
+        // A `nextToken` this service did not mint for THIS version's asset listing cannot
+        // name a place in the asset-name order. Read AFTER the whole coordinate resolves,
+        // so a request naming a resource this service does not hold is answered as
+        // not-found whatever its cursor says.
+        let scope = crate::state::asset_cursor_scope(
+            &input.domain,
+            &input.repository,
+            &input.format,
+            input.namespace.as_deref(),
+            &input.package,
+            &input.package_version,
+        );
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_token(&scope, token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListPackageVersionAssetsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "nextToken is not a pagination token this service issued \
+                                      for this listing"
+                                .to_string(),
+                            reason: Some(crate::state::VALIDATION_REASON_FIELD_FAILED.to_string()),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // Every asset the version holds, in asset-name order: this listing has no filter
+        // members, so the page is the next `maxResults` assets after the cursor.
+        let (assets, next_token) = crate::state::page_of(
+            &version.assets,
+            &scope,
+            cursor.as_deref(),
+            input.max_results,
+            |_name, _asset| true,
+            crate::state::Asset::summary,
+        );
+
+        Ok(ListPackageVersionAssetsOutput {
+            // The STORED coordinate, not the requested strings — the lookup is exact, so
+            // they agree, and the answer reports the record.
+            format: Some(package.format.clone()),
+            namespace: package.namespace.clone(),
+            package: Some(package.name.clone()),
+            version: Some(version.version.clone()),
+            // The version's CURRENT revision, derived from the same records the page was
+            // projected from, so it cannot disagree with the assets listed beside it.
+            version_revision: Some(version.revision()),
+            next_token,
+            // Present even when empty: a client iterating `assets` must see "this version
+            // holds no asset", not "no information".
+            assets: Some(assets),
+        })
     }
+}
+
+/// A `ResourceNotFoundException` (404) naming the resource that was addressed, so a
+/// caller can tell an unknown domain or repository from an unknown package or version.
+/// Each `resourceType` is one of the modelled `ResourceType` values this service names
+/// once, in [`crate::state`].
+fn not_found(
+    message: String,
+    resource_id: &str,
+    resource_type: &str,
+) -> ListPackageVersionAssetsError {
+    ListPackageVersionAssetsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    })
+    .into()
 }

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkspace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkspace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkspace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below persists a workspace under the name the request
+//! gives it, with the encryption configuration it states, and starts the
+//! `CREATING` -> `ACTIVE` transition the operation documents, so the
+//! workspace-scoped resources — tasks, pipelines — have a workspace to live in. A
+//! retry carrying the `clientToken` of the create that already made that
+//! workspace replays its answer rather than colliding with it.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +175,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkspace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkspaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkspace"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWorkspaceError::Modeled(CreateWorkspaceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `kmsKeyId`'s own documentation states the rule the enum cannot: it is
+        // "Required for KMS_BASED_ENCRYPTION; must be omitted for
+        // SITEWISE_DEFAULT_ENCRYPTION".
+        let encryption = &input.encryption_configuration;
+        let key_named = encryption.kms_key_id.is_some();
+        match encryption.encryption_type.as_str() {
+            crate::state::ENCRYPTION_TYPE_KMS_BASED if !key_named => {
+                return Err(invalid_request(format!(
+                    "kmsKeyId is required for {} encryption.",
+                    crate::state::ENCRYPTION_TYPE_KMS_BASED
+                )));
+            }
+            crate::state::ENCRYPTION_TYPE_SITEWISE_DEFAULT if key_named => {
+                return Err(invalid_request(format!(
+                    "kmsKeyId must be omitted for {} encryption.",
+                    crate::state::ENCRYPTION_TYPE_SITEWISE_DEFAULT
+                )));
+            }
+            _ => {}
+        }
+
+        let mut store = state.lock();
+
+        // The store is bounded: a create is the only thing that adds a workspace and
+        // nothing evicts one, so past the cap this is a quota refusal.
+        if store.workspaces.len() >= crate::state::MAX_WORKSPACES {
+            return Err(CreateWorkspaceError::Modeled(
+                CreateWorkspaceErrorModeled::LimitExceededException(LimitExceededException {
+                    message: format!(
+                        "This emulator holds at most {} workspaces.",
+                        crate::state::MAX_WORKSPACES
+                    ),
+                }),
+            ));
+        }
+
+        // `clientToken` makes the create idempotent, as the member documents: "If
+        // you retry a request that completed successfully using the same client
+        // token, the retry succeeds without performing any further actions." A
+        // workspace is identified by its name, so a second create of that name
+        // either IS that retry — same token — or collides with the workspace the
+        // name already belongs to.
+        if let Some(existing) = store.workspaces.get(&input.workspace_name) {
+            if input.client_token.is_some() && input.client_token == existing.client_token {
+                return Ok(CreateWorkspaceOutput {
+                    workspace_name: existing.name.clone(),
+                    workspace_arn: existing.arn.clone(),
+                    workspace_status: existing.status(now),
+                });
+            }
+            return Err(CreateWorkspaceError::Modeled(
+                CreateWorkspaceErrorModeled::ConflictingOperationException(
+                    ConflictingOperationException {
+                        message: crate::state::already_using_message(
+                            crate::state::RESOURCE_WORKSPACE,
+                            "workspaceName",
+                        ),
+                        resource_id: existing.name.clone(),
+                        resource_arn: existing.arn.clone(),
+                    },
+                ),
+            ));
+        }
+
+        let record = crate::state::WorkspaceRecord {
+            name: input.workspace_name.clone(),
+            arn: crate::state::workspace_arn(&region, &input.workspace_name),
+            description: input.workspace_description.clone(),
+            encryption: encryption.clone(),
+            creation_date: now,
+            last_update_date: now,
+            // The CREATING -> ACTIVE transition the clock owes. Stored, never slept on.
+            active_at: now + crate::state::ACTIVATION_DELAY,
+            settling_state: crate::state::STATE_CREATING.to_string(),
+            client_token: input.client_token.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+
+        let output = CreateWorkspaceOutput {
+            workspace_name: record.name.clone(),
+            workspace_arn: record.arn.clone(),
+            workspace_status: record.status(now),
+        };
+
+        store.workspaces.insert(record.name.clone(), record);
+
+        Ok(output)
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> CreateWorkspaceError {
+    CreateWorkspaceError::Modeled(CreateWorkspaceErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
 }
