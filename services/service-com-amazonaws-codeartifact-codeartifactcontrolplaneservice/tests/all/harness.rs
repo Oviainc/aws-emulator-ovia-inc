@@ -32,6 +32,48 @@ pub const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 /// suite asserts is regional on it.
 pub const REGION: &str = "us-east-1";
 
+/// The characters an ARN resource path carries LITERALLY inside a segment: RFC 3986's
+/// unreserved set, `ALPHA / DIGIT / "-" / "." / "_" / "~"`.
+const ARN_LITERAL_PUNCTUATION: [char; 4] = ['-', '.', '_', '~'];
+
+/// The ARN a package group of `pattern` in `domain` reports:
+/// `arn:aws:codeartifact:<region>:<account>:package-group/<domain><pattern>`, with each
+/// SEGMENT of the path percent-encoded (lower-case escapes) and the `/` separators kept
+/// literal.
+///
+/// `tests/all/package_group_arn_encoding.rs` pins that encoding on a hand-written table of
+/// patterns and the exact ARN each must get; this helper is the same rule in closed form,
+/// so a suite that just needs "the ARN of this group" does not restate it.
+pub fn package_group_arn(domain: &str, pattern: &str) -> String {
+    let path = pattern.strip_prefix('/').unwrap_or(pattern);
+    let resource: Vec<String> = format!("{domain}/{path}")
+        .split('/')
+        .map(|segment| {
+            segment
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric()
+                        || ARN_LITERAL_PUNCTUATION.contains(&character)
+                    {
+                        character.to_string()
+                    } else {
+                        let mut buffer = [0_u8; 4];
+                        character
+                            .encode_utf8(&mut buffer)
+                            .bytes()
+                            .map(|byte| format!("%{byte:02x}"))
+                            .collect()
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    format!(
+        "arn:aws:codeartifact:{REGION}:{ACCOUNT}:package-group/{}",
+        resource.join("/")
+    )
+}
+
 /// One HTTP answer, reduced to what a client branches on.
 #[derive(Debug)]
 pub struct Answer {

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCustomDetectionRuleAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCustomDetectionRuleAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCustomDetectionRuleAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: enrolls this account in a PUBLISHED custom detection rule in the mode
+//! the request names, mints the `AssociationId` a later
+//! `GetCustomDetectionRuleAssociation` reports, and answers with the association's full
+//! detail. A `RuleId` the catalogue does not publish is refused with the modelled
+//! `ResourceNotFoundException`, and a second create for a `(RuleId, Mode)` pair this
+//! account already associated with the modelled `ConflictException`; a replayed
+//! `ClientToken` answers with the association the first call made.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +151,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCustomDetectionRuleAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCustomDetectionRuleAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCustomDetectionRuleAssociation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateCustomDetectionRuleAssociationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        // `RuleId` carries its own length and pattern constraints and `Mode` is a
+        // modelled enum, both refused at the request boundary, so reaching here
+        // means the pair is well formed and only its EXISTENCE is open.
+        let token = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+
+        let mut state = state.lock();
+
+        // `ClientToken` is `@idempotencyToken`: a replayed create answers with the
+        // association the first call made rather than refusing the pair it took.
+        if let Some(token) = token.as_deref() {
+            if let Some(saved) = state.detection_rule_association_for_client_token(&region, token) {
+                return Ok(CreateCustomDetectionRuleAssociationOutput {
+                    rule_association: crate::state::detection_rule_association_view(saved),
+                });
+            }
+        }
+
+        // A custom detection rule is published BY GuardDuty, so an association can
+        // only ever name one the catalogue carries. The modelled 404 is the only
+        // way a caller can tell "this rule was never authored" from "you may not do
+        // this" (`AccessDeniedException`), which is why it is answered as the
+        // modelled shape and not under the `BadRequestException` envelope this
+        // service's 400s use.
+        if state.custom_detection_rules.rule(&input.rule_id).is_none() {
+            return Err(not_found());
+        }
+
+        // Creating is not updating: `UpdateCustomDetectionRuleAssociation` is the
+        // operation that changes an existing association's mode, so a second
+        // create for the same `(RuleId, Mode)` pair is the modelled conflict.
+        if state
+            .detection_rule_association(&region, &input.rule_id, &input.mode)
+            .is_some()
+        {
+            return Err(
+                CreateCustomDetectionRuleAssociationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(
+                            crate::state::detection_rule_association_conflict_message(),
+                        ),
+                        // "The error type"
+                        // (`smithy_query(shape="ConflictException")`): the class,
+                        // the same value the body's `__type` carries.
+                        r#type: Some(CONFLICT_EXCEPTION.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The Region is request-chosen, so the number of PARTITIONS needs its own
+        // ceiling; a Region the store already holds a record for is never refused
+        // by it.
+        if state.detection_rule_regions_exhausted(&region) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::DETECTION_RULE_REGION_LIMIT_MESSAGE,
+            ));
+        }
+
+        let now = state.tick_millis();
+        let association_id = state.mint_id();
+        let record = crate::state::DetectionRuleAssociationRecord {
+            association_id,
+            region: region.clone(),
+            rule_id: input.rule_id.clone(),
+            // "The Amazon Web Services account ID associated with this rule
+            // association" (`smithy_query(shape="AssociationDetail")`): the
+            // account this endpoint serves, NOT caller input.
+            account_id: crate::state::administrator_account_id(),
+            mode: input.mode.clone(),
+            tags: input
+                .tags
+                .as_ref()
+                .map(|tags| {
+                    tags.iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                })
+                .unwrap_or_default(),
+            client_token: token,
+            created_at_millis: now,
+            // Nothing has changed it yet, so it reports the instant it was made.
+            updated_at_millis: now,
+        };
+        let view = crate::state::detection_rule_association_view(&record);
+        state.custom_detection_rule_associations.insert(
+            (region, input.rule_id.clone(), input.mode.clone()),
+            record,
+        );
+
+        Ok(CreateCustomDetectionRuleAssociationOutput {
+            rule_association: view,
+        })
     }
+}
+
+/// The error CLASS a create naming a rule the catalogue does not publish is named
+/// by on the wire.
+///
+/// `ResourceNotFoundException` is a modelled error of this operation (`httpError`
+/// 404 — `smithy_query(operation="CreateCustomDetectionRuleAssociation")`), so it
+/// is answered as the modelled shape, exactly as `GetCustomDetectionRule` answers
+/// the same absence.
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
+/// The error CLASS a second create for an already-associated `(RuleId, Mode)` pair
+/// is named by — the modelled 409.
+const CONFLICT_EXCEPTION: &str = "ConflictException";
+
+/// Refuse a `RuleId` the catalogue does not publish with the modelled 404.
+fn not_found() -> CreateCustomDetectionRuleAssociationError {
+    CreateCustomDetectionRuleAssociationErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(crate::state::custom_detection_rule_not_found_message()),
+            r#type: Some(RESOURCE_NOT_FOUND_EXCEPTION.to_string()),
+        },
+    )
+    .into()
 }

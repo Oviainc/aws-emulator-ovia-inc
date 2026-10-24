@@ -19,6 +19,8 @@ mod account_and_platform_catalog;
 mod application_version_updates;
 #[path = "all/application_versions.rs"]
 mod application_versions;
+#[path = "all/configuration_templates.rs"]
+mod configuration_templates;
 #[path = "all/describe_application_versions.rs"]
 mod describe_application_versions;
 #[path = "all/dns_availability.rs"]
@@ -39,6 +41,8 @@ mod not_found_messages;
 mod operations_role;
 #[path = "all/platform_branches.rs"]
 mod platform_branches;
+#[path = "all/platform_version_catalog_projection.rs"]
+mod platform_version_catalog_projection;
 #[path = "all/platform_versions.rs"]
 mod platform_versions;
 #[path = "all/record_projections.rs"]

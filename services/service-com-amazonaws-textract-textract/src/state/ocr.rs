@@ -29,7 +29,12 @@
 //!    shape overlap (the Sørensen-Dice coefficient) plus the glyph's height, width and
 //!    position inside its line. The best match above [`MIN_GLYPH_SCORE`] is the
 //!    character; the mean winning score is the `Confidence` the blocks report, because
-//!    it is the only confidence anything here actually measured.
+//!    it is the only confidence anything here actually measured — per word, per line and
+//!    per page, each over the characters that block was read from.
+//! 5. **Measure** — every line and every word also reports WHERE its ink was found, as
+//!    the fraction of the decoded page it covers ([`MeasuredLine`], [`MeasuredWord`]), so
+//!    the `Geometry` the blocks carry is the position and the size the recogniser
+//!    measured rather than a typographic grid.
 //!
 //! No maintained Rust crate performs offline OCR: the ones that exist either bind to a
 //! C library or load neural-network weights from a file this emulator may not fetch, so
@@ -112,6 +117,64 @@ pub struct Recognised {
     /// The mean score of the characters recognised, as a percentage inside `Percent`'s
     /// `0..=100` range. Zero when the page carries no recognised text.
     pub confidence: f32,
+    /// WHERE the recognised text sits on the page, one entry per line of `text` and in
+    /// the same order, each with the words of that line in reading order.
+    ///
+    /// Every rectangle here was MEASURED off the submitted pixels — a word is the extent
+    /// of the glyph run the line's text separates with a space or a tab, and a line the
+    /// box enclosing its words — so the geometry the blocks report describes the document
+    /// rather than a page template.
+    pub lines: Vec<MeasuredLine>,
+}
+
+/// Where something sits on a page, in the page-relative fractions `BoundingBox` and
+/// `Point` are expressed in: `0.0` is the page's left or top edge and `1.0` its right or
+/// bottom edge.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rect {
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Rect {
+    /// The whole page: what was examined when there is no ink to bound.
+    pub const fn whole_page() -> Self {
+        Self {
+            left: 0.0,
+            top: 0.0,
+            width: 1.0,
+            height: 1.0,
+        }
+    }
+}
+
+/// One word of a recognised line: where its ink sits, and the mean score its own
+/// characters were recognised with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeasuredWord {
+    pub rect: Rect,
+    pub confidence: f32,
+}
+
+/// One recognised line: the mean score its characters were recognised with, and its
+/// words — each with its own ink — in reading order. The line's own extent is the box
+/// enclosing its words, which is where the block layer takes it from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeasuredLine {
+    pub confidence: f32,
+    pub words: Vec<MeasuredWord>,
+}
+
+/// A mean score as the percentage `Confidence` reports, inside `Percent`'s `0..=100`
+/// range. Zero when nothing was recognised, because nothing was measured.
+fn percentage(score_total: f32, score_count: usize) -> f32 {
+    if score_count == 0 {
+        0.0
+    } else {
+        (score_total / score_count as f32 * 100.0).clamp(0.0, 100.0)
+    }
 }
 
 /// `Some(format)` when these bytes are a raster document format Textract accepts.
@@ -167,6 +230,7 @@ pub fn read_raster(bytes: &[u8], format: ImageFormat) -> Result<Recognised, Unre
     let lines = ink.text_lines()?;
 
     let mut text = String::new();
+    let mut measured: Vec<MeasuredLine> = Vec::new();
     let mut score_total = 0.0f32;
     let mut score_count = 0usize;
     for line in &lines {
@@ -177,14 +241,17 @@ pub fn read_raster(bytes: &[u8], format: ImageFormat) -> Result<Recognised, Unre
         text.push('\n');
         score_total += rendered.score_total;
         score_count += rendered.score_count;
+        // Measured in the frame of the image that was DECODED, which is the page the ink
+        // was read off, so one entry per line of `text` in the same order.
+        measured.push(rendered.measured(ink.width, ink.height));
     }
 
-    let confidence = if score_count == 0 {
-        0.0
-    } else {
-        (score_total / score_count as f32 * 100.0).clamp(0.0, 100.0)
-    };
-    Ok(Recognised { text, confidence })
+    let confidence = percentage(score_total, score_count);
+    Ok(Recognised {
+        text,
+        confidence,
+        lines: measured,
+    })
 }
 
 fn format_name(format: ImageFormat) -> &'static str {
@@ -422,6 +489,74 @@ struct RenderedLine {
     text: String,
     score_total: f32,
     score_count: usize,
+    /// The line's words, in reading order: one per run of glyphs the text does NOT
+    /// separate with a space or a tab, so `words[k]` is the k-th whitespace-separated
+    /// word of `text`.
+    words: Vec<WordRun>,
+}
+
+/// One word's measured ink, in page pixels, and the scores its characters matched with.
+struct WordRun {
+    x0: usize,
+    x1: usize,
+    y0: usize,
+    y1: usize,
+    score_total: f32,
+    score_count: usize,
+}
+
+impl WordRun {
+    /// A word starting at `glyph`.
+    fn starting_at(glyph: &GlyphBox, score: f32) -> Self {
+        Self {
+            x0: glyph.x0,
+            x1: glyph.x1,
+            y0: glyph.y0,
+            y1: glyph.y1,
+            score_total: score,
+            score_count: 1,
+        }
+    }
+
+    /// Take `glyph` into this word.
+    fn extend(&mut self, glyph: &GlyphBox, score: f32) {
+        self.x0 = self.x0.min(glyph.x0);
+        self.x1 = self.x1.max(glyph.x1);
+        self.y0 = self.y0.min(glyph.y0);
+        self.y1 = self.y1.max(glyph.y1);
+        self.score_total += score;
+        self.score_count += 1;
+    }
+
+    /// This word's ink as a fraction of a `width` x `height` page.
+    fn rect(&self, width: usize, height: usize) -> Rect {
+        let page_width = width.max(1) as f32;
+        let page_height = height.max(1) as f32;
+        Rect {
+            left: (self.x0 as f32 / page_width).clamp(0.0, 1.0),
+            top: (self.y0 as f32 / page_height).clamp(0.0, 1.0),
+            width: ((self.x1 + 1 - self.x0) as f32 / page_width).clamp(0.0, 1.0),
+            height: ((self.y1 + 1 - self.y0) as f32 / page_height).clamp(0.0, 1.0),
+        }
+    }
+}
+
+impl RenderedLine {
+    /// This line's measurements, as fractions of a `width` x `height` page: the extent of
+    /// each word's own ink, and the score each was recognised with.
+    fn measured(&self, width: usize, height: usize) -> MeasuredLine {
+        MeasuredLine {
+            confidence: percentage(self.score_total, self.score_count),
+            words: self
+                .words
+                .iter()
+                .map(|run| MeasuredWord {
+                    rect: run.rect(width, height),
+                    confidence: percentage(run.score_total, run.score_count),
+                })
+                .collect(),
+        }
+    }
 }
 
 impl InkLine {
@@ -463,26 +598,39 @@ impl InkLine {
         let mut text = String::new();
         let mut score_total = 0.0f32;
         let mut score_count = 0usize;
+        let mut words: Vec<WordRun> = Vec::new();
         let mut previous: Option<&GlyphBox> = None;
         for glyph in &self.glyphs {
             let Some((ch, score)) = recognise(ink, glyph, self.top, band) else {
                 continue;
             };
-            match previous {
+            // Whether this glyph starts a new word is decided by the same gaps the text
+            // is separated on, so the measured words and the words of the text are one
+            // and the same list.
+            let starts_word = match previous {
                 None => {
                     let indent = ((glyph.x0 as f32 / cell).round() as usize).min(MAX_INDENT);
                     text.push_str(&" ".repeat(indent));
+                    true
                 }
                 Some(before) => {
                     let gap = glyph.x0.saturating_sub(before.x1 + 1) as f32;
                     if gap > column_gap {
                         text.push('\t');
+                        true
                     } else if gap > word_gap {
                         text.push(' ');
+                        true
+                    } else {
+                        false
                     }
                 }
-            }
+            };
             text.push(ch);
+            match words.last_mut() {
+                Some(word) if !starts_word => word.extend(glyph, score),
+                _ => words.push(WordRun::starting_at(glyph, score)),
+            }
             score_total += score;
             score_count += 1;
             previous = Some(glyph);
@@ -494,6 +642,7 @@ impl InkLine {
             text,
             score_total,
             score_count,
+            words,
         })
     }
 }

@@ -6,10 +6,14 @@
 //! workspace handler needs (the ARN, the Prometheus endpoint, the request's region,
 //! a fresh workspace id), so `src/ops/*.rs` share ONE copy of each rule.
 
-use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
+use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
+use aws_smithy_schema_server::constraints::{
+    validate, LengthTrait, PatternTrait, Violation, ViolationKind,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// `WorkspaceStatusCode` values a workspace moves through here. Each is an entry of
@@ -1473,6 +1477,110 @@ fn unanchored(pattern: &str) -> &str {
         Some(head) if !head.ends_with('\\') => head,
         _ => body,
     }
+}
+
+// =============================================================================
+// `kmsKeyArn`: the member whose modelled `@pattern` the published model over-states
+// =============================================================================
+//
+// `CreateWorkspace$kmsKeyArn` targets `KmsKeyArn`
+// (`smithy_query(query="shape", shape="KmsKeyArn")`): `@length(20..2048)` plus
+// `@pattern(^arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/[-a-f0-9]+$)`. That pattern's
+// key-id segment is `[-a-f0-9]+` — lowercase hex and dashes — but the recorded live
+// refusal for a malformed `kmsKeyArn` quotes the requirement the service ACTUALLY
+// applies, `arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/.+`, whose key-id segment is
+// unconstrained. That message is built FROM the request (it names the member and the
+// constraint the value failed), so the CONSTRAINT it reports is the service's own; under
+// the published pattern this emulator refuses key ARNs AWS accepts — a multi-region
+// `key/mrk-<hex>` CMK among them — and reports a requirement no aps response states.
+//
+// `CreateWorkspaceInput` therefore carries `skip_validation = ["kmsKeyArn"]` in
+// `src/ops/types/create_workspace_types.rs`, and this module re-declares the member's
+// constraints with the key-id segment as the service reads it. The published model in
+// `smithy-model/` is left exactly as shipped.
+//
+// NOTHING about constraint checking is reimplemented here: the constraints are
+// re-declared in the framework's own form (a [`TraitMap`] of
+// [`LengthTrait`]/[`PatternTrait`]) hung on a member schema of the same name, and the
+// check is [`validate`] — the same walk the request boundary runs — so a refusal made
+// here reads exactly like one made there, down to the requirement
+// [`constraint_requirement`] renders for it.
+
+/// This service's Smithy namespace, for the member schema below.
+const NAMESPACE: &str = "com.amazonaws.amp";
+
+/// `KmsKeyArn`'s pattern with its key-id segment as the service applies and reports it:
+/// `key/.+` rather than the published `key/[-a-f0-9]+`. See the section comment above for
+/// where that reading comes from.
+pub const KMS_KEY_ARN_PATTERN: &str = r"^arn:aws[-a-z]*:kms:[-a-z0-9]+:[0-9]{12}:key/.+$";
+
+/// `kmsKeyArn`: the member's modelled `@length(20..2048)` plus [`KMS_KEY_ARN_PATTERN`].
+/// The length bound is the model's as shipped — only the pattern is re-read.
+static KMS_KEY_ARN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(20), Some(2048))));
+    traits.insert(Box::new(PatternTrait::new(KMS_KEY_ARN_PATTERN)));
+    traits
+});
+
+/// The `kmsKeyArn` member schema the walk reads: its name gives the violation path — so
+/// the refusal names `kmsKeyArn`, exactly as a boundary refusal would — and its trait map
+/// carries the constraints.
+static M_KMS_KEY_ARN: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.amp#CheckedKmsKeyArn$kmsKeyArn",
+        NAMESPACE,
+        "kmsKeyArn",
+    ),
+    ShapeType::String,
+    "kmsKeyArn",
+    0,
+)
+.with_traits(&KMS_KEY_ARN_TRAITS);
+
+/// The root of the shadow input the walk is driven over. Its member list is empty on
+/// purpose: the walk visits what [`CheckedKmsKeyArn`] WRITES, and a root struct schema
+/// carries no member name, so it contributes no path segment. The shape id is deliberately
+/// one the model does not declare, so it cannot collide with a modelled shape.
+static CHECKED_KMS_KEY_ARN_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "com.amazonaws.amp#CheckedKmsKeyArn",
+        NAMESPACE,
+        "CheckedKmsKeyArn",
+    ),
+    ShapeType::Structure,
+    &[],
+);
+
+/// One request's `kmsKeyArn`, written for the validating walk the way the codec writes a
+/// string member.
+struct CheckedKmsKeyArn<'a> {
+    kms_key_arn: &'a str,
+}
+
+impl SerializableStruct for CheckedKmsKeyArn<'_> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&M_KMS_KEY_ARN, self.kms_key_arn)
+    }
+}
+
+/// Refuse a `kmsKeyArn` that violates the member's modelled length bound or the pattern
+/// the service applies, or pass it through.
+///
+/// The refusal is composed by [`constraint_validation_failed`] — the one composition the
+/// request boundary and every other aps handler refuse through — so a caller reads the
+/// same `reason`, the same single `fieldList` entry naming the member and the requirement
+/// it failed, and the same `Invalid kmsKeyArn: <requirement>` message, whichever side made
+/// the decision.
+pub fn check_kms_key_arn(kms_key_arn: &str) -> Result<(), crate::ops::types::ValidationException> {
+    let violations: Vec<Violation> = validate(
+        &CheckedKmsKeyArn { kms_key_arn },
+        &CHECKED_KMS_KEY_ARN_SCHEMA,
+    );
+    if violations.is_empty() {
+        return Ok(());
+    }
+    Err(constraint_validation_failed(&violations))
 }
 
 // =============================================================================

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches the requested key-value pairs to the email contact the `arn` label names.
+//! This is a MUTATING operation: the pairs are MERGED into the tag set already on the
+//! record — a key the request repeats takes the request's value, and a key the request
+//! does not mention keeps the value it had — so two tag calls naming different keys
+//! both survive. A well-formed ARN naming no stored contact is the modelled 404, and
+//! the stored set is kept inside the modelled `TagMap` bound, because
+//! `ListTagsForResource` reports it through a member carrying that same bound.
+//!
+//! Tags are resource metadata held beside the contact: the modelled `EmailContact`
+//! shape reports none of them, so tagging leaves every member of the contact itself —
+//! `status`, `creationTime`, `updateTime` — exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +148,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // `arn`'s pattern and the `tags` map's own 0..200 length, key pattern and value
+        // length are modelled, so the centralized walk has already refused anything
+        // outside them with a 400 before this body runs. What is left for this handler
+        // is whether the contact exists and whether the MERGED set still fits the bound.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the email contact store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut store = state.lock();
+        let contact = store.contact_mut(&input.arn).ok_or_else(|| {
+            TagResourceErrorModeled::ResourceNotFoundException(crate::state::contact_not_found(
+                &input.arn,
+            ))
+        })?;
+
+        // A key the request repeats replaces a value rather than adding a pair, so only
+        // the keys this call introduces grow the set.
+        let fresh_keys = input
+            .tags
+            .keys()
+            .filter(|key| !contact.tags.contains_key(key.as_str()))
+            .count();
+        if contact.tags.len() + fresh_keys > crate::state::MAX_TAGS_PER_CONTACT {
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::field_validation_failure(
+                    "tags",
+                    &format!(
+                        "would take this resource past the maximum of {} tags",
+                        crate::state::MAX_TAGS_PER_CONTACT
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        for (key, value) in input.tags {
+            contact.tags.insert(key, value);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }

@@ -46,12 +46,6 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
-/// The error code AWS answers a boundary constraint refusal with on this service's
-/// protocol (restJson1), and the code the framework's own default picks there too.
-/// Restated here because `override_refusal` names the code and the message together: a
-/// message without its matching code is worse than leaving both alone.
-const VALIDATION_EXCEPTION: &str = "ValidationException";
-
 /// The order this service states one enum's value set in, one row per enum.
 ///
 /// The value SET is the model's and the CHECK is the framework's; only the order the
@@ -113,8 +107,9 @@ const SHARED_ARN_NAMESPACE: &str = "lambda";
 /// A resource belongs to the service whose own operations MINT it: `microvm-image` is
 /// minted by `CreateMicrovmImage` in the Lambda MicroVMs service, whose model binds the
 /// same tagging URIs and whose `TaggableResource` pattern accepts it (this model's does
-/// not). Every other type that pattern accepts here — `function`, `code-signing-config`,
-/// `event-source-mapping`, `capacity-provider`, `network-connector` — is minted by this
+/// not). Every other type that pattern accepts here — `function`, `layer`,
+/// `code-signing-config`, `event-source-mapping`, `capacity-provider`,
+/// `network-connector` — is minted by this
 /// service or has no other claimant, so it stays with this endpoint, whose own identity
 /// IS the shared signing name (`sdkId: Lambda`, `endpointPrefix: lambda`). Source:
 /// `smithy_query(query="shape", shape="TaggableResource")` on both models.
@@ -212,21 +207,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this service
         // reword it. Everything about the envelope — the `N validation error(s)
         // detected:` prefix, the member paths, the echoed value and every requirement
-        // sentence — is the framework's, so the two refusal paths cannot drift. The ONE
-        // rendering chosen here is the ORDER of an enum's value set (see
-        // [`reported_enum_order`]), which no model records.
+        // sentence — is the framework's, so the two refusal paths cannot drift.
+        //
+        // TWO renderings are stated here, neither of which a model records:
+        //
+        // * the ORDER of an enum's value set (see [`reported_enum_order`]), which is
+        //   this service's own and is applied below;
+        // * how a `@pattern` requirement quotes its expression. AWS states it WITHOUT
+        //   the `^`/`$` anchors a whole-value Smithy pattern wraps it in, so a
+        //   `TaggableResource` the tagging URIs refuse is reported as
+        //   `Member must satisfy regular expression pattern: arn:(aws[a-zA-Z-]*):lambda:…`
+        //   rather than `^arn:…$`. That wording is shared by every service on a JSON
+        //   protocol, so it lives in `service-common` and is delegated to rather than
+        //   restated — the CHECK still uses the model's pattern as written, and only
+        //   the rendering drops the pair.
         let Refusal::Invalid(violations) = refusal else {
             // An unauthenticated caller keeps the framework's 403 code and wording.
             return None;
         };
-        if !violations
-            .iter()
-            .any(|violation| matches!(violation.kind, ViolationKind::EnumValue(_)))
-        {
-            // Nothing this service states differently, so the framework's wording
-            // stands as it is.
-            return None;
-        }
         let restated: Vec<Violation> = violations
             .iter()
             .map(|violation| match &violation.kind {
@@ -238,10 +236,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 _ => violation.clone(),
             })
             .collect();
-        Some(Refused {
-            code: VALIDATION_EXCEPTION.to_string(),
-            message: aws_smithy_schema_server::envelope(&restated)?,
-        })
+        // The code, the envelope and the `@pattern` rendering are `service-common`'s;
+        // the value set order above is this service's.
+        service_common::aws_validation_refusal(&Refusal::Invalid(restated))
     }
 
     fn override_routing_error(

@@ -8,6 +8,10 @@
 //! [`crate::state::resolve_resource_arn`] and edit the one tag set the table holds,
 //! which `list_tags_of_resource` reports.
 //!
+//! The removal is ASYNCHRONOUS, as the doc below says: it leaves the resource with the
+//! remaining set at once, and the eventually consistent reader sees that set one
+//! propagation span later (see [`crate::state::ResourceTags`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -218,8 +222,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // Exactly the keys named go, and a key the table does not carry is nothing to
-        // remove — so repeating the call changes nothing further.
-        table.remove_tags(input.tag_keys.iter().map(String::as_str));
+        // remove — so repeating the call changes nothing further. What is left becomes
+        // visible to `ListTagsOfResource` one propagation span later: "The application
+        // or removal of tags using TagResource and UntagResource APIs is eventually
+        // consistent" (this operation's own doc above).
+        table
+            .tags
+            .remove(input.tag_keys.iter().map(String::as_str), now);
 
         Ok(UntagResourceOutput)
     }

@@ -3,8 +3,11 @@
 //! @op DeleteSecondaryNetwork
 //! IMPLEMENTED: starts deleting the secondary network the request names and answers it as
 //! [`crate::state`] now holds it — `delete-in-progress`, with its IPv4 CIDR block
-//! `disassociating` and `delete-complete` owed by the clock. This is the ONLY file to touch
-//! for this operation.
+//! `disassociating` and `delete-complete` owed by the clock. The refusals in order:
+//! something that is not a secondary network id at all
+//! (`InvalidSecondaryNetworkId.Malformed`, answered before any lookup), a well-formed id
+//! the account holds no network for (`InvalidSecondaryNetworkId.NotFound`), then `DryRun`
+//! (`DryRunOperation`). This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,9 +167,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let networks = state::require_service_state(&*self.engine)?;
         let mut store = networks.lock();
 
-        // "Deletes a secondary network" (`DeleteSecondaryNetwork`): an id the account holds
-        // no network for is a refusal, not a no-op — a caller has to be able to tell the
-        // deletion it performed from one it did not.
+        // "Deletes a secondary network" (`DeleteSecondaryNetwork`): the id is read for its
+        // SYNTAX first and only then looked up, which is the order EC2 answers the two
+        // questions in — something that is not a secondary network id at all is
+        // `InvalidSecondaryNetworkId.Malformed` before any lookup, and a well-formed id the
+        // account holds no network for is `InvalidSecondaryNetworkId.NotFound`. Neither is
+        // a no-op: a caller has to be able to tell the deletion it performed from one it
+        // did not, and a typo from a resource that is gone.
         state::require_known_secondary_network(&store, &input.secondary_network_id)?;
 
         // "You must delete all secondary subnets in the secondary network before you can

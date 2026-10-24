@@ -350,6 +350,13 @@ impl LifecyclePolicyRecord {
     /// both") — so for one of those the stored body parameters are reported
     /// here, each with the default its member documents when the request named
     /// no value.
+    ///
+    /// A CUSTOM policy therefore reports its stored structure and nothing else,
+    /// and that loses nothing: every one of the `[Default policies only]` fields
+    /// below is left unset on a custom record, because a create or an update
+    /// that states one for a policy that is not a default policy is refused
+    /// ([`default_policy_only_parameters_refused`]) instead of being stored
+    /// where no read could reach it.
     pub fn effective_policy_details(&self) -> Option<PolicyDetails> {
         if !self.default_policy {
             return self.policy_details.clone();
@@ -659,6 +666,94 @@ pub fn required_parameters_omitted(
         required_parameters: Some(parameters),
         ..invalid_request(message)
     }
+}
+
+/// The prefix [`DefaultPolicyOnlyParameters::stated_names`] qualifies a member
+/// stated inside the `PolicyDetails` configuration structure with, so a refusal
+/// tells a caller WHERE it stated the parameter.
+pub const POLICY_DETAILS_PREFIX: &str = "PolicyDetails.";
+
+/// Which `[Default policies only]` configuration members a request states,
+/// wherever it stated them.
+///
+/// `CreateLifecyclePolicyRequest`, `UpdateLifecyclePolicyRequest` and
+/// `PolicyDetails` all declare the same configuration members, and the model
+/// documents every one of them `[Default policies only]`. `ResourceType` is
+/// declared by `PolicyDetails` alone — the request body states the same thing as
+/// `CreateLifecyclePolicyRequest$DefaultPolicy`, which is the member that MAKES
+/// a request a default-policy request — so a request-body set leaves it unset.
+///
+/// This is the ONE list of their wire names, so the refusal of a default-only
+/// parameter and the "either in the request body, or in the PolicyDetails
+/// request structure, but not both" rule name the same members.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultPolicyOnlyParameters {
+    pub resource_type: bool,
+    pub create_interval: bool,
+    pub retain_interval: bool,
+    pub copy_tags: bool,
+    pub cross_region_copy_targets: bool,
+    pub extend_deletion: bool,
+    pub exclusions: bool,
+}
+
+impl DefaultPolicyOnlyParameters {
+    /// Which of them `details` states.
+    pub fn in_policy_details(details: Option<&PolicyDetails>) -> Self {
+        let Some(details) = details else {
+            return Self::default();
+        };
+        Self {
+            resource_type: details.resource_type.is_some(),
+            create_interval: details.create_interval.is_some(),
+            retain_interval: details.retain_interval.is_some(),
+            copy_tags: details.copy_tags.is_some(),
+            cross_region_copy_targets: details.cross_region_copy_targets.is_some(),
+            extend_deletion: details.extend_deletion.is_some(),
+            exclusions: details.exclusions.is_some(),
+        }
+    }
+
+    /// The wire names of the members stated, in the order the model declares
+    /// them, each qualified by `prefix` — [`POLICY_DETAILS_PREFIX`] for a member
+    /// stated inside the configuration structure, `""` for a request-body one.
+    pub fn stated_names(&self, prefix: &str) -> Vec<String> {
+        [
+            ("ResourceType", self.resource_type),
+            ("CreateInterval", self.create_interval),
+            ("RetainInterval", self.retain_interval),
+            ("CopyTags", self.copy_tags),
+            ("CrossRegionCopyTargets", self.cross_region_copy_targets),
+            ("ExtendDeletion", self.extend_deletion),
+            ("Exclusions", self.exclusions),
+        ]
+        .into_iter()
+        .filter(|(_, stated)| *stated)
+        .map(|(name, _)| format!("{prefix}{name}"))
+        .collect()
+    }
+}
+
+/// The `InvalidRequestException` for `[Default policies only]` parameters stated
+/// by a request that is not creating or updating a DEFAULT policy.
+///
+/// Every member [`DefaultPolicyOnlyParameters`] lists is documented `[Default
+/// policies only]`, so a custom policy has nowhere to carry one and no read of
+/// one can report it: the request states a configuration the service cannot
+/// apply, which is exactly the "invalid parameters" the operation models
+/// `InvalidRequestException` for. The message is built from the request — it
+/// names the parameters refused and the constraint they fall outside.
+pub fn default_policy_only_parameters_refused(parameters: &[String]) -> InvalidRequestException {
+    invalid_request(format!(
+        "The {} {} {} supported for default policies only.",
+        if parameters.len() == 1 {
+            "parameter"
+        } else {
+            "parameters"
+        },
+        parameters.join(", "),
+        if parameters.len() == 1 { "is" } else { "are" },
+    ))
 }
 
 /// The first tag key in `keys` that begins with the reserved [`aws:`

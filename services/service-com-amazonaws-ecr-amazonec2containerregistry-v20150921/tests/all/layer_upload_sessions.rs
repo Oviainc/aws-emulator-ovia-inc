@@ -365,3 +365,200 @@ async fn the_upload_past_the_cap_is_refused() {
         "a refused call opens no upload, so the store stays at the cap"
     );
 }
+
+/// The caller-supplied bytes this registry holds: every in-flight upload's received
+/// bytes plus every stored image manifest, bounded together by
+/// [`state::MAX_REGISTRY_CALLER_BYTES`].
+fn held_bytes(engine: &Arc<engine::InMemoryEngine>) -> usize {
+    state::service_state(&**engine)
+        .expect("the ecr store is reachable from the engine the router was built over")
+        .lock()
+        .caller_bytes_held()
+}
+
+/// Whether the registry would take `additional` more caller-supplied bytes.
+fn has_budget_for(engine: &Arc<engine::InMemoryEngine>, additional: usize) -> bool {
+    state::service_state(&**engine)
+        .expect("the ecr store is reachable from the engine the router was built over")
+        .lock()
+        .has_byte_budget_for(additional)
+}
+
+/// One `UploadLayerPart` of `bytes` into the upload `upload_id` of `repository`.
+async fn upload_part(
+    router: &MultiServiceRouter,
+    case: &str,
+    repository: &str,
+    upload_id: &str,
+    bytes: &[u8],
+) {
+    let last = i64::try_from(bytes.len()).expect("a test part fits in an i64") - 1;
+    ok(
+        router,
+        case,
+        "UploadLayerPart",
+        &json!({
+            "repositoryName": repository,
+            "uploadId": upload_id,
+            "partFirstByte": 0,
+            "partLastByte": last,
+            "layerPartBlob": aws_smithy_types::base64::encode(bytes),
+        }),
+    )
+    .await;
+}
+
+/// The bytes a client can make this registry retain are bounded in AGGREGATE, not just
+/// per record: the rule under test is that the registry accounts for every in-flight
+/// upload's received bytes and every stored manifest against one budget
+/// ([`state::MAX_REGISTRY_CALLER_BYTES`]), and that an upload nobody completed is
+/// reclaimed once the registry needs its slot rather than pinning it for the life of the
+/// process.
+///
+/// The accounting is asserted over a table of part sizes, and the budget boundary is read
+/// from the constant, so what is tested is wherever the implementation puts it.
+#[tokio::test]
+async fn the_registry_bounds_the_caller_bytes_it_retains() {
+    let (router, engine) = emulator_with_engine();
+    given_repository(&router, "byte accounting", "accounted").await;
+    assert_eq!(
+        held_bytes(&engine),
+        0,
+        "a registry nobody has pushed to retains no caller bytes"
+    );
+
+    // One upload per row, left IN FLIGHT: its received bytes are what the registry is
+    // holding. The rows differ in the part's size, which is what the accounting is over.
+    let mut fresh_uploads: Vec<String> = Vec::new();
+    let mut expected_bytes = 0_usize;
+    for (case, size) in [
+        ("a one-byte part", 1_usize),
+        ("a kilobyte part", 1024),
+        ("a sixty-four kilobyte part", 64 * 1024),
+    ] {
+        let opened = ok(
+            &router,
+            case,
+            "InitiateLayerUpload",
+            &json!({"repositoryName": "accounted"}),
+        )
+        .await;
+        let upload_id = opened["uploadId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: InitiateLayerUpload reported no uploadId"))
+            .to_string();
+        upload_part(
+            &router,
+            case,
+            "accounted",
+            &upload_id,
+            &vec![b'a'; size],
+        )
+        .await;
+        fresh_uploads.push(upload_id);
+        expected_bytes += size;
+        assert_eq!(
+            held_bytes(&engine),
+            expected_bytes,
+            "case {case:?}: the registry accounts for exactly the bytes its uploads received"
+        );
+    }
+
+    // A stored manifest is caller bytes too, so pushing one is charged against the same
+    // budget. A manifest naming no layer references no blob, so nothing has to be pushed
+    // for it first.
+    let manifest = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
+    ok(
+        &router,
+        "a stored manifest",
+        "PutImage",
+        &json!({"repositoryName": "accounted", "imageManifest": manifest}),
+    )
+    .await;
+    expected_bytes += manifest.len();
+    assert_eq!(
+        held_bytes(&engine),
+        expected_bytes,
+        "a stored manifest is accounted for beside the in-flight uploads"
+    );
+
+    // The boundary itself: the registry takes what still fits under the budget and
+    // refuses the byte past it.
+    let room = state::MAX_REGISTRY_CALLER_BYTES - expected_bytes;
+    for (case, additional, fits) in [
+        ("nothing", 0_usize, true),
+        ("one byte", 1, true),
+        ("exactly the room left", room, true),
+        ("one byte past the room left", room + 1, false),
+        ("the whole budget again", state::MAX_REGISTRY_CALLER_BYTES, false),
+    ] {
+        assert_eq!(
+            has_budget_for(&engine, additional),
+            fits,
+            "case {case:?}: with {expected_bytes} bytes held of \
+             {} the registry must {}take {additional} more",
+            state::MAX_REGISTRY_CALLER_BYTES,
+            if fits { "" } else { "not " }
+        );
+    }
+
+    // Reclamation: fill the store to its entry cap with uploads nobody has touched for
+    // longer than the registry waits, and the next open succeeds by taking one of those
+    // slots — while every upload opened in this test keeps its own.
+    let abandoned_at = std::time::SystemTime::now()
+        - state::ABANDONED_UPLOAD_AGE
+        - std::time::Duration::from_secs(1);
+    let fill = state::MAX_LAYER_UPLOADS - stored_uploads(&engine).len();
+    {
+        let store = state::service_state(&*engine).expect("the ecr store");
+        let mut store = store.lock();
+        for index in 0..fill {
+            store.uploads.insert(
+                format!("abandoned-upload-{index}"),
+                state::LayerUpload {
+                    repository_name: "accounted".to_string(),
+                    part_size: state::REPORTED_LAYER_PART_SIZE,
+                    started_at: abandoned_at,
+                    received_bytes: Vec::new(),
+                },
+            );
+        }
+    }
+    assert_eq!(
+        stored_uploads(&engine).len(),
+        state::MAX_LAYER_UPLOADS,
+        "the store is at its entry cap before the reclaiming open"
+    );
+
+    let opened = call(
+        &router,
+        "InitiateLayerUpload",
+        &json!({"repositoryName": "accounted"}),
+    )
+    .await;
+    assert_eq!(
+        opened.status, 200,
+        "an abandoned upload's slot is reclaimed rather than refusing the open, got {} \
+         with {:?}",
+        opened.status, opened.body
+    );
+    let uploads_now = stored_uploads(&engine);
+    assert!(
+        uploads_now.len() <= state::MAX_LAYER_UPLOADS,
+        "the reclaiming open leaves the store within its cap, got {} uploads",
+        uploads_now.len()
+    );
+    for upload_id in &fresh_uploads {
+        assert!(
+            uploads_now.contains_key(upload_id),
+            "the upload {upload_id:?} was opened just now, so nothing may reclaim it: \
+             {} uploads held",
+            uploads_now.len()
+        );
+    }
+    assert_eq!(
+        held_bytes(&engine),
+        expected_bytes,
+        "reclaiming empty abandoned uploads changes no accounted byte"
+    );
+}

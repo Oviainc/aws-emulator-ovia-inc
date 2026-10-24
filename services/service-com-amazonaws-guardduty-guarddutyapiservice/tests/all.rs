@@ -51,6 +51,8 @@ mod member_association;
 mod member_creation;
 #[path = "all/modeled_constraint_refusals.rs"]
 mod modeled_constraint_refusals;
+#[path = "all/negative_class_rejections.rs"]
+mod negative_class_rejections;
 #[path = "all/publishing_destination_lifecycle.rs"]
 mod publishing_destination_lifecycle;
 #[path = "all/request_region_partition_bounds.rs"]

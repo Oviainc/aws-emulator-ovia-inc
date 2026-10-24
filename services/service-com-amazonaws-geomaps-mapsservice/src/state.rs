@@ -23,11 +23,13 @@
 //! derived from it.
 
 pub mod assets;
+pub mod boundaries;
 pub mod canvas;
 pub mod glyph_pbf;
+pub mod labels;
 pub mod vector_tile;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// An 8-bit RGBA colour: the one colour representation the catalog, the
 /// renderer and the style documents share.
@@ -333,6 +335,14 @@ pub struct ComAmazonawsGeomapsMapsserviceState {
     /// `GetGlyphs` models no error, so every modeled-valid stack must answer.
     pub fallback_font: FontRecord,
     pub static_maps: StaticMapRecord,
+    /// The languages the catalog has label data for, as
+    /// `GetStaticMapRequest$Language` documents them. A request that asks for
+    /// one of these gets its labels; one that asks for anything else falls back
+    /// to [`Self::primary_label_language`].
+    pub label_languages: BTreeSet<String>,
+    /// The "regional primary language" the `Language` documentation falls back
+    /// to, and the language a request that names none gets.
+    pub primary_label_language: String,
     /// How a STORED asset (a glyph range, a sprite file) is delivered.
     pub asset_delivery: AssetDeliveryRecord,
     /// The pricing bucket reported for an asset whose own record carries none.
@@ -353,6 +363,21 @@ impl ComAmazonawsGeomapsMapsserviceState {
         record
             .cloned()
             .unwrap_or_else(|| self.default_pricing_bucket.clone())
+    }
+
+    /// The language an image's labels are written in for a request that asked
+    /// for `requested`.
+    ///
+    /// `Language` is a BCP 47 tag, so the language it selects is its primary
+    /// subtag ([`labels::primary_subtag`]); a language this catalog has no
+    /// label data for — and a request that named none — is answered in
+    /// [`Self::primary_label_language`], which is what the member's own
+    /// documentation says happens.
+    pub fn label_language(&self, requested: Option<&str>) -> String {
+        match requested.map(labels::primary_subtag) {
+            Some(language) if self.label_languages.contains(&language) => language,
+            _ => self.primary_label_language.clone(),
+        }
     }
 }
 
@@ -402,6 +427,13 @@ fn seed() -> ComAmazonawsGeomapsMapsserviceState {
             cache_control: "max-age=300".to_string(),
             pricing_bucket: Some("StaticMaps".to_string()),
         },
+        // The label languages are the modeled ones: the set `Language`'s own
+        // documentation lists, not a shorter one chosen here.
+        label_languages: labels::SUPPORTED_LANGUAGES
+            .iter()
+            .map(|language| (*language).to_string())
+            .collect(),
+        primary_label_language: labels::PRIMARY_LANGUAGE.to_string(),
         default_pricing_bucket: "MapAssets".to_string(),
     }
 }

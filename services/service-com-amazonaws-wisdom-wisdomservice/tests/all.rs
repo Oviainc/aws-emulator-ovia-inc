@@ -15,6 +15,8 @@
 mod assistant_association;
 #[path = "all/assistant_lifecycle.rs"]
 mod assistant_lifecycle;
+#[path = "all/knowledge_base_lifecycle.rs"]
+mod knowledge_base_lifecycle;
 #[path = "all/shared_signing_name_routing.rs"]
 mod shared_signing_name_routing;
 #[path = "all/state_roundtrip.rs"]

@@ -913,12 +913,20 @@ async fn an_unknown_query_id_is_refused_by_each_reader_with_its_own_modelled_err
     }
 }
 
+/// A `StartQuery*` whose parent resource the store does not hold is refused: none of
+/// the three models a `ResourceNotFoundException`, so the reference it cannot resolve
+/// is the modelled `AccessDeniedException` (403).
+///
+/// Each family's absent owner is of its OWN identifier form — a `ResourceName` for the
+/// monitor family, a `scopeId` for the two workload-insights ones — so every row
+/// exercises the resolution path rather than the form check that precedes it
+/// (`wire_status_and_error_classes.rs` covers that one).
 #[tokio::test]
 async fn a_start_query_for_a_resource_the_store_does_not_hold_is_refused() {
     let plane = Plane::new().await;
 
     for family in FAMILIES {
-        for owner in ["absent-monitor", "00000000-0000-4000-8000-00000000ffff"] {
+        for owner in absent_owners(*family) {
             let body = json!({
                 "startTime": "2026-10-22T19:07:07Z",
                 "endTime": "2026-10-22T20:07:07Z",
@@ -927,17 +935,29 @@ async fn a_start_query_for_a_resource_the_store_does_not_hold_is_refused() {
             });
             let answer = plane.start_raw(*family, owner, body).await;
             assert_eq!(
-                answer.status, 400,
-                "case {family:?}/{owner:?}: expected 400, got {} with body {}",
+                answer.status, 403,
+                "case {family:?}/{owner:?}: expected 403, got {} with body {}",
                 answer.status, answer.body
             );
             assert!(
-                is_error(&answer, "ValidationException"),
-                "case {family:?}/{owner:?}: expected ValidationException, got {:?} / body {}",
+                is_error(&answer, "AccessDeniedException"),
+                "case {family:?}/{owner:?}: expected AccessDeniedException, got {:?} / body {}",
                 answer.error_type,
                 answer.body
             );
         }
+    }
+}
+
+/// Two owners of `family`'s own identifier form that no test creates: a monitor name
+/// for the monitor family, a `scopeId` for the two scope-wide ones.
+fn absent_owners(family: Family) -> [&'static str; 2] {
+    match family {
+        Family::Monitor => ["absent-monitor", "Absent.Monitor_2"],
+        _ => [
+            "00000000-0000-4000-8000-00000000ffff",
+            "ffffffff-ffff-4fff-8fff-ffffffffffff",
+        ],
     }
 }
 

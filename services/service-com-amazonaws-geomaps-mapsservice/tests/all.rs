@@ -15,3 +15,5 @@
 mod map_assets;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/static_map_knobs.rs"]
+mod static_map_knobs;

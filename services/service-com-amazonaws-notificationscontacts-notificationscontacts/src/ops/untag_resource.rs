@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Detaches the named tag keys from the email contact the `arn` label names. This is a
+//! MUTATING operation, and it is `@idempotent`: every key the request names is absent
+//! from the contact's tag set afterwards, so naming a key the contact does not carry
+//! removes nothing and still succeeds, while every key the request does NOT name keeps
+//! its value. A well-formed ARN naming no stored contact is the modelled 404.
 //!
+//! Tags are resource metadata held beside the contact: the modelled `EmailContact`
+//! shape reports none of them, so untagging leaves every member of the contact itself —
+//! `status`, `creationTime`, `updateTime` — exactly as it was.
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -147,18 +147,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // `arn`'s pattern and `tagKeys`' own element constraints are modelled, so the
+        // centralized walk has already refused anything outside them with a 400 before
+        // this body runs; whether the contact exists is all this handler decides.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the email contact store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut store = state.lock();
+        let contact = store.contact_mut(&input.arn).ok_or_else(|| {
+            UntagResourceErrorModeled::ResourceNotFoundException(crate::state::contact_not_found(
+                &input.arn,
+            ))
+        })?;
+
+        // Removing a key the contact never carried is a no-op success, which is what
+        // makes repeating the same request answer the same thing.
+        for key in &input.tag_keys {
+            contact.tags.remove(key);
+        }
+
+        Ok(UntagResourceOutput {})
     }
 }

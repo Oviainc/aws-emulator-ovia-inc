@@ -24,6 +24,10 @@ tracing = { workspace = true }
 # The content digest of an image manifest (`sha256:<hex>`) and its hex rendering.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `arn::parse_of` / `iam_role::role_name`: the tree's ONE resource-ARN parse and its one
+# IAM role-ARN reading, which this service's `resourceArn`, `credentialArn` and
+# `customRoleArn` readings go through rather than splitting an ARN of their own.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

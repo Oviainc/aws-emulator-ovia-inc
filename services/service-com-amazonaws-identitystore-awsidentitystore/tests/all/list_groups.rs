@@ -23,8 +23,13 @@ use crate::harness::{call, emulator, ok, refused, string, MISSING_STORE, STORE};
 use crate::identity_store_lifecycle::{assert_resource_arn, assert_uuid};
 
 /// A well-formed `IdentityStoreId` in the UUID form the modelled pattern also admits,
-/// naming no identity store: a second FORM of "no such store", not a second store.
+/// of a store of THIS account that nothing has written to: a second FORM of a store the
+/// caller names, which this emulator serves.
 const UUID_STORE: &str = "a1b2c3d4-5678-90ab-cdef-111122223333";
+
+/// The account field of an ARN that names a store of ANOTHER account — not one this
+/// emulator serves, whatever id it ends with.
+const OTHER_ACCOUNT: &str = "210987654321";
 
 /// The prefix of an identity store's ARN, the third identifier form the modelled
 /// `IdentityStoreId` pattern admits
@@ -385,8 +390,8 @@ async fn a_listing_covers_exactly_the_store_the_request_names() {
          got {by_arn:?} vs {by_id:?}"
     );
 
-    // And a store that does not exist lists nothing at all — it is refused, so one
-    // store's groups can never appear in another's listing.
+    // And a store this emulator does not serve lists nothing at all — it is refused — so
+    // one store's groups can never appear in another's listing.
     refused(
         &router,
         "ListGroups",
@@ -396,6 +401,21 @@ async fn a_listing_covers_exactly_the_store_the_request_names() {
         case,
     )
     .await;
+
+    // A store of this account that nothing has written to is served and lists no group,
+    // which is also how one store's groups stay out of another's listing.
+    let empty = ok(
+        &router,
+        "ListGroups",
+        list_request("d-0c0d0e0f00", None, None),
+        case,
+    )
+    .await;
+    assert_eq!(
+        empty["Groups"].as_array().map(Vec::len),
+        Some(0),
+        "case {case:?}: expected a store nothing has written to to list no groups, got {empty}"
+    );
 }
 
 #[tokio::test]
@@ -589,20 +609,21 @@ async fn a_max_results_outside_the_modelled_range_is_refused() {
 }
 
 #[tokio::test]
-async fn an_identity_store_that_does_not_exist_is_reported_as_not_found() {
+async fn a_store_this_emulator_does_not_serve_is_not_found_and_an_unwritten_one_lists_nothing() {
     let router = emulator();
-    // Rows are the identifier FORMS of a store this emulator does not hold: the `d-`
-    // form, the UUID form and the store ARN.
-    let case = "unknown identity store";
-    let arn = format!(
-        "{STORE_ARN_PREFIX}{}:identitystore/d-00ff00ff00",
-        engine::emulator_account_id()
-    );
-    for store in [MISSING_STORE, UUID_STORE, arn.as_str()] {
+    // Rows are the identifier FORMS of a store this emulator does not serve: the ARN
+    // form is the one that carries the OWNING ACCOUNT, so each of these names another
+    // account's store — in the `d-` form and in the UUID form.
+    let case = "another account's identity store";
+    for store in [
+        MISSING_STORE.to_string(),
+        format!("{STORE_ARN_PREFIX}{OTHER_ACCOUNT}:identitystore/d-00ff00ff00"),
+        format!("{STORE_ARN_PREFIX}{OTHER_ACCOUNT}:identitystore/{UUID_STORE}"),
+    ] {
         let body = refused(
             &router,
             "ListGroups",
-            list_request(store, None, None),
+            list_request(&store, None, None),
             404,
             "ResourceNotFoundException",
             &format!("{case}: {store}"),
@@ -615,8 +636,33 @@ async fn an_identity_store_that_does_not_exist_is_reported_as_not_found() {
         );
     }
 
-    // The refusals brought no store into being, and the store that DOES exist still
-    // lists exactly what was created in it.
+    // A store of THIS account that nothing has written to is served and lists nothing, in
+    // every form that names it.
+    let case = "a store nothing has written to";
+    for store in [
+        "d-00ff00ff00".to_string(),
+        UUID_STORE.to_string(),
+        format!(
+            "{STORE_ARN_PREFIX}{}:identitystore/d-00ff00ff00",
+            engine::emulator_account_id()
+        ),
+    ] {
+        let listed = ok(
+            &router,
+            "ListGroups",
+            list_request(&store, None, None),
+            &format!("{case}: {store}"),
+        )
+        .await;
+        assert_eq!(
+            listed["Groups"].as_array().map(Vec::len),
+            Some(0),
+            "case {case:?}: expected {store} to list no group, got {listed}"
+        );
+    }
+
+    // The reads wrote nothing, and the store a group was created in still lists exactly
+    // what was created in it — not what the other stores were read for.
     let group = create_group(
         &router,
         &json!({ "IdentityStoreId": STORE, "DisplayName": "first" }),
@@ -629,11 +675,10 @@ async fn an_identity_store_that_does_not_exist_is_reported_as_not_found() {
         vec![group],
         "case {case:?}: expected the created group to be the whole listing, got {listed:?}"
     );
-    // ...and the stores that do not exist are still unknown.
-    let (status, code, _) = call(&router, "ListGroups", list_request(UUID_STORE, None, None)).await;
+    let (status, code, body) = call(&router, "ListGroups", list_request(UUID_STORE, None, None)).await;
     assert_eq!(
-        (status, code.contains("ResourceNotFoundException")),
-        (404, true),
-        "case {case:?}: expected a read never to vivify a store, got {status} {code}"
+        (status, code.as_str(), body["Groups"].as_array().map(Vec::len)),
+        (200, "", Some(0)),
+        "case {case:?}: expected a read to leave that store empty, got {status} {code} {body}"
     );
 }

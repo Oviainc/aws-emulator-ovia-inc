@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteKnowledgeBase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteKnowledgeBase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteKnowledgeBase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Forgets the knowledge base the request addresses — by id or by ARN — and answers the
+//! modelled empty body (HTTP 204). After it, every read of that knowledge base is the
+//! not-found its own operation models, and the name the record held is free again.
+//! A label this account holds no knowledge base under is `ResourceNotFoundException`
+//! (HTTP 404), which is also what a repeated delete of the same knowledge base gets.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +148,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteKnowledgeBase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteKnowledgeBaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteKnowledgeBase"))
+        // The modelled `UuidOrArn` pattern on `knowledgeBaseId` is already refused
+        // BEFORE this handler runs, so reaching here means the label is a well-formed id
+        // or ARN; whether it names a knowledge base this account holds is decided below,
+        // out of the store.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("DeleteKnowledgeBase")
+        })?;
+        let mut store = state.lock();
+
+        // The record and every index entry that named it go together, so a later read
+        // cannot answer out of a leftover index.
+        if store
+            .remove_knowledge_base(&input.knowledge_base_id)
+            .is_none()
+        {
+            return Err(DeleteKnowledgeBaseErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND.to_string()),
+                    resource_name: Some(input.knowledge_base_id.clone()),
+                },
+            )
+            .into());
+        }
+        Ok(DeleteKnowledgeBaseOutput {})
     }
 }

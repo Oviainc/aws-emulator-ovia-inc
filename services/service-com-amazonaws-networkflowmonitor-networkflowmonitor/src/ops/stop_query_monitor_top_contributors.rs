@@ -161,6 +161,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(::std::time::SystemTime::now());
 
+        // The monitor the query hangs off, before the query itself: this operation
+        // models no `ResourceNotFoundException`, so a monitor reference the store
+        // cannot resolve — and therefore cannot authorize — is the modelled 403
+        // rather than a refusal naming the `queryId`.
+        if !state.monitors.contains_key(&input.monitor_name) {
+            return Err(
+                StopQueryMonitorTopContributorsErrorModeled::AccessDeniedException(
+                    crate::state::reference_denied(crate::state::MONITOR_RESOURCE),
+                )
+                .into(),
+            );
+        }
+
         let Some(query) = state.query_mut(
             crate::state::QueryKind::MonitorTopContributors,
             &input.monitor_name,

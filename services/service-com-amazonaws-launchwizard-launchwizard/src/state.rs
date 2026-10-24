@@ -40,6 +40,14 @@ pub const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 /// See [`STATUS_CREATING`].
 pub const STATUS_COMPLETED: &str = "COMPLETED";
 /// See [`STATUS_CREATING`].
+///
+/// `UPDATE_IN_PROGRESS` and `UPDATE_COMPLETED` are the two `DeploymentStatus` members
+/// the model declares for an UPDATE of a deployment, which is why an update moves a
+/// deployment through them rather than through the create pair.
+pub const STATUS_UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
+/// See [`STATUS_UPDATE_IN_PROGRESS`].
+pub const STATUS_UPDATE_COMPLETED: &str = "UPDATE_COMPLETED";
+/// See [`STATUS_CREATING`].
 pub const STATUS_DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
 /// See [`STATUS_CREATING`].
 pub const STATUS_DELETE_INITIATING: &str = "DELETE_INITIATING";
@@ -90,6 +98,16 @@ pub const COMPARATOR_NOT_EQUAL: &str = "NotEqual";
 /// deployment-pattern-version operations extend this when they are implemented.
 pub const CATALOGUE_VERSION: &str = "1.0.0";
 
+/// The message an update of a deployment that is going away is refused with.
+///
+/// A deployment whose delete has started no longer has settings to apply, so an
+/// update of it is refused rather than applied. Fixed and identifier-free like the
+/// not-found messages above; AWS documents no wording for it, so this text is CHOSEN
+/// and only the status (HTTP 400) and the modelled `ValidationException` code are the
+/// contract.
+pub const DEPLOYMENT_NOT_UPDATABLE_MESSAGE: &str =
+    "The specified deployment is being deleted and cannot be updated.";
+
 /// The message a deployment lookup that finds nothing carries.
 ///
 /// Launch Wizard's `ResourceNotFoundException` message is FIXED per kind of resource
@@ -126,6 +144,18 @@ pub const DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE: &str =
 /// `ResourceLimitException`, which is exactly what Launch Wizard answers when a
 /// deployment limit is exceeded.
 pub const MAX_DEPLOYMENTS: usize = 200;
+
+/// How many events ONE deployment's history keeps.
+///
+/// AWS publishes no bound on a deployment's event history, so this is the EMULATOR's
+/// own ceiling, not a claim about the service: the store lives for the life of the
+/// process and `UpdateDeployment` can be called on the same deployment any number of
+/// times, each call appending to that deployment's log, so the log needs a ceiling of
+/// its own — the number of deployment RECORDS ([`MAX_DEPLOYMENTS`]) does not bound it.
+/// Reaching it drops the OLDEST events, the way the other per-resource event logs in
+/// this workspace are bounded (cloudformation's `MAX_EVENTS_PER_STACK`), so the most
+/// recent history — what a caller polls for — is the part that is kept.
+pub const MAX_EVENTS_PER_DEPLOYMENT: usize = 200;
 
 /// The page size a list operation uses when the caller names no `maxResults`.
 ///
@@ -452,6 +482,16 @@ pub struct Deployment {
     /// Tags live here, on the deployment, keyed by nothing else — so the tagging
     /// operations can be layered on without a second store.
     pub tags: BTreeMap<String, String>,
+    /// The `WorkloadVersionName` this deployment deploys: the catalogue version of its
+    /// workload at create time, and whatever version `UpdateDeployment` last named.
+    ///
+    /// No output shape in this model carries a deployment's version (neither
+    /// `DeploymentData` nor `DeploymentDataSummary` declares one), so it is observable
+    /// through the deployment event an update appends rather than as a response member.
+    pub workload_version_name: String,
+    /// The `DeploymentPatternVersionName` this deployment deploys. See
+    /// [`Deployment::workload_version_name`].
+    pub pattern_version_name: String,
     pub created_at: SystemTime,
     pub modified_at: SystemTime,
     pub deleted_at: Option<SystemTime>,
@@ -461,6 +501,20 @@ pub struct Deployment {
 }
 
 impl Deployment {
+    /// Append `event` to this deployment's history, dropping the OLDEST events once
+    /// the log is over [`MAX_EVENTS_PER_DEPLOYMENT`].
+    ///
+    /// EVERY append goes through here: the log is the one part of a deployment record
+    /// that a repeatable call can grow, so the ceiling is enforced where the growth
+    /// happens rather than at each caller.
+    pub fn append_event(&mut self, event: DeploymentEvent) {
+        self.events.push(event);
+        if self.events.len() > MAX_EVENTS_PER_DEPLOYMENT {
+            let overflow = self.events.len() - MAX_EVENTS_PER_DEPLOYMENT;
+            self.events.drain(..overflow);
+        }
+    }
+
     /// Materialise every status step whose `due_at` has already passed.
     ///
     /// This is the one write a reporting operation is allowed to make: each step was
@@ -478,7 +532,7 @@ impl Deployment {
             if self.status == STATUS_DELETED {
                 self.deleted_at = Some(step.due_at);
             }
-            self.events.push(step.event);
+            self.append_event(step.event);
         }
     }
 
@@ -1111,6 +1165,81 @@ pub fn constraint_refusal(
 ) -> Option<String> {
     let violations = ::aws_smithy_schema_server::constraints::validate(value, schema);
     (!violations.is_empty()).then(|| validation_report(&violations))
+}
+
+/// The validation warnings a submitted `specifications` map raises against the
+/// specification schema of the deployment pattern it is submitted for — the SAME
+/// schema `GetWorkloadDeploymentPattern` reports for that pattern.
+///
+/// Launch Wizard judges a deployment's settings against the schema of the pattern it
+/// deploys, and `UpdateDeployment$force` exists to apply an update "even if validation
+/// warnings are present" — so these are the warnings that member overrides. Each one
+/// is a statement the STORED schema makes about the submitted map: a setting the
+/// pattern does not define, a value outside a field's `allowedValues`, and a field the
+/// pattern marks required that the map does not carry.
+///
+/// `DeploymentSpecifications` is `@sensitive`, so a warning names the KEY it is about
+/// (a caller cannot fix the request otherwise) and never the submitted VALUE; an
+/// `allowedValues` warning lists the values the SCHEMA allows, which is the pattern's
+/// own published vocabulary rather than anything the caller sent.
+///
+/// The order is the schema's own then the submitted map's (both ordered), so one
+/// request always produces the same report.
+pub fn specification_warnings(
+    pattern: &DeploymentPattern,
+    specifications: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for field in &pattern.specifications {
+        match specifications.get(&field.name) {
+            None if field.required => warnings.push(format!(
+                "'{}' is required by deployment pattern '{}'",
+                field.name, pattern.pattern_name
+            )),
+            None => {}
+            Some(value) => {
+                let allowed = &field.allowed_values;
+                if !allowed.is_empty() && !allowed.iter().any(|candidate| candidate == value) {
+                    warnings.push(format!(
+                        "the value of '{}' is not one of the values deployment pattern '{}' \
+                         allows for it [{}]",
+                        field.name,
+                        pattern.pattern_name,
+                        allowed.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+    for name in specifications.keys() {
+        if !pattern.specifications.iter().any(|f| &f.name == name) {
+            warnings.push(format!(
+                "'{name}' is not a specification of deployment pattern '{}'",
+                pattern.pattern_name
+            ));
+        }
+    }
+    warnings
+}
+
+/// The `ValidationException` message an update refused for its specification warnings
+/// carries: every warning, and the member that applies the update regardless.
+///
+/// Worded like [`validation_report`] — how many clauses, then the clauses — because a
+/// caller reads both the same way. AWS documents no text for this refusal, so only the
+/// HTTP 400 and the modelled `ValidationException` code are the contract.
+pub fn specification_warning_refusal(warnings: &[String]) -> String {
+    let noun = if warnings.len() == 1 {
+        "warning"
+    } else {
+        "warnings"
+    };
+    format!(
+        "{} validation {noun} detected: {}; resubmit with force set to true to update the \
+         deployment anyway.",
+        warnings.len(),
+        warnings.join("; ")
+    )
 }
 
 /// A `SystemTime` as the modelled `Timestamp` the wire carries.

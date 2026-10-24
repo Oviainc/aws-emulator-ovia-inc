@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/config_listing.rs"]
 mod config_listing;
+#[path = "all/dataflow_endpoint_groups.rs"]
+mod dataflow_endpoint_groups;
 #[path = "all/lifecycle_writes.rs"]
 mod lifecycle_writes;
 #[path = "all/minute_usage.rs"]

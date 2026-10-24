@@ -7,26 +7,36 @@
 //! database holds tables. Every handler reads and writes THIS store, so a
 //! `CreateTable` in one request is visible to a `GetTable` in the next.
 //!
-//! Crawlers sit BESIDE that tree, in one per-account namespace keyed by crawler name:
+//! Beside the catalog the store holds the two account-level resources an ETL client
+//! registers: JOB DEFINITIONS (`CreateJob` writes one, `GetJob` reads it back) and, inside
+//! each catalog, CONNECTION definitions (`CreateConnection` / `GetConnection`). A job is
+//! named per account ("The name you assign to this job definition. It must be unique in
+//! your account" — `CreateJobRequest$Name`) and a connection per catalog, which is where
+//! each lives here.
+//!
+//! Crawlers sit BESIDE that tree too, in one per-account namespace keyed by crawler name:
 //! every operation that addresses a crawler does so by name alone, so a crawler's
 //! `CatalogId` says where its output goes, not where the crawler itself lives.
 //!
 //! Database and table names are folded to lowercase on the way in — the model says
 //! so for both `DatabaseInput$Name` ("For Hive compatibility, this is folded to
 //! lowercase when it is stored") and `TableInput$Name` — and every lookup folds the
-//! requested name the same way, so the fold cannot make a resource unreachable.
+//! requested name the same way, so the fold cannot make a resource unreachable. A JOB,
+//! CONNECTION or CRAWLER name is NOT folded: the model documents the fold for the two
+//! Hive-compatible catalog resources only.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    CodeGenConfigurationNode, Column, ConnectionsList, Crawler, CrawlerTargets, CreateCrawlerInput,
-    CreateJobInput, DataLakePrincipal, Database, DatabaseIdentifier, DatabaseInput, ErrorDetail,
-    ExecutionProperty, FederatedDatabase, FederatedTable, Job, JobCommand,
-    LakeFormationConfiguration, LineageConfiguration, NotificationProperty, PrincipalPermissions,
-    RLSProperties, RecrawlPolicy, Schedule, SchemaChangePolicy, SourceControlDetails,
-    StorageDescriptor, Table, TableIdentifier, TableInput,
+    CodeGenConfigurationNode, Column, Connection, ConnectionInput, ConnectionsList, Crawler,
+    CrawlerTargets, CreateCrawlerInput, CreateJobInput, DataLakePrincipal, Database,
+    DatabaseIdentifier, DatabaseInput, ErrorDetail, ExecutionProperty, FederatedDatabase,
+    FederatedTable, Job, JobCommand, LakeFormationConfiguration, LineageConfiguration,
+    NotificationProperty, PrincipalPermissions, RLSProperties, RecrawlPolicy, Schedule,
+    SchemaChangePolicy, SourceControlDetails, StorageDescriptor, Table, TableIdentifier,
+    TableInput,
 };
 
 /// Ceiling on the databases one catalog may hold.
@@ -45,6 +55,36 @@ pub const MAX_TABLES_PER_DATABASE: usize = 1_000;
 /// Bounds the product of the two per-container ceilings, which on its own would still
 /// let a caller grow the store far past what one process should hold.
 pub const MAX_STORED_TABLES: usize = 10_000;
+
+/// Ceiling on the connection definitions one catalog may hold, for the same reason as
+/// [`MAX_JOBS`].
+pub const MAX_CONNECTIONS_PER_CATALOG: usize = 1_000;
+
+/// The `ConnectionProperties` key holding a connection's password: "`PASSWORD` - A
+/// password, if one is used, for the user name." (`Connection$ConnectionProperties`.) It is
+/// what `GetConnection`'s `HidePassword` withholds.
+pub const PASSWORD_PROPERTY: &str = "PASSWORD";
+
+/// The `ConnectionProperties` key holding the encrypted form of that password: "
+/// `ENCRYPTED_PASSWORD` - When you enable connection password protection … this field
+/// stores the encrypted password." Withheld with [`PASSWORD_PROPERTY`].
+pub const ENCRYPTED_PASSWORD_PROPERTY: &str = "ENCRYPTED_PASSWORD";
+
+/// `Connection$ConnectionSchemaVersion` for a connection whose properties are the version 1
+/// set, and for one carrying the per-compute-environment properties: "The version of the
+/// connection schema for this connection. Version 2 supports properties for specific
+/// compute environments."
+pub const CONNECTION_SCHEMA_VERSION_V1: i32 = 1;
+/// See [`CONNECTION_SCHEMA_VERSION_V1`].
+pub const CONNECTION_SCHEMA_VERSION_V2: i32 = 2;
+
+/// The three values the model's `ComputeEnvironment` enum carries, which
+/// `GetConnection$ApplyOverrideForComputeEnvironment` names one of.
+pub const COMPUTE_ENVIRONMENT_SPARK: &str = "SPARK";
+/// See [`COMPUTE_ENVIRONMENT_SPARK`].
+pub const COMPUTE_ENVIRONMENT_ATHENA: &str = "ATHENA";
+/// See [`COMPUTE_ENVIRONMENT_SPARK`].
+pub const COMPUTE_ENVIRONMENT_PYTHON: &str = "PYTHON";
 
 /// Ceiling on the crawlers this emulator will hold, for the same reason as
 /// [`MAX_DATABASES_PER_CATALOG`]: resident memory bounded against a create any caller
@@ -232,6 +272,14 @@ impl ComAmazonawsGlueAwsglueState {
             .and_then(|catalog| catalog.databases.get_mut(&fold_name(name)))
     }
 
+    /// The stored connection definition `name` of `catalog_id`, or `None` when either the
+    /// catalog or the connection is absent.
+    pub fn connection(&self, catalog_id: &str, name: &str) -> Option<&ConnectionEntry> {
+        self.catalogs
+            .get(catalog_id)
+            .and_then(|catalog| catalog.connections.get(name))
+    }
+
     /// How many tables the whole store holds. Bounded by the ceilings above, so this
     /// walk is over at most [`MAX_DATABASES_PER_CATALOG`] entries per catalog.
     pub fn stored_tables(&self) -> usize {
@@ -269,6 +317,8 @@ impl ComAmazonawsGlueAwsglueState {
 pub struct Catalog {
     /// Databases keyed by their folded (lowercased) name.
     pub databases: HashMap<String, DatabaseEntry>,
+    /// Connection definitions keyed by `ConnectionInput$Name`, in name order.
+    pub connections: BTreeMap<String, ConnectionEntry>,
 }
 
 impl Catalog {
@@ -276,6 +326,12 @@ impl Catalog {
     /// [`MAX_DATABASES_PER_CATALOG`].
     pub fn can_store_database(&self) -> bool {
         self.databases.len() < MAX_DATABASES_PER_CATALOG
+    }
+
+    /// Whether this catalog can hold another connection, i.e. is below
+    /// [`MAX_CONNECTIONS_PER_CATALOG`].
+    pub fn can_store_connection(&self) -> bool {
+        self.connections.len() < MAX_CONNECTIONS_PER_CATALOG
     }
 }
 
@@ -743,6 +799,30 @@ pub const DEFAULT_TIMEOUT_MINUTES_FROM_GLUE_5: i32 = 480;
 /// days or 10080 minutes. Otherwise, the jobs will throw an exception." (`Job$Timeout`)
 pub const MAX_TIMEOUT_MINUTES: i32 = 10_080;
 
+/// The `JobCommand$Name` of an Apache Spark ETL job, which is the only command
+/// `ExecutionClass=FLEX` may be set on, and the `ExecutionClass` that restriction is
+/// about: "Only jobs with Glue version 3.0 and above and command type `glueetl` will be
+/// allowed to set `ExecutionClass` to `FLEX`." (`CreateJob$ExecutionClass`.)
+pub const SPARK_ETL_COMMAND: &str = "glueetl";
+/// See [`SPARK_ETL_COMMAND`].
+pub const EXECUTION_CLASS_FLEX: &str = "FLEX";
+/// The lowest `GlueVersion` that sentence admits `FLEX` on.
+pub const MIN_FLEX_GLUE_VERSION: f64 = 3.0;
+
+/// Whether a job's command and Glue version are the pair `ExecutionClass=FLEX` is allowed
+/// on, by the sentence quoted on [`SPARK_ETL_COMMAND`].
+///
+/// A `GlueVersion` this cannot read as a number (the model's pattern `^(\w+\.)+\w+$` is
+/// wider than a decimal) admits nothing: the restriction is stated over a version
+/// comparison, so a version that cannot be compared does not satisfy it.
+pub fn admits_flex_execution_class(command: &JobCommand, glue_version: &str) -> bool {
+    let spark_etl = command.name.as_deref() == Some(SPARK_ETL_COMMAND);
+    let version_admits = glue_version
+        .parse::<f64>()
+        .is_ok_and(|version| version >= MIN_FLEX_GLUE_VERSION);
+    spark_etl && version_admits
+}
+
 /// The first Glue major version that takes [`DEFAULT_TIMEOUT_MINUTES_FROM_GLUE_5`].
 const FIRST_GLUE_MAJOR_VERSION_WITH_SHORT_DEFAULT_TIMEOUT: u32 = 5;
 
@@ -984,6 +1064,141 @@ pub fn is_cron_expression(expression: &str) -> bool {
 /// address its only version by — numbering the first version `"1"` left version `"0"`
 /// unfetchable. `VersionString` is a string, so the id is formatted as one.
 pub const FIRST_TABLE_VERSION_ID: &str = "0";
+
+/// A stored connection definition: the `Connection` every read projects, plus the tags the
+/// create carried.
+#[derive(Debug, Clone)]
+pub struct ConnectionEntry {
+    /// `Name`, which is also this entry's key in [`Catalog::connections`].
+    pub name: String,
+    /// What a read of this connection reports, before `HidePassword` is applied.
+    pub definition: Connection,
+    /// `CreateConnectionRequest$Tags`.
+    pub tags: HashMap<String, String>,
+}
+
+impl ConnectionEntry {
+    /// Build a stored connection definition from the client's `ConnectionInput`.
+    ///
+    /// `CreationTime` and `LastUpdatedTime` are both the instant of the create (nothing has
+    /// updated the definition yet), `LastUpdatedBy` is the principal that issued it, and
+    /// `ConnectionSchemaVersion` is 2 exactly when the input carried the
+    /// per-compute-environment property maps version 2 adds ("Version 2 supports properties
+    /// for specific compute environments"), else 1.
+    pub fn from_input(
+        input: &ConnectionInput,
+        last_updated_by: Option<String>,
+        tags: Option<&HashMap<String, String>>,
+        now: SystemTime,
+    ) -> Self {
+        let compute_environment_properties = [
+            input.spark_properties.as_ref(),
+            input.athena_properties.as_ref(),
+            input.python_properties.as_ref(),
+        ]
+        .iter()
+        .any(|properties| properties.is_some_and(|map| !map.is_empty()));
+        let at = to_date_time(now);
+        Self {
+            name: input.name.clone(),
+            definition: Connection {
+                name: Some(input.name.clone()),
+                description: input.description.clone(),
+                connection_type: Some(input.connection_type.clone()),
+                match_criteria: input.match_criteria.clone(),
+                connection_properties: Some(input.connection_properties.clone()),
+                spark_properties: input.spark_properties.clone(),
+                athena_properties: input.athena_properties.clone(),
+                python_properties: input.python_properties.clone(),
+                physical_connection_requirements: input.physical_connection_requirements.clone(),
+                creation_time: Some(at),
+                last_updated_time: Some(at),
+                last_updated_by,
+                // `Status`/`StatusReason` report the outcome of VALIDATING the connection
+                // ("Can be one of: READY, IN_PROGRESS, or FAILED"), and this emulator
+                // connects to nothing, so it reports no status and no validation instant
+                // rather than inventing one.
+                status: None,
+                status_reason: None,
+                last_connection_validation_time: None,
+                // The authentication configuration a read reports is the one the input
+                // declared, with its credentials left where they were: an
+                // `AuthenticationConfigurationInput` carries secrets
+                // (`BasicAuthenticationCredentials`, OAuth2 credentials) that the response
+                // shape has no member for, and nothing here copies them into one.
+                authentication_configuration: input.authentication_configuration.as_ref().map(
+                    |configuration| crate::ops::types::AuthenticationConfiguration {
+                        authentication_type: configuration.authentication_type.clone(),
+                        secret_arn: configuration.secret_arn.clone(),
+                        kms_key_arn: configuration.kms_key_arn.clone(),
+                        o_auth2_properties: None,
+                    },
+                ),
+                connection_schema_version: Some(if compute_environment_properties {
+                    CONNECTION_SCHEMA_VERSION_V2
+                } else {
+                    CONNECTION_SCHEMA_VERSION_V1
+                }),
+                // "A list of compute environments compatible with the connection" is a
+                // property of the connection TYPE, which this emulator does not model.
+                compatible_compute_environments: None,
+            },
+            tags: tags.cloned().unwrap_or_default(),
+        }
+    }
+
+    /// What a read of this connection reports.
+    ///
+    /// `hide_password` is `GetConnectionRequest$HidePassword`: "Allows you to retrieve the
+    /// connection metadata without returning the password", and
+    /// `compute_environment` is `GetConnectionRequest$ApplyOverrideForComputeEnvironment`:
+    /// "For connections that may be used in multiple services, specifies returning
+    /// properties for the specified compute environment" — that environment's own property
+    /// map overlays the connection's, key by key, so a property only that environment sets
+    /// is reported and one it does not set keeps the connection's value.
+    ///
+    /// The overlay is applied FIRST and the password properties are withheld from EVERY
+    /// property map the answer carries — the connection's own and each
+    /// per-compute-environment one — because a per-environment map may itself carry a
+    /// `PASSWORD`, and "without returning the password" is about the password, not about
+    /// one member.
+    pub fn to_connection(
+        &self,
+        hide_password: bool,
+        compute_environment: Option<&str>,
+    ) -> Connection {
+        let mut connection = self.definition.clone();
+        let overrides = match compute_environment {
+            Some(COMPUTE_ENVIRONMENT_SPARK) => connection.spark_properties.clone(),
+            Some(COMPUTE_ENVIRONMENT_ATHENA) => connection.athena_properties.clone(),
+            Some(COMPUTE_ENVIRONMENT_PYTHON) => connection.python_properties.clone(),
+            // The model's `ComputeEnvironment` enum carries exactly those three, and the
+            // request walk refuses any other value before a handler runs.
+            _ => None,
+        };
+        if let Some(overrides) = overrides {
+            connection
+                .connection_properties
+                .get_or_insert_with(Default::default)
+                .extend(overrides);
+        }
+        if hide_password {
+            for properties in [
+                connection.connection_properties.as_mut(),
+                connection.spark_properties.as_mut(),
+                connection.athena_properties.as_mut(),
+                connection.python_properties.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                properties.remove(PASSWORD_PROPERTY);
+                properties.remove(ENCRYPTED_PASSWORD_PROPERTY);
+            }
+        }
+        connection
+    }
+}
 
 /// The `VersionId` that follows `current`: the stored counter plus one.
 ///

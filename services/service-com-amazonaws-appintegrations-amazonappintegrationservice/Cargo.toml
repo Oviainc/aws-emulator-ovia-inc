@@ -30,9 +30,10 @@ service-common = { path = "../common" }
 # in-process callback into this same emulator (no network client feature is enabled: the
 # transport is the emulator's own).
 aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
-# The `Id` of a DataIntegration is a v4 UUID (model: `CreateDataIntegrationResponse.Id`
-# -> `UUID`, pattern ^[a-f0-9]{8}-[a-f0-9]{4}-...$), minted with the maintained crate
-# rather than hand-formatted from a random number.
+# The `Id` of an Application and of a DataIntegration is a v4 UUID (model:
+# `CreateApplicationResponse.Id` / `CreateDataIntegrationResponse.Id` -> `UUID`, pattern
+# ^[a-f0-9]{8}-[a-f0-9]{4}-...$), minted with the maintained crate rather than
+# hand-formatted from a random number.
 uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]

@@ -2853,13 +2853,13 @@ fn name_and_qualifier(value: &str, was_arn: bool) -> Option<FunctionReference> {
 /// What a `TaggableResource` ARN — the `Resource` label of the
 /// `/2017-03-31/tags/{Resource}` operations — names.
 ///
-/// The member's own pattern admits exactly five Lambda resource types
+/// The member's own pattern admits exactly six Lambda resource types
 /// (`smithy_query(query="operation", operation="ListTags")`): a function, optionally
-/// qualified by a published version or an alias, a code-signing configuration, an event
-/// source mapping, a capacity provider and a network connector. A function and a capacity
-/// provider are the ones this store holds records of; the rest are reported by their
-/// resource type and answered as what is true of them here — a resource of that type this
-/// account does not have.
+/// qualified by a published version or an alias, a layer, a code-signing configuration, an
+/// event source mapping, a capacity provider and a network connector. A function, a
+/// capacity provider and an event source mapping are the ones this store holds records of;
+/// the rest are reported by their resource type and answered as what is true of them here
+/// — a resource of that type this account does not have.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaggableResourceRef {
     /// `…:function:<name>` — one function, whose tag set is
@@ -3244,6 +3244,12 @@ mod tests {
             (
                 "arn:aws:lambda:us-east-1:000000000000:network-connector:link-1",
                 Some(TaggableResourceRef::Other("network-connector".to_string())),
+            ),
+            // `layer:([a-zA-Z0-9-_]+)` — a layer is a taggable Lambda resource this
+            // store holds no records of, so it is named by its resource type.
+            (
+                "arn:aws:lambda:us-east-1:000000000000:layer:my-layer",
+                Some(TaggableResourceRef::Other("layer".to_string())),
             ),
             ("arn:aws:sqs:us-east-1:000000000000:queue:q", None),
             ("my-function", None),

@@ -40,7 +40,10 @@ const PAGE_SIZE_MIN: i64 = 1;
 const PAGE_SIZE_MAX: i64 = 400;
 
 /// One awsQuery call to `action_name` with the extra form fields `fields`.
-async fn describe(
+///
+/// `pub(crate)` because `all/ssl_policies.rs` — the suite that pages this same
+/// catalogue — makes its calls through it, so one encoder and one reader serve both.
+pub(crate) async fn describe(
     router: &MultiServiceRouter,
     action_name: &str,
     fields: &[(String, String)],
@@ -301,12 +304,12 @@ async fn the_account_limits_catalogue_pages_in_one_stable_order() {
 // ---------------------------------------------------------------------------
 
 /// The `<member>` XML of each policy the reply reports.
-fn reported_policies(reply: &Reply) -> Vec<String> {
+pub(crate) fn reported_policies(reply: &Reply) -> Vec<String> {
     members(&reply.body, "SslPolicies")
 }
 
 /// The policy names the reply reports, in the order it reported them.
-fn reported_policy_names(reply: &Reply) -> Vec<String> {
+pub(crate) fn reported_policy_names(reply: &Reply) -> Vec<String> {
     reported_policies(reply)
         .iter()
         .map(|policy| policy_name(policy))
@@ -318,7 +321,7 @@ fn reported_policy_names(reply: &Reply) -> Vec<String> {
 /// `SslPolicy` serializes in its schema's member order — `SslProtocols`, `Ciphers`,
 /// `Name`, `SupportedLoadBalancerTypes` — and every cipher carries a `<Name>` of its
 /// own, so the policy's own name is read from the text AFTER the cipher list.
-fn policy_name(member: &str) -> String {
+pub(crate) fn policy_name(member: &str) -> String {
     let tail = member
         .split_once("</Ciphers>")
         .map(|(_, tail)| tail)

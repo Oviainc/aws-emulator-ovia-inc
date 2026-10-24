@@ -30,6 +30,9 @@ hex = { workspace = true }
 # id in this service is minted with (cluster/compute-quota/scheduler-config ids, EC2
 # instance ids, node logical ids, presigned-URL grant tokens).
 sha2 = { workspace = true }
+# RFC 3986 percent-encoding, for the authorization token a presigned MLflow URL carries
+# in a query parameter (the minted secret's alphabet includes `+` and `/`).
+percent-encoding = "2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

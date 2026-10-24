@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetHealthEvent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetHealthEvent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetHealthEvent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the one health event [`crate::state`] holds for the monitor and `EventId` the
+//! request names — the single-event read of what `ListHealthEvents` pages over, out of the
+//! same store, so the two can never disagree.
+//!
+//! Internet Monitor raises health events itself, from the internet-measurement pipeline it
+//! runs behind a monitor, and its API has no operation that creates one. So an `EventId`
+//! nothing recorded names no event, which is a refusal rather than an invented event: the
+//! modelled `ValidationException` (HTTP 400), whose message is built from the resource the
+//! request named — `resourceID is invalid: health-event/<MonitorName>/<EventId>`, the
+//! template the real service answers with for a health event this account does not hold.
 //!
 //! ## Shape of an operation
 //!
@@ -179,20 +181,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetHealthEvent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetHealthEventErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetHealthEvent"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetHealthEventError::Modeled(GetHealthEventErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("monitor store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // This emulator serves exactly one account, so the only id that can name monitors
+        // reachable here is its own.
+        if let Some(linked) = input.linked_account_id.as_deref() {
+            if linked != ::engine::emulator_account_id() {
+                return Err(GetHealthEventErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "LinkedAccountId {linked} is not an account linked to this monitoring account."
+                    )),
+                })
+                .into());
+            }
+        }
+
+        let store = state.lock();
+
+        // A health event belongs to a monitor, and a deleted monitor releases its events,
+        // so one lookup answers both "no such monitor" and "no such event": the resource
+        // the request names is not one this account holds. The message is AWS's
+        // request-derived template, built from the resource path the request named.
+        let event = store
+            .monitors
+            .contains_key(&input.monitor_name)
+            .then(|| {
+                store
+                    .health_events
+                    .get(&(input.monitor_name.clone(), input.event_id.clone()))
+            })
+            .flatten();
+        let Some(event) = event else {
+            return Err(GetHealthEventErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "resourceID is invalid: health-event/{}/{}",
+                    input.monitor_name, input.event_id
+                )),
+            })
+            .into());
+        };
+
+        Ok(GetHealthEventOutput {
+            event_arn: event.arn.clone(),
+            event_id: event.event_id.clone(),
+            started_at: crate::state::wire_timestamp(event.started_at),
+            ended_at: event.ended_at.map(crate::state::wire_timestamp),
+            created_at: Some(crate::state::wire_timestamp(event.created_at)),
+            last_updated_at: crate::state::wire_timestamp(event.last_updated_at),
+            impacted_locations: event.impacted_locations.clone(),
+            status: event.status().to_string(),
+            percent_of_total_traffic_impacted: event.percent_of_total_traffic_impacted,
+            impact_type: event.impact_type.clone(),
+            health_score_threshold: event.health_score_threshold,
+        })
     }
 }

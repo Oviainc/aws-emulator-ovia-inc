@@ -166,9 +166,10 @@ async fn a_user_is_resolved_by_every_documented_unique_attribute_path() {
 async fn resolution_is_stable_and_scoped_to_one_identity_store() {
     let router = emulator();
     // The answer depends on which store the request names — and repeating a read
-    // answers the same thing. The store that does not exist is the other side of that
-    // scope: it resolves nothing at all.
+    // answers the same thing. A second store of this account is the other side of that
+    // scope: the same `UserName` claimed in each resolves to that store's OWN user.
     let user_name = "shared-name";
+    let elsewhere_store = "d-1b2c3d4e5f";
     let (here, here_arn) = create_user(
         &router,
         STORE,
@@ -177,8 +178,23 @@ async fn resolution_is_stable_and_scoped_to_one_identity_store() {
         "one store",
     )
     .await;
+    let (elsewhere, elsewhere_arn) = create_user(
+        &router,
+        elsewhere_store,
+        user_name,
+        Some("elsewhere@example.test"),
+        "another store",
+    )
+    .await;
+    assert_ne!(
+        here, elsewhere,
+        "expected two stores to mint two users for the same UserName, got {here} twice"
+    );
 
-    for (store, expected_id, expected_arn) in [(STORE, &here, &here_arn)] {
+    for (store, expected_id, expected_arn) in [
+        (STORE, &here, &here_arn),
+        (elsewhere_store, &elsewhere, &elsewhere_arn),
+    ] {
         for attempt in 0..3 {
             let case = format!("{store} attempt {attempt}");
             let got = ok(
@@ -201,9 +217,10 @@ async fn resolution_is_stable_and_scoped_to_one_identity_store() {
         }
     }
 
-    // The same lookup addressed to a store that does not exist is refused, every time.
+    // The same lookup addressed to a store this emulator does not serve is refused,
+    // every time.
     for attempt in 0..3 {
-        let case = format!("a store that does not exist, attempt {attempt}");
+        let case = format!("another account's store, attempt {attempt}");
         let body = refused(
             &router,
             "GetUserId",
@@ -312,21 +329,21 @@ async fn an_identifier_no_user_carries_is_reported_as_not_found() {
         );
     }
 
-    // A store that does not exist is a different missing resource: the STORE, not the
-    // user the identifier names.
+    // An identifier naming no store this emulator serves is a different missing resource:
+    // the STORE, not the user the identifier names.
     let body = refused(
         &router,
         "GetUserId",
-        get_user_id("d-00000000ff", unique_attribute("userName", json!("present"))),
+        get_user_id(MISSING_STORE, unique_attribute("userName", json!("present"))),
         404,
         "ResourceNotFoundException",
-        "a store that does not exist",
+        "another account's store",
     )
     .await;
     assert_eq!(
         body.get("ResourceType").and_then(Value::as_str),
         Some("IDENTITY_STORE"),
-        "case \"a store that does not exist\": expected the store to be the missing \
+        "case \"another account's store\": expected the store to be the missing \
          resource, got {body}"
     );
 }
@@ -377,16 +394,17 @@ async fn an_identifier_the_service_resolves_no_user_by_is_refused() {
 #[tokio::test]
 async fn resolving_a_user_id_persists_nothing() {
     let router = emulator();
-    // `GetUserId` is `@readonly`: a read of a store that does not exist must not bring
-    // it into being, so the same read is refused however often it is made and a CREATE
-    // addressed to that store is refused too.
+    // `GetUserId` is `@readonly`: a read of a store nothing has written to must not
+    // write — it reports the user it holds none of, however often it is made, and the
+    // store still holds nothing afterwards (a `ListUsers` of it is empty), so a CREATE
+    // addressed to it afterwards is the FIRST user that store holds.
     let probe_stores: Vec<String> = (0..4)
         .map(|index| format!("d-{:010x}", 0xf000_0000u64 + index as u64))
         .collect();
     for store in &probe_stores {
         for attempt in 0..2 {
             let case = format!("read {attempt} of {store}");
-            refused(
+            let refusal = refused(
                 &router,
                 "GetUserId",
                 get_user_id(store, unique_attribute("userName", json!("nobody"))),
@@ -395,17 +413,47 @@ async fn resolving_a_user_id_persists_nothing() {
                 &case,
             )
             .await;
+            assert_eq!(
+                refusal.get("ResourceType").and_then(Value::as_str),
+                Some("USER"),
+                "case {case:?}: expected the USER to be the missing resource in a store \
+                 that is served, got {refusal}"
+            );
         }
-        let case = format!("create in {store} after the reads");
-        refused(
+        let case = format!("the store {store} still holds nothing");
+        let listed = ok(
             &router,
-            "CreateUser",
-            json!({ "IdentityStoreId": store.clone(), "UserName": "first" }),
-            404,
-            "ResourceNotFoundException",
+            "ListUsers",
+            json!({ "IdentityStoreId": store.clone() }),
             &case,
         )
         .await;
+        assert_eq!(
+            listed["Users"].as_array().map(Vec::len),
+            Some(0),
+            "case {case:?}: expected the reads to have written nothing, got {listed}"
+        );
+        let case = format!("create in {store} after the reads");
+        let created = ok(
+            &router,
+            "CreateUser",
+            json!({ "IdentityStoreId": store.clone(), "UserName": "first" }),
+            &case,
+        )
+        .await;
+        let resolved = ok(
+            &router,
+            "GetUserId",
+            get_user_id(store, unique_attribute("userName", json!("first"))),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            string(&resolved, "UserId", &case),
+            string(&created, "UserId", &case),
+            "case {case:?}: expected the created user to resolve in the store it was \
+             created in, got {resolved}"
+        );
     }
 
     // A SUCCESSFUL read persists nothing either: the user resolved in the store that

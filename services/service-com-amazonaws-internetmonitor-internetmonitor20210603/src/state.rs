@@ -8,6 +8,10 @@
 //! answer from this one store, so a create is observable from a get/list and a delete is
 //! observable as an absence.
 //!
+//! A monitor's **health events** live beside it, in one store keyed by
+//! `(MonitorName, EventId)`, so `ListHealthEvents` reports exactly the events recorded for
+//! the monitor it names and a monitor nothing has recorded an event for reports none.
+//!
 //! The small helpers below (region, ARN, wire timestamp, page token) live beside the
 //! store rather than in one operation's file because several handlers need exactly the
 //! same rule and two copies of it would be two rules.
@@ -15,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{HealthEventsConfig, InternetMeasurementsLogDelivery};
+use crate::ops::types::{HealthEventsConfig, ImpactedLocation, InternetMeasurementsLogDelivery};
 
 /// `MonitorConfigState` members, as the model spells them (see
 /// `crate::ops::types::MONITOR_CONFIG_STATE_VALUES`).
@@ -30,6 +34,12 @@ pub const MONITOR_STATE_INACTIVE: &str = "INACTIVE";
 pub const PROCESSING_STATUS_COLLECTING_DATA: &str = "COLLECTING_DATA";
 /// See [`PROCESSING_STATUS_COLLECTING_DATA`].
 pub const PROCESSING_STATUS_INACTIVE: &str = "INACTIVE";
+
+/// `HealthEventStatus` members, as the model spells them (see
+/// `crate::ops::types::HEALTH_EVENT_STATUS_VALUES`).
+pub const HEALTH_EVENT_STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`HEALTH_EVENT_STATUS_ACTIVE`].
+pub const HEALTH_EVENT_STATUS_RESOLVED: &str = "RESOLVED";
 
 /// The region an emulated ARN carries when the request names none.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -82,6 +92,14 @@ pub const MAX_RESOURCES_PER_MONITOR: usize = 100;
 /// (`smithy_query(query="doc",shape="CreateMonitorInput",member="Tags")`). `TagMap`'s own
 /// 0..200 length bounds one REQUEST, not the stored map that `TagResource` merges into.
 pub const MAX_TAGS_PER_MONITOR: usize = 50;
+
+/// The most health events this emulator holds for one monitor.
+///
+/// A bound on the store, not a claim about an AWS quota: [`HealthEventRecord`]s live as
+/// long as the process, so the collection needs a ceiling just as the monitor store does.
+/// [`ComAmazonawsInternetmonitorInternetmonitor20210603State::record_health_event`]
+/// refuses a record past the ceiling rather than growing without limit.
+pub const MAX_HEALTH_EVENTS_PER_MONITOR: usize = 100;
 
 /// One idempotency record: the monitor a `ClientToken` acted on, and when it did, so the
 /// record can be expired and evicted.
@@ -161,6 +179,84 @@ impl MonitorRecord {
     }
 }
 
+/// One stored health event of one monitor: every member a health-event report carries.
+///
+/// Internet Monitor raises these itself, from the internet-measurement pipeline it runs
+/// behind a monitor, and its API has no operation that creates one — so this store holds
+/// exactly the events something recorded here, and a monitor nothing has recorded an event
+/// for has none. `Status` is NOT stored: it follows from whether the event has ended (see
+/// [`HealthEventRecord::status`]), so one record cannot disagree with itself.
+#[derive(Debug, Clone)]
+pub struct HealthEventRecord {
+    /// The `MonitorName` this event belongs to — half of the store's key, kept on the
+    /// record so a value-only scan can report it.
+    pub monitor_name: String,
+    /// `EventId`, the other half of the store's key.
+    pub event_id: String,
+    /// `EventArn`, built by [`health_event_arn`].
+    pub arn: String,
+    /// `StartedAt`.
+    pub started_at: SystemTime,
+    /// `EndedAt`: unset while the event is still ongoing, which is also what makes it
+    /// report `ACTIVE`.
+    pub ended_at: Option<SystemTime>,
+    /// `CreatedAt`.
+    pub created_at: SystemTime,
+    /// `LastUpdatedAt`.
+    pub last_updated_at: SystemTime,
+    /// `ImpactedLocations`.
+    pub impacted_locations: Vec<ImpactedLocation>,
+    /// `ImpactType`, one of `crate::ops::types::HEALTH_EVENT_IMPACT_TYPE_VALUES`.
+    pub impact_type: String,
+    /// `PercentOfTotalTrafficImpacted`.
+    pub percent_of_total_traffic_impacted: Option<f64>,
+    /// `HealthScoreThreshold`, whose modelled default is 0.
+    pub health_score_threshold: f64,
+}
+
+impl HealthEventRecord {
+    /// A record for `event_id` of `monitor_name`, started at `started_at` and still
+    /// ongoing, with the ARN this service mints for it. A caller then sets the members
+    /// its event actually carries.
+    pub fn new(
+        region: &str,
+        monitor_name: &str,
+        event_id: &str,
+        impact_type: &str,
+        started_at: SystemTime,
+    ) -> Self {
+        Self {
+            monitor_name: monitor_name.to_string(),
+            event_id: event_id.to_string(),
+            arn: health_event_arn(region, monitor_name, event_id),
+            started_at,
+            ended_at: None,
+            created_at: started_at,
+            last_updated_at: started_at,
+            impacted_locations: Vec::new(),
+            impact_type: impact_type.to_string(),
+            percent_of_total_traffic_impacted: None,
+            health_score_threshold: 0.0,
+        }
+    }
+
+    /// `Status`: an event that has not ended is still `ACTIVE`, and one that has is
+    /// `RESOLVED`.
+    pub fn status(&self) -> &'static str {
+        if self.ended_at.is_some() {
+            HEALTH_EVENT_STATUS_RESOLVED
+        } else {
+            HEALTH_EVENT_STATUS_ACTIVE
+        }
+    }
+
+    /// The instant this event's own interval ends: when it ended, or `now` for an event
+    /// that is still ongoing — never before it started.
+    pub fn interval_end(&self, now: SystemTime) -> SystemTime {
+        self.ended_at.unwrap_or(now).max(self.started_at)
+    }
+}
+
 /// Per-service state for com-amazonaws-internetmonitor-internetmonitor20210603. A handler reaches it through [`service_state`].
 ///
 /// Every map here is explicitly bounded, because this store lives for the whole life of
@@ -181,6 +277,12 @@ pub struct ComAmazonawsInternetmonitorInternetmonitor20210603State {
     /// [`Self::create_client_tokens`] so one token reused across the two operations cannot
     /// make an update look already-applied. Bounded the same way.
     pub update_client_tokens: HashMap<String, ClientTokenRecord>,
+    /// Every health event, keyed by `(MonitorName, EventId)`. A `BTreeMap` so one
+    /// monitor's events are a contiguous range in a stable total order, which is what lets
+    /// `ListHealthEvents` page over them with a `NextToken` that names a resume point.
+    /// Bounded by [`MAX_HEALTH_EVENTS_PER_MONITOR`] per monitor; reach it through
+    /// [`Self::health_events_for`] / [`Self::record_health_event`].
+    pub health_events: BTreeMap<(String, String), HealthEventRecord>,
 }
 
 impl ComAmazonawsInternetmonitorInternetmonitor20210603State {
@@ -229,6 +331,40 @@ impl ComAmazonawsInternetmonitorInternetmonitor20210603State {
     /// map stays bounded.
     pub fn record_update_token(&mut self, token: String, monitor_name: String, now: SystemTime) {
         Self::record_token(&mut self.update_client_tokens, token, monitor_name, now);
+    }
+
+    /// Every health event of `monitor_name`, in `EventId` order.
+    pub fn health_events_for<'a>(
+        &'a self,
+        monitor_name: &'a str,
+    ) -> impl Iterator<Item = &'a HealthEventRecord> + 'a {
+        self.health_events
+            .range((monitor_name.to_string(), String::new())..)
+            .take_while(move |((name, _), _)| name == monitor_name)
+            .map(|(_, record)| record)
+    }
+
+    /// Store `record`, replacing any earlier record of the same event of the same monitor.
+    ///
+    /// Answers `false`, storing nothing, when the monitor already holds
+    /// [`MAX_HEALTH_EVENTS_PER_MONITOR`] other events: the store is bounded.
+    pub fn record_health_event(&mut self, record: HealthEventRecord) -> bool {
+        let key = (record.monitor_name.clone(), record.event_id.clone());
+        if !self.health_events.contains_key(&key)
+            && self.health_events_for(&record.monitor_name).count() >= MAX_HEALTH_EVENTS_PER_MONITOR
+        {
+            return false;
+        }
+        self.health_events.insert(key, record);
+        true
+    }
+
+    /// Forget every health event of `monitor_name`, for a monitor that no longer exists:
+    /// its events are no longer reportable, and a monitor later created with the same name
+    /// is a new monitor that has had none.
+    pub fn forget_health_events_for(&mut self, monitor_name: &str) {
+        self.health_events
+            .retain(|(name, _), _| name != monitor_name);
     }
 
     /// Forget every idempotency record that names `monitor_name`, for a monitor that no
@@ -309,6 +445,17 @@ pub fn monitor_arn(region: &str, monitor_name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("monitor/{monitor_name}"))
 }
 
+/// A health event's ARN:
+/// `arn:aws:internetmonitor:<region>:<account>:monitor/<MonitorName>/health-event/<EventId>`
+/// — an event is a child of its monitor, so its ARN extends the monitor's resource path.
+pub fn health_event_arn(region: &str, monitor_name: &str, event_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("monitor/{monitor_name}/health-event/{event_id}"),
+    )
+}
+
 /// A stored instant as the wire timestamp the model's `Timestamp` members carry.
 pub fn wire_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = at
@@ -317,16 +464,18 @@ pub fn wire_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
 }
 
-/// `ListMonitors`' `NextToken`: the opaque form of "resume after this `MonitorName`".
+/// A listing's `NextToken`: the opaque form of "resume after this key" — the
+/// `MonitorName` a `ListMonitors` page ended on, the `EventId` a `ListHealthEvents` page
+/// ended on.
 ///
 /// Hex (the `hex` crate) rather than a hand-rolled scheme, and opaque to the caller by
 /// construction: the only contract is that [`decode_page_token`] round-trips it.
-pub fn encode_page_token(after_monitor_name: &str) -> String {
-    ::hex::encode(after_monitor_name.as_bytes())
+pub fn encode_page_token(after_key: &str) -> String {
+    ::hex::encode(after_key.as_bytes())
 }
 
-/// The `MonitorName` a `NextToken` resumes after, or `None` when the token was not
-/// produced by [`encode_page_token`].
+/// The key a `NextToken` resumes after, or `None` when the token was not produced by
+/// [`encode_page_token`].
 pub fn decode_page_token(token: &str) -> Option<String> {
     String::from_utf8(::hex::decode(token).ok()?).ok()
 }

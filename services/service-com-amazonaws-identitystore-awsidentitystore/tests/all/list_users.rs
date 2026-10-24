@@ -314,11 +314,12 @@ async fn a_listed_user_is_reported_exactly_as_describe_user_reports_it() {
         assert_round_tripped(&sent, item, case);
         assert_absent(&sent, item, case);
         // Nothing stored an external id or an extension, so the listing reports
-        // neither. `UserStatus` and `CreatedBy` are NOT in this list: every stored user
-        // has a status (a created one is `ENABLED`) and records the principal that
-        // created it, so both are reported — `assert_eq!` against `DescribeUser` above
-        // already pins that the listing and the describe agree on them.
-        for member in ["Extensions", "ExternalIds", "UpdatedBy"] {
+        // neither. `UserStatus`, `CreatedBy` and `UpdatedBy` are NOT in this list: every
+        // stored user has a status (a created one is `ENABLED`) and records the principal
+        // that created it — which is also the principal that last wrote it until
+        // something updates it — so all three are reported; `assert_eq!` against
+        // `DescribeUser` above already pins that the listing and the describe agree.
+        for member in ["Extensions", "ExternalIds"] {
             assert!(
                 item.get(member).is_none(),
                 "case {case:?}: nothing stored {member}, so the listing must not report \
@@ -326,7 +327,7 @@ async fn a_listed_user_is_reported_exactly_as_describe_user_reports_it() {
                 item.get(member)
             );
         }
-        for member in ["UserStatus", "CreatedBy"] {
+        for member in ["UserStatus", "CreatedBy", "UpdatedBy"] {
             assert!(
                 item.get(member).is_some_and(|value| value.is_string()),
                 "case {case:?}: expected the listing to report {member}, got {:?}",
@@ -438,18 +439,22 @@ async fn an_attribute_path_other_than_user_name_is_refused() {
 }
 
 #[tokio::test]
-async fn an_identity_store_that_does_not_exist_is_reported_as_not_found() {
+async fn a_store_this_emulator_does_not_serve_is_not_found_and_an_unwritten_one_lists_nothing() {
     let router = emulator();
-    // Rows differ along the form of the id of a store this emulator does not hold.
+    // Rows differ along the form of an identifier that names no store this emulator
+    // serves: the ARN form carries the OWNING ACCOUNT, and each of these names a store of
+    // another account, in both of the id forms the modelled pattern admits.
     for (row_case, store) in [
-        ("a bare id", MISSING_STORE.to_string()),
-        ("another bare id", "d-00ff00ff00".to_string()),
+        ("another account's d- store", MISSING_STORE.to_string()),
         (
-            "the store's ARN",
-            format!(
-                "arn:aws:identitystore::{}:identitystore/d-0a0b0c0d0e",
-                engine::emulator_account_id()
-            ),
+            "another account's other d- store",
+            "arn:aws:identitystore::210987654321:identitystore/d-00ff00ff00".to_string(),
+        ),
+        (
+            "another account's store in UUID form",
+            "arn:aws-us-gov:identitystore::210987654321:identitystore/\
+             11111111-2222-3333-4444-555555555555"
+                .to_string(),
         ),
     ] {
         let body = refused(
@@ -468,8 +473,47 @@ async fn an_identity_store_that_does_not_exist_is_reported_as_not_found() {
         );
     }
 
-    // A listing is scoped to the store it names, and the store that exists lists
-    // exactly its own users.
+    // A store of THIS account that nothing has written to is served: it lists the nothing
+    // it holds rather than being refused, and listing it stores nothing — a create
+    // addressed to it afterwards is the first user it holds.
+    for (row_case, store) in [
+        ("a d- id nothing has written to", "d-0a0b0c0d0e".to_string()),
+        (
+            "that id as an ARN",
+            format!(
+                "arn:aws:identitystore::{}:identitystore/d-0a0b0c0d0e",
+                engine::emulator_account_id()
+            ),
+        ),
+        (
+            "an id in UUID form",
+            "11111111-2222-3333-4444-555555555555".to_string(),
+        ),
+    ] {
+        for attempt in 0..2 {
+            let case = format!("{row_case}, read {attempt}");
+            let listed = ok(
+                &router,
+                "ListUsers",
+                json!({ "IdentityStoreId": store.clone() }),
+                &case,
+            )
+            .await;
+            let users = listed["Users"].as_array().cloned().unwrap_or_default();
+            assert!(
+                users.is_empty(),
+                "case {case:?}: expected a store nothing has written to to list no users, \
+                 got {listed}"
+            );
+            assert!(
+                listed.get("NextToken").is_none_or(Value::is_null),
+                "case {case:?}: expected no NextToken on an empty listing, got {listed}"
+            );
+        }
+    }
+
+    // A listing is scoped to the store it names, and the store that holds a user lists
+    // exactly its own.
     let here = create_user(&router, STORE, "alice", "per-store scope").await;
     let listed = ids(
         &walk_users(&router, STORE, None, None, "per-store scope").await,
@@ -479,6 +523,17 @@ async fn an_identity_store_that_does_not_exist_is_reported_as_not_found() {
         listed,
         vec![here],
         "case \"per-store scope\": expected the provisioned store to list only its own user"
+    );
+    // And a user created in one store is in no other store's listing.
+    let elsewhere = create_user(&router, "d-0a0b0c0d0e", "alice", "per-store scope").await;
+    let other = ids(
+        &walk_users(&router, "d-0a0b0c0d0e", None, None, "per-store scope").await,
+        "per-store scope",
+    );
+    assert_eq!(
+        other,
+        vec![elsewhere],
+        "case \"per-store scope\": expected the caller-named store to list only its own user"
     );
 }
 

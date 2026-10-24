@@ -162,10 +162,9 @@ pub const LIST_CONFIGURATION_RECORDERS_PAGE_SIZE: usize = 20;
 /// ([`unsupported_third_party_service_principal_message`]). Extend this table as Config
 /// links further services.
 ///
-/// This set bounds only the THIRD-PARTY operation:
-/// `PutServiceLinkedConfigurationRecorder`, which records this account's own resources,
-/// takes any Amazon Web Services service principal (see
-/// [`service_linked_recorder_name`]). Both operations derive the recorder's name the
+/// This set bounds only the THIRD-PARTY operation; the services whose recorder
+/// `PutServiceLinkedConfigurationRecorder` creates are
+/// [`SERVICE_LINKED_PRINCIPALS`]. Both operations derive the recorder's name the
 /// same way, so one service has ONE service-linked recorder however it was created.
 pub const THIRD_PARTY_SERVICE_LINKED_PRINCIPALS: [&str; 1] = ["securityhub.amazonaws.com"];
 
@@ -173,6 +172,43 @@ pub const THIRD_PARTY_SERVICE_LINKED_PRINCIPALS: [&str; 1] = ["securityhub.amazo
 /// configuration recorder ([`THIRD_PARTY_SERVICE_LINKED_PRINCIPALS`]).
 pub fn supports_third_party_service_linked_recording(service_principal: &str) -> bool {
     THIRD_PARTY_SERVICE_LINKED_PRINCIPALS.contains(&service_principal)
+}
+
+/// The Amazon Web Services service principals `PutServiceLinkedConfigurationRecorder`
+/// creates a configuration recorder for — the services Config links a recorder of THIS
+/// account's own Amazon Web Services resources to.
+///
+/// A service principal is NOT an arbitrary string here: the operation "creates a
+/// service-linked configuration recorder that is linked to a specific Amazon Web
+/// Services service based on the ServicePrincipal you specify", and points at the
+/// published catalogue for which services those are ("For more information and a list
+/// of supported services/service principals, see Working with the Configuration
+/// Recorder in the Config Developer Guide" —
+/// `smithy_query(query="doc", shape="PutServiceLinkedConfigurationRecorder")`). The
+/// model cannot state that list as an enum, so it is the table below: the Observability
+/// Admin service principals Config links a recorder for the account's own telemetry
+/// resources to. A WELL-FORMED principal outside it names no service Config links a
+/// recorder to, and is refused rather than stored
+/// ([`invalid_service_principal_message`]; `ValidationException`: "You have provided a
+/// service principal for service-linked configuration recorder that is not valid").
+/// Extend this table as Config links further services.
+///
+/// The services whose recorder records a THIRD-PARTY cloud service provider's resources
+/// through a connector are a separate set, created by
+/// `PutThirdPartyServiceLinkedConfigurationRecorder`
+/// ([`THIRD_PARTY_SERVICE_LINKED_PRINCIPALS`]): that recorder cannot exist without the
+/// connector this operation takes none of, so a connector-only service is no service
+/// principal of THIS operation either.
+pub const SERVICE_LINKED_PRINCIPALS: [&str; 2] = [
+    "observabilityadmin.amazonaws.com",
+    "telemetry-enablement.observabilityadmin.amazonaws.com",
+];
+
+/// Whether the service `service_principal` names can own the service-linked
+/// configuration recorder `PutServiceLinkedConfigurationRecorder` creates
+/// ([`SERVICE_LINKED_PRINCIPALS`]).
+pub fn supports_service_linked_recording(service_principal: &str) -> bool {
+    SERVICE_LINKED_PRINCIPALS.contains(&service_principal)
 }
 
 /// How Config words `ValidationException` for a `ServicePrincipal` that names no
@@ -2597,14 +2633,14 @@ pub fn invalid_service_principal_message(service_principal: &str) -> String {
 /// create a service-linked recorder because a service-linked recorder already exists
 /// for the specified service").
 ///
-/// BUILT FROM THE REQUEST, for the same reason as
-/// [`invalid_service_principal_message`].
-pub fn service_linked_recorder_conflict_message(service_principal: &str) -> String {
-    format!(
-        "A service-linked configuration recorder already exists for the service principal \
-         '{service_principal}'."
-    )
-}
+/// A FIXED sentence: it states WHICH condition refused the call ("a service-linked
+/// recorder already exists for the specified service") and quotes nothing the caller
+/// sent, so the text is the same however the request named the service — a client
+/// matching it separates this conflict leg from the operation's others, which the error
+/// code alone does not.
+pub const SERVICE_LINKED_RECORDER_CONFLICT_MESSAGE: &str =
+    "A service-linked configuration recorder with the specified service principal \
+     already exists.";
 
 /// How Config words `LimitExceededException` when creating one more service-linked
 /// configuration recorder would take the account past
@@ -3293,6 +3329,72 @@ pub const NO_SUCH_CONFIG_RULES: &str = "One or more ConfigRules provided in the 
 pub const NO_SUCH_CONFIGURATION_RECORDER: &str =
     "The name of the configuration recorder you entered cannot be found. Verify the \
      configuration recorder name, and try again.";
+
+/// How `PutConfigurationRecorder` words `InvalidConfigurationRecorderNameException`
+/// for a name carrying the prefix Config reserves for the recorders it creates itself
+/// ([`SERVICE_LINKED_RECORDER_NAME_PREFIX`]).
+///
+/// The MODEL STATES THIS MESSAGE, so the text is part of the contract rather than
+/// wording this emulator is free to choose: it is
+/// `InvalidConfigurationRecorderNameException`'s own documentation ("The configuration
+/// recorder name is not valid. The prefix \"AWSConfigurationRecorderFor\" is reserved
+/// for service-linked configuration recorders"), which the service itself renders as
+/// ONE sentence with the prefix unquoted — the form the recorded refusal carries. It is
+/// request-independent: it names the reserved prefix, not the name the caller sent,
+/// which is the only thing that was wrong.
+pub fn reserved_recorder_name_prefix_message() -> String {
+    format!(
+        "The configuration recorder name is not valid, the prefix \
+         {SERVICE_LINKED_RECORDER_NAME_PREFIX} is reserved for service-linked configuration \
+         recorders."
+    )
+}
+
+/// How `StartConfigurationRecorder` and `StopConfigurationRecorder` word
+/// `UnmodifiableEntityException` for a SERVICE-LINKED configuration recorder.
+///
+/// The MODEL STATES THIS MESSAGE, verbatim, for exactly these two operations
+/// (`UnmodifiableEntityException`: "For StartConfigurationRecorder and
+/// StopConfigurationRecorder, you will see this exception because these operations do
+/// not affect service-linked configuration recorders. Service-linked configuration
+/// recorders are ALWAYS RECORDING. To stop recording, you must delete the
+/// service-linked configuration recorder. Use the
+/// DeleteServiceLinkedConfigurationRecorder operation to delete a service-linked
+/// configuration recorder"). The property the refusal is about is that the recorder
+/// always records — so the call is not permitted for this recorder class, rather than a
+/// call that had no effect — and the recovery it indicates is the service-linked delete.
+///
+/// A FIXED sentence for the class: it quotes nothing the caller sent, because what is
+/// wrong is the KIND of recorder named, not its name.
+pub const SERVICE_LINKED_RECORDER_ALWAYS_RECORDING: &str =
+    "This operation does not affect service-linked configuration recorders. \
+     Service-linked configuration recorders are always recording. To stop recording, \
+     you must delete the service-linked configuration recorder. Use the \
+     DeleteServiceLinkedConfigurationRecorder operation to delete a service-linked \
+     configuration recorder.";
+
+/// How `PutConfigurationRecorder` words `UnmodifiableEntityException` for a request
+/// asking it for a service-linked configuration recorder — also stated by the model
+/// ("For PutConfigurationRecorder, you will see this exception because you cannot use
+/// this operation to create a service-linked configuration recorder. Use the
+/// PutServiceLinkedConfigurationRecorder operation to create a service-linked
+/// configuration recorder"), and fixed for the same reason as
+/// [`SERVICE_LINKED_RECORDER_ALWAYS_RECORDING`].
+pub const PUT_RECORDER_IS_NOT_SERVICE_LINKED: &str =
+    "You cannot use this operation to create a service-linked configuration recorder. \
+     Use the PutServiceLinkedConfigurationRecorder operation to create a service-linked \
+     configuration recorder.";
+
+/// How `DeleteConfigurationRecorder` words `UnmodifiableEntityException` for a
+/// service-linked configuration recorder — the model's own sentence again ("For
+/// DeleteConfigurationRecorder, you will see this exception because you cannot use this
+/// operation to delete a service-linked configuration recorder. Use the
+/// DeleteServiceLinkedConfigurationRecorder operation to delete a service-linked
+/// configuration recorder").
+pub const DELETE_RECORDER_IS_NOT_SERVICE_LINKED: &str =
+    "You cannot use this operation to delete a service-linked configuration recorder. \
+     Use the DeleteServiceLinkedConfigurationRecorder operation to delete a \
+     service-linked configuration recorder.";
 
 /// How `PutConfigRule` words `NoAvailableConfigurationRecorderException`.
 ///

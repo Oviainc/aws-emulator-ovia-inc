@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMasterAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMasterAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMasterAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the administrator relationship the detector's account accepted
+//! an invitation into, or an EMPTY `Master` while it has accepted none — every member of
+//! the shape is optional (`smithy_query(shape="Master")`), so "no administrator" is
+//! reported by their absence rather than by invented values. A pure report: it writes
+//! nothing. An unknown detector id is refused with the `BadRequestException` envelope.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +136,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMasterAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMasterAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMasterAccount"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetMasterAccountErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        // A pure report: nothing below writes to the store, and no transition is
+        // owed on an administrator relationship — accepting an invitation settles
+        // it in one step.
+        let state = state.lock();
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            // Classified from the REQUEST: a value that cannot be a detector id is
+            // a parameter failure, a well-formed one this account does not hold an
+            // ownership failure.
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::detector_id_rejection(&input.detector_id),
+            ));
+        };
+
+        Ok(GetMasterAccountOutput {
+            // `Master` is `@required` but every one of its members is optional, so
+            // an account no administrator monitors reports the shape with nothing
+            // in it. That is the observable difference a caller switches on —
+            // `Master.AccountId` absent means "no administrator" — and it is why
+            // nothing here is defaulted to a value.
+            master: detector
+                .administrator
+                .as_ref()
+                .map(|administrator| Master {
+                    account_id: Some(administrator.account_id.clone()),
+                    invitation_id: Some(administrator.invitation_id.clone()),
+                    relationship_status: Some(administrator.relationship_status.clone()),
+                    // `Master.InvitedAt` targets a `String`
+                    // (`smithy_query(shape="Master")`), rendered the way every
+                    // other instant this service reports as text is.
+                    invited_at: Some(crate::state::iso8601(administrator.invited_at_millis)),
+                })
+                .unwrap_or_default(),
+        })
     }
 }

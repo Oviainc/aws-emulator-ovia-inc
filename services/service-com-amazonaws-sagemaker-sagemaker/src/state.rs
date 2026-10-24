@@ -588,6 +588,11 @@ pub fn mint_node_logical_id() -> String {
 /// A fresh opaque token for a presigned-URL grant, from the same scheme as every other
 /// id here. It is an identifier inside this emulator's own store, never a credential:
 /// nothing signs with it and nothing presents it back to the emulator.
+///
+/// NOT for a presigned URL whose token is handed to the caller as a SECRET: such a token
+/// is minted through the emulator's credential store, because a service may not construct
+/// a secret itself (`CreatePresignedMlflowAppUrl` does that). This one mints the id of a
+/// grant this emulator stores and looks up again.
 pub fn mint_grant_token() -> String {
     mint_opaque_resource_id()
 }
@@ -2548,9 +2553,18 @@ pub const RESOURCE_IN_USE_MESSAGE: &str = "The ID or Name specified is already i
 /// An ARN's region component is positional, so a scope carrying `:` or `/` would mint a
 /// structurally malformed ARN. Anything outside the grammar is not accepted as a region.
 fn is_region_token(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 32
-        && value
+    is_dns_label(value, 32)
+}
+
+/// Whether `label` is a DNS label of at most `max_len` bytes: non-empty, and lowercase
+/// alphanumerics and hyphens only. The one definition of that grammar in this crate —
+/// [`is_region_token`], which bounds a credential scope's region, and the host-label
+/// check `CreatePresignedMlflowAppUrl` applies to an ARN id it splices into a host name,
+/// differ only in the cap they pass.
+pub(crate) fn is_dns_label(label: &str, max_len: usize) -> bool {
+    !label.is_empty()
+        && label.len() <= max_len
+        && label
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }

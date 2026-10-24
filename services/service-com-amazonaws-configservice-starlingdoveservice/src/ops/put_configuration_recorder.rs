@@ -216,10 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 PutConfigurationRecorderErrorModeled::UnmodifiableEntityException(
                     UnmodifiableEntityException {
                         message: Some(
-                            "PutConfigurationRecorder cannot create a service-linked \
-                             configuration recorder; use \
-                             PutServiceLinkedConfigurationRecorder instead"
-                                .to_string(),
+                            crate::state::PUT_RECORDER_IS_NOT_SERVICE_LINKED.to_string(),
                         ),
                     },
                 )
@@ -246,15 +243,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(name) => name.to_string(),
         };
 
+        // The model states the message this refusal carries, so the text is part of the
+        // contract rather than wording of this emulator's own
+        // ([`crate::state::reserved_recorder_name_prefix_message`]).
         if name.starts_with(crate::state::SERVICE_LINKED_RECORDER_NAME_PREFIX) {
             return Err(
                 PutConfigurationRecorderErrorModeled::InvalidConfigurationRecorderNameException(
                     InvalidConfigurationRecorderNameException {
-                        message: Some(format!(
-                            "the prefix '{}' is reserved for service-linked configuration \
-                             recorders, so '{name}' is not a valid configuration recorder name",
-                            crate::state::SERVICE_LINKED_RECORDER_NAME_PREFIX,
-                        )),
+                        message: Some(crate::state::reserved_recorder_name_prefix_message()),
                     },
                 )
                 .into(),

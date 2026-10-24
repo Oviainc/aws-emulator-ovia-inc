@@ -1214,9 +1214,12 @@ async fn feature_flag_content_is_validated_only_on_a_feature_flags_profile() {
             written.status,
             String::from_utf8_lossy(&written.body)
         );
-        // The round trip: the stored bytes come back exactly as written. The version
-        // number is bound to the `Version-Number` response header, because `Content` is
-        // this operation's `@httpPayload`.
+        // The round trip: AppConfig's feature-flags helper REWRITES a document it accepts
+        // (it stamps `_createdAt`/`_updatedAt` on every entry of `flags` and `values`, as
+        // `feature_flag_metadata` asserts), so what comes back is the stored document —
+        // identical to the submitted one in everything but those stamps, and byte for byte
+        // what the write answered. The version number is bound to the `Version-Number`
+        // response header, because `Content` is this operation's `@httpPayload`.
         let version = written
             .header("Version-Number")
             .unwrap_or_else(|| panic!("case {case:?}: no Version-Number header"));
@@ -1231,8 +1234,15 @@ async fn feature_flag_content_is_validated_only_on_a_feature_flags_profile() {
         .await;
         assert_eq!(
             read_back.body.as_ref(),
-            content.as_slice(),
+            written.body.as_ref(),
             "case {case:?}: the stored document must come back byte for byte, got {}",
+            String::from_utf8_lossy(&read_back.body)
+        );
+        assert_eq!(
+            super::feature_flag_metadata::without_stamps(&read_back.json()),
+            document,
+            "case {case:?}: apart from the helper's stamps the stored document must match the \
+             submitted one, got {}",
             String::from_utf8_lossy(&read_back.body)
         );
     }

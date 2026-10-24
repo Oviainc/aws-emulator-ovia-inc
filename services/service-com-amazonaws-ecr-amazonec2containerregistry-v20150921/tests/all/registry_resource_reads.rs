@@ -14,13 +14,14 @@
 //! rule, not a recorded request.
 
 use std::collections::{BTreeSet, HashMap};
-use std::time::SystemTime;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ecr_amazonec2containerregistry_v20150921 as ecr;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{emulator_with_engine, given_layer, ok, refused, REGISTRY_ID};
+use crate::wire::{
+    emulator_with_engine, given_layer, ok, refused, seed_pull_through_cache_rule, REGISTRY_ID,
+};
 
 /// An account id that is NOT this emulator's registry.
 const OTHER_REGISTRY_ID: &str = "123456789012";
@@ -57,38 +58,6 @@ async fn push(
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: PutImage reported no digest: {body:?}"))
         .to_string()
-}
-
-/// Seed one pull through cache rule into the registry's store.
-///
-/// `CreatePullThroughCacheRule` is the operation that creates one, and it refuses an
-/// upstream URL it cannot resolve to a supported registry, so the update and validate
-/// paths are exercised here against a record placed straight into the same store those
-/// handlers read — which is also how a rule naming an upstream the create would refuse
-/// is arranged.
-fn seed_pull_through_cache_rule(
-    engine: &engine::InMemoryEngine,
-    prefix: &str,
-    upstream_registry: Option<&str>,
-    upstream_url: &str,
-    credential_arn: Option<&str>,
-    custom_role_arn: Option<&str>,
-) {
-    let state = ecr::state::service_state(engine).expect("the ecr store is reachable");
-    state.lock().pull_through_cache_rules.insert(
-        prefix.to_string(),
-        ecr::ops::types::PullThroughCacheRule {
-            ecr_repository_prefix: Some(prefix.to_string()),
-            upstream_registry_url: Some(upstream_url.to_string()),
-            created_at: Some(::aws_smithy_types::DateTime::from(SystemTime::now())),
-            registry_id: Some(REGISTRY_ID.to_string()),
-            credential_arn: credential_arn.map(ToString::to_string),
-            custom_role_arn: custom_role_arn.map(ToString::to_string),
-            upstream_repository_prefix: Some("ROOT".to_string()),
-            upstream_registry: upstream_registry.map(ToString::to_string),
-            updated_at: None,
-        },
-    );
 }
 
 /// Create one repository creation template through the API the registry exposes for it.
@@ -768,7 +737,7 @@ async fn deregister_pull_time_update_exclusion_removes_one_registered_principal(
 
 /// One row of the validation table: the case, the rule's `upstreamRegistry`, its
 /// `upstreamRegistryUrl`, the credential it stores, and whether the stored configuration
-/// is missing a credential the upstream requires.
+/// is missing a credential the upstream requires — which is what makes the rule invalid.
 type ValidationRow<'a> = (&'a str, Option<&'a str>, &'a str, Option<&'a str>, bool);
 
 /// Updating and validating a pull through cache rule resolve the prefix against the
@@ -901,11 +870,11 @@ async fn pull_through_cache_rule_update_and_validate_resolve_the_prefix() {
         );
     }
 
-    // Validation never claims a successful upstream round trip, because none can run
-    // here; what it does distinguish is a rule whose stored configuration cannot even
-    // authenticate. The rows span the upstream registries the model's `UpstreamRegistry`
-    // enum carries, including the two the ECR user guide documents as anonymous, and a
-    // rule that names no upstream registry at all.
+    // Validation is a verdict on the STORED rule: a rule whose configuration can
+    // authenticate to its upstream validates, and one that cannot is invalid with the
+    // failure naming the defect. The rows span the upstream registries the model's
+    // `UpstreamRegistry` enum carries, including the two the ECR user guide documents as
+    // anonymous, and a rule that names no upstream registry at all.
     let validations: Vec<ValidationRow<'_>> = vec![
         (
             "docker-hub without a credential",
@@ -977,13 +946,14 @@ async fn pull_through_cache_rule_update_and_validate_resolve_the_prefix() {
         .await;
         assert_eq!(
             body["isValid"].as_bool(),
-            Some(false),
-            "case {case:?}: isValid is only true of an upstream round trip that ran: {body:?}"
+            Some(!*expect_missing_credential),
+            "case {case:?}: the verdict is the stored rule's own completeness: {body:?}"
         );
         let failure = body["failure"].as_str().unwrap_or_default();
-        assert!(
+        assert_eq!(
             !failure.is_empty(),
-            "case {case:?}: a validation that did not succeed must say why: {body:?}"
+            *expect_missing_credential,
+            "case {case:?}: only a rule that did not validate carries a failure: {body:?}"
         );
         assert_eq!(
             failure.contains("requires authentication"),

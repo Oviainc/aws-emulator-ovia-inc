@@ -27,8 +27,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    ConfigTypeData, ContactVersion, Eirp, Frequency, FrequencyBandwidth, InvalidParameterException,
-    KmsKey, SpectrumConfig, TrackingOverrides,
+    ConfigTypeData, ContactVersion, Eirp, EndpointDetails, Frequency, FrequencyBandwidth,
+    InvalidParameterException, KmsKey, SpectrumConfig, TrackingOverrides,
 };
 
 /// Region used in minted ARNs when the request carries no usable SigV4 credential
@@ -43,6 +43,13 @@ pub const ARN_SERVICE: &str = "groundstation";
 /// 250–750 ms band this project gives a clock-owed transition, so a caller that reads
 /// the contact straight after reserving it still observes the transient status.
 pub const SCHEDULING_SETTLES_AFTER: Duration = Duration::from_millis(300);
+
+/// `CreateDataflowEndpointGroup` admits a dataflow endpoint in `creating`; the service
+/// finishes attaching it and it becomes `created` on its own. CHOSEN span (AWS documents
+/// no duration for it — the real service takes minutes to place the stream's network
+/// interfaces), inside the 250–750 ms band this project gives a clock-owed transition, so
+/// a caller that reads the group straight after creating it still observes `creating`.
+pub const ENDPOINT_CREATION_SETTLES_AFTER: Duration = Duration::from_millis(300);
 
 /// Which `ConfigCapabilityType` a `ConfigTypeData` union member selects.
 ///
@@ -653,6 +660,8 @@ pub enum ResourceRef {
     MissionProfile { mission_profile_id: String },
     /// A contact, by `contactId`.
     Contact { contact_id: String },
+    /// A dataflow endpoint group, by `dataflowEndpointGroupId`.
+    DataflowEndpointGroup { dataflow_endpoint_group_id: String },
 }
 
 /// A config as `CreateConfig` stored it.
@@ -840,6 +849,117 @@ pub fn config_reference_not_found_message(arn: &str, required_type: Option<&str>
     }
 }
 
+/// What this service answers when a dataflow endpoint group a request names does not
+/// exist: a fixed literal that discloses neither the id nor the ARN that was asked for,
+/// spelled the way this service already answers for a missing mission profile (see
+/// [`MISSION_PROFILE_NOT_FOUND`]).
+///
+/// It lives here rather than in one handler because every operation addressed at a group
+/// by its `{dataflowEndpointGroupId}` label answers it — `GetDataflowEndpointGroup` and
+/// `DeleteDataflowEndpointGroup` — so it is one text of the service.
+pub const DATAFLOW_ENDPOINT_GROUP_NOT_FOUND: &str = "DataflowEndpointGroup not found";
+
+/// Which kind of endpoint an `EndpointDetails` describes.
+///
+/// The operation's own documentation partitions the endpoints exactly this way — "All
+/// dataflow endpoints within a single dataflow endpoint group must be of the same type.
+/// You cannot mix AWS Ground Station Agent endpoints with Dataflow endpoints in the same
+/// group" (`smithy_query(query="operation", operation="CreateDataflowEndpointGroup")`) —
+/// so the kind is what a group's endpoints have to agree on, and it is also what decides
+/// which members the service derives for an endpoint rather than reads from the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointKind {
+    /// The `endpoint` member: a `DataflowEndpoint` Ground Station itself connects the
+    /// stream to, inside the customer's VPC.
+    Dataflow,
+    /// One of the three AWS Ground Station Agent members: the stream is carried by an
+    /// agent the customer runs on an instance of their own.
+    Agent,
+}
+
+impl EndpointKind {
+    /// How a refusal names this kind, so a mixed group's message says what disagrees.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Dataflow => "a dataflow endpoint",
+            Self::Agent => "an AWS Ground Station Agent endpoint",
+        }
+    }
+}
+
+/// The endpoint members `details` sets, by the modelled member name and the kind of
+/// endpoint each one describes, in the order `EndpointDetails` declares them
+/// (`smithy_query(query="shape", shape="EndpointDetails")`).
+///
+/// An `EndpointDetails` describes ONE endpoint, so exactly one of these members belongs
+/// to a well-formed request; this is what lets `CreateDataflowEndpointGroup` refuse an
+/// item that names none or several, and what the read path classifies a stored endpoint
+/// with.
+pub fn endpoint_members(details: &EndpointDetails) -> Vec<(&'static str, EndpointKind)> {
+    let mut members = Vec::new();
+    if details.endpoint.is_some() {
+        members.push(("endpoint", EndpointKind::Dataflow));
+    }
+    if details.aws_ground_station_agent_endpoint.is_some() {
+        members.push(("awsGroundStationAgentEndpoint", EndpointKind::Agent));
+    }
+    if details.uplink_aws_ground_station_agent_endpoint.is_some() {
+        members.push(("uplinkAwsGroundStationAgentEndpoint", EndpointKind::Agent));
+    }
+    if details.downlink_aws_ground_station_agent_endpoint.is_some() {
+        members.push(("downlinkAwsGroundStationAgentEndpoint", EndpointKind::Agent));
+    }
+    members
+}
+
+/// The `EndpointStatus` a dataflow endpoint carries while the service is still attaching
+/// it, and the one it carries once attached (`smithy_query(query="shape",
+/// shape="EndpointStatus")` — `created`, `creating`, `deleted`, `deleting`, `failed`).
+pub const ENDPOINT_CREATING: &str = "creating";
+/// See [`ENDPOINT_CREATING`].
+pub const ENDPOINT_CREATED: &str = "created";
+
+/// The `CapabilityHealth` values an endpoint's `healthStatus` reports
+/// (`smithy_query(query="shape", shape="CapabilityHealth")`).
+pub const HEALTH_HEALTHY: &str = "HEALTHY";
+/// See [`HEALTH_HEALTHY`].
+pub const HEALTH_UNHEALTHY: &str = "UNHEALTHY";
+
+/// The `CapabilityHealthReason` an endpoint still being attached reports, the one a
+/// finished endpoint reports, and the one an AWS Ground Station Agent endpoint no agent
+/// has registered against reports (`smithy_query(query="shape",
+/// shape="CapabilityHealthReason")` — `NO_REGISTERED_AGENT`, `INVALID_IP_OWNERSHIP`,
+/// `NOT_AUTHORIZED_TO_CREATE_SLR`, `UNVERIFIED_IP_OWNERSHIP`, `INITIALIZING_DATAPLANE`,
+/// `DATAPLANE_FAILURE`, `HEALTHY`).
+pub const REASON_INITIALIZING_DATAPLANE: &str = "INITIALIZING_DATAPLANE";
+/// See [`REASON_INITIALIZING_DATAPLANE`].
+pub const REASON_HEALTHY: &str = "HEALTHY";
+/// See [`REASON_INITIALIZING_DATAPLANE`].
+pub const REASON_NO_REGISTERED_AGENT: &str = "NO_REGISTERED_AGENT";
+
+/// The `AgentStatus` an AWS Ground Station Agent endpoint carries while no agent has
+/// registered itself for that endpoint (`smithy_query(query="shape",
+/// shape="AgentStatus")` — `SUCCESS`, `FAILED`, `ACTIVE`, `INACTIVE`).
+pub const AGENT_INACTIVE: &str = "INACTIVE";
+
+/// A dataflow endpoint group as `CreateDataflowEndpointGroup` stored it.
+#[derive(Debug, Clone)]
+pub struct DataflowEndpointGroup {
+    pub dataflow_endpoint_group_id: String,
+    pub dataflow_endpoint_group_arn: String,
+    /// The endpoints of the group, as the request described them plus the members the
+    /// SERVICE owns: each endpoint's `status`, and the `healthStatus`/`healthReasons`
+    /// the model documents as "ignored when calling `CreateDataflowEndpointGroup`"
+    /// (`smithy_query(query="doc", shape="EndpointDetails", member="healthStatus")`).
+    pub endpoint_details: Vec<EndpointDetails>,
+    pub contact_pre_pass_duration_seconds: Option<i32>,
+    pub contact_post_pass_duration_seconds: Option<i32>,
+    pub tags: HashMap<String, String>,
+    /// The instant the service owes this group's dataflow endpoints their `creating` ->
+    /// `created` move; `None` once the move has been materialised.
+    pub endpoints_settle_at: Option<SystemTime>,
+}
+
 /// Per-service state for com-amazonaws-groundstation-groundstation. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsGroundstationGroundstationState {
@@ -849,6 +969,8 @@ pub struct ComAmazonawsGroundstationGroundstationState {
     pub mission_profiles: HashMap<String, MissionProfile>,
     /// Contacts, keyed by `contactId`.
     pub contacts: HashMap<String, Contact>,
+    /// Dataflow endpoint groups, keyed by `dataflowEndpointGroupId`.
+    pub dataflow_endpoint_groups: HashMap<String, DataflowEndpointGroup>,
     /// Every ARN this service minted, and what it points at.
     pub arn_index: HashMap<String, ResourceRef>,
     /// The uplink frequency bands, in MHz, this account has been approved to transmit
@@ -1031,6 +1153,7 @@ impl Default for ComAmazonawsGroundstationGroundstationState {
             configs: HashMap::new(),
             mission_profiles: HashMap::new(),
             contacts: HashMap::new(),
+            dataflow_endpoint_groups: HashMap::new(),
             arn_index: HashMap::new(),
             approved_uplink_bands_mhz: from_env(
                 APPROVED_UPLINK_BANDS_ENV,
@@ -1107,6 +1230,51 @@ impl ComAmazonawsGroundstationGroundstationState {
                 self.mission_profiles.get(mission_profile_id)
             }
             _ => None,
+        }
+    }
+
+    /// Remove the dataflow endpoint group `dataflow_endpoint_group_id` addresses, along
+    /// with its ARN index entry, and answer it; `None` when no group has that id.
+    pub fn remove_dataflow_endpoint_group(
+        &mut self,
+        dataflow_endpoint_group_id: &str,
+    ) -> Option<DataflowEndpointGroup> {
+        let removed = self
+            .dataflow_endpoint_groups
+            .remove(dataflow_endpoint_group_id)?;
+        self.arn_index.remove(&removed.dataflow_endpoint_group_arn);
+        Some(removed)
+    }
+
+    /// Materialise every `creating` -> `created` endpoint move the clock has already made
+    /// due. A reporting operation calls this before reading: the move was owed at this
+    /// instant whether or not anybody called, so applying it changes nothing a later
+    /// caller could otherwise have seen.
+    ///
+    /// An endpoint that is `created` is attached, so its health is the dataplane's own:
+    /// `HEALTHY`. An AWS Ground Station Agent endpoint carries no `status` of its own and
+    /// keeps the health it was stored with, which stays `NO_REGISTERED_AGENT` until an
+    /// agent registers for it.
+    pub fn settle_due_endpoints(&mut self) {
+        let now = SystemTime::now();
+        for group in self.dataflow_endpoint_groups.values_mut() {
+            let Some(due) = group.endpoints_settle_at else {
+                continue;
+            };
+            if due > now {
+                continue;
+            }
+            for details in &mut group.endpoint_details {
+                let Some(endpoint) = details.endpoint.as_mut() else {
+                    continue;
+                };
+                if endpoint.status.as_deref() == Some(ENDPOINT_CREATING) {
+                    endpoint.status = Some(ENDPOINT_CREATED.to_string());
+                    details.health_status = Some(HEALTH_HEALTHY.to_string());
+                    details.health_reasons = Some(vec![REASON_HEALTHY.to_string()]);
+                }
+            }
+            group.endpoints_settle_at = None;
         }
     }
 

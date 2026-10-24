@@ -21,6 +21,17 @@
 //!   can carry.
 //! * `DescribeIpGroups` reports stored groups, filtered by `GroupIds`, paginated over a
 //!   stable creation order, and changes nothing a later caller sees.
+//! * `UpdateRulesOfIpGroup` REPLACES the stored rule set of the group it names with the
+//!   submitted one — whatever that set is, including the empty one, which leaves the
+//!   group with no rules and so no `userRules` member at all — and changes nothing else
+//!   about that group and nothing about any other.
+//! * `AuthorizeIpRules` ADDS the submitted rules to the ones the group holds, newest
+//!   first, holding at most one rule per address range; `RevokeIpRules` REMOVES exactly
+//!   the ranges it names and keeps every other rule in place.
+//! * `DeleteIpGroup` removes the group it names, so a later `DescribeIpGroups` does not
+//!   list it and a second delete of it is a `ResourceNotFoundException`.
+//! * A mutation that names a group this emulator does not hold, or carries a rule list it
+//!   refuses, leaves every stored group exactly as it was.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -38,6 +49,56 @@ use super::workspace_lifecycle::{call, emulator_with_engine};
 /// Call `CreateIpGroup` with `request` and return `(status, body)`.
 async fn create(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
     call(router, "CreateIpGroup", request).await
+}
+
+/// Call `UpdateRulesOfIpGroup` with `request` and return `(status, body)`.
+async fn update_rules(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
+    call(router, "UpdateRulesOfIpGroup", request).await
+}
+
+/// Call `AuthorizeIpRules` with `request` and return `(status, body)`.
+async fn authorize_rules(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
+    call(router, "AuthorizeIpRules", request).await
+}
+
+/// Call `RevokeIpRules` with `request` and return `(status, body)`.
+async fn revoke_rules(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
+    call(router, "RevokeIpRules", request).await
+}
+
+/// Assert `body` is the empty structure an operation with no output members answers with.
+fn assert_no_output_members(case: &str, body: &Value) {
+    assert_eq!(
+        body.as_object().map(serde_json::Map::len),
+        Some(0),
+        "case {case:?}: the modelled output carries no members, got {body}"
+    );
+}
+
+/// Call `DeleteIpGroup` with `request` and return `(status, body)`.
+async fn delete_group(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
+    call(router, "DeleteIpGroup", request).await
+}
+
+/// What `DescribeIpGroups` must report for a group whose stored rule set is `rules`.
+///
+/// `WorkspacesIpGroup$userRules` is optional, and a group holding NO rules reports no
+/// `userRules` member rather than an empty list — which is also what `serde_json`
+/// yields for an absent key, so the two sides of the assertion compare directly.
+fn expected_user_rules(rules: &Value) -> Value {
+    match rules.as_array() {
+        Some(rules) if !rules.is_empty() => Value::Array(rules.clone()),
+        _ => Value::Null,
+    }
+}
+
+/// `count` distinct `ipRule` entries, one per row, with no `ruleDesc`.
+fn ip_rules(count: usize) -> Value {
+    Value::Array(
+        (0..count)
+            .map(|index| json!({ "ipRule": format!("10.{}.{}.0/24", index / 256, index % 256) }))
+            .collect(),
+    )
 }
 
 /// Create one group, asserting the call was accepted, and return its `GroupId`.
@@ -214,10 +275,7 @@ async fn created_ip_groups_are_persisted_and_described_back() {
             reported["groupDesc"], request["GroupDesc"],
             "case {case:?}: the group reports the requested description, got {reported}"
         );
-        let expected_rules = match request["UserRules"].as_array() {
-            Some(rules) => Value::Array(rules.clone()),
-            None => json!([]),
-        };
+        let expected_rules = expected_user_rules(&request["UserRules"]);
         assert_eq!(
             reported["userRules"], expected_rules,
             "case {case:?}: the group reports the requested rules, got {reported}"
@@ -666,19 +724,12 @@ async fn caller_sized_members_are_bounded_before_anything_is_persisted() {
     // The model constrains the length of none of these members, so the bounds are
     // the emulator's own (MAX_RULES_PER_IP_GROUP, MAX_IP_GROUP_TEXT_CHARS). Each row
     // is a member at its bound — accepted — and one value past it — refused.
-    let rules = |count: usize| -> Value {
-        Value::Array(
-            (0..count)
-                .map(|index| json!({ "ipRule": format!("10.{}.{}.0/24", index / 256, index % 256) }))
-                .collect(),
-        )
-    };
     let bound = MAX_IP_GROUP_TEXT_CHARS;
     let table: Vec<(&str, Value, Value)> = vec![
         (
             "rule count",
-            json!({ "GroupName": "grp-rules-at-bound", "UserRules": rules(MAX_RULES_PER_IP_GROUP) }),
-            json!({ "GroupName": "grp-rules-past-bound", "UserRules": rules(MAX_RULES_PER_IP_GROUP + 1) }),
+            json!({ "GroupName": "grp-rules-at-bound", "UserRules": ip_rules(MAX_RULES_PER_IP_GROUP) }),
+            json!({ "GroupName": "grp-rules-past-bound", "UserRules": ip_rules(MAX_RULES_PER_IP_GROUP + 1) }),
         ),
         (
             "group name length",
@@ -725,4 +776,665 @@ async fn caller_sized_members_are_bounded_before_anything_is_persisted() {
             "case {case:?}: the refused create persists nothing, {stored} groups stored"
         );
     }
+}
+
+/// The rule sets one group's `UserRules` is replaced by, applied in order to the SAME
+/// group. The rows differ along what the replacement rule generalises over: how many
+/// rules the submitted set holds (more than before, fewer, none, the stored bound),
+/// which of them are new, their order, their address family and form, and whether each
+/// carries a `ruleDesc`.
+fn replacement_table() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "a rule added beside the one created with",
+            json!([
+                { "ipRule": "192.168.1.0/24", "ruleDesc": "vpn range" },
+                { "ipRule": "10.0.0.0/16", "ruleDesc": "initial office range" },
+            ]),
+        ),
+        (
+            "the same two rules in the opposite order",
+            json!([
+                { "ipRule": "10.0.0.0/16", "ruleDesc": "initial office range" },
+                { "ipRule": "192.168.1.0/24", "ruleDesc": "vpn range" },
+            ]),
+        ),
+        (
+            "a wholly different single rule",
+            json!([{ "ipRule": "172.16.0.0/12", "ruleDesc": "replaced range" }]),
+        ),
+        (
+            "one rule with no description",
+            json!([{ "ipRule": "198.51.100.0/24" }]),
+        ),
+        (
+            "an IPv6 range and a bare address",
+            json!([
+                { "ipRule": "2001:db8::/32", "ruleDesc": "documentation range" },
+                { "ipRule": "203.0.113.7" },
+            ]),
+        ),
+        (
+            "as many rules as the emulator stores",
+            ip_rules(MAX_RULES_PER_IP_GROUP),
+        ),
+        ("no rules at all", json!([])),
+        (
+            "one rule again, after the empty set",
+            json!([{ "ipRule": "10.1.0.0/16", "ruleDesc": "authorized again" }]),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn updating_the_rules_of_a_group_replaces_the_stored_rule_set() {
+    let (router, _engine) = emulator_with_engine();
+    let group_id = create_one(
+        &router,
+        &json!({
+            "GroupName": "grp-under-update",
+            "GroupDesc": "the group whose rules are replaced",
+            "UserRules": [{ "ipRule": "10.0.0.0/16", "ruleDesc": "initial office range" }],
+        }),
+    )
+    .await;
+    // A second group, never updated: a replacement touches only the group it names.
+    let bystander_rules = json!([{ "ipRule": "203.0.113.0/24", "ruleDesc": "left alone" }]);
+    let bystander = create_one(
+        &router,
+        &json!({ "GroupName": "grp-bystander", "UserRules": bystander_rules.clone() }),
+    )
+    .await;
+
+    for (case, submitted) in replacement_table() {
+        let request = json!({ "GroupId": group_id, "UserRules": submitted });
+        let (status, body) = update_rules(&router, &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: UpdateRulesOfIpGroup must answer 200, got {status} with {body}"
+        );
+        assert_no_output_members(case, &body);
+
+        let reported = describe_one(&router, &group_id).await;
+        assert_eq!(
+            reported["userRules"],
+            expected_user_rules(&submitted),
+            "case {case:?}: the group reports exactly the submitted rules, got {reported}"
+        );
+        // Replacing the rule set changes nothing else about the group.
+        assert_eq!(
+            reported["groupId"], json!(group_id),
+            "case {case:?}: the group keeps its id, got {reported}"
+        );
+        assert_eq!(
+            reported["groupName"], json!("grp-under-update"),
+            "case {case:?}: the group keeps its name, got {reported}"
+        );
+        assert_eq!(
+            reported["groupDesc"], json!("the group whose rules are replaced"),
+            "case {case:?}: the group keeps its description, got {reported}"
+        );
+
+        let other = describe_one(&router, &bystander).await;
+        assert_eq!(
+            other["userRules"],
+            expected_user_rules(&bystander_rules),
+            "case {case:?}: only the group named is updated, got {other}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_refused_update_leaves_the_stored_rule_set_untouched() {
+    let (router, _engine) = emulator_with_engine();
+    let stored_rules = json!([{ "ipRule": "10.0.0.0/16", "ruleDesc": "initial office range" }]);
+    let group_id = create_one(
+        &router,
+        &json!({ "GroupName": "grp-refused-updates", "UserRules": stored_rules.clone() }),
+    )
+    .await;
+
+    // A group this emulator does not hold: both an id it never minted and the id of a
+    // group that was deleted are `ResourceNotFoundException`, never a silent success.
+    let doomed = create_one(&router, &json!({ "GroupName": "grp-doomed" })).await;
+    let (status, body) = delete_group(&router, &json!({ "GroupId": doomed })).await;
+    assert_eq!(
+        status, 200,
+        "deleting a stored group must answer 200, got {status} with {body}"
+    );
+    for (case, missing) in [
+        ("an id never minted", "wsipg-ffffffff"),
+        ("the id of a deleted group", doomed.as_str()),
+    ] {
+        let request = json!({ "GroupId": missing, "UserRules": [{ "ipRule": "192.0.2.0/24" }] });
+        let (status, body) = update_rules(&router, &request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: updating a group that is not stored is a 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: that refusal is a ResourceNotFoundException, got {body}"
+        );
+    }
+
+    // A rule list this emulator refuses: the same list `CreateIpGroup` refuses, refused
+    // the same way, and refused BEFORE anything is written.
+    let desc_past_bound = "r".repeat(MAX_IP_GROUP_TEXT_CHARS + 1);
+    let refused: Vec<(&str, Value)> = vec![
+        (
+            "a rule that is not an address range",
+            json!([{ "ipRule": "not-a-cidr", "ruleDesc": "refused" }]),
+        ),
+        (
+            "a prefix wider than its family",
+            json!([{ "ipRule": "10.0.0.0/33" }]),
+        ),
+        (
+            "an accepted rule beside a refused one",
+            json!([{ "ipRule": "192.0.2.0/24" }, { "ipRule": "10.0.0.256/24" }]),
+        ),
+        (
+            "one rule more than the emulator stores",
+            ip_rules(MAX_RULES_PER_IP_GROUP + 1),
+        ),
+        (
+            "a rule description one character past the bound",
+            json!([{ "ipRule": "192.0.2.0/24", "ruleDesc": desc_past_bound }]),
+        ),
+    ];
+    for (case, rules) in refused {
+        let request = json!({ "GroupId": group_id, "UserRules": rules });
+        let (status, body) = update_rules(&router, &request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a refused rule list is a 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValuesException",
+            "case {case:?}: that refusal is an InvalidParameterValuesException, got {body}"
+        );
+
+        let reported = describe_one(&router, &group_id).await;
+        assert_eq!(
+            reported["userRules"],
+            expected_user_rules(&stored_rules),
+            "case {case:?}: a refused update must not change the stored rules, got {reported}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleting_a_group_removes_it_from_the_registry() {
+    let (router, _engine) = emulator_with_engine();
+
+    // The rows differ in how many groups are stored and which of them is deleted: the
+    // first, one in the middle, the last, and the only one.
+    let table: Vec<(&str, usize, usize)> = vec![
+        ("the only group", 1, 0),
+        ("the first of three", 3, 0),
+        ("the middle of three", 3, 1),
+        ("the last of four", 4, 3),
+    ];
+
+    for (case, count, victim) in table {
+        let mut created = Vec::new();
+        for index in 0..count {
+            created.push(
+                create_one(
+                    &router,
+                    &json!({
+                        "GroupName": format!("{case}-{index}"),
+                        "UserRules": [{ "ipRule": format!("10.{index}.0.0/16") }],
+                    }),
+                )
+                .await,
+            );
+        }
+        let doomed = created[victim].clone();
+
+        let (status, body) = delete_group(&router, &json!({ "GroupId": doomed })).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DeleteIpGroup must answer 200 for a stored group, got {status} with {body}"
+        );
+        assert_no_output_members(case, &body);
+
+        // A full sweep no longer lists it, and every surviving group keeps its place
+        // in creation order.
+        let surviving: Vec<String> = sweep(&router, Some(2))
+            .await
+            .iter()
+            .map(|group| group["groupId"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let expected: Vec<String> = created
+            .iter()
+            .filter(|group_id| **group_id != doomed)
+            .cloned()
+            .collect();
+        assert_eq!(
+            surviving, expected,
+            "case {case:?}: a deleted group is no longer reported, got {surviving:?}"
+        );
+
+        // Nor does asking for it by id, which the operation models no error for.
+        let request = json!({ "GroupIds": [doomed] });
+        let (status, body) = call(&router, "DescribeIpGroups", &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: describing a deleted group by id is still a 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["Result"], json!([]),
+            "case {case:?}: a deleted group is reported by nothing, got {body}"
+        );
+
+        // Deleting it again is a ResourceNotFoundException: the deletion is complete
+        // when the call returns, so a second one finds nothing.
+        let (status, body) = delete_group(&router, &json!({ "GroupId": doomed })).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: deleting a group twice is a 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: that refusal is a ResourceNotFoundException, got {body}"
+        );
+
+        // The name the deleted group held is free again, and the group created under
+        // it is a DIFFERENT group.
+        let name = format!("{case}-{victim}");
+        let recreated = create_one(&router, &json!({ "GroupName": name })).await;
+        assert_ne!(
+            recreated, doomed,
+            "case {case:?}: recreating a deleted group's name mints a new id"
+        );
+
+        // Clear the registry for the next row: every group left, including the
+        // recreated one, is deleted through the wire.
+        for group_id in expected.iter().chain(std::iter::once(&recreated)) {
+            let (status, body) = delete_group(&router, &json!({ "GroupId": group_id })).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: clearing {group_id} must answer 200, got {status} with {body}"
+            );
+        }
+        let left = sweep(&router, None).await;
+        assert!(
+            left.is_empty(),
+            "case {case:?}: every group was deleted, got {left:?}"
+        );
+    }
+}
+
+/// An id a mutation names must be the id of a stored group: `DeleteIpGroup` on an id
+/// this emulator never minted is refused rather than accepted as a no-op.
+#[tokio::test]
+async fn deleting_a_group_that_is_not_stored_is_refused() {
+    let (router, _engine) = emulator_with_engine();
+    let kept = create_one(&router, &json!({ "GroupName": "grp-kept" })).await;
+
+    // Well-formed `IpGroupId` values (`^wsipg-[0-9a-z]{8,63}$`) naming no stored group:
+    // at the pattern's shortest suffix, at its longest, and in between.
+    for suffix in ["00000000", "ffffffff", "deadbeef00", &"z".repeat(63)] {
+        let group_id = format!("wsipg-{suffix}");
+        let (status, body) = delete_group(&router, &json!({ "GroupId": group_id })).await;
+        assert_eq!(
+            status, 400,
+            "case {group_id:?}: deleting an unknown group is a 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {group_id:?}: that refusal is a ResourceNotFoundException, got {body}"
+        );
+    }
+
+    let surviving: Vec<String> = sweep(&router, None)
+        .await
+        .iter()
+        .map(|group| group["groupId"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        surviving,
+        vec![kept],
+        "a refused delete must not remove anything, got {surviving:?}"
+    );
+}
+
+/// The authorize cases, as (case, the rules the group holds, the rules submitted, the
+/// rule set the group must hold afterwards).
+///
+/// The expected column is this test's statement of the rule, written out rather than
+/// computed: the rules just authorized come first, in the order submitted, then the
+/// rules the group already held that the request did not name, in the order it held
+/// them, with at most one rule per address range. The rows differ along what that
+/// generalises over: how many rules are held and submitted, whether a submitted range
+/// is new or already held, the address family and form of the ranges, and whether a
+/// rule carries a description.
+#[allow(clippy::type_complexity)]
+fn authorize_table() -> Vec<(&'static str, Value, Value, Value)> {
+    vec![
+        (
+            "one new rule onto a group holding one",
+            json!([{ "ipRule": "10.0.0.0/16", "ruleDesc": "initial office range" }]),
+            json!([{ "ipRule": "192.168.1.0/24", "ruleDesc": "vpn range" }]),
+            json!([
+                { "ipRule": "192.168.1.0/24", "ruleDesc": "vpn range" },
+                { "ipRule": "10.0.0.0/16", "ruleDesc": "initial office range" },
+            ]),
+        ),
+        (
+            "two new rules onto a group holding two",
+            json!([{ "ipRule": "10.0.0.0/16" }, { "ipRule": "10.1.0.0/16" }]),
+            json!([
+                { "ipRule": "2001:db8::/32", "ruleDesc": "documentation range" },
+                { "ipRule": "203.0.113.7" },
+            ]),
+            json!([
+                { "ipRule": "2001:db8::/32", "ruleDesc": "documentation range" },
+                { "ipRule": "203.0.113.7" },
+                { "ipRule": "10.0.0.0/16" },
+                { "ipRule": "10.1.0.0/16" },
+            ]),
+        ),
+        (
+            "one new rule onto a group holding none",
+            json!([]),
+            json!([{ "ipRule": "0.0.0.0/0", "ruleDesc": "from anywhere" }]),
+            json!([{ "ipRule": "0.0.0.0/0", "ruleDesc": "from anywhere" }]),
+        ),
+        (
+            "a range the group already holds, with a new description",
+            json!([
+                { "ipRule": "10.0.0.0/16", "ruleDesc": "initial office range" },
+                { "ipRule": "192.0.2.0/24" },
+            ]),
+            json!([{ "ipRule": "10.0.0.0/16", "ruleDesc": "office range, renamed" }]),
+            json!([
+                { "ipRule": "10.0.0.0/16", "ruleDesc": "office range, renamed" },
+                { "ipRule": "192.0.2.0/24" },
+            ]),
+        ),
+        (
+            "a new range beside one already held",
+            json!([{ "ipRule": "10.0.0.0/16", "ruleDesc": "initial office range" }]),
+            json!([
+                { "ipRule": "198.51.100.0/24", "ruleDesc": "branch office" },
+                { "ipRule": "10.0.0.0/16", "ruleDesc": "initial office range" },
+            ]),
+            json!([
+                { "ipRule": "198.51.100.0/24", "ruleDesc": "branch office" },
+                { "ipRule": "10.0.0.0/16", "ruleDesc": "initial office range" },
+            ]),
+        ),
+        (
+            "no rules at all, onto a group holding one",
+            json!([{ "ipRule": "10.0.0.0/16", "ruleDesc": "initial office range" }]),
+            json!([]),
+            json!([{ "ipRule": "10.0.0.0/16", "ruleDesc": "initial office range" }]),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn authorizing_rules_adds_them_to_the_stored_rule_set() {
+    let (router, _engine) = emulator_with_engine();
+
+    for (index, (case, held, submitted, expected)) in authorize_table().into_iter().enumerate() {
+        let group_id = create_one(
+            &router,
+            &json!({ "GroupName": format!("grp-authorize-{index}"), "UserRules": held }),
+        )
+        .await;
+
+        let request = json!({ "GroupId": group_id, "UserRules": submitted });
+        let (status, body) = authorize_rules(&router, &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: AuthorizeIpRules must answer 200, got {status} with {body}"
+        );
+        assert_no_output_members(case, &body);
+
+        let reported = describe_one(&router, &group_id).await;
+        assert_eq!(
+            reported["userRules"],
+            expected_user_rules(&expected),
+            "case {case:?}: the group must hold the authorized rules beside the ones it held, got {reported}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn authorizing_more_rules_than_a_group_holds_is_refused_and_changes_nothing() {
+    let (router, _engine) = emulator_with_engine();
+    let held = ip_rules(MAX_RULES_PER_IP_GROUP);
+    let group_id = create_one(
+        &router,
+        &json!({ "GroupName": "grp-at-the-rule-bound", "UserRules": held.clone() }),
+    )
+    .await;
+
+    // A group at the bound: one more range does not fit, but re-authorizing ranges it
+    // already holds does, because a group holds at most one rule per range.
+    let (status, body) = authorize_rules(
+        &router,
+        &json!({ "GroupId": group_id, "UserRules": [{ "ipRule": "203.0.113.0/24" }] }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a rule past the bound is a 400, got {status} with {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ResourceLimitExceededException",
+        "a rule past the bound is a ResourceLimitExceededException, got {body}"
+    );
+    let reported = describe_one(&router, &group_id).await;
+    assert_eq!(
+        reported["userRules"],
+        expected_user_rules(&held),
+        "a refused authorize must not change the stored rules, got {reported}"
+    );
+
+    let already_held = json!([{ "ipRule": "10.0.0.0/24", "ruleDesc": "re-authorized" }]);
+    let (status, body) = authorize_rules(
+        &router,
+        &json!({ "GroupId": group_id, "UserRules": already_held }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "re-authorizing a range the group holds must answer 200, got {status} with {body}"
+    );
+    let reported = describe_one(&router, &group_id).await;
+    let rule_count = reported["userRules"].as_array().map_or(0, Vec::len);
+    assert_eq!(
+        rule_count, MAX_RULES_PER_IP_GROUP,
+        "a group holds at most one rule per range, got {rule_count} rules: {reported}"
+    );
+}
+
+/// The revoke cases, as (case, the rules the group holds, the ranges revoked, the rule
+/// set the group must hold afterwards).
+///
+/// The rows differ along what the rule generalises over: which position in the held set
+/// is revoked, how many ranges one call names, a range the group does not hold, a range
+/// named twice, and revoking everything.
+#[allow(clippy::type_complexity)]
+fn revoke_table() -> Vec<(&'static str, Value, Value, Value)> {
+    let three = json!([
+        { "ipRule": "10.0.0.0/16", "ruleDesc": "office" },
+        { "ipRule": "192.0.2.0/24" },
+        { "ipRule": "2001:db8::/32", "ruleDesc": "documentation range" },
+    ]);
+    vec![
+        (
+            "the first of three",
+            three.clone(),
+            json!(["10.0.0.0/16"]),
+            json!([
+                { "ipRule": "192.0.2.0/24" },
+                { "ipRule": "2001:db8::/32", "ruleDesc": "documentation range" },
+            ]),
+        ),
+        (
+            "the middle of three",
+            three.clone(),
+            json!(["192.0.2.0/24"]),
+            json!([
+                { "ipRule": "10.0.0.0/16", "ruleDesc": "office" },
+                { "ipRule": "2001:db8::/32", "ruleDesc": "documentation range" },
+            ]),
+        ),
+        (
+            "two of three at once",
+            three.clone(),
+            json!(["2001:db8::/32", "10.0.0.0/16"]),
+            json!([{ "ipRule": "192.0.2.0/24" }]),
+        ),
+        (
+            "every rule the group holds",
+            three.clone(),
+            json!(["10.0.0.0/16", "192.0.2.0/24", "2001:db8::/32"]),
+            json!([]),
+        ),
+        (
+            "a range the group does not hold",
+            three.clone(),
+            json!(["198.51.100.0/24"]),
+            three.clone(),
+        ),
+        (
+            "one range named twice",
+            three.clone(),
+            json!(["10.0.0.0/16", "10.0.0.0/16"]),
+            json!([
+                { "ipRule": "192.0.2.0/24" },
+                { "ipRule": "2001:db8::/32", "ruleDesc": "documentation range" },
+            ]),
+        ),
+        ("no range at all", three.clone(), json!([]), three),
+        (
+            "the only rule of a group holding one",
+            json!([{ "ipRule": "203.0.113.7", "ruleDesc": "one address" }]),
+            json!(["203.0.113.7"]),
+            json!([]),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn revoking_rules_removes_exactly_the_ranges_named() {
+    let (router, _engine) = emulator_with_engine();
+
+    for (index, (case, held, revoked, expected)) in revoke_table().into_iter().enumerate() {
+        let group_id = create_one(
+            &router,
+            &json!({ "GroupName": format!("grp-revoke-{index}"), "UserRules": held }),
+        )
+        .await;
+
+        let request = json!({ "GroupId": group_id, "UserRules": revoked });
+        let (status, body) = revoke_rules(&router, &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: RevokeIpRules must answer 200, got {status} with {body}"
+        );
+        assert_no_output_members(case, &body);
+
+        let reported = describe_one(&router, &group_id).await;
+        assert_eq!(
+            reported["userRules"],
+            expected_user_rules(&expected),
+            "case {case:?}: the group must hold exactly the rules not revoked, got {reported}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_rule_mutation_on_a_group_that_is_not_stored_is_refused() {
+    let (router, _engine) = emulator_with_engine();
+    let stored_rules = json!([{ "ipRule": "10.0.0.0/16", "ruleDesc": "initial office range" }]);
+    let group_id = create_one(
+        &router,
+        &json!({ "GroupName": "grp-bystander", "UserRules": stored_rules.clone() }),
+    )
+    .await;
+
+    // Every rule mutation refuses an id this emulator does not hold, rather than
+    // reporting a success that changed nothing.
+    for missing in ["wsipg-00000000", "wsipg-ffffffff", "wsipg-deadbeef99"] {
+        for (operation, request) in [
+            (
+                "AuthorizeIpRules",
+                json!({ "GroupId": missing, "UserRules": [{ "ipRule": "192.0.2.0/24" }] }),
+            ),
+            (
+                "RevokeIpRules",
+                json!({ "GroupId": missing, "UserRules": ["192.0.2.0/24"] }),
+            ),
+            (
+                "UpdateRulesOfIpGroup",
+                json!({ "GroupId": missing, "UserRules": [{ "ipRule": "192.0.2.0/24" }] }),
+            ),
+            ("DeleteIpGroup", json!({ "GroupId": missing })),
+        ] {
+            let (status, body) = call(&router, operation, &request).await;
+            assert_eq!(
+                status, 400,
+                "case {operation} on {missing:?}: a group that is not stored is a 400, got {status} with {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ResourceNotFoundException",
+                "case {operation} on {missing:?}: that refusal is a ResourceNotFoundException, got {body}"
+            );
+        }
+    }
+
+    // A value that is not an address range is refused by both rule mutations, and
+    // neither touches the stored group.
+    for bad in ["not-a-cidr", "10.0.0.0/33", "192.0.2.1:443", ""] {
+        let (status, body) = authorize_rules(
+            &router,
+            &json!({ "GroupId": group_id, "UserRules": [{ "ipRule": bad }] }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {bad:?}: authorizing a value that is not an address range is a 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValuesException",
+            "case {bad:?}: that refusal is an InvalidParameterValuesException, got {body}"
+        );
+
+        let (status, body) = revoke_rules(
+            &router,
+            &json!({ "GroupId": group_id, "UserRules": [bad] }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {bad:?}: revoking a value that is not an address range is a 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValuesException",
+            "case {bad:?}: that refusal is an InvalidParameterValuesException, got {body}"
+        );
+    }
+
+    let reported = describe_one(&router, &group_id).await;
+    assert_eq!(
+        reported["userRules"],
+        expected_user_rules(&stored_rules),
+        "a refused rule mutation must not change the stored rules, got {reported}"
+    );
 }

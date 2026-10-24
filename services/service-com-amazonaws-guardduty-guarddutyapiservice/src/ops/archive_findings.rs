@@ -4,8 +4,10 @@
 //! IMPLEMENTED: puts every named finding the detector holds into the archived state,
 //! through the one write [`crate::state::ComAmazonawsGuarddutyGuarddutyapiserviceState::set_findings_archived_in`]
 //! that `UnarchiveFindings` drives the other way, so the last call to land decides the
-//! state a findings read reports. An id the detector does not hold moves nothing; an
-//! unknown detector id is refused with the `BadRequestException` envelope.
+//! state a findings read reports. Every `FindingIds` entry is resolved against the
+//! detector's own findings first, so a batch naming an id it does not hold is refused
+//! whole with the `BadRequestException` envelope and archives nothing; an unknown
+//! detector id is refused the same way.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -148,8 +150,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         // Classified from the REQUEST: a value that cannot be a detector id is a
         // parameter failure, a well-formed one this account does not hold an
-        // ownership failure. The write resolves the detector before it reads the
-        // clock, so a refused request moves nothing and advances nothing.
+        // ownership failure.
+        let rejection = {
+            let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+                return Err(crate::scaffolded::Scaffolded::invalid_input(
+                    crate::state::detector_id_rejection(&input.detector_id),
+                ));
+            };
+            // Every `FindingIds` entry is resolved against this detector's own
+            // findings BEFORE anything is written, so a batch naming an id the
+            // detector does not hold archives nothing at all.
+            detector
+                .first_unheld_finding_id(&input.finding_ids)
+                .map(crate::state::finding_id_rejection)
+        };
+        if let Some(message) = rejection {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(message));
+        }
+
+        // The write resolves the detector before it reads the clock, so a refused
+        // request moves nothing and advances nothing.
         if state
             .set_findings_archived_in(
                 &region,

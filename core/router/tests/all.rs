@@ -43,6 +43,11 @@ mod bedrock_signing_name_routing;
 mod billingconductor_payer_account;
 #[path = "all/boot_serve.rs"]
 mod boot_serve;
+// Declared in the sorted list rather than appended at the end of this file: the tail is
+// the contended region every other new router suite lands in, and a declaration here
+// merges cleanly beside them.
+#[path = "all/cfn_provisions_declared_resources.rs"]
+mod cfn_provisions_declared_resources;
 #[path = "all/cloudformation_provisions_stack_resources.rs"]
 mod cloudformation_provisions_stack_resources;
 #[path = "all/cloudfront_key_value_store_handshake.rs"]
@@ -193,3 +198,5 @@ mod cloudformation_provisions_waf_regional_ip_sets;
 mod mediapackagev2_published_data_plane_urls;
 #[path = "all/pi_resource_features.rs"]
 mod pi_resource_features;
+#[path = "all/cloudformation_provisions_cloudwatch_metric_streams.rs"]
+mod cloudformation_provisions_cloudwatch_metric_streams;

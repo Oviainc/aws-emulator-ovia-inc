@@ -19,7 +19,10 @@
 //! `CreatedAt`, description, log subscriptions, tags) and every other channel. The rotation
 //! is persisted, so the operation's own response and the next `DescribeChannel` render the
 //! same record; a rotation naming a channel, or an ingest endpoint id, the service does not
-//! hold writes nothing and is `NotFoundException` (404).
+//! hold writes nothing and is `NotFoundException` (404) — scoped the way the lookup was:
+//! an unresolvable channel is reported against the channel id alone, while an endpoint the
+//! RESOLVED channel does not hold is reported against that channel AND the guid, because
+//! this lookup is scoped per channel and the same guid may exist under another one.
 //!
 //! The generated shape — 32 lowercase-hex characters for each of `Id`, `Username` and
 //! `Password` — is the one `tests/all/ingest_credentials.rs` pins for a freshly created
@@ -35,6 +38,7 @@
 //! many times in a row the same endpoint is rotated.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_mediapackage_mediapackage::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::{call, emulator, error_code};
@@ -442,6 +446,39 @@ async fn rotating_a_target_the_service_does_not_hold_is_not_found_and_writes_not
             "NotFoundException",
             "case {case:?}: expected NotFoundException, got {body:?}"
         );
+
+        // The refusal is scoped the way the lookup was: taken from the service's own
+        // wording rather than restated here.
+        let channel_resolves = channel_id == held;
+        let expected = if channel_resolves {
+            state::ingest_endpoint_not_found(&channel_id, &endpoint_id)
+        } else {
+            state::channel_not_found(&channel_id)
+        };
+        let message = body
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(
+            message,
+            expected.message(),
+            "case {case:?}: expected the refusal {:?}, got {body:?}",
+            expected.message()
+        );
+        if channel_resolves {
+            // The rule: a child addressed inside its parent is reported with BOTH ids, so
+            // the reader can tell which channel the guid was looked up under.
+            assert!(
+                message.contains(&channel_id) && message.contains(&endpoint_id),
+                "case {case:?}: the refusal must name the channel the lookup was scoped to \
+                 and the guid that was not found, got {message:?}"
+            );
+            assert!(
+                body.pointer("/errors/channel").is_some(),
+                "case {case:?}: a channel-scoped refusal is keyed by the channel, got \
+                 {body:?}"
+            );
+        }
     }
 
     // Nothing was written: the held channel still carries the credentials it was

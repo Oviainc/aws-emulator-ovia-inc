@@ -19,10 +19,10 @@ use serde_json::{json, Value};
 use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emulator, ACCOUNT};
 
 /// Long enough to pass `state::MLFLOW_APP_CREATED_AFTER` (300 ms).
-const PAST_CREATED_DUE: std::time::Duration = std::time::Duration::from_millis(600);
+pub(crate) const PAST_CREATED_DUE: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// An IAM role ARN satisfying `RoleArn`'s modelled pattern.
-const ROLE: &str = "arn:aws:iam::123456789012:role/service-role/MlflowAppRole";
+pub(crate) const ROLE: &str = "arn:aws:iam::123456789012:role/service-role/MlflowAppRole";
 
 /// `ModelRegistrationMode`'s members, from
 /// `smithy_query(query="shape",shape="ModelRegistrationMode")`.
@@ -50,7 +50,7 @@ fn signed_identity_arn(principal: &str) -> String {
 }
 
 /// A minimal create body: the three required members only.
-fn minimal(name: &str) -> Value {
+pub(crate) fn minimal(name: &str) -> Value {
     json!({
         "Name": name,
         "ArtifactStoreUri": "s3://mlflow-artifacts/apps/",
@@ -70,7 +70,7 @@ async fn create(emulator: &Emulator, case: &str, body: &Value) -> String {
 }
 
 /// The resource segment of `arn`, i.e. everything after `:mlflow-app/`.
-fn mlflow_app_id(arn: &str) -> &str {
+pub(crate) fn mlflow_app_id(arn: &str) -> &str {
     arn.rsplit(":mlflow-app/").next().unwrap_or_default()
 }
 

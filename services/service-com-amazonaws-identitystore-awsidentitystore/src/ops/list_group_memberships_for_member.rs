@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        // A read: it looks the store up rather than vivifying one, so listing a
+        // A read: the store is RESOLVED and nothing is written, so listing a
         // member's memberships can never change what a later caller sees.
         let state = state.lock();
 
@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // end of a membership. The request names that user through `MemberId` rather
         // than through a user id of its own, so it is the member end's constant, exactly
         // as `CreateGroupMembership` and `IsMemberInGroups` answer. A store that was
-        // never created holds no such member either and is reported the same way, as
+        // never written to holds no such member either and is reported the same way, as
         // this operation's own suite pins: the member is the resource the call is about.
         let MemberId::UserId(member) = &input.member_id;
         let not_found = || {
@@ -194,8 +194,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::member_not_found(member),
             )
         };
-        // The identity store the request names must exist; one that does not is the
-        // missing resource, reported as `IDENTITY_STORE`.
+        // Any well-formed `IdentityStoreId` of this account names the store the caller
+        // has; an identifier naming no store this emulator serves is the missing
+        // resource, reported as `IDENTITY_STORE`.
         let store = state
             .resolve_store(&input.identity_store_id)
             .map_err(ListGroupMembershipsForMemberErrorModeled::ResourceNotFoundException)?;

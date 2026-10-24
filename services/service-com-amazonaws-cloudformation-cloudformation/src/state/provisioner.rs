@@ -30,6 +30,10 @@
 //! * `AWS::KinesisFirehose::DeliveryStream`'s properties ARE `CreateDeliveryStream`'s own
 //!   members, so the evaluated property document is the request, passed through verbatim
 //!   with the one member CloudFormation decides (the name) set on the way out;
+//! * `AWS::CloudWatch::MetricStream`'s are `PutMetricStream`'s own members the same way,
+//!   and that one call is documented "Creates or updates a metric stream" — so it is also
+//!   this type's UPDATE, the one arm here that can apply a changed declaration to a
+//!   resource the stack already has;
 //! * `AWS::CodePipeline::Pipeline`'s are the same document with one transformation: they
 //!   are `PipelineDeclaration`'s members spelled with an upper-case initial, so
 //!   [`camel_cased`] lower-cases each key's first letter and the document is the
@@ -67,6 +71,14 @@
 //!   `IPSetDescriptors` entry is INSERTed by an `UpdateIPSet`, and both carry a change
 //!   token of their own. Its identity is its owning service's too ("Ref returns the IPSet
 //!   ID"), so its arm answers the `IPSetId` AWS WAF returned as the resource's physical id.
+//! * `AWS::EMR::Cluster`'s are mostly `RunJobFlow`'s own members (`ReleaseLabel`,
+//!   `Applications`, `BootstrapActions`, `Tags`, the roles and the scalars), so they pass
+//!   through verbatim; the two that are shaped differently are mapped — the per-role
+//!   capacity properties of `Instances` onto the one `InstanceGroups` or `InstanceFleets`
+//!   list the API takes, and a `Configurations` entry's `ConfigurationProperties` onto the
+//!   API's `Properties`. Its identity is its owning service's as well ("Ref returns the
+//!   cluster ID"), so its arm answers the `j-` job-flow id Amazon EMR minted as the
+//!   resource's physical id.
 //!
 //! No arm invents a value: a property the template does not declare is absent from the
 //! request, and what the owning service answers is what the stack records. A property an
@@ -85,8 +97,8 @@ use super::provisioning::{
     AWS_JSON_1_0, AWS_JSON_1_1,
 };
 use super::template::{
-    ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
-    SNS_TOPIC, SQS_QUEUE, WAF_REGIONAL_IP_SET,
+    CLOUDWATCH_METRIC_STREAM, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, EMR_CLUSTER,
+    FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE, SNS_TOPIC, SQS_QUEUE, WAF_REGIONAL_IP_SET,
 };
 use super::StoredResource;
 
@@ -110,8 +122,10 @@ const NOT_IMPLEMENTED: &str = "NotImplemented";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Provisioner {
     FirehoseDeliveryStream,
+    CloudWatchMetricStream,
     EcrPublicRepository,
     S3Bucket,
+    EmrCluster,
     IamRole,
     CodePipelinePipeline,
     EcsCluster,
@@ -126,8 +140,10 @@ pub(super) enum Provisioner {
 pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
     match resource_type {
         FIREHOSE_DELIVERY_STREAM => Some(Provisioner::FirehoseDeliveryStream),
+        CLOUDWATCH_METRIC_STREAM => Some(Provisioner::CloudWatchMetricStream),
         ECR_PUBLIC_REPOSITORY => Some(Provisioner::EcrPublicRepository),
         S3_BUCKET => Some(Provisioner::S3Bucket),
+        EMR_CLUSTER => Some(Provisioner::EmrCluster),
         IAM_ROLE => Some(Provisioner::IamRole),
         CODEPIPELINE_PIPELINE => Some(Provisioner::CodePipelinePipeline),
         ECS_CLUSTER => Some(Provisioner::EcsCluster),
@@ -154,8 +170,10 @@ impl Provisioner {
     ) -> Result<Created, Refusal> {
         match self {
             Self::FirehoseDeliveryStream => create_delivery_stream(ctx, region, resource).await,
+            Self::CloudWatchMetricStream => put_metric_stream(ctx, region, resource).await,
             Self::EcrPublicRepository => create_public_repository(ctx, region, resource).await,
             Self::S3Bucket => create_bucket(ctx, region, resource).await,
+            Self::EmrCluster => run_job_flow(ctx, region, resource).await,
             Self::IamRole => create_role(ctx, region, resource).await,
             Self::CodePipelinePipeline => create_pipeline(ctx, region, resource).await,
             Self::EcsCluster => create_cluster(ctx, region, resource).await,
@@ -191,6 +209,20 @@ impl Provisioner {
     ) -> Result<Option<Created>, Refusal> {
         match self {
             Self::SqsQueue => update_queue(ctx, region, resource, declared).await.map(Some),
+            // CloudWatch's own `PutMetricStream` is documented "Creates or updates a metric
+            // stream", so the call that created the stream is the call that applies a
+            // changed declaration to it — under the name the stack gave it, with the
+            // configuration the template now declares.
+            Self::CloudWatchMetricStream => {
+                put_metric_stream_configuration(
+                    ctx,
+                    region,
+                    &resource.physical_resource_id,
+                    declared,
+                )
+                .await
+                .map(Some)
+            }
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -213,10 +245,14 @@ impl Provisioner {
             Self::FirehoseDeliveryStream => {
                 delete_delivery_stream(ctx, region, physical_resource_id).await
             }
+            Self::CloudWatchMetricStream => {
+                delete_metric_stream(ctx, region, physical_resource_id).await
+            }
             Self::EcrPublicRepository => {
                 delete_public_repository(ctx, region, physical_resource_id).await
             }
             Self::S3Bucket => delete_bucket(ctx, region, physical_resource_id).await,
+            Self::EmrCluster => terminate_job_flow(ctx, region, physical_resource_id).await,
             // The role's policies have to go first, and only the resource's own record
             // says which ones there are.
             Self::IamRole => delete_role(ctx, region, resource).await,
@@ -254,10 +290,14 @@ impl Provisioner {
             Self::FirehoseDeliveryStream => {
                 describe_delivery_stream(ctx, region, physical_resource_id).await
             }
+            Self::CloudWatchMetricStream => {
+                describe_metric_stream(ctx, region, physical_resource_id).await
+            }
             Self::EcrPublicRepository => {
                 describe_public_repository(ctx, region, physical_resource_id).await
             }
             Self::S3Bucket => describe_bucket(ctx, region, physical_resource_id).await,
+            Self::EmrCluster => describe_job_flow(ctx, region, physical_resource_id).await,
             Self::IamRole => describe_role(ctx, region, physical_resource_id).await,
             Self::CodePipelinePipeline => {
                 describe_pipeline(ctx, region, physical_resource_id).await
@@ -373,6 +413,128 @@ async fn describe_delivery_stream(
 }
 
 // ---------------------------------------------------------------------------
+// Amazon CloudWatch: AWS::CloudWatch::MetricStream
+// ---------------------------------------------------------------------------
+
+/// Amazon CloudWatch's signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: monitoring`, service shape `GraniteServiceVersion20100801`), whose
+/// protocol list starts with `awsJson1_0` — the wire this call is written on, as the
+/// service's own suites drive it.
+const CLOUDWATCH_SIGNING_NAME: &str = "monitoring";
+const CLOUDWATCH_TARGET_PREFIX: &str = "GraniteServiceVersion20100801";
+
+/// Create — or update — the metric stream an `AWS::CloudWatch::MetricStream` declares.
+///
+/// The type's properties ARE `PutMetricStream`'s own members: `FirehoseArn`, `RoleArn`,
+/// `OutputFormat`, `IncludeFilters`, `ExcludeFilters`, `StatisticsConfigurations`,
+/// `IncludeLinkedAccountsMetrics` and `Tags` are named identically on both sides (AWS's
+/// resource reference for the type against `PutMetricStreamInput`), so the resolved
+/// property document IS the request, with the one member CloudFormation decides — the
+/// stream's name, which is this resource's physical id — set on the way out.
+///
+/// The same call serves an UPDATE of the stream: "Creates or updates a metric stream …
+/// When you use PutMetricStream to create a new metric stream, the stream is created in
+/// the running state. If you use it to update an existing stream, the state of the stream
+/// is not changed" (`PutMetricStream`). That is why [`put_metric_stream_configuration`] is
+/// also the type's [`Provisioner::update`]: a deployment that changes a declared filter
+/// reaches CloudWatch as the configuration the template now declares, under the same name.
+async fn put_metric_stream(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    put_metric_stream_configuration(
+        ctx,
+        region,
+        &resource.physical_resource_id,
+        &resource.properties,
+    )
+    .await
+}
+
+/// `PutMetricStream` with `properties` as the request and `name` as the one member
+/// CloudFormation decides — the call behind both this type's create and its update, so the
+/// two cannot send a different request for the same declaration. `properties` is the
+/// configuration to put: the resource's own on a create, and the document the deployment
+/// DECLARES on an update.
+async fn put_metric_stream_configuration(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+    properties: &Value,
+) -> Result<Created, Refusal> {
+    let mut request = match properties {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    request.insert("Name".to_string(), Value::String(name.to_string()));
+    let reported = call_json_rpc(
+        ctx,
+        CLOUDWATCH_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{CLOUDWATCH_TARGET_PREFIX}.PutMetricStream"),
+        &Value::Object(request),
+    )
+    .await?;
+    let mut attributes = BTreeMap::new();
+    if let Some(arn) = reported.get("Arn").and_then(Value::as_str) {
+        attributes.insert("Arn".to_string(), arn.to_string());
+    }
+    Ok(Created::attributes(attributes))
+}
+
+/// Delete the metric stream a stack created: "Permanently deletes the metric stream that
+/// you specify."
+///
+/// `DeleteMetricStream` models no not-found error at all (`InternalServiceFault`,
+/// `InvalidParameterValueException` and `MissingRequiredParameterException` are its whole
+/// error list), unlike `GetMetricStream`, so a stream CloudWatch no longer holds is not
+/// refused and there is no not-found code to treat as success here.
+async fn delete_metric_stream(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "Name": physical_resource_id });
+    call_json_rpc(
+        ctx,
+        CLOUDWATCH_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{CLOUDWATCH_TARGET_PREFIX}.DeleteMetricStream"),
+        &request,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The metric stream's configuration as CloudWatch reports it, for drift detection: the
+/// `GetMetricStream` answer, whose members are the type's own property names. A stream
+/// CloudWatch no longer holds (`ResourceNotFoundException`) was deleted.
+async fn describe_metric_stream(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "Name": physical_resource_id });
+    match call_json_rpc(
+        ctx,
+        CLOUDWATCH_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{CLOUDWATCH_TARGET_PREFIX}.GetMetricStream"),
+        &request,
+    )
+    .await
+    {
+        Ok(answer) => Ok(Some(answer)),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Amazon ECR Public: AWS::ECR::PublicRepository
 // ---------------------------------------------------------------------------
 
@@ -453,6 +615,7 @@ async fn create_public_repository(
     {
         attributes.insert("Arn".to_string(), arn.to_string());
     }
+    // The repository was created under the name CloudFormation decided.
     Ok(Created::attributes(attributes))
 }
 
@@ -653,6 +816,315 @@ async fn describe_bucket(
         }
     }
     Ok(Some(Value::Object(actual)))
+}
+
+// ---------------------------------------------------------------------------
+// Amazon EMR: AWS::EMR::Cluster
+// ---------------------------------------------------------------------------
+
+/// Amazon EMR's signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: elasticmapreduce`, service shape `ElasticMapReduce`).
+const EMR_SIGNING_NAME: &str = "elasticmapreduce";
+const EMR_TARGET_PREFIX: &str = "ElasticMapReduce";
+
+/// The error code Amazon EMR answers for a cluster id it does not hold.
+const INVALID_REQUEST: &str = "InvalidRequestException";
+
+/// The deepest nesting of `Configurations` inside `Configurations` this arm descends into.
+///
+/// The declared properties come from a caller-supplied template body, so the nesting is the
+/// REQUESTER's choice and a recursive walk over it must be bounded by a constant rather
+/// than by the input: exhausting the native stack aborts the process instead of unwinding.
+/// Chosen, and deliberately shallow, because EMR's own documented nesting is one level of
+/// application configuration inside another — a deeper chain is a template built to explode
+/// the walk, and it is REFUSED rather than quietly truncated.
+const MAX_CONFIGURATION_NESTING: usize = 8;
+
+/// `InstanceGroupConfig$InstanceRole` for the three groups an `AWS::EMR::Cluster` declares
+/// one property at a time, and which `RunJobFlow` takes as ONE list whose entries carry the
+/// role. The one shape difference between the template's `Instances` and the API's.
+const INSTANCE_GROUP_ROLES: &[(&str, &str)] = &[
+    ("MasterInstanceGroup", "MASTER"),
+    ("CoreInstanceGroup", "CORE"),
+    ("TaskInstanceGroups", "TASK"),
+];
+
+/// The same fold for the FLEET form of the same three node types: the template declares
+/// `MasterInstanceFleet`, `CoreInstanceFleet` and `TaskInstanceFleets` one property at a
+/// time where `RunJobFlow` takes one `InstanceFleets` list whose entries carry
+/// `InstanceFleetConfig$InstanceFleetType` ("The node type that the instance fleet hosts.
+/// Valid values are MASTER, CORE, and TASK").
+///
+/// A cluster may declare groups or fleets but not both ("A valid JobFlowInstancesConfig
+/// must contain either InstanceGroups or InstanceFleets. They cannot be used together"),
+/// which Amazon EMR's own `RunJobFlow` refuses — so a template declaring both is carried to
+/// EMR as declared and left to that refusal rather than judged here.
+const INSTANCE_FLEET_ROLES: &[(&str, &str)] = &[
+    ("MasterInstanceFleet", "MASTER"),
+    ("CoreInstanceFleet", "CORE"),
+    ("TaskInstanceFleets", "TASK"),
+];
+
+/// Run the job flow an `AWS::EMR::Cluster` declares, and report the `j-` job-flow id EMR
+/// ASSIGNED it.
+///
+/// Unlike a stream, a repository or a bucket, this identifier is not CloudFormation's to
+/// decide: "Ref returns the cluster ID", which exists only once EMR has run the flow — so
+/// it is answered as the resource's own physical id ([`Created::physical_resource_id`]),
+/// which [`super::provisioning::reconcile`] adopts, and the `Id`/`ClusterId` attributes are
+/// re-pointed at it ([`super::template::identity_attributes`]).
+///
+/// Most of the type's properties ARE `RunJobFlow`'s own members (`ReleaseLabel`,
+/// `Applications`, `BootstrapActions`, `Tags`, the roles and the scalars), so they are
+/// passed through verbatim. Two are shaped differently and are mapped: `Instances`, whose
+/// per-role capacity properties the API takes as one `InstanceGroups` or `InstanceFleets`
+/// list, and `Configurations`, whose property map the template spells
+/// `ConfigurationProperties` where the API spells it `Properties`. `Name` is the one member
+/// CloudFormation decides when the template declares none: EMR requires a cluster name, so
+/// the generated resource name is used.
+async fn run_job_flow(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let declared = match &resource.properties {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    let mut request = Map::new();
+    for (member, value) in &declared {
+        match member.as_str() {
+            "Instances" => {
+                request.insert("Instances".to_string(), instances(value)?);
+            }
+            "Configurations" => {
+                request.insert("Configurations".to_string(), configurations(value, 0)?);
+            }
+            _ => {
+                request.insert(member.clone(), value.clone());
+            }
+        }
+    }
+    let name = declared
+        .get("Name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| resource.physical_resource_id.clone());
+    request.insert("Name".to_string(), Value::String(name));
+
+    let reported = call_json_rpc(
+        ctx,
+        EMR_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{EMR_TARGET_PREFIX}.RunJobFlow"),
+        &Value::Object(request),
+    )
+    .await?;
+    let Some(job_flow_id) = reported.get("JobFlowId").and_then(Value::as_str) else {
+        // EMR answered a success carrying no job-flow id: there is no identifier to report,
+        // and nothing here invents one.
+        return Err(Refusal {
+            code: "InternalFailure".to_string(),
+            message: "Amazon EMR reported no JobFlowId for the job flow it ran".to_string(),
+        });
+    };
+    Ok(Created {
+        // The job-flow id is the cluster's identity, not an attribute beside it: "Ref
+        // returns the cluster ID".
+        physical_resource_id: Some(job_flow_id.to_string()),
+        attributes: BTreeMap::new(),
+    })
+}
+
+/// The cluster's configuration as Amazon EMR reports it, for drift detection:
+/// `DescribeCluster`'s own record, read by the `j-` job-flow id EMR minted.
+///
+/// A cluster id EMR does not hold is refused with its own `InvalidRequestException` — "the
+/// cluster id is not valid or does not exist" — which is the resource having been deleted.
+/// The record's members are EMR's own (`Name`, `ReleaseLabel`, `Applications`,
+/// `Configurations`), so a declared property spelled identically on both sides takes part in
+/// the comparison and one spelled differently leaves the cluster reported as existing rather
+/// than as modified, exactly as [`super::drift`] documents for every arm here.
+async fn describe_job_flow(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "ClusterId": physical_resource_id });
+    match call_json_rpc(
+        ctx,
+        EMR_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{EMR_TARGET_PREFIX}.DescribeCluster"),
+        &request,
+    )
+    .await
+    {
+        Ok(answer) => Ok(answer.get("Cluster").cloned()),
+        Err(refusal) if refusal.code == INVALID_REQUEST => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Terminate the job flow a stack created.
+///
+/// `TerminateJobFlows` "shuts a list of clusters down" and answers nothing; a cluster EMR
+/// does not have is refused with its own `InvalidRequestException`, which is the state the
+/// delete asks for.
+async fn terminate_job_flow(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "JobFlowIds": [physical_resource_id] });
+    match call_json_rpc(
+        ctx,
+        EMR_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{EMR_TARGET_PREFIX}.TerminateJobFlows"),
+        &request,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == INVALID_REQUEST => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The `Instances` an `AWS::EMR::Cluster` declares, as the `JobFlowInstancesConfig`
+/// `RunJobFlow` takes: every member passed through, and the per-role capacity properties
+/// folded onto the one list the API takes for that form — the three GROUP properties onto
+/// `InstanceGroups`, keyed by `InstanceRole`, and the three FLEET properties onto
+/// `InstanceFleets`, keyed by `InstanceFleetType`. Nothing a template declares is dropped:
+/// a cluster created with less capacity than its template asked for is not the cluster the
+/// template described.
+fn instances(declared: &Value) -> Result<Value, Refusal> {
+    let Value::Object(members) = declared else {
+        return Ok(declared.clone());
+    };
+    let mut config = Map::new();
+    let mut groups: Vec<Value> = Vec::new();
+    let mut fleets: Vec<Value> = Vec::new();
+    for (member, value) in members {
+        if let Some((_, role)) = INSTANCE_GROUP_ROLES
+            .iter()
+            .find(|(property, _)| property == member)
+        {
+            fold_per_role(member, value, "InstanceRole", role, &mut groups)?;
+            continue;
+        }
+        if let Some((_, role)) = INSTANCE_FLEET_ROLES
+            .iter()
+            .find(|(property, _)| property == member)
+        {
+            fold_per_role(member, value, "InstanceFleetType", role, &mut fleets)?;
+            continue;
+        }
+        config.insert(member.clone(), value.clone());
+    }
+    if !groups.is_empty() {
+        config.insert("InstanceGroups".to_string(), Value::Array(groups));
+    }
+    if !fleets.is_empty() {
+        config.insert("InstanceFleets".to_string(), Value::Array(fleets));
+    }
+    Ok(Value::Object(config))
+}
+
+/// Fold one per-role capacity property onto the list the API takes, stamping the role onto
+/// each entry under `role_member`.
+///
+/// The task-node property is a LIST (`TaskInstanceGroups`, `TaskInstanceFleets`) where the
+/// master and core ones are single structures, so both spellings are accepted. An entry
+/// that is not a structure at all is REFUSED rather than dropped: it is capacity the
+/// template asked for and this arm cannot carry.
+fn fold_per_role(
+    property: &str,
+    declared: &Value,
+    role_member: &str,
+    role: &str,
+    onto: &mut Vec<Value>,
+) -> Result<(), Refusal> {
+    let entries: Vec<&Value> = match declared {
+        Value::Array(items) => items.iter().collect(),
+        single => vec![single],
+    };
+    for entry in entries {
+        let Value::Object(entry) = entry else {
+            return Err(malformed_property(property));
+        };
+        let mut built = entry.clone();
+        built.insert(role_member.to_string(), Value::String(role.to_string()));
+        onto.push(Value::Object(built));
+    }
+    Ok(())
+}
+
+/// The `Configurations` an `AWS::EMR::Cluster` declares, as the `Configuration` list
+/// `RunJobFlow` takes — the application configurations (`hive-site`, `spark-hive-site`, …)
+/// a client reads back off the cluster.
+///
+/// One member is spelled differently on the two sides: the template's property map is
+/// `ConfigurationProperties` where the API's is `Properties`. Nested `Configurations` are
+/// mapped the same way, to the depth the template declares them; a chain of more than
+/// [`MAX_CONFIGURATION_NESTING`] levels is REFUSED, because a cluster created with part of
+/// the configuration its template declared is not the cluster the template described.
+///
+/// `depth` is how many levels are already above this one, so the outermost list is `0` and
+/// the deepest list this carries is `MAX_CONFIGURATION_NESTING - 1`: exactly
+/// [`MAX_CONFIGURATION_NESTING`] levels, which is what that constant names.
+fn configurations(declared: &Value, depth: usize) -> Result<Value, Refusal> {
+    if depth >= MAX_CONFIGURATION_NESTING {
+        return Err(Refusal {
+            code: "ValidationException".to_string(),
+            message: format!(
+                "Configurations are nested deeper than the {MAX_CONFIGURATION_NESTING} levels \
+                 this emulator carries, so the cluster was not created"
+            ),
+        });
+    }
+    let Value::Array(items) = declared else {
+        return Ok(declared.clone());
+    };
+    let mut mapped = Vec::with_capacity(items.len());
+    for configuration in items {
+        let Value::Object(members) = configuration else {
+            return Err(malformed_property("Configurations"));
+        };
+        let mut built = Map::new();
+        for (member, value) in members {
+            match member.as_str() {
+                "ConfigurationProperties" => {
+                    built.insert("Properties".to_string(), value.clone());
+                }
+                "Configurations" => {
+                    built.insert(
+                        "Configurations".to_string(),
+                        configurations(value, depth + 1)?,
+                    );
+                }
+                _ => {
+                    built.insert(member.clone(), value.clone());
+                }
+            }
+        }
+        mapped.push(Value::Object(built));
+    }
+    Ok(Value::Array(mapped))
+}
+
+/// The refusal for a declared property this arm cannot map onto the owning API's member,
+/// named so a caller can tell WHICH property it was. Refusing is what keeps a resource from
+/// being created with less than the template declared.
+fn malformed_property(property: &str) -> Refusal {
+    Refusal {
+        code: "ValidationException".to_string(),
+        message: format!("Property {property} is not shaped as the resource type declares it"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,6 +1752,7 @@ async fn create_cluster(
     {
         attributes.insert("Arn".to_string(), arn.to_string());
     }
+    // The cluster was created under the name CloudFormation decided.
     Ok(Created::attributes(attributes))
 }
 
@@ -1420,6 +1893,8 @@ async fn create_queue(
     if let Some(url) = reported.get("QueueUrl").and_then(Value::as_str) {
         attributes.insert("QueueUrl".to_string(), url.to_string());
     }
+    // The queue was created under the name CloudFormation decided, and its url is built
+    // from that name.
     Ok(Created::attributes(attributes))
 }
 

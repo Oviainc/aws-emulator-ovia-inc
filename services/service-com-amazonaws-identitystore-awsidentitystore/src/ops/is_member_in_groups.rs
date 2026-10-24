@@ -149,8 +149,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// Report, for each requested group, whether this identity store holds a
     /// membership joining that group and this member.
     ///
-    /// `@readonly`: the store is looked up rather than vivified and nothing is
-    /// written, so a check can never change what a later caller sees.
+    /// `@readonly`: the store is RESOLVED and nothing is written, so a check can never
+    /// change what a later caller sees.
     ///
     /// One result per element of `GroupIds`, in the order they were requested
     /// (repeats included): the modelled `Results` is a list of per-group

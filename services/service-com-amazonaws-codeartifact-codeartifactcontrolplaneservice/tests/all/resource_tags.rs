@@ -35,7 +35,7 @@ use service_com_amazonaws_codeartifact_codeartifactcontrolplaneservice::state::M
 // minted ARN carries), the same request/answer reduction and the same account id. Only
 // the TAGGED creates below are this suite's own, because the harness's creators take no
 // `tags`.
-use crate::harness::{call, emulator, Answer, ACCOUNT, REGION};
+use crate::harness::{call, emulator, package_group_arn, Answer, ACCOUNT, REGION};
 
 /// Percent-encode one query value the way an SDK does: `percent_encoding`'s
 /// `NON_ALPHANUMERIC` set, so an ARN's colons and slashes — and the spaces and non-ASCII
@@ -654,7 +654,7 @@ async fn a_package_group_is_tagged_by_the_same_rules() {
     .await;
     assert_eq!(
         nested_arn,
-        format!("arn:aws:codeartifact:{REGION}:{ACCOUNT}:package-group/group-tags/npm/scope/*"),
+        package_group_arn("group-tags", "/npm/scope/*"),
         "the group's ARN must carry its pattern as a path, got {nested_arn:?}"
     );
     let got = held_tags(&router, &nested_arn, "a group created with a repeated key").await;

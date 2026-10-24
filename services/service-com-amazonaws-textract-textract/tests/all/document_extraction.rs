@@ -139,9 +139,12 @@ fn collapse(text: &str) -> String {
 ///
 /// `expected_confidence` is the one value every block of this answer must report, when
 /// the caller knows it: a document whose text was read VERBATIM reports
-/// `state::EXTRACTED_TEXT_CONFIDENCE`, while a raster reports the confidence its
-/// recogniser measured, which only the service knows. Either way every block of ONE
-/// answer reports the SAME value, because they all describe one document's text.
+/// `state::EXTRACTED_TEXT_CONFIDENCE` on every block, because its characters were read
+/// rather than recognised and there is nothing finer to report. A RECOGNISED page is
+/// passed `None`: each of its blocks reports the confidence measured over the characters
+/// IT was read from, so the values differ between blocks and only `Percent`'s range is
+/// asserted here (`confidence_varies_with_the_text_it_was_measured_from` is where the
+/// spread itself is asserted).
 pub(crate) fn assert_block_graph(
     case: &str,
     body: &Value,
@@ -181,9 +184,6 @@ pub(crate) fn assert_block_graph(
         page_blocks.len()
     );
 
-    // Every block of one answer describes one document's text, so they all report that
-    // document's one confidence; the first one seen fixes it for the rest.
-    let mut shared_confidence: Option<f64> = None;
     for block in blocks {
         // `BLOCK_TYPE_VALUES` / `RELATIONSHIP_TYPE_VALUES` / `ENTITY_TYPE_VALUES` are
         // the BlockType, RelationshipType and EntityType enums of the Smithy model.
@@ -233,17 +233,14 @@ pub(crate) fn assert_block_graph(
                 "case {case:?}: block {} Confidence is {confidence}, outside Percent's 0..=100",
                 block_id(block)
             );
-            let expected = expected_confidence
-                .map(f64::from)
-                .or(shared_confidence)
-                .unwrap_or(confidence);
-            shared_confidence = Some(expected);
-            assert!(
-                (confidence - expected).abs() < 0.001,
-                "case {case:?}: block {} must report this document's one confidence \
-                 {expected}, got {confidence}",
-                block_id(block)
-            );
+            if let Some(expected) = expected_confidence.map(f64::from) {
+                assert!(
+                    (confidence - expected).abs() < 0.001,
+                    "case {case:?}: block {} must report the one confidence {expected} of a \
+                     document read verbatim, got {confidence}",
+                    block_id(block)
+                );
+            }
         }
         for rel in block
             .get("Relationships")

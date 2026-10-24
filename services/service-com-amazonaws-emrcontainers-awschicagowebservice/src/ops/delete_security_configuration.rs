@@ -8,6 +8,26 @@
 //! models no not-found error), because the output reports the id that WAS deleted and
 //! there was none.
 //!
+//! ## The rule this operation implements
+//!
+//! "Deletes a security configuration": the record LEAVES the store, which is observable
+//! in three ways, and all three are what this handler owes:
+//!
+//! 1. every later read of that id misses — not just the first one, since nothing of the
+//!    record is kept behind the read;
+//! 2. the `clientToken` that minted it is free again
+//!    ([`crate::state::ServiceState::remove_security_configuration`] drops the idempotency
+//!    entry with the record), so a create replaying that token mints a new configuration
+//!    rather than answering the deleted one;
+//! 3. the slot it occupied in the store's retention bound
+//!    ([`crate::state::MAX_SECURITY_CONFIGURATIONS`]) is free again — exactly one slot, so
+//!    a full store admits exactly one more create per delete.
+//!
+//! `tests/all/security_configuration.rs` pins the wire contract (what the delete answers,
+//! and the refusals), and `tests/all/security_configuration_delete.rs` pins the rules that
+//! take several calls to observe: the repeated poll of a deleted id, the records a delete
+//! must leave alone, and the one freed slot at the retention bound.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

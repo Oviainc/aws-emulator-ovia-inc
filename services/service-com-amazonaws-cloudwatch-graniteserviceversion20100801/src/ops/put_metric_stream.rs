@@ -390,6 +390,12 @@ const MAX_INCLUDE_METRICS: usize = 100;
 /// "You can associate as many as 50 tags with a metric stream." (`PutMetricStreamInput$Tags`)
 const MAX_TAGS: usize = 50;
 
+/// How CloudWatch opens its refusal of an additional statistic the selected output format
+/// cannot carry: `Unsupported statistic <statistic> for selected OutputFormat`. The
+/// sentence is fixed and parameterized by the request's own statistic, so the statistic
+/// follows this prefix verbatim and nothing else of the request appears in it.
+const UNSUPPORTED_STATISTIC_PREFIX: &str = "Unsupported statistic ";
+
 /// Refuse a statistics configuration the stream's output format cannot carry.
 ///
 /// "If the `OutputFormat` for the stream is `opentelemetry1.0` or `opentelemetry0.7`, the
@@ -397,6 +403,11 @@ const MAX_TAGS: usize = 50;
 /// `OutputFormat` for the stream is `json`, the valid values include the abbreviations for
 /// all of the statistics listed in CloudWatch statistics definitions."
 /// (`MetricStreamStatisticsConfiguration$AdditionalStatistics`)
+///
+/// CloudWatch words that refusal as one fixed sentence carrying the statistic the request
+/// asked for: `Unsupported statistic <statistic> for selected OutputFormat`
+/// ([`UNSUPPORTED_STATISTIC_PREFIX`], measured against `monitoring` in us-west-2), so the
+/// sentence names the member's value and nothing else about the request.
 fn validate_statistics_configurations(
     input: &PutMetricStreamInput,
 ) -> Result<(), PutMetricStreamError> {
@@ -431,9 +442,7 @@ fn validate_statistics_configurations(
             };
             if !supported {
                 return Err(invalid_parameter_value(format!(
-                    "The additional statistic {statistic} is not supported for metric streams \
-                     with the output format {}",
-                    input.output_format
+                    "{UNSUPPORTED_STATISTIC_PREFIX}{statistic} for selected OutputFormat"
                 )));
             }
         }

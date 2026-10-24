@@ -100,8 +100,20 @@ async fn create_table(router: &MultiServiceRouter, region: &str, name: &str) -> 
 }
 
 /// The tag set `ListTagsOfResource` reports for `arn`, as `Key=Value` pairs in key
-/// order.
+/// order, read once the tag writes before it have propagated.
+///
+/// A tag read is eventually consistent — "The application or removal of tags using
+/// TagResource and UntagResource APIs is eventually consistent. ListTagsOfResource API
+/// will only reflect the changes after a few seconds" (the `TagResource` doc) — so a
+/// write becomes visible one `STATUS_TRANSITION` after the call that made it. These
+/// refusal tests are about WHAT a call leaves stored, so they wait the span out first;
+/// `tag_read_propagation` is the test that pins WHEN it appears.
 async fn listed_tags(router: &MultiServiceRouter, region: &str, arn: &str) -> Vec<String> {
+    tokio::time::sleep(
+        service_com_amazonaws_dynamodb_dynamodb_20120810::state::STATUS_TRANSITION
+            + std::time::Duration::from_millis(50),
+    )
+    .await;
     let (status, body) = call_in(
         router,
         region,

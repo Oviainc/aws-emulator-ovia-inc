@@ -11,7 +11,18 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-amp-amazonprometheusservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.amp#CreateWorkspaceRequest")]
+// `skip_validation` names `kmsKeyArn`, whose published `@pattern` constrains the key-id
+// segment after `key/` to `[-a-f0-9]+` while the recorded live refusal quotes the
+// requirement the service actually applies, `…:key/.+` — so the model as published
+// refuses key ARNs the real service accepts (a multi-region `key/mrk-<hex>` CMK among
+// them). `crate::state::check_kms_key_arn` re-declares the member's modelled length bound
+// and that pattern with its key-id segment read as one-or-more of any character, and the
+// handler runs it. Every other member of this input keeps its modelled constraints at the
+// boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.amp#CreateWorkspaceRequest",
+    skip_validation = ["kmsKeyArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct CreateWorkspaceInput {
     pub alias: Option<String>,

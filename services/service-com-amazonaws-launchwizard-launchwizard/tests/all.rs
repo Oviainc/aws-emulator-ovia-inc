@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/deployment_lifecycle.rs"]
 mod deployment_lifecycle;
+#[path = "all/deployment_update.rs"]
+mod deployment_update;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/not_found_contract.rs"]

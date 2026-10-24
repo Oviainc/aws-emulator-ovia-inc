@@ -3,17 +3,19 @@
 //! Engine state for the com-amazonaws-appintegrations-amazonappintegrationservice service.
 //!
 //! Besides the state struct itself this module holds the few helpers the
-//! event-integration and data-integration handlers share — ARN construction, the
-//! request's region, the not-found wording, the record-to-modelled-shape conversions
-//! and the list cursor codec — so the operation files agree on one implementation of
-//! each instead of carrying a copy apiece that can drift apart.
+//! application, event-integration and data-integration handlers share — ARN
+//! construction, identifier resolution, the request's region, the not-found wording,
+//! the record-to-modelled-shape conversions and the list cursor codec — so the
+//! operation files agree on one implementation of each instead of carrying a copy
+//! apiece that can drift apart.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    DataIntegrationSummary, EventFilter, EventIntegration, FileConfiguration,
-    ScheduleConfiguration,
+    ApplicationConfig, ApplicationSourceConfig, AuthConfig, DataIntegrationSummary, EventFilter,
+    EventIntegration, FileConfiguration, IframeConfig, Publication, ScheduleConfiguration,
+    Subscription,
 };
 
 /// The region an emulated request is treated as having been made in when its
@@ -39,6 +41,16 @@ pub const DEFAULT_MAX_RESULTS: usize = 50;
 /// caller's delete ever shrinks from growing without end, and sits far above anything a
 /// test or a client script creates.
 pub const MAX_STORED_EVENT_INTEGRATIONS: usize = 1_000;
+
+/// The most applications this emulator stores at once.
+///
+/// AWS caps Applications with a service quota and reports an exceeded cap as
+/// `ResourceQuotaExceededException` ("the allowed quota for the resource has been
+/// exceeded"), which `CreateApplication` models. The NUMBER here is this emulator's own
+/// bound, not an AWS quota: it keeps an in-memory store that only a caller's delete ever
+/// shrinks from growing without end, and sits far above anything a test or a client
+/// script creates.
+pub const MAX_STORED_APPLICATIONS: usize = 1_000;
 
 /// The most data integrations this emulator stores at once.
 ///
@@ -68,6 +80,11 @@ pub const MAX_REMEMBERED_CLIENT_TOKENS: usize = MAX_STORED_DATA_INTEGRATIONS;
 /// [`ComAmazonawsAppintegrationsAmazonappintegrationserviceState::remember_event_client_token`].
 pub const MAX_REMEMBERED_EVENT_CLIENT_TOKENS: usize = MAX_STORED_EVENT_INTEGRATIONS;
 
+/// The most `ClientToken` -> application entries this emulator remembers at once, the
+/// [`MAX_REMEMBERED_CLIENT_TOKENS`] of the application index and enforced the same way,
+/// by [`ComAmazonawsAppintegrationsAmazonappintegrationserviceState::remember_application_client_token`].
+pub const MAX_REMEMBERED_APPLICATION_CLIENT_TOKENS: usize = MAX_STORED_APPLICATIONS;
+
 /// The resource type name AppIntegrations calls an event integration in the text of a
 /// `ResourceNotFoundException` — the Smithy shape name of the resource
 /// (`smithy_query(query="operation", operation="GetEventIntegration")`: the resource is
@@ -77,6 +94,10 @@ pub const EVENT_INTEGRATION_RESOURCE: &str = "EventIntegration";
 /// The same, for a data integration, which is addressed by an opaque identifier rather
 /// than by a name (`GetDataIntegration`'s `Identifier` label).
 pub const DATA_INTEGRATION_RESOURCE: &str = "DataIntegration";
+
+/// The same, for an application, which is addressed by an `ArnOrUUID` identifier
+/// (`GetApplication`'s `Arn` label).
+pub const APPLICATION_RESOURCE: &str = "Application";
 
 /// What a resource addressed by its `Name` member is called in a not-found message.
 pub const ADDRESSED_BY_NAME: &str = "name";
@@ -104,6 +125,11 @@ pub fn event_integration_not_found(name: &str) -> String {
 /// [`not_found_message`] for the data integration `identifier` the request named.
 pub fn data_integration_not_found(identifier: &str) -> String {
     not_found_message(DATA_INTEGRATION_RESOURCE, ADDRESSED_BY_IDENTIFIER, identifier)
+}
+
+/// [`not_found_message`] for the application `identifier` the request named.
+pub fn application_not_found(identifier: &str) -> String {
+    not_found_message(APPLICATION_RESOURCE, ADDRESSED_BY_IDENTIFIER, identifier)
 }
 
 /// The persisted tags as the modelled `TagMap`, or `None` when the resource carries
@@ -164,6 +190,45 @@ impl EventIntegrationRecord {
     }
 }
 
+/// One stored application: every member `CreateApplication` was given plus the id
+/// and ARN the service minted for it, so `GetApplication` reports the identical
+/// values instead of echoing a request or recomputing them.
+///
+/// The nested configuration members are kept as the modelled shapes they arrive
+/// as — they are plain data this service only stores and reports, so a parallel
+/// record type for each would add conversions without adding meaning.
+#[derive(Debug, Clone)]
+pub struct ApplicationRecord {
+    /// The `UUID` this service minted for the application: its identity, and the
+    /// last segment of [`ApplicationRecord::arn`].
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub namespace: String,
+    pub description: Option<String>,
+    pub application_source_config: ApplicationSourceConfig,
+    pub subscriptions: Option<Vec<Subscription>>,
+    pub publications: Option<Vec<Publication>>,
+    pub permissions: Option<Vec<String>>,
+    pub tags: BTreeMap<String, String>,
+    pub is_service: bool,
+    pub initialization_timeout: Option<i32>,
+    pub application_config: Option<ApplicationConfig>,
+    pub iframe_config: Option<IframeConfig>,
+    pub application_type: Option<String>,
+    pub auth_config: Option<AuthConfig>,
+    pub client_token: Option<String>,
+    pub created_time: SystemTime,
+    pub last_modified_time: SystemTime,
+}
+
+impl ApplicationRecord {
+    /// This record's tags as the modelled `TagMap` (see [`modeled_tags`]).
+    pub fn modeled_tags(&self) -> Option<HashMap<String, String>> {
+        modeled_tags(&self.tags)
+    }
+}
+
 /// One stored data integration: everything `CreateDataIntegration` was given, plus the
 /// id and ARN the service minted for it, so `Get`/`List` report the identical values
 /// `Create` returned instead of recomputing or echoing them.
@@ -210,6 +275,21 @@ impl DataIntegrationRecord {
 /// Per-service state for com-amazonaws-appintegrations-amazonappintegrationservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAppintegrationsAmazonappintegrationserviceState {
+    /// Every stored application, keyed by the `UUID` this service minted for it —
+    /// the resource's identity in this API, and what both identifier forms resolve
+    /// to (see [`Self::application_id`]). A `BTreeMap` so list order, and therefore
+    /// pagination, is deterministic. Bounded at [`MAX_STORED_APPLICATIONS`] entries
+    /// by the create that writes it ([`Self::has_room_for_another_application`]), so
+    /// a caller cannot grow it without end.
+    pub applications: BTreeMap<String, ApplicationRecord>,
+    /// `ClientToken` -> application id, so a retried `CreateApplication` carrying
+    /// the token of a completed one answers with the id and ARN it already minted
+    /// instead of creating a second application or failing as a duplicate. A
+    /// separate map from [`Self::idempotency`] and [`Self::data_integration_idempotency`]
+    /// because one token namespace belongs to one resource type. Bounded at
+    /// [`MAX_REMEMBERED_APPLICATION_CLIENT_TOKENS`] by
+    /// [`Self::remember_application_client_token`].
+    pub application_idempotency: BTreeMap<String, String>,
     /// Every stored event integration, keyed by its name — the resource's
     /// identity in this API. A `BTreeMap` so list order, and therefore
     /// pagination, is deterministic. Bounded at [`MAX_STORED_EVENT_INTEGRATIONS`]
@@ -246,6 +326,65 @@ pub struct ComAmazonawsAppintegrationsAmazonappintegrationserviceState {
 }
 
 impl ComAmazonawsAppintegrationsAmazonappintegrationserviceState {
+    /// The id of the application `identifier` names, or `None` when this account holds
+    /// none.
+    ///
+    /// The application operations address the resource by `ArnOrUUID` (model:
+    /// `GetApplication.Arn`, pattern `^(arn:aws:…|[a-f0-9]{8}-…)(:[\w\$]+)?$`), so both
+    /// forms this service hands out resolve: the `Id` it minted and the `Arn` built
+    /// from that id, either of them optionally carrying the trailing `:<qualifier>` the
+    /// pattern allows. Nothing else does — an ARN is matched against the stored one in
+    /// full, exactly as [`Self::data_integration_id`] matches a data integration's, so
+    /// a foreign ARN ending in the same id (another account, Region, vendor or resource
+    /// type) names no application here.
+    pub fn application_id(&self, identifier: &str) -> Option<String> {
+        if let Some(id) = self.exact_application_id(identifier) {
+            return Some(id);
+        }
+        let (base, _qualifier) = identifier.rsplit_once(':')?;
+        self.exact_application_id(base)
+    }
+
+    /// [`Self::application_id`] for an identifier carrying no qualifier: the minted id
+    /// itself, or the whole ARN built from it.
+    fn exact_application_id(&self, identifier: &str) -> Option<String> {
+        if self.applications.contains_key(identifier) {
+            return Some(identifier.to_string());
+        }
+        self.applications
+            .values()
+            .find(|record| record.arn == identifier)
+            .map(|record| record.id.clone())
+    }
+
+    /// Whether the store can hold another application, which is what
+    /// `CreateApplication` checks BEFORE it mints one: past
+    /// [`MAX_STORED_APPLICATIONS`] it refuses with the quota error that operation
+    /// models, for the same reason as [`Self::has_room_for_another_data_integration`].
+    pub fn has_room_for_another_application(&self) -> bool {
+        self.applications.len() < MAX_STORED_APPLICATIONS
+    }
+
+    /// Remember that the create carrying `token` minted the application `id`, so a
+    /// retry under that token answers with the resource it already made.
+    ///
+    /// Bounded exactly as [`Self::remember_client_token`] is, and for the same reason:
+    /// the key is caller-supplied, so the index it is written into cannot be allowed to
+    /// grow one request at a time.
+    pub fn remember_application_client_token(&mut self, token: String, id: String) {
+        if self.application_idempotency.len() >= MAX_REMEMBERED_APPLICATION_CLIENT_TOKENS {
+            let Self {
+                applications,
+                application_idempotency,
+                ..
+            } = self;
+            application_idempotency.retain(|_, minted| applications.contains_key(minted));
+        }
+        if self.application_idempotency.len() < MAX_REMEMBERED_APPLICATION_CLIENT_TOKENS {
+            self.application_idempotency.insert(token, id);
+        }
+    }
+
     /// The id of the data integration `identifier` names, or `None` when this account
     /// holds none.
     ///
@@ -339,6 +478,12 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The ARN of an application in `region`:
+/// `arn:aws:app-integrations:<region>:<account>:application/<id>`.
+pub fn application_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("application/{id}"))
 }
 
 /// The ARN of an event integration in `region`:

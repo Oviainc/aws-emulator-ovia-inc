@@ -24,8 +24,9 @@ use crate::ops::types::{
     POI_CATEGORY_VALUES, STATIC_MAP_STYLE_VALUES, TILE_ADDITIONAL_FEATURE_VALUES,
 };
 use super::{
-    ColorSchemeKind, ComAmazonawsGeomapsMapsserviceState, FontRecord, IconShape, MapStyleKind,
-    Palette, Rgba, SpriteSheetRecord, StyleRecord, TileFormat, TilesetRecord, VariantKind,
+    boundaries, labels, ColorSchemeKind, ComAmazonawsGeomapsMapsserviceState, FontRecord,
+    IconShape, MapStyleKind, Palette, Rgba, SpriteSheetRecord, StyleRecord, TileFormat,
+    TilesetRecord, VariantKind,
 };
 
 /// Earth's equatorial circumference in metres, the constant that turns a
@@ -1145,6 +1146,20 @@ pub struct StaticMapView {
     /// Whether the scale bar's leading unit is miles rather than kilometres.
     pub scale_bar_miles: bool,
     pub overlay: Vec<OverlayShape>,
+    /// The language the image's labels are written in: the request's
+    /// `Language` already resolved against the catalog's label languages, so
+    /// the renderer is handed a language the catalog has data for.
+    pub label_language: String,
+    /// The metrics the labels are measured with: the stored record for the
+    /// style's own font stack, the same one `GetGlyphs` serves that stack's
+    /// glyph ranges from.
+    pub label_font: FontRecord,
+    /// `CropLabels`: whether a label that does not fit entirely inside the
+    /// frame is left off the image rather than drawn and cut by its edge.
+    pub crop_labels: bool,
+    /// `PoliticalView`: the country code whose view of a disputed boundary the
+    /// image draws, or `None` for the de-facto boundaries.
+    pub political_view: Option<String>,
 }
 
 impl StaticMapView {
@@ -1155,7 +1170,9 @@ impl StaticMapView {
 }
 
 /// Render a static map: the terrain field inside the framed envelope, a
-/// graticule, the requested markers and overlay, and a scale bar.
+/// graticule, the political boundaries the requested view recognises, the
+/// requested markers and overlay, the places the frame carries with their
+/// labels, and a scale bar.
 pub fn render_static_map(palette: &Palette, view: &StaticMapView) -> Vec<u8> {
     let (pixel_width, pixel_height) = view.pixel_size();
     let mut canvas = Canvas::new(pixel_width, pixel_height, palette.land);
@@ -1195,25 +1212,64 @@ pub fn render_static_map(palette: &Palette, view: &StaticMapView) -> Vec<u8> {
         )
     };
 
+    // The political boundaries inside the frame, at the lines the requested
+    // view recognises. Drawn under the overlay and the annotations, the way a
+    // basemap's `borders` layer sits under them.
+    for line in boundaries::boundary_lines(view.envelope, view.political_view.as_deref()) {
+        for pair in line.windows(2) {
+            thick_line(
+                &mut canvas,
+                project(pair[0]),
+                project(pair[1]),
+                palette.label,
+                view.pixel_ratio,
+            );
+        }
+    }
+
     for shape in &view.overlay {
         draw_overlay_shape(&mut canvas, palette, shape, &project);
     }
 
     if view.show_pois {
-        // POIs are placed on a fixed lattice over the view and kept where the
-        // terrain field says there is land, so they land on ground rather than
-        // in the sea.
-        for ix in 0..5 {
-            for iy in 0..5 {
-                let fx = (f64::from(ix) + 0.5) / 5.0;
-                let fy = (f64::from(iy) + 0.5) / 5.0;
-                let position = view.envelope.unproject_fraction(fx, fy);
-                if elevation_at(position.0, position.1) < 0.0 {
-                    continue;
-                }
-                let (px, py) = project(position);
-                canvas.disc(px, py, 2 * view.pixel_ratio, palette.label);
+        // The places the frame carries: the icon and its label are one layer of
+        // a map (the style document's `places` symbol layer draws both), so one
+        // switch shows or hides both.
+        let label_size = labels::LABEL_TEXT_SIZE * view.label_scale * view.pixel_ratio;
+        let icon_radius = 2 * view.pixel_ratio;
+        for (position, name) in labelled_places(view.envelope, &view.label_language) {
+            let (px, py) = project(position);
+            canvas.disc(px, py, icon_radius, palette.label);
+            // The label sits to the right of its icon, on the icon's own
+            // baseline, the way a symbol layer places text beside an icon.
+            let anchor = (
+                px + i64::from(icon_radius) + i64::from(2 * view.pixel_ratio),
+                py + i64::from(label_size) / 3,
+            );
+            let (label_width, label_height) =
+                labels::label_extent(&view.label_font, &name, label_size);
+            // `CropLabels` "prevents the labels that are on the edge of the
+            // image from being cut or obscured": a label that does not fit
+            // inside the frame is left off the image entirely rather than drawn
+            // across its edge.
+            if view.crop_labels
+                && !fits_inside(
+                    anchor,
+                    (label_width, label_height),
+                    inset,
+                    (frame_width, frame_height),
+                )
+            {
+                continue;
             }
+            labels::draw_label(
+                &mut canvas,
+                &view.label_font,
+                &name,
+                label_size,
+                anchor,
+                palette.label,
+            );
         }
     }
 
@@ -1251,6 +1307,55 @@ pub fn render_static_map(palette: &Palette, view: &StaticMapView) -> Vec<u8> {
     canvas.vline(right, i64::from(inset), bottom, palette.graticule);
 
     canvas.to_jpeg()
+}
+
+/// How many place candidates there are per axis of the frame.
+const PLACE_LATTICE: u32 = 5;
+
+/// The places an image framed by `envelope` carries, each with the name it is
+/// labelled with in `language`.
+///
+/// A fixed lattice over the frame, kept where the terrain field says there is
+/// land, so a place sits on ground rather than in the sea — the same field
+/// every other asset of this service samples. One function, so the dots drawn,
+/// the labels drawn beside them and what a caller expects a frame to carry are
+/// all the same list.
+pub fn labelled_places(envelope: Envelope, language: &str) -> Vec<(Position, String)> {
+    let mut places = Vec::new();
+    for ix in 0..PLACE_LATTICE {
+        for iy in 0..PLACE_LATTICE {
+            let fx = (f64::from(ix) + 0.5) / f64::from(PLACE_LATTICE);
+            let fy = (f64::from(iy) + 0.5) / f64::from(PLACE_LATTICE);
+            let position = envelope.unproject_fraction(fx, fy);
+            if elevation_at(position.0, position.1) < 0.0 {
+                continue;
+            }
+            places.push((position, labels::place_name(position, language)));
+        }
+    }
+    places
+}
+
+/// Whether a label whose pen starts at `anchor` and whose extent is
+/// `(width, height)` lies entirely inside the frame.
+fn fits_inside(anchor: (i64, i64), extent: (u32, u32), inset: u32, frame: (u32, u32)) -> bool {
+    let (frame_width, frame_height) = frame;
+    let left = i64::from(inset);
+    let top = left;
+    let right = left + i64::from(frame_width) - 1;
+    let bottom = top + i64::from(frame_height) - 1;
+    let label_right = anchor.0 + i64::from(extent.0) - 1;
+    let label_top = anchor.1 - i64::from(extent.1) + 1;
+    anchor.0 >= left && label_right <= right && label_top >= top && anchor.1 <= bottom
+}
+
+/// Draw a line `thickness` pixels wide, so a one-pixel feature stays visible at
+/// a higher device pixel ratio.
+fn thick_line(canvas: &mut Canvas, from: (i64, i64), to: (i64, i64), color: Rgba, thickness: u32) {
+    for offset in 0..i64::from(thickness.max(1)) {
+        canvas.line((from.0, from.1 + offset), (to.0, to.1 + offset), color);
+        canvas.line((from.0 + offset, from.1), (to.0 + offset, to.1), color);
+    }
 }
 
 /// Draw meridians and parallels at a round interval chosen for the view's span.
