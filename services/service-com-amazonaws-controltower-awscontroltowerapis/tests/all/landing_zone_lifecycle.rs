@@ -83,6 +83,18 @@ pub(crate) async fn call(
     dispatch(router, "POST", path, Some(body)).await
 }
 
+/// As [`call`], signing for `region` rather than [`SIGNED_REGION`]: the credential scope
+/// is what names a request's region, so this is how a test varies the region the service
+/// mints its ARNs in.
+pub(crate) async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> Answer {
+    dispatch_in_region(router, region, "POST", path, Some(body)).await
+}
+
 /// As [`call`], for the operations whose `@http` trait binds a method other than `POST`
 /// or carries their members in the URI rather than a body: `method` and `path` are the
 /// request line, and `body` is omitted entirely when `None`.
@@ -92,14 +104,32 @@ pub(crate) async fn dispatch(
     path: &str,
     body: Option<serde_json::Value>,
 ) -> Answer {
+    dispatch_in_region(router, SIGNED_REGION, method, path, body).await
+}
+
+/// The region these tests sign for unless a case names another one.
+pub(crate) const SIGNED_REGION: &str = "us-west-2";
+
+/// As [`dispatch`], with the signed region as a parameter.
+pub(crate) async fn dispatch_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Answer {
     let mut request = http::Request::builder()
         .method(method)
-        .uri(format!("https://controltower.us-west-2.amazonaws.com{path}"))
+        .uri(format!(
+            "https://controltower.{region}.amazonaws.com{path}"
+        ))
         .header(
             "authorization",
-            "AWS4-HMAC-SHA256 \
-             Credential=AKIDEXAMPLE/20260101/us-west-2/controltower/aws4_request, \
-             SignedHeaders=host, Signature=0",
+            format!(
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIDEXAMPLE/20260101/{region}/controltower/aws4_request, \
+                 SignedHeaders=host, Signature=0"
+            ),
         );
     if body.is_some() {
         request = request.header("content-type", "application/json");

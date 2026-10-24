@@ -27,6 +27,8 @@ mod cluster_versions;
 mod error_envelope;
 #[path = "all/existence_preconditions.rs"]
 mod existence_preconditions;
+#[path = "all/maintenance_tracks.rs"]
+mod maintenance_tracks;
 #[path = "all/modify_cluster_parameter_group.rs"]
 mod modify_cluster_parameter_group;
 #[path = "all/orderable_cluster_options.rs"]

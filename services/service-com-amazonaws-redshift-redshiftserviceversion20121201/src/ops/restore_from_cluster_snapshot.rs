@@ -447,6 +447,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A maintenance track the service does not publish names no track at
+        // all, so it is refused with the modelled `InvalidClusterTrackFault`
+        // rather than stored on the restored cluster: the track set a cluster
+        // can be on is exactly the one `DescribeClusterTracks` reports.
+        if let Some(track) = input.maintenance_track_name.as_deref() {
+            if let Err(message) = st::check_maintenance_track(track) {
+                return Err(
+                    RestoreFromClusterSnapshotErrorModeled::InvalidClusterTrackFault(
+                        InvalidClusterTrackFault {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
         // A restore that also exchanges a reserved node, or that joins an IAM
         // Identity Center application, needs a record this service does not
         // hold: nothing creates a reserved node, a reserved node offering or an

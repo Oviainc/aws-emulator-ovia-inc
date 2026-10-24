@@ -16,7 +16,8 @@
 //! [`published_parameter_group_families`]), the engine default PARAMETERS a
 //! parameter group of such a family publishes (see
 //! [`ENGINE_DEFAULT_PARAMETERS`]), the documented identifier syntax, the
-//! documented `MaxRecords` window, every `Cluster` member this service DERIVES
+//! documented `MaxRecords` window, the published maintenance-track catalog (see
+//! [`published_maintenance_tracks`]), every `Cluster` member this service DERIVES
 //! from a cluster's own configuration (one rule, [`populate_derived_members`],
 //! so the create, modify and read paths cannot report different member sets),
 //! and the clock-owed `creating` -> `available` transitions (see
@@ -25,8 +26,9 @@
 use crate::ops::types::{
     AccountWithRestoreAccess, AquaConfiguration, AvailabilityZone, Cluster, ClusterNode,
     ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus, ClusterSubnetGroup,
-    ClusterVersion, CreateUsageLimitOutput, NetworkInterface, Parameter, PendingModifiedValues,
-    Snapshot, Subnet, SupportedPlatform, VpcEndpoint, VpcSecurityGroupMembership,
+    ClusterVersion, CreateUsageLimitOutput, MaintenanceTrack, NetworkInterface, Parameter,
+    PendingModifiedValues, Snapshot, Subnet, SupportedOperation, SupportedPlatform, UpdateTarget,
+    VpcEndpoint, VpcSecurityGroupMembership,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -652,6 +654,136 @@ pub const PARAMETER_GROUP_QUOTA: usize = 1_000;
 /// name, the cluster is assigned to the current track."
 pub const DEFAULT_MAINTENANCE_TRACK: &str = "current";
 
+/// The maintenance track that applies the PREVIOUSLY certified maintenance
+/// release.
+///
+/// Source: `smithy_query(query="shape", shape="MaintenanceTrack")` — "If the
+/// value for MaintenanceTrack is current, the cluster is updated to the most
+/// recently certified maintenance release. If the value is trailing, the cluster
+/// is updated to the previously certified maintenance release."
+pub const TRAILING_MAINTENANCE_TRACK: &str = "trailing";
+
+/// Every maintenance track this service publishes, in the order
+/// `DescribeClusterTracks` reports them.
+///
+/// Source: `smithy_query(query="shape", shape="MaintenanceTrack")` on
+/// `MaintenanceTrackName` — "The name of the maintenance track. Possible values
+/// are current and trailing." This list IS the catalogue every operation that
+/// names a maintenance track resolves against, so a cluster can always look its
+/// own track up in what `DescribeClusterTracks` reports.
+pub const PUBLISHED_MAINTENANCE_TRACKS: [&str; 2] =
+    [DEFAULT_MAINTENANCE_TRACK, TRAILING_MAINTENANCE_TRACK];
+
+/// The operations a maintenance track you can switch to supports, in the
+/// hyphenated form `SupportedOperation$OperationName` names an operation by.
+///
+/// Source: `smithy_query(query="shape", shape="SupportedOperation")` —
+/// "Describes the operations that are allowed on a maintenance track" — read
+/// against the operations whose input carries a `MaintenanceTrackName` and acts
+/// on a cluster that already exists: `ModifyClusterMessage$MaintenanceTrackName`
+/// ("The name for the maintenance track that you want to assign for the
+/// cluster") and `RestoreFromClusterSnapshotMessage$MaintenanceTrackName` ("The
+/// name of the maintenance track for the restored cluster"). `CreateCluster`
+/// also carries the member but puts a NEW cluster on a track rather than
+/// switching an existing one onto it, so it is not an operation a switch target
+/// supports.
+pub const TRACK_SWITCH_OPERATIONS: [&str; 2] = ["modify-cluster", "restore-from-cluster-snapshot"];
+
+/// The engine builds this service has certified, oldest first: the build column
+/// of [`PUBLISHED_ENGINE_BUILDS`].
+pub fn certified_engine_builds() -> Vec<&'static str> {
+    PUBLISHED_ENGINE_BUILDS
+        .iter()
+        .map(|(_, build)| *build)
+        .collect()
+}
+
+/// `MaintenanceTrack$DatabaseVersion` — "The version number for the cluster
+/// release" — of one published track, or `None` for a name the catalog does not
+/// publish.
+///
+/// The `current` track applies the most recently certified release and the
+/// `trailing` track the one certified before it
+/// (`smithy_query(query="shape", shape="MaintenanceTrack")`), so both are read
+/// off [`certified_engine_builds`] rather than written out: this service
+/// publishes ONE certified release, so until a second is added the previously
+/// certified release is that same build.
+pub fn track_database_version(track: &str) -> Option<String> {
+    let builds = certified_engine_builds();
+    let latest = *builds.last()?;
+    if track == DEFAULT_MAINTENANCE_TRACK {
+        Some(latest.to_string())
+    } else if track == TRAILING_MAINTENANCE_TRACK {
+        Some(
+            builds
+                .iter()
+                .rev()
+                .nth(1)
+                .copied()
+                .unwrap_or(latest)
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+/// The maintenance-track catalog, in the order `DescribeClusterTracks` reports
+/// it.
+///
+/// Each track carries the release it applies ([`track_database_version`]) and,
+/// as its `UpdateTargets`, every OTHER published track — "A maintenance track
+/// that you can switch the current track to"
+/// (`smithy_query(query="shape", shape="UpdateTarget")`) — with that target's
+/// own release and the operations a switch onto it is performed by
+/// ([`TRACK_SWITCH_OPERATIONS`]). Seeded into
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::maintenance_tracks`]
+/// when the store is created, so the catalog a read reports and the
+/// [`DEFAULT_MAINTENANCE_TRACK`] a `CreateCluster` applies cannot disagree.
+pub fn published_maintenance_tracks() -> Vec<MaintenanceTrack> {
+    PUBLISHED_MAINTENANCE_TRACKS
+        .into_iter()
+        .map(|track| MaintenanceTrack {
+            maintenance_track_name: Some(track.to_string()),
+            database_version: track_database_version(track),
+            update_targets: Some(
+                PUBLISHED_MAINTENANCE_TRACKS
+                    .into_iter()
+                    .filter(|target| *target != track)
+                    .map(|target| UpdateTarget {
+                        maintenance_track_name: Some(target.to_string()),
+                        database_version: track_database_version(target),
+                        supported_operations: Some(
+                            TRACK_SWITCH_OPERATIONS
+                                .into_iter()
+                                .map(|operation| SupportedOperation {
+                                    operation_name: Some(operation.to_string()),
+                                })
+                                .collect(),
+                        ),
+                    })
+                    .collect(),
+            ),
+        })
+        .collect()
+}
+
+/// Refuse a `MaintenanceTrackName` the catalog does not publish, with the
+/// message the modelled `InvalidClusterTrackFault` carries.
+///
+/// One rule for every operation that names a maintenance track, so a name
+/// `DescribeClusterTracks` does not report cannot be accepted by a create, a
+/// modify or a restore.
+pub fn check_maintenance_track(name: &str) -> Result<(), String> {
+    if PUBLISHED_MAINTENANCE_TRACKS.contains(&name) {
+        return Ok(());
+    }
+    Err(format!(
+        "Invalid value for MaintenanceTrackName: '{name}'. Valid values: {}.",
+        PUBLISHED_MAINTENANCE_TRACKS.join(" | ")
+    ))
+}
+
 /// The default number of days automated snapshots are retained.
 ///
 /// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
@@ -1077,6 +1209,12 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// `DescribeClusterVersions` can be called "even before creating any
     /// clusters" — and no operation adds to or removes from it.
     pub cluster_versions: Vec<ClusterVersion>,
+    /// The maintenance tracks this service publishes, in catalog order. SEEDED
+    /// when the store is created, exactly like
+    /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::cluster_versions`]:
+    /// the tracks a cluster can be assigned to exist before any cluster does,
+    /// and no operation adds to or removes from the list.
+    pub maintenance_tracks: Vec<MaintenanceTrack>,
 }
 
 /// Where in the store one resource an ARN names sits: its collection and its
@@ -1111,6 +1249,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             parameter_groups: default_parameter_groups(),
             usage_limits: Vec::new(),
             cluster_versions: published_cluster_versions(),
+            maintenance_tracks: published_maintenance_tracks(),
         }
     }
 }
@@ -1178,6 +1317,13 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         self.clusters
             .iter()
             .find(|c| c.cluster.cluster_identifier.as_deref() == Some(identifier))
+    }
+
+    /// The published maintenance track with this name, if the catalog has one.
+    pub fn maintenance_track(&self, name: &str) -> Option<&MaintenanceTrack> {
+        self.maintenance_tracks
+            .iter()
+            .find(|track| track.maintenance_track_name.as_deref() == Some(name))
     }
 
     /// The stored usage limit with this `UsageLimitId`, if any.
