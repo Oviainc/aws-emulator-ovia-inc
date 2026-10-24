@@ -6,6 +6,9 @@
 //! one `failedFindings` entry per identifier it cannot resolve rather than failing the
 //! whole call.
 //!
+//! Each reported entry carries the modelled `ErrorCode` for the reason that identifier
+//! could not be resolved; [`classify_unresolved`] is where that classification lives.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -171,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // occurrence is resolved normally.
             if !seen.insert(key) {
                 failed_findings.push(BatchGetFindingsError2 {
-                    scan_name: identifier.scan_name.clone(),
+                    scan_name: crate::state::reportable_scan_name(&identifier.scan_name),
                     finding_id: identifier.finding_id.clone(),
                     error_code: crate::state::ERROR_CODE_DUPLICATE_IDENTIFIER.to_string(),
                     message: "this scanName and findingId appear more than once in \
@@ -181,28 +184,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
 
-            if !store.scans.contains_key(&identifier.scan_name) {
-                failed_findings.push(BatchGetFindingsError2 {
-                    scan_name: identifier.scan_name.clone(),
-                    finding_id: identifier.finding_id.clone(),
-                    error_code: crate::state::ERROR_CODE_INVALID_SCAN_NAME.to_string(),
-                    message: format!("no scan named {}", identifier.scan_name),
-                });
-                continue;
-            }
-
+            // Resolution comes first: an identifier the store answers is never a
+            // failure, whatever form its parts take, so every `findingId` `GetFindings`
+            // reports resolves back through this operation.
             match store.finding(&identifier.scan_name, &identifier.finding_id) {
                 Some(finding) => findings.push(finding.clone()),
-                None => failed_findings.push(BatchGetFindingsError2 {
-                    scan_name: identifier.scan_name.clone(),
-                    finding_id: identifier.finding_id.clone(),
-                    error_code: crate::state::ERROR_CODE_ITEM_DOES_NOT_EXIST.to_string(),
-                    message: format!(
-                        "scan {scan_name} has no finding {finding_id}",
-                        scan_name = identifier.scan_name,
-                        finding_id = identifier.finding_id,
-                    ),
-                }),
+                None => failed_findings.push(classify_unresolved(&store, identifier)),
             }
         }
 
@@ -210,5 +197,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             findings,
             failed_findings,
         })
+    }
+}
+
+/// Why an identifier that resolved to no stored finding could not be resolved, as the
+/// `ErrorCode` the model enumerates for that reason.
+///
+/// A value this service cannot take for one of its identifiers at all is reported as
+/// that part of the identifier being invalid — the `scanName` against the modelled
+/// `ScanName` shape ([`crate::state::is_valid_scan_name`]), the `findingId` against the
+/// form of an identifier this service issues ([`crate::state::is_minted_identifier`]) —
+/// and an identifier whose parts are both well formed is reported as naming nothing,
+/// whether the scan is one this account never created or one that holds no such finding.
+///
+/// The `scanName` is judged first: it names the scan a `findingId` is resolved within, so
+/// a request that has not named a scan has not named a finding either.
+fn classify_unresolved(
+    store: &crate::state::Store,
+    identifier: &FindingIdentifier,
+) -> BatchGetFindingsError2 {
+    // Every entry reports the identifier it is about: the `findingId` verbatim (the
+    // member is an unconstrained `String`), the `scanName` as its own constrained target
+    // shape can carry it, with the verbatim value in the message.
+    let scan_name = crate::state::reportable_scan_name(&identifier.scan_name);
+    let finding_id = identifier.finding_id.clone();
+
+    if !crate::state::is_valid_scan_name(&identifier.scan_name) {
+        return BatchGetFindingsError2 {
+            scan_name,
+            finding_id,
+            error_code: crate::state::ERROR_CODE_INVALID_SCAN_NAME.to_string(),
+            message: format!(
+                "scanName {requested:?} is not a scan name: a scan name is {min} to \
+                 {max} characters long and holds only letters, digits and the \
+                 characters -_$:.",
+                requested = identifier.scan_name,
+                min = crate::state::SCAN_NAME_MIN_LEN,
+                max = crate::state::SCAN_NAME_MAX_LEN,
+            ),
+        };
+    }
+
+    if !crate::state::is_minted_identifier(&identifier.finding_id) {
+        return BatchGetFindingsError2 {
+            scan_name,
+            finding_id,
+            error_code: crate::state::ERROR_CODE_INVALID_FINDING_ID.to_string(),
+            message: format!(
+                "findingId {requested:?} is not a finding identifier: a findingId is an \
+                 identifier this service issued, as GetFindings reports for each finding \
+                 of a scan",
+                requested = identifier.finding_id,
+            ),
+        };
+    }
+
+    let message = if store.scans.contains_key(&identifier.scan_name) {
+        format!(
+            "scan {scan_name} has no finding {finding_id}",
+            scan_name = identifier.scan_name,
+            finding_id = identifier.finding_id,
+        )
+    } else {
+        format!(
+            "this account has no scan named {scan_name}",
+            scan_name = identifier.scan_name,
+        )
+    };
+
+    BatchGetFindingsError2 {
+        scan_name,
+        finding_id,
+        error_code: crate::state::ERROR_CODE_ITEM_DOES_NOT_EXIST.to_string(),
+        message,
     }
 }

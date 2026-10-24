@@ -24,13 +24,21 @@
 //!    stores nothing;
 //! 6. a request outside the modelled constraints — an `AuthenticationMethodType` the
 //!    enum does not carry, an `AuthenticationMethod` union variant the model does not
-//!    declare — is refused `ValidationException` by the boundary, on both the put and
-//!    the get.
+//!    declare — is refused `ValidationException` by the boundary, on the put, the get and
+//!    the delete;
 //! 7. because the method lives ON the application record, the put resolves the
 //!    application at the INSTANT of the call: an application whose instance the clock has
 //!    already removed no longer exists, so the put is refused `ResourceNotFoundException`
 //!    and stores nothing, while an application whose instance is still being deleted does
-//!    exist and is served.
+//!    exist and is served;
+//! 8. `DeleteApplicationAuthenticationMethod` REMOVES the method of the named type from
+//!    the named application: the type stops resolving for every later read, a later put
+//!    of the same type stores it afresh, and no other application's method is touched;
+//! 9. the delete resolves the method it names, so an `ApplicationArn` this account holds
+//!    no application for, and an `AuthenticationMethodType` the application carries no
+//!    method for — never put, or already deleted — are refused
+//!    `ResourceNotFoundException` rather than answered with an empty 200, and that
+//!    refusal deletes nothing.
 //!
 //! Every call goes through `MultiServiceRouter::dispatch`, so the modelled constraints,
 //! the `awsJson1_1` envelope and the `X-Amz-Target` routing are exercised rather than
@@ -131,6 +139,23 @@ async fn get_method(
     call(
         router,
         "GetApplicationAuthenticationMethod",
+        &json!({
+            "ApplicationArn": application_arn,
+            "AuthenticationMethodType": method_type,
+        }),
+    )
+    .await
+}
+
+/// `DeleteApplicationAuthenticationMethod` for one type of one application.
+async fn delete_method(
+    router: &MultiServiceRouter,
+    application_arn: &str,
+    method_type: &str,
+) -> (u16, Value) {
+    call(
+        router,
+        "DeleteApplicationAuthenticationMethod",
         &json!({
             "ApplicationArn": application_arn,
             "AuthenticationMethodType": method_type,
@@ -608,6 +633,18 @@ async fn requests_outside_the_modeled_constraints_are_refused() {
             "ValidationException",
             "case {case:?}: expected ValidationException from the get, got {body}"
         );
+
+        let (status, body) = delete_method(&router, &application_arn, method_type).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a delete with an unmodelled AuthenticationMethodType must be \
+             refused 400, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected ValidationException from the delete, got {body}"
+        );
     }
 
     // `AuthenticationMethod` bodies the model's union does not admit: a variant it does
@@ -648,6 +685,155 @@ async fn requests_outside_the_modeled_constraints_are_refused() {
         "ResourceNotFoundException",
         "expected ResourceNotFoundException for a method no put stored, got {body}"
     );
+}
+
+/// Rules 8 and 9: the delete removes the stored method of the type it names, so the type
+/// stops resolving, a second delete of it is refused, and a later put stores it afresh —
+/// over every `ActorPolicy` row, since what the delete removes must not depend on what
+/// the stored document looks like.
+#[tokio::test]
+async fn deleting_an_authentication_method_makes_the_type_stop_resolving() {
+    let router = router();
+    let instance_arn = seeded_instance_arn(&router).await;
+
+    for (case, policy) in actor_policies() {
+        // One application per row, so each row observes the whole put / delete / put
+        // cycle from a clean application.
+        let application_arn = create_application(&router, &instance_arn, "method-delete").await;
+
+        let (status, body) = put_iam_method(&router, &application_arn, &policy).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the seed put must answer 200, got {status} {body}"
+        );
+        let (status, read) = get_method(&router, &application_arn, IAM).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the get before the delete must answer 200, got {status} {read}"
+        );
+
+        let (status, body) = delete_method(&router, &application_arn, IAM).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the delete must answer 200, got {status} {body}"
+        );
+        assert_eq!(
+            body,
+            json!({}),
+            "case {case:?}: the delete's output is modelled as Unit, got {body}"
+        );
+
+        // Rule 8: the method is GONE, not merely hidden from this caller.
+        let (status, body) = get_method(&router, &application_arn, IAM).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: the get after the delete must be refused 400, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException after the delete, got {body}"
+        );
+
+        // Rule 9: a second delete has nothing left to remove.
+        let (status, body) = delete_method(&router, &application_arn, IAM).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a second delete must be refused 400, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException from the second delete, got \
+             {body}"
+        );
+
+        // Rule 8: the application survives the delete, so a put stores the method afresh
+        // and the get reports it again.
+        let (status, body) = put_iam_method(&router, &application_arn, &policy).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a put after the delete must answer 200, got {status} {body}"
+        );
+        let (status, again) = get_method(&router, &application_arn, IAM).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the get after the re-put must answer 200, got {status} {again}"
+        );
+        assert_eq!(
+            again,
+            expected_iam_body(&policy),
+            "case {case:?}: the re-put must store the method afresh, got {again}"
+        );
+        assert_eq!(
+            again, read,
+            "case {case:?}: the re-put must store what the first put stored, got {again}"
+        );
+    }
+}
+
+/// Rule 8: a delete reaches ONE application's method, so deleting on one leaves every
+/// other application's method exactly where it was — asserted while deleting them one at
+/// a time, so each row sees a different number of surviving methods.
+#[tokio::test]
+async fn a_delete_removes_the_method_of_one_application_only() {
+    let router = router();
+    let instance_arn = seeded_instance_arn(&router).await;
+
+    let names = ["app-one", "app-two", "app-three", "app-four", "app-five"];
+    let mut arns: Vec<String> = Vec::new();
+    for name in names {
+        arns.push(create_application(&router, &instance_arn, name).await);
+    }
+    // Each application gets its OWN policy, so a delete that reached the wrong record is
+    // visible as the wrong document and not only as a status.
+    for (index, arn) in arns.iter().enumerate() {
+        let (status, body) = put_iam_method(&router, arn, &policy_for(index)).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the seed put must answer 200, got {status} {body}",
+            names[index]
+        );
+    }
+
+    for (deleted, arn) in arns.iter().enumerate() {
+        let case = names[deleted];
+        let (status, body) = delete_method(&router, arn, IAM).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the delete must answer 200, got {status} {body}"
+        );
+
+        for (index, other) in arns.iter().enumerate() {
+            let (status, read) = get_method(&router, other, IAM).await;
+            if index <= deleted {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: the method of {:?} was already deleted, so its get must \
+                     be refused 400, got {status} {read}",
+                    names[index]
+                );
+                assert_eq!(
+                    error_code(&read),
+                    "ResourceNotFoundException",
+                    "case {case:?}: expected ResourceNotFoundException for {:?}, got {read}",
+                    names[index]
+                );
+            } else {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the method of {:?} must survive, got {status} {read}",
+                    names[index]
+                );
+                assert_eq!(
+                    read,
+                    expected_iam_body(&policy_for(index)),
+                    "case {case:?}: {:?} must still report its OWN method, got {read}",
+                    names[index]
+                );
+            }
+        }
+    }
 }
 
 /// The `ActorPolicy` the application created `index` places along a table carries, so a
@@ -804,5 +990,109 @@ async fn a_put_resolves_the_application_at_the_instant_of_the_call() {
         read,
         expected_iam_body(&stored),
         "the fresh application must report the method its own put stored, got {read}"
+    );
+}
+
+/// Rule 9: a delete that names a method nothing stored is refused
+/// `ResourceNotFoundException` and deletes nothing — over the parts of the
+/// `ApplicationArn` that identify the application, and over an application that exists
+/// but carries no method.
+#[tokio::test]
+async fn a_delete_of_a_method_nothing_stored_is_refused_not_found() {
+    let router = router();
+    let instance_arn = seeded_instance_arn(&router).await;
+    let instance_id = instance_arn.rsplit('/').next().unwrap_or_default().to_string();
+    // One application holds a method, so each refusal below is about the method the
+    // request named and not about an empty store.
+    let held = create_application(&router, &instance_arn, "stored-app").await;
+    let policy = json!({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}],
+    });
+    let (status, body) = put_iam_method(&router, &held, &policy).await;
+    assert_eq!(status, 200, "the seed put must answer 200, got {status} {body}");
+
+    let account = held.split(':').nth(4).unwrap_or_default().to_string();
+    let suffix = held.rsplit("/apl-").next().unwrap_or_default().to_string();
+    let application_arn = |partition: &str, account: &str, instance: &str, suffix: &str| {
+        format!("arn:{partition}:sso::{account}:application/{instance}/apl-{suffix}")
+    };
+    // The rows span the parts of the ARN that identify the application: the `apl-`
+    // suffix, the instance segment, the account segment and the partition.
+    let unknown_applications: Vec<(&str, String)> = vec![
+        (
+            "a pattern-valid apl- suffix that was never minted",
+            application_arn("aws", &account, &instance_id, "0000000000000000"),
+        ),
+        (
+            "the stored suffix under another instance",
+            application_arn("aws", &account, "ssoins-0000000000000000", &suffix),
+        ),
+        (
+            "the stored application under another account",
+            application_arn("aws", "210987654321", &instance_id, &suffix),
+        ),
+        (
+            "the stored application in another partition",
+            application_arn("aws-us-gov", &account, &instance_id, &suffix),
+        ),
+    ];
+    for (case, arn) in unknown_applications {
+        assert_ne!(
+            arn, held,
+            "case {case:?}: the row must name a DIFFERENT ARN than the stored one"
+        );
+        let (status, body) = delete_method(&router, &arn, IAM).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a delete under an unminted ARN must be refused 400, got \
+             {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException from the delete, got {body}"
+        );
+    }
+
+    // An application that EXISTS but carries no method of the type: the same refusal, for
+    // a freshly created application and for one whose method a delete already removed.
+    let empty = create_application(&router, &instance_arn, "no-method-app").await;
+    let emptied = create_application(&router, &instance_arn, "deleted-method-app").await;
+    let (status, body) = put_iam_method(&router, &emptied, &policy).await;
+    assert_eq!(
+        status, 200,
+        "the put on the to-be-deleted application must answer 200, got {status} {body}"
+    );
+    let (status, body) = delete_method(&router, &emptied, IAM).await;
+    assert_eq!(status, 200, "the delete must answer 200, got {status} {body}");
+
+    for (case, arn) in [
+        ("an application no put ever named", &empty),
+        ("an application whose method a delete removed", &emptied),
+    ] {
+        let (status, body) = delete_method(&router, arn, IAM).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a delete of a method nothing stored must be refused 400, got \
+             {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {body}"
+        );
+    }
+
+    // Every refusal above deleted nothing: the one stored method is still readable.
+    let (status, read) = get_method(&router, &held, IAM).await;
+    assert_eq!(
+        status, 200,
+        "the stored method must survive the refused deletes, got {status} {read}"
+    );
+    assert_eq!(
+        read,
+        expected_iam_body(&policy),
+        "a refused delete must not change the stored method, got {read}"
     );
 }

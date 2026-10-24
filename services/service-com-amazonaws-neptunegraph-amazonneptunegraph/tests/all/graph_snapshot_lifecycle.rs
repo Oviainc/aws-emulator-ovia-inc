@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::state::{
-    ARN_NAMESPACE, PROVISIONING_SPAN,
+    ARN_NAMESPACE, PROVISIONING_SPAN, SERVICE_OWNED_KMS_KEY,
 };
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -301,7 +301,10 @@ async fn create_graph_snapshot_persists_the_record_and_reads_it_back() {
             "case {case:?}: expected a snapshotCreateTime, got {}",
             created["snapshotCreateTime"]
         );
-        let expected_key = kms_key.map_or(Value::Null, |key| json!(key));
+        // A snapshot carries the key its source graph's data is encrypted with, and
+        // every graph is encrypted: a graph created without a customer managed key is
+        // encrypted with the service-owned key its sentinel names.
+        let expected_key = kms_key.map_or_else(|| json!(SERVICE_OWNED_KMS_KEY), |key| json!(key));
         assert_eq!(
             created["kmsKeyIdentifier"],
             expected_key,

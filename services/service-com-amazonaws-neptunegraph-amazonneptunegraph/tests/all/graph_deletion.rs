@@ -33,7 +33,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::state::{
     ComAmazonawsNeptunegraphAmazonneptunegraphState as Store, DELETION_SPAN,
-    FINAL_SNAPSHOT_SUFFIX, MAX_RESOURCE_NAME_CHARS, PROVISIONING_SPAN,
+    FINAL_SNAPSHOT_SUFFIX, MAX_RESOURCE_NAME_CHARS, PROVISIONING_SPAN, SERVICE_OWNED_KMS_KEY,
 };
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -403,9 +403,12 @@ async fn an_accepted_delete_reports_deleting_and_takes_a_final_snapshot_when_ask
                 "case {case:?}: expected the final snapshot named after the graph, got {}",
                 snapshot["name"]
             );
+            // The final snapshot carries the key the graph's data was encrypted with,
+            // which is the service-owned key's sentinel when the graph was created
+            // without a customer managed key.
             assert_eq!(
                 snapshot["kmsKeyIdentifier"],
-                kms_key.map_or(Value::Null, |key| json!(key)),
+                kms_key.map_or_else(|| json!(SERVICE_OWNED_KMS_KEY), |key| json!(key)),
                 "case {case:?}: expected the source graph's key on the snapshot, got {}",
                 snapshot["kmsKeyIdentifier"]
             );

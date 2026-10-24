@@ -276,9 +276,23 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             expected: Body::Error("BadRequestException"),
         },
         Case {
-            case: "BatchGetRumMetricDefinitions 501 (scaffolded operation)",
+            case: "BatchGetRumMetricDefinitions 200 (GET, members)",
             method: "GET",
             path: format!("/rummetrics/{live}/metrics?destination=CloudWatch"),
+            body: None,
+            status: 200,
+            announces: RESPONSE_CONTENT_TYPE,
+            expected: Body::Members,
+        },
+        Case {
+            // Still a scaffold, so still the 501 channel — which announces the service's
+            // media type like every other answer. `MetricDefinitionIds` is a required
+            // `@httpQuery` member, so the refusal is reached with no payload at all.
+            case: "BatchDeleteRumMetricDefinitions 501 (scaffolded operation)",
+            method: "DELETE",
+            path: format!(
+                "/rummetrics/{live}/metrics?destination=CloudWatch&metricDefinitionIds=none"
+            ),
             body: None,
             status: 501,
             announces: RESPONSE_CONTENT_TYPE,

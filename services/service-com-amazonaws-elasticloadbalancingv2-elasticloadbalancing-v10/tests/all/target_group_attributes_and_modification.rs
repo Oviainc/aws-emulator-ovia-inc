@@ -75,8 +75,9 @@ fn absent_target_group_arn() -> String {
 /// an assertion compares the VALUE rather than its encoding (the framework's XML codec
 /// escapes `'` as `&apos;`).
 ///
-/// `pub(crate)` because `all/target_validation_and_quotas.rs` compares refusal messages
-/// the same way: ONE reader for the crate, so two suites cannot drift on the encoding.
+/// `pub(crate)` because `all/target_validation_and_quotas.rs` and the listener suite
+/// compare refusal messages the same way: ONE reader for the crate, so the suites cannot
+/// drift on the encoding.
 pub(crate) fn unescaped(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")

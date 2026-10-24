@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCompatibleVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCompatibleVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCompatibleVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the service's engine-version upgrade table: for each source version, the
+//! versions a domain running it can be upgraded to.
+//!
+//! The compatibility rule lives in [`crate::state::compatible_target_versions`] —
+//! every published version of the source's own engine line that is later than it,
+//! plus the whole of the line that succeeds it once the source has reached the last
+//! published version of its own — so this handler only chooses WHICH source
+//! versions to report it for: the one version the named domain runs, or every version
+//! [`crate::state::SUPPORTED_ENGINE_VERSIONS`] publishes when the request names no
+//! domain.
+//!
+//! Reporting an upgrade table changes nothing a later caller cannot see: the only
+//! write it can cause is the configuration change the clock already owed the named
+//! domain, which `settled_mut` materialises whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +155,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCompatibleVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCompatibleVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCompatibleVersions"))
+        let _ = ctx;
+
+        // `DomainName` is "the name of an existing domain. Provide this parameter to
+        // limit the results to a single domain": with it, the answer reports the ONE
+        // version that domain runs; without it, the whole published table.
+        let source_versions: Vec<String> = match &input.domain_name {
+            Some(domain_name) => {
+                let state = crate::state::service_state(&*self.engine)
+                    .ok_or_else(crate::state::state_unavailable)?;
+                let now = ::std::time::SystemTime::now();
+                let mut store = state.lock();
+                // Reporting on the domain materialises only the configuration change
+                // the clock already owed it at `now` — an in-flight `EngineVersion`
+                // update among them — so the version this table is built from is the
+                // version every other reader sees.
+                let domain = store.settled_mut(domain_name, now).ok_or_else(|| {
+                    GetCompatibleVersionsErrorModeled::ResourceNotFoundException(
+                        crate::state::domain_not_found(domain_name),
+                    )
+                })?;
+                vec![domain.engine_version.clone()]
+            }
+            None => crate::state::SUPPORTED_ENGINE_VERSIONS
+                .iter()
+                .map(|version| (*version).to_string())
+                .collect(),
+        };
+
+        let compatible_versions = source_versions
+            .into_iter()
+            .map(|source_version| CompatibleVersionsMap {
+                // A source with nothing ahead of it — the newest published version —
+                // reports an EMPTY list rather than no member: the member is "the
+                // versions you can upgrade this one to", and for that one there are
+                // none.
+                target_versions: Some(crate::state::compatible_target_versions(&source_version)),
+                source_version: Some(source_version),
+            })
+            .collect();
+
+        Ok(GetCompatibleVersionsOutput {
+            compatible_versions: Some(compatible_versions),
+        })
     }
 }

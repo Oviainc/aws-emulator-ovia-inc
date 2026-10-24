@@ -29,6 +29,8 @@ mod custom_line_item_and_create_name_refusals;
 mod delete_custom_line_item;
 #[path = "all/disassociate_accounts.rs"]
 mod disassociate_accounts;
+#[path = "all/list_custom_line_item_versions.rs"]
+mod list_custom_line_item_versions;
 #[path = "all/list_custom_line_items.rs"]
 mod list_custom_line_items;
 #[path = "all/payer_account_authorization.rs"]

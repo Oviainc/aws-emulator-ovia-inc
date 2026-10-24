@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteApplicationAuthenticationMethod
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteApplicationAuthenticationMethod`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the authentication method its `AuthenticationMethodType` names
+//! from the application its `ApplicationArn` names, on that application's record in this
+//! service's state (`crate::state`), so the type stops resolving: the next
+//! `GetApplicationAuthenticationMethod` of it answers the modelled
+//! `ResourceNotFoundException` rather than the method the put stored. This is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteApplicationAuthenticationMethod::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A method is keyed by its TYPE, so the delete leaves every other type — and every other
+//! application — untouched. The removal is immediate (the model declares no in-progress
+//! status for a method and the operation returns nothing), and a method nothing holds is
+//! refused with the modelled `ResourceNotFoundException`: an `ApplicationArn` this account
+//! holds no application for, and a type the application carries no method for (never put,
+//! or already deleted), so a second delete of the same pair is that refusal rather than an
+//! empty success claiming a method was deleted.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +177,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteApplicationAuthenticationMethod` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteApplicationAuthenticationMethodErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteApplicationAuthenticationMethod"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteApplicationAuthenticationMethodErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // A WRITE, so it first materialises what the CLOCK already owes every instance —
+        // an application whose instance the clock has already removed no longer exists —
+        // and so resolves the same application a read at this instant would resolve.
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        // The methods live ON the application record, so an `ApplicationArn` this account
+        // holds no application for resolves to nothing to delete from: the modelled
+        // `ResourceNotFoundException`, exactly as the put and the get of a method under
+        // that same ARN answer.
+        let application = store
+            .application_mut(&input.application_arn)
+            .ok_or_else(|| {
+                DeleteApplicationAuthenticationMethodErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::application_not_found_message(
+                            &input.application_arn,
+                        )),
+                        // The model's `ResourceNotFoundExceptionReason` enum carries only
+                        // `KMS_NotFoundException`, which this is not.
+                        reason: None,
+                    },
+                )
+            })?;
+
+        // "Deletes an authentication method from an application": a method is keyed by its
+        // TYPE, so this removes the method of the requested type and leaves every other
+        // type — and every other application — alone. The REMOVAL is what makes the type
+        // stop resolving, for the get and for a second delete alike, so a type this
+        // application carries no method for (never put, or already deleted) earns the
+        // modelled `ResourceNotFoundException` — the answer the get of that type gives —
+        // rather than an empty 200 that would tell the caller a method was deleted when
+        // none was.
+        if application
+            .authentication_methods
+            .remove(&input.authentication_method_type)
+            .is_none()
+        {
+            return Err(
+                DeleteApplicationAuthenticationMethodErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::authentication_method_not_found_message(
+                            &input.application_arn,
+                            &input.authentication_method_type,
+                        )),
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The modelled response carries no members: that the method is gone is observed
+        // through `GetApplicationAuthenticationMethod`.
+        Ok(DeleteApplicationAuthenticationMethodOutput)
     }
 }

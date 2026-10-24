@@ -362,8 +362,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // modelled maximum length (`crate::state::MAX_TAGS_PER_RESOURCE`) and so is
             // already enforced by the centralized walk.
             tags: crate::state::tag_map(input.tags.as_ref()),
-            // A freshly created application has been amended by nobody.
-            amendments: Vec::new(),
+            // A freshly created application has been written by nobody but this create,
+            // whose own `ClientToken` the catalog's token index holds.
+            applied_writes: Vec::new(),
         };
         let revision = application.created_revision_text();
         store.insert_application(input.client_token, application);

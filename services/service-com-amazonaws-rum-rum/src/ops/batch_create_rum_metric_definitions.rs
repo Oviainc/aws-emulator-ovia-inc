@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchCreateRumMetricDefinitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchCreateRumMetricDefinitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchCreateRumMetricDefinitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates metric definitions — extended metrics and custom metrics — under ONE
+//! extended-metrics destination of the app monitor the request names, in this service's
+//! persisted state. Each definition the call accepts is stored under a freshly minted
+//! `MetricDefinitionId` and reported back under it, and each one it refuses is reported in
+//! `Errors` while the rest still succeed, which is what the model asks for: "If some
+//! metric definitions specified in a BatchCreateRumMetricDefinitions operations are not
+//! valid, those metric definitions fail and return errors, but all valid metric
+//! definitions in the same operation still succeed." `BatchGetRumMetricDefinitions` reads
+//! the same map back and `UpdateRumMetricDefinition` replaces one entry of it.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +192,193 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchCreateRumMetricDefinitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchCreateRumMetricDefinitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchCreateRumMetricDefinitions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchCreateRumMetricDefinitionsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::NO_STORE.to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // An empty `DestinationArn` (the member is modelled `length 0..2048`) names no
+        // experiment, so it is the same input as an absent one.
+        let destination_arn = input
+            .destination_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|arn| !arn.is_empty());
+
+        // The prose-only pairing every metrics call of this service shares: an Evidently
+        // destination is identified by an experiment ARN and a CloudWatch one carries
+        // none.
+        if let Some(message) =
+            crate::state::metric_destination_choice_refusal(&input.destination, destination_arn)
+        {
+            return Err(
+                BatchCreateRumMetricDefinitionsErrorModeled::ValidationException(
+                    ValidationException { message },
+                )
+                .into(),
+            );
+        }
+        // The BATCH's own documented bound. Past it the whole call is refused rather than
+        // part of the list being created: the request as a whole is the thing that is too
+        // large.
+        if input.metric_definitions.len() > crate::state::MAX_METRIC_DEFINITIONS_PER_BATCH {
+            return Err(
+                BatchCreateRumMetricDefinitionsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "A BatchCreateRumMetricDefinitions request can specify at most {} \
+                             metric definitions; this one specifies {}.",
+                            crate::state::MAX_METRIC_DEFINITIONS_PER_BATCH,
+                            input.metric_definitions.len()
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // May this caller define THIS app monitor's metrics? Decided per call from the
+        // caller's identity-based policies and the monitor's resource policy, with the
+        // monitor and the policy in force read under a SHORT lock.
+        let (resource_arn, held_policy) = {
+            let store = state.lock();
+            let Some(record) = store.app_monitors.get(&input.app_monitor_name) else {
+                return Err(
+                    BatchCreateRumMetricDefinitionsErrorModeled::ResourceNotFoundException(
+                        crate::state::app_monitor_not_found(&input.app_monitor_name),
+                    )
+                    .into(),
+                );
+            };
+            (record.arn.clone(), record.resource_policy_document())
+        };
+        if let Err(denial) = crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::BATCH_CREATE_RUM_METRIC_DEFINITIONS,
+            &resource_arn,
+            held_policy.as_deref(),
+            &[],
+        ) {
+            return Err(
+                BatchCreateRumMetricDefinitionsErrorModeled::AccessDeniedException(
+                    crate::state::access_denied(&denial),
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        // A definition is created under a destination: "You must have already created a
+        // destination for the metrics before you send them." So a request naming a
+        // destination this monitor does not have has nothing to create the metrics on.
+        let Some(monitor) = store.app_monitors.get(&input.app_monitor_name) else {
+            return Err(
+                BatchCreateRumMetricDefinitionsErrorModeled::ResourceNotFoundException(
+                    crate::state::app_monitor_not_found(&input.app_monitor_name),
+                )
+                .into(),
+            );
+        };
+        if !monitor.has_metric_destination(&input.destination, destination_arn) {
+            return Err(
+                BatchCreateRumMetricDefinitionsErrorModeled::ResourceNotFoundException(
+                    crate::state::metric_destination_not_found(
+                        &input.app_monitor_name,
+                        &input.destination,
+                        destination_arn,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // Which of the requested definitions this call can store, decided BEFORE anything
+        // is written: a definition the service cannot store fails on its own
+        // (`BatchCreateRumMetricDefinitionsError` carries the definition that caused the
+        // error, its code and its message) and the rest of the list still succeeds, and
+        // the destination's documented capacity is consumed in request order, so which
+        // definitions fit is decided once rather than per insert.
+        let mut held = monitor.metric_definition_count(&input.destination, destination_arn);
+        let mut errors: Vec<BatchCreateRumMetricDefinitionsError2> = Vec::new();
+        let mut accepted: Vec<&MetricDefinitionRequest> = Vec::new();
+        for requested in &input.metric_definitions {
+            if let Some(message) = crate::state::metric_definition_refusal(requested) {
+                errors.push(BatchCreateRumMetricDefinitionsError2 {
+                    metric_definition: requested.clone(),
+                    error_code: VALIDATION_ERROR_CODE.to_string(),
+                    error_message: message,
+                });
+                continue;
+            }
+            if held >= crate::state::MAX_METRIC_DEFINITIONS_PER_DESTINATION {
+                errors.push(BatchCreateRumMetricDefinitionsError2 {
+                    metric_definition: requested.clone(),
+                    error_code: QUOTA_ERROR_CODE.to_string(),
+                    error_message: crate::state::metric_definitions_quota_exceeded(
+                        &input.destination,
+                    )
+                    .message,
+                });
+                continue;
+            }
+            held += 1;
+            accepted.push(requested);
+        }
+
+        // The ids are minted from the state's own counter, so they come from the store
+        // rather than from the monitor record; the records are then written under the SAME
+        // lock, so every id reported here names a stored definition.
+        let records: Vec<crate::state::MetricDefinitionRecord> = accepted
+            .into_iter()
+            .map(|requested| {
+                let id = store.mint_metric_definition_id();
+                crate::state::MetricDefinitionRecord::from_request(&id, requested)
+            })
+            .collect();
+        let Some(monitor) = store.app_monitors.get_mut(&input.app_monitor_name) else {
+            return Err(
+                BatchCreateRumMetricDefinitionsErrorModeled::ResourceNotFoundException(
+                    crate::state::app_monitor_not_found(&input.app_monitor_name),
+                )
+                .into(),
+            );
+        };
+        let created: Vec<MetricDefinition> = records
+            .into_iter()
+            .map(|record| {
+                let reported = record.to_metric_definition();
+                monitor.insert_metric_definition(&input.destination, destination_arn, record);
+                reported
+            })
+            .collect();
+
+        Ok(BatchCreateRumMetricDefinitionsOutput {
+            // `Errors` is `@required`, so a call that refused nothing reports the EMPTY
+            // list rather than leaving the member off the wire.
+            errors,
+            metric_definitions: Some(created),
+        })
     }
 }
+
+/// The `ErrorCode` this operation reports for a definition it would not store.
+///
+/// `BatchCreateRumMetricDefinitionsError$ErrorCode` is modelled as a bare `String` with no
+/// catalog, and the definition was refused for the same reason the single-definition
+/// `UpdateRumMetricDefinition` answers `ValidationException` for, so the per-definition
+/// error reports that modelled error's name.
+const VALIDATION_ERROR_CODE: &str = "ValidationException";
+
+/// The `ErrorCode` for a definition that would take the destination past the most
+/// definitions it may contain — the quota error this operation models
+/// (`ServiceQuotaExceededException`), reported per definition because the rest of the list
+/// still succeeds.
+const QUOTA_ERROR_CODE: &str = "ServiceQuotaExceededException";
