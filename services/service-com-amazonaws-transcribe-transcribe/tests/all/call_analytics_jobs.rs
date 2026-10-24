@@ -158,7 +158,7 @@ async fn get(transcribe: &Transcribe, name: &str) -> Reply {
         .await
 }
 
-/// `ListCallAnalyticsJobs` with `request`.
+
 async fn list(transcribe: &Transcribe, request: Value) -> Reply {
     transcribe.call("ListCallAnalyticsJobs", request).await
 }
@@ -319,7 +319,6 @@ async fn a_call_analytics_job_completes_once_its_processing_span_has_elapsed() {
             "case {case:?}: a second read must report the same job, got {again:?}"
         );
 
-        // The listing reports the same status for the same record.
         let listed = list(&transcribe, json!({"MaxResults": 100})).await;
         let summaries = listed.ok(case)["CallAnalyticsJobSummaries"].clone();
         let summary = summaries
@@ -651,9 +650,28 @@ async fn a_next_token_this_service_did_not_hand_out_is_refused() {
 async fn a_call_analytics_job_this_account_never_started_is_refused() {
     let transcribe = Transcribe::new();
 
+    // A job of ANOTHER family under the same name is not a Call Analytics job: each
+    // family is keyed on its own store.
+    transcribe
+        .call(
+            "StartTranscriptionJob",
+            json!({
+                "TranscriptionJobName": "other-family",
+                "LanguageCode": "en-US",
+                "Media": {"MediaFileUri": "s3://example-media/call.flac"}
+            }),
+        )
+        .await
+        .ok("a transcription job of the same name");
+
     // The name forms `CallAnalyticsJobName`'s pattern allows (`^[0-9a-zA-Z._-]+$`),
     // including both published length bounds, none of them ever started here.
     for name in [
+        "never-started",
+        "a",
+        "never.started_2",
+        "9",
+        "other-family",
         "never-started",
         "a",
         "never.started_2",
@@ -672,6 +690,12 @@ async fn a_call_analytics_job_this_account_never_started_is_refused() {
             "case {name:?}: unexpected not-found message, got {message:?}"
         );
     }
+
+    // One past the published name length is refused by the boundary validator, before
+    // the handler runs: `CallAnalyticsJobName` is `length {min 1, max 200}`.
+    get(&transcribe, &"n".repeat(201))
+        .await
+        .refused("a 201-character job name", 400, "ValidationException");
 
     // An empty store lists an empty page and no cursor, rather than refusing.
     let listed = list(&transcribe, json!({"MaxResults": 100})).await;
@@ -785,6 +809,27 @@ async fn a_start_whose_members_cannot_hold_together_is_refused() {
         json!([]),
         "a refused StartCallAnalyticsJob must store nothing, got {:?}",
         listed.body
+    );
+
+    // `ChannelDefinition$ParticipantRole` is OPTIONAL, so two definitions that name
+    // no role at all have not named one twice: the distinctness rule applies to the
+    // roles a request actually names, and a start that names none is accepted.
+    let case = "two channel definitions that name no participant role";
+    let accepted = transcribe
+        .call(
+            "StartCallAnalyticsJob",
+            json!({
+                "CallAnalyticsJobName": "roles-omitted",
+                "Media": {"MediaFileUri": "s3://example-media/two-channel.wav"},
+                "ChannelDefinitions": [{"ChannelId": 0}, {"ChannelId": 1}]
+            }),
+        )
+        .await;
+    assert_eq!(
+        accepted.ok(case)["CallAnalyticsJob"]["CallAnalyticsJobStatus"],
+        json!("IN_PROGRESS"),
+        "case {case:?}: the start must be accepted, got {:?}",
+        accepted.body
     );
 }
 
