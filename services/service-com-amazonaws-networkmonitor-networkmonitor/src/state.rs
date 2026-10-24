@@ -281,20 +281,47 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// The marker a cursor this service vended carries ahead of the key it
+/// encodes.
+///
+/// A `@paginated` token is opaque, so the CALLER cannot tell a cursor apart
+/// from text of its own; the marker is what lets the SERVICE tell them apart,
+/// so a string nothing ever vended is still refused while every cursor this
+/// service did vend is honoured. The version digit keeps a cursor minted in
+/// some other format from being read as a key.
+const PAGE_TOKEN_MARKER: &str = "monitor-page/1:";
+
 /// Encode a pagination cursor: the key of the first item of the NEXT page.
 ///
 /// Hex-encoded so the token is opaque to the caller, as a `@paginated` token is
 /// meant to be, and safe to carry in a `@httpQuery` parameter.
 pub fn encode_page_token(key: &str) -> String {
-    hex::encode(key)
+    hex::encode(format!("{PAGE_TOKEN_MARKER}{key}"))
 }
 
-/// Decode a cursor produced by [`encode_page_token`]; `None` when the token was
-/// not produced by this service.
+/// The key a cursor produced by [`encode_page_token`] encodes; `None` when the
+/// token was not produced by this service.
 pub fn decode_page_token(token: &str) -> Option<String> {
-    hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    decoded.strip_prefix(PAGE_TOKEN_MARKER).map(str::to_owned)
+}
+
+/// Where a listing resumes from a cursor: the index of the first item of
+/// `ordered` whose key does not sort before `cursor`.
+///
+/// A cursor names a POSITION in the key order, not a membership. The item it
+/// names can be gone by the time the caller resumes — deleted, or no longer
+/// matching the filter the listing was made with — and the items after it are
+/// still owed to the caller, so the resume falls forward to the next key at or
+/// after the cursor instead of requiring the cursor's own item to still be in
+/// the set. `ordered.len()` (an empty final page) when every key sorts before
+/// the cursor.
+///
+/// `ordered` must be sorted by `key`, which the `monitorName`-keyed
+/// [`BTreeMap`] walk over
+/// [`ComAmazonawsNetworkmonitorNetworkmonitorState::monitors`] already is.
+pub fn resume_index<T>(ordered: &[T], cursor: &str, key: impl Fn(&T) -> &str) -> usize {
+    ordered.partition_point(|item| key(item) < cursor)
 }
 
 /// The `AddressFamily` of a probe destination, derived from the address itself.

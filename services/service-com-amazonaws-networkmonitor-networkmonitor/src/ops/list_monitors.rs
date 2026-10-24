@@ -5,7 +5,9 @@
 //! Pages the monitor records [`crate::state`] holds, in `monitorName` order,
 //! filtered by the `state` query parameter when one is given. `nextToken` is an
 //! opaque cursor naming the first monitor of the NEXT page, and is absent on the
-//! final page.
+//! final page. A cursor names a position in that order rather than a particular
+//! monitor, so a resume falls forward to the first monitor at or after it and a
+//! cursor this service vended keeps working after the set has shifted.
 //!
 //! ## Shape of an operation
 //!
@@ -199,18 +201,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let start = match input.next_token.as_deref() {
             None => 0,
             Some(token) => {
-                let key = crate::state::decode_page_token(token);
-                let position = key.and_then(|key| {
-                    matching
-                        .iter()
-                        .position(|monitor| monitor.monitor_name == key)
-                });
-                let Some(position) = position else {
+                // A cursor this service vended stays usable: it names a
+                // POSITION in the name order, so the resume falls forward to
+                // the first monitor at or after that name. The monitor the
+                // cursor was cut at can have been deleted, or have settled out
+                // of the `state` filter, since the page that vended it — the
+                // monitors after it are still owed to the caller, so it drops
+                // out of the results rather than refusing the call. Only a
+                // token this service never produced names no position at all.
+                let Some(key) = crate::state::decode_page_token(token) else {
                     return Err(validation(
                         "nextToken does not name a page of this result set".to_string(),
                     ));
                 };
-                position
+                crate::state::resume_index(&matching, &key, |monitor| {
+                    monitor.monitor_name.as_str()
+                })
             }
         };
         // No `maxResults` means one page: the model's own maximum. The model's
