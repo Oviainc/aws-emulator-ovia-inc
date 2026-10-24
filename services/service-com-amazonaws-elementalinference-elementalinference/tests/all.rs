@@ -35,6 +35,8 @@ mod fixture_data_source;
 mod fixture_search;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/output_provenance.rs"]
+mod output_provenance;
 #[path = "all/refusals_from_state.rs"]
 mod refusals_from_state;
 #[path = "all/resource_tagging.rs"]

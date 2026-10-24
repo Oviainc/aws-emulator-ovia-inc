@@ -416,8 +416,9 @@ async fn list_feeds_pages_over_every_persisted_feed() {
 #[tokio::test]
 async fn update_feed_overwrites_the_stored_feed() {
     // Each row changes the feed along a different axis: fewer outputs, more outputs,
-    // a different config member, an output marked as coming from an association, and
-    // an access role that the PUT payload drops.
+    // a different config member, and an access role that the PUT payload drops.
+    // `fromAssociation` is not among the axes: it is service-owned, so what an update
+    // may do with it is asserted in `output_provenance`.
     let rows: Vec<(&str, Value)> = vec![
         (
             "same output count, new name",
@@ -443,12 +444,12 @@ async fn update_feed_overwrites_the_stored_feed() {
             }),
         ),
         (
-            "an output that came from an association, and the access role dropped",
+            "a different config member, and the access role dropped",
             json!({
                 "name": "feed-without-a-role",
                 "outputs": [
                     {"name": "meta1", "outputConfig": output_config("contextualMetadata"),
-                     "status": "ENABLED", "fromAssociation": true}
+                     "status": "ENABLED"}
                 ]
             }),
         ),
