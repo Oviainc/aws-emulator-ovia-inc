@@ -110,6 +110,21 @@ impl From<DeleteCollectionErrorModeled> for DeleteCollectionError {
     }
 }
 
+/// `crate::state::DELETABLE_STATUSES` as the sentence fragment `ConflictException`'s own
+/// documentation states them in — `'ACTIVE', 'FAILED', or 'UPDATE_FAILED'` — so the
+/// refusal text and the check it explains are read off one list and can never disagree.
+fn deletable_statuses_phrase() -> String {
+    let quoted: Vec<String> = crate::state::DELETABLE_STATUSES
+        .iter()
+        .map(|status| format!("'{status}'"))
+        .collect();
+    match quoted.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{}, or {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
 /// The `DeleteCollection` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -189,10 +204,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteCollectionErrorModeled::ConflictException(
                 ConflictException {
                     message: Some(format!(
-                        "Collection with ID {} is in status {} and cannot be deleted; it must be one of [{}]",
-                        input.id,
-                        record.status,
-                        crate::state::DELETABLE_STATUSES.join(", ")
+                        "Collection cannot be deleted because it is not in {} status.",
+                        deletable_statuses_phrase()
                     )),
                 },
             )

@@ -24,8 +24,9 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. This service restates one thing there: a `@pattern`
+//!   clause names the regex without the trait's anchors. See the inline note on
+//!   that method for how to reword.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -40,10 +41,39 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema_server::constraints::{envelope, Violation, ViolationKind};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The wire error code a boundary refusal carries, which is also this service's own
+/// modelled `ValidationException` (`smithy_query(query="shape", shape="ValidationException")`:
+/// "Thrown when the HTTP request contains invalid input or is missing required input").
+/// Rewording a refusal must not change it: a client branches on the code.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// A boundary violation as this service STATES it: a `@pattern` failure reports the
+/// trait's regex without its anchors.
+///
+/// A pattern clause already means "the whole value must match", so the `^` and `$` the
+/// model carries say nothing to a caller and the aoss endpoint does not print them:
+/// recorded refusals of a value outside `CollectionName`, `CollectionGroupName` and
+/// `PolicyVersion` each state `Member must satisfy regular expression pattern: <regex>`
+/// with the anchors absent, while `smithy_query(query="shape", shape="CollectionName")`
+/// shows them on the trait. Every other violation kind is restated unchanged.
+fn as_reported(violation: &Violation) -> Violation {
+    let ViolationKind::Pattern(pattern) = &violation.kind else {
+        return violation.clone();
+    };
+    let unanchored = pattern.strip_prefix('^').unwrap_or(pattern);
+    let unanchored = unanchored.strip_suffix('$').unwrap_or(unanchored);
+    Violation {
+        path: violation.path.clone(),
+        kind: ViolationKind::Pattern(unanchored.to_string()),
+        value: violation.value.clone(),
+    }
+}
 
 /// The `com-amazonaws-opensearchserverless-opensearchserverless` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -97,16 +127,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. This service restates exactly one thing: a `@pattern` clause names
+        // the regex without the trait's anchors, the way the aoss endpoint does (see
+        // [`as_reported`]). Everything else — the envelope, the clause order, the error
+        // code — stays the framework's, and a refusal carrying no pattern violation keeps
+        // the framework's own wording by answering `None`.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        let restated: Vec<Violation> = violations.iter().map(as_reported).collect();
+        if restated == *violations {
+            return None;
+        }
+        Some(Refused {
+            code: VALIDATION_EXCEPTION.to_string(),
+            message: envelope(&restated)?,
+        })
     }
 
     fn override_routing_error(

@@ -177,16 +177,44 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The HTTP status this service answers EVERY client error with.
+///
+/// OpenSearch Serverless speaks `awsJson1_0` (`smithy_query(query="service_info")` ->
+/// `protocols: ["awsJson1_0"]`), where the response status is not how a client
+/// discriminates an error — the body's `__type` is. The aoss endpoint accordingly answers
+/// one status, HTTP 400, for every client error it models, whatever `@httpError` that
+/// error's shape carries (`ConflictException` 409, `ResourceNotFoundException` 404,
+/// `ServiceQuotaExceededException` / `OcuLimitExceededException` 402,
+/// `ValidationException` 400). Recorded aoss responses show the 400 with the
+/// `com.amazon.aoss#…` `__type` that names the error.
+const CLIENT_ERROR_STATUS: u16 = 400;
+
+/// The status a modeled error is serialized with: [`CLIENT_ERROR_STATUS`] for a client
+/// error (`errorKind: client`, which the model expresses as a 4xx `@httpError`), the
+/// model's own status for anything else.
+///
+/// Server faults keep their status: the status class is what an SDK's retry classifier
+/// reads, and this service's `InternalServerException` really is the 500 its `@httpError`
+/// declares. Only the 4xx -> 400 collapse is aoss-specific.
+const fn client_error_status(modeled: u16) -> u16 {
+    if modeled >= 400 && modeled < 500 {
+        CLIENT_ERROR_STATUS
+    } else {
+        modeled
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
 pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
-    /// A modeled error the operation declares. Renders with the model's own status.
+    /// A modeled error the operation declares. A client error renders with
+    /// [`CLIENT_ERROR_STATUS`]; a server fault renders with the model's own status.
     Modeled(E),
-    /// The request was refused as invalid. Renders as HTTP 400 with the error code
-    /// `ValidationException`.
+    /// The request was refused as invalid. Renders as [`CLIENT_ERROR_STATUS`] (HTTP 400)
+    /// with the error code `ValidationException`.
     ///
     /// On the JSON and CBOR protocols that is the same status and code the boundary
     /// validator answers with. Two differences are worth knowing, and neither is
@@ -245,10 +273,12 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
     }
 }
 
-/// Every `OperationError` method delegates to the modeled error, so wrapping an
-/// implemented operation's error channel changes NOTHING about how that error is
-/// rendered. Only the synthetic variant behaves differently — and it is the one that
-/// must answer 501.
+/// Every `OperationError` method delegates to the modeled error, with ONE exception: the
+/// status. `http_status` collapses a modeled client error's `@httpError` status to this
+/// service's single client-error status, because that is what the aoss endpoint answers;
+/// the wire code, the schema and the serialized body all stay the modeled error's own.
+/// The synthetic scaffold variant is the other one that answers its own status — the 501
+/// it must.
 impl<E: OperationError> OperationError for Scaffolded<E> {
     fn as_serializable(&self) -> &dyn SerializableStruct {
         match self {
@@ -278,15 +308,21 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         }
     }
 
-    /// 501 for the scaffold signal.
+    /// 501 for the scaffold signal, [`CLIENT_ERROR_STATUS`] for every modeled client
+    /// error, and the model's own status for a modeled server fault.
     ///
-    /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
+    /// Keep the 501 a 501 and not a 5xx server fault: SDK retry classifiers treat those as
     /// retryable, so a client would retry an operation that can never succeed.
+    ///
+    /// A modeled error does NOT answer its `@httpError` status directly: on this
+    /// service's `awsJson1_0` channel the status is not the discriminator, and the aoss
+    /// endpoint answers every client error with [`CLIENT_ERROR_STATUS`]. See
+    /// [`client_error_status`].
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
-            Self::ValidationException(_) => 400,
+            Self::Modeled(e) => client_error_status(e.http_status()),
+            Self::ValidationException(_) => CLIENT_ERROR_STATUS,
         }
     }
 

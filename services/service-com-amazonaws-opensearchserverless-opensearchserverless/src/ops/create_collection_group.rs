@@ -244,12 +244,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A collection group name identifies one group in the account, so a name already
         // taken is the conflict `ConflictException` describes: "thrown when a resource
         // with the same name already exists or is being created".
-        if let Some(existing) = store.collection_group_by_name(&input.name) {
+        //
+        // As in `CreateCollection`, the refusal names the requested name and nothing
+        // else: the id of the group already holding it is not part of this answer.
+        if store.collection_group_by_name(&input.name).is_some() {
             return Err(CreateCollectionGroupErrorModeled::ConflictException(
                 ConflictException {
                     message: Some(format!(
-                        "Collection group with name {} already exists with id {}",
-                        existing.name, existing.id
+                        "A collection group with name '{}' already exists.",
+                        input.name
                     )),
                 },
             )

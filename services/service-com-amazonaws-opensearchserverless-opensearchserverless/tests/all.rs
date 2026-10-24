@@ -15,6 +15,8 @@
 mod access_policy;
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/client_error_status.rs"]
+mod client_error_status;
 #[path = "all/collection_group_capacity.rs"]
 mod collection_group_capacity;
 #[path = "all/collection_group_delete.rs"]

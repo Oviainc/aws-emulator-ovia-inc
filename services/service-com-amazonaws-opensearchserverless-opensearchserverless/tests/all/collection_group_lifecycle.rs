@@ -26,7 +26,9 @@
 use serde_json::{json, Value};
 
 use crate::collection_group_capacity::expected_capacity_limits;
-use crate::collection_lifecycle::{at, call, call_in, emulator, is_collection_id, text, ACCOUNT};
+use crate::collection_lifecycle::{
+    at, call, call_in, emulator, is_collection_id, text, ACCOUNT, CLIENT_ERROR,
+};
 
 /// Every `ServerlessGeneration` member, from the model's own value list
 /// (`smithy_query(query="shape", shape="ServerlessGeneration")` -> `values`).
@@ -414,7 +416,7 @@ async fn create_collection_group_refuses_a_duplicate_name_and_invalid_input() {
         (
             "a name already taken",
             json!({ "name": "taken-group", "standbyReplicas": "DISABLED" }),
-            409,
+            CLIENT_ERROR,
             "ConflictException",
         ),
         (
@@ -595,8 +597,8 @@ async fn a_replayed_client_token_answers_the_group_it_first_created() {
         .await;
         assert_eq!(
             (status, code.as_str()),
-            (409, "ConflictException"),
-            "case fresh token on a taken name ({token}): expected 409 ConflictException, got {status} {code} with {answer}"
+            (CLIENT_ERROR, "ConflictException"),
+            "case fresh token on a taken name ({token}): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
         );
     }
 }

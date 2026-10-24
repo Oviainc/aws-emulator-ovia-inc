@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use crate::collection_lifecycle::{at, call, emulator, is_policy_version, text};
+use crate::collection_lifecycle::{at, call, emulator, is_policy_version, text, CLIENT_ERROR};
 
 /// A minimal IdP metadata document: `samlMetadata` is
 /// `@length(1..51200)` with `@pattern("[\u{0009}\u{000A}\u{000D}\u{0020}-\u{007E}\u{00A1}-\u{00FF}]+")`,
@@ -299,8 +299,8 @@ async fn a_created_security_config_is_what_the_listing_of_its_type_reports() {
         }
     }
 
-    // An id that names no stored configuration is the modelled 404, including the id a
-    // stored NAME carries under a type it was never created under.
+    // An id that names no stored configuration is the modelled `ResourceNotFoundException`,
+    // including the id a stored NAME carries under a type it was never created under.
     for (case, id) in [
         ("an id of no configuration", expected_id("saml", "absent-config")),
         (
@@ -311,8 +311,8 @@ async fn a_created_security_config_is_what_the_listing_of_its_type_reports() {
         let (status, code, answer) = call(&router, "GetSecurityConfig", json!({ "id": id })).await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case GetSecurityConfig({case}): expected 404 ResourceNotFoundException, got {status} {code} with {answer}"
+            (CLIENT_ERROR, "ResourceNotFoundException"),
+            "case GetSecurityConfig({case}): expected {CLIENT_ERROR} ResourceNotFoundException, got {status} {code} with {answer}"
         );
     }
 
@@ -587,13 +587,13 @@ async fn deleting_a_security_config_removes_it_from_every_read() {
             "case {case}: the model declares no output members, so the body is empty, got {answer}"
         );
 
-        // The record is gone: the read is a 404, the listing of its type no longer carries
-        // it, and a second delete is a 404 too.
+        // The record is gone: the read is refused as missing, the listing of its type no
+        // longer carries it, and a second delete is refused too.
         let (status, code, read) =
             call(&router, "GetSecurityConfig", json!({ "id": id.clone() })).await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ResourceNotFoundException"),
+            (CLIENT_ERROR, "ResourceNotFoundException"),
             "case {case}: a deleted configuration is not readable, got {status} {code} with {read}"
         );
         assert!(
@@ -607,8 +607,8 @@ async fn deleting_a_security_config_removes_it_from_every_read() {
             call(&router, "DeleteSecurityConfig", json!({ "id": id.clone() })).await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case}, second time: expected 404 ResourceNotFoundException, got {status} {code} with {answer}"
+            (CLIENT_ERROR, "ResourceNotFoundException"),
+            "case {case}, second time: expected {CLIENT_ERROR} ResourceNotFoundException, got {status} {code} with {answer}"
         );
 
         // And the (type, name) pair is free again, which is what shows the delete removed
@@ -665,7 +665,8 @@ async fn deleting_a_security_config_removes_it_from_every_read() {
         "case CreateSecurityConfig(token of a deleted record): the token must not answer the deleted configuration, got {second}"
     );
 
-    // An id of the right shape that names no configuration is a 404, not an empty success.
+    // An id of the right shape that names no configuration is refused, not an empty
+    // success.
     let (status, code, answer) = call(
         &router,
         "DeleteSecurityConfig",
@@ -674,8 +675,8 @@ async fn deleting_a_security_config_removes_it_from_every_read() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (404, "ResourceNotFoundException"),
-        "case DeleteSecurityConfig(unknown id): expected 404 ResourceNotFoundException, got {status} {code} with {answer}"
+        (CLIENT_ERROR, "ResourceNotFoundException"),
+        "case DeleteSecurityConfig(unknown id): expected {CLIENT_ERROR} ResourceNotFoundException, got {status} {code} with {answer}"
     );
 }
 
@@ -821,8 +822,8 @@ async fn create_security_config_refuses_what_it_must_and_stops_at_the_quota() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (409, "ConflictException"),
-        "case CreateSecurityConfig(duplicate pair): expected 409 ConflictException, got {status} {code} with {answer}"
+        (CLIENT_ERROR, "ConflictException"),
+        "case CreateSecurityConfig(duplicate pair): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
     );
     assert_eq!(
         list_all(&router, "saml").await,
@@ -858,12 +859,12 @@ async fn create_security_config_refuses_what_it_must_and_stops_at_the_quota() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (409, "ConflictException"),
-        "case CreateSecurityConfig(new token, taken name): expected 409 ConflictException, got {status} {code} with {answer}"
+        (CLIENT_ERROR, "ConflictException"),
+        "case CreateSecurityConfig(new token, taken name): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
     );
 
     // The quota, which is counted per `SecurityConfigType`: creates are accepted up to it
-    // and the one past it is a 402 `ServiceQuotaExceededException` whose message names the
+    // and the one past it is the `ServiceQuotaExceededException` whose message names the
     // requested type and the limit. The table spans two types, so the count and the
     // message are per type and not one account-wide total.
     let quota = service_com_amazonaws_opensearchserverless_opensearchserverless::state::MAX_SECURITY_CONFIGS_PER_TYPE;
@@ -888,8 +889,8 @@ async fn create_security_config_refuses_what_it_must_and_stops_at_the_quota() {
         let (status, code, answer) = call(&router, "CreateSecurityConfig", request).await;
         assert_eq!(
             (status, code.as_str()),
-            (402, "ServiceQuotaExceededException"),
-            "case CreateSecurityConfig({kind}, one past the quota): expected 402 ServiceQuotaExceededException, got {status} {code} with {answer}"
+            (CLIENT_ERROR, "ServiceQuotaExceededException"),
+            "case CreateSecurityConfig({kind}, one past the quota): expected {CLIENT_ERROR} ServiceQuotaExceededException, got {status} {code} with {answer}"
         );
         assert_eq!(
             text(&answer, "message"),

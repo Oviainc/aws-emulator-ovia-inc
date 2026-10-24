@@ -25,7 +25,9 @@ use serde_json::{json, Value};
 use crate::collection_group_lifecycle::{
     batch_get, create_group, detail_at, error_at, NOT_FOUND_CODE, NOT_FOUND_MESSAGE,
 };
-use crate::collection_lifecycle::{at, call, call_in, emulator, is_collection_id, text};
+use crate::collection_lifecycle::{
+    at, call, call_in, emulator, is_collection_id, text, CLIENT_ERROR,
+};
 
 /// Long enough for the `CREATING -> ACTIVE` transition `CreateCollection` starts to fall
 /// due, so the collection it created can be deleted; the emulator's span is 500 ms and
@@ -179,11 +181,12 @@ async fn a_deleted_collection_group_is_reported_as_a_not_found_error_detail() {
             );
         }
 
-        // Deleting the same id again is the modelled 404: the record is already gone.
+        // Deleting the same id again is the modelled `ResourceNotFoundException`: the
+        // record is already gone.
         let (status, code, body) = delete_group(&router, region, json!({ "id": &id })).await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ResourceNotFoundException"),
+            (CLIENT_ERROR, "ResourceNotFoundException"),
             "case {case}: a second delete must be refused, got {status} {code} with {body}"
         );
 
@@ -358,13 +361,13 @@ async fn delete_collection_group_refuses_an_unknown_id_and_a_non_empty_group() {
     let router = emulator();
 
     // An id that never named a group, at both published bounds of `CollectionGroupId` and
-    // in between, is the modelled 404 — not a silent success.
+    // in between, is the modelled `ResourceNotFoundException` — not a silent success.
     for id in ["abc", &"z9".repeat(20), "0123456789abcdef"] {
         let (status, code, body) = delete_group(&router, "us-east-1", json!({ "id": id })).await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case DeleteCollectionGroup({id}) with no such group: expected 404, got {status} {code} with {body}"
+            (CLIENT_ERROR, "ResourceNotFoundException"),
+            "case DeleteCollectionGroup({id}) with no such group: expected {CLIENT_ERROR}, got {status} {code} with {body}"
         );
     }
 
@@ -408,8 +411,8 @@ async fn delete_collection_group_refuses_an_unknown_id_and_a_non_empty_group() {
         let (status, code, body) = delete_group(&router, "us-east-1", json!({ "id": &id })).await;
         assert_eq!(
             (status, code.as_str()),
-            (409, "ConflictException"),
-            "case DeleteCollectionGroup({group}) holding {} collection(s): expected 409, got \
+            (CLIENT_ERROR, "ConflictException"),
+            "case DeleteCollectionGroup({group}) holding {} collection(s): expected {CLIENT_ERROR}, got \
              {status} {code} with {body}",
             collections.len()
         );
