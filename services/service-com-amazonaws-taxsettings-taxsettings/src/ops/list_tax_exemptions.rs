@@ -20,11 +20,13 @@
 //! `ListTaxRegistrations` issues ([`crate::state::encode_page_token`]), because
 //! both page by account id.
 //!
-//! The page size is the SERVER's decision: `maxResults` when the request names
-//! one, [`crate::state::DEFAULT_PAGE_SIZE`] when it does not, capped at
-//! [`crate::state::MAX_PAGE_SIZE`] — so a request that names no page size cannot
-//! ask for the whole store in one response, and the work done while the state
-//! lock is held is bounded by the page.
+//! The page size is the SERVER's decision, under THIS operation's bounds
+//! ([`crate::state::TAX_EXEMPTIONS_PAGE_BOUNDS`]): `maxResults` when the request
+//! names one, that default when it does not, capped at that ceiling. This
+//! operation's documentation states no page bound (unlike
+//! `ListTaxRegistrations`), so the bounds are the emulator's own — a request
+//! that names no page size still cannot ask for the whole store in one response,
+//! and the work done while the state lock is held is bounded by the page.
 //!
 //! Enumerating the exemptions reports each record as the projection renders it
 //! at this instant, so an exemption whose expiration date has passed is reported
@@ -180,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request's own 1..=1000 range is a modelled constraint the boundary
         // already refused outside, but a request that names NO page size must
         // still get a bounded page.
-        let page_size = crate::state::page_size(input.max_results);
+        let page_size = crate::state::TAX_EXEMPTIONS_PAGE_BOUNDS.page_size(input.max_results);
         let resume_after = match input.next_token.as_deref() {
             Some(token) => Some(
                 crate::state::decode_page_token(token)
