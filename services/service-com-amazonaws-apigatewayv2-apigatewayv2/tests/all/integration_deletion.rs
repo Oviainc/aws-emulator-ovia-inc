@@ -356,8 +356,28 @@ async fn a_route_of_another_api_does_not_block_the_delete() {
     )
     .await;
 
-    // A route of a DIFFERENT api, carrying the very same target string.
+    // A route of a DIFFERENT api, carrying the very same target string. That api holds
+    // an integration of its own under the same id — an `IntegrationId` is unique only
+    // within its api, and both apis mint from their own sequence — so the target
+    // resolves there, against the bystander's OWN integration.
     let bystander = create_api(&emulator, "the bystander api", &http_api("scoped-other-api")).await;
+    let bystander_integration = create_integration(
+        &emulator,
+        "the bystander api's integration",
+        &bystander,
+        json!({
+            "integrationType": "AWS_PROXY",
+            "integrationUri": "arn:aws:lambda:us-east-1:000000000000:function:bystander",
+            "payloadFormatVersion": "2.0"
+        }),
+    )
+    .await;
+    assert_eq!(
+        bystander_integration, integration_id,
+        "each api mints its integration ids from its own sequence, so the first \
+         integration of either api carries the same id; got {bystander_integration} and \
+         {integration_id}"
+    );
     let bystander_route = create_route(
         &emulator,
         "the bystander api's route",

@@ -477,7 +477,7 @@ struct RouteCase {
     request: Value,
 }
 
-fn route_cases() -> Vec<RouteCase> {
+fn route_cases(integration_id: &str, authorizer_id: &str) -> Vec<RouteCase> {
     vec![
         RouteCase {
             label: "method and path",
@@ -485,7 +485,12 @@ fn route_cases() -> Vec<RouteCase> {
         },
         RouteCase {
             label: "greedy path variable",
-            request: json!({ "routeKey": "ANY /{proxy+}", "target": "integrations/abc123" }),
+            // A target addresses an integration of the route's OWN api, so the id is one
+            // this api minted.
+            request: json!({
+                "routeKey": "ANY /{proxy+}",
+                "target": format!("integrations/{integration_id}")
+            }),
         },
         RouteCase {
             label: "catch-all",
@@ -507,7 +512,14 @@ fn route_cases() -> Vec<RouteCase> {
         },
         RouteCase {
             label: "path with a single variable",
-            request: json!({ "routeKey": "DELETE /items/{id}", "authorizationType": "JWT", "authorizerId": "auth12345" }),
+            // `CUSTOM` is the authorizer-backed type a WebSocket api's route may carry
+            // ("For WebSocket APIs, valid values are NONE …, AWS_IAM … and CUSTOM"), and
+            // the id names the authorizer this api holds.
+            request: json!({
+                "routeKey": "DELETE /items/{id}",
+                "authorizationType": "CUSTOM",
+                "authorizerId": authorizer_id
+            }),
         },
     ]
 }
@@ -524,8 +536,40 @@ async fn create_route_persists_the_record_get_route_reports_back() {
     .await;
     let api_id = as_str(&api, "apiId");
 
+    // The two resources a route of this api can reference: an integration for a
+    // `Target` and an authorizer for an `AuthorizerId`.
+    let (status, integration) = call(
+        &emulator,
+        "POST",
+        &format!("/v2/apis/{api_id}/integrations"),
+        Some(json!({ "integrationType": "MOCK" })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "expected 201 from CreateIntegration, got {status} {integration}"
+    );
+    let integration_id = as_str(&integration, "integrationId");
+    let (status, authorizer) = call(
+        &emulator,
+        "POST",
+        &format!("/v2/apis/{api_id}/authorizers"),
+        Some(json!({
+            "name": "route-authorizer",
+            "authorizerType": "REQUEST",
+            "identitySource": ["$request.header.Authorization"],
+            "authorizerUri": "arn:aws:apigateway:eu-west-1:lambda:path/2015-03-31/functions/arn:aws:lambda:eu-west-1:000000000000:function:route-authorizer/invocations"
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "expected 201 from CreateAuthorizer, got {status} {authorizer}"
+    );
+    let authorizer_id = as_str(&authorizer, "authorizerId");
+
     let mut stored_ids = BTreeSet::new();
-    for case in route_cases() {
+    for case in route_cases(&integration_id, &authorizer_id) {
         let (status, created) = call(
             &emulator,
             "POST",

@@ -745,6 +745,41 @@ async fn a_definition_this_service_cannot_import_is_refused_and_persists_nothing
             .to_string(),
         ),
         (
+            // The same rule `CreateIntegration` applies: 2.0 is a Lambda proxy's
+            // payload format, and "for all other integrations, 1.0 is the only
+            // supported value".
+            "a payload format version the integration type does not support",
+            "",
+            json!({
+                "openapi": "3.0.1",
+                "info": { "title": "bad-payload-format" },
+                "paths": { "/pets": { "get": { "x-amazon-apigateway-integration": { "type": "http_proxy", "uri": "https://example.com", "payloadFormatVersion": "2.0" } } } }
+            })
+            .to_string(),
+        ),
+        (
+            "a service-action subtype on an integration that is not AWS_PROXY",
+            "",
+            json!({
+                "openapi": "3.0.1",
+                "info": { "title": "bad-subtype" },
+                "paths": { "/pets": { "get": { "x-amazon-apigateway-integration": { "type": "http_proxy", "uri": "https://example.com", "integrationSubtype": "SQS-SendMessage" } } } }
+            })
+            .to_string(),
+        ),
+        (
+            // And the CORS rule every writer of a configuration applies.
+            "a CORS configuration allowing credentials and the wildcard origin",
+            "",
+            json!({
+                "openapi": "3.0.1",
+                "info": { "title": "cors-wildcard-credentials" },
+                "x-amazon-apigateway-cors": { "allowOrigins": ["*"], "allowCredentials": true },
+                "paths": {}
+            })
+            .to_string(),
+        ),
+        (
             "a CORS maxAge past the modelled range",
             "",
             json!({
@@ -1005,5 +1040,61 @@ async fn two_imports_of_one_definition_are_two_apis() {
                  hold; got {integrations:?}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn an_imported_service_action_integration_needs_no_uri() {
+    let router = emulator();
+
+    // The same rule `CreateIntegration` applies: an integration carrying an
+    // `IntegrationSubtype` names the AWS service action it invokes there, so it needs no
+    // `uri`. One row per subtype, so the rule is asserted over the class and not over
+    // one service.
+    for subtype in [
+        "SQS-SendMessage",
+        "EventBridge-PutEvents",
+        "StepFunctions-StartExecution",
+    ] {
+        let definition = json!({
+            "openapi": "3.0.1",
+            "info": { "title": format!("subtype-{subtype}") },
+            "paths": {
+                "/send": {
+                    "post": {
+                        "x-amazon-apigateway-integration": {
+                            "type": "aws_proxy",
+                            "integrationSubtype": subtype,
+                            "payloadFormatVersion": "1.0",
+                            "credentials": "arn:aws:iam::000000000000:role/apigw",
+                            "requestParameters": { "MessageBody": "$request.body.message" }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let (status, imported) = import(&router, "", &definition).await;
+        assert_eq!(
+            status, 201,
+            "case {subtype:?}: expected 201 from ImportApi, got {status} {imported}"
+        );
+        let api_id = as_str(&imported, "apiId");
+        let integrations = stored_integrations(&router, &api_id).await;
+        let stored = integrations
+            .values()
+            .next()
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            as_str(&stored, "integrationSubtype"),
+            subtype,
+            "case {subtype:?}: the imported integration must carry the subtype, got {stored}"
+        );
+        assert!(
+            stored.get("integrationUri").is_none(),
+            "case {subtype:?}: an integration created from a subtype names no URI, got {stored}"
+        );
     }
 }

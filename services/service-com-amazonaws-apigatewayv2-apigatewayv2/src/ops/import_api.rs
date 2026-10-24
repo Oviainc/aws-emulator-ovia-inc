@@ -981,14 +981,23 @@ fn read_cors(document: &Node) -> Result<Option<Cors>, String> {
             ));
         }
     }
-    Ok(Some(Cors {
+    let cors = Cors {
         allow_credentials: extension.boolean_member("allowCredentials")?,
         allow_headers: extension.string_list_member("allowHeaders"),
         allow_methods: extension.string_list_member("allowMethods"),
         allow_origins: extension.string_list_member("allowOrigins"),
         expose_headers: extension.string_list_member("exposeHeaders"),
         max_age: max_age.map(|seconds| i32::try_from(seconds).unwrap_or(i32::MAX)),
-    }))
+    };
+    // An imported CORS document is held to the same rule a caller-supplied one is
+    // (`crate::state::validate_cors_configuration`): a definition cannot write a
+    // configuration `CreateApi` would have refused.
+    if let Err(message) = crate::state::validate_cors_configuration(&cors) {
+        return Err(format!(
+            "Unable to parse API definition: '{CORS_EXTENSION}' is not valid: {message}"
+        ));
+    }
+    Ok(Some(cors))
 }
 
 /// The integration an operation's [`INTEGRATION_EXTENSION`] declares.
@@ -1028,17 +1037,10 @@ fn read_integration(extension: &Node, route_key: &str) -> Result<ImportedIntegra
         return Err(refusal(&message));
     }
 
-    // "For a Lambda integration, specify the URI of a Lambda function. For an HTTP
-    // integration, specify a fully-qualified URL" (`CreateIntegration$IntegrationUri`):
-    // every integration type names an endpoint except `MOCK`, which an HTTP api cannot
-    // carry at all and which the protocol gate above has already refused.
-    let integration_uri = extension.string_member("uri").ok_or_else(|| {
-        refusal(&format!(
-            "'{INTEGRATION_EXTENSION}.uri' is required for an integration of type \
-             {integration_type}"
-        ))
-    })?;
-
+    // Everything else the extension declares, read before anything is refused beyond
+    // the catalogs above, so the whole integration is checked at once.
+    let integration_uri = extension.string_member("uri");
+    let integration_subtype = extension.string_member("integrationSubtype");
     let connection_type = extension
         .string_member("connectionType")
         .map(|value| value.to_ascii_uppercase());
@@ -1051,11 +1053,29 @@ fn read_integration(extension: &Node, route_key: &str) -> Result<ImportedIntegra
         }
     }
     let connection_id = extension.string_member("connectionId");
-    if connection_type.as_deref() == Some(VPC_LINK_CONNECTION_TYPE) && connection_id.is_none() {
-        return Err(refusal(&format!(
-            "'{INTEGRATION_EXTENSION}.connectionId' is required for a connection of type \
-             {VPC_LINK_CONNECTION_TYPE}"
-        )));
+    let payload_format_version = extension
+        .string_member("payloadFormatVersion")
+        .unwrap_or_else(|| DEFAULT_PAYLOAD_FORMAT_VERSION.to_string());
+
+    // The rules an integration RECORD has to satisfy, whatever wrote it: which members
+    // name what it invokes, the payload format its type supports, and the link a private
+    // connection connects through. The ONE owner of them is
+    // `crate::state::validate_integration`, the same one `CreateIntegration` and
+    // `UpdateIntegration` go through, so an imported integration cannot be a record a
+    // caller could not have created. A template selection expression is not read here:
+    // an imported api speaks HTTP and that member is supported only for WebSocket APIs.
+    if let Err(message) = crate::state::validate_integration(
+        &integration_type,
+        integration_subtype.as_deref(),
+        integration_uri.as_deref(),
+        Some(payload_format_version.as_str()),
+        connection_type
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_CONNECTION_TYPE),
+        connection_id.as_deref(),
+        ::std::option::Option::None,
+    ) {
+        return Err(refusal(&message));
     }
 
     let timeout_in_millis = extension
@@ -1072,15 +1092,13 @@ fn read_integration(extension: &Node, route_key: &str) -> Result<ImportedIntegra
 
     Ok(ImportedIntegration {
         integration_type,
-        integration_uri: Some(integration_uri),
+        integration_uri,
         integration_method: extension.string_member("httpMethod"),
-        integration_subtype: extension.string_member("integrationSubtype"),
+        integration_subtype,
         connection_type,
         connection_id,
         credentials_arn: extension.string_member("credentials"),
-        payload_format_version: extension
-            .string_member("payloadFormatVersion")
-            .unwrap_or_else(|| DEFAULT_PAYLOAD_FORMAT_VERSION.to_string()),
+        payload_format_version,
         // The value is inside the modelled range, checked above, so it is an `i32`.
         timeout_in_millis: timeout_in_millis.map(|timeout| {
             i32::try_from(timeout).unwrap_or(crate::state::DEFAULT_HTTP_TIMEOUT_MILLIS)
@@ -1098,10 +1116,6 @@ fn read_integration(extension: &Node, route_key: &str) -> Result<ImportedIntegra
             .and_then(|config| config.string_member("serverNameToVerify")),
     })
 }
-
-/// The `ConnectionType` of a private integration, from `CONNECTION_TYPE_VALUES`: the one
-/// that connects through a VPC link and so needs the link's id.
-const VPC_LINK_CONNECTION_TYPE: &str = "VPC_LINK";
 
 /// The path every imported route is prefixed with: the base path the definition declares,
 /// read as the request's `Basepath` says to.
