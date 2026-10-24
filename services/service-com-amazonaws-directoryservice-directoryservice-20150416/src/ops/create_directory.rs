@@ -210,15 +210,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.advance_clock(now);
 
-        if store.directories.len() >= crate::state::MAX_DIRECTORIES {
+        // Each category of directory carries its own published Region quota, so this
+        // create counts against the cloud-only (Simple AD) one alone — the same bound
+        // `GetDirectoryLimits` reports as `CloudOnlyDirectoriesLimit`.
+        if store.category_limit_reached(crate::state::DirectoryLimitCategory::CloudOnly) {
             return Err(CreateDirectoryErrorModeled::DirectoryLimitExceededException(
-                DirectoryLimitExceededException {
-                    message: Some(format!(
-                        "Maximum number of directories in the region has been reached: {}",
-                        crate::state::MAX_DIRECTORIES
-                    )),
-                    request_id: None,
-                },
+                crate::state::refusal(format!(
+                    "Maximum number of directories in the region has been reached: {}",
+                    crate::state::MAX_CLOUD_ONLY_DIRECTORIES
+                )),
             )
             .into());
         }
@@ -293,9 +293,5 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Refuse the request with the modelled `InvalidParameterException`, naming the member
 /// and the rule it broke so the caller can fix the request from the message alone.
 fn invalid_parameter(message: String) -> CreateDirectoryError {
-    CreateDirectoryErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(message),
-        request_id: None,
-    })
-    .into()
+    CreateDirectoryErrorModeled::InvalidParameterException(crate::state::refusal(message)).into()
 }

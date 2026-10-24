@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBridgeState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBridgeState`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBridgeState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Asks the STORED bridge to reach the state the request names and answers with the state
+//! the stored record is now headed for, so DescribeBridge afterwards reports the
+//! transition this call started.
+//!
+//! `DesiredState` (ACTIVE | DELETED | STANDBY) is the state the bridge is to END UP in,
+//! and each of its three values is also a value of `BridgeState`, so the move is: enter
+//! the transient `BridgeState` that reports it being in progress now, and owe the desired
+//! state one transition span later — STARTING toward ACTIVE, STOPPING toward STANDBY,
+//! DELETING toward DELETED ([`crate::state::bridge_transition_to`], the one mapping). A
+//! caller that reads the bridge straight afterwards therefore still sees the transient
+//! state, and the clock settles it exactly as it settles a create.
+//!
+//! The operation is `@idempotent`: a bridge already in the state the request asks for, or
+//! already settling into it, is left exactly as it is — no new transient state and no new
+//! due instant — so repeating the call changes nothing and answers the same thing.
+//!
+//! A bridge that has reached, or is reaching, the terminal `DELETED` state is the one
+//! thing this operation refuses: that transition is irreversible, so asking such a bridge
+//! for any other state is answered with `ConflictException` (HTTP 409), "the requested
+//! operation would cause a conflict with the current state of a service resource
+//! associated with the request". Nothing else about a bridge's current state refuses a
+//! desired state: the member states what the caller WANTS the bridge to converge to.
+//!
+//! A bridge asked for `DELETED` stays a readable resource in that state rather than being
+//! evicted — `BridgeState` declares `DELETED`, which is the model's own statement that a
+//! bridge is reported in it (see [`crate::state::BRIDGE_STATE_DELETED`]) — while
+//! DeleteBridge, whose answer carries only the ARN of the record it removed, is what drops
+//! the record.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +105,28 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable about the REQUEST's content; the message carries it inside this service's
+/// refusal envelope ([`crate::state::validation_failed_message`]), the one every refusal
+/// about a request's content carries.
+fn bad_request(detail: impl Into<String>) -> UpdateBridgeStateError {
+    UpdateBridgeStateErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources in
+/// the request does not exist in the system" — the bridge `identifier` addressed, in this
+/// service's not-found envelope ([`crate::state::not_found_message`]).
+fn not_found(identifier: &str) -> UpdateBridgeStateError {
+    UpdateBridgeStateErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,18 +201,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBridgeState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBridgeStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBridgeState"))
+        // Nothing in this operation's answer depends on request metadata: the bridge is
+        // addressed by an `@httpLabel` and the desired state by a body member, both already
+        // on `input`, and the answer is read back out of the stored bridge.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateBridgeStateErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect bridge store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The transition the requested desired state names. A value outside the
+        // `DesiredState` enum is refused by the framework's constraint walk before this
+        // handler runs, so reaching here with one the mapping does not know means the member
+        // carried nothing at all; either way the refusal is about the REQUEST's content, so
+        // it is made before the bridge it addresses is resolved.
+        let Some((transient, settled)) = crate::state::bridge_transition_to(&input.desired_state)
+        else {
+            return Err(bad_request(format!(
+                "DesiredState is required and must name the state the bridge is to reach, \
+                 one of: {}.",
+                DESIRED_STATE_VALUES.join(", ")
+            )));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A bridge state change the clock already made due is materialised before the bridge
+        // is read or written, exactly as the reporting operations do it: a bridge whose
+        // `CREATING` became `STANDBY` while nobody was looking is a settled bridge.
+        store.settle_due_transitions(now);
+
+        let Some(bridge) = store.bridges.get_mut(&input.bridge_arn) else {
+            return Err(not_found(&input.bridge_arn));
+        };
+
+        // The state the stored bridge is headed for: the one it is settling into while a
+        // transition is in flight, and the one it is in otherwise.
+        let settling = bridge.settling_state().to_string();
+
+        // A bridge that has reached, or is reaching, the terminal `DELETED` state cannot be
+        // asked for another state: the deletion is irreversible, which is the conflict
+        // `ConflictException` describes ("would cause a conflict with the current state of a
+        // service resource associated with the request", 409 and retryable). The status and
+        // the error code are the contract; the sentence states the precondition and carries
+        // neither of this service's `BadRequestException` / `NotFoundException` envelopes.
+        if settling == crate::state::BRIDGE_STATE_DELETED
+            && settled != crate::state::BRIDGE_STATE_DELETED
+        {
+            return Err(UpdateBridgeStateErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Bridge {} is {} and cannot be returned to {settled}.",
+                        bridge.bridge_arn, bridge.bridge_state
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `@idempotent`: a bridge already in the asked-for state, or already settling into
+        // it, keeps the state and the due instant it has, so repeating the call neither
+        // restarts a transition nor pushes its deadline out. Otherwise the bridge enters the
+        // transient state now and the clock owes it the desired one a transition span later.
+        if settling != settled {
+            bridge.begin_transition(transient, settled, now);
+        }
+
+        // "The ARN of the updated bridge" and "the new state of the bridge", both read back
+        // off the STORED record rather than echoed from the request: the state answered is
+        // the one the stored bridge is headed for.
+        Ok(UpdateBridgeStateOutput {
+            bridge_arn: Some(bridge.bridge_arn.clone()),
+            desired_state: Some(bridge.settling_state().to_string()),
+        })
     }
 }

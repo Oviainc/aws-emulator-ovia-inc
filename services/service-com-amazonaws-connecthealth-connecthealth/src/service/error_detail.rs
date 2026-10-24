@@ -158,6 +158,16 @@ pub fn scribe_session_not_found_message(session_id: &str) -> String {
     format!("Resource not found: sessionId with ID {session_id} does not exist")
 }
 
+/// The detail text of the `ResourceNotFoundException` answered when a patient insights
+/// job cannot be resolved under the `domainId` the request named.
+///
+/// Built from the REQUEST, and in the same form [`scribe_session_not_found_message`]
+/// carries for a scoped identifier ConnectHealth cannot resolve: the member that could
+/// not be resolved and the value the request gave it.
+pub fn patient_insights_job_not_found_message(job_id: &str) -> String {
+    format!("Resource not found: jobId with ID {job_id} does not exist")
+}
+
 /// The detail text of the `ResourceNotFoundException` answered when a subscription cannot
 /// be resolved — because the subscription is absent, or because its parent domain is.
 ///

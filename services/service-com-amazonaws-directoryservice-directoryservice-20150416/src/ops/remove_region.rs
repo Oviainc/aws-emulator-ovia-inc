@@ -169,24 +169,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let directory = store
             .directories
             .get_mut(&input.directory_id)
-            .ok_or_else(|| directory_does_not_exist(&input.directory_id, &region))?;
+            .ok_or_else(|| directory_does_not_exist(&input.directory_id))?;
 
         if !directory.exists_in_region(&region) {
-            return Err(directory_does_not_exist(&input.directory_id, &region).into());
+            return Err(directory_does_not_exist(&input.directory_id).into());
         }
 
         if directory.primary_region == region {
             return Err(
-                RemoveRegionErrorModeled::UnsupportedOperationException(
-                    UnsupportedOperationException {
-                        message: Some(format!(
-                            "Region {region} is the primary Region of directory {id} and cannot \
-                             be removed with RemoveRegion; use DeleteDirectory instead",
-                            id = directory.directory_id
-                        )),
-                        request_id: None,
-                    },
-                )
+                RemoveRegionErrorModeled::UnsupportedOperationException(crate::state::refusal(
+                    format!(
+                        "Region {region} is the primary Region of directory {id} and cannot \
+                         be removed with RemoveRegion; use DeleteDirectory instead",
+                        id = directory.directory_id
+                    ),
+                ))
                 .into(),
             );
         }
@@ -195,18 +192,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // itself, so it needs a directory that is in service: one still being built by
         // the transition its create owes is unavailable.
         if directory.stage != crate::state::STAGE_ACTIVE {
-            return Err(RemoveRegionErrorModeled::DirectoryUnavailableException(
-                DirectoryUnavailableException {
-                    message: Some(format!(
+            return Err(
+                RemoveRegionErrorModeled::DirectoryUnavailableException(crate::state::refusal(
+                    format!(
                         "Directory {id} is in stage {stage} and is not available for Region \
                          changes",
                         id = directory.directory_id,
                         stage = directory.stage
-                    )),
-                    request_id: None,
-                },
-            )
-            .into());
+                    ),
+                ))
+                .into(),
+            );
         }
 
         directory.additional_regions.remove(&region);
@@ -216,13 +212,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// Refuse the request with the modelled `DirectoryDoesNotExistException`: the id names
-/// no directory that exists in the Region the call was made against.
-fn directory_does_not_exist(directory_id: &str, region: &str) -> RemoveRegionErrorModeled {
-    RemoveRegionErrorModeled::DirectoryDoesNotExistException(DirectoryDoesNotExistException {
-        message: Some(crate::state::no_such_directory_in_region(
-            directory_id,
-            region,
-        )),
-        request_id: None,
-    })
+/// no directory this call can act on.
+///
+/// The diagnostic is built from the REQUEST, which carries a `DirectoryId` and nothing
+/// else: it quotes the id that was passed and names no Region, so the text a caller (or
+/// a multi-Region test asserting the refusal) sees varies with its own input rather than
+/// with the Region the emulator was called in. It is the one shared directory-lookup
+/// template ([`crate::state::no_such_directory`]), so this refusal reads exactly like
+/// every other operation's for the same failure.
+fn directory_does_not_exist(directory_id: &str) -> RemoveRegionErrorModeled {
+    RemoveRegionErrorModeled::DirectoryDoesNotExistException(crate::state::refusal(
+        crate::state::no_such_directory(directory_id),
+    ))
 }

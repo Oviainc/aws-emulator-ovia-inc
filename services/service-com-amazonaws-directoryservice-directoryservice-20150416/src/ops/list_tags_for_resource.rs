@@ -153,10 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(token) => Some(
                 crate::state::decode_cursor(CURSOR_KIND, token).ok_or_else(|| {
                     ListTagsForResourceErrorModeled::InvalidNextTokenException(
-                        InvalidNextTokenException {
-                            message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
-                            request_id: None,
-                        },
+                        crate::state::invalid_next_token(),
                     )
                 })?,
             ),
@@ -167,11 +164,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.advance_clock(::std::time::SystemTime::now());
 
         let directory = store.directories.get(&input.resource_id).ok_or_else(|| {
+            // The tag family's own diagnostic: a `ResourceId` that names no taggable
+            // resource (see [`crate::state::invalid_resource_id`]).
             ListTagsForResourceErrorModeled::EntityDoesNotExistException(
-                EntityDoesNotExistException {
-                    message: Some(crate::state::no_such_directory(&input.resource_id)),
-                    request_id: None,
-                },
+                crate::state::invalid_resource_id(),
             )
         })?;
 
