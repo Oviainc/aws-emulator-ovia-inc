@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDepotUrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDepotUrl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the URL and the authentication token one environment's Amazon EVS Custom
+//! Addon depot is reached with, held on that environment's record in [`crate::state`].
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDepotUrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The token belongs to the environment, not to the call: the first call issues one and
+//! stores it, and every later call reports the stored one, which is what "the depot URL
+//! remains active until you rotate the authentication token by calling this action with
+//! rotate set to true" says of it. A call carrying `rotate` true is the one that replaces
+//! it — "Revokes the current authentication token and returns a new depot URL with a new
+//! token" (`rotate` doc) — so this action is both what issues the depot credential and
+//! what rotates it. That is the only thing it writes: it moves no state, consumes no
+//! quota and bumps no counter, and once a token has been issued a non-rotating call
+//! leaves the store exactly as the next caller finds it.
+//!
+//! An environment this service holds no record of at the endpoint the caller addressed,
+//! or one that has reached `DELETED`, is a `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -96,12 +102,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // here — hence the `GetDepotUrlError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.evs#GetDepotUrl")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.evs#GetDepotUrl",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetDepotUrlErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the one honest answer when this service's store cannot be reached at all, or when
+    /// no depot token could be issued.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -155,18 +168,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDepotUrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDepotUrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDepotUrl"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetDepotUrlErrorModeled::InternalServerException(InternalServerException {
+                message: "The Amazon EVS environment store is unavailable.".to_string(),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        // Authorization first: AWS decides it at the IAM layer, BEFORE the resource the
+        // request names is evaluated, so a denied caller is told it is not authorized
+        // rather than whether the environment exists. The ARN is therefore the one the
+        // REQUEST names, built without a lookup.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(&crate::state::environment_arn(&region, &input.environment_id)),
+        ) {
+            return Err(denied);
+        }
+        // "Revokes the current authentication token and returns a new depot URL with a
+        // new token" (`rotate` doc): an absent `rotate` asks for no rotation, so the call
+        // reports the token the environment already holds and writes nothing.
+        let rotate = input.rotate.unwrap_or(false);
+
+        let mut state = state.lock();
+        // This materialises the state changes the clock already owed, which were due
+        // whether or not anybody called, so the environment is in the state that is due
+        // at this instant before it is resolved.
+        state.materialise_due_transitions();
+
+        // Regional resource: an environment exists at the endpoint of the Region it was
+        // created in, so a request from any other Region is a miss — as is one naming an
+        // environment that has reached DELETED: "The resource might not be specified
+        // correctly, or it may have a state of DELETED" (`ResourceNotFoundException`
+        // doc).
+        let environment = state
+            .environment_in_region_mut(&region, &input.environment_id)
+            .filter(|environment| environment.state != crate::state::STATE_DELETED)
+            .ok_or_else(|| {
+                GetDepotUrlErrorModeled::ResourceNotFoundException(
+                    crate::state::environment_not_found(&input.environment_id),
+                )
+            })?;
+
+        let token = match environment.depot_token.clone().filter(|_| !rotate) {
+            // The token this environment's depot is already reached with: reporting it
+            // again leaves the depot URL every earlier caller holds working.
+            Some(held) => held,
+            // Either this environment has no depot token yet, or this call rotates the
+            // one it has. Both are what the spec says THIS action does, and both hand the
+            // caller a secret — which is minted by the emulator's credential store and
+            // never built here ([`crate::state::mint_depot_token`]).
+            None => {
+                let minted = crate::state::mint_depot_token(ctx.credential_store())
+                    .ok_or_else(|| {
+                        GetDepotUrlErrorModeled::InternalServerException(InternalServerException {
+                            message: format!(
+                                "No depot authentication token could be issued for environment {}.",
+                                environment.environment_id
+                            ),
+                        })
+                    })?;
+                // Stored, so the next call reports this token rather than a fresh one,
+                // and so a rotation revokes the token it replaced.
+                environment.depot_token = Some(minted.clone());
+                minted
+            }
+        };
+        // Every value reported is the STORED environment's own, never the request's.
+        Ok(GetDepotUrlOutput {
+            depot_url: crate::state::depot_url(
+                &environment.region,
+                &environment.environment_id,
+                &token,
+            ),
+            token,
+        })
     }
 }

@@ -2786,6 +2786,128 @@ pub fn rds_recommendation_matches_filters(
     })
 }
 
+/// Does the analysis of `resource` record a different DB INSTANCE configuration for the
+/// database — the condition an `RDSDBInstanceRecommendationOption` is reported under?
+///
+/// The analysis would move the database's instance only where the configuration it
+/// recommends costs something other than the current one AND the instance finding is not
+/// `Optimized`, the value that says the analysis found nothing to change on that side.
+/// Stated once here so the two readers of one catalog row — the recommendation and the
+/// metrics projected for its option — cannot disagree about whether the row has an instance
+/// recommendation option at all.
+pub fn rds_changes_instance_configuration(resource: &AnalysedResource) -> bool {
+    let (instance_finding, _) = rds_finding_members(&resource.finding);
+    resource.recommended_monthly_cost != resource.current_monthly_cost
+        && instance_finding.is_some_and(|finding| finding != FINDING_OPTIMIZED)
+}
+
+/// The capacity of one DB instance class — or EC2 instance type — RELATIVE to the `xlarge`
+/// size of the same family, or `None` for a size name outside the catalog below.
+///
+/// AWS names an instance size `<family>.<size>`, a DB instance class prefixing `db.`, and
+/// the standard size names are a doubling sequence — `nano`, `micro`, `small`, `medium`,
+/// `large`, `xlarge` — above which `<N>xlarge` carries N times the vCPU and memory of
+/// `xlarge`. The catalog is that sequence, each size expressed as a multiple of `xlarge`; a
+/// size name outside it (`metal`, say) has no multiple recorded, so a caller projects
+/// nothing from it rather than guessing one.
+pub fn instance_size_capacity(instance_class: &str) -> Option<f64> {
+    let size = instance_class.split('.').next_back()?;
+    if let Some(multiple) = size.strip_suffix("xlarge") {
+        if multiple.is_empty() {
+            return Some(1.0);
+        }
+        return multiple.parse::<u16>().ok().map(f64::from);
+    }
+    // Each named size below `xlarge` halves the one above it.
+    match size {
+        "large" => Some(0.5),
+        "medium" => Some(0.25),
+        "small" => Some(0.125),
+        "micro" => Some(0.062_5),
+        "nano" => Some(0.031_25),
+        _ => None,
+    }
+}
+
+/// The `RDSDBMetricName` values ([`R_D_S_D_B_METRIC_NAME_VALUES`]) that measure, as a
+/// percentage, a resource the DB INSTANCE CLASS sizes: the instance's vCPU and its memory.
+/// Moving the database to another instance class changes what those percentages are OF, so
+/// they are the metrics a projection scales; every other metric of that value set measures
+/// the workload itself (connections, throughput, IOPs) or the database's storage, neither of
+/// which an instance-class change resizes.
+pub const RDS_METRIC_CPU: &str = "CPU";
+/// See [`RDS_METRIC_CPU`].
+pub const RDS_METRIC_MEMORY: &str = "Memory";
+
+/// The highest value a metric measured as a PERCENTAGE of a capacity can take.
+pub const UTILIZATION_PERCENTAGE_CEILING: f64 = 100.0;
+
+/// The value `metric_name` is projected to take on the recommended DB instance class, given
+/// the `observed` value on the current one.
+///
+/// A metric measured as a percentage of what the instance class sizes ([`RDS_METRIC_CPU`],
+/// [`RDS_METRIC_MEMORY`]) is projected by the ratio of the two classes' capacities — the
+/// same work on half the capacity runs at twice the utilization — and cannot exceed the
+/// percentage ceiling. Every other metric measures the workload or the storage, which an
+/// instance-class change does not resize, so it is projected unchanged. A class whose size
+/// name the catalog records no capacity for ([`instance_size_capacity`]) leaves the metric
+/// unchanged too, because there is then no ratio to project by.
+pub fn rds_projected_metric_value(
+    metric_name: &str,
+    observed: f64,
+    current_instance_class: Option<&str>,
+    recommended_instance_class: Option<&str>,
+) -> f64 {
+    if metric_name != RDS_METRIC_CPU && metric_name != RDS_METRIC_MEMORY {
+        return observed;
+    }
+    let capacities = current_instance_class
+        .and_then(instance_size_capacity)
+        .zip(recommended_instance_class.and_then(instance_size_capacity));
+    let Some((current, recommended)) = capacities.filter(|(_, recommended)| *recommended > 0.0)
+    else {
+        return observed;
+    };
+    round_hundredths(
+        (observed * current / recommended).clamp(0.0, UTILIZATION_PERCENTAGE_CEILING),
+    )
+}
+
+/// The most data points one projected-metrics response carries, whatever window and
+/// granularity a request names: a ceiling applied in the handler, so no number a request
+/// carries can size a response or the allocation that builds it — the same rule
+/// [`MAX_PAGE_SIZE`] states for a paged reader. A request that would cross it is refused
+/// with the parameter named, because a coarser period or a shorter window asks for a
+/// response this service can build.
+pub const MAX_PROJECTED_METRIC_DATA_POINTS: usize = 1_440;
+
+/// The timestamps of the projected metric data points of the window `[start, end)` at a
+/// granularity of `period` seconds: one data point per period that BEGINS inside the window,
+/// the first at `start`.
+///
+/// `None` for a window and granularity that is not a series at all (an empty or backwards
+/// window, a period that is not positive) or that would carry more than
+/// [`MAX_PROJECTED_METRIC_DATA_POINTS`] data points — both of which a caller refuses rather
+/// than answer with a series the request did not ask for.
+pub fn projected_metric_timestamps(start: f64, end: f64, period: f64) -> Option<Vec<DateTime>> {
+    if !period.is_finite() || period <= 0.0 || !start.is_finite() || !end.is_finite() {
+        return None;
+    }
+    if end <= start {
+        return None;
+    }
+    let mut timestamps = Vec::new();
+    let mut at = start;
+    while at < end {
+        if timestamps.len() >= MAX_PROJECTED_METRIC_DATA_POINTS {
+            return None;
+        }
+        timestamps.push(DateTime::from_secs_f64(at));
+        at += period;
+    }
+    Some(timestamps)
+}
+
 // ===========================================================================
 // The Lambda function analysis `GetLambdaFunctionRecommendations` reports
 //

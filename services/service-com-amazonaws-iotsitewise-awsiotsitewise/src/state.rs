@@ -16,7 +16,9 @@
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::pipelines`], keyed by the
 //! workspace and the pipeline name, each record carrying every version written
 //! to it, bounded by [`MAX_PIPELINE_VERSIONS`], so a read naming an older
-//! version still answers from it. The service's own settings live here too:
+//! version still answers from it. A workspace's tasks live in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::tasks`], keyed and versioned
+//! the same way, bounded by [`MAX_TASK_VERSIONS`]. The service's own settings live here too:
 //! the logging options, one entry per scope a call named
 //! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::logging_options`]). Every
 //! handler reads and writes THIS struct through [`service_state`]; nothing in
@@ -31,8 +33,8 @@ use crate::ops::types::{
     AssetModelProperty, AssetModelPropertyDefinition, AssetModelStatus, AssetProperty,
     AssetPropertyValue, AssetStatus, AssetSummary, ComputeNode, DatasetConfig, DatasetSource,
     DatasetStatus, ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, ImageLocation,
-    LoggingOptions, PortalStatus, PortalTypeEntry, PropertyType, ResourceStatus, TimeInNanos,
-    Variant,
+    LoggingOptions, PortalStatus, PortalTypeEntry, PropertyType, ResourceStatus, TaskConfiguration,
+    TimeInNanos, Variant,
 };
 
 /// The `iotsitewise` ARN service namespace, as `OPERATIONS.md` reports it.
@@ -235,6 +237,42 @@ pub const MAX_PIPELINE_VERSIONS: usize = 50;
 /// created pipeline") and `UpdatePipeline`'s ("The new version of the pipeline
 /// created by this update") describe the counter.
 pub const FIRST_PIPELINE_VERSION: u64 = 1;
+
+/// The ARN resource-type segment of a task ARN, as [`task_arn`] builds it.
+pub const TASK_RESOURCE_TYPE: &str = "task";
+
+/// How many tasks one workspace holds.
+///
+/// The same kind of bound, and for the same reason, as
+/// [`MAX_PIPELINES_PER_WORKSPACE`]: a create is the only thing that adds a task
+/// and nothing evicts one, so the map needs a maximum entry count. The
+/// emulator's own bound, not a published AWS default; `CreateTask` refuses past
+/// it with the modelled `LimitExceededException` (HTTP 410).
+pub const MAX_TASKS_PER_WORKSPACE: usize = 100;
+
+/// How many tasks the store holds in total, across every workspace.
+///
+/// The per-workspace cap above cannot bound the store on its own, for the reason
+/// [`MAX_PIPELINES`] states: `workspaceName` is a caller-supplied string this
+/// service holds no workspace registry to resolve, so a caller naming a fresh
+/// workspace each time would open a new per-workspace bucket every time.
+pub const MAX_TASKS: usize = 1_000;
+
+/// How many versions one task keeps.
+///
+/// The same eviction policy, and for the same reason, as
+/// [`MAX_PIPELINE_VERSIONS`]: a read answers from the newest version unless it
+/// names an older one, so past this many versions
+/// [`TaskRecord::record_update`] drops the OLDEST superseded version and no
+/// number of updates grows one record without limit. The emulator's own bound;
+/// AWS publishes no retained-version count.
+pub const MAX_TASK_VERSIONS: usize = 50;
+
+/// The `version` a freshly created task reports: its first version, counted from
+/// one, as `CreateTask`'s `version` member ("The version of the newly created
+/// task") and `UpdateTask`'s ("The new version of the task created by this
+/// update") describe the counter.
+pub const FIRST_TASK_VERSION: u64 = 1;
 
 /// The ARN resource-type segment of a dataset ARN, as [`dataset_arn`] builds it.
 pub const DATASET_RESOURCE_TYPE: &str = "dataset";
@@ -1151,6 +1189,155 @@ pub fn pipeline_arn(region: &str, workspace_name: &str, pipeline_name: &str) -> 
     )
 }
 
+/// One version of a task: the caller-owned configuration as of the call that
+/// wrote it.
+///
+/// A task is VERSIONED — `UpdateTask` answers with "The new version of the task
+/// created by this update", and `DescribeTask`'s `taskVersion` reads "The
+/// version number of the task to retrieve. If not specified, returns the latest
+/// version" — so an accepted write appends one of these instead of overwriting
+/// the configuration in place, and a read naming an older version still answers
+/// from the configuration that version carried.
+#[derive(Debug, Clone)]
+pub struct TaskVersion {
+    /// This version's number, as the modelled `Version` string spells it.
+    pub version: u64,
+    pub description: Option<String>,
+    /// The `TaskConfiguration` this version carries, stored exactly as the call
+    /// that wrote it sent it.
+    pub configuration: TaskConfiguration,
+    /// When the call that wrote this version landed — what `updatedAt` reports
+    /// for it.
+    pub recorded_at: SystemTime,
+}
+
+/// A stored task: its identity within a workspace, the version a read answers
+/// from, every version a later write superseded, and the `tags` the tagging
+/// operations read.
+#[derive(Debug, Clone)]
+pub struct TaskRecord {
+    /// The workspace this task lives in. A task name "must be unique within the
+    /// workspace", so the pair is the task's identity.
+    pub workspace_name: String,
+    pub name: String,
+    pub arn: String,
+    /// The newest version: what a read naming no version answers from.
+    pub current: TaskVersion,
+    /// The versions a later write replaced, ascending by version number.
+    pub superseded: Vec<TaskVersion>,
+    pub created_at: SystemTime,
+    /// The instant the transition the clock owes — from [`Self::settling_state`]
+    /// to `ACTIVE` — falls due.
+    pub active_at: SystemTime,
+    /// The `ResourceState` this task reports until [`Self::active_at`] falls
+    /// due: [`STATE_CREATING`] for a freshly created task, [`STATE_UPDATING`]
+    /// while a mutating call it already accepted settles.
+    pub settling_state: String,
+    /// The `clientToken` of the create that made this task, if it carried one,
+    /// so a retry of that same create replays its answer rather than colliding
+    /// with the task it already made.
+    pub client_token: Option<String>,
+    pub tags: HashMap<String, String>,
+}
+
+impl TaskRecord {
+    /// The task's `version` as the modelled `Version` string.
+    pub fn version_label(&self) -> String {
+        self.current.version.to_string()
+    }
+
+    /// The version a `Version` label names — the current one or any it
+    /// superseded — or `None` when no write ever produced it.
+    ///
+    /// Compared NUMERICALLY, after parsing the label the modelled `Version`
+    /// pattern (`^(0|([1-9]{1}\d*))$`, at most 10 digits) admits.
+    pub fn version(&self, label: &str) -> Option<&TaskVersion> {
+        let wanted: u64 = label.parse().ok()?;
+        if self.current.version == wanted {
+            return Some(&self.current);
+        }
+        self.superseded
+            .iter()
+            .find(|version| version.version == wanted)
+    }
+
+    /// When the task was last written: the instant its current version was
+    /// recorded.
+    pub fn updated_at(&self) -> SystemTime {
+        self.current.recorded_at
+    }
+
+    /// The task's `ResourceState` as of `now`: its [`Self::settling_state`]
+    /// until the owed transition falls due, `ACTIVE` from then on. Derived, so a
+    /// read never has to write.
+    pub fn state(&self, now: SystemTime) -> &str {
+        state_at(&self.settling_state, self.active_at, now)
+    }
+
+    /// The task's status as of `now`. No write has failed, so it carries no
+    /// error.
+    pub fn status(&self, now: SystemTime) -> ResourceStatus {
+        ResourceStatus {
+            state: Some(self.state(now).to_string()),
+            error: None,
+        }
+    }
+
+    /// Record that an accepted update landed at `now`: the configuration it
+    /// carries becomes a NEW version, the version it replaces is kept for a read
+    /// that names it, and the task reports `UPDATING` until the transition this
+    /// call owes falls due.
+    ///
+    /// The due instant is STORED, never slept on, so the caller's own call
+    /// returns immediately and the transient state is still what a read taken
+    /// straight afterwards observes.
+    pub fn record_update(
+        &mut self,
+        description: Option<String>,
+        configuration: TaskConfiguration,
+        now: SystemTime,
+    ) {
+        let next = TaskVersion {
+            version: self.current.version + 1,
+            description,
+            configuration,
+            recorded_at: now,
+        };
+        let previous = ::std::mem::replace(&mut self.current, next);
+        self.superseded.push(previous);
+        // The retained history is BOUNDED: past [`MAX_TASK_VERSIONS`] the oldest
+        // superseded version is evicted, the way a pipeline's history is, so no
+        // number of updates grows one record without limit.
+        let retained = self.superseded.len() + 1;
+        if retained > MAX_TASK_VERSIONS {
+            self.superseded.drain(..retained - MAX_TASK_VERSIONS);
+        }
+        self.settling_state = STATE_UPDATING.to_string();
+        self.active_at = now + ACTIVATION_DELAY;
+    }
+}
+
+/// The key a task is stored under in
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::tasks`]: the workspace it lives
+/// in and its own name, since the name is unique only within the workspace.
+pub fn task_key(workspace_name: &str, task_name: &str) -> (String, String) {
+    (workspace_name.to_string(), task_name.to_string())
+}
+
+/// The canonical ARN of a task in `region`.
+///
+/// The resource section carries the WORKSPACE as well as the task name, for the
+/// reason [`pipeline_arn`] states: the name is unique only within its workspace,
+/// so two workspaces may each hold a task of one name and the ARN has to tell
+/// them apart.
+pub fn task_arn(region: &str, workspace_name: &str, task_name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{TASK_RESOURCE_TYPE}/{workspace_name}/{task_name}"),
+    )
+}
+
 /// Refuse a `computations` list that is not a pipeline DAG, in the wording the
 /// refusal carries; `Ok` for one that is.
 ///
@@ -1287,6 +1474,7 @@ tagged_record!(AssetModelRecord);
 tagged_record!(GatewayRecord);
 tagged_record!(PortalRecord);
 tagged_record!(PipelineRecord);
+tagged_record!(TaskRecord);
 tagged_record!(DatasetRecord);
 
 /// `record`'s tag set, but only when `record` is the one `arn` names exactly —
@@ -1360,6 +1548,9 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// Pipelines by [`pipeline_key`] — the workspace they live in and their own
     /// name — because a pipeline name is unique only within its workspace.
     pub pipelines: HashMap<(String, String), PipelineRecord>,
+    /// Tasks by [`task_key`] — the workspace they live in and their own name —
+    /// because a task name is unique only within its workspace.
+    pub tasks: HashMap<(String, String), TaskRecord>,
     /// The logging options each scope has been SET to, keyed by the
     /// `workspaceName` the call named and by [`ACCOUNT_LOGGING_SCOPE`] for a call
     /// that named none. An absent key is a scope no `PutLoggingOptions` has
@@ -1837,6 +2028,10 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                 let (workspace, name) = id.split_once('/')?;
                 tags_of(self.pipelines.get(&pipeline_key(workspace, name)), arn)
             }
+            TASK_RESOURCE_TYPE => {
+                let (workspace, name) = id.split_once('/')?;
+                tags_of(self.tasks.get(&task_key(workspace, name)), arn)
+            }
             DATASET_RESOURCE_TYPE => tags_of(self.datasets.get(id), arn),
             _ => None,
         }
@@ -1853,6 +2048,10 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             PIPELINE_RESOURCE_TYPE => {
                 let (workspace, name) = id.split_once('/')?;
                 tags_of_mut(self.pipelines.get_mut(&pipeline_key(workspace, name)), arn)
+            }
+            TASK_RESOURCE_TYPE => {
+                let (workspace, name) = id.split_once('/')?;
+                tags_of_mut(self.tasks.get_mut(&task_key(workspace, name)), arn)
             }
             DATASET_RESOURCE_TYPE => tags_of_mut(self.datasets.get_mut(id), arn),
             _ => None,
@@ -2209,6 +2408,9 @@ pub const RESOURCE_ASSET_MODEL: &str = "Asset Model";
 
 /// The resource kind those errors name for a pipeline.
 pub const RESOURCE_PIPELINE: &str = "Pipeline";
+
+/// The resource kind those errors name for a task.
+pub const RESOURCE_TASK: &str = "Task";
 
 /// The resource kind those errors name for a dataset.
 pub const RESOURCE_DATASET: &str = "Dataset";
