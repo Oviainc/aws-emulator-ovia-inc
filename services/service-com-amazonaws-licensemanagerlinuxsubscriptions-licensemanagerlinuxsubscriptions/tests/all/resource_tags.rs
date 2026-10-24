@@ -216,13 +216,12 @@ fn generated_pairs(count: usize) -> Vec<(String, String)> {
 /// Put a subscription provider carrying `tags` in the store and return its ARN.
 ///
 /// The provider is seeded DIRECTLY, through the same `engine.state::<…>()` seam the
-/// handlers use, because `RegisterSubscriptionProvider` registers nothing in this
-/// emulator: the real service registers a provider only once it has validated the access
-/// token held in the referenced secret, which cannot be done here, so every registration
-/// is refused (see `src/ops/register_subscription_provider.rs`). The tag operations under
-/// test still have to answer from the store, so the suite puts the resource there. The
-/// `secret` keeps each seeded record distinct, exactly as it kept each registration
-/// distinct.
+/// handlers use, because these rules are about the TAG slice of a provider whose
+/// registration has settled in an accepted state, which `RegisterSubscriptionProvider`
+/// cannot produce here: validating a provider access token needs trust material this
+/// emulator does not hold, so a registration it creates settles `INVALID` (the create
+/// path itself is covered by `tests/all/subscription_provider_registration.rs`). The
+/// `secret` keeps each seeded record distinct.
 async fn register(h: &Harness, case: &str, secret: &str, tags: &[(String, String)]) -> String {
     let store = h.engine.state::<ServiceState>();
     let mut guard = store.lock();
@@ -237,15 +236,13 @@ async fn register(h: &Harness, case: &str, secret: &str, tags: &[(String, String
     );
     guard.providers.insert(
         arn.clone(),
-        SubscriptionProviderRecord {
-            arn: arn.clone(),
-            source: RED_HAT.to_string(),
-            secret_arn: secret.to_string(),
-            status: PROVIDER_STATUS_ACTIVE.to_string(),
-            status_message: None,
-            last_successful_data_retrieval_time: None,
-            tags: tags.iter().cloned().collect(),
-        },
+        SubscriptionProviderRecord::settled(
+            arn.clone(),
+            RED_HAT.to_string(),
+            secret.to_string(),
+            PROVIDER_STATUS_ACTIVE.to_string(),
+            tags.iter().cloned().collect(),
+        ),
     );
     guard.provider_order.push(arn.clone());
     arn

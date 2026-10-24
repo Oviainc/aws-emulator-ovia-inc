@@ -9,6 +9,7 @@
 //! resolve a resource the same way instead of each growing its own copy.
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Filter, LinuxSubscriptionsDiscoverySettings, RegisteredSubscriptionProvider, OPERATOR_VALUES,
@@ -17,6 +18,45 @@ use crate::ops::types::{
 /// `SubscriptionProviderStatus` for a provider whose access token License Manager holds
 /// and accepted (`SubscriptionProviderStatus`: ACTIVE | INVALID | PENDING).
 pub const PROVIDER_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `SubscriptionProviderStatus` of a registration whose access token License Manager has
+/// not finished validating: the status `RegisterSubscriptionProvider` reports, because the
+/// registration resource exists from that call on while the validation of its token runs
+/// behind it (`GetRegisteredSubscriptionProvider` is what reports where it got to).
+pub const PROVIDER_STATUS_PENDING: &str = "PENDING";
+
+/// `SubscriptionProviderStatus` of a registration whose access token could not be
+/// established as genuine. Terminal: the registration stays in the store reporting it,
+/// together with the [`SubscriptionProviderRecord::status_message`] that says why, which
+/// is the only way a client can tell a refused token from a token still being checked.
+pub const PROVIDER_STATUS_INVALID: &str = "INVALID";
+
+/// How long a fresh registration stays [`PROVIDER_STATUS_PENDING`] before the clock owes
+/// it its terminal `SubscriptionProviderStatus`.
+///
+/// Validating the access token is work that happens BEHIND the registration call — the
+/// call answers `PENDING` and the verdict lands later — and AWS documents no duration for
+/// it, so this span is CHOSEN rather than cited: long enough that a caller polling
+/// straight after `RegisterSubscriptionProvider` still observes `PENDING`, short enough
+/// that a client script does not wait on it. The due instant is stored on the record
+/// ([`SubscriptionProviderRecord::settles_at`]) and materialized by whichever later call
+/// runs after it falls due ([`SubscriptionProviderRecord::settle`]) — nothing sleeps.
+pub const TOKEN_VALIDATION_DELAY: Duration = Duration::from_millis(500);
+
+/// The `SubscriptionProviderStatusMessage` of a registration whose token validation this
+/// emulator could not carry out.
+///
+/// Validating a Red Hat offline token means an outbound call to the provider with trust
+/// material this emulator does not hold, so no token reaches a verdict here — and work
+/// nothing performed must not be reported as having succeeded. The registration therefore
+/// settles into the modelled failure status [`PROVIDER_STATUS_INVALID`] with this reason,
+/// rather than into [`PROVIDER_STATUS_ACTIVE`], which would claim a validation nothing
+/// ran. Nothing of the request is interpolated into it: it states what did not happen,
+/// not a verdict on the caller's secret.
+pub const TOKEN_NOT_VALIDATED_MESSAGE: &str =
+    "The subscription provider access token was not validated: this emulator holds no \
+     subscription-provider trust material and makes no call to the provider, so no access \
+     token can be established as genuine";
 
 /// The `LinuxSubscriptionsDiscovery` value an account that never called
 /// `UpdateServiceSettings` reports (`LinuxSubscriptionsDiscovery`: Disabled | Enabled).
@@ -55,6 +95,7 @@ pub enum StateError {
 
 /// A registered Linux subscription provider, as `RegisterSubscriptionProvider` stored it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SubscriptionProviderRecord {
     /// The minted `SubscriptionProviderArn`; the key of `providers`.
     pub arn: String,
@@ -72,6 +113,75 @@ pub struct SubscriptionProviderRecord {
     pub last_successful_data_retrieval_time: Option<String>,
     /// The metadata tags the registration carried.
     pub tags: HashMap<String, String>,
+    /// When the clock owes this registration its terminal `SubscriptionProviderStatus`,
+    /// while the token validation behind the registration call has not landed yet; `None`
+    /// once the status is terminal, so nothing moves twice.
+    pub settles_at: Option<SystemTime>,
+}
+
+impl SubscriptionProviderRecord {
+    /// A registration of `source` against `secret_arn`, as the registration call leaves
+    /// it: `PENDING`, with the terminal status the clock owes it due at
+    /// `now + `[`TOKEN_VALIDATION_DELAY`].
+    pub fn registered(
+        arn: String,
+        source: String,
+        secret_arn: String,
+        tags: HashMap<String, String>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            arn,
+            source,
+            secret_arn,
+            status: PROVIDER_STATUS_PENDING.to_string(),
+            // Nothing to report about the token while it is still being checked.
+            status_message: None,
+            last_successful_data_retrieval_time: None,
+            tags,
+            settles_at: Some(now + TOKEN_VALIDATION_DELAY),
+        }
+    }
+
+    /// A registration already in a terminal `status`, for a record this service's state
+    /// holds without a registration call having produced it.
+    pub fn settled(
+        arn: String,
+        source: String,
+        secret_arn: String,
+        status: String,
+        tags: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            arn,
+            source,
+            secret_arn,
+            status,
+            status_message: None,
+            last_successful_data_retrieval_time: None,
+            tags,
+            settles_at: None,
+        }
+    }
+
+    /// Materialize the status transition the clock owes this registration by `now`.
+    ///
+    /// The token validation that runs behind the registration call cannot be carried out
+    /// here (see [`TOKEN_NOT_VALIDATED_MESSAGE`]), so the status this settles into is the
+    /// modelled failure one with the reason that says so. The transition was owed at
+    /// `settles_at` whether or not anybody called, which is what lets a report materialize
+    /// it: no caller's read decides it.
+    fn settle(&mut self, now: SystemTime) {
+        let Some(due) = self.settles_at else {
+            return;
+        };
+        if due > now {
+            return;
+        }
+        self.settles_at = None;
+        self.status = PROVIDER_STATUS_INVALID.to_string();
+        self.status_message = Some(TOKEN_NOT_VALIDATED_MESSAGE.to_string());
+    }
 }
 
 /// The `Status` of a discovered instance that is running, and so counts towards its
@@ -166,6 +276,10 @@ pub struct ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscr
     pub providers: HashMap<String, SubscriptionProviderRecord>,
     /// Provider ARNs in registration order, so a list is stable and pageable.
     pub provider_order: Vec<String>,
+    /// How many registrations this account has ever minted, so a fresh
+    /// `SubscriptionProviderArn` is unique even after the registration that held the
+    /// previous one was deregistered.
+    pub minted_providers: u64,
     /// The per-account settings singleton, once an update persisted one.
     pub service_settings: Option<ServiceSettingsRecord>,
     /// The instances Linux subscription discovery has found, by `Instance$InstanceID`.
@@ -179,6 +293,92 @@ pub struct ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscr
 }
 
 impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState {
+    /// Materialize every provider status transition the clock owes by `now`.
+    ///
+    /// Called by the operations that REPORT a `SubscriptionProviderStatus` before they read
+    /// it, so what they report is the status that was already due at the instant they ran
+    /// — the same status a caller would have seen had nobody called at all.
+    pub fn settle_providers(&mut self, now: SystemTime) {
+        for record in self.providers.values_mut() {
+            record.settle(now);
+        }
+    }
+
+    /// Register `source` against `secret_arn`, and answer the registration to report.
+    ///
+    /// `RegisterSubscriptionProvider` is `@idempotent`, so a repeat of the same request
+    /// must leave the account with the same ONE registration it had after the first:
+    /// a request naming a (source, secret) pair this account already registered answers
+    /// THAT registration — its ARN and the status it has reached — instead of minting a
+    /// second resource. Any tags the repeat carries are merged into the registration's tag
+    /// set, exactly as `TagResource` merges them.
+    ///
+    /// `Err` is a registration this account may not take: a resultant tag set past
+    /// [`MAX_TAGS_PER_RESOURCE`], or a registration past [`MAX_REGISTERED_PROVIDERS`].
+    /// Nothing is written in either case.
+    pub fn register_provider(
+        &mut self,
+        region: &str,
+        source: &str,
+        secret_arn: &str,
+        tags: HashMap<String, String>,
+        now: SystemTime,
+    ) -> Result<SubscriptionProviderRecord, RegisterRefusal> {
+        self.settle_providers(now);
+
+        if let Some(arn) = self.registered_arn(source, secret_arn) {
+            let record = self
+                .providers
+                .get_mut(&arn)
+                .expect("the ARN was just read out of the same map");
+            let mut merged = record.tags.clone();
+            merged.extend(tags);
+            if merged.len() > MAX_TAGS_PER_RESOURCE {
+                return Err(RegisterRefusal::TagLimitExceeded);
+            }
+            record.tags = merged;
+            return Ok(record.clone());
+        }
+
+        if tags.len() > MAX_TAGS_PER_RESOURCE {
+            return Err(RegisterRefusal::TagLimitExceeded);
+        }
+        // A registration this account cannot hold is refused BEFORE anything is written,
+        // so the store cannot grow past the ceiling however often a caller registers.
+        if self.providers.len() >= MAX_REGISTERED_PROVIDERS {
+            return Err(RegisterRefusal::TooManyProviders);
+        }
+        self.minted_providers += 1;
+        let arn = provider_arn(region, &provider_id(self.minted_providers));
+        let record = SubscriptionProviderRecord::registered(
+            arn.clone(),
+            source.to_string(),
+            secret_arn.to_string(),
+            tags,
+            now,
+        );
+        self.providers.insert(arn.clone(), record.clone());
+        self.provider_order.push(arn);
+        Ok(record)
+    }
+
+    /// The `SubscriptionProviderArn` this account already registered `source` against
+    /// `secret_arn` under, if any — the identity a repeated registration resolves to.
+    ///
+    /// The scan is over the registrations this account holds, which
+    /// [`MAX_REGISTERED_PROVIDERS`] bounds, so the work one registration costs is bounded
+    /// however many registrations have been made.
+    fn registered_arn(&self, source: &str, secret_arn: &str) -> Option<String> {
+        self.provider_order
+            .iter()
+            .find(|arn| {
+                self.providers
+                    .get(*arn)
+                    .is_some_and(|record| record.source == source && record.secret_arn == secret_arn)
+            })
+            .cloned()
+    }
+
     /// The registered providers in registration order.
     pub fn providers_in_order(&self) -> Vec<SubscriptionProviderRecord> {
         self.provider_order
@@ -254,6 +454,72 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
         self.provider_order.retain(|stored| stored != arn);
         Some(record)
     }
+}
+
+/// Why a registration was not taken.
+///
+/// Two conditions with two different wire answers, so the handler can state each with the
+/// taxonomy that belongs to it rather than collapsing them into one code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterRefusal {
+    /// The resultant tag set would be larger than a resource of this service may carry
+    /// ([`MAX_TAGS_PER_RESOURCE`]).
+    ///
+    /// Answered with the TAGGING surface's `BadRequestException`, not this service's
+    /// modelled `ValidationException`: a tag set past the limit is that surface's refusal
+    /// wherever the tag map appears, which is what the request boundary already answers
+    /// for an over-limit `Tags` map
+    /// ([`crate::scaffolded::UnmodeledRefusal::tag_limit_exceeded`]), so the same
+    /// condition reached from a handler must not acquire a second code.
+    TagLimitExceeded,
+    /// The account already holds [`MAX_REGISTERED_PROVIDERS`] registrations, so this one
+    /// cannot be taken. Answered with the operation's modelled `ValidationException`.
+    TooManyProviders,
+}
+
+/// The most registrations one account's provider store holds.
+///
+/// `RegisterSubscriptionProvider` is the only writer and it mints one record per distinct
+/// (source, secret) pair, with no modelled quota, no TTL and no eviction: without a
+/// ceiling a caller varying `SecretArn` grows the store — and the lookup, list and page
+/// work every later call does over it — without limit. A registration past this ceiling is
+/// refused with the operation's modelled `ValidationException` before anything is written.
+/// AWS publishes its own quota and it is not this number (the real service registers one
+/// provider per supported source); this is the emulator's own ceiling, chosen well above
+/// what a client script needs.
+pub const MAX_REGISTERED_PROVIDERS: usize = 100;
+
+/// The resource segment of a `SubscriptionProviderArn`: this service's one resource kind.
+pub const PROVIDER_RESOURCE_TYPE: &str = "subscription-provider";
+
+/// The `SubscriptionProviderArn` of the registration carrying `id` in `region`.
+///
+/// Built through [`emulator_server::emulator_arn`], so the account segment is the
+/// emulator's single canonical account id rather than a literal, and the result satisfies
+/// the modelled `SubscriptionProviderArn` pattern
+/// (`arn:<partition>:<service>:<region>:<account>:<type>/<id>`, every segment
+/// `[a-z0-9-\.]`) for any `region` [`request_region`] admits.
+pub fn provider_arn(region: &str, id: &str) -> String {
+    ::emulator_server::emulator_arn(
+        PROVIDER_ARN_SERVICE,
+        region,
+        &format!("{PROVIDER_RESOURCE_TYPE}/{id}"),
+    )
+}
+
+/// The service segment every ARN of this service carries: its `arnNamespace`
+/// (`smithy_query(query="service_info")`).
+const PROVIDER_ARN_SERVICE: &str = "license-manager-linux-subscriptions";
+
+/// The resource id of the `sequence`-th registration this account minted.
+///
+/// `SubscriptionProviderArn`'s pattern allows `[a-z0-9-\.]` in the resource segment and
+/// the real service's ids are UUIDs, so this is UUID-shaped — 8-4-4-4-12 lowercase hex
+/// with RFC 4122's version (4) and variant (8) nibbles — with the store's own monotonic
+/// sequence in the node field. That makes every id unique and id order registration
+/// order, so a list page and its cursor stay stable.
+pub fn provider_id(sequence: u64) -> String {
+    format!("00000000-0000-4000-8000-{sequence:012x}")
 }
 
 /// The `RegisteredSubscriptionProvider` the model describes, built entirely from the

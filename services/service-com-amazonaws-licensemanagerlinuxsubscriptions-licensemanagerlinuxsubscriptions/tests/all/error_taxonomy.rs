@@ -12,10 +12,8 @@
 //! 2. a `SourceRegions` entry that does not name an AWS Region is refused with
 //!    `ValidationException` naming that entry, and the account's settings are left
 //!    unchanged;
-//! 3. `RegisterSubscriptionProvider` registers nothing: the access token in the
-//!    referenced secret cannot be validated here, so the registration is refused and the
-//!    store stays empty — and a tag set past the modelled limit is refused with the tag
-//!    APIs' `BadRequestException` before that;
+//! 3. a registration past the modelled `Tags` limit is refused with the tag APIs' own
+//!    `BadRequestException` and registers nothing;
 //! 4. a `@pattern` violation quotes the modelled expression WITHOUT its `^` / `$`
 //!    anchors;
 //! 5. an enum violation on an ELEMENT of a list is reported at the LIST member, with the
@@ -185,42 +183,52 @@ async fn a_source_region_outside_the_region_catalog_is_refused() {
     }
 }
 
-/// Rule 3: a registration is refused and leaves nothing behind, and an over-limit tag
-/// set is refused with the tag APIs' own code before the token is even reached.
+/// Rule 3: a registration carrying a tag set past the modelled `Tags` maximum is refused
+/// with the tagging surface's own code, and leaves nothing registered.
+///
+/// The ACCEPTED create path (and the statuses it reports) is
+/// `tests/all/subscription_provider_registration.rs`; what this pins is the refusal and
+/// that it writes nothing. The rows differ along the secret ARN's grammar (partition,
+/// empty region/account, the `[^/]` secret-name class) and along how far past the bound
+/// the tag set sits.
 #[tokio::test]
-async fn a_registration_is_refused_and_registers_nothing() {
+async fn an_over_limit_tag_set_is_refused_and_registers_nothing() {
     let h = harness();
 
-    // The rows differ along the secret ARN's grammar (partition, empty region/account,
-    // the `[^/]` secret-name class) and along the size of the tag set, which is what the
-    // rule generalises over.
     let secret_arns = [
         "arn:aws:secretsmanager:us-east-1:123456789012:secret:rhel-token",
         "arn:aws-us-gov:secretsmanager:us-gov-west-1:123456789012:secret:rhsm-offline",
         "arn:aws:secretsmanager:::secret:token",
         "arn:aws:secretsmanager:eu-west-1:000000000000:secret:RedHat_Offline+Token=1",
     ];
-    for secret_arn in secret_arns {
-        for tag_count in [0_usize, 1, 50] {
+    // One past the modelled `Tags` maximum (`@length 0..50`), and well past it.
+    for tag_count in [51_usize, 60, 120] {
+        for secret_arn in secret_arns {
             let case = format!("register {secret_arn} with {tag_count} tags");
-            let mut request = json!({
-                "SubscriptionProviderSource": RED_HAT,
-                "SecretArn": secret_arn,
-            });
-            if tag_count > 0 {
-                let tags: serde_json::Map<String, Value> = (0..tag_count)
-                    .map(|index| (format!("key-{index}"), json!(format!("value-{index}"))))
-                    .collect();
-                request["Tags"] = Value::Object(tags);
-            }
-            let reply = register(&h, &request).await;
-            reply.error(&case, 400, "ValidationException");
+            let tags: serde_json::Map<String, Value> = (0..tag_count)
+                .map(|index| (format!("key-{index}"), json!(format!("value-{index}"))))
+                .collect();
+            let reply = register(
+                &h,
+                &json!({
+                    "SubscriptionProviderSource": RED_HAT,
+                    "SecretArn": secret_arn,
+                    "Tags": Value::Object(tags),
+                }),
+            )
+            .await;
+            reply.error(&case, 400, "BadRequestException");
+            assert_eq!(
+                reply.message(),
+                "The resultant tag set must not have more than 50 user tags.",
+                "case {case:?}: expected the modelled tag limit stated, got {:?}",
+                reply.message()
+            );
             assert_eq!(
                 stored_provider_count(&h),
                 0,
                 "case {case:?}: a refused registration must leave the store empty"
             );
-            // And nothing is reachable through the read side either.
             let listed = list_providers(&h, &json!({})).await;
             assert_eq!(
                 listed
@@ -234,29 +242,6 @@ async fn a_registration_is_refused_and_registers_nothing() {
             );
         }
     }
-
-    // One past the modelled `Tags` maximum (`@length 0..50`) is the tag APIs' own
-    // refusal, which the token check never gets behind.
-    let case = "register with 51 tags";
-    let tags: serde_json::Map<String, Value> = (0..51)
-        .map(|index| (format!("key-{index}"), json!(format!("value-{index}"))))
-        .collect();
-    let reply = register(
-        &h,
-        &json!({
-            "SubscriptionProviderSource": RED_HAT,
-            "SecretArn": secret_arns[0],
-            "Tags": Value::Object(tags),
-        }),
-    )
-    .await;
-    reply.error(case, 400, "BadRequestException");
-    assert_eq!(
-        reply.message(),
-        "The resultant tag set must not have more than 50 user tags.",
-        "case {case:?}: expected the modelled tag limit stated, got {:?}",
-        reply.message()
-    );
 }
 
 /// Rule 4: a `@pattern` violation quotes the expression without the model's anchors.

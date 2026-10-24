@@ -157,8 +157,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the boundary already refused anything else for.
         let sources = input.subscription_provider_sources.clone().unwrap_or_default();
 
-        // A pure read: the page is built from the stored records, and nothing is written.
-        let state = state.lock();
+        // A report, not a mutation: the only write is materializing the status transitions
+        // the clock already owed the stored registrations, each of which was due at the
+        // same instant whether or not anybody called. The page itself is then built from
+        // the stored records.
+        let mut state = state.lock();
+        state.settle_providers(::std::time::SystemTime::now());
         let selected: Vec<crate::state::SubscriptionProviderRecord> = state
             .providers_in_order()
             .into_iter()

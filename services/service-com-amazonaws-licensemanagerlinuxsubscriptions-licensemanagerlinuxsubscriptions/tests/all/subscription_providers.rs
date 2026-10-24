@@ -17,9 +17,12 @@
 //!   is what admits a second home Region.
 //!
 //! The registrations these tests read are seeded into the store directly
-//! ([`harness::seed_provider`]) because `RegisterSubscriptionProvider` refuses every
-//! registration in this emulator — see `tests/all/error_taxonomy.rs`, which covers that
-//! refusal and the rest of this service's error taxonomy.
+//! ([`harness::seed_provider`]) because their rules are about the read, list, page and
+//! deregister side of registrations in an ACCEPTED (`ACTIVE`) state, which
+//! `RegisterSubscriptionProvider` cannot produce in this emulator: validating a provider
+//! access token needs trust material it does not hold, so a registration it creates
+//! settles `INVALID`. The create path itself — and the statuses it does report — is
+//! covered by `tests/all/subscription_provider_registration.rs`.
 
 use serde_json::{json, Value};
 
