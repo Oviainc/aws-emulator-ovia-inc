@@ -241,32 +241,49 @@ async fn every_error_carries_the_status_this_service_serves_its_shape_with() {
     }
 
     // And a stub still answers 501, which is not a modelled shape at all: the override is
-    // over the modelled errors only. `GetBenefit` is one of the operations still carrying
-    // the scaffold marker (`grep -l '^//! SCAFFOLDED, NOT IMPLEMENTED:' src/ops/`);
-    // `GetBenefitAllocation` above is implemented, so its entitled answer is the lookup's
-    // own 404 rather than a 501.
+    // over the modelled errors only. `AssociateBenefitApplicationResource` is one of the
+    // operations still carrying the scaffold marker
+    // (`grep -l '^//! SCAFFOLDED, NOT IMPLEMENTED:' src/ops/`); `GetBenefit` and
+    // `GetBenefitAllocation` are implemented, so their entitled answer is the lookup's own
+    // 404 rather than a 501.
     let (status, out) = entitled
         .call(
-            "GetBenefit",
-            &json!({ "Catalog": CATALOG, "Identifier": UNKNOWN_BENEFIT }),
+            "AssociateBenefitApplicationResource",
+            &json!({
+                "Catalog": CATALOG,
+                "BenefitApplicationIdentifier": UNKNOWN_APPLICATION,
+                "ResourceArn": application,
+            }),
         )
         .await;
     assert_eq!(
         status, 501,
         "case \"an unimplemented operation, entitled\": expected 501, got {status} {out:?}"
     );
-    let (status, out) = entitled
-        .call(
+    for (case, operation, identifier) in [
+        (
+            "an implemented get of a benefit that does not exist, entitled",
+            "GetBenefit",
+            UNKNOWN_BENEFIT,
+        ),
+        (
+            "an implemented get of an allocation that does not exist, entitled",
             "GetBenefitAllocation",
-            &json!({ "Catalog": CATALOG, "Identifier": UNKNOWN_ALLOCATION }),
-        )
-        .await;
-    assert_eq!(
-        status,
-        served_status("ResourceNotFoundException"),
-        "case \"an implemented get of an allocation that does not exist, entitled\": \
-         expected the lookup's own refusal, got {status} {out:?}"
-    );
+            UNKNOWN_ALLOCATION,
+        ),
+    ] {
+        let (status, out) = entitled
+            .call(
+                operation,
+                &json!({ "Catalog": CATALOG, "Identifier": identifier }),
+            )
+            .await;
+        assert_eq!(
+            status,
+            served_status("ResourceNotFoundException"),
+            "case {case:?}: expected the lookup's own refusal, got {status} {out:?}"
+        );
+    }
 }
 
 /// Rule 2 on the operation the issue's fixture recorded: for an un-entitled caller every

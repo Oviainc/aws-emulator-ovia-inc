@@ -327,6 +327,15 @@ pub const RESOURCE_TYPE_VOCABULARY_FILTER: &str = "vocabulary-filter";
 /// The ARN resource type of a custom language model, as the Amazon Transcribe
 /// "Tagging resources" guide lists it. See [`RESOURCE_TYPE_TRANSCRIPTION_JOB`].
 pub const RESOURCE_TYPE_LANGUAGE_MODEL: &str = "language-model";
+/// The ARN resource type of a Call Analytics category, as the Amazon Transcribe
+/// resource-type ARN formats spell this family's `<type>/<name>` segment
+/// (`arn:${Partition}:transcribe:${Region}:${Account}:analytics-category/${CategoryName}`).
+/// See [`RESOURCE_TYPE_TRANSCRIPTION_JOB`].
+pub const RESOURCE_TYPE_CALL_ANALYTICS_CATEGORY: &str = "analytics-category";
+/// The ARN resource type of a Medical Scribe (AWS HealthScribe) job, spelled as this
+/// family's published `<type>/${JobName}` segment — the same hyphenated family name
+/// the other job families' types use. See [`RESOURCE_TYPE_TRANSCRIPTION_JOB`].
+pub const RESOURCE_TYPE_MEDICAL_SCRIBE_JOB: &str = "medical-scribe-job";
 
 /// The word this service's own client-error messages use for the kind of resource an
 /// ARN's `<type>` segment names, for each type this emulator stores records of.
@@ -351,21 +360,89 @@ pub const KIND_CATEGORY: &str = "category";
 /// See [`KIND_JOB`].
 pub const KIND_RESOURCE: &str = "resource";
 
+/// A family of resource this emulator holds records of, as an ARN's `<type>` segment
+/// names it.
+///
+/// The ARN `<type>` segment is what says WHICH family a tagging operation is talking
+/// about, so the mapping from that segment to a family is single-homed here: the tag
+/// lookups ([`ComAmazonawsTranscribeTranscribeState::tags`] /
+/// [`ComAmazonawsTranscribeTranscribeState::tags_mut`]) and the word a refusal names
+/// the family by ([`resource_kind`]) all read the same mapping, so a family cannot be
+/// reachable through one and unknown to another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceFamily {
+    /// [`RESOURCE_TYPE_TRANSCRIPTION_JOB`].
+    TranscriptionJob,
+    /// [`RESOURCE_TYPE_VOCABULARY`].
+    Vocabulary,
+    /// [`RESOURCE_TYPE_MEDICAL_VOCABULARY`].
+    MedicalVocabulary,
+    /// [`RESOURCE_TYPE_VOCABULARY_FILTER`].
+    VocabularyFilter,
+    /// [`RESOURCE_TYPE_LANGUAGE_MODEL`].
+    LanguageModel,
+    /// [`RESOURCE_TYPE_CALL_ANALYTICS_CATEGORY`].
+    CallAnalyticsCategory,
+    /// [`RESOURCE_TYPE_MEDICAL_SCRIBE_JOB`].
+    MedicalScribeJob,
+}
+
+impl ResourceFamily {
+    /// The family an ARN's `<type>` segment names, or `None` for a type segment this
+    /// emulator holds no records of at all — which every caller renders as the
+    /// modelled not-found error, never as an empty tag set.
+    pub fn from_resource_type(resource_type: &str) -> Option<Self> {
+        match resource_type {
+            RESOURCE_TYPE_TRANSCRIPTION_JOB => Some(Self::TranscriptionJob),
+            RESOURCE_TYPE_VOCABULARY => Some(Self::Vocabulary),
+            RESOURCE_TYPE_MEDICAL_VOCABULARY => Some(Self::MedicalVocabulary),
+            RESOURCE_TYPE_VOCABULARY_FILTER => Some(Self::VocabularyFilter),
+            RESOURCE_TYPE_LANGUAGE_MODEL => Some(Self::LanguageModel),
+            RESOURCE_TYPE_CALL_ANALYTICS_CATEGORY => Some(Self::CallAnalyticsCategory),
+            RESOURCE_TYPE_MEDICAL_SCRIBE_JOB => Some(Self::MedicalScribeJob),
+            _ => None,
+        }
+    }
+
+    /// The ARN `<type>` segment that names this family.
+    pub fn resource_type(self) -> &'static str {
+        match self {
+            Self::TranscriptionJob => RESOURCE_TYPE_TRANSCRIPTION_JOB,
+            Self::Vocabulary => RESOURCE_TYPE_VOCABULARY,
+            Self::MedicalVocabulary => RESOURCE_TYPE_MEDICAL_VOCABULARY,
+            Self::VocabularyFilter => RESOURCE_TYPE_VOCABULARY_FILTER,
+            Self::LanguageModel => RESOURCE_TYPE_LANGUAGE_MODEL,
+            Self::CallAnalyticsCategory => RESOURCE_TYPE_CALL_ANALYTICS_CATEGORY,
+            Self::MedicalScribeJob => RESOURCE_TYPE_MEDICAL_SCRIBE_JOB,
+        }
+    }
+
+    /// The word this service's own client-error messages name this family by.
+    ///
+    /// A Medical Scribe job is a "job" like the transcription-job family: the
+    /// recorded Medical Scribe not-found response reads "The requested job couldn't be
+    /// found."
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::TranscriptionJob | Self::MedicalScribeJob => KIND_JOB,
+            Self::Vocabulary => KIND_VOCABULARY,
+            Self::MedicalVocabulary => KIND_MEDICAL_VOCABULARY,
+            Self::VocabularyFilter => KIND_VOCABULARY_FILTER,
+            Self::LanguageModel => KIND_LANGUAGE_MODEL,
+            Self::CallAnalyticsCategory => KIND_CATEGORY,
+        }
+    }
+}
+
 /// The resource kind the ARN resource type `resource_type` denotes — the word a
 /// refusal about that resource names it by.
 ///
-/// The mapped types are the ones [`ComAmazonawsTranscribeTranscribeState::tags`]
-/// and [`ComAmazonawsTranscribeTranscribeState::tags_mut`] can find a record for, so
-/// the two agree about which ARN names which family.
+/// Reads [`ResourceFamily`]'s own mapping, so the kind a refusal names and the store a
+/// tag lookup reaches cannot disagree about which ARN names which family. A type
+/// segment naming a family this emulator holds no records of (a medical transcription
+/// job, whose start is still a stub) gets the neutral [`KIND_RESOURCE`].
 pub fn resource_kind(resource_type: &str) -> &'static str {
-    match resource_type {
-        RESOURCE_TYPE_TRANSCRIPTION_JOB => KIND_JOB,
-        RESOURCE_TYPE_VOCABULARY => KIND_VOCABULARY,
-        RESOURCE_TYPE_MEDICAL_VOCABULARY => KIND_MEDICAL_VOCABULARY,
-        RESOURCE_TYPE_VOCABULARY_FILTER => KIND_VOCABULARY_FILTER,
-        RESOURCE_TYPE_LANGUAGE_MODEL => KIND_LANGUAGE_MODEL,
-        _ => KIND_RESOURCE,
-    }
+    ResourceFamily::from_resource_type(resource_type).map_or(KIND_RESOURCE, ResourceFamily::kind)
 }
 
 /// How this service words "there is no such resource", for a resource of `kind`.
@@ -432,13 +509,10 @@ pub struct ComAmazonawsTranscribeTranscribeState {
     /// `StartMedicalScribeJob` requires to be "unique within an Amazon Web Services
     /// account").
     ///
-    /// A job of this family carries the tags its start request asked for and reports
-    /// them through its own operations, but it is NOT reachable from
-    /// [`Self::tags`] / [`Self::tags_mut`]: this emulator has no recorded spelling for
-    /// the ARN `<type>` segment of a Medical Scribe job, which is the same reason the
-    /// Call Analytics categories are absent from that lookup. An ARN naming one
-    /// therefore answers the three tagging operations' modelled not-found error rather
-    /// than an empty tag set.
+    /// A job of this family carries the tags its start request asked for, reports them
+    /// through its own operations, and is reachable from [`Self::tags`] /
+    /// [`Self::tags_mut`] under [`RESOURCE_TYPE_MEDICAL_SCRIBE_JOB`], like every other
+    /// family this state holds records of.
     pub medical_scribe_jobs: BTreeMap<String, MedicalScribeJobRecord>,
     /// Source of [`TranscriptionJobRecord::sequence`]: a monotonic counter, so
     /// creation order is total even when two jobs start in the same clock tick.
@@ -565,28 +639,35 @@ impl ComAmazonawsTranscribeTranscribeState {
     /// about which ARN names which stored record, so both match on the same resource
     /// types.
     pub fn tags(&self, resource: &ResourceRef) -> Option<&Vec<Tag>> {
-        match resource.resource_type.as_str() {
-            RESOURCE_TYPE_TRANSCRIPTION_JOB => self
+        match ResourceFamily::from_resource_type(&resource.resource_type)? {
+            ResourceFamily::TranscriptionJob => self
                 .transcription_jobs
                 .get(&resource.name)
                 .map(|record| &record.tags),
-            RESOURCE_TYPE_VOCABULARY => self
+            ResourceFamily::Vocabulary => self
                 .vocabularies
                 .get(&resource.name)
                 .map(|record| &record.tags),
-            RESOURCE_TYPE_MEDICAL_VOCABULARY => self
+            ResourceFamily::MedicalVocabulary => self
                 .medical_vocabularies
                 .get(&resource.name)
                 .map(|record| &record.tags),
-            RESOURCE_TYPE_VOCABULARY_FILTER => self
+            ResourceFamily::VocabularyFilter => self
                 .vocabulary_filters
                 .get(&resource.name)
                 .map(|record| &record.tags),
-            RESOURCE_TYPE_LANGUAGE_MODEL => self
+            ResourceFamily::LanguageModel => self
                 .language_models
                 .get(&resource.name)
                 .map(|record| &record.tags),
-            _ => None,
+            ResourceFamily::CallAnalyticsCategory => self
+                .call_analytics_categories
+                .get(&resource.name)
+                .map(|record| &record.tags),
+            ResourceFamily::MedicalScribeJob => self
+                .medical_scribe_jobs
+                .get(&resource.name)
+                .map(|record| &record.tags),
         }
     }
 
@@ -594,34 +675,42 @@ impl ComAmazonawsTranscribeTranscribeState {
     /// `None` when this account holds no such resource.
     ///
     /// One lookup for the two tagging operations that WRITE, so `TagResource` and
-    /// `UntagResource` cannot disagree about which ARN names which stored record. A
-    /// resource type this lookup does not map (a Call Analytics category — whose tag
-    /// set is written by its own create, since this emulator has no recorded spelling
-    /// for that family's ARN `<type>` segment) answers `None`, which the caller renders
-    /// as the modelled not-found error — never as an empty tag set.
+    /// `UntagResource` cannot disagree about which ARN names which stored record. It
+    /// reaches EVERY family this emulator holds records of — each of their creates
+    /// accepts `Tags`, so each of their records carries a tag set the standard tagging
+    /// API owns. An ARN whose `<type>` segment names no family this emulator stores, or
+    /// whose `<name>` names no stored record of that family, answers `None`, which the
+    /// caller renders as the modelled not-found error — never as an empty tag set.
     pub fn tags_mut(&mut self, resource: &ResourceRef) -> Option<&mut Vec<Tag>> {
-        match resource.resource_type.as_str() {
-            RESOURCE_TYPE_TRANSCRIPTION_JOB => self
+        match ResourceFamily::from_resource_type(&resource.resource_type)? {
+            ResourceFamily::TranscriptionJob => self
                 .transcription_jobs
                 .get_mut(&resource.name)
                 .map(|record| &mut record.tags),
-            RESOURCE_TYPE_VOCABULARY => self
+            ResourceFamily::Vocabulary => self
                 .vocabularies
                 .get_mut(&resource.name)
                 .map(|record| &mut record.tags),
-            RESOURCE_TYPE_MEDICAL_VOCABULARY => self
+            ResourceFamily::MedicalVocabulary => self
                 .medical_vocabularies
                 .get_mut(&resource.name)
                 .map(|record| &mut record.tags),
-            RESOURCE_TYPE_VOCABULARY_FILTER => self
+            ResourceFamily::VocabularyFilter => self
                 .vocabulary_filters
                 .get_mut(&resource.name)
                 .map(|record| &mut record.tags),
-            RESOURCE_TYPE_LANGUAGE_MODEL => self
+            ResourceFamily::LanguageModel => self
                 .language_models
                 .get_mut(&resource.name)
                 .map(|record| &mut record.tags),
-            _ => None,
+            ResourceFamily::CallAnalyticsCategory => self
+                .call_analytics_categories
+                .get_mut(&resource.name)
+                .map(|record| &mut record.tags),
+            ResourceFamily::MedicalScribeJob => self
+                .medical_scribe_jobs
+                .get_mut(&resource.name)
+                .map(|record| &mut record.tags),
         }
     }
 }

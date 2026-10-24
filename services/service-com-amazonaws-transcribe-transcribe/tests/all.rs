@@ -31,6 +31,8 @@ mod rpc_success_status;
 mod service_claim;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tagging_resource_families.rs"]
+mod tagging_resource_families;
 #[path = "all/transcription_jobs.rs"]
 mod transcription_jobs;
 #[path = "all/vocabularies.rs"]
