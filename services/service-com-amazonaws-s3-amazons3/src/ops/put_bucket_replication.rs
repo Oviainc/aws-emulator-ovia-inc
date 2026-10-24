@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketReplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBucketReplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: associates a replication configuration with an existing bucket, replacing
+//! whatever configuration the bucket carried. The payload IS the configuration, so what
+//! the request names becomes the bucket's configuration in full and `GetBucketReplication`
+//! reports it back. Refused before anything is written when the configuration is not one
+//! S3 can apply: a bucket whose versioning is not `Enabled` (`InvalidRequest`), a
+//! configuration naming no rule or more than [`crate::state::MAX_REPLICATION_RULES`]
+//! (`MalformedXML` / `InvalidRequest`), a `Role` that is not an IAM role ARN or a rule
+//! `Destination.Bucket` that is not an S3 bucket ARN (`InvalidArgument`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBucketReplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The read side is `GetBucketReplication`, implemented in the same change so a put can be
+//! read back; `DeleteBucketReplication` is still the scaffold's 501 and is its own stub
+//! issue.
 //!
 //! ## Shape of an operation
 //!
@@ -148,9 +151,21 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutBucketReplicationOutp
 // here — hence the `PutBucketReplicationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutBucketReplication")]
+// Widened by `NoSuchBucket` for the reason `PutBucketEncryption` widens it: the model's
+// error list for this operation is empty
+// (`smithy_query(query="operation",operation="PutBucketReplication")` reports
+// `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that does
+// not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`). `extra_errors` widens the set with that shape, which the
+// SERVICE models, so this handler answers the same 404 every other bucket-scoped
+// operation does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutBucketReplication",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum PutBucketReplicationErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -204,18 +219,187 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBucketReplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBucketReplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Everything this write needs is in its deserialized input: the expected owner and
+        // the configuration travel as members, not as raw headers.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner. If the account ID that you provide
+        // does not match the actual owner of the bucket, the request fails with the HTTP
+        // status code 403 Forbidden (access denied)"
+        // (`PutBucketReplicationRequest$ExpectedBucketOwner`), judged the way
+        // `PutBucketEncryption` judges it: this emulator serves one account, so that
+        // account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine
+            // that is not the shared `InMemoryEngine`; nothing can then be persisted, and
+            // this operation models no server-fault error to say so, so the scaffold's
+            // 501 carries "this emulator cannot serve it" rather than a false success.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutBucketReplication",
+            ));
+        };
+
+        // Every refusal below is decided BEFORE anything is written, so a refused put
+        // leaves the bucket's current configuration exactly as it was; and the bucket is
+        // looked up FIRST, so a request naming a bucket this emulator does not hold
+        // answers that rather than reporting whatever is wrong with a configuration the
+        // bucket could never have carried (the order `PutBucketEncryption` keeps).
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(PutBucketReplicationErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+
+        // Replication copies OBJECT VERSIONS, so a replication configuration applies only
+        // to a bucket that has them: "For information about enabling versioning on a
+        // bucket, see Using Versioning" (this operation's own documentation), and the
+        // Amazon S3 User Guide's replication requirements state it outright — the source
+        // and destination buckets must have versioning enabled. A bucket without it is a
+        // request S3 cannot carry out rather than a payload it cannot parse, which is what
+        // `InvalidRequest` reports.
+        if !bucket.versioning_enabled() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                format!(
+                    "Versioning must be '{}' on the bucket to apply a replication \
+                     configuration",
+                    crate::state::VERSIONING_ENABLED_STATUS
+                ),
+            ));
+        }
+
+        let configuration = &input.replication_configuration;
+
+        // "A replication configuration must include at least one rule": a container naming
+        // none does not validate against the schema S3 publishes for the payload, which is
+        // what `MalformedXML` reports (the channel `PutBucketEncryption` answers an empty
+        // `Rules` through). `Rules` is REQUIRED and `xmlFlattened`, so a payload with no
+        // `Rule` element is already refused at the request boundary against the model; this
+        // is the backstop that keeps the stored invariant — a configuration this store
+        // holds names at least one rule — if a payload ever parses to an empty list.
+        if configuration.rules.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MALFORMED_XML_CODE,
+                MALFORMED_XML_STATUS,
+                "ReplicationConfiguration names no Rule; a replication configuration \
+                 includes at least one rule",
+            ));
+        }
+        // "… and can contain a maximum of 1,000" — the same sentence's other end.
+        if configuration.rules.len() > crate::state::MAX_REPLICATION_RULES {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                format!(
+                    "ReplicationConfiguration carries {} rules, more than the {} a \
+                     replication configuration may contain",
+                    configuration.rules.len(),
+                    crate::state::MAX_REPLICATION_RULES
+                ),
+            ));
+        }
+
+        // "The Amazon Resource Name (ARN) of the Identity and Access Management (IAM) role
+        // that Amazon S3 assumes when replicating objects"
+        // (`ReplicationConfiguration$Role`): a value that is not such an ARN is not valid
+        // for the member carrying it, which is what `InvalidArgument` reports.
+        if !is_iam_role_arn(&configuration.role) {
+
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                format!(
+                    "ReplicationConfiguration.Role must be the ARN of an IAM role \
+                     (arn:<partition>:iam::<account>:role/<name>), got {:?}",
+                    configuration.role
+                ),
+            ));
+        }
+
+        for rule in &configuration.rules {
+            // "The Amazon Resource Name (ARN) of the bucket where you want Amazon S3 to
+            // store the results" (`Destination$Bucket`): the destination travels as a
+            // bucket ARN, so a value that is not one — a bare bucket name, say — is
+            // refused the same way the role is.
+            if !is_s3_bucket_arn(&rule.destination.bucket) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "ReplicationRule.Destination.Bucket must be the ARN of a bucket \
+                         (arn:<partition>:s3:::<name>), got {:?}",
+                        rule.destination.bucket
+                    ),
+                ));
+            }
+        }
+
+        // "Creates a replication configuration or replaces an existing one": the payload
+        // is the complete container, so what it names becomes the bucket's replication
+        // configuration in full.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBucketReplication"))
+        // `ContentMD5` is NOT verified here, for the reason `PutBucketEncryption` gives:
+        // by the time this handler runs the payload is the deserialized container rather
+        // than the bytes the digest was computed over. `Token` is the Object Lock token,
+        // which this slice records nothing for.
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            // Unreachable: the lookup above ran under this same guard.
+            return Err(PutBucketReplicationErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        bucket.set_replication(input.replication_configuration);
+
+        // `Unit` output: success is the modelled 200 and an empty body.
+        Ok(PutBucketReplicationOutput)
     }
 }
+
+/// Whether `value` is the ARN of an IAM role:
+/// `arn:<partition>:iam::<account>:role/<name>`.
+///
+/// IAM is a global service, so the Region field of one of its ARNs is empty, and a role's
+/// resource part is `role/` followed by its path and its name — read through the crate's
+/// one ARN grammar, [`crate::state::is_arn_of`], which every member that takes an ARN is
+/// judged by.
+fn is_iam_role_arn(value: &str) -> bool {
+    crate::state::is_arn_of(
+        value,
+        "iam",
+        crate::state::ArnField::Empty,
+        crate::state::ArnField::Present,
+        "role/",
+    )
+}
+
+/// Whether `value` is the ARN of an S3 bucket: `arn:<partition>:s3:::<name>`.
+///
+/// A bucket ARN carries neither a Region nor an account id, because a bucket name is
+/// globally unique, and its resource part is the bare bucket name.
+fn is_s3_bucket_arn(value: &str) -> bool {
+    crate::state::is_arn_of(
+        value,
+        "s3",
+        crate::state::ArnField::Empty,
+        crate::state::ArnField::Empty,
+        "",
+    )
+}
+
+/// The HTTP status AWS answers `MalformedXML` with: 400, the status S3's error-responses
+/// list carries for it.
+const MALFORMED_XML_STATUS: u16 = 400;
+
+/// The status `ExpectedBucketOwner` names for a mismatch: "the request fails with the HTTP
+/// status code 403 Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;

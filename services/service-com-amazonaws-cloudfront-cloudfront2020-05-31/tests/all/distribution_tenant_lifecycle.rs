@@ -45,6 +45,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{
     call, create_distribution, emulator, Answer, Node, ACCOUNT_ID, API_VERSION,
+    CUSTOM_VIEWER_CERTIFICATE,
 };
 
 // ---------------------------------------------------------------------------
@@ -189,6 +190,12 @@ async fn standard_distribution(
             extra.push_str(&format!("<CNAME>{}</CNAME>", escape(alias)));
         }
         extra.push_str("</Items></Aliases>");
+        // `ViewerCertificate`: a distribution that uses `Aliases` names one of
+        // `ACMCertificateArn` or `IAMCertificateId`, because CloudFront's own default
+        // certificate validates no alternate domain name — so a standard distribution
+        // that claims a domain states a certificate for it, which is what makes this a
+        // request CloudFront accepts.
+        extra.push_str(CUSTOM_VIEWER_CERTIFICATE);
     }
     let created = create_distribution(router, &distribution_config_xml(caller_reference, &extra)).await;
     assert_eq!(
