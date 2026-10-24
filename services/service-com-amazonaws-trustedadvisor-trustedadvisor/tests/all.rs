@@ -27,6 +27,8 @@ mod organization_recommendations;
 mod recommendation_loop;
 #[path = "all/recommendations_for_resource.rs"]
 mod recommendations_for_resource;
+#[path = "all/seeded_support_plan.rs"]
+mod seeded_support_plan;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/support_level_gate.rs"]

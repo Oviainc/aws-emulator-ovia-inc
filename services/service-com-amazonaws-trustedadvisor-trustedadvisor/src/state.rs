@@ -51,10 +51,12 @@
 //! Beside the four maps the store holds the calling account's
 //! [`SupportPlan`] — the whole input to the support-level authorization stage
 //! [`support_level_refusal`], which every operation applies before it resolves
-//! an identifier or writes anything. An operation whose input names an AWS
-//! resource in ANOTHER account answers for that resource first
-//! ([`foreign_resource_refusal`]): no support plan grants an account access to
-//! another account's resources.
+//! an identifier or writes anything. The seeded plan is
+//! [`SEEDED_SUPPORT_PLAN`], a plan whose entitlement includes the API, because
+//! the account this emulator presents is the account the API answers (see that
+//! constant). An operation whose input names an AWS resource in ANOTHER account
+//! answers for that resource first ([`foreign_resource_refusal`]): no support
+//! plan grants an account access to another account's resources.
 
 use std::collections::BTreeMap;
 
@@ -118,6 +120,29 @@ impl SupportPlan {
         )
     }
 }
+
+/// The support plan the emulated account holds until something outside the API
+/// records another one — [`SupportPlan::Enterprise`].
+///
+/// The Trusted Advisor API answers only an account whose plan includes it
+/// ([`SupportPlan::includes_trusted_advisor_api`]), and the account this
+/// emulator presents is that account: a client pointed at a freshly booted
+/// emulator is the entitled caller every real request to this API comes from, so
+/// it gets the 2xx AWS answers it rather than a 403 it has no modelled operation
+/// to clear (the API declares none that reads, buys or changes a plan).
+///
+/// Enterprise rather than the lowest entitled plan because the seeded catalog
+/// includes what the top plan unlocks — `priority` recommendations, whose
+/// lifecycle `UpdateRecommendationLifecycle` moves (Trusted Advisor Priority),
+/// and organization-level recommendations (the organizational view) — so the
+/// seeded surface is what AWS would report for the plan the account holds.
+///
+/// The gate stays fully observable: an in-process caller holding the engine
+/// moves the plan with
+/// [`set_support_plan`](ComAmazonawsTrustedadvisorTrustedadvisorState::set_support_plan),
+/// which is also how an unentitled account is modelled, since nothing on the
+/// wire changes a support subscription.
+pub const SEEDED_SUPPORT_PLAN: SupportPlan = SupportPlan::Enterprise;
 
 /// The `ExclusionStatus` value a resource carries unless a caller excluded it.
 /// `RecommendationResourceSummary$exclusionStatus` declares
@@ -498,12 +523,13 @@ pub struct ComAmazonawsTrustedadvisorTrustedadvisorState {
     /// support-level gate [`support_level_refusal`] applies ahead of every
     /// operation.
     ///
-    /// [`SupportPlan::Basic`] at state init, and deliberately so: a support
-    /// subscription is a property of an account that this API cannot establish —
-    /// it models no operation that reads, buys or changes a plan — so no caller
-    /// is entitled until something outside the API records one. Seeding an
-    /// entitled plan here would make the gate unobservable, which is the defect
-    /// this field exists to close.
+    /// [`SEEDED_SUPPORT_PLAN`] at state init: a support subscription is a
+    /// property of the account, not a resource of this API (which models no
+    /// operation that reads, buys or changes a plan), and the account this
+    /// emulator presents holds a plan the API answers. Something outside the API
+    /// — in this emulator an in-process caller holding the engine — moves it,
+    /// which is both how an unentitled account is modelled and how the gate is
+    /// observed.
     support_plan: SupportPlan,
 }
 
@@ -1413,7 +1439,7 @@ impl Default for ComAmazonawsTrustedadvisorTrustedadvisorState {
             recommendations: BTreeMap::new(),
             recommendation_resources: BTreeMap::new(),
             organization_recommendations: BTreeMap::new(),
-            support_plan: SupportPlan::Basic,
+            support_plan: SEEDED_SUPPORT_PLAN,
         };
         for (index, row) in SEED.iter().enumerate() {
             let recommendation_id = format!("{}-recommendation", row.check_id);

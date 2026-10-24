@@ -93,7 +93,7 @@ fn recommendation_arn_of(partition: &str, account: &str, id: &str) -> String {
 ///
 /// The identifiers name SEEDED resources, so for an entitled caller each row reaches the
 /// operation's own behaviour rather than a not-found.
-fn well_formed_requests() -> Vec<(&'static str, &'static str, String, Option<Value>)> {
+pub(crate) fn well_formed_requests() -> Vec<(&'static str, &'static str, String, Option<Value>)> {
     // `low-utilization-ec2-instances` produced a `priority` recommendation, the type
     // whose lifecycle `UpdateRecommendationLifecycle` can move; `amazon-ebs-snapshots`
     // produced a `standard` one, whose resources are what the exclusion batch accepts.
