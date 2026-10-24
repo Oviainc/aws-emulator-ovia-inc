@@ -9,7 +9,10 @@
 //!   charges they imply;
 //! * an **agreement** — what `AcceptAgreementRequest` finalises from one of
 //!   those requests, and what `DescribeAgreement`, `GetAgreementTerms`,
-//!   `SearchAgreements` and `CancelAgreement` report on and mutate;
+//!   `SearchAgreements` and `CancelAgreement` report on and mutate. Accepting it
+//!   also provisions the **entitlements** it grants, which belong to the
+//!   agreement rather than standing on their own and which
+//!   `GetAgreementEntitlements` reports;
 //! * a **payment request** — what `SendAgreementPaymentRequest` submits under an
 //!   agreement's `VariablePaymentTerm`, and what
 //!   `ListAgreementPaymentRequests` reports;
@@ -45,16 +48,17 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AcceptedTerm, Acceptor, AgreementCancellationRequestSummary, AgreementViewSummary,
-    BatchCreateBillingAdjustmentRequestEntry, BillingAdjustmentSummary, ByolPricingTerm,
-    ChargeSummary, ConfigurableUpfrontPricingTerm, ConflictException, DescribeAgreementOutput,
-    EndTimeBehavior, EstimatedCharges, ExpectedCharge, Filter, FixedUpfrontPricingTerm,
-    FreeTrialPricingTerm, GetBillingAdjustmentRequestOutput, InternalServerException,
-    ItemizedCharge, LegalTerm, NetPaymentTerm, PaymentRequestSummary, PaymentScheduleTerm,
-    ProposalSummary, Proposer, PurchaseOrder, RecurringPaymentTerm, RenewalTerm, RequestedTerm,
-    RequestedTermConfiguration, ResourceNotFoundException, SendAgreementPaymentRequestInput,
-    SupportTerm, TaxConfiguration, ThrottlingException, UsageBasedPricingTerm, ValidationException,
-    ValidationExceptionField, ValidityTerm, VariablePaymentTerm,
+    AcceptedTerm, Acceptor, AgreementCancellationRequestSummary, AgreementEntitlement,
+    AgreementViewSummary, BatchCreateBillingAdjustmentRequestEntry, BillingAdjustmentSummary,
+    ByolPricingTerm, ChargeSummary, ConfigurableUpfrontPricingTerm, ConflictException,
+    DescribeAgreementOutput, EndTimeBehavior, Entitlement, EstimatedCharges, ExpectedCharge,
+    Filter, FixedUpfrontPricingTerm, FreeTrialPricingTerm, GetBillingAdjustmentRequestOutput,
+    InternalServerException, ItemizedCharge, LegalTerm, NetPaymentTerm, PaymentRequestSummary,
+    PaymentScheduleTerm, ProposalSummary, Proposer, PurchaseOrder, RecurringPaymentTerm,
+    RenewalTerm, RequestedTerm, RequestedTermConfiguration, Resource, ResourceNotFoundException,
+    SendAgreementPaymentRequestInput, SupportTerm, TaxConfiguration, ThrottlingException,
+    UsageBasedPricingTerm, ValidationException, ValidationExceptionField, ValidityTerm,
+    VariablePaymentTerm,
 };
 
 /// The `agreementType` every agreement this slice mints carries.
@@ -90,6 +94,72 @@ pub const STATUS_CANCELLED: &str = "CANCELLED";
 /// from then on: "REPLACED – The agreement was replaced using an agreement
 /// replacement offer."
 pub const STATUS_REPLACED: &str = "REPLACED";
+
+// ---------------------------------------------------------------------------
+// Entitlements
+// ---------------------------------------------------------------------------
+
+/// The `AgreementEntitlementStatus` values an entitlement of this emulator
+/// reports (`AGREEMENT_ENTITLEMENT_STATUS_VALUES` in `types`), each the state
+/// the agreement that provisioned it and the clock put it in — see
+/// [`Agreement::entitlement_state`].
+///
+/// `FAILED` is the one modelled value none reports: every condition the model
+/// gives a reason code for a failure (`INVALID_PAYMENT_INSTRUMENT`,
+/// `ACCOUNT_SUSPENDED`, `INCOMPATIBLE_CURRENCY`, `PRODUCT_RESTRICTED`,
+/// `UNSUPPORTED_OPERATION`) belongs to a payment instrument, an account state or
+/// a product catalog this service neither models nor stores, so the emulator
+/// never reports a provisioning failure for work nothing ran.
+pub const ENTITLEMENT_PENDING: &str = "PENDING";
+/// See [`ENTITLEMENT_PENDING`].
+pub const ENTITLEMENT_SCHEDULED: &str = "SCHEDULED";
+/// See [`ENTITLEMENT_PENDING`].
+pub const ENTITLEMENT_PROVISIONED: &str = "PROVISIONED";
+/// See [`ENTITLEMENT_PENDING`].
+pub const ENTITLEMENT_DEPROVISIONED: &str = "DEPROVISIONED";
+
+/// The `AgreementEntitlementStatusReasonCode` reported beside each of those
+/// statuses — "provides more information about the status of an entitlement", so
+/// it names WHY the entitlement is in that state
+/// (`AGREEMENT_ENTITLEMENT_STATUS_REASON_CODE_VALUES` in `types`).
+pub const ENTITLEMENT_REASON_PROVISIONING: &str = "PROVISIONING_IN_PROGRESS";
+/// See [`ENTITLEMENT_REASON_PROVISIONING`].
+pub const ENTITLEMENT_REASON_FUTURE_START_DATE: &str = "FUTURE_START_DATE";
+/// See [`ENTITLEMENT_REASON_PROVISIONING`].
+pub const ENTITLEMENT_REASON_AGREEMENT_ACTIVE: &str = "AGREEMENT_ACTIVE";
+/// See [`ENTITLEMENT_REASON_PROVISIONING`].
+pub const ENTITLEMENT_REASON_AGREEMENT_INACTIVE: &str = "AGREEMENT_INACTIVE";
+
+/// How long an entitlement an acceptance provisioned stays `PENDING` before the
+/// clock owes it `PROVISIONED`.
+///
+/// AWS publishes no provisioning time for an agreement's entitlements, so this
+/// span is the emulator's OWN — the same kind of span as
+/// [`BILLING_ADJUSTMENT_SETTLEMENT`]: non-zero, so a caller reading straight
+/// after the accept still sees the `PROVISIONING_IN_PROGRESS` every entitlement
+/// starts in, and short enough that a test can wait it out.
+pub const ENTITLEMENT_PROVISIONING: Duration = Duration::from_millis(500);
+
+/// The service segment of the ARN an entitlement's licence carries:
+/// `AgreementEntitlement$licenseArn` is "the Amazon Resource Name (ARN) of the
+/// AWS License Manager license associated with the entitlement".
+pub const LICENSE_ARN_SERVICE: &str = "license-manager";
+
+/// The region an ARN this service mints is in when the caller signed for none —
+/// `::engine::emulator_arn`'s own documented default ("emulators default to
+/// `us-east-1`").
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The region to mint a licence ARN in: the one the caller signed for, else
+/// [`DEFAULT_REGION`].
+///
+/// Read from the SigV4 credential scope, the same signal the router routes on,
+/// so a licence is minted in the region the client addressed.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
 
 /// `ResourceType` values this service reports on a `ResourceNotFoundException`
 /// or a `ConflictException` (`RESOURCE_TYPE_VALUES` in `types`).
@@ -678,6 +748,34 @@ pub struct AgreementRequest {
     pub created_at: SystemTime,
 }
 
+/// One entitlement an acceptance provisioned, as this emulator persists it.
+///
+/// What is STORED is the entitlement's IDENTITY — the resource it was
+/// provisioned to, the licence it granted and the instant provisioning is due to
+/// finish. Its `status` and `statusReasonCode` are COMPUTED from the agreement
+/// it belongs to and the clock ([`Agreement::entitlement_state`]), so cancelling
+/// or replacing the agreement moves every entitlement it granted without a
+/// second copy of the agreement's own state to keep in step.
+#[derive(Debug, Clone)]
+pub struct AgreementEntitlementRecord {
+    /// "The resource that the entitlement is provisioned to, such as a product"
+    /// — one of the resources the agreement's proposal names, and absent for an
+    /// agreement whose proposal names none. The proposal is a resource of a
+    /// different AWS Marketplace API (see the module docs), so its products are
+    /// known only for an agreement derived from one that already carried them;
+    /// the member is left absent rather than naming an invented product.
+    pub resource: Option<Resource>,
+    /// The AWS License Manager licence this entitlement granted, minted once
+    /// when the entitlement was provisioned so every later report — this
+    /// agreement's entitlements, `AgreementViewSummary$entitlements` and the
+    /// `LicenseArn` search filter — names the same licence.
+    pub license_arn: String,
+    /// When the `PENDING` this entitlement was provisioned in is due to become
+    /// `PROVISIONED`: the acceptance instant plus [`ENTITLEMENT_PROVISIONING`].
+    /// Stored rather than slept for.
+    pub provisioned_at: SystemTime,
+}
+
 /// One agreement, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct Agreement {
@@ -706,6 +804,11 @@ pub struct Agreement {
     /// The purchase orders the accept call associated with this agreement's
     /// charges.
     pub purchase_orders: Vec<PurchaseOrder>,
+    /// The entitlements accepting this agreement provisioned — one per resource
+    /// its proposal names, and the single one the agreement grants when the
+    /// proposal names none (see
+    /// [`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::provision_entitlements`]).
+    pub entitlements: Vec<AgreementEntitlementRecord>,
     pub updated_at: SystemTime,
 }
 
@@ -781,6 +884,71 @@ impl Agreement {
         }
     }
 
+    /// The provisioning state of one entitlement of this agreement at `now`:
+    /// its `AgreementEntitlementStatus` and the `…StatusReasonCode` that says
+    /// why it is in that state.
+    ///
+    /// An entitlement is granted BY the agreement, so its state follows the
+    /// agreement's own and the clock: an agreement that is no longer `ACTIVE`
+    /// entitles its acceptor to nothing (`DEPROVISIONED`, `AGREEMENT_INACTIVE`),
+    /// one that has not started yet has its entitlement waiting for that start
+    /// date (`SCHEDULED`, `FUTURE_START_DATE`), and one that has started is
+    /// provisioning until the instant the clock owes the entitlement its licence
+    /// (`PENDING`, `PROVISIONING_IN_PROGRESS`), and provisioned from then on
+    /// (`PROVISIONED`, `AGREEMENT_ACTIVE`).
+    pub fn entitlement_state(
+        &self,
+        record: &AgreementEntitlementRecord,
+        now: SystemTime,
+    ) -> (&'static str, &'static str) {
+        if self.status != STATUS_ACTIVE {
+            (
+                ENTITLEMENT_DEPROVISIONED,
+                ENTITLEMENT_REASON_AGREEMENT_INACTIVE,
+            )
+        } else if now < self.start_time {
+            (ENTITLEMENT_SCHEDULED, ENTITLEMENT_REASON_FUTURE_START_DATE)
+        } else if now < record.provisioned_at {
+            (ENTITLEMENT_PENDING, ENTITLEMENT_REASON_PROVISIONING)
+        } else {
+            (
+                ENTITLEMENT_PROVISIONED,
+                ENTITLEMENT_REASON_AGREEMENT_ACTIVE,
+            )
+        }
+    }
+
+    /// The `GetAgreementEntitlements` projection of this agreement's
+    /// entitlements at `now`, in the order they were provisioned in.
+    ///
+    /// Two of `AgreementEntitlement`'s members are left absent rather than
+    /// invented, the way the module docs leave every amount absent:
+    ///
+    /// * `type` — "the type of entitlement". `EntitlementType` is a plain
+    ///   string, the model declares no values for it and AWS documents none, so
+    ///   there is no value to report rather than make up.
+    /// * `registrationToken` — "a short-lived token required by acceptors to
+    ///   register their account with the product provider". It is a capability
+    ///   redeemed with the provider, outside this service's model: no operation
+    ///   of this API consumes one, so a token this emulator minted would grant
+    ///   nothing and verify nothing.
+    pub fn to_entitlements(&self, now: SystemTime) -> Vec<AgreementEntitlement> {
+        self.entitlements
+            .iter()
+            .map(|record| {
+                let (status, reason_code) = self.entitlement_state(record, now);
+                AgreementEntitlement {
+                    resource: record.resource.clone(),
+                    r#type: None,
+                    registration_token: None,
+                    status: Some(status.to_string()),
+                    status_reason_code: Some(reason_code.to_string()),
+                    license_arn: Some(record.license_arn.clone()),
+                }
+            })
+            .collect()
+    }
+
     /// The `DescribeAgreement` projection of this agreement.
     pub fn to_description(&self) -> DescribeAgreementOutput {
         DescribeAgreementOutput {
@@ -813,10 +981,19 @@ impl Agreement {
             proposer: Some(self.proposer.clone()),
             proposal_summary: Some(self.proposal_summary.clone()),
             status: Some(self.status.clone()),
-            // An entitlement is a License Manager licence granted by the
-            // agreement; `GetAgreementEntitlements`, which is what provisions
-            // and reports them, is still a stub, so none exists to report.
-            entitlements: None,
+            // "A list of entitlements associated with the agreement": an
+            // `Entitlement` carries only the licence of each entitlement the
+            // acceptance provisioned; `GetAgreementEntitlements` reports the
+            // same entitlements in full. Absent, not empty, for an agreement
+            // that granted none.
+            entitlements: (!self.entitlements.is_empty()).then(|| {
+                self.entitlements
+                    .iter()
+                    .map(|record| Entitlement {
+                        license_arn: Some(record.license_arn.clone()),
+                    })
+                    .collect()
+            }),
             initial_agreement_id: Some(self.initial_agreement_id.clone()),
             end_time_behavior_type: behavior.as_ref().map(|b| b.r#type.clone()),
             end_time_behavior_reason_code: behavior.and_then(|b| b.reason_code),
@@ -1274,9 +1451,12 @@ fn matches_filter(agreement: &Agreement, name: &str, value: &str) -> bool {
         "EndTimeBehaviorReasonCode" => {
             behavior.is_some_and(|b| b.reason_code.as_deref() == Some(value))
         }
-        // A License Manager licence granted by the agreement; see
-        // `AgreementViewSummary$entitlements` above for why none exists yet.
-        "LicenseArn" => false,
+        // "A License Manager licence granted by the agreement": the licence of
+        // one of the entitlements accepting the agreement provisioned.
+        "LicenseArn" => agreement
+            .entitlements
+            .iter()
+            .any(|entitlement| entitlement.license_arn == value),
         _ => false,
     }
 }
@@ -2071,6 +2251,56 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
                 return id;
             }
         }
+    }
+
+    /// Mint the ARN of the AWS License Manager licence one entitlement grants.
+    ///
+    /// The licence id carries License Manager's own `l-` prefix, and the ARN is
+    /// built through [`::engine::emulator_arn`], so its account segment is the
+    /// emulator's canonical one and its region is the one the accepting caller
+    /// signed for. Every ARN this mints satisfies `AwsArn`'s pattern, whose
+    /// resource part admits the `license:<id>` form License Manager uses.
+    fn mint_license_arn(&mut self, region: &str) -> String {
+        let license_id = format!("l-{:016x}", self.next_sequence());
+        ::engine::emulator_arn(
+            LICENSE_ARN_SERVICE,
+            region,
+            &format!("license:{license_id}"),
+        )
+    }
+
+    /// The entitlements accepting an agreement provisions, each with its own
+    /// freshly minted licence and the instant its provisioning is due to finish.
+    ///
+    /// `AgreementEntitlement` "represents an entitlement associated with an
+    /// agreement, including the provisioning status, resource, and type", and
+    /// `Resource` is "the resource that the entitlement is provisioned to, such
+    /// as a product" — so an agreement grants one entitlement per resource its
+    /// proposal names. An agreement whose proposal names no resource still
+    /// entitles its acceptor to what it accepted, so it provisions the single
+    /// entitlement it grants, with `resource` absent rather than an invented
+    /// product (see [`AgreementEntitlementRecord::resource`]).
+    pub fn provision_entitlements(
+        &mut self,
+        resources: Option<&[Resource]>,
+        region: &str,
+        now: SystemTime,
+    ) -> Vec<AgreementEntitlementRecord> {
+        let provisioned_at = now + ENTITLEMENT_PROVISIONING;
+        let provisioned_to: Vec<Option<Resource>> = match resources {
+            Some(resources) if !resources.is_empty() => {
+                resources.iter().cloned().map(Some).collect()
+            }
+            _ => vec![None],
+        };
+        provisioned_to
+            .into_iter()
+            .map(|resource| AgreementEntitlementRecord {
+                resource,
+                license_arn: self.mint_license_arn(region),
+                provisioned_at,
+            })
+            .collect()
     }
 
     /// The payment request `token` already sent, if any.

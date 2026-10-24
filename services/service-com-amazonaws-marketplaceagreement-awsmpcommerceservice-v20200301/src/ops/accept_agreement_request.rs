@@ -241,6 +241,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .and_then(|source| source.proposal_summary.offer_set_id.clone()),
         };
+        // Accepting the quote is what provisions the agreement's entitlements:
+        // one licence per resource the proposal names, each `PENDING` until the
+        // clock owes it its `PROVISIONED` status. The licence is minted in the
+        // region this caller signed for, and reported from then on by
+        // `GetAgreementEntitlements`, `SearchAgreements` and its `LicenseArn`
+        // filter.
+        let region = crate::state::request_region(ctx.parts());
+        let entitlements = store.provision_entitlements(
+            proposal_summary.resources.as_deref(),
+            &region,
+            now,
+        );
         let agreement = crate::state::Agreement {
             // "When an agreement isn't derived from another agreement, its
             // InitialAgreementId is its own AgreementId."
@@ -282,6 +294,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ..order
                 })
                 .collect(),
+            entitlements,
             updated_at: now,
         };
 

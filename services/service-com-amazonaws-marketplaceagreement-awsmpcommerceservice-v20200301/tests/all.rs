@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/agreement_cancellation_requests.rs"]
 mod agreement_cancellation_requests;
+#[path = "all/agreement_entitlements.rs"]
+mod agreement_entitlements;
 #[path = "all/agreement_lifecycle.rs"]
 mod agreement_lifecycle;
 #[path = "all/billing_adjustments.rs"]
