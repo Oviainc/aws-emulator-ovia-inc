@@ -1353,6 +1353,31 @@ pub fn new_usage_limit_id() -> String {
 /// reports is terminal and no transition is owed on it.
 pub const QEV2_IDC_ONBOARD_STATUS: &str = "Completed";
 
+/// What every operation taking a `Qev2IdcApplicationArn` answers when the ARN
+/// names no registered application: ONE fixed sentence naming the resource type.
+///
+/// The message carries nothing from the request, so the refusal never reflects
+/// a caller's value back and two operations enforcing the same precondition
+/// cannot report different wording. The modelled doc text
+/// (`smithy_query(query="doc", shape="Qev2IdcApplicationNotExistsFault")`) is
+/// the API reference's prose about the fault, not the sentence the service puts
+/// on the wire, which is why it is not reused verbatim here.
+pub const QEV2_IDC_APPLICATION_NOT_EXISTS: &str =
+    "The Qev2IdcApplication you specified doesn't exist.";
+
+/// What `ModifyQev2IdcApplication` answers when no application it may act on
+/// matches the ARN — see
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::modifiable_qev2_idc_application_position`].
+///
+/// A refusal states the precondition the operation enforces, and a modify's is
+/// wider than a read's or a delete's: the application must exist AND have
+/// finished onboarding, because a modify changes the IAM Identity Center managed
+/// application that onboarding minted, while a read only reports the
+/// registration and a delete only removes it. Like
+/// [`QEV2_IDC_APPLICATION_NOT_EXISTS`] it carries nothing from the request.
+pub const QEV2_IDC_APPLICATION_NOT_MODIFIABLE: &str =
+    "The Qev2IdcApplication you specified doesn't exist or the status isn't Completed.";
+
 /// The ARN of a Query Editor (QEV2) IAM Identity Center application:
 /// `arn:aws:redshift:<region>:<account>:qev2idcapplication:<uuid>`.
 ///
@@ -1827,6 +1852,31 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             .iter()
             .position(|application| {
                 application.qev2_idc_application_arn.as_deref() == Some(application_arn)
+            })
+    }
+
+    /// The position of the registered QEV2 IAM Identity Center application a
+    /// MODIFY may act on: the ARN must name one, and its onboarding must have
+    /// finished ([`QEV2_IDC_ONBOARD_STATUS`]), since a modify changes the IAM
+    /// Identity Center managed application that onboarding minted. A read
+    /// reports an application whatever its onboarding status and a delete
+    /// removes it whatever its status — which is what makes the status
+    /// observable at all — so neither takes this narrower predicate.
+    ///
+    /// No implemented operation mints a half-onboarded application: a create's
+    /// application carries [`QEV2_IDC_ONBOARD_STATUS`] by the time the call
+    /// returns, so today only a record seeded straight into the store reaches
+    /// the refusing branch.
+    pub fn modifiable_qev2_idc_application_position(
+        &self,
+        application_arn: &str,
+    ) -> Option<usize> {
+        self.qev2_idc_application_position(application_arn)
+            .filter(|position| {
+                self.qev2_idc_applications[*position]
+                    .idc_onboard_status
+                    .as_deref()
+                    == Some(QEV2_IDC_ONBOARD_STATUS)
             })
     }
 

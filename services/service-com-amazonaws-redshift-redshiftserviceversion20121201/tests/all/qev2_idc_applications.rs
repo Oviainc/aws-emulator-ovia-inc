@@ -14,7 +14,9 @@
 //! `IdcManagedApplicationArn` of the IAM Identity Center instance it names; the
 //! application NAME being what one account's applications are unique on, and a
 //! delete freeing it; an ARN that names no application being refused by every
-//! operation that takes one; a modify changing only the display name; a delete
+//! operation that takes one, with one fixed sentence stating the precondition
+//! that operation enforces — existence for the read and the delete, existence
+//! and finished onboarding for the modify; a modify changing only the display name; a delete
 //! making the application absent from every later read; the service's
 //! `MaxRecords` window and `Marker` cursor; an `IdcInstanceArn` that is not an
 //! ARN (or is longer than one can be) being refused with nothing stored; and the
@@ -401,7 +403,9 @@ async fn an_application_name_is_unique_and_a_delete_frees_it() {
 }
 
 /// An ARN that names no application is refused with the modelled 404 fault by
-/// every operation that takes one, and an ARN that names one is served.
+/// every operation that takes one, and an ARN that names one is served. Every
+/// such refusal carries the fault's one fixed sentence, whatever ARN the
+/// request supplied.
 #[tokio::test]
 async fn an_arn_naming_no_application_is_refused_by_every_operation_that_takes_one() {
     let emulator = Emulator::new();
@@ -482,6 +486,179 @@ async fn an_arn_naming_no_application_is_refused_by_every_operation_that_takes_o
                 );
             } else {
                 assert_refused(&case, &answer, 404, "Qev2IdcApplicationNotExists");
+                // The refusal carries ONE fixed sentence, stating the whole
+                // precondition the call failed: existence for the read and the
+                // delete, existence AND finished onboarding for the modify. The
+                // wording is the same for every form of ARN and carries nothing
+                // the request supplied, so a refusal reflects no caller value
+                // back.
+                let expected = expected_refusal(action);
+                assert_eq!(
+                    answer.text("Message").as_deref(),
+                    Some(expected),
+                    "case {case}: expected the fault's fixed wording {expected:?}, got {:?}",
+                    answer.text("Message")
+                );
+                assert!(
+                    !answer
+                        .text("Message")
+                        .is_some_and(|message| message.contains(arn.as_str())),
+                    "case {case}: expected the refusal to carry none of the requested ARN {arn:?}, got {:?}",
+                    answer.text("Message")
+                );
+            }
+        }
+    }
+}
+
+/// The sentence the `Qev2IdcApplicationNotExists` fault carries, which states
+/// the precondition the operation enforces: existence for the read and the
+/// delete, existence and finished onboarding for the modify.
+///
+/// Spelt out as a literal here rather than read from the crate's own constants,
+/// so an edit to a constant changes the wording ON THE WIRE and this suite
+/// fails; the constants the handlers emit are tied to these literals below.
+fn expected_refusal(action: &str) -> &'static str {
+    if action == "ModifyQev2IdcApplication" {
+        "The Qev2IdcApplication you specified doesn't exist or the status isn't Completed."
+    } else {
+        "The Qev2IdcApplication you specified doesn't exist."
+    }
+}
+
+/// The wording the crate serves is the wording this suite pins, so neither can
+/// drift without the other: every refusal row compares the wire `Message`
+/// against [`expected_refusal`]'s literals, and this case ties the constants the
+/// handlers emit to the same text.
+#[test]
+fn the_refusal_wording_the_handlers_emit_is_the_pinned_text() {
+    for (case, action, constant) in [
+        (
+            "the read's and the delete's wording",
+            "DescribeQev2IdcApplications",
+            state::QEV2_IDC_APPLICATION_NOT_EXISTS,
+        ),
+        (
+            "the modify's wording",
+            "ModifyQev2IdcApplication",
+            state::QEV2_IDC_APPLICATION_NOT_MODIFIABLE,
+        ),
+    ] {
+        assert_eq!(
+            constant,
+            expected_refusal(action),
+            "case {case}: expected {:?}, got {constant:?}",
+            expected_refusal(action)
+        );
+    }
+}
+
+/// An application whose onboarding has NOT finished is reported by the read and
+/// deleted by the delete, but refused by the modify: a modify changes the IAM
+/// Identity Center managed application that onboarding mints, so its
+/// precondition is wider than the other two.
+///
+/// Every status but [`state::QEV2_IDC_ONBOARD_STATUS`] is a row here. No
+/// implemented operation mints one — a create's application is onboarded by the
+/// time it returns — so the record is seeded straight into the same shared store
+/// the handlers read, exactly as the harness seeds an automated snapshot.
+#[tokio::test]
+async fn an_application_that_has_not_finished_onboarding_is_read_and_deleted_but_not_modified() {
+    // The rows differ along the onboarding status that is not the finished one:
+    // a status the service could report while onboarding, one spelt in another
+    // case, and an empty one.
+    for status in ["InProgress", "Failed", "completed", ""] {
+        for action in ["ModifyQev2IdcApplication", "DeleteQev2IdcApplication"] {
+            let emulator = Emulator::new();
+            let arn = state::qev2_idc_application_arn("onboarding-app", "us-west-2");
+            {
+                let store = state::service_state(&*emulator.engine).expect("the Redshift store");
+                let mut store = store.lock();
+                store.qev2_idc_applications.push(Qev2IdcApplication {
+                    qev2_idc_application_arn: Some(arn.clone()),
+                    qev2_idc_application_name: Some("onboarding-app".to_string()),
+                    idc_instance_arn: Some(IDC_INSTANCE_ARN.to_string()),
+                    idc_managed_application_arn: Some(state::idc_managed_application_arn(
+                        IDC_INSTANCE_ARN,
+                        "onboarding-app",
+                    )),
+                    idc_display_name: Some("Onboarding".to_string()),
+                    idc_onboard_status: Some(status.to_string()),
+                    tags: Some(Vec::new()),
+                });
+            }
+            let case = format!("status {status:?} on {action}");
+
+            // The read reports it, status and all: a read's only precondition is
+            // that the application exists.
+            let described = emulator
+                .call(
+                    "DescribeQev2IdcApplications",
+                    &[("Qev2IdcApplicationArn", arn.as_str())],
+                )
+                .await;
+            assert_eq!(
+                described.status, 200,
+                "case {case}: expected the read to report it with 200, got {} with body {}",
+                described.status, described.body
+            );
+            assert_eq!(
+                described.text("IdcOnboardStatus").as_deref(),
+                Some(status),
+                "case {case}: expected the stored onboarding status, got {:?}",
+                described.text("IdcOnboardStatus")
+            );
+
+            // The modify is refused and changes nothing; the delete is served
+            // and makes the application absent from every later read.
+            if action == "ModifyQev2IdcApplication" {
+                let answer = emulator
+                    .call(
+                        action,
+                        &[
+                            ("Qev2IdcApplicationArn", arn.as_str()),
+                            ("IdcDisplayName", "Renamed"),
+                        ],
+                    )
+                    .await;
+                assert_refused(&case, &answer, 404, "Qev2IdcApplicationNotExists");
+                assert_eq!(
+                    answer.text("Message").as_deref(),
+                    Some(expected_refusal(action)),
+                    "case {case}: expected the modify's fixed wording {:?}, got {:?}",
+                    expected_refusal(action),
+                    answer.text("Message")
+                );
+
+                let after = emulator
+                    .call(
+                        "DescribeQev2IdcApplications",
+                        &[("Qev2IdcApplicationArn", arn.as_str())],
+                    )
+                    .await;
+                assert_eq!(
+                    application_members(&after.body),
+                    application_members(&described.body),
+                    "case {case}: expected the refused modify to change nothing, got {:?}",
+                    application_members(&after.body)
+                );
+            } else {
+                let answer = emulator
+                    .call(action, &[("Qev2IdcApplicationArn", arn.as_str())])
+                    .await;
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case}: expected the delete to be served with 200, got {} with body {}",
+                    answer.status, answer.body
+                );
+
+                let after = emulator
+                    .call(
+                        "DescribeQev2IdcApplications",
+                        &[("Qev2IdcApplicationArn", arn.as_str())],
+                    )
+                    .await;
+                assert_refused(&case, &after, 404, "Qev2IdcApplicationNotExists");
             }
         }
     }
