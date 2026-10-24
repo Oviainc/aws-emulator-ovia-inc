@@ -163,14 +163,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which is a change the clock owes rather than one this call makes.
         store.settle(now);
 
-        // Deleting leaves the resource with no policy attached, which is the
-        // state a resource that never had one is already in: this is a write to
-        // the resource-POLICY store, keyed by the resource the ARN names, and it
-        // creates no binding to the catalog's own record — so deleting an absent
-        // policy, or one for a resource the catalog holds no record for, is the
-        // same success, and the answer carries no members either way. Attaching
-        // is the operation that binds, and it is the one that requires the
-        // entity to exist.
+        // An ARN the catalog holds no record of identifies no resource to clear
+        // a policy on — the same existence test every ARN-addressed operation of
+        // this service applies, so the policy surface agrees with the tagging
+        // surface about whether a resource exists.
+        if !store.holds_resource(&resource) {
+            return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(&resource),
+            )
+            .into());
+        }
+
+        // For a resource the catalog DOES hold, deleting asks for an END STATE —
+        // no policy attached — which a resource that carries none is already in,
+        // so clearing an absent policy is the same success and the answer carries
+        // no members either way.
         store.resource_policies.remove(&resource.policy_key());
 
         Ok(DeleteResourcePolicyOutput {})

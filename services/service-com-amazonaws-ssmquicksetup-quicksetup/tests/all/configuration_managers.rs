@@ -20,8 +20,8 @@ use service_com_amazonaws_ssmquicksetup_quicksetup::ops::types::{
     STATUS_TYPE_VALUES, STATUS_VALUES,
 };
 use service_com_amazonaws_ssmquicksetup_quicksetup::state::{
-    MAX_FILTERS, MAX_FILTER_VALUES, MAX_ITEMS_LIMIT, STATUS_INITIALIZING, STATUS_SUCCEEDED,
-    STATUS_TYPE_DEPLOYMENT, TRANSITION_SPAN,
+    MAX_FILTERS, MAX_FILTER_VALUES, MAX_ITEMS_LIMIT, QUICK_SETUP_TYPE_CATALOG, STATUS_INITIALIZING,
+    STATUS_SUCCEEDED, STATUS_TYPE_DEPLOYMENT, TRANSITION_SPAN,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -1802,4 +1802,238 @@ async fn reading_a_configuration_reports_the_status_the_clock_owes_and_moves_not
         again, settled,
         "a second read must report the same record, got {again:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A configuration definition may only name a configuration type this service offers
+// ---------------------------------------------------------------------------
+
+/// Whether the published catalog (`crate::state::QUICK_SETUP_TYPE_CATALOG`, what
+/// `ListQuickSetupTypes` answers) offers `type_`.
+fn is_published_type(type_: &str) -> bool {
+    QUICK_SETUP_TYPE_CATALOG
+        .iter()
+        .any(|entry| entry.type_ == type_)
+}
+
+/// The rule: a configuration definition's `Type` selects the service-owned template
+/// Quick Setup deploys, so only a type the service publishes can be named — a
+/// pattern-valid value the catalog does not carry is refused with the modelled 400
+/// `ValidationException` and nothing is stored for it.
+///
+/// Each row is a value that satisfies the modelled
+/// `ConfigurationDefinitionInput$Type` pattern `^[a-zA-Z0-9_\-.:/]{3,200}$` (so the
+/// boundary walk admits it and the handler is what refuses it) while naming no
+/// published type; the rows differ along what the rule generalises over — the value's
+/// form (a plausible Quick Setup name, a published one with a suffix, truncated,
+/// re-separated, re-cased, differently prefixed) and its size, including each bound
+/// the pattern publishes. Each row is sent twice: alone, and beside a published type,
+/// because one unacceptable definition refuses the whole create.
+#[tokio::test]
+async fn a_definition_naming_an_unpublished_configuration_type_is_refused_and_stores_nothing() {
+    let router = emulator();
+
+    // A manager created with a published type, so each refusal can be shown to leave
+    // the store exactly as it already was.
+    let kept_type = "AWSQuickSetupType-SSMOpsCenter";
+    let kept = create_ok(
+        &router,
+        "kept",
+        &json!({
+            "Name": "published-type",
+            "ConfigurationDefinitions": [definition(
+                kept_type,
+                json!({ "TargetRegions": "us-east-1" }),
+            )],
+        }),
+    )
+    .await;
+
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "a plausible but unpublished Quick Setup name",
+            "AWSQuickSetupType-NotAThing".to_string(),
+        ),
+        (
+            "the shortest value the modelled pattern admits",
+            "abc".to_string(),
+        ),
+        (
+            "the longest value the modelled pattern admits",
+            "T".repeat(200),
+        ),
+        (
+            "a published type differing only in case",
+            "awsquicksetuptype-dhmc".to_string(),
+        ),
+        (
+            "a published type carrying a suffix",
+            "AWSQuickSetupType-DHMC-v2".to_string(),
+        ),
+        (
+            "a published type truncated by one character",
+            "AWSQuickSetupType-DHM".to_string(),
+        ),
+        (
+            "a published type with its separator changed",
+            "AWSQuickSetupType/DHMC".to_string(),
+        ),
+        (
+            "a published type with surrounding punctuation",
+            ".AWSQuickSetupType-SSM.".to_string(),
+        ),
+        (
+            "a type named for another product family",
+            "CustomType-Patching".to_string(),
+        ),
+        (
+            "a type naming only the catalog's common prefix",
+            "AWSQuickSetupType-".to_string(),
+        ),
+    ];
+
+    for (case, type_) in &cases {
+        assert!(
+            !is_published_type(type_),
+            "case {case}: this row must name a type outside the published catalog, got {type_:?}"
+        );
+        let requests: [(&str, Value); 2] = [
+            (
+                "alone",
+                json!({
+                    "Name": "unsupported",
+                    "ConfigurationDefinitions": [definition(type_, json!({ "TargetRegions": "us-east-1" }))],
+                }),
+            ),
+            (
+                "beside a published type",
+                json!({
+                    "ConfigurationDefinitions": [
+                        definition(kept_type, json!({ "TargetRegions": "us-east-1" })),
+                        definition(type_, json!({})),
+                    ],
+                }),
+            ),
+        ];
+        for (position, body) in requests {
+            let (status, answer) = create(&router, &body).await;
+            assert_eq!(
+                status, 400,
+                "case {case} ({position}): {type_:?} names no published type and must be refused \
+                 with 400, got {status} / {answer:?}"
+            );
+            assert_eq!(
+                error_code(&answer),
+                "ValidationException",
+                "case {case} ({position}): expected ValidationException, got {answer:?}"
+            );
+        }
+    }
+
+    // Nothing a refused create named was stored: the only manager is the one created
+    // with a published type, and every stored configuration names a published type.
+    let (status, answer) = list_managers(&router, &json!({})).await;
+    assert_eq!(status, 200, "got {status} / {answer:?}");
+    let managers = answer["ConfigurationManagersList"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a ConfigurationManagersList, got {answer:?}"));
+    assert_eq!(
+        managers.len(),
+        1,
+        "a refused create must store no manager, got {answer:?}"
+    );
+    assert_eq!(
+        managers[0]["ManagerArn"].as_str(),
+        Some(kept.as_str()),
+        "the surviving manager must be the one the accepted create minted, got {answer:?}"
+    );
+
+    let (status, answer) = list_configurations(&router, &json!({})).await;
+    assert_eq!(status, 200, "got {status} / {answer:?}");
+    let configurations = answer["ConfigurationsList"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a ConfigurationsList, got {answer:?}"));
+    assert_eq!(
+        configurations.len(),
+        1,
+        "a refused create must store no configuration, got {answer:?}"
+    );
+    for configuration in configurations {
+        let type_ = configuration["Type"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a stored configuration carries its Type, got {answer:?}"));
+        assert!(
+            is_published_type(type_),
+            "the store must hold no configuration of an unpublished type, got {type_:?}"
+        );
+    }
+}
+
+/// The other half of the same rule: EVERY type the catalog publishes is accepted and
+/// stored, so the accepted set is exactly the published one — not a subset of it. Each
+/// row is one catalog entry, read back through `GetConfigurationManager`, the
+/// configuration listing and `GetConfiguration`.
+#[tokio::test]
+async fn every_published_configuration_type_is_accepted_and_read_back() {
+    let router = emulator();
+    assert!(
+        !QUICK_SETUP_TYPE_CATALOG.is_empty(),
+        "the published catalog must not be empty"
+    );
+
+    for entry in QUICK_SETUP_TYPE_CATALOG {
+        let case = entry.type_;
+        let manager_arn = create_ok(
+            &router,
+            case,
+            &json!({
+                "Name": "published",
+                "ConfigurationDefinitions": [{
+                    "Type": entry.type_,
+                    "TypeVersion": entry.latest_version,
+                    "Parameters": { "TargetRegions": REGION },
+                }],
+            }),
+        )
+        .await;
+
+        let manager = get_ok(&router, case, &manager_arn).await;
+        assert_eq!(
+            manager["ConfigurationDefinitions"][0]["Type"].as_str(),
+            Some(entry.type_),
+            "case {case}: the stored definition must carry the type the create named, got {manager:?}"
+        );
+
+        let listed = configurations_of(&router, case, &manager_arn).await;
+        assert_eq!(
+            listed.len(),
+            1,
+            "case {case}: expected one configuration per definition, got {listed:?}"
+        );
+        assert_eq!(
+            listed[0]["Type"].as_str(),
+            Some(entry.type_),
+            "case {case}: the listed configuration must carry that type, got {:?}",
+            listed[0]
+        );
+
+        let id = listed[0]["Id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: a stored configuration carries its id"));
+        let (status, got) = get_configuration(&router, id).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: GetConfiguration must succeed, got {status} / {got:?}"
+        );
+        assert_eq!(
+            got["Type"].as_str(),
+            Some(entry.type_),
+            "case {case}: the read configuration must carry that type, got {got:?}"
+        );
+        assert_eq!(
+            got["TypeVersion"].as_str(),
+            Some(entry.latest_version),
+            "case {case}: the published LatestVersion must be accepted as the TypeVersion, got {got:?}"
+        );
+    }
 }

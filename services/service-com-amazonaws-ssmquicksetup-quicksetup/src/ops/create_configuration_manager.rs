@@ -117,7 +117,10 @@ impl From<CreateConfigurationManagerErrorModeled> for CreateConfigurationManager
 ///
 /// `ConfigurationDefinitionsInputList` is `@required` but carries no modelled length,
 /// so an EMPTY list reaches the handler: a configuration manager is the deployment of
-/// its definitions, so one with none to deploy is refused. The remaining checks are
+/// its definitions, so one with none to deploy is refused. Each definition's `Type`
+/// must name a configuration type this service offers, because that is what selects
+/// the service-owned template the definition deploys
+/// (`crate::state::quick_setup_type_rejection`). The remaining checks are
 /// the store's own bounds on collections the model gives no length (see
 /// `crate::state`'s `MAX_*` constants), and the `IAMRoleArn` form of
 /// `LocalDeploymentAdministrationRoleArn`, which the model states as an
@@ -148,6 +151,20 @@ fn definitions_rejection(input: &CreateConfigurationManagerInput) -> Option<Stri
                     "ConfigurationDefinitions.Parameters",
                     definition.parameters.len(),
                     crate::state::MAX_PARAMETERS,
+                )
+            })
+    })
+    .or_else(|| {
+        // `Type` resolves a service-owned template, so only a type this service
+        // publishes can be deployed; the catalog `ListQuickSetupTypes` answers is the
+        // accepted set, and `crate::state` is the one place that rule lives.
+        input
+            .configuration_definitions
+            .iter()
+            .find_map(|definition| {
+                crate::state::quick_setup_type_rejection(
+                    "ConfigurationDefinitions.Type",
+                    &definition.r#type,
                 )
             })
     })
@@ -218,7 +235,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // every parameter and tag key/value length are MODELLED constraints, so the
         // centralized walk has already refused anything outside them with a 400
         // `ValidationException` before this body runs. What is checked here is what the
-        // model cannot say: that the list carries at least one definition, and that no
+        // model cannot say: that the list carries at least one definition, that every
+        // `Type` names a configuration type this service actually offers, and that no
         // caller-sized collection the model gives no length may grow the store without
         // bound.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

@@ -208,12 +208,13 @@ async fn a_scaffolded_operation_still_answers_501() {
             }),
         ),
         (
-            "DescribeBudgetAction",
+            // `DescribeBudgetAction` is implemented now (it reads the action
+            // `CreateBudgetAction` / `ExecuteBudgetAction` write), so the stub row
+            // here is the LIST side of the same resource, still under its own issue.
+            "DescribeBudgetActionsForBudget",
             json!({
                 "AccountId": &account_id,
-                "BudgetName": "stub",
-                // ActionId is @pattern a 36-character UUID.
-                "ActionId": "11111111-2222-3333-4444-555555555555"
+                "BudgetName": "stub"
             }),
         ),
         (

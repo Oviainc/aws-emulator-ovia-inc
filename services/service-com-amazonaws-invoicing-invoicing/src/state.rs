@@ -928,6 +928,32 @@ pub fn now() -> DateTime {
     )
 }
 
+/// One call's `ResourceTags` array as the tag plane stores it for a resource THIS CALL
+/// CREATES — one entry per key, a key repeated inside the array keeping the last value
+/// it carried — or `Err(count)` with the number of distinct keys when storing them would
+/// leave the new resource holding more than [`MAX_RESOURCE_TAGS`].
+///
+/// A resource holds at most that many tags however the tags got there, so every write of
+/// tags decides this BEFORE it persists anything: the resource a create mints holds
+/// nothing yet, so its whole array counts, while `TagResource` counts only the keys the
+/// resource does not already hold. The refusal is the quota error the ANSWERING
+/// OPERATION models — `ServiceQuotaExceededException` where it declares one, otherwise
+/// the `ValidationException` it does declare — carried by
+/// [`TAG_QUOTA_EXCEEDED_MESSAGE`], and nothing of the refused create persists.
+pub fn resource_tags_for_new_resource(
+    tags: Option<Vec<ResourceTag>>,
+) -> Result<BTreeMap<String, String>, usize> {
+    let tags = tags
+        .unwrap_or_default()
+        .into_iter()
+        .map(|tag| (tag.key, tag.value))
+        .collect::<BTreeMap<_, _>>();
+    if tags.len() > MAX_RESOURCE_TAGS {
+        return Err(tags.len());
+    }
+    Ok(tags)
+}
+
 /// A tag map as the modelled `ResourceTagList`, in a deterministic key order.
 pub fn resource_tag_list(tags: &BTreeMap<String, String>) -> Vec<ResourceTag> {
     tags.iter()
