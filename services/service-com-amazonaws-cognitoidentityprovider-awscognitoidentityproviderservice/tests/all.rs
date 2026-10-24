@@ -25,6 +25,8 @@ mod group_lifecycle;
 mod group_membership;
 #[path = "all/initiate_auth.rs"]
 mod initiate_auth;
+#[path = "all/resource_server_lifecycle.rs"]
+mod resource_server_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/token_signing.rs"]
