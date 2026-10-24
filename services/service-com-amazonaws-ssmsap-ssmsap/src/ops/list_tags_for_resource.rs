@@ -158,11 +158,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::store_unavailable(),
             )
         })?;
-        // A plain read: no status is reported here and a tag is not something the clock
-        // changes, so this call has nothing to settle and writes NOTHING. Reading a
-        // Region that holds nothing mints no partition for it (`region`, not
-        // `region_entry`).
-        let state = state.lock();
+        // A tag is not something the clock changes, but the RESOURCE it is held for is:
+        // a deregistration the clock has completed takes the application with its tags,
+        // so the change already due is materialised before this read answers, exactly as
+        // every other read of this service does. It is the only write a reporting
+        // operation makes. Reading a Region that holds nothing mints no partition for it
+        // (`region`, not `region_entry`).
+        let mut state = state.lock();
+        state.settle(::std::time::SystemTime::now());
         let region_state = state.region(&region);
 
         // `ResourceArn` is modelled `@required` with a `@pattern`, so reaching here means
