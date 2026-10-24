@@ -15,6 +15,8 @@
 mod client_rejections;
 #[path = "all/client_token_store.rs"]
 mod client_token_store;
+#[path = "all/custom_detection_rule_org_configuration_update.rs"]
+mod custom_detection_rule_org_configuration_update;
 #[path = "all/custom_detection_rules.rs"]
 mod custom_detection_rules;
 #[path = "all/detector_data_sources_projection.rs"]
