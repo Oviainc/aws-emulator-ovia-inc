@@ -3,17 +3,18 @@
 //! Engine state for the com-amazonaws-wisdom-wisdomservice service.
 //!
 //! Wisdom's assistant lifecycle lives here: the assistants, the sessions nested
-//! under each assistant, and the indexes that let a handler resolve the
-//! `UuidOrArn` path labels the model declares (`^<uuid>$|^arn:…$`) back to the
-//! one stored record. Handlers read and write ONLY through these structures, so
-//! every response is computed from what a previous call persisted.
+//! under each assistant, the knowledge bases, and the indexes that let a handler
+//! resolve the `UuidOrArn` path labels the model declares (`^<uuid>$|^arn:…$`) back
+//! to the one stored record. Handlers read and write ONLY through these structures,
+//! so every response is computed from what a previous call persisted.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
     AssistantAssociationData, AssistantAssociationOutputData, AssistantData, AssistantSummary,
-    KnowledgeBaseAssociationData, ServerSideEncryptionConfiguration, SessionData,
+    KnowledgeBaseAssociationData, KnowledgeBaseData, RenderingConfiguration,
+    ServerSideEncryptionConfiguration, SessionData, SourceConfiguration,
 };
 
 /// The ARN namespace Wisdom resources carry (`awsService.arnNamespace` in the
@@ -81,6 +82,39 @@ pub const ASSOCIATION_TYPE_KNOWLEDGE_BASE: &str = "KNOWLEDGE_BASE";
 /// new resource rather than letting the index grow forever.
 pub const MAX_REMEMBERED_CLIENT_TOKENS: usize = 10_000;
 
+/// The most knowledge bases this store holds at once.
+///
+/// Same contract as [`MAX_ASSISTANTS`], one resource family over: a knowledge base
+/// stays in the store until something deletes it, so the ceiling is the bound on
+/// that growth. It is a resource guard this emulator owns, NOT an AWS-published
+/// quota, and a create past it is refused with the error the model declares for
+/// exactly this on `CreateKnowledgeBase`, a 402 `ServiceQuotaExceededException`.
+pub const MAX_KNOWLEDGE_BASES: usize = 100;
+
+/// The terminal `KnowledgeBaseStatus` of a usable knowledge base, and the one a
+/// create answers with
+/// (`smithy_query(query="shape",shape="KnowledgeBaseStatus")` also declares
+/// `CREATE_IN_PROGRESS`, `CREATE_FAILED`, `DELETE_IN_PROGRESS`, `DELETE_FAILED` and
+/// `DELETED`, none of which this emulator reaches: a delete removes the record
+/// outright).
+///
+/// A recorded `CreateKnowledgeBase` answer carries `status` ACTIVE, so the create
+/// owes no later transition — a resource the service returns ready stays ready.
+pub const KNOWLEDGE_BASE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The sentence this endpoint answers a request addressed to a knowledge base this
+/// account does not hold with.
+///
+/// It is a FIXED service text that quotes nothing from the request: the recorded wire
+/// responses of this endpoint name no id in the message, and the Amazon Q in Connect
+/// model of this same endpoint words it from its own copy of this constant
+/// (`services/service-com-amazonaws-qconnect-wisdomservice/src/state.rs`'s
+/// `MESSAGE_KNOWLEDGE_BASE_NOT_FOUND`) — the two are one endpoint, so a client must
+/// not get a different sentence depending on which model it addressed. The requested
+/// label still travels, in `ResourceNotFoundException`'s own `resourceName` member,
+/// which the model provides for naming it.
+pub const MESSAGE_KNOWLEDGE_BASE_NOT_FOUND: &str = "Knowledge Base does not exist.";
+
 /// The most tags one resource carries.
 ///
 /// AWS's tagging restrictions put the maximum number of tags per resource at
@@ -124,26 +158,6 @@ pub struct Session {
     /// When this session was created. `SessionData` models no timestamp member,
     /// so nothing renders it; see [`Assistant::created_at`].
     pub created_at: SystemTime,
-}
-
-/// A knowledge base this account holds, as this crate persists it.
-///
-/// Only the two members an assistant association needs are kept — the id a
-/// request names the knowledge base by, and the ARN a record that references it
-/// reports — because this crate's `CreateKnowledgeBase` is still a scaffold stub
-/// (its own issue): nothing else of a knowledge base is reported by any
-/// implemented operation of this model yet. `CreateKnowledgeBase` EXTENDS this
-/// record and this map when it lands, rather than adding a second knowledge-base
-/// store beside them, so the two cannot disagree about one knowledge base.
-///
-/// The endpoint's real `wisdom` traffic is served by the Amazon Q in Connect
-/// crate (`src/service.rs`'s `OWN_REGISTRATION_KEY` explains why), whose own
-/// `CreateKnowledgeBase` fills the registry the same association create there
-/// resolves against.
-#[derive(Debug, Clone)]
-pub struct KnowledgeBase {
-    pub knowledge_base_id: String,
-    pub knowledge_base_arn: String,
 }
 
 /// A persisted association between an assistant and a knowledge base.
@@ -291,6 +305,59 @@ impl Session {
     }
 }
 
+/// A persisted Wisdom knowledge base.
+///
+/// The knowledge base is the root of the content/quick-response side of this service,
+/// the way [`Assistant`] is the root of the session side; nothing is nested under it
+/// yet, because every content operation is still a scaffold. It is also the record a
+/// `CreateAssistantAssociation` resolves its `knowledgeBaseId` against, so there is
+/// ONE knowledge-base store in this crate rather than a second one beside it.
+#[derive(Debug, Clone)]
+pub struct KnowledgeBase {
+    pub knowledge_base_id: String,
+    pub knowledge_base_arn: String,
+    pub name: String,
+    /// `KnowledgeBaseType` on the wire (`CUSTOM`, `EXTERNAL` or `QUICK_RESPONSES`).
+    pub knowledge_base_type: String,
+    /// `KnowledgeBaseStatus` on the wire.
+    pub status: String,
+    pub description: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    pub source_configuration: Option<SourceConfiguration>,
+    pub rendering_configuration: Option<RenderingConfiguration>,
+    pub server_side_encryption_configuration: Option<ServerSideEncryptionConfiguration>,
+    /// When this record was created, as [`Assistant`] keeps it too.
+    /// `KnowledgeBaseData` models no creation-time member, so nothing renders it; it
+    /// is the record's own age and is never derived from the request.
+    pub created_at: SystemTime,
+}
+
+impl KnowledgeBase {
+    /// This knowledge base as the `KnowledgeBaseData` shape `CreateKnowledgeBase` and
+    /// `GetKnowledgeBase` return.
+    pub fn to_data(&self) -> KnowledgeBaseData {
+        KnowledgeBaseData {
+            knowledge_base_id: self.knowledge_base_id.clone(),
+            knowledge_base_arn: self.knowledge_base_arn.clone(),
+            name: self.name.clone(),
+            knowledge_base_type: self.knowledge_base_type.clone(),
+            status: self.status.clone(),
+            description: self.description.clone(),
+            tags: wire_tags(&self.tags),
+            source_configuration: self.source_configuration.clone(),
+            rendering_configuration: self.rendering_configuration.clone(),
+            server_side_encryption_configuration: self
+                .server_side_encryption_configuration
+                .clone(),
+            // The model's own wording for the member: "If no content exists in a
+            // knowledge base, this value is unset". No content operation is
+            // implemented in this view of the endpoint, so no knowledge base it holds
+            // has content whose modification time there would be to report.
+            last_content_modification_time: None,
+        }
+    }
+}
+
 /// What makes a `clientToken` replay the SAME create: the operation, the scope
 /// the created resource lives in, and the token itself.
 ///
@@ -339,7 +406,9 @@ pub enum SessionInsert {
 /// [`MAX_SESSIONS_PER_ASSISTANT`] each and [`MAX_STORED_SESSIONS`] in total, so
 /// the product of the two ceilings cannot multiply out; each record's tag map
 /// holds at most [`MAX_TAGS_PER_RESOURCE`] pairs; and `idempotency` holds at
-/// most [`MAX_REMEMBERED_CLIENT_TOKENS`] entries, evicting the oldest first.
+/// most [`MAX_REMEMBERED_CLIENT_TOKENS`] entries, evicting the oldest first; and
+/// `knowledge_bases` (with the two indexes that mirror it) holds at most
+/// [`MAX_KNOWLEDGE_BASES`] records.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsWisdomWisdomserviceState {
     /// Every assistant, keyed by its `assistantId` (a v4 uuid).
@@ -356,6 +425,16 @@ pub struct ComAmazonawsWisdomWisdomserviceState {
     pub assistant_arn_index: HashMap<String, String>,
     /// `sessionArn` -> (`assistantId`, `sessionId`), the same for session labels.
     pub session_arn_index: HashMap<String, (String, String)>,
+    /// Every knowledge base this account holds, keyed by its `knowledgeBaseId` (a
+    /// v4 uuid) — the record `CreateKnowledgeBase` mints and the one a
+    /// `CreateAssistantAssociation` resolves its `knowledgeBaseId` against, so the
+    /// two cannot disagree about one knowledge base.
+    pub knowledge_bases: HashMap<String, KnowledgeBase>,
+    /// `name` -> `knowledgeBaseId`, so a duplicate name is a `ConflictException`.
+    pub knowledge_base_name_index: HashMap<String, String>,
+    /// `knowledgeBaseArn` -> `knowledgeBaseId`, so an ARN-form label resolves to the
+    /// same record an id-form label does.
+    pub knowledge_base_arn_index: HashMap<String, String>,
     /// Every assistant association, keyed by its `assistantAssociationId`. Each
     /// record names the assistant it belongs to, so a lookup is always scoped to
     /// the parent the route named.
@@ -363,10 +442,6 @@ pub struct ComAmazonawsWisdomWisdomserviceState {
     /// `assistantAssociationArn` -> (`assistantId`, `assistantAssociationId`), so
     /// an ARN-form label resolves to the same record an id-form label does.
     pub assistant_association_arn_index: HashMap<String, (String, String)>,
-    /// Every knowledge base this account holds, keyed by its `knowledgeBaseId` —
-    /// what a `CreateAssistantAssociation` resolves its `knowledgeBaseId` against.
-    /// See [`KnowledgeBase`] for why only two members are kept and who fills this.
-    pub knowledge_bases: HashMap<String, KnowledgeBase>,
     /// How many sessions `assistants` holds in total, for the store-wide
     /// session ceiling ([`MAX_STORED_SESSIONS`]).
     pub stored_sessions: usize,
@@ -504,17 +579,75 @@ impl ComAmazonawsWisdomWisdomserviceState {
         Some(assistant)
     }
 
-    /// The knowledge base a `knowledgeBaseId` names, or `None` when this account
-    /// holds none under it. The modelled member is a bare `Uuid` (no ARN form),
-    /// so an id is the only label a request can name a knowledge base by.
-    pub fn knowledge_base(&self, knowledge_base_id: &str) -> Option<&KnowledgeBase> {
-        self.knowledge_bases.get(knowledge_base_id)
+    /// Resolve a knowledge base path label — a bare uuid or a knowledge-base ARN — to
+    /// a stored `knowledgeBaseId`. `None` means no such knowledge base, which includes
+    /// an ARN this emulator never minted: it is in no index, so it names nothing.
+    pub fn resolve_knowledge_base_id(&self, label: &str) -> Option<String> {
+        if label.starts_with("arn:") {
+            self.knowledge_base_arn_index.get(label).cloned()
+        } else {
+            self.knowledge_bases
+                .contains_key(label)
+                .then(|| label.to_string())
+        }
     }
 
-    /// Persist a knowledge base and make it referenceable by an association.
-    pub fn insert_knowledge_base(&mut self, knowledge_base: KnowledgeBase) {
+    /// The knowledge base a path label names, in either label form. A caller whose
+    /// modelled member is a bare `Uuid` (`CreateAssistantAssociation`'s
+    /// `knowledgeBaseId`) simply never reaches the ARN branch.
+    pub fn knowledge_base(&self, label: &str) -> Option<&KnowledgeBase> {
+        let id = self.resolve_knowledge_base_id(label)?;
+        self.knowledge_bases.get(&id)
+    }
+
+    /// Whether this store already holds [`MAX_KNOWLEDGE_BASES`] knowledge bases, i.e.
+    /// whether a create must be refused rather than add another record.
+    pub fn knowledge_bases_at_capacity(&self) -> bool {
+        self.knowledge_bases.len() >= MAX_KNOWLEDGE_BASES
+    }
+
+    /// Persist a new knowledge base and index it by name and ARN. `false` — nothing
+    /// stored — when the store is already at [`MAX_KNOWLEDGE_BASES`], so the bound
+    /// holds however the caller reaches this.
+    pub fn insert_knowledge_base(&mut self, knowledge_base: KnowledgeBase) -> bool {
+        if self.knowledge_bases_at_capacity() {
+            return false;
+        }
+        self.knowledge_base_name_index.insert(
+            knowledge_base.name.clone(),
+            knowledge_base.knowledge_base_id.clone(),
+        );
+        self.knowledge_base_arn_index.insert(
+            knowledge_base.knowledge_base_arn.clone(),
+            knowledge_base.knowledge_base_id.clone(),
+        );
         self.knowledge_bases
             .insert(knowledge_base.knowledge_base_id.clone(), knowledge_base);
+        true
+    }
+
+    /// Drop a knowledge base and every index entry that named it — including the
+    /// `clientToken` entry that created it, so a create/delete cycle reclaims
+    /// everything it allocated and a replayed token cannot resurrect a deleted record.
+    ///
+    /// The name goes with it, so a later create may take that name again: a duplicate
+    /// name conflicts with a LIVE knowledge base, not with one that is gone. `None`
+    /// means the label named no knowledge base, which is the caller's not-found.
+    ///
+    /// An association made against this knowledge base is NOT dropped with it: the
+    /// association keeps the id and the ARN it was made against ([`AssistantAssociation`]),
+    /// so a read of it still reports the knowledge base it names.
+    pub fn remove_knowledge_base(&mut self, label: &str) -> Option<KnowledgeBase> {
+        let id = self.resolve_knowledge_base_id(label)?;
+        let knowledge_base = self.knowledge_bases.remove(&id)?;
+        self.knowledge_base_name_index.remove(&knowledge_base.name);
+        self.knowledge_base_arn_index
+            .remove(&knowledge_base.knowledge_base_arn);
+        self.idempotency.retain(|_, resource_id| *resource_id != id);
+        // The order queue mirrors the map, so it drops exactly the same entries.
+        self.idempotency_order
+            .retain(|key| self.idempotency.contains_key(key));
+        Some(knowledge_base)
     }
 
     /// The association a (assistant label, association label) pair names, in
@@ -708,6 +841,16 @@ pub fn assistant_arn(region: &str, assistant_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("assistant/{assistant_id}"))
 }
 
+/// The ARN of a knowledge base:
+/// `arn:aws:wisdom:<region>:<account>:knowledge-base/<knowledgeBaseId>`.
+pub fn knowledge_base_arn(region: &str, knowledge_base_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("knowledge-base/{knowledge_base_id}"),
+    )
+}
+
 /// The ARN of a session: `arn:aws:wisdom:<region>:<account>:session/<assistantId>/<sessionId>`.
 ///
 /// The session's own id is the LAST segment and the owning assistant's the
@@ -718,16 +861,6 @@ pub fn session_arn(region: &str, assistant_id: &str, session_id: &str) -> String
         ARN_NAMESPACE,
         region,
         &format!("session/{assistant_id}/{session_id}"),
-    )
-}
-
-/// The ARN of a knowledge base:
-/// `arn:aws:wisdom:<region>:<account>:knowledge-base/<knowledgeBaseId>`.
-pub fn knowledge_base_arn(region: &str, knowledge_base_id: &str) -> String {
-    ::engine::emulator_arn(
-        ARN_NAMESPACE,
-        region,
-        &format!("knowledge-base/{knowledge_base_id}"),
     )
 }
 
