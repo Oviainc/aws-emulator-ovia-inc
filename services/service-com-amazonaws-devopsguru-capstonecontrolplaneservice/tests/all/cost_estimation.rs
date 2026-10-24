@@ -137,119 +137,125 @@ async fn add_coverage(emulator: &Emulator, collection: Value) {
     );
 }
 
-/// What one row of the resolution table expects back.
+/// What one row of the collection table expects back.
 #[derive(Debug)]
 enum Expect {
-    /// The start is accepted and an estimation is created.
-    Accepted,
+    /// The start is accepted and the estimate prices these `(Type, Count)` lines.
+    Accepted(&'static [(&'static str, i64)]),
     /// The start is refused with this error shape and status.
     Refused(&'static str, u16),
 }
 
 struct ResolutionCase {
     name: &'static str,
-    /// Coverage to declare through `UpdateResourceCollection` first, if any.
+    /// Coverage to declare through `UpdateResourceCollection` before the start, if
+    /// any. The rule is that it makes NO difference to the estimate, so the rows vary
+    /// it deliberately: absent, disjoint, identical, differing only in letter case.
     coverage: Option<Value>,
     collection: Value,
     expect: Expect,
-    /// For a refusal that names a resource, the `(ResourceId, ResourceType)` the error
-    /// must carry.
-    missing: Option<(&'static str, &'static str)>,
-    /// The exact `Message` the refusal must carry, where the service answers the
-    /// condition with a fixed text rather than one built from the request.
-    expect_message: Option<&'static str>,
 }
 
-/// RULE: a cost estimate is of the resources DevOps Guru analyses, so
-/// `StartCostEstimation` resolves every resource the submitted collection names — a
-/// CloudFormation stack, an app-boundary tag value — against the account's analysis
-/// coverage, and refuses one the coverage does not hold with
-/// `ResourceNotFoundException` (404) naming that resource; a collection that names no
-/// resource at all, or more tags than the one a cost estimate may carry, is refused
-/// with `ValidationException` (400). A refusal creates no estimation.
+/// RULE: a cost estimate prices the `CostEstimationResourceCollectionFilter` the
+/// request itself submits — DevOps Guru's estimate exists so a customer can price
+/// analysis of resources BEFORE enabling analysis for them — so `StartCostEstimation`
+/// never resolves that collection against the account's analysis coverage: a
+/// well-formed collection is accepted (200) and read back by `GetCostEstimation`
+/// whichever resources the coverage holds, and only a collection no estimate can be
+/// made of (one naming no resource at all, or one outside a modelled or documented
+/// size) is refused, with `ValidationException` (400), creating no estimation.
 ///
-/// The rows differ along which half of the collection is named, whether its entries
-/// are covered, how many entries it names (none, one, two) and letter case.
+/// The rows differ along which half of the collection is named, how many entries it
+/// names (none, one, two) and how the coverage declared first overlaps it (absent,
+/// disjoint, identical, differing only in letter case).
 #[tokio::test]
-async fn a_start_resolves_its_collection_against_the_analysis_coverage() {
+async fn a_start_prices_its_own_collection_whatever_the_coverage_holds() {
+    /// `ServiceResourceCost.Type` for the stack half of a collection.
+    const STACK: &str = "AWS::CloudFormation::Stack";
+    /// `ServiceResourceCost.Type` for the tag half of a collection.
+    const TAG: &str = "AWS::Tag";
+
     let cases = [
         ResolutionCase {
             name: "a stack with no coverage declared at all",
             coverage: None,
             collection: cloud_formation(&["my-stack"]),
-            expect: Expect::Refused("ResourceNotFoundException", 404),
-            missing: Some(("my-stack", "AWS::CloudFormation::Stack")),
-            expect_message: None,
+            expect: Expect::Accepted(&[(STACK, 1)]),
         },
         ResolutionCase {
-            name: "the covered stack",
+            name: "the stack the coverage already holds",
             coverage: Some(cloud_formation(&["my-stack"])),
             collection: cloud_formation(&["my-stack"]),
-            expect: Expect::Accepted,
-            missing: None,
-            expect_message: None,
+            expect: Expect::Accepted(&[(STACK, 1)]),
         },
         ResolutionCase {
             name: "a stack other than the covered one",
             coverage: Some(cloud_formation(&["covered-stack"])),
             collection: cloud_formation(&["other-stack"]),
-            expect: Expect::Refused("ResourceNotFoundException", 404),
-            missing: Some(("other-stack", "AWS::CloudFormation::Stack")),
-            expect_message: None,
+            expect: Expect::Accepted(&[(STACK, 1)]),
         },
         ResolutionCase {
             name: "a covered stack name in different letter case",
             coverage: Some(cloud_formation(&["MyStack"])),
             collection: cloud_formation(&["mystack"]),
-            expect: Expect::Refused("ResourceNotFoundException", 404),
-            missing: Some(("mystack", "AWS::CloudFormation::Stack")),
-            expect_message: None,
+            expect: Expect::Accepted(&[(STACK, 1)]),
         },
         ResolutionCase {
             name: "a tag no covered resource carries",
             coverage: None,
             collection: tags(&[("Devops-guru-app", &["production"])]),
-            expect: Expect::Refused("ResourceNotFoundException", 404),
-            missing: Some(("Devops-guru-app/production", "AWS::Tag")),
-            expect_message: Some("Invalid tag in the request"),
+            expect: Expect::Accepted(&[(TAG, 1)]),
         },
         ResolutionCase {
             name: "a covered app boundary key with an uncovered value",
             coverage: Some(tags(&[("Devops-guru-app", &["production"])])),
             collection: tags(&[("Devops-guru-app", &["staging"])]),
-            expect: Expect::Refused("ResourceNotFoundException", 404),
-            missing: Some(("Devops-guru-app/staging", "AWS::Tag")),
-            expect_message: Some("Invalid tag in the request"),
+            expect: Expect::Accepted(&[(TAG, 1)]),
         },
         ResolutionCase {
-            name: "a covered tag filter",
+            name: "the tag filter the coverage already holds",
             coverage: Some(tags(&[("Devops-guru-app", &["production"])])),
             collection: tags(&[("Devops-guru-app", &["production"])]),
-            expect: Expect::Accepted,
-            missing: None,
-            expect_message: None,
+            expect: Expect::Accepted(&[(TAG, 1)]),
+        },
+        ResolutionCase {
+            name: "an app boundary key outside the Devops-guru- prefix",
+            coverage: None,
+            collection: tags(&[("Team", &["payments"])]),
+            expect: Expect::Accepted(&[(TAG, 1)]),
+        },
+        ResolutionCase {
+            name: "both halves, neither of them covered",
+            coverage: Some(cloud_formation(&["covered-stack"])),
+            collection: json!({
+                "CloudFormation": { "StackNames": ["uncovered-stack"] },
+                "Tags": [{ "AppBoundaryKey": "Devops-guru-app", "TagValues": ["staging"] }],
+            }),
+            expect: Expect::Accepted(&[(STACK, 1), (TAG, 1)]),
         },
         ResolutionCase {
             name: "a collection naming neither half",
             coverage: Some(cloud_formation(&["my-stack"])),
             collection: json!({}),
             expect: Expect::Refused("ValidationException", 400),
-            missing: None,
-            expect_message: None,
         },
         ResolutionCase {
             name: "a CloudFormation filter naming no stack",
             coverage: Some(cloud_formation(&["my-stack"])),
             collection: json!({ "CloudFormation": {} }),
             expect: Expect::Refused("ValidationException", 400),
-            missing: None,
-            expect_message: None,
+        },
+        ResolutionCase {
+            // `CostEstimationStackNames`'s length is fixed at 1 item by the model, so
+            // a second stack is outside the collection's modelled size.
+            name: "one stack more than the modelled list holds",
+            coverage: None,
+            collection: cloud_formation(&["first-stack", "second-stack"]),
+            expect: Expect::Refused("ValidationException", 400),
         },
         ResolutionCase {
             // "The maximum number of tags you can specify for a cost estimate is one"
-            // — `TagCostEstimationResourceCollectionFilter`'s model documentation. The
-            // refusal is about the request, so it needs no coverage (and an account
-            // has exactly one app-boundary key, so two could never be covered).
+            // — `TagCostEstimationResourceCollectionFilter`'s model documentation.
             name: "one tag filter more than a cost estimate may carry",
             coverage: None,
             collection: tags(&[
@@ -257,14 +263,14 @@ async fn a_start_resolves_its_collection_against_the_analysis_coverage() {
                 ("Devops-guru-tier", &["web"]),
             ]),
             expect: Expect::Refused("ValidationException", 400),
-            missing: None,
-            expect_message: None,
         },
     ];
 
+    // The documented maximum the "one tag filter more than a cost estimate may carry"
+    // row exercises.
     assert_eq!(
         MAX_COST_ESTIMATION_TAG_FILTERS, 1,
-        "the documented maximum of one tag per cost estimate is what the last row exercises, got {MAX_COST_ESTIMATION_TAG_FILTERS}"
+        "the documented maximum of one tag per cost estimate is what that row exercises, got {MAX_COST_ESTIMATION_TAG_FILTERS}"
     );
 
     for case in &cases {
@@ -277,7 +283,7 @@ async fn a_start_resolves_its_collection_against_the_analysis_coverage() {
         let read = get_cost_estimation(&emulator, None).await;
 
         match case.expect {
-            Expect::Accepted => {
+            Expect::Accepted(expect_lines) => {
                 assert_eq!(
                     reply.status, 200,
                     "case {:?}: expected the start to be accepted with 200, got {} {}",
@@ -288,6 +294,23 @@ async fn a_start_resolves_its_collection_against_the_analysis_coverage() {
                     "case {:?}: expected the created estimation to read back, got {}",
                     case.name,
                     read.raw
+                );
+                assert_eq!(
+                    read.at("/ResourceCollection"),
+                    Some(&case.collection),
+                    "case {:?}: expected the submitted collection to round-trip, got {}",
+                    case.name,
+                    read.raw
+                );
+                let lines = reported_cost_lines(&read);
+                let expected: Vec<(String, i64)> = expect_lines
+                    .iter()
+                    .map(|(resource_type, count)| (resource_type.to_string(), *count))
+                    .collect();
+                assert_eq!(
+                    lines, expected,
+                    "case {:?}: expected cost lines {expected:?}, got {lines:?} in {}",
+                    case.name, read.raw
                 );
             }
             Expect::Refused(error_name, status) => {
@@ -302,31 +325,6 @@ async fn a_start_resolves_its_collection_against_the_analysis_coverage() {
                     case.name,
                     reply.raw
                 );
-                if let Some((resource_id, resource_type)) = case.missing {
-                    assert_eq!(
-                        reply.at("/ResourceId").and_then(Value::as_str),
-                        Some(resource_id),
-                        "case {:?}: expected the error to name the missing resource, got {}",
-                        case.name,
-                        reply.raw
-                    );
-                    assert_eq!(
-                        reply.at("/ResourceType").and_then(Value::as_str),
-                        Some(resource_type),
-                        "case {:?}: expected the error to name the resource's type, got {}",
-                        case.name,
-                        reply.raw
-                    );
-                }
-                if let Some(expect_message) = case.expect_message {
-                    assert_eq!(
-                        reply.at("/Message").and_then(Value::as_str),
-                        Some(expect_message),
-                        "case {:?}: expected the refusal's fixed message, got {}",
-                        case.name,
-                        reply.raw
-                    );
-                }
                 assert_eq!(
                     reported_status(&read),
                     None,
@@ -345,40 +343,119 @@ async fn a_start_resolves_its_collection_against_the_analysis_coverage() {
     }
 }
 
+/// RULE: the pre-onboarding workflow a cost estimate exists for — estimate first,
+/// onboard afterwards — works in that order: a start before any
+/// `UpdateResourceCollection` is accepted, the estimate it created reports the
+/// collection it was given, and onboarding resources afterwards neither creates nor
+/// changes an estimate.
+///
+/// The steps differ along the order of the calls relative to the coverage change and
+/// along which half of the collection each call names.
+#[tokio::test]
+async fn an_estimate_can_be_made_before_anything_is_onboarded() {
+    let emulator = Emulator::new();
+
+    // Nothing is onboarded: the account's coverage is empty.
+    let collection = cloud_formation(&["not-yet-onboarded"]);
+    let started = start_cost_estimation(&emulator, &collection, Some("preonboarding")).await;
+    assert_eq!(
+        started.status, 200,
+        "case {:?}: expected 200 before anything is onboarded, got {} {}",
+        "start with an empty coverage", started.status, started.raw
+    );
+
+    let read = get_cost_estimation(&emulator, None).await;
+    assert!(
+        reports_an_estimation(&read),
+        "case {:?}: expected the estimate to be reported, got {}",
+        "read before onboarding",
+        read.raw
+    );
+    assert_eq!(
+        read.strings_at("/ResourceCollection/CloudFormation/StackNames"),
+        vec!["not-yet-onboarded".to_string()],
+        "case {:?}: expected the submitted collection to be reported, got {}",
+        "read before onboarding",
+        read.raw
+    );
+    let priced = reported_total_cost(&read);
+    assert!(
+        (priced - monthly_cost(1)).abs() < MONEY_EPSILON,
+        "case {:?}: expected the one named stack to be priced at {}, got {priced} in {}",
+        "read before onboarding",
+        monthly_cost(1),
+        read.raw
+    );
+
+    // Onboarding is the NEXT step of the workflow, and it is not what makes an
+    // estimate: it changes neither the estimate's collection nor its cost.
+    add_coverage(&emulator, cloud_formation(&["not-yet-onboarded"])).await;
+    add_coverage(&emulator, tags(&[("Devops-guru-app", &["production"])])).await;
+    let after = get_cost_estimation(&emulator, None).await;
+    assert_eq!(
+        after.at("/ResourceCollection"),
+        read.at("/ResourceCollection"),
+        "case {:?}: onboarding must not rewrite the estimate's collection, got {}",
+        "read after onboarding",
+        after.raw
+    );
+    let after_total = reported_total_cost(&after);
+    assert!(
+        (after_total - priced).abs() < MONEY_EPSILON,
+        "case {:?}: expected the estimate's cost to stay {priced}, got {after_total} in {}",
+        "read after onboarding",
+        after.raw
+    );
+}
+
 struct PricingCase {
     name: &'static str,
     /// Every coverage filter to declare through `UpdateResourceCollection` first, so a
-    /// row needs no code outside the table.
+    /// row needs no code outside the table. Empty for a row that prices a collection
+    /// nothing has been onboarded for, which is priced exactly like an onboarded one.
     coverage: Vec<Value>,
     collection: Value,
     /// The `(Type, Count)` lines the estimate must report, in order.
     expect_lines: &'static [(&'static str, i64)],
 }
 
-/// RULE: the estimate prices the resources the collection names — one line per
-/// resource type, each counting the resources of that type, priced at DevOps Guru's
-/// published per-resource-hour rate over a billing month — and `TotalCost` is the sum
-/// of the lines in the response.
+/// RULE: the estimate prices the resources the submitted collection names — one line
+/// per resource type, each counting the resources of that type, priced at DevOps
+/// Guru's published per-resource-hour rate over a billing month — and `TotalCost` is
+/// the sum of the lines in the response.
 ///
-/// The rows differ along which half of the collection is named and how many types the
-/// estimate therefore prices (one, two).
+/// The rows differ along which half of the collection is named, how many types the
+/// estimate therefore prices (one, two) and whether the named resources have been
+/// onboarded for analysis (which does not change the price).
 #[tokio::test]
-async fn the_estimate_prices_every_covered_resource_the_collection_resolves_to() {
+async fn the_estimate_prices_every_resource_its_collection_names() {
     let cases = [
         PricingCase {
-            name: "a covered stack",
+            name: "an onboarded stack",
             coverage: vec![cloud_formation(&["my-stack"])],
             collection: cloud_formation(&["my-stack"]),
             expect_lines: &[("AWS::CloudFormation::Stack", 1)],
         },
         PricingCase {
-            name: "a covered tag value",
+            name: "a stack nothing has been onboarded for",
+            coverage: vec![],
+            collection: cloud_formation(&["unonboarded-stack"]),
+            expect_lines: &[("AWS::CloudFormation::Stack", 1)],
+        },
+        PricingCase {
+            name: "an onboarded tag value",
             coverage: vec![tags(&[("Devops-guru-app", &["production"])])],
             collection: tags(&[("Devops-guru-app", &["production"])]),
             expect_lines: &[("AWS::Tag", 1)],
         },
         PricingCase {
-            name: "both halves covered",
+            name: "a tag value nothing has been onboarded for",
+            coverage: vec![],
+            collection: tags(&[("Devops-guru-app", &["staging"])]),
+            expect_lines: &[("AWS::Tag", 1)],
+        },
+        PricingCase {
+            name: "both halves onboarded",
             coverage: vec![
                 cloud_formation(&["my-stack"]),
                 tags(&[("Devops-guru-app", &["production"])]),
@@ -386,6 +463,15 @@ async fn the_estimate_prices_every_covered_resource_the_collection_resolves_to()
             collection: json!({
                 "CloudFormation": { "StackNames": ["my-stack"] },
                 "Tags": [{ "AppBoundaryKey": "Devops-guru-app", "TagValues": ["production"] }],
+            }),
+            expect_lines: &[("AWS::CloudFormation::Stack", 1), ("AWS::Tag", 1)],
+        },
+        PricingCase {
+            name: "both halves with an empty coverage",
+            coverage: vec![],
+            collection: json!({
+                "CloudFormation": { "StackNames": ["fresh-stack"] },
+                "Tags": [{ "AppBoundaryKey": "Devops-guru-app", "TagValues": ["canary"] }],
             }),
             expect_lines: &[("AWS::CloudFormation::Stack", 1), ("AWS::Tag", 1)],
         },
