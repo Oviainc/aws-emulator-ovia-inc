@@ -31,3 +31,5 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/tagging_frontend_errors.rs"]
 mod tagging_frontend_errors;
+#[path = "all/update_investigation_group_identifier.rs"]
+mod update_investigation_group_identifier;
