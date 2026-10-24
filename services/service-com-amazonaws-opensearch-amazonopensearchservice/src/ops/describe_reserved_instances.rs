@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReservedInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReservedInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReservedInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Reserved Instances this account holds: the records
+//! `PurchaseReservedInstanceOffering` persisted, narrowed by
+//! `ReservedInstanceId` and paged by `MaxResults`/`NextToken`.
+//!
+//! A REPORTING operation. The one write it makes is materialising the state
+//! change the clock already owed each reservation — owed at this instant whether
+//! or not anybody called — through
+//! [`crate::state::ComAmazonawsOpensearchAmazonopensearchserviceState::settle_reserved_instances`].
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +87,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::is_guid;
+
+/// The largest page this operation answers with: `MaxResults` is
+/// `@range(max: 100)`, the same bound `DescribeReservedInstanceOfferings` serves.
+const MAX_PAGE_SIZE: i32 = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -120,6 +126,15 @@ impl From<DescribeReservedInstancesErrorModeled> for DescribeReservedInstancesEr
     fn from(modeled: DescribeReservedInstancesErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// `message` as this operation's modelled `ValidationException` (HTTP 400): the
+/// refusal of a request this operation cannot serve as asked.
+fn validation(message: String) -> DescribeReservedInstancesError {
+    DescribeReservedInstancesErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }
 
 /// The `DescribeReservedInstances` operation.
@@ -158,18 +173,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReservedInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReservedInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReservedInstances"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // `MaxResults` is `@range(max: 100)`, so a larger page size is a malformed
+        // request; the boundary validator refuses it before this handler runs, and
+        // the check is repeated here so the rule holds however the request reached
+        // us. A NEGATIVE page size is malformed for the same reason — it is not a
+        // page size at all — while `@default(0)` (no page size sent) stays the
+        // unbounded case below. The same rule as the offerings listing serves.
+        if input.max_results < 0 || input.max_results > MAX_PAGE_SIZE {
+            return Err(validation(format!(
+                "MaxResults must be between 0 and {MAX_PAGE_SIZE}: {}",
+                input.max_results
+            )));
+        }
+        // `GUID` is `@length(36, 36)` with its own pattern, and the request
+        // boundary enforces only the length, so a value that is not a `GUID` is
+        // refused here rather than treated as an id that merely names nothing.
+        if let Some(id) = input.reserved_instance_id.as_deref() {
+            if !is_guid(id) {
+                return Err(DescribeReservedInstancesErrorModeled::ValidationException(
+                    crate::state::malformed_guid("ReservedInstanceId", id),
+                )
+                .into());
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_reserved_instances(now);
+
+        // `ReservedInstanceId` "shows only the reservation that matches the
+        // specified reserved OpenSearch instance ID": it names ONE resource, so it
+        // narrows the listing to that reservation — and an id this account holds no
+        // reservation under is refused rather than served as an empty page.
+        let selected: Vec<&crate::state::ReservedInstanceRecord> =
+            match input.reserved_instance_id.as_deref() {
+                Some(id) => {
+                    let reservation = store.reserved_instances.get(id).ok_or_else(|| {
+                        DescribeReservedInstancesErrorModeled::ValidationException(
+                            crate::state::reserved_instance_not_found(id),
+                        )
+                    })?;
+                    vec![reservation]
+                }
+                None => store.reserved_instances.values().collect(),
+            };
+
+        // The token names the first reservation of the page to answer with, so a
+        // caller resumes exactly where the previous page stopped. It is only ever a
+        // value this operation handed out, so one that names no reservation of the
+        // listing is a malformed request rather than an empty page — and because the
+        // listing is what the filter selected, a token is scoped to the filter it
+        // was issued under.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => selected
+                .iter()
+                .position(|reservation| reservation.reserved_instance_id == token)
+                .ok_or_else(|| {
+                    DescribeReservedInstancesErrorModeled::ValidationException(
+                        crate::state::invalid_next_token(),
+                    )
+                })?,
+        };
+
+        // "An optional parameter that specifies the maximum number of results to
+        // return." `MaxResults` is `@default(0)`, so a request that sends no page
+        // size reaches here as zero: nothing bounds the page but the store itself,
+        // which is bounded by the reserved-instance quota.
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|size| *size > 0)
+            .unwrap_or(selected.len());
+        let end = start.saturating_add(page_size).min(selected.len());
+        let page: Vec<ReservedInstance> = selected[start..end]
+            .iter()
+            .map(|reservation| reservation.to_modeled())
+            .collect();
+
+        // "When nextToken is returned, there are more results available" — so the
+        // member is present only while the listing holds a reservation this page did
+        // not report, and the last page carries none.
+        let next_token = selected
+            .get(end)
+            .map(|reservation| reservation.reserved_instance_id.clone());
+
+        Ok(DescribeReservedInstancesOutput {
+            next_token,
+            reserved_instances: Some(page),
+        })
     }
 }

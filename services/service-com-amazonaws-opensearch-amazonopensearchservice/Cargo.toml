@@ -22,9 +22,10 @@ http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # Mints the GUID `ChangeId` a domain configuration change is addressed by
-# (`state::new_change_id`): `GUID`'s pattern is exactly a hyphenated UUID. The `v5`
-# feature derives the GUID of a seeded Reserved Instance offering from what the
-# offering IS, so the catalog reports the same ids on every call.
+# (`state::new_change_id`) and the GUID `ReservedInstanceId` a purchase mints
+# (`state::new_reserved_instance_id`): `GUID`'s pattern is exactly a hyphenated
+# UUID. The `v5` feature derives the GUID of a seeded Reserved Instance offering
+# from what the offering IS, so the catalog reports the same ids on every call.
 uuid = { version = "1", features = ["v4", "v5"] }
 
 [build-dependencies]
