@@ -1162,8 +1162,10 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// not-found answer is made from.
     ///
     /// Tags live ON the resource record (the same map `CreateBillingGroup` /
-    /// `CreatePricingPlan` / `CreatePricingRule` persisted their `Tags` into), so there
-    /// is one copy of a resource's tags and a delete reclaims them with the resource.
+    /// `CreatePricingPlan` / `CreatePricingRule` / `CreateCustomLineItem` persisted their
+    /// `Tags` into), so there is one copy of a resource's tags and a delete reclaims them
+    /// with the resource. EVERY taggable kind this service persists is resolved here: a
+    /// kind left unresolved would make the tags its create stored unreadable.
     pub fn resource_tags(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
         let resource = parse_taggable_arn(resource_arn)?;
         match resource.kind {
@@ -1179,10 +1181,10 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
                 .pricing_rules
                 .get(&resource.arn)
                 .map(|record| &record.tags),
-            // Nothing in this slice persists a custom line item
-            // (`CreateCustomLineItem` is still a scaffold), so no ARN of that kind names
-            // a resource that exists yet.
-            TaggableResourceKind::CustomLineItem => None,
+            TaggableResourceKind::CustomLineItem => self
+                .custom_line_items
+                .get(&resource.arn)
+                .map(|record| &record.tags),
         }
     }
 
@@ -1205,7 +1207,10 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
                 .pricing_rules
                 .get_mut(&resource.arn)
                 .map(|record| &mut record.tags),
-            TaggableResourceKind::CustomLineItem => None,
+            TaggableResourceKind::CustomLineItem => self
+                .custom_line_items
+                .get_mut(&resource.arn)
+                .map(|record| &mut record.tags),
         }
     }
 }

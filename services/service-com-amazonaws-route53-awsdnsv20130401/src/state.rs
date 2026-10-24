@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::shared_types::{
     ChangeInfo, DelegationSet, HostedZone, HostedZoneConfig, NoSuchHostedZone, ResourceRecordSet,
-    Tag, VPC,
+    Tag, VPC, V_P_C_REGION_VALUES,
 };
 
 /// How long after a change is submitted it reaches `INSYNC`.
@@ -97,6 +97,15 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 10;
 /// Route 53's documented account quota ("Health checks: 200 per account"), and
 /// the model declares `TooManyHealthChecks` for the refusal that enforces it.
 pub const MAX_HEALTH_CHECKS: usize = 200;
+
+/// The most Amazon VPCs one private hosted zone may be associated with.
+///
+/// Route 53's documented per-zone quota ("Amazon VPCs that you can associate
+/// with a private hosted zone: 100"), which is the limit
+/// `HostedZoneLimitType`'s `MAX_VPCS_ASSOCIATED_BY_ZONE` reports and which
+/// `AssociateVPCWithHostedZone`'s modelled `LimitsExceeded` refuses past, so
+/// repeated associations cannot grow one zone's association list without end.
+pub const MAX_VPCS_PER_HOSTED_ZONE: usize = 100;
 
 /// The most reusable delegation sets the account may hold.
 ///
@@ -342,6 +351,20 @@ impl StoredZone {
                 || !matches!(key.rr_type.as_str(), "SOA" | "NS")
         })
     }
+
+    /// Where this zone's association list holds the VPC named by `vpc_id`, if it
+    /// holds it at all.
+    ///
+    /// An Amazon VPC id identifies the VPC on its own, so it alone is the
+    /// identity of an association; the region is carried ALONGSIDE it (it is
+    /// what a reader needs to find the VPC again), never part of that identity.
+    /// A zone therefore holds at most one association per VPC id, which is what
+    /// makes associating a VPC a second time a no-op rather than a duplicate.
+    pub fn vpc_position(&self, vpc_id: &str) -> Option<usize> {
+        self.vpcs
+            .iter()
+            .position(|vpc| vpc.vpc_id.as_deref() == Some(vpc_id))
+    }
 }
 
 /// Per-service state for com-amazonaws-route53-awsdnsv20130401. A handler reaches it through [`service_state`].
@@ -445,6 +468,28 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
             _ => return None,
         };
         Some((count_as_i64(limit), count_as_i64(count)))
+    }
+
+    /// The zone OTHER than `excluding_zone_id` that carries the same DNS name
+    /// as `zone_name` and is already associated with `vpc_id`, if there is one.
+    ///
+    /// `ConflictingDomainExists`'s own documentation, for the case "Associate
+    /// VPCs with a private hosted zone": "The VPC that you specified is already
+    /// associated with another hosted zone that has the same name." One VPC
+    /// resolving one name through two zones has no answer, so the association
+    /// that would create the ambiguity is the one refused.
+    pub fn zone_with_name_associated_to_vpc(
+        &self,
+        zone_name: &str,
+        excluding_zone_id: &str,
+        vpc_id: &str,
+    ) -> Option<&StoredZone> {
+        let name_key = dns_sort_key(zone_name);
+        self.zones.values().find(|zone| {
+            zone.id != excluding_zone_id
+                && dns_sort_key(&zone.name) == name_key
+                && zone.vpc_position(vpc_id).is_some()
+        })
     }
 
     /// Mint the four authoritative name servers for a new hosted zone.
@@ -651,6 +696,32 @@ pub fn new_request_id() -> String {
         &hex[16..20],
         &hex[20..32]
     )
+}
+
+/// Whether `vpc_id` has the form of an Amazon VPC id.
+///
+/// A VPC id is the literal `vpc-` followed by the resource's lowercase
+/// hexadecimal identifier — 8 characters in the original form, 17 in the long
+/// form issued today — and nothing else names a VPC. `InvalidVPCId`'s own
+/// documentation is the refusal for anything else: "The VPC ID that you
+/// specified either isn't a valid ID or the current account is not authorized
+/// to access this VPC."
+pub fn vpc_id_is_well_formed(vpc_id: &str) -> bool {
+    let Some(body) = vpc_id.strip_prefix("vpc-") else {
+        return false;
+    };
+    matches!(body.len(), 8 | 17)
+        && body
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Whether `region` is one of the regions the model's `VPCRegion` enum names.
+///
+/// `VPC$VPCRegion` targets that enum, so a value outside it names no region a
+/// VPC can have been created in.
+pub fn vpc_region_is_modelled(region: &str) -> bool {
+    V_P_C_REGION_VALUES.contains(&region)
 }
 
 /// A hosted-zone id with the `/hostedzone/` prefix stripped, so a caller may

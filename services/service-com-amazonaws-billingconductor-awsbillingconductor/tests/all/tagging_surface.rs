@@ -18,10 +18,11 @@
 //!    `issues/.../20261022T200837Z-billingconductor-tagresource-stub.md`) — and nothing
 //!    is created by the attempt.
 //!
-//! The rows differ along what those rules generalise over: the resource KIND
-//! (`pricingplan`, `billinggroup`, and the two kinds nothing persists yet), the ARN
-//! SPELLING of one resource (the `billinggroup` separator the modelled pattern makes
-//! optional), how many pairs one request carries, whether a key is new or overwritten,
+//! The rows differ along what those rules generalise over: the resource KIND (all four
+//! the modelled tagging `Arn` enumerates — `pricingplan`, `billinggroup`, `pricingrule`
+//! and `customlineitem`), the ARN SPELLING of one resource (the `billinggroup` separator
+//! the modelled pattern makes optional, and the bare custom-line-item id), how many pairs
+//! one request carries, whether a key is new or overwritten,
 //! the tag value at each end of the modelled `TagValue` length bound, a key at the
 //! modelled `TagKey` maximum, how many keys one `UntagResource` removes, whether a
 //! removed key was ever set, and which single ARN field (account, partition, resource
@@ -164,6 +165,59 @@ impl Emulator {
         answered["Arn"]
             .as_str()
             .expect("setup CreateBillingGroup: no Arn in the response")
+            .to_string()
+    }
+
+    /// Create a pricing rule and return the ARN it minted.
+    async fn create_rule(&self, name: &str, tags: Option<Value>) -> String {
+        let mut body = json!({
+            "Name": name,
+            "Scope": "GLOBAL",
+            "Type": "MARKUP",
+            "ModifierPercentage": 10.0,
+        });
+        if let Some(tags) = tags {
+            body["Tags"] = tags;
+        }
+        let (status, answered) = self.call("POST", "/create-pricing-rule", Some(&body)).await;
+        assert_eq!(
+            status, 200,
+            "setup CreatePricingRule {name:?}: expected 200, got {status} with {answered}"
+        );
+        answered["Arn"]
+            .as_str()
+            .expect("setup CreatePricingRule: no Arn in the response")
+            .to_string()
+    }
+
+    /// Create a custom line item on `group_arn` with the given `ChargeDetails` and return
+    /// the ARN it minted.
+    async fn create_item(
+        &self,
+        name: &str,
+        group_arn: &str,
+        charge_details: Value,
+        tags: Option<Value>,
+    ) -> String {
+        let mut body = json!({
+            "Name": name,
+            "Description": format!("the {name} custom line item"),
+            "BillingGroupArn": group_arn,
+            "ChargeDetails": charge_details,
+        });
+        if let Some(tags) = tags {
+            body["Tags"] = tags;
+        }
+        let (status, answered) = self
+            .call("POST", "/create-custom-line-item", Some(&body))
+            .await;
+        assert_eq!(
+            status, 200,
+            "setup CreateCustomLineItem {name:?}: expected 200, got {status} with {answered}"
+        );
+        answered["Arn"]
+            .as_str()
+            .expect("setup CreateCustomLineItem: no Arn in the response")
             .to_string()
     }
 
@@ -402,6 +456,189 @@ async fn tag_resource_merges_its_pairs_into_the_named_resource() {
     );
 }
 
+/// The bare resource id of a full ARN — the other spelling the modelled tagging `Arn`
+/// admits for a custom line item
+/// (`^(arn:aws(-cn)?:billingconductor::[0-9]{12}:customlineitem/)?[a-zA-Z0-9]{10}$`).
+fn bare_id(arn: &str) -> &str {
+    match arn.rsplit_once('/') {
+        Some((_, id)) => id,
+        None => arn,
+    }
+}
+
+/// RULE 1, across KINDS: a tagging operation resolves its `ResourceArn` against EVERY
+/// taggable resource kind this service persists, so the `Tags` a create stored are what
+/// `ListTagsForResource` reports and what `TagResource` / `UntagResource` change — for a
+/// custom line item exactly as for a pricing plan, a billing group or a pricing rule.
+///
+/// The rows differ along the resource KIND the ARN names (all four the modelled tagging
+/// `Arn` enumerates), the ARN SPELLING of one resource (the optional `billinggroup`
+/// separator, and the bare custom-line-item id the pattern admits), the charge shape of a
+/// custom line item (flat and percentage), how many pairs its create persisted, and
+/// whether the create persisted any tags at all.
+#[tokio::test]
+async fn the_tagging_surface_addresses_every_taggable_kind_this_service_persists() {
+    let em = Emulator::new();
+    let plan = em
+        .create_plan("KindsPlan", Some(tag_map(&[("kind", "pricingplan")])))
+        .await;
+    let group = em
+        .create_group(
+            "KindsGroup",
+            &plan,
+            Some(tag_map(&[("kind", "billinggroup")])),
+        )
+        .await;
+    let group_unseparated = group.replace("billinggroup/", "billinggroup");
+    let rule = em
+        .create_rule("KindsRule", Some(tag_map(&[("kind", "pricingrule")])))
+        .await;
+    let flat_item = em
+        .create_item(
+            "KindsFlatItem",
+            &group,
+            json!({ "Type": "FEE", "Flat": { "ChargeValue": 10.0 } }),
+            Some(tag_map(&[("kind", "customlineitem"), ("env", "prod")])),
+        )
+        .await;
+    let percentage_item = em
+        .create_item(
+            "KindsPercentageItem",
+            &group,
+            json!({ "Type": "CREDIT", "Percentage": { "PercentageValue": 12.5 } }),
+            Some(tag_map(&[("kind", "customlineitem")])),
+        )
+        .await;
+    let untagged_item = em
+        .create_item(
+            "KindsUntaggedItem",
+            &group,
+            json!({ "Type": "FEE", "Flat": { "ChargeValue": 1.0 } }),
+            None,
+        )
+        .await;
+    let percentage_item_bare = bare_id(&percentage_item).to_string();
+
+    /// One row: the ARN the tagging calls address, the spelling the tags are read back
+    /// through (the same resource), and the pairs that resource's own create persisted.
+    struct KindCase<'a> {
+        label: &'a str,
+        address: &'a str,
+        read_through: &'a str,
+        created: Vec<(&'a str, &'a str)>,
+    }
+
+    let cases: Vec<KindCase<'_>> = vec![
+        KindCase {
+            label: "a pricing plan, by its full ARN",
+            address: &plan,
+            read_through: &plan,
+            created: vec![("kind", "pricingplan")],
+        },
+        KindCase {
+            label: "a billing group, by its full ARN",
+            address: &group,
+            read_through: &group,
+            created: vec![("kind", "billinggroup")],
+        },
+        KindCase {
+            label: "the same billing group, without the optional separator",
+            address: &group_unseparated,
+            read_through: &group,
+            created: vec![("kind", "billinggroup")],
+        },
+        KindCase {
+            label: "a pricing rule, by its full ARN",
+            address: &rule,
+            read_through: &rule,
+            created: vec![("kind", "pricingrule")],
+        },
+        KindCase {
+            label: "a flat custom line item created with two pairs",
+            address: &flat_item,
+            read_through: &flat_item,
+            created: vec![("kind", "customlineitem"), ("env", "prod")],
+        },
+        KindCase {
+            label: "a percentage custom line item, addressed by its bare id",
+            address: &percentage_item_bare,
+            read_through: &percentage_item,
+            created: vec![("kind", "customlineitem")],
+        },
+        KindCase {
+            label: "a custom line item created with no tags at all",
+            address: &untagged_item,
+            read_through: &untagged_item,
+            created: vec![],
+        },
+    ];
+
+    for case in &cases {
+        let label = case.label;
+
+        // The create's own `Tags` are observable: the resource exists, so the read is
+        // served, and it reports exactly what the create persisted.
+        let stored = em.stored_tags(label, case.read_through).await;
+        assert_eq!(
+            stored,
+            expected(&case.created),
+            "case {label:?}: expected the created tags {:?}, got {stored:?}",
+            expected(&case.created)
+        );
+
+        // And the resource is writable through the same ARN: a merge adds one pair.
+        let (status, body) = em.tag(case.address, &tag_map(&[("added", "yes")])).await;
+        assert_eq!(
+            status, TAGGING_STATUS,
+            "case {label:?}: TagResource expected {TAGGING_STATUS}, got {status} with {body}"
+        );
+        let mut after = case.created.clone();
+        after.push(("added", "yes"));
+        let merged = em.stored_tags(label, case.read_through).await;
+        assert_eq!(
+            merged,
+            expected(&after),
+            "case {label:?}: expected the merged tags {:?}, got {merged:?}",
+            expected(&after)
+        );
+
+        // …and removable, leaving the create's own pairs in place.
+        let (status, body) = em.untag(case.address, &["added"]).await;
+        assert_eq!(
+            status, TAGGING_STATUS,
+            "case {label:?}: UntagResource expected {TAGGING_STATUS}, got {status} with {body}"
+        );
+        let removed = em.stored_tags(label, case.read_through).await;
+        assert_eq!(
+            removed,
+            expected(&case.created),
+            "case {label:?}: expected the created tags {:?} after the removal, got {removed:?}",
+            expected(&case.created)
+        );
+    }
+
+    // A custom line item's tags are ITS OWN: the two items created on one billing group
+    // report their own maps, and the bare-id spelling names the same resource as the
+    // full ARN.
+    let flat = em.stored_tags("two items do not share tags", &flat_item).await;
+    assert_eq!(
+        flat,
+        expected(&[("kind", "customlineitem"), ("env", "prod")]),
+        "expected the flat item's own tags, got {flat:?}"
+    );
+    let by_bare = em
+        .stored_tags("the bare id names the same item", &percentage_item_bare)
+        .await;
+    let by_arn = em
+        .stored_tags("the full ARN names the same item", &percentage_item)
+        .await;
+    assert_eq!(
+        by_bare, by_arn,
+        "expected both spellings of one custom line item to report the same tags, got \
+         {by_bare:?} and {by_arn:?}"
+    );
+}
+
 /// RULE 1, the removal half: `UntagResource` deletes exactly the keys it names, leaves
 /// every other key in place, and is not refused for a key the resource never carried.
 ///
@@ -591,9 +828,8 @@ async fn a_resource_holds_at_most_the_modelled_number_of_tags() {
 /// nothing.
 ///
 /// The rows are ARNs that differ from a STORED one in exactly one field — the resource
-/// id, the resource kind, the account, the partition — plus the two taggable kinds
-/// nothing persists yet (`pricingrule`, `customlineitem`, whose creates are still
-/// scaffolds) and the bare-id spelling the modelled pattern admits.
+/// id, the resource kind, the account, the partition — over several taggable kinds, plus
+/// the bare-id spelling the modelled pattern admits.
 #[tokio::test]
 async fn every_tagging_operation_answers_404_not_found_for_an_unknown_resource() {
     let em = Emulator::new();
@@ -631,7 +867,7 @@ async fn every_tagging_operation_answers_404_not_found_for_an_unknown_resource()
             format!("arn:aws:billingconductor::{account}:billinggroup999999999999"),
         ),
         (
-            "a custom line item ARN (nothing persists one yet)",
+            "a custom line item ARN that was never created",
             format!("arn:aws:billingconductor::{account}:customlineitem/ABCDEFGHIJ"),
         ),
         (

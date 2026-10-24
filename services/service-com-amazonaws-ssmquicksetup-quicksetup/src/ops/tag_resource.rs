@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Assigns the request's key-value pairs to the tags persisted with the one
+//! configuration manager `ResourceArn` names: a key the resource already carries takes
+//! the request's value, a key it does not carry is added, and every key the request
+//! does not name stays as it was — so a later `GetConfigurationManager` reports the
+//! merged set. `@idempotent`: repeating a request leaves the same stored tags, and the
+//! stamp moves only when the stored record actually changed.
 //!
 //! ## Shape of an operation
 //!
@@ -134,6 +132,24 @@ impl From<TagResourceErrorModeled> for TagResourceError {
     }
 }
 
+/// Why this request's `Tags` map cannot be served, or `None` when it can.
+///
+/// Each key's and value's length and form are MODELLED (`TagsMap`'s `@length` and
+/// `@pattern`), so the centralized walk has already refused anything outside them; what
+/// the model does not say is how MANY entries the map may carry, so the only bound left
+/// is the store's own (`crate::state::MAX_TAGS`, the most tags one configuration manager
+/// may carry), checked before the store lock is taken. An EMPTY map needs no refusal:
+/// assigning no pair is the same no-op as re-assigning a value a key already holds.
+fn tags_rejection(tags: &::std::collections::HashMap<String, String>) -> Option<String> {
+    (tags.len() > crate::state::MAX_TAGS).then(|| {
+        format!(
+            "Tags carries {} entries, more than the {} this service accepts",
+            tags.len(),
+            crate::state::MAX_TAGS
+        )
+    })
+}
+
 /// The `TagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -170,18 +186,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // Every constraint `TagsMap` states on a key and a value is refused by the
+        // centralized walk before this body runs, so what is checked here is only what
+        // the model cannot say (see `tags_rejection`).
+        let _ = ctx;
+        if let Some(why) = tags_rejection(&input.tags) {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException { message: Some(why) },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the configuration manager store is unavailable".to_string()),
+            })
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The configuration manager is this service's only ARN-addressable resource, so
+        // an ARN naming no stored manager names no taggable resource at all.
+        let Some(manager) = store.managers.get_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no configuration manager with ARN {} exists",
+                        input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // One resource holds at most `MAX_TAGS` tags however they were assigned, so what
+        // the bound applies to is the set this request would LEAVE stored: a pair whose
+        // key the resource already carries replaces a value and adds nothing.
+        let added = input
+            .tags
+            .keys()
+            .filter(|key| !manager.tags.contains_key(*key))
+            .count();
+        if manager.tags.len() + added > crate::state::MAX_TAGS {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "this request would leave the resource carrying {} tags, more than \
+                         the {} this service accepts",
+                        manager.tags.len() + added,
+                        crate::state::MAX_TAGS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Assignment is a MERGE: the named keys take the request's values and every
+        // other stored tag is left alone. Re-assigning the value a key already holds
+        // changes nothing, which is what makes this `@idempotent` operation answer the
+        // same way however often the same request is repeated.
+        let mut changed = false;
+        for (key, value) in input.tags {
+            match manager.tags.get(&key) {
+                Some(stored) if *stored == value => {}
+                _ => {
+                    manager.tags.insert(key, value);
+                    changed = true;
+                }
+            }
+        }
+
+        // The stamp moves only when the stored record actually changed, so a repeat of
+        // an already-served assignment leaves every reported value as it was. Monotonic:
+        // it never moves backwards, whatever the host clock does.
+        if changed {
+            manager.last_modified_at = now.max(manager.last_modified_at);
+        }
+
+        Ok(TagResourceOutput)
     }
 }
