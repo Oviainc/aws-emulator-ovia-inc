@@ -15,9 +15,10 @@
 //! what is stored, which is the same map every other reader of that resource
 //! reports. A tag write is admitted only within the documented limits: a key of
 //! 1..128 Unicode characters, no `aws:` prefix and only Unicode letters, digits,
-//! white space and `_ . / = + - @` (the model's own `UntagResourceRequest$TagKeys`
-//! documentation), a value of at most 256 characters and at most 50 tags on one
-//! resource (the published Amazon MSK tag restrictions).
+//! white space and `+ - = . _ : / @` (the character set of AWS's own tagging rule,
+//! AWS General Reference, "Tagging AWS resources"), a value of at most 256
+//! characters and at most 50 tags on one resource (the published Amazon MSK tag
+//! restrictions).
 //!
 //! The rule is asserted on BOTH resource types this service persists a tag set
 //! for — clusters and channels — because the operations resolve any MSK resource
@@ -36,10 +37,11 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 // The handler's own limits, so the suite and the service cannot disagree about
-// where a bound is. Their sources are cited on the constants: the key length and
-// character rules come from the model's `UntagResourceRequest$TagKeys`
-// documentation, the per-resource count and value length from the published Amazon
-// MSK tag restrictions.
+// where a bound is. Their sources are cited on the constants: the key length bound
+// and the reserved prefix come from the model's `UntagResourceRequest$TagKeys`
+// documentation, the admitted key characters from AWS's own tagging rule, and the
+// per-resource count and value length from the published Amazon MSK tag
+// restrictions.
 use service_com_amazonaws_kafka_kafka::state::{
     MAX_TAGS_PER_RESOURCE, MAX_TAG_KEY_LENGTH, MAX_TAG_VALUE_LENGTH,
 };
@@ -360,6 +362,17 @@ async fn tags_written_are_the_tags_every_reader_reports() {
             ]),
         },
         TagSet {
+            case: "namespaced-keys",
+            // The namespacing convention the colon exists for: keys written
+            // `<namespace>:<name>`, with one and with several separators.
+            pairs: owned(&[
+                ("sim2real:managed", "true"),
+                ("team:owner", "data"),
+                ("cost-center:1234:usd", "9"),
+                (":leading-colon", "edge"),
+            ]),
+        },
+        TagSet {
             case: "unicode-and-digits",
             pairs: owned(&[("ümlaut", "wert"), ("日本語", "値"), ("12345", "numeric")]),
         },
@@ -550,6 +563,11 @@ async fn tags_from_create_and_from_tag_resource_are_one_set() {
             case: "overlapping",
             created: vec![("env", "prod"), ("team", "data")],
             added: vec![("env", "staging")],
+        },
+        MergeCase {
+            case: "namespaced",
+            created: vec![("sim2real:managed", "true"), ("team:owner", "data")],
+            added: vec![("team:owner", "platform"), ("cost-center:1234", "9")],
         },
         MergeCase {
             case: "identical",
@@ -827,17 +845,18 @@ async fn a_value_that_is_not_an_msk_resource_arn_is_a_bad_request() {
     }
 }
 
-/// RULE: a tag key is held to the rules the model states for it — 1..128 Unicode
+/// RULE: a tag key is held to the rules AWS states for one — 1..128 Unicode
 /// characters, no `aws:` prefix, and only Unicode letters, digits, white space and
-/// `_ . / = + - @`. A key outside them is a 400 `BadRequestException` from every
+/// `+ - = . _ : / @`. A key outside them is a 400 `BadRequestException` from every
 /// operation that takes tag keys, and a refused request writes NOTHING.
 #[tokio::test]
 async fn tag_keys_are_held_to_the_rules_the_model_states() {
     let at_bound = key_of_length(MAX_TAG_KEY_LENGTH);
     let past_bound = key_of_length(MAX_TAG_KEY_LENGTH + 1);
 
-    // Accepted: one row per character class the model's documentation lists, plus
-    // each published length bound (1 and 128 characters).
+    // Accepted: one row per character class the tagging rule lists (its special
+    // characters walked one at a time, the colon among them), plus each published
+    // length bound (1 and 128 characters).
     let accepted: Vec<(&str, String)> = vec![
         ("letters", "release".to_string()),
         ("digits", "12345".to_string()),
@@ -850,6 +869,14 @@ async fn tag_keys_are_held_to_the_rules_the_model_states() {
         ("plus", "a+b".to_string()),
         ("dash", "a-b".to_string()),
         ("at", "a@b".to_string()),
+        ("colon", "a:b".to_string()),
+        // The convention the colon is there for: a namespaced key, and one
+        // carrying several namespace separators.
+        ("namespaced", "team:owner".to_string()),
+        ("two-colons", "cost-center:1234:usd".to_string()),
+        // Only the exact prefix `aws:` is reserved, so a key that merely starts
+        // with those letters and carries a colon later is a caller's to set.
+        ("reserved-word-then-colon", "awsome:key".to_string()),
         ("one-character", "k".to_string()),
         ("at-length-bound", at_bound),
         // `aws` is only reserved as the prefix `aws:`; the bare word is a legal key.
@@ -861,7 +888,6 @@ async fn tag_keys_are_held_to_the_rules_the_model_states() {
         ("empty", String::new()),
         ("past-length-bound", past_bound),
         ("reserved-prefix", "aws:cloudformation".to_string()),
-        ("colon", "team:data".to_string()),
         ("hash", "bad#key".to_string()),
         ("comma", "a,b".to_string()),
         ("percent", "a%b".to_string()),
@@ -1173,6 +1199,11 @@ async fn a_channels_tags_round_trip_through_the_same_operations() {
             case: "created-tagged-overlapping",
             created: &[("env", "prod")],
             added: &[("env", "staging"), ("owner", "msk")],
+        },
+        ChannelCase {
+            case: "created-tagged-namespaced",
+            created: &[("sim2real:managed", "true")],
+            added: &[("team:owner", "data")],
         },
     ];
 

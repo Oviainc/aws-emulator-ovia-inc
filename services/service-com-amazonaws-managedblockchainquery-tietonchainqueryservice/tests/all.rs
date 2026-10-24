@@ -19,6 +19,8 @@ mod asset_contracts;
 mod batch_token_balance;
 #[path = "all/chain_query_slice.rs"]
 mod chain_query_slice;
+#[path = "all/default_page_size.rs"]
+mod default_page_size;
 #[path = "all/derived_chain_history.rs"]
 mod derived_chain_history;
 #[path = "all/derived_chain_reads.rs"]

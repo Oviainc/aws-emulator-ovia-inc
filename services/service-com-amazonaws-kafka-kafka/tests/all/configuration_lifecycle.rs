@@ -15,6 +15,11 @@
 
 use serde_json::{json, Value};
 
+// The service's own version catalogue, so the suite and the handler cannot
+// disagree about which Apache Kafka versions exist; it is the same list
+// `ListKafkaVersions` reports.
+use service_com_amazonaws_kafka_kafka::state::KAFKA_VERSION_CATALOG;
+
 // The router harness, the signing region, the account id and the URI encoder
 // every suite of this crate shares, so this one adds only its own rule and its
 // configuration-shaped requests.
@@ -442,6 +447,173 @@ async fn an_unknown_or_malformed_configuration_arn_is_refused() {
         elsewhere.status,
         elsewhere.body
     );
+}
+
+/// RULE: `KafkaVersions` names the Apache Kafka versions a configuration may be
+/// applied to, so every entry has to BE a version this service publishes — the
+/// catalogue `ListKafkaVersions` reports. A list carrying an entry that is not is
+/// refused HTTP 400 `BadRequestException` and stores nothing, whichever position
+/// the entry is in; a list whose every entry is catalogued is stored and read back
+/// verbatim.
+#[tokio::test]
+async fn kafka_versions_must_name_versions_the_service_publishes() {
+    let emulator = Emulator::new();
+
+    // The catalogue is the service's own, so the accepted rows below are taken
+    // FROM it rather than written out again: its oldest entry, its newest, a
+    // qualified name and a `.x` patch name, plus the whole catalogue in one list.
+    let oldest = KAFKA_VERSION_CATALOG
+        .first()
+        .expect("the version catalogue is not empty")
+        .version;
+    let newest = KAFKA_VERSION_CATALOG
+        .last()
+        .expect("the version catalogue is not empty")
+        .version;
+    let every_version: Vec<String> = KAFKA_VERSION_CATALOG
+        .iter()
+        .map(|entry| entry.version.to_string())
+        .collect();
+
+    let accepted: Vec<(&str, Vec<String>)> = vec![
+        ("member-omitted", Vec::new()),
+        ("oldest-catalogued", vec![oldest.to_string()]),
+        ("newest-catalogued", vec![newest.to_string()]),
+        // A qualified name and a `.x` patch name, neither of which is a plain
+        // three-component release.
+        ("qualified-name", vec!["2.8.2.tiered".to_string()]),
+        ("patch-name", vec!["3.7.x".to_string()]),
+        (
+            "two-catalogued",
+            vec!["2.8.1".to_string(), "3.6.0".to_string()],
+        ),
+        ("the-whole-catalogue", every_version),
+    ];
+
+    for (case, versions) in &accepted {
+        let row = ConfigurationRequest {
+            kafka_versions: versions.clone(),
+            ..ConfigurationRequest::named(&format!("accepted-{case}"))
+        };
+        let reply = create(&emulator, &row).await;
+        assert_eq!(
+            (reply.status, reply.error_code()),
+            (200, ""),
+            "case {case} ({versions:?}): expected a catalogued version list to be accepted, \
+             got {} {}",
+            reply.status,
+            reply.body
+        );
+        assert_eq!(
+            reply.body["state"].as_str(),
+            Some("ACTIVE"),
+            "case {case}: a created configuration is ACTIVE, got {}",
+            reply.body
+        );
+        assert_eq!(
+            reply.body["latestRevision"]["revision"].as_i64(),
+            Some(1),
+            "case {case}: the submitted body is revision 1, got {}",
+            reply.body
+        );
+        // Read the stored record back: the versions are kept as submitted.
+        let arn = reply.body["arn"].as_str().unwrap_or_else(|| {
+            panic!("case {case}: CreateConfiguration returned no arn: {}", reply.body)
+        });
+        let described = describe(&emulator, arn).await;
+        assert_eq!(
+            described.body["kafkaVersions"],
+            json!(versions),
+            "case {case}: DescribeConfiguration must report the versions submitted, got {}",
+            described.body
+        );
+    }
+
+    // Refused: an entry that names no catalogued version. The rows differ along
+    // what makes it uncatalogued (a version that never existed, one newer than
+    // everything published, a truncation and an extension of a catalogued name,
+    // a surrounding space, an empty entry) and along its POSITION in the list —
+    // only, first, middle, last — so a single bad entry is refused wherever it
+    // sits beside good ones.
+    let refused: Vec<(&str, Vec<&str>)> = vec![
+        ("only-entry-unknown", vec!["0.0.1-does-not-exist"]),
+        ("newer-than-the-catalogue", vec!["9.9.9"]),
+        ("truncated-patch-name", vec!["3.9"]),
+        ("extended-catalogued-name", vec!["3.6.0.1"]),
+        ("padded-catalogued-name", vec![" 3.6.0"]),
+        ("empty-entry", vec![""]),
+        ("first-of-three", vec!["0.0.1-does-not-exist", "2.8.1", "3.6.0"]),
+        ("middle-of-three", vec!["2.8.1", "nope", "3.6.0"]),
+        ("last-of-three", vec!["2.8.1", "3.6.0", "4.0.0-preview"]),
+        // Several bad entries at once: the refusal names every one of them, so a
+        // caller does not have to fix them one round trip at a time.
+        (
+            "two-of-four",
+            vec!["2.8.1", "0.0.1-does-not-exist", "3.6.0", "9.9.9"],
+        ),
+    ];
+
+    for (case, versions) in &refused {
+        let name = format!("refused-{case}");
+        let row = ConfigurationRequest {
+            kafka_versions: versions.iter().map(|entry| (*entry).to_string()).collect(),
+            ..ConfigurationRequest::named(&name)
+        };
+        let reply = create(&emulator, &row).await;
+        assert_eq!(
+            (reply.status, reply.error_code()),
+            (400, "BadRequestException"),
+            "case {case} ({versions:?}): expected the create to be refused, got {} {}",
+            reply.status,
+            reply.body
+        );
+        assert_eq!(
+            reply.at("/invalidParameter").as_str(),
+            Some("kafkaVersions"),
+            "case {case}: the refusal must name the offending member, got {}",
+            reply.body
+        );
+        // The message is built from the request: every entry that named no
+        // catalogued version is in it, not only the first.
+        let message = reply.at("/message").as_str().unwrap_or_default();
+        for entry in versions
+            .iter()
+            .filter(|entry| !KAFKA_VERSION_CATALOG.iter().any(|row| row.version == **entry))
+        {
+            assert!(
+                message.contains(*entry),
+                "case {case}: expected the refusal to name {entry:?}, got {message:?}"
+            );
+        }
+        // Nothing was stored: the name never appears in a listing, so it is still
+        // free for a create that names catalogued versions only.
+        let listed = list(&emulator, "").await;
+        assert!(
+            !listed.body["configurations"]
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| entry["name"].as_str() == Some(name.as_str()))
+                })
+                .unwrap_or_default(),
+            "case {case}: a refused create must store nothing, got {}",
+            listed.body
+        );
+        let retried = create(
+            &emulator,
+            &ConfigurationRequest {
+                kafka_versions: vec![newest.to_string()],
+                ..ConfigurationRequest::named(&name)
+            },
+        )
+        .await;
+        assert_eq!(
+            retried.status, 200,
+            "case {case}: a refused create leaves the name free, got {} {}",
+            retried.status, retried.body
+        );
+    }
 }
 
 /// RULE: paging enumerates every stored configuration exactly once for any page

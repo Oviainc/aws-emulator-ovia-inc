@@ -30,15 +30,25 @@
 //!    `ValidationException` (HTTP 400) by the modelled constraints before the handler
 //!    runs: the member's `@default` is what an UNCONFIGURED application carries, not a
 //!    licence to omit it on the wire.
+//! 8. the configuration lives INSIDE the application, and the application inside its
+//!    instance: while a `DeleteInstance` is still pending the application is still there
+//!    and reports its configuration, and once the clock makes the removal due both
+//!    operations answer `ResourceNotFoundException` and nothing of the configuration is
+//!    left in the store.
 //!
 //! Every call goes through `MultiServiceRouter::dispatch`, so the modelled constraints,
 //! the `awsJson1_1` envelope and the `X-Amz-Target` routing are exercised rather than
 //! bypassed. The harness is the one `ssoadmin_permission_sets.rs` owns.
 
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::ssoadmin_permission_sets::{call, error_code, router, seeded_instance_arn};
+use crate::ssoadmin_permission_sets::{
+    call, error_code, hold_deletion, router, router_over, seeded_instance_arn, with_store,
+};
 
 /// The one published provider an application can be CREATED under: `CreateApplication`
 /// makes an OAuth 2.0 CUSTOMER MANAGED application, which is what this provider backs.
@@ -550,4 +560,103 @@ async fn a_put_that_omits_assignment_required_is_refused() {
         !actual,
         "case {arn:?}: the refused put must store nothing, expected false, got {actual}"
     );
+}
+
+/// Rule 8: the configuration is a field of the application record, and an application
+/// belongs to the instance it was created under, so it lasts exactly as long as that
+/// instance does — whatever the configuration had been set to.
+///
+/// The deletion a `DeleteInstance` owes falls due a span LATER, never at once, so the
+/// rows assert BOTH sides of that instant: before it the application still reports its
+/// configuration, after it both operations refuse the ARN.
+#[tokio::test]
+async fn a_configuration_lasts_exactly_as_long_as_its_instance() {
+    // The rows differ along what the configuration was when the instance went away: never
+    // configured (so the modelled default), configured away from it, and configured back
+    // onto it by an explicit put.
+    let rows: Vec<(&str, Option<bool>, bool)> = vec![
+        ("never configured", None, MODELLED_DEFAULT),
+        ("configured to false", Some(false), false),
+        ("configured to true explicitly", Some(true), true),
+    ];
+
+    for (case, configured, expected) in rows {
+        // One engine per row: the account's enablement is settled once, so a deleted
+        // instance is never replaced inside the same store.
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let router = router_over(engine.clone());
+        let instance_arn = seeded_instance_arn(&router).await;
+        let arn = minted_application(
+            &router,
+            &instance_arn,
+            &Application::new("an application of the deleted instance", "doomed-app"),
+        )
+        .await;
+        if let Some(required) = configured {
+            let (status, body) = put_configuration(&router, &arn, Some(required)).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the put must answer 200, got {status} {body}"
+            );
+        }
+
+        let (status, body) = call(
+            &router,
+            "DeleteInstance",
+            &json!({"InstanceArn": instance_arn}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DeleteInstance must answer 200, got {status} {body}"
+        );
+
+        // The removal is still PENDING: the application is there and reports the
+        // configuration it was left with.
+        let actual = configuration_of(&router, case, &arn).await;
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: while the instance deletion is pending the get must still \
+             report {expected}, got {actual}"
+        );
+
+        // Move the stored due instant into the past rather than sleeping for it; the
+        // service applies the removal itself on the next request.
+        hold_deletion(&engine, SystemTime::now() - Duration::from_secs(60));
+
+        let (status, body) = get_configuration(&router, &arn).await;
+        assert_eq!(
+            status, REFUSAL_STATUS,
+            "case {case:?}: the get of an application whose instance is gone must answer \
+             {REFUSAL_STATUS}, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException from the get, got {body}"
+        );
+
+        for required in [Some(true), Some(false)] {
+            let (status, body) = put_configuration(&router, &arn, required).await;
+            assert_eq!(
+                status, REFUSAL_STATUS,
+                "case {case:?} / {required:?}: the put of an application whose instance is \
+                 gone must answer {REFUSAL_STATUS}, got {status} {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ResourceNotFoundException",
+                "case {case:?} / {required:?}: expected ResourceNotFoundException from the \
+                 put, got {body}"
+            );
+        }
+
+        // Nothing of the configuration is left behind for a later resource to inherit.
+        let remaining = with_store(&engine, |store| store.applications.len());
+        assert_eq!(
+            remaining, 0,
+            "case {case:?}: the applications of a gone instance must be gone too, \
+             expected 0, got {remaining}"
+        );
+    }
 }

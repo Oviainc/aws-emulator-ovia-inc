@@ -25,8 +25,8 @@
 //!
 //! Two deliberate gaps: a component's `componentTypeId` is stored WITHOUT
 //! checking that the named component type exists (the real service refuses an
-//! unknown one, but this emulator holds no registry of the built-in component
-//! types every real workspace carries, so refusing would reject creates the
+//! unknown one, but a real workspace carries more built-in component types than
+//! this emulator models, so refusing would reject creates the
 //! real service accepts — which is also why a composite component path THROUGH
 //! a component type this workspace does not hold cannot be resolved and is
 //! refused), and authorization is not emulated, so the modelled
