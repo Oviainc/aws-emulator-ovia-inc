@@ -379,6 +379,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             environment_variables: std::collections::BTreeMap::new(),
             created_at: std::time::SystemTime::now(),
             api_keys: std::collections::BTreeMap::new(),
+            // Data sources are created by `CreateDataSource`, so a fresh API holds
+            // none.
+            data_sources: std::collections::BTreeMap::new(),
         };
 
         guard.graphql_apis.insert(api_id.clone(), record);

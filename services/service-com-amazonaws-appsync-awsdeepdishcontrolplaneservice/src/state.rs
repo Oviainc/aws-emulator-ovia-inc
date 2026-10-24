@@ -3,17 +3,19 @@
 //! Engine state for the com-amazonaws-appsync-awsdeepdishcontrolplaneservice service.
 //!
 //! Holds the GraphQL API lifecycle: every `GraphqlApi` the service created, each with
-//! the API keys created under it, and every source-API association between two of
-//! them. A handler reaches it through [`service_state`] and answers from what is
+//! the API keys and data sources created under it, and every source-API association
+//! between two of them. A handler reaches it through [`service_state`] and answers from what is
 //! stored here — nothing is recomputed from the request.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AdditionalAuthenticationProvider, ApiKey, EnhancedMetricsConfig, GraphqlApi,
-    LambdaAuthorizerConfig, LogConfig, OpenIDConnectConfig, SourceApiAssociation,
-    SourceApiAssociationConfig, UserPoolConfig,
+    AdditionalAuthenticationProvider, ApiKey, DataSource, DynamodbDataSourceConfig,
+    ElasticsearchDataSourceConfig, EnhancedMetricsConfig, EventBridgeDataSourceConfig, GraphqlApi,
+    HttpDataSourceConfig, LambdaAuthorizerConfig, LambdaDataSourceConfig, LogConfig,
+    OpenIDConnectConfig, OpenSearchServiceDataSourceConfig, RelationalDatabaseDataSourceConfig,
+    SourceApiAssociation, SourceApiAssociationConfig, UserPoolConfig,
 };
 
 /// One stored `GraphqlApi`, plus the API keys created under it.
@@ -57,6 +59,12 @@ pub struct GraphqlApiRecord {
     pub created_at: SystemTime,
     /// The API keys created under this API, keyed by key id.
     pub api_keys: BTreeMap<String, ApiKeyRecord>,
+    /// The data sources created under this API, keyed by their caller-supplied
+    /// name — the name is what every data-source operation addresses one by, so it
+    /// identifies the data source within its API and no second key is needed.
+    /// Bounded: `CreateDataSource` refuses a create once the API holds the AppSync
+    /// per-API quota of data sources, so this map cannot grow without limit.
+    pub data_sources: BTreeMap<String, DataSourceRecord>,
 }
 
 impl GraphqlApiRecord {
@@ -129,6 +137,128 @@ impl ApiKeyRecord {
             deletes: self.deletes,
         }
     }
+}
+
+/// One stored data source of a `GraphqlApiRecord`.
+///
+/// Every member of the modelled `DataSource` shape that a create or update call can
+/// set is kept, including each per-type configuration, so a reader projects exactly
+/// what was written rather than a subset. `description` is kept as an `Option`, so a
+/// data source that has no description reports none rather than an empty one — see
+/// [`data_source_description`] for which requests leave it with none.
+#[derive(Debug, Clone)]
+pub struct DataSourceRecord {
+    pub name: String,
+    pub arn: String,
+    pub description: Option<String>,
+    /// The `DataSourceType` this data source is of.
+    pub r#type: String,
+    pub service_role_arn: Option<String>,
+    pub dynamodb_config: Option<DynamodbDataSourceConfig>,
+    pub lambda_config: Option<LambdaDataSourceConfig>,
+    pub elasticsearch_config: Option<ElasticsearchDataSourceConfig>,
+    pub open_search_service_config: Option<OpenSearchServiceDataSourceConfig>,
+    pub http_config: Option<HttpDataSourceConfig>,
+    pub relational_database_config: Option<RelationalDatabaseDataSourceConfig>,
+    pub event_bridge_config: Option<EventBridgeDataSourceConfig>,
+    /// The `DataSourceLevelMetricsConfig` the request asked for, or `None` when it
+    /// asked for none: the model documents no default for it.
+    pub metrics_config: Option<String>,
+}
+
+impl DataSourceRecord {
+    /// The configuration member this data source's `type` is set up through and which
+    /// it does not carry, or `None` when the type carries it (or needs none at all).
+    ///
+    /// Source: the per-type configuration members of `CreateDataSourceRequest` /
+    /// `UpdateDataSourceRequest` and the `DataSourceType` values they configure —
+    /// `dynamodbConfig` ("Amazon DynamoDB settings"), `lambdaConfig` ("Lambda
+    /// settings"), `elasticsearchConfig` / `openSearchServiceConfig` ("Amazon
+    /// OpenSearch Service settings"), `httpConfig` ("HTTP endpoint settings"),
+    /// `relationalDatabaseConfig` ("Relational database settings") and
+    /// `eventBridgeConfig` ("Amazon EventBridge settings"). `NONE` and
+    /// `AMAZON_BEDROCK_RUNTIME` are configured by no member of either request, so a
+    /// data source of either type is complete without one.
+    pub fn missing_config(&self) -> Option<&'static str> {
+        match self.r#type.as_str() {
+            "AMAZON_DYNAMODB" if self.dynamodb_config.is_none() => Some("dynamodbConfig"),
+            "AWS_LAMBDA" if self.lambda_config.is_none() => Some("lambdaConfig"),
+            "AMAZON_ELASTICSEARCH" if self.elasticsearch_config.is_none() => {
+                Some("elasticsearchConfig")
+            }
+            "AMAZON_OPENSEARCH_SERVICE" if self.open_search_service_config.is_none() => {
+                Some("openSearchServiceConfig")
+            }
+            "HTTP" if self.http_config.is_none() => Some("httpConfig"),
+            "RELATIONAL_DATABASE" if self.relational_database_config.is_none() => {
+                Some("relationalDatabaseConfig")
+            }
+            "AMAZON_EVENTBRIDGE" if self.event_bridge_config.is_none() => Some("eventBridgeConfig"),
+            _ => None,
+        }
+    }
+
+    /// This record as the modelled `DataSource` shape.
+    ///
+    /// The single projection every operation that reports a data source answers with,
+    /// so the create and the reads cannot disagree about one data source.
+    pub fn to_data_source(&self) -> DataSource {
+        DataSource {
+            data_source_arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            r#type: Some(self.r#type.clone()),
+            service_role_arn: self.service_role_arn.clone(),
+            dynamodb_config: self.dynamodb_config.clone(),
+            lambda_config: self.lambda_config.clone(),
+            elasticsearch_config: self.elasticsearch_config.clone(),
+            open_search_service_config: self.open_search_service_config.clone(),
+            http_config: self.http_config.clone(),
+            relational_database_config: self.relational_database_config.clone(),
+            event_bridge_config: self.event_bridge_config.clone(),
+            metrics_config: self.metrics_config.clone(),
+        }
+    }
+}
+
+/// The description a data source keeps for the `description` a request carried.
+///
+/// An empty description describes nothing, so no description is kept for it: a data
+/// source whose request left `description` empty reports the member absent, exactly
+/// as one whose request omitted it. (The recorded creates this projection answers
+/// report no description for an explicitly empty one.)
+pub fn data_source_description(description: Option<String>) -> Option<String> {
+    description.filter(|description| !description.is_empty())
+}
+
+/// The resource portion of a data source's ARN: a data source is a child of its API,
+/// so it is named under the API's own `apis/{apiId}` path, as `GetDataSource`'s URI
+/// (`/v1/apis/{apiId}/datasources/{name}`) addresses it.
+pub fn data_source_resource(api_id: &str, name: &str) -> String {
+    format!("apis/{api_id}/datasources/{name}")
+}
+
+/// The text a `NotFoundException` (HTTP 404) carries for a data source the named API
+/// does not hold. No recording pins AppSync's own wording, so the requirement this
+/// answers is the status and the error shape; the text names the absent data source,
+/// which is what the caller has to act on.
+pub fn data_source_not_found_message(name: &str) -> String {
+    format!("No data source found named {name}.")
+}
+
+/// The text a `BadRequestException` (HTTP 400) carries for a create whose name is
+/// already taken within the API: the name, which is the member the caller has to
+/// change.
+pub fn data_source_exists_message(name: &str) -> String {
+    format!("Data source with name {name} already exists.")
+}
+
+/// The text a `BadRequestException` (HTTP 400) carries for a data source whose type
+/// is configured through a member the request did not carry
+/// ([`DataSourceRecord::missing_config`]): the member and the type that needs it, so
+/// the caller can fix the request from the message alone.
+pub fn missing_data_source_config_message(member: &str, data_source_type: &str) -> String {
+    format!("{member} is required for a data source of type {data_source_type}")
 }
 
 /// One stored association between a Merged API and one of its source APIs.
