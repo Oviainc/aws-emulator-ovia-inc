@@ -19,7 +19,7 @@ use crate::ops::types::{
     Budget, CostTypes, HealthStatus, Notification, ResourceTag, Spend, Subscriber, TimePeriod,
 };
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Per-service state for com-amazonaws-budgets-awsbudgetservicegateway. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -184,6 +184,82 @@ fn cost_types_apply(budget: &Budget) -> bool {
 
 /// The `BudgetType` that has cost types.
 const COST_BUDGET_TYPE: &str = "COST";
+
+/// The `BudgetType` members whose budget is required to carry a limit, and the only ones
+/// a `PlannedBudgetLimits` map can be written for: "`BudgetLimit` is required for cost or
+/// usage budgets, but optional for RI or Savings Plans utilization or coverage budgets"
+/// (`Budget$BudgetLimit`) and "`PlannedBudgetLimits` is available for cost or usage
+/// budget" (`Budget$PlannedBudgetLimits`).
+const LIMIT_REQUIRED_BUDGET_TYPES: [&str; 2] = [COST_BUDGET_TYPE, "USAGE"];
+
+/// The `TimeUnit` members a `PlannedBudgetLimits` map can be written for:
+/// "`PlannedBudgetLimits` ... supports both monthly and quarterly `TimeUnit`"
+/// (`Budget$PlannedBudgetLimits`). The map's key is "the start of the month" or "the
+/// start of the quarter", so a budget on any other granularity has no planned periods to
+/// key them by.
+const PLANNED_LIMIT_TIME_UNITS: [&str; 2] = ["MONTHLY", "QUARTERLY"];
+
+/// `AutoAdjustType$HISTORICAL` — the auto-adjust type whose budget amount comes from
+/// historical data, so it is the one that takes `HistoricalOptions` ("the parameters that
+/// define or describe the historical data that your auto-adjusting budget is based on",
+/// `AutoAdjustData$HistoricalOptions`). The other member, `FORECAST`, adjusts from
+/// forecasted data and so has no historical parameters.
+const AUTO_ADJUST_TYPE_HISTORICAL: &str = "HISTORICAL";
+
+/// The maximum `BudgetAdjustmentPeriod` for each `TimeUnit` granularity, from
+/// `HistoricalOptions$BudgetAdjustmentPeriod`: "The maximum value depends on the
+/// `TimeUnit` granularity of the budget: For the `DAILY` granularity, the maximum value
+/// is `60`. For the `MONTHLY` granularity, the maximum value is `12`. For the
+/// `QUARTERLY` granularity, the maximum value is `4`. For the `ANNUALLY` granularity,
+/// the maximum value is `1`."
+///
+/// A `TimeUnit` that sentence does not name (`CUSTOM`, or one the model adds later)
+/// names no period length, so only the modelled `@range(1, 60)` bounds it — and that
+/// bound is already enforced at request validation.
+const MAX_BUDGET_ADJUSTMENT_PERIOD: [(&str, i32); 4] = [
+    ("DAILY", 60),
+    ("MONTHLY", 12),
+    ("QUARTERLY", 4),
+    ("ANNUALLY", 1),
+];
+
+/// The documented maximum [`MAX_BUDGET_ADJUSTMENT_PERIOD`] holds for `time_unit`, or
+/// `None` for a granularity it does not name.
+fn max_budget_adjustment_period(time_unit: &str) -> Option<i32> {
+    MAX_BUDGET_ADJUSTMENT_PERIOD
+        .iter()
+        .find(|(unit, _)| *unit == time_unit)
+        .map(|(_, max)| *max)
+}
+
+/// The instant `secs` seconds after the Unix epoch, or `None` when that is no instant
+/// this host can represent: an epoch before the epoch, or one so far after it that the
+/// platform's clock type cannot hold it. Neither names a period a budget can be keyed
+/// by, and the second is reachable from a request (a `PlannedBudgetLimits` key is a
+/// caller-supplied decimal), so the addition is CHECKED — `SystemTime`'s own `Add` is an
+/// `expect` on overflow, which would unwind the handler instead of refusing the value.
+fn instant_at(secs: i64) -> Option<SystemTime> {
+    let secs = u64::try_from(secs).ok()?;
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs))
+}
+
+/// Whether `secs` is exactly the start of a period of `time_unit` — the midnight-UTC
+/// boundary [`default_time_period_start`] computes for the period containing it, which
+/// equals the instant itself only when the instant IS that boundary.
+fn is_period_start(time_unit: &str, secs: i64) -> bool {
+    let Some(at) = instant_at(secs) else {
+        return false;
+    };
+    // An instant the calendar cannot render names no period at all.
+    // [`default_time_period_start`] answers such an instant with the instant itself (the
+    // only sound answer it has for "the period containing it"), which would make every
+    // unrenderable epoch look like its own boundary — so renderability is required here
+    // before that comparison means anything.
+    if civil_date(at).is_none() {
+        return false;
+    }
+    default_time_period_start(time_unit, at).secs() == secs
+}
 
 /// Stamp the members of `budget` the SERVICE owns, on the `CreateBudget` /
 /// `UpdateBudget` write path, so that every later read reports what was stored rather
@@ -573,6 +649,21 @@ pub fn budget_name_violation(member_path: &[&str], name: &str) -> Option<String>
 ///   one time. Either `FilterExpression` and `Metrics` or `CostFilters` and
 ///   `CostTypes`, not both or a different combination." (`CreateBudget`)
 /// * "The start date must come before the end date." (`Budget$TimePeriod`)
+/// * "The end date must come before `06/15/87 00:00 UTC`." (`Budget$TimePeriod`) —
+///   [`validate_time_period_end`]
+/// * "`BudgetLimit` is required for cost or usage budgets." (`Budget$BudgetLimit`) —
+///   [`validate_budget_limit_present`]
+/// * "`PlannedBudgetLimits` is available for cost or usage budget and supports both
+///   monthly and quarterly `TimeUnit` ... The `key` is the start of the month, `UTC` in
+///   epoch seconds" (`Budget$PlannedBudgetLimits`) — [`validate_planned_budget_limits`]
+/// * the `AutoAdjustType`/`HistoricalOptions` pairing and the per-`TimeUnit` maximum
+///   `BudgetAdjustmentPeriod` (`AutoAdjustData$HistoricalOptions`,
+///   `HistoricalOptions$BudgetAdjustmentPeriod`) — [`validate_auto_adjust_data`]
+///
+/// Every rule holds for the whole `Budget` shape, so both write paths
+/// (`CreateBudget$Budget` and `UpdateBudget$NewBudget`) run all of them before anything
+/// is stored: an update that would leave a budget in a shape a create could not have
+/// produced is refused, and the stored budget is left as it was.
 pub fn validate_budget(budget: &Budget) -> Result<(), String> {
     if budget.budget_limit.is_some() && budget.planned_budget_limits.is_some() {
         return Err(
@@ -600,6 +691,137 @@ pub fn validate_budget(budget: &Budget) -> Result<(), String> {
                         .to_string(),
                 );
             }
+        }
+    }
+    validate_time_period_end(budget)?;
+    validate_budget_limit_present(budget)?;
+    validate_planned_budget_limits(budget)?;
+    validate_auto_adjust_data(budget)?;
+    Ok(())
+}
+
+/// "The end date must come before `06/15/87 00:00 UTC`" (`Budget$TimePeriod`), which is
+/// also the end date a budget written without one is given
+/// ([`default_time_period_end`]) — so that instant itself is accepted and anything after
+/// it is not.
+fn validate_time_period_end(budget: &Budget) -> Result<(), String> {
+    let Some(end) = budget.time_period.as_ref().and_then(|period| period.end.as_ref()) else {
+        return Ok(());
+    };
+    let last = default_time_period_end();
+    if (end.secs(), end.subsec_nanos()) > (last.secs(), last.subsec_nanos()) {
+        return Err(
+            "Unable to create/update budget: TimePeriod End must not come after \
+             06/15/87 00:00 UTC."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// "`BudgetLimit` is required for cost or usage budgets, but optional for RI or Savings
+/// Plans utilization or coverage budgets" (`Budget$BudgetLimit`).
+///
+/// Three members can carry such a budget's limit, and exactly one of them has to: the
+/// fixed `BudgetLimit`; a non-empty `PlannedBudgetLimits`, which a read derives the
+/// current `BudgetLimit` from ("`DescribeBudget` and `DescribeBudgets` response along
+/// with `PlannedBudgetLimits` also contain `BudgetLimit`"); and `AutoAdjustData`, "the
+/// parameters that determine the budget amount for an auto-adjusting budget"
+/// (`Budget$AutoAdjustData`), whose amount the service adjusts rather than the caller
+/// setting it.
+fn validate_budget_limit_present(budget: &Budget) -> Result<(), String> {
+    if !LIMIT_REQUIRED_BUDGET_TYPES.contains(&budget.budget_type.as_str()) {
+        return Ok(());
+    }
+    let planned = budget
+        .planned_budget_limits
+        .as_ref()
+        .is_some_and(|planned| !planned.is_empty());
+    if budget.budget_limit.is_some() || planned || budget.auto_adjust_data.is_some() {
+        return Ok(());
+    }
+    Err(
+        "Unable to create/update budget: BudgetLimit is required for cost or usage budgets."
+            .to_string(),
+    )
+}
+
+/// "`PlannedBudgetLimits` is available for cost or usage budget and supports both monthly
+/// and quarterly `TimeUnit`" and "The `key` is the start of the month, `UTC` in epoch
+/// seconds" / "the start of the quarter, `UTC` in epoch seconds"
+/// (`Budget$PlannedBudgetLimits`) — so a planned map is refused on any other budget type
+/// or granularity, and every key has to be the midnight-UTC start of one of the periods
+/// the budget's own `TimeUnit` names.
+fn validate_planned_budget_limits(budget: &Budget) -> Result<(), String> {
+    let Some(planned) = &budget.planned_budget_limits else {
+        return Ok(());
+    };
+    if !LIMIT_REQUIRED_BUDGET_TYPES.contains(&budget.budget_type.as_str())
+        || !PLANNED_LIMIT_TIME_UNITS.contains(&budget.time_unit.as_str())
+    {
+        return Err(
+            "Unable to create/update budget: PlannedBudgetLimits is available for cost or \
+             usage budgets with a MONTHLY or QUARTERLY TimeUnit."
+                .to_string(),
+        );
+    }
+    // The key is reported back as stored, so it is never echoed into this message: the
+    // member and the rule it failed are what a caller needs. `TimeUnit` is a modelled
+    // enum, already checked at request validation.
+    if !planned
+        .keys()
+        .all(|start| start.parse::<i64>().is_ok_and(|secs| is_period_start(&budget.time_unit, secs)))
+    {
+        return Err(format!(
+            "Unable to create/update budget: every PlannedBudgetLimits key must be the start \
+             of a {} period, UTC in epoch seconds.",
+            budget.time_unit
+        ));
+    }
+    Ok(())
+}
+
+/// The rules the model documents for an auto-adjusting budget:
+///
+/// * `HistoricalOptions` are "the parameters that define or describe the historical data
+///   that your auto-adjusting budget is based on"
+///   (`AutoAdjustData$HistoricalOptions`), so they belong to — and are needed by — the
+///   `HISTORICAL` auto-adjust type, and to no other.
+/// * `BudgetAdjustmentPeriod` counts "budget periods included in the moving-average
+///   calculation", and "the maximum value depends on the `TimeUnit` granularity of the
+///   budget" ([`MAX_BUDGET_ADJUSTMENT_PERIOD`]).
+fn validate_auto_adjust_data(budget: &Budget) -> Result<(), String> {
+    let Some(auto_adjust) = &budget.auto_adjust_data else {
+        return Ok(());
+    };
+    let historical = auto_adjust.auto_adjust_type == AUTO_ADJUST_TYPE_HISTORICAL;
+    match (&auto_adjust.historical_options, historical) {
+        (None, true) => {
+            return Err(
+                "Unable to create/update budget: HistoricalOptions is required for a \
+                 HISTORICAL AutoAdjustType."
+                    .to_string(),
+            )
+        }
+        (Some(_), false) => {
+            return Err(
+                "Unable to create/update budget: HistoricalOptions is only valid for a \
+                 HISTORICAL AutoAdjustType."
+                    .to_string(),
+            )
+        }
+        _ => {}
+    }
+    if let (Some(options), Some(max)) = (
+        &auto_adjust.historical_options,
+        max_budget_adjustment_period(&budget.time_unit),
+    ) {
+        if options.budget_adjustment_period > max {
+            return Err(format!(
+                "Unable to create/update budget: BudgetAdjustmentPeriod must not exceed {max} \
+                 for a {} budget.",
+                budget.time_unit
+            ));
         }
     }
     Ok(())

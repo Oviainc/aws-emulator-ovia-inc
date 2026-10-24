@@ -453,7 +453,14 @@ pub struct VpcConfig {
     pub security_group_ids: Vec<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#MarketplaceModelEndpoint")]
+/// `MarketplaceModelEndpoint`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `updatedAt` carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="MarketplaceModelEndpoint")`), which the derive does
+/// not put on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct MarketplaceModelEndpoint {
     pub endpoint_arn: String,
@@ -466,6 +473,58 @@ pub struct MarketplaceModelEndpoint {
     pub endpoint_status: String,
     pub endpoint_status_message: Option<String>,
 }
+
+bedrock_schema_and_codec!(
+    MarketplaceModelEndpoint,
+    MARKETPLACE_MODEL_ENDPOINT_SCHEMA,
+    "com.amazonaws.bedrock#MarketplaceModelEndpoint",
+    "com.amazonaws.bedrock",
+    "MarketplaceModelEndpoint",
+    (M_ENDPOINT_ARN, endpoint_arn, "endpointArn", 0, req, string),
+    (
+        M_MODEL_SOURCE_IDENTIFIER,
+        model_source_identifier,
+        "modelSourceIdentifier",
+        1,
+        req,
+        string
+    ),
+    (M_STATUS, status, "status", 2, opt, string),
+    (
+        M_STATUS_MESSAGE,
+        status_message,
+        "statusMessage",
+        3,
+        opt,
+        string
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 4, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 5, req, date_time),
+    (
+        M_ENDPOINT_CONFIG,
+        endpoint_config,
+        "endpointConfig",
+        6,
+        req,
+        union_of(EndpointConfig)
+    ),
+    (
+        M_ENDPOINT_STATUS,
+        endpoint_status,
+        "endpointStatus",
+        7,
+        req,
+        string
+    ),
+    (
+        M_ENDPOINT_STATUS_MESSAGE,
+        endpoint_status_message,
+        "endpointStatusMessage",
+        8,
+        opt,
+        string
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrock#ServiceUnavailableException")]
 #[derive(Debug, Clone, Default)]

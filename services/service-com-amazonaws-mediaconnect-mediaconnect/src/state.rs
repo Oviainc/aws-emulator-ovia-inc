@@ -573,6 +573,103 @@ pub fn flow_source_bound_rejection(
     ))
 }
 
+/// The `FlowSize` values (`smithy_query(query="shape",shape="FlowSize")`: MEDIUM | LARGE |
+/// LARGE_4X) whose "processing capacity and feature set" carries NDI®.
+///
+/// `CreateFlowRequest$FlowSize` is "set this optional parameter to `LARGE` if you want to
+/// enable NDI sources or outputs on the flow", and UpdateFlow's own documentation says "if
+/// you have a MEDIUM flow and you want to change the flow source to NDI: first, use the
+/// UpdateFlow operation to upgrade the flow size to LARGE". The capable sizes are therefore
+/// an ALLOW-list — `LARGE` and the larger `LARGE_4X` — so a flow whose size was never set
+/// is not NDI-capable either. Named ONCE here because every operation that can put NDI on a
+/// flow reads it (CreateFlow, AddFlowSources, AddFlowOutputs, UpdateFlowSource,
+/// UpdateFlowOutput, UpdateFlow).
+pub const NDI_CAPABLE_FLOW_SIZES: [&str; 2] = ["LARGE", "LARGE_4X"];
+
+/// The `Protocol` value that names the NDI® transport
+/// (`smithy_query(query="shape",shape="Protocol")`: … | ndi-speed-hq). A source or an
+/// output whose transport uses it is an NDI source or output.
+pub const PROTOCOL_NDI_SPEED_HQ: &str = "ndi-speed-hq";
+
+/// Whether `flow_size` is one of [`NDI_CAPABLE_FLOW_SIZES`]. A flow whose size was never
+/// set is NOT: the capable sizes are the ones the documentation names.
+pub fn flow_size_supports_ndi(flow_size: Option<&str>) -> bool {
+    flow_size.is_some_and(|size| NDI_CAPABLE_FLOW_SIZES.contains(&size))
+}
+
+/// Whether `config` turns NDI® on: `NdiConfig$NdiState` is "a setting that controls whether
+/// NDI sources or outputs can be used in the flow… The default value is DISABLED. This
+/// value must be set as ENABLED for your flow to support NDI sources or outputs", so a flow
+/// with no `NdiConfig`, or one whose state is unset, has NDI off.
+pub fn ndi_is_enabled(config: Option<&NdiConfig>) -> bool {
+    config.and_then(|config| config.ndi_state.as_deref()) == Some(STATE_ENABLED)
+}
+
+/// Whether a transport described by `protocol` and whether it carries `NdiSourceSettings`
+/// is an NDI® transport.
+///
+/// The TWO markers of NDI on a source or an output, read here once: the protocol is
+/// [`PROTOCOL_NDI_SPEED_HQ`], or the record carries `NdiSourceSettings` ("the settings for
+/// the NDI® source… the exact name of the upstream NDI sender"), which only an NDI source
+/// has. Every caller — the stored record, the create/add request shapes and the update
+/// request shapes, which are all different types carrying the same two members — resolves
+/// NDI through this function.
+pub fn uses_ndi_transport(protocol: Option<&str>, ndi_source_settings: bool) -> bool {
+    protocol == Some(PROTOCOL_NDI_SPEED_HQ) || ndi_source_settings
+}
+
+/// Whether `transport` is an NDI® transport — see [`uses_ndi_transport`].
+pub fn transport_uses_ndi(transport: Option<&Transport>) -> bool {
+    transport.is_some_and(|transport| {
+        uses_ndi_transport(
+            Some(transport.protocol.as_str()),
+            transport.ndi_source_settings.is_some(),
+        )
+    })
+}
+
+/// Whether a stored source is an NDI® source — see [`transport_uses_ndi`].
+pub fn stored_source_uses_ndi(source: &StoredSource) -> bool {
+    transport_uses_ndi(source.transport.as_ref())
+}
+
+/// Whether a `SetSourceRequest` describes an NDI® source: the same two markers
+/// [`uses_ndi_transport`] reads, on the request the source is materialised from.
+pub fn source_request_uses_ndi(request: &SetSourceRequest) -> bool {
+    uses_ndi_transport(
+        request.protocol.as_deref(),
+        request.ndi_source_settings.is_some(),
+    )
+}
+
+/// Whether an `AddOutputRequest` describes an NDI® output: its protocol is the NDI
+/// transport. `NdiSourceSettings` is a SOURCE's member, and the request's other `Ndi…`
+/// members tune an NDI sender the output only has when that protocol is what carries it
+/// (`AddOutputRequest$NdiProgramName` is "a suffix for the name of the NDI® sender that the
+/// flow creates"), so the PROTOCOL is what makes an output an NDI output.
+pub fn output_request_uses_ndi(request: &AddOutputRequest) -> bool {
+    uses_ndi_transport(request.protocol.as_deref(), false)
+}
+
+/// The detail a request is refused with when it would leave a flow including NDI® at a size
+/// that does not carry it: `ndi_feature` names what uses NDI, `flow_size` is the size the
+/// flow ends up with. `None` when that size is NDI-capable ([`flow_size_supports_ndi`]), so
+/// a caller states the rule by naming the feature and the size and nothing else.
+///
+/// Every operation that can put NDI on a flow words the refusal HERE, so the create side,
+/// the add sides and the update sides state one rule for one reason.
+pub fn ndi_flow_size_rejection(ndi_feature: &str, flow_size: Option<&str>) -> Option<String> {
+    if flow_size_supports_ndi(flow_size) {
+        return None;
+    }
+    Some(format!(
+        "{ndi_feature} needs a flow of size {}; this flow's size is {}. Set the flow size to \
+         one that supports NDI before enabling NDI sources or outputs on it.",
+        NDI_CAPABLE_FLOW_SIZES.join(" or "),
+        flow_size.unwrap_or("unset")
+    ))
+}
+
 /// The first port handed to a source that did not ask for one. MediaConnect assigns an
 /// ingest port from its own pool when the request omits `IngestPort`; the emulator
 /// assigns from a WRAPPING pool that starts at this base, so a source's port is drawn

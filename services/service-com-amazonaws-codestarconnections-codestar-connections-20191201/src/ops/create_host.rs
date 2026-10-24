@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHost
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateHost`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateHost::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a host, persists it in [`crate::state`] and answers out of that
+//! record. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -95,9 +88,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codestarconnections-cod
 // here — hence the `CreateHostError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codestarconnections#CreateHost")]
+// `InternalServerException` is widened in through `extra_errors`: the service models it
+// (see `types::shared_types`) but this operation does not list it, and it is the only
+// honest answer for "this service is mounted on an engine that holds no state" — a 400
+// would blame the caller's request and a 501 would claim the operation is unwritten.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codestarconnections#CreateHost",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateHostErrorModeled {
+    InternalServerException(InternalServerException),
     LimitExceededException(LimitExceededException),
 }
 
@@ -152,18 +153,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateHost` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateHostErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateHost"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateHostErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "CodeStar connections state is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The ARN carries the region the caller signed for, so an ARN this service mints
+        // resolves against the endpoint the client addressed.
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // The service caps how many hosts it holds; `LimitExceededException` is the only
+        // error this operation models, and the cap is what keeps state from growing
+        // without bound. See `crate::state::MAX_HOSTS`.
+        if store.hosts.len() >= crate::state::MAX_HOSTS {
+            return Err(CreateHostErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Exceeded the maximum limit of {} hosts",
+                        crate::state::MAX_HOSTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The id is minted from the store's own monotonic sequence, so it is unique by
+        // construction and nothing is minted for a request the cap refuses. Two hosts
+        // created under the SAME name therefore get distinct ARNs: nothing about a host
+        // is keyed by its name, which the model does not constrain to be unique.
+        let sequence = store.take_sequence();
+        let host_id = crate::state::mint_resource_uuid(sequence);
+        let host_arn = crate::state::host_arn(&region, &host_id);
+        store.hosts.insert(
+            host_arn.clone(),
+            crate::state::StoredHost {
+                name: input.name,
+                host_arn: host_arn.clone(),
+                provider_type: input.provider_type,
+                provider_endpoint: input.provider_endpoint,
+                vpc_configuration: input.vpc_configuration,
+                // A host created through the API is PENDING until it is set up in the
+                // console; see `crate::state::HOST_STATUS_PENDING` for the modeled doc
+                // sentence, and `HOST_STATUS_MESSAGE_PENDING` for the description that
+                // non-terminal status reports.
+                status: crate::state::HOST_STATUS_PENDING.to_string(),
+                status_message: Some(crate::state::HOST_STATUS_MESSAGE_PENDING.to_string()),
+            },
+        );
+        if let Some(tags) = input.tags.as_deref() {
+            store.merge_tags(&host_arn, tags);
+        }
+        // Read the tags back out of state rather than echoing the request, so the
+        // response reports what was stored.
+        let tags = store.tag_list(&host_arn);
+        drop(store);
+
+        // Audit record for a state-changing operation: who presented which access key
+        // id, what changed, and the outcome. No secret is logged — the access key id is
+        // the public half the request already carries in its SigV4 scope.
+        ::tracing::info!(
+            operation = "CreateHost",
+            access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+            host_arn = %host_arn,
+            outcome = "created",
+            "host created"
+        );
+
+        Ok(CreateHostOutput {
+            host_arn: Some(host_arn),
+            // The modelled member reports the tags of the CREATED host, so a host
+            // created with none has no tag list to report — the rendering
+            // `CreateConnection` uses, deliberately not `ListTagsForResource`'s, whose
+            // whole output IS the tag list.
+            tags: (!tags.is_empty()).then_some(tags),
+        })
     }
 }

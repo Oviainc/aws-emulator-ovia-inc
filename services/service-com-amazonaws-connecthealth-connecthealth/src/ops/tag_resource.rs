@@ -70,7 +70,8 @@
 //! A tag key or value outside its modelled length is refused as a 400
 //! `ValidationException` (`crate::scaffolded::Scaffolded::validation`): the model bounds
 //! `TagKey` at 1..128 and `TagValue` at 0..256 and declares no error shape for a bad
-//! input, so that is the only channel for it.
+//! input, so that is the only channel for it. The check itself is
+//! [`crate::service::tag_bounds::violation`], shared with `CreateDomain`.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -206,22 +207,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The model bounds a tag key at 1..128 characters and a value at 0..256
         // (`smithy_query(query="shape",shape="TagMap")`); checked here as well because a
         // constraint on a MAP's key or value is not one the boundary walk can refuse
-        // through the member it was bound to. Same bounds, and the same refusal, as
-        // `CreateDomain` applies to the tags a create carries.
-        if let Some((key, value)) = input.tags.iter().find(|(key, value)| {
-            key.is_empty()
-                || key.len() > crate::state::MAX_TAG_KEY_LEN
-                || value.len() > crate::state::MAX_TAG_VALUE_LEN
-        }) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "tags entry '{}' is outside the bounds of a tag: a key is 1..{} characters \
-                 and a value 0..{} (key {} characters, value {} characters)",
-                key.chars().take(32).collect::<String>(),
-                crate::state::MAX_TAG_KEY_LEN,
-                crate::state::MAX_TAG_VALUE_LEN,
-                key.len(),
-                value.len()
-            )));
+        // through the member it was bound to. The SAME check `CreateDomain` applies to
+        // the tags a create carries, so neither can enforce half a bound.
+        if let Some(violation) = crate::service::tag_bounds::violation(input.tags.iter()) {
+            return Err(crate::scaffolded::Scaffolded::validation(violation));
         }
 
         // The limit is on the resource's tag SET, so it is the merged set that is

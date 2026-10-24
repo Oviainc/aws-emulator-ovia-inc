@@ -760,6 +760,13 @@ async fn reads_are_repeatable_and_a_rewrite_replaces_the_record() {
         "case {account_id:?}: a read changed what the next read saw: {reads:?}"
     );
 
+    // The first write's validation falls due, the way the clock would have made
+    // it: a TRN that is still outstanding may not be rewritten at all (that rule
+    // is `tests/all/pending_trn_conflict.rs`), so what this case is about — that a
+    // rewrite REPLACES the record rather than adding one — is observable only
+    // once the record it replaces has settled.
+    make_validations_due(&engine);
+
     let rewrite = call(
         &router,
         "PutTaxRegistration",
@@ -1289,7 +1296,7 @@ async fn reading_an_account_with_no_registration_is_a_404() {
 /// after a delete has released a slot, both still succeed.
 #[tokio::test]
 async fn the_resident_registration_store_is_bounded() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     let seeded = seed(&router, MAX_STORED_REGISTRATIONS).await;
 
     let entry = json!({
@@ -1331,7 +1338,10 @@ async fn the_resident_registration_store_is_bounded() {
         "case {overflow_account:?}: a refused write must store nothing, got {not_stored:?}"
     );
 
-    // A rewrite adds no record, so the bound does not refuse it.
+    // A rewrite adds no record, so the bound does not refuse it — once the
+    // record it replaces is no longer an outstanding TRN, which the clock settles
+    // and `tests/all/pending_trn_conflict.rs` covers.
+    make_validations_due(&engine);
     let rewritten = call(
         &router,
         "PutTaxRegistration",

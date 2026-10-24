@@ -17,7 +17,9 @@ use service_com_amazonaws_taxsettings_taxsettings::state::{
     STATUS_PENDING,
 };
 
-use crate::tax_registration_lifecycle::{call, emulator, emulator_with_engine, hold_validations_open};
+use crate::tax_registration_lifecycle::{
+    call, emulator, emulator_with_engine, hold_validations_open, make_validations_due,
+};
 
 /// `n` distinct 12-digit account ids.
 fn account_ids(n: usize) -> Vec<String> {
@@ -187,6 +189,13 @@ async fn a_batch_write_registers_every_account_it_names() {
         answer.status, 200,
         "case \"repeated account\": the batch write must succeed, got {answer:?}"
     );
+    assert_eq!(
+        answer.get("errors").as_array().map(Vec::len),
+        Some(0),
+        "case \"repeated account\": a repeated id names one write, not a conflict with the record \
+         this call wrote, got {:?}",
+        answer.body
+    );
     let listed = call(&router, "ListTaxRegistrations", &json!({})).await;
     let accounts: Vec<&str> = listed
         .get("accountDetails")
@@ -205,8 +214,13 @@ async fn a_batch_write_registers_every_account_it_names() {
     );
 }
 
-/// RULE: a batch write replaces the record of an account that already holds one,
-/// exactly as a single-account write does, rather than adding a second.
+/// RULE: a batch write replaces the record of an account that already holds one
+/// whose validation has run, exactly as a single-account write does, rather than
+/// adding a second.
+///
+/// A record whose validation is still outstanding is NOT replaced — that rule,
+/// for both writers, is `tests/all/pending_trn_conflict.rs` — so the clock is
+/// moved on before the rewrite here.
 #[tokio::test]
 async fn a_batch_write_replaces_a_record_the_account_already_holds() {
     let (router, engine) = emulator_with_engine();
@@ -220,6 +234,9 @@ async fn a_batch_write_replaces_a_record_the_account_already_holds() {
     )
     .await;
     assert_eq!(put.status, 200, "setup put failed: {:?}", put.body);
+    // The first write's validation falls due, the way the clock would have made
+    // it: the record is no longer an outstanding TRN, so it may be rewritten.
+    make_validations_due(&engine);
 
     let batch = call(
         &router,

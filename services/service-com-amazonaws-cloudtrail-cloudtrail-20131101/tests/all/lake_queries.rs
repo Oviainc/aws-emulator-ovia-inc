@@ -8,7 +8,10 @@
 //!   `DescribeQueryResponse` is the value the query record carries, for every
 //!   value of the model's `QueryStatus` enum, and `DeliveryS3Uri` /
 //!   `DeliveryStatus` are reported exactly when the run delivered results to S3;
-//! * it writes nothing — two calls in a row report the same thing;
+//! * it moves nothing — two calls in a row report the same thing, and the one
+//!   write a read makes is materialising the transition the clock already owed
+//!   a run (see `tests/all/start_query.rs`, where a run started through
+//!   `StartQuery` ends on its own);
 //! * "You must specify either QueryId or QueryAlias": a request with neither,
 //!   with both, or with `RefreshId` but no alias is refused with
 //!   `InvalidParameterException`;
@@ -31,12 +34,12 @@
 //! Both not-found refusals answer HTTP 400 — the status CloudTrail answers with,
 //! which is not the `@httpError(404)` its model annotates.
 //!
-//! `StartQuery` and `CreateEventDataStore` are still scaffold stubs
-//! (`issues/things-that-do-not-work/…-cloudtrail-startquery-stub.md` and
-//! `…-cloudtrail-createeventdatastore-stub.md`), so no implemented operation can
-//! mint a query yet. These cases therefore seed the SAME registries the handler
-//! reads, through the shared engine, and then go over the wire for every
-//! assertion.
+//! `CreateEventDataStore` mints a store but `StartQuery` mints only a `QUEUED`
+//! run that the clock finishes — no implemented operation produces a run that
+//! failed, timed out or was cancelled, and none produces a store awaiting
+//! deletion or one shared from another account. These cases therefore seed the
+//! SAME registries the handler reads, through the shared engine, and then go
+//! over the wire for every assertion.
 
 use serde_json::{json, Value};
 use std::time::{Duration, SystemTime};
@@ -120,7 +123,8 @@ fn seed_store_with(
     );
 }
 
-/// Seed one query run, the way `StartQuery` will once it is implemented.
+/// Seed one query run in a state no implemented operation produces (a run that
+/// failed, timed out or was cancelled), or at an instant a case needs fixed.
 fn seed_query(emulator: &Emulator, record: &QueryRecord) {
     emulator
         .state()

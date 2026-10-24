@@ -74,6 +74,11 @@
 //! * `ValidationException` (HTTP 400) — widened in through `extra_errors` (see below):
 //!   this SERVICE models the shape, this operation's own `errors` list does not name it,
 //!   and it is the error the account-wide Domain cap is surfaced as.
+//! * `ValidationException` (HTTP 400), through `crate::scaffolded::Scaffolded::validation`
+//!   — a `tags` entry outside the modelled `TagKey`/`TagValue` lengths (key 1..128
+//!   characters, value 0..256), refused through the one check every operation that
+//!   accepts a `TagMap` shares ([`crate::service::tag_bounds::violation`]) because a
+//!   constraint on a map's key or value is not one the boundary walk refuses.
 //!
 //! ## Beside the model
 //!
@@ -247,19 +252,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            if let Some((key, value)) = tags.iter().find(|(key, value)| {
-                key.len() > crate::state::MAX_TAG_KEY_LEN
-                    || value.len() > crate::state::MAX_TAG_VALUE_LEN
-            }) {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "tags entry '{}' exceeds the maximum key length {} or value length {} \
-                     (key {} characters, value {} characters)",
-                    key.chars().take(32).collect::<String>(),
-                    crate::state::MAX_TAG_KEY_LEN,
-                    crate::state::MAX_TAG_VALUE_LEN,
-                    key.len(),
-                    value.len()
-                )));
+            // The modelled `TagKey`/`TagValue` lengths, at BOTH ends, through the one
+            // check every operation that accepts a `TagMap` shares — a constraint on a
+            // map's key or value is not one the boundary walk refuses, so the handler is
+            // what refuses it. A refusal here writes nothing: it is raised before any id
+            // is minted.
+            if let Some(violation) = crate::service::tag_bounds::violation(tags.iter()) {
+                return Err(crate::scaffolded::Scaffolded::validation(violation));
             }
         }
 

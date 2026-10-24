@@ -109,6 +109,20 @@ pub(crate) fn account(n: u64) -> String {
     format!("{n:012}")
 }
 
+/// The instant `YYYY-MM-DDThh:mm:ssZ` names, in epoch seconds — so a suite writes a
+/// budget timestamp as the date it is rather than as an epoch literal, and the calendar
+/// is the runtime's own.
+///
+/// `pub(crate)` so every suite in this test target shares the one helper.
+pub(crate) fn civil_secs(rendered: &str) -> i64 {
+    ::aws_smithy_types::DateTime::from_str(
+        rendered,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .unwrap_or_else(|error| panic!("{rendered:?} must be a date-time: {error}"))
+    .secs()
+}
+
 /// One row of the lifecycle table: a case name and the `Budget` / notification
 /// payloads to create it with.
 struct Row {

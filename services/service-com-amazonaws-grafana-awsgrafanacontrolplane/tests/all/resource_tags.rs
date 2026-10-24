@@ -320,34 +320,60 @@ async fn tag_resource_merges_the_submitted_tags_and_the_readers_report_them() {
 /// `TagKey` is `@length(min: 1, max: 128)` and `TagValue` `@length(min: 0, max: 256)`:
 /// each published bound is accepted and one character past it is refused, leaving the
 /// stored tags as they were.
+///
+/// The two refusals carry different codes because two different layers raise them: a tag
+/// VALUE is walked by the service's request-body validator, which refuses the body as a
+/// bad request, while a tag KEY is a map key the walk does not descend into, so the
+/// handler refuses it with the modelled `ValidationException`.
 #[tokio::test]
 async fn tag_lengths_are_accepted_at_the_published_bounds_and_refused_past_them() {
-    let cases: Vec<(&str, String, String, u16)> = vec![
-        ("the shortest key the model admits", "k".to_string(), "v".to_string(), 200),
-        ("the longest key the model admits", "k".repeat(MAX_KEY_LEN), "v".to_string(), 200),
+    let cases: Vec<(&str, String, String, u16, &str)> = vec![
+        (
+            "the shortest key the model admits",
+            "k".to_string(),
+            "v".to_string(),
+            200,
+            "",
+        ),
+        (
+            "the longest key the model admits",
+            "k".repeat(MAX_KEY_LEN),
+            "v".to_string(),
+            200,
+            "",
+        ),
         (
             "one character past the longest key",
             "k".repeat(MAX_KEY_LEN + 1),
             "v".to_string(),
             400,
+            "ValidationException",
         ),
-        ("the shortest value the model admits", "empty".to_string(), String::new(), 200),
+        (
+            "the shortest value the model admits",
+            "empty".to_string(),
+            String::new(),
+            200,
+            "",
+        ),
         (
             "the longest value the model admits",
             "long".to_string(),
             "v".repeat(MAX_VALUE_LEN),
             200,
+            "",
         ),
         (
             "one character past the longest value",
             "long".to_string(),
             "v".repeat(MAX_VALUE_LEN + 1),
             400,
+            "BadRequestException",
         ),
     ];
 
     let router = emulator();
-    for (case, key, value, expected_status) in cases {
+    for (case, key, value, expected_status, expected_code) in cases {
         let id = create_workspace(&router, &BTreeMap::new()).await;
         let arn = workspace_arn(&id);
         let submission: BTreeMap<String, String> = [(key.clone(), value.clone())].into();
@@ -367,8 +393,8 @@ async fn tag_lengths_are_accepted_at_the_published_bounds_and_refused_past_them(
         } else {
             assert_eq!(
                 answer.error_code(),
-                "ValidationException",
-                "case {case:?}: expected ValidationException, got {:?}",
+                expected_code,
+                "case {case:?}: expected {expected_code}, got {:?}",
                 answer.body
             );
             assert!(

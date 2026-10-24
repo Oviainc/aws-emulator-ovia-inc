@@ -41,9 +41,80 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+pub mod workspace_api;
+
+/// The error code the service's request validator answers a request whose BODY
+/// does not satisfy the model's own rules with, and the message it states.
+///
+/// This is recorded behaviour, not a modelled error: Amazon Managed Grafana
+/// fronts its control plane with a request validator that checks the request body
+/// against the operation's schema and refuses one that fails it with the
+/// unmodelled code `BadRequestException` and the message "Invalid request body" —
+/// the message names the body because the body is what it validated. A member
+/// bound to the URI (a `@httpLabel` path segment, a `@httpQuery` parameter) is not
+/// part of that body, so a refusal of one keeps the modelled `ValidationException`
+/// the service itself raises.
+const BAD_REQUEST_CODE: &str = "BadRequestException";
+const INVALID_REQUEST_BODY: &str = "Invalid request body";
+
+/// The members this service carries in the request URI rather than in the body:
+/// every `@httpLabel` and `@httpQuery` member of any operation of
+/// `com.amazonaws.grafana#AWSGrafanaControlPlane`.
+///
+/// Source: the model, read per operation with
+/// `smithy_query(query="operation", operation="...")` — the labels are the
+/// segments of the operations' own `@http` URIs (`/workspaces/{workspaceId}`,
+/// `/workspaces/{workspaceId}/licenses/{licenseType}`,
+/// `/workspaces/{workspaceId}/apikeys/{keyName}`,
+/// `/workspaces/{workspaceId}/serviceaccounts/{serviceAccountId}/tokens/{tokenId}`,
+/// `/tags/{resourceArn}`) and the query members are the pagination and filter
+/// parameters (`maxResults`, `nextToken`, `tagKeys`, `userId`, `userType`,
+/// `groupId`, and `ListVersions`' own `workspace-id`).
+///
+/// `keyName` is deliberately NOT here: `CreateWorkspaceApiKeyRequest` carries it
+/// in the BODY, and the refusal renderer is handed the violated member without the
+/// operation, so the member is classified by the binding it has where a request
+/// body carries it at all.
+const URI_BOUND_MEMBERS: [&str; 10] = [
+    "workspaceId",
+    "licenseType",
+    "serviceAccountId",
+    "tokenId",
+    "resourceArn",
+    "maxResults",
+    "nextToken",
+    "tagKeys",
+    "userId",
+    "userType",
+];
+
+/// How this service states a refusal of one violated member, or `None` to leave
+/// the framework's wording (and the modelled `ValidationException` code) in place.
+///
+/// A violation of a member the request carries in its body is the request
+/// validator's, so it is answered with [`BAD_REQUEST_CODE`]; a violation of a
+/// URI-bound member is the service's own and keeps the modelled code. Absence is
+/// not reworded: the recorded refusal is of a value that was PRESENT and outside a
+/// bound the model declares, so that is the class this answers for.
+fn refusal_for(violation: &Violation) -> Option<Refused> {
+    // A nested path names its top-level member first
+    // (`samlConfiguration.idpMetadata`), and that member is the one the body
+    // carries.
+    let member = violation.path.split('.').next().unwrap_or_default();
+    if matches!(violation.kind, ViolationKind::MissingRequiredMember)
+        || URI_BOUND_MEMBERS.contains(&member)
+    {
+        return None;
+    }
+    Some(Refused {
+        code: BAD_REQUEST_CODE.to_string(),
+        message: INVALID_REQUEST_BODY.to_string(),
+    })
+}
 
 /// The `com-amazonaws-grafana-awsgrafanacontrolplane` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -52,6 +123,14 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The same shared engine the generated entry constructs each operation from.
+    ///
+    /// A workspace's own Grafana HTTP API ([`workspace_api`]) is not a modelled
+    /// operation — the model describes the control plane only — so it is served
+    /// from `override_routing_error` below, which is handed the request but no
+    /// operation. It reaches this service's store through this handle, exactly as
+    /// a handler reaches it through its own `self.engine`.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +139,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
         }
     }
 }
@@ -77,10 +157,32 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+        let route_key = smithy_server_runtime::resolve_route_key(parts);
+        if route_key
+            .as_deref()
+            .is_some_and(|key| key == self.entry.identity().signing_name())
+        {
+            return true;
         }
+        // And a request to a workspace's own Grafana HTTP API, which is claimed by
+        // PATH because that is the only thing that identifies it: a client holding
+        // a workspace API key or a service-account token presents it as a bearer
+        // token, with no SigV4 credential and no `X-Amz-Target`, and addresses the
+        // endpoint the control plane announced — this emulator's own, whose host
+        // (an IP literal, `localhost`) names no service. Without this the router
+        // answers `UnknownService` for an endpoint this service handed out.
+        //
+        // A request that DOES name another service is left to it: a second
+        // claimant would only make the router refuse both as `AmbiguousService`.
+        if route_key
+            .as_deref()
+            .is_some_and(workspace_api::names_a_service)
+        {
+            return false;
+        }
+        // `http::Uri::path` already strips the scheme, the authority and the
+        // query, for an origin-form request line and an absolute-form one alike.
+        workspace_api::route(parts.method.as_str(), parts.uri.path()).is_some()
     }
 
     fn override_operation(
@@ -98,15 +200,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Amazon Managed Grafana does not answer the modelled `ValidationException`
+        // for a value its request validator rejected in the request BODY: that
+        // refusal carries the unmodelled code `BadRequestException`. A client
+        // branches on the code, so both the code and the message are replaced
+        // here. See [`refusal_for`] for which members that covers and why a
+        // URI-bound member keeps the framework's wording.
+        match refusal {
+            Refusal::Invalid(violations) => violations.iter().find_map(refusal_for),
+            // Authentication refusals, and any refusal kind added later, keep the
+            // framework's wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
@@ -117,10 +224,48 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501).
+        //
+        // A request to a workspace's own Grafana HTTP API is exactly such a
+        // request and is served here: that API is not in the Smithy model, so it
+        // names no modelled operation and no routing key, and it carries no SigV4
+        // signature for the framework to verify (its caller authenticates with a
+        // workspace API key or a service-account token, presented as a bearer
+        // token). It is answered in the Grafana API's own JSON envelope rather
+        // than in an AWS error envelope, because a Grafana client is what reads
+        // it.
+        let path = workspace_api::uri_path(req.uri());
+        let request = workspace_api::route(req.method(), &path)?;
+        let now = ::std::time::SystemTime::now();
+        let response = match crate::state::service_state(&*self.engine) {
+            Some(state) => {
+                let authorization = req.headers().get("authorization");
+                workspace_api::serve(&mut state.lock(), &request, authorization, now)
+            }
+            // The store was not mounted, so nothing can be said about the
+            // workspace or the key presented; a server fault is the only honest
+            // answer.
+            None => workspace_api::Response {
+                status: 500,
+                body: br#"{"message":"the grafana workspace store is unavailable"}"#.to_vec(),
+            },
+        };
+        let mut rendered = aws_smithy_runtime_api::http::Response::new(
+            aws_smithy_runtime_api::http::StatusCode::try_from(response.status).unwrap_or_else(
+                |_| {
+                    aws_smithy_runtime_api::http::StatusCode::try_from(500u16)
+                        .expect("500 is a status")
+                },
+            ),
+            aws_smithy_types::body::SdkBody::from(response.body),
+        );
+        rendered
+            .headers_mut()
+            .insert("content-type", workspace_api::CONTENT_TYPE);
+        // What a key authenticates is a snapshot the next control-plane call may
+        // move (a delete revokes it), so no answer here may be cached.
+        rendered.headers_mut().insert("cache-control", "no-store");
+        Some(rendered)
     }
 
     fn override_framework_error(

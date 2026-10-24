@@ -54,6 +54,16 @@ const STATE_ENABLED: &str = "ENABLED";
 /// See [`STATE_ENABLED`].
 const STATE_DISABLED: &str = "DISABLED";
 
+/// The `Protocol` value naming the NDI® transport
+/// (`smithy_query(query="shape",shape="Protocol")`: … | ndi-speed-hq), and a `FlowSize`
+/// that carries it (`smithy_query(query="shape",shape="FlowSize")`: MEDIUM | LARGE |
+/// LARGE_4X). A flow whose source or output is NDI exists only at the larger size — see
+/// `crate::flow_ndi_sizing`, which asserts that rule; here it only keeps the catalog row
+/// for the NDI protocol describing a flow AWS would create.
+const NDI_PROTOCOL: &str = "ndi-speed-hq";
+/// See [`NDI_PROTOCOL`].
+const NDI_CAPABLE_FLOW_SIZE: &str = "LARGE";
+
 /// Create a flow and return its 201 body, asserting the create itself succeeded.
 async fn create(emulator: &Emulator, case: &str, body: Value) -> Value {
     let (status, code, created) = emulator.create_flow(body).await;
@@ -286,19 +296,23 @@ async fn a_source_that_names_no_max_bitrate_reports_the_assigned_one() {
         } else {
             Value::Null
         };
-        let created = create(
-            &emulator,
-            case,
-            json!({
-                "name": format!("assigned-bitrate-flow-{index}"),
-                "source": {
-                    "name": "src",
-                    "protocol": protocol,
-                    "whitelistCidr": "10.0.0.0/16"
-                }
-            }),
-        )
-        .await;
+        let mut body = json!({
+            "name": format!("assigned-bitrate-flow-{index}"),
+            "source": {
+                "name": "src",
+                "protocol": protocol,
+                "whitelistCidr": "10.0.0.0/16"
+            }
+        });
+        // A flow whose source uses the NDI® transport exists only at an NDI-capable size:
+        // "set this optional parameter to LARGE if you want to enable NDI sources or
+        // outputs on the flow"
+        // (`smithy_query(query="doc",shape="CreateFlowRequest",member="FlowSize")`), so the
+        // NDI row of this catalog asks for that size.
+        if protocol == NDI_PROTOCOL {
+            body["flowSize"] = json!(NDI_CAPABLE_FLOW_SIZE);
+        }
+        let created = create(&emulator, case, body).await;
         let arn = flow_arn(&created);
         let described = describe(&emulator, case, &arn).await;
 

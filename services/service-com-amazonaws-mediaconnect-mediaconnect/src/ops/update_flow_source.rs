@@ -408,6 +408,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // anything is written: a refused request must leave the source exactly as it was.
         let mut updated = flow.sources[position].clone();
 
+        // NDI needs the larger flow: "set this optional parameter to LARGE if you want to
+        // enable NDI sources or outputs on the flow" (`CreateFlowRequest$FlowSize`), and
+        // this operation is what "change[s] the flow source type" between a transport
+        // stream and NDI (UpdateFlow's own documentation). A request that makes this source
+        // an NDI source is refused on a flow whose size does not carry NDI — the rule, its
+        // markers and its wording read from the one place CreateFlow and the add paths read
+        // them from (`crate::state`). A request that does not make the source NDI is never
+        // refused for what the source already carries.
+        if crate::state::uses_ndi_transport(
+            input.protocol.as_deref(),
+            input.ndi_source_settings.is_some(),
+        ) {
+            if let Some(rejection) = crate::state::ndi_flow_size_rejection(
+                &format!("The NDI source {:?}", updated.name),
+                flow.flow_size.as_deref(),
+            ) {
+                return Err(bad_request(rejection));
+            }
+        }
+
         // What each setting becomes once this request is applied: the request's value
         // where it carries one, the stored value where it does not.
         if let Some(description) = input.description.clone() {

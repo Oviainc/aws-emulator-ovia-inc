@@ -15,7 +15,7 @@
 //! every read then reports what that validation reached
 //! ([`crate::state::SETTLED_REGISTRATION_STATUS`]).
 //!
-//! Four refusals this handler adds beyond the constraints the boundary
+//! The refusals this handler adds beyond the constraints the boundary
 //! validator enforces, spelled out here so a later fixer does not read them as
 //! model-derived:
 //!
@@ -38,6 +38,12 @@
 //! * the model's non-blank pattern `^(?!\s*$)[\s\S]+$` is a negative lookahead
 //!   the boundary validator's regex engine cannot compile, so this handler
 //!   applies it to `registrationId`, `legalName` and every address line.
+//! * a write aimed at an account whose stored TRN is still `Pending` is refused
+//!   with the modelled `ConflictException`: the model documents "You can't set a
+//!   TRN if there's a pending TRN. You'll need to delete the pending TRN first",
+//!   so the outstanding record is left exactly as it was and the caller deletes
+//!   it (or waits for its validation to run) before writing again — see
+//!   [`crate::state::pending_registration_conflict`].
 //! * a write that would take the resident store past
 //!   [`crate::state::MAX_STORED_REGISTRATIONS`] is refused with the modelled
 //!   `ConflictException`; see that constant for why the store is bounded.
@@ -256,10 +262,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(PutTaxRegistrationErrorModeled::ValidationException)?;
 
         // A write replaces the account's record and bumps its revision, which the
-        // document access tokens derived from it carry; the store is bounded, so
-        // a write that would ADD a record past that bound is refused. The write
-        // itself lives in `state.rs` so this operation and
-        // `BatchPutTaxRegistration` cannot store one entry two different ways.
+        // document access tokens derived from it carry — unless the record it
+        // would replace is a TRN whose validation is still outstanding, which the
+        // model says must be deleted first, or the store is at its bound. The
+        // write itself lives in `state.rs` so this operation and
+        // `BatchPutTaxRegistration` cannot store one entry two different ways,
+        // nor judge one account's state two different ways; both refusals are
+        // this operation's modelled `ConflictException`.
         let status = state
             .lock()
             .store_registration(&account_id, entry, ::std::time::Instant::now())

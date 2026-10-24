@@ -16,11 +16,14 @@
 //!   outside the 1..=550 the model sets on it never reaches this handler: the
 //!   boundary validator refuses it, naming the member and the bound.
 //! * an account the service could not write while the entry itself was fine is
-//!   reported in the response's `errors` list, which names that account and why.
-//!   Today the one such reason is the resident bound
-//!   [`crate::state::MAX_STORED_REGISTRATIONS`], the same bound
-//!   `PutTaxRegistration` answers `ConflictException` for; reporting it per
-//!   account is what the `errors` member is for.
+//!   reported in the response's `errors` list, which names that account and why,
+//!   while every other account the request named is still stored; reporting a
+//!   per-account failure there is what the `errors` member is for. The reasons
+//!   are the ones the shared write refuses on, each a `ConflictException` the
+//!   single-account write answers 409 with: the account's stored TRN is still
+//!   `Pending` ("You can't set a TRN if there's a pending TRN. You'll need to
+//!   delete the pending TRN first" — that account's record is left exactly as it
+//!   was), and the resident bound [`crate::state::MAX_STORED_REGISTRATIONS`].
 //!
 //! `status` is the status the registrations were stored with — `Pending`, while
 //! the validation each write started is outstanding (see
@@ -220,19 +223,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut stored_status: Option<String> = None;
         let written_at = ::std::time::Instant::now();
         let mut store = state.lock();
+        let mut addressed: ::std::collections::BTreeSet<&str> =
+            ::std::collections::BTreeSet::new();
         for account_id in &input.account_ids {
+            // `accountIds` is "List of unique account identifiers", and one
+            // entry is written to every account the request names, so an id
+            // named twice names the SAME write: it is performed once rather
+            // than a second time against the record this very call just wrote.
+            if !addressed.insert(account_id.as_str()) {
+                continue;
+            }
             // The same write `PutTaxRegistration` performs, so one entry cannot
-            // be stored two different ways. An account the write refuses — a new
-            // record this emulator has no room for — is reported against that
-            // account, and the rest of the batch still goes through.
+            // be stored two different ways, and neither can one account's state
+            // be judged two different ways. An account the write refuses — one
+            // whose TRN is still pending, or a new record this emulator has no
+            // room for — is reported against that account with its record left
+            // as it was, and the rest of the batch still goes through.
             match store.store_registration(account_id, entry, written_at) {
                 Ok(status) => stored_status = Some(status),
                 Err(conflict) => errors.push(BatchPutTaxRegistrationError2 {
                     account_id: account_id.clone(),
                     message: conflict.message,
                     // The code this account's own single-account write would
-                    // have failed with: `PutTaxRegistration` answers the
-                    // resident bound with its modelled `ConflictException`.
+                    // have failed with: `PutTaxRegistration` answers both
+                    // refusals with its modelled `ConflictException`.
                     code: Some("ConflictException".to_string()),
                 }),
             }

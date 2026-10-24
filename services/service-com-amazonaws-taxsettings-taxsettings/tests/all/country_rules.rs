@@ -25,10 +25,14 @@ use crate::tax_registration_lifecycle::{call, emulator, Answer};
 
 /// Both operations that store a `TaxRegistrationEntry`. The model gives them the
 /// same entry shape and the same country-specific documentation.
-const WRITERS: &[&str] = &["PutTaxRegistration", "BatchPutTaxRegistration"];
+///
+/// `pub(crate)` because `tests/all/pending_trn_conflict.rs` drives the same two
+/// writers: the pending-TRN rule, like the country rules, is one rule set both
+/// of them reach.
+pub(crate) const WRITERS: &[&str] = &["PutTaxRegistration", "BatchPutTaxRegistration"];
 
 /// Store `entry` for `account_id` through `writer`, whichever of the two it is.
-async fn write(
+pub(crate) async fn write(
     router: &smithy_server_runtime::MultiServiceRouter,
     writer: &str,
     account_id: &str,

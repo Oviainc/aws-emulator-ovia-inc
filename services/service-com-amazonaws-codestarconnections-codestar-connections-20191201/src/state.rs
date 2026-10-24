@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use std::hash::BuildHasher;
 use std::time::SystemTime;
 
-use crate::ops::types::{Connection, Tag, VpcConfiguration};
+use crate::ops::types::{Connection, Host, Tag, VpcConfiguration};
 
 /// This service's ARN namespace (`awsService.arnNamespace` in the Smithy model), used
 /// for every ARN the service mints.
@@ -37,6 +37,18 @@ pub const CONNECTION_STATUS_PENDING: &str = "PENDING";
 /// `HostStatus` is modeled as a free-form string (`len 1..64`) rather than an enum, so
 /// these are the values the doc names rather than a closed set the wire enforces.
 pub const HOST_STATUS_PENDING: &str = "PENDING";
+/// The status description a host carries while it is `PENDING`.
+///
+/// `CreateHost`'s own doc states what a pending host is waiting for: "A host created
+/// through the CLI or the SDK is in `PENDING` status by default. You can make its
+/// status `AVAILABLE` by setting up the host in the console." `Host$StatusMessage` is
+/// modeled "The status description for the host" — so while the host sits in that
+/// non-terminal status the service has a description to report, and this is it. The
+/// WORDING is the emulator's (AWS documents none); what the API contract carries is
+/// that a pending host reports a description at all.
+pub const HOST_STATUS_MESSAGE_PENDING: &str =
+    "Host is pending. Complete the host setup in the console to make it available.";
+
 /// See [`HOST_STATUS_PENDING`].
 pub const HOST_STATUS_AVAILABLE: &str = "AVAILABLE";
 /// See [`HOST_STATUS_PENDING`].
@@ -86,6 +98,14 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// chosen high enough that no realistic client workflow meets it, and finite so a
 /// long-lived process cannot grow its state without limit.
 pub const MAX_CONNECTIONS: usize = 1000;
+
+/// The largest number of hosts this emulator holds at once.
+///
+/// A CHOSEN bound, exactly like [`MAX_CONNECTIONS`] and for the same reason: the store
+/// lives in this process, so the number of records a caller can accumulate has to be
+/// capped somewhere. `CreateHost` refuses past it with `LimitExceededException` (429),
+/// the only error that operation models.
+pub const MAX_HOSTS: usize = 1000;
 
 /// The largest number of tags one resource holds.
 ///
@@ -143,11 +163,11 @@ impl StoredConnection {
 ///
 /// One record per `HostArn`, holding every member of the modeled `Host` shape the API
 /// can observe, so an operation that reports or deletes a host works off this one row
-/// rather than recomputing one. `DeleteHost` reads [`StoredHost::status`] (the delete
-/// is refused while the host's VPC configuration is in flight) and removes the whole
-/// record; the fields it does not read are what makes the record a HOST, and are what
-/// `CreateHost` / `GetHost` / `ListHosts` / `UpdateHost` write and report (each still
-/// a scaffold with its own open issue).
+/// rather than recomputing one. `CreateHost` writes the row, `GetHost` renders it
+/// through [`StoredHost::to_host`], and `DeleteHost` reads [`StoredHost::status`] (the
+/// delete is refused while the host's VPC configuration is in flight) before removing
+/// the whole record. `ListHosts` and `UpdateHost` report and update this same row (each
+/// still a scaffold with its own open issue).
 #[derive(Debug, Clone)]
 pub struct StoredHost {
     /// `Name` as supplied at create.
@@ -167,6 +187,23 @@ pub struct StoredHost {
 }
 
 impl StoredHost {
+    /// This record as the modeled `Host` structure every reader renders from.
+    ///
+    /// `GetHost` projects this onto its own (flattened, `HostArn`-less and
+    /// `StatusMessage`-less) output shape, and `ListHosts` reports it whole, so both
+    /// read ONE rendering of a stored host rather than each recomputing one.
+    pub fn to_host(&self) -> Host {
+        Host {
+            name: Some(self.name.clone()),
+            host_arn: Some(self.host_arn.clone()),
+            provider_type: Some(self.provider_type.clone()),
+            provider_endpoint: Some(self.provider_endpoint.clone()),
+            vpc_configuration: self.vpc_configuration.clone(),
+            status: Some(self.status.clone()),
+            status_message: self.status_message.clone(),
+        }
+    }
+
     /// Whether this host's status forbids deleting it — see
     /// [`HOST_STATUS_DELETE_BLOCKED`].
     pub fn delete_blocked_by_status(&self) -> bool {
@@ -220,6 +257,18 @@ impl ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
             .values()
             .filter(|connection| connection.host_arn.as_deref() == Some(host_arn))
             .count()
+    }
+
+    /// Whether this service holds a resource under `resource_arn`.
+    ///
+    /// The tag operations (`TagResource` / `UntagResource` / `ListTagsForResource`) are
+    /// modeled over a `ResourceArn` rather than over one resource kind, so each
+    /// resolves the ARN through this one predicate: EVERY resource kind this service
+    /// persists is tag-addressable, and an ARN naming none of them is the
+    /// `ResourceNotFoundException` those operations declare. `CreateHost` and
+    /// `CreateConnection` both accept `Tags`, so both kinds have to resolve here.
+    pub fn holds_resource(&self, resource_arn: &str) -> bool {
+        self.connections.contains_key(resource_arn) || self.hosts.contains_key(resource_arn)
     }
 
     /// How many distinct keys `resource_arn` would hold after merging `tags`.
@@ -292,8 +341,9 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// Mint the id of a new connection: a hyphenated UUID, which is the shape the real
-/// service's connection ids carry (`connection/<uuid>` in the ARN).
+/// Mint the id of a new resource: a hyphenated UUID, which is the shape the real
+/// service's connection and host ids carry (`connection/<uuid>`, `host/<uuid>` in the
+/// ARN).
 ///
 /// The low 48 bits carry the store's monotonic `sequence`, so an id is unique BY
 /// CONSTRUCTION — never by probability — and is never handed out twice however many
@@ -303,7 +353,10 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// that parses the id as a UUID gets a well-formed one. Built from `std` alone: the
 /// uniqueness this needs comes from state, not from a random-number source, so the
 /// crate carries no UUID dependency for it.
-pub fn mint_connection_id(sequence: u64) -> String {
+///
+/// One counter feeds every resource kind ([`ComAmazonawsCodestarconnectionsCodestarConnections20191201State::take_sequence`]),
+/// so no two resources of this service — of the same kind or not — ever share an id.
+pub fn mint_resource_uuid(sequence: u64) -> String {
     let mut bytes = [0u8; 16];
     // Two independently seeded hashes of the sequence: `RandomState::new` takes fresh
     // keys from the process's seed, so these differ from call to call.
@@ -336,6 +389,22 @@ pub fn connection_arn(region: &str, connection_id: &str) -> String {
         region,
         &format!("connection/{connection_id}"),
     )
+}
+
+/// The ARN of a host: `arn:aws:codestar-connections:<region>:<account>:host/<id>` — the
+/// modeled `HostArn` form `^arn:aws(-[\w]+)*:codestar-connections:.+:[0-9]{12}:host\/.+$`.
+pub fn host_arn(region: &str, host_id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("host/{host_id}"))
+}
+
+/// How this service reports a `HostArn` that resolves to no host it holds.
+///
+/// Shared by every operation that resolves one (`DeleteHost`, `GetHost`), so an absent
+/// host reads the same whichever call found it absent. The message is built from the
+/// REQUEST — it names the ARN that was supplied — which is the part of it that is a
+/// contract.
+pub fn host_not_found_message(host_arn: &str) -> String {
+    format!("No host exists with the ARN: {host_arn}")
 }
 
 /// Encode a pagination cursor: the creation sequence the next page starts at.

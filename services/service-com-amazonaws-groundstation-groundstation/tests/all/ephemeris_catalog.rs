@@ -212,7 +212,7 @@ fn member(item: &Value, name: &str) -> String {
 
 /// A `tle` ephemeris supplied inline, one `TLEData` entry per `(start, end)` validity
 /// range.
-fn tle_inline(ranges: &[(i64, i64)]) -> Value {
+pub(crate) fn tle_inline(ranges: &[(i64, i64)]) -> Value {
     let entries: Vec<Value> = ranges
         .iter()
         .map(|(start, end)| {

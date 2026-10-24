@@ -270,6 +270,12 @@ pub fn launch_host_instance<Eng: Send + Sync + 'static>(
         placement_az: availability_zone,
         monitoring_state: ec2::MONITORING_STATE_DISABLED.to_string(),
         architecture: ec2::architecture_for(launch.instance_type),
+        // An ESX host boots the image Amazon EVS publishes, not a kernel or RAM disk
+        // image a launch names, so it carries neither; source/destination checking
+        // starts at the default every EC2 instance starts at.
+        kernel_id: None,
+        ramdisk_id: None,
+        source_dest_check: ec2::DEFAULT_SOURCE_DEST_CHECK,
         ebs_optimized: false,
         hibernation_configured: false,
         disable_api_termination: false,

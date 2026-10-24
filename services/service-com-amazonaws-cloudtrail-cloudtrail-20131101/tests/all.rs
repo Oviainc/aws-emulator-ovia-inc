@@ -83,6 +83,8 @@ mod refusal_fidelity;
 mod resource_policies;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/start_query.rs"]
+mod start_query;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 // Declared HERE rather than in the `import_*` span of the sorted list above: that span

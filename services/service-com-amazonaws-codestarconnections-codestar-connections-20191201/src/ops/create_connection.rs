@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The id is minted from the store's own creation-order sequence, so it is unique
         // by construction and nothing is minted for a request the cap refuses.
         let sequence = store.take_sequence();
-        let connection_id = crate::state::mint_connection_id(sequence);
+        let connection_id = crate::state::mint_resource_uuid(sequence);
         let connection_arn = crate::state::connection_arn(&region, &connection_id);
         store.connections.insert(
             connection_arn.clone(),

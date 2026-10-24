@@ -149,9 +149,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // A pure read of the tag map; an untagged resource reports an empty list, which
-        // is a different answer from an ARN naming no resource at all.
+        // is a different answer from an ARN naming no resource at all. Any KIND of
+        // resource this service holds resolves here (see `state::holds_resource`).
         let store = state.lock();
-        if !store.connections.contains_key(&input.resource_arn) {
+        if !store.holds_resource(&input.resource_arn) {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!("Could not find resource {}", input.resource_arn)),

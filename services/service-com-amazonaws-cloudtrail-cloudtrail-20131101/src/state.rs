@@ -1434,6 +1434,41 @@ impl QueryState {
     }
 }
 
+/// How long a Lake query reads a non-terminal `QueryStatus` before the clock
+/// settles it into the terminal one.
+///
+/// The model's `QueryStatus` enum carries `QUEUED` and `RUNNING`, so a query IS
+/// asynchronous: `StartQuery` answers with an id while the run is still queued.
+/// CloudTrail publishes no duration for a run, so this span is the emulator's
+/// own: short enough not to stall a workflow, non-zero so a caller that
+/// describes the query straight after starting it still sees `QUEUED`.
+pub const QUERY_SETTLE_AFTER: Duration = Duration::from_millis(500);
+
+/// How many runs of one Region may be in flight at once, from the model doc for
+/// `MaxConcurrentQueriesException`: "You are already running the maximum number
+/// of concurrent queries. The maximum number of concurrent queries is 10."
+pub const MAX_CONCURRENT_QUERIES: usize = 10;
+
+/// How many query runs the registry keeps before `StartQuery` drops the oldest
+/// finished ones.
+///
+/// Every `StartQuery` adds a record and no operation removes one, so the
+/// registry would grow for the life of the process. CloudTrail publishes a
+/// 7-day query history rather than a count, so this is the emulator's OWN bound
+/// on the store, not a claim about the service: it sits far above any workflow
+/// an emulator serves, and only runs that have already reached a terminal state
+/// are dropped, oldest first, so no in-flight run is ever lost.
+pub const QUERY_HISTORY_LIMIT: usize = 1_000;
+
+/// The `DeliveryStatus` value a run whose results were asked for in S3 carries
+/// while the delivery has not completed, from the model's `DeliveryStatus` enum
+/// (`ops::types::DELIVERY_STATUS_VALUES`).
+///
+/// It is where a delivery this emulator accepted STAYS: writing the result file
+/// would mean writing to an S3 bucket, which no part of this service does, so
+/// reporting `SUCCESS` would claim a delivery that never happened.
+pub const DELIVERY_STATUS_PENDING: &str = "PENDING";
+
 /// Where a query's results were delivered.
 ///
 /// The URI and the delivery status are one value because the model reports them
@@ -1485,6 +1520,9 @@ pub struct QueryRecord {
     /// When `StartQuery` minted the query: the `CreationTime` of the statistics
     /// `DescribeQuery` reports.
     pub created_at: Option<SystemTime>,
+    /// When a non-terminal run is due to reach its terminal state; `None` once it
+    /// has, and for a run the clock owes nothing.
+    pub settles_at: Option<SystemTime>,
 }
 
 impl QueryRecord {
@@ -1493,6 +1531,38 @@ impl QueryRecord {
     pub fn addressed_by(&self, region: &str, event_data_store_id: Option<&str>) -> bool {
         self.region == region
             && event_data_store_id.is_none_or(|store| self.event_data_store_id == store)
+    }
+
+    /// Materialise the transition the clock already owes this run: a run that is
+    /// still `QUEUED` or `RUNNING` at [`Self::settles_at`] has ended, and ended
+    /// `FINISHED` — the statement parsed and the store it reads resolved before
+    /// the run was ever queued, so there is nothing left for it to fail on.
+    ///
+    /// A reporting operation may call this: the run ended at `settles_at` whether
+    /// or not anybody looked, so applying it changes nothing a later caller would
+    /// otherwise have seen.
+    ///
+    /// The statistics it leaves are the run's own: this emulator ingests no
+    /// CloudTrail events, so the store the query read held none and the run
+    /// scanned and matched nothing. The run time is the span the run took — from
+    /// when it was queued to when it ended — and not the time until somebody
+    /// asked about it.
+    pub fn settle(&mut self, now: SystemTime) {
+        let Some(due) = self.settles_at else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.settles_at = None;
+        if self.status.is_terminal() {
+            return;
+        }
+        self.status = QueryState::Finished;
+        self.statistics.execution_time_in_millis = self
+            .created_at
+            .and_then(|started| due.duration_since(started).ok())
+            .map(|took| i32::try_from(took.as_millis()).unwrap_or(i32::MAX));
     }
 }
 
@@ -2093,6 +2163,67 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
                 refresh_id.is_none_or(|refresh| record.refresh_id.as_deref() == Some(refresh))
             })
             .max_by_key(|record| record.created_at)
+    }
+
+    /// Materialise every query transition the clock already owes (see
+    /// [`QueryRecord::settle`]), so what the registry holds is what the runs in
+    /// it have actually reached by `now`.
+    pub fn settle_queries(&mut self, now: SystemTime) {
+        for record in self.queries.values_mut() {
+            record.settle(now);
+        }
+    }
+
+    /// How many runs in `region` have not reached a terminal state — the
+    /// concurrent queries [`MAX_CONCURRENT_QUERIES`] bounds.
+    ///
+    /// Call [`Self::settle_queries`] first: a run whose settle instant has passed
+    /// is no longer in flight, whether or not anybody has looked at it.
+    pub fn queries_in_flight(&self, region: &str) -> usize {
+        self.queries
+            .values()
+            .filter(|record| record.region == region && !record.status.is_terminal())
+            .count()
+    }
+
+    /// Hold the registry to `limit` records by dropping the oldest runs that have
+    /// already reached a terminal state.
+    ///
+    /// A run still in flight is never dropped, so this can leave the registry
+    /// above `limit` — [`MAX_CONCURRENT_QUERIES`] is what bounds those.
+    pub fn trim_query_history(&mut self, limit: usize) {
+        let over = self.queries.len().saturating_sub(limit);
+        if over == 0 {
+            return;
+        }
+        // Oldest first, so the runs dropped are the ones whose history is
+        // furthest behind; a record carrying no creation time sorts oldest.
+        let mut ended: Vec<(Option<SystemTime>, String)> = self
+            .queries
+            .values()
+            .filter(|record| record.status.is_terminal())
+            .map(|record| (record.created_at, record.query_id.clone()))
+            .collect();
+        ended.sort_unstable();
+        for (_, query_id) in ended.into_iter().take(over) {
+            self.queries.remove(&query_id);
+        }
+    }
+
+    /// The query template `alias` names: the statement of a stored dashboard
+    /// widget carrying that alias, in `region`.
+    ///
+    /// "The QueryAlias and QueryParameters parameters are used only for the
+    /// queries that populate the CloudTrail Lake dashboards" (model doc for
+    /// `StartQuery`), so a dashboard's widgets are where an alias resolves — a
+    /// widget's `QueryAlias` names the CloudTrail-managed query it draws.
+    pub fn query_template(&self, alias: &str, region: &str) -> Option<&str> {
+        self.dashboards
+            .values()
+            .filter(|dashboard| dashboard.home_region == region)
+            .flat_map(|dashboard| dashboard.widgets.iter())
+            .find(|widget| widget.query_alias.as_deref() == Some(alias))
+            .and_then(|widget| widget.query_statement.as_deref())
     }
 }
 
