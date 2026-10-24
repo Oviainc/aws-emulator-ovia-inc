@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEnrollmentStatusesForOrganization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEnrollmentStatusesForOrganization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEnrollmentStatusesForOrganization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports one row per member account of the organization this service's store
+//! holds — the account id, the `Status` its enrollment has reached, why, and when it was
+//! written — selected by the `Status` filter and paged at `maxResults`. A pure report: the
+//! member accounts move only when a client calls `UpdateEnrollmentStatus` including them.
+//!
+//! The account's OWN enrollment is not a row here; `GetEnrollmentStatus` reports it.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +160,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEnrollmentStatusesForOrganization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEnrollmentStatusesForOrganizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEnrollmentStatusesForOrganization"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetEnrollmentStatusesForOrganizationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The Compute Optimizer enrollment store is unavailable.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A malformed request is refused BEFORE the store is read, as it is in the other
+        // read operations of this service. The filter vocabulary is the model's own; a name
+        // or value outside it is refused rather than silently matching nothing. The modelled
+        // `@enum` on `EnrollmentFilter$name` already refuses an unmodelled name at the
+        // request boundary, so this covers the VALUES a filter carries and a filter with no
+        // name at all.
+        let filters = input.filters.unwrap_or_default();
+        if let Some(reason) = crate::state::enrollment_filter_rejection(&filters) {
+            return Err(invalid_parameter(reason));
+        }
+
+        // The page token carries this operation's name and the selection it was taken with,
+        // so resuming a walk with a different selection, or with a token another operation
+        // issued, is refused rather than answered with a page of a different result set.
+        let selection_fingerprint = crate::state::fingerprint(&(Self::NAME, &filters));
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let cursor = crate::state::decode_offset_page_token(token)
+                    .filter(|cursor| cursor.selection_fingerprint == selection_fingerprint);
+                let Some(cursor) = cursor else {
+                    return Err(invalid_parameter(
+                        "The value supplied for parameter nextToken is not valid: it must be a \
+                         token returned by a previous GetEnrollmentStatusesForOrganization call \
+                         for the same filters."
+                            .to_string(),
+                    ));
+                };
+                cursor.offset
+            }
+        };
+
+        // `maxResults` is modelled 0..1000 (the request boundary refuses anything outside
+        // that), while the member itself documents "You can specify up to 100 statuses to
+        // return with each request". Whatever it asks for, the page is capped at
+        // `ENROLLMENT_STATUSES_MAX_PAGE_SIZE` so no number a request carries can size the
+        // response or the allocation that builds it; a request naming no size — or the
+        // range's lower bound `0`, which the service documents no meaning for — gets that
+        // same bound plus a `nextToken` to walk the rest. `0` carries no documented meaning,
+        // so it reads as "no size asked for" rather than as an empty page a walk could never
+        // advance through.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .filter(|requested| *requested > 0)
+            .unwrap_or(crate::state::ENROLLMENT_STATUSES_MAX_PAGE_SIZE)
+            .min(crate::state::ENROLLMENT_STATUSES_MAX_PAGE_SIZE);
+
+        // The member accounts the request selects, in the store's own account-id order, each
+        // reporting the status its enrollment has reached at this instant. Nothing is
+        // written: the `Pending` a just-enrolled member account reports is DERIVED from when
+        // its enrollment was written.
+        let now = crate::state::now_secs();
+        let selected: Vec<AccountEnrollmentStatus> = state
+            .lock()
+            .organization_enrollment_statuses(now)
+            .into_iter()
+            .filter(|row| crate::state::account_enrollment_matches_filters(row, &filters))
+            .collect();
+
+        // One page of the selected sequence. A next token is handed out only when the
+        // sequence continues past this page, and it resumes exactly where this page stopped:
+        // "This value is null when there are no more pages of account enrollment statuses to
+        // return."
+        let page: Vec<AccountEnrollmentStatus> = selected
+            .into_iter()
+            .skip(offset)
+            .take(page_size.saturating_add(1))
+            .collect();
+        let has_more = page.len() > page_size;
+        let page: Vec<AccountEnrollmentStatus> = page.into_iter().take(page_size).collect();
+        let next_token = has_more.then(|| {
+            crate::state::encode_offset_page_token(&crate::state::PageCursor {
+                offset: offset.saturating_add(page.len()),
+                selection_fingerprint,
+            })
+        });
+
+        Ok(GetEnrollmentStatusesForOrganizationOutput {
+            account_enrollment_statuses: Some(page),
+            next_token,
+        })
     }
+}
+
+/// The 400 `InvalidParameterValueException` this operation refuses a bad request with:
+/// "The value supplied for the input parameter is out of range or not valid."
+fn invalid_parameter(message: String) -> GetEnrollmentStatusesForOrganizationError {
+    GetEnrollmentStatusesForOrganizationErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

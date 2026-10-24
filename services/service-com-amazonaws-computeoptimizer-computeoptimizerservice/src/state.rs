@@ -8,7 +8,11 @@
 //! than one operation applies to them — scope well-formedness, the preference upsert, the
 //! scope precedence `GetEffectiveRecommendationPreferences` resolves with, and the opaque
 //! page token `GetRecommendationPreferences` round-trips — so no two handlers can drift
-//! from each other's view of the same record.
+//! from each other's view of the same record. The ORGANIZATION's member accounts live here
+//! too ([`OrganizationMemberStore`]): AWS Organizations records which accounts an
+//! organization holds, so no operation of this API creates one, while an
+//! `UpdateEnrollmentStatus` call that includes them writes their enrollment — which
+//! `GetEnrollmentStatusesForOrganization` reports and `GetEnrollmentStatus` counts over.
 //!
 //! The analysis output this service REPORTS lives here too. The FINDINGS CATALOG holds one
 //! row per resource Compute Optimizer has analysed for the account (its finding, its reason
@@ -34,11 +38,12 @@ use ::aws_smithy_types::DateTime;
 use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AutoScalingGroupConfiguration, CustomizableMetricParameters, DBStorageConfiguration,
+    AccountEnrollmentStatus, AutoScalingGroupConfiguration, CustomizableMetricParameters,
+    DBStorageConfiguration,
     EBSEffectiveRecommendationPreferences, EBSEstimatedMonthlySavings, EBSSavingsEstimationMode,
     EBSSavingsOpportunityAfterDiscounts, EBSUtilizationMetric, EffectivePreferredResource,
-    EffectiveRecommendationPreferences, EstimatedMonthlySavings, ExportDestination,
-    ExternalMetricsPreference, IdleRecommendation, IdleRecommendationFilter,
+    EffectiveRecommendationPreferences, EnrollmentFilter, EstimatedMonthlySavings,
+    ExportDestination, ExternalMetricsPreference, IdleRecommendation, IdleRecommendationFilter,
     InstanceSavingsEstimationMode, JobFilter,
     LambdaEffectiveRecommendationPreferences, LambdaEstimatedMonthlySavings,
     LambdaFunctionMemoryProjectedMetric, LambdaFunctionMemoryRecommendationOption,
@@ -50,13 +55,14 @@ use crate::ops::types::{
     Scope, Tag, UtilizationMetric, UtilizationPreference, VolumeConfiguration,
     VolumeRecommendation, VolumeRecommendationOption,
     IDLE_FINDING_VALUES, IDLE_RECOMMENDATION_FILTER_NAME_VALUES,
-    IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES, IDLE_VALUES, JOB_FILTER_NAME_VALUES,
-    JOB_STATUS_VALUES, LAMBDA_FUNCTION_RECOMMENDATION_FILTER_NAME_VALUES,
+    ENROLLMENT_FILTER_NAME_VALUES, IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES, IDLE_VALUES,
+    JOB_FILTER_NAME_VALUES, JOB_STATUS_VALUES,
+    LAMBDA_FUNCTION_RECOMMENDATION_FILTER_NAME_VALUES,
     LAMBDA_FUNCTION_RECOMMENDATION_FINDING_REASON_CODE_VALUES,
     LAMBDA_FUNCTION_RECOMMENDATION_FINDING_VALUES, R_D_S_D_B_RECOMMENDATION_FILTER_NAME_VALUES,
     R_D_S_INSTANCE_FINDING_REASON_CODE_VALUES, R_D_S_INSTANCE_FINDING_VALUES,
-    R_D_S_STORAGE_FINDING_REASON_CODE_VALUES, R_D_S_STORAGE_FINDING_VALUES,
-    RESOURCE_TYPE_VALUES,
+    R_D_S_STORAGE_FINDING_REASON_CODE_VALUES, R_D_S_STORAGE_FINDING_VALUES, RESOURCE_TYPE_VALUES,
+    STATUS_VALUES,
 };
 
 /// The look-back period in force when no preference sets one. From the model's own
@@ -138,10 +144,6 @@ pub struct Enrollment {
     pub member_accounts_enrolled: bool,
     /// When the enrollment record was last written; `None` until the first write.
     pub last_updated_timestamp: Option<DateTime>,
-    /// How many organization member accounts are opted in. A COUNT, not a flag: it is
-    /// zero while no member account is opted in, never absent, because
-    /// `GetEnrollmentStatus` reports the count whatever it is.
-    pub number_of_member_accounts_opted_in: i32,
 }
 
 impl Default for Enrollment {
@@ -151,7 +153,6 @@ impl Default for Enrollment {
             status_reason: None,
             member_accounts_enrolled: false,
             last_updated_timestamp: None,
-            number_of_member_accounts_opted_in: 0,
         }
     }
 }
@@ -186,6 +187,263 @@ impl Enrollment {
             .as_ref()
             .is_some_and(|written| now - written.as_secs_f64() >= ANALYSIS_DELAY.as_secs_f64())
     }
+}
+
+/// Why an account is in the status its enrollment record holds — the `statusReason` the
+/// account's own reader and every member account's row report. Derived from the stored
+/// status, so no two of them can disagree about one record.
+pub fn enrollment_status_reason(status: &str) -> String {
+    if status == STATUS_ACTIVE {
+        "The account is opted in to Compute Optimizer.".to_string()
+    } else {
+        "The account is opted out of Compute Optimizer.".to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The organization's member accounts
+//
+// `GetEnrollmentStatusesForOrganization` "Returns the Compute Optimizer enrollment (opt-in)
+// status of organization member accounts", so what it reports is one row per member account
+// of the organization — never the account's own record, which `GetEnrollmentStatus` reports.
+// Which accounts an organization HOLDS is recorded by AWS Organizations, so no operation of
+// THIS API creates one ([`OrganizationMemberStore`]); what this API writes is their
+// ENROLLMENT, through the `includeMemberAccounts` of an `UpdateEnrollmentStatus` call.
+// ---------------------------------------------------------------------------
+
+/// The one `EnrollmentFilterName` the model declares
+/// (`crate::ops::types::ENROLLMENT_FILTER_NAME_VALUES`): "Specify `Status` to return
+/// accounts with a specific enrollment status".
+pub const ENROLLMENT_FILTER_STATUS: &str = "Status";
+
+/// The `Status` a member account reports while the enrollment the management account asked
+/// for is still reaching it (`crate::ops::types::STATUS_VALUES`).
+pub const STATUS_PENDING: &str = "Pending";
+
+/// How long a member account the management account has just enrolled reports
+/// [`STATUS_PENDING`] for, before it reports the status that call asked for.
+///
+/// A member account's enrollment does not take effect at the instant the management
+/// account's call returns — "an account might show a status of `Pending` because member
+/// accounts of an organization require more time to be enrolled in the service"
+/// (`AccountEnrollmentStatus$statusReason`) — and AWS documents no duration for it, so this
+/// is the emulator's own span. It is deliberately NON-ZERO, so a caller that reads the
+/// organization straight after enrolling it still sees the transient `Pending` rows, and
+/// short enough that a caller can poll them through to the status it asked for. Derived
+/// from the instant the enrollment was written and never waited for
+/// ([`MemberAccountEnrollment::status_at`]).
+pub const MEMBER_ENROLLMENT_DELAY: Duration = Duration::from_millis(500);
+
+/// The reason a member account is `Pending`, in the service's own words: its enrollment is
+/// still reaching it ([`MEMBER_ENROLLMENT_DELAY`]).
+pub const MEMBER_ENROLLMENT_PENDING_REASON: &str =
+    "Member accounts of the organization require more time to be enrolled in the service.";
+
+/// One organization member account's Compute Optimizer enrollment, as
+/// `GetEnrollmentStatusesForOrganization` reports it.
+///
+/// The status it REPORTS is not stored on its own: while the enrollment the management
+/// account asked for is still reaching the member account the row reports
+/// [`STATUS_PENDING`], which the clock makes due rather than any call
+/// ([`Self::status_at`]) — so a reader reports the status the clock has made due without
+/// writing to the store, and two readers of one member account can never disagree about
+/// where its enrollment has got to.
+#[derive(Debug, Clone)]
+pub struct MemberAccountEnrollment {
+    /// The member account's `AccountId` — "a 12-digit Amazon Web Services account ID".
+    pub account_id: String,
+    /// The `Status` its enrollment was last written to.
+    pub status: String,
+    /// Why it is in that status; `None` while nothing has been written for it.
+    pub status_reason: Option<String>,
+    /// When its enrollment was last written; `None` until the first write.
+    pub last_updated_timestamp: Option<DateTime>,
+    /// When the enrollment last written for it finishes reaching it, in seconds since the
+    /// epoch ([`now_secs`]); `None` for a member account whose enrollment is settled.
+    pub pending_until: Option<f64>,
+}
+
+impl MemberAccountEnrollment {
+    /// A member account of the organization that nobody has enrolled: not opted in, with no
+    /// reason and no last-updated timestamp, exactly as the account's own record starts.
+    pub fn new(account_id: &str) -> Self {
+        let enrollment = Enrollment::default();
+        Self {
+            account_id: account_id.to_string(),
+            status: enrollment.status,
+            status_reason: enrollment.status_reason,
+            last_updated_timestamp: enrollment.last_updated_timestamp,
+            pending_until: None,
+        }
+    }
+
+    /// Record the enrollment the management account asked for at `now`: the status it asked
+    /// for, reached once [`MEMBER_ENROLLMENT_DELAY`] has elapsed.
+    pub fn enroll(&mut self, status: &str, now: f64) {
+        self.status = status.to_string();
+        self.status_reason = Some(enrollment_status_reason(status));
+        self.last_updated_timestamp = Some(DateTime::from_secs_f64(now));
+        self.pending_until = Some(now + MEMBER_ENROLLMENT_DELAY.as_secs_f64());
+    }
+
+    /// Whether the enrollment written for this member account is still reaching it at `now`.
+    pub fn is_pending_at(&self, now: f64) -> bool {
+        self.pending_until.is_some_and(|due| now < due)
+    }
+
+    /// The `Status` this member account reports at `now`.
+    pub fn status_at(&self, now: f64) -> &str {
+        if self.is_pending_at(now) {
+            STATUS_PENDING
+        } else {
+            &self.status
+        }
+    }
+
+    /// Whether this member account is opted in at `now` — what
+    /// `GetEnrollmentStatus$numberOfMemberAccountsOptedIn` counts.
+    pub fn is_opted_in_at(&self, now: f64) -> bool {
+        self.status_at(now) == STATUS_ACTIVE
+    }
+
+    /// The member account as `GetEnrollmentStatusesForOrganization` reports it at `now`.
+    pub fn to_status(&self, now: f64) -> AccountEnrollmentStatus {
+        AccountEnrollmentStatus {
+            account_id: Some(self.account_id.clone()),
+            status: Some(self.status_at(now).to_string()),
+            status_reason: if self.is_pending_at(now) {
+                Some(MEMBER_ENROLLMENT_PENDING_REASON.to_string())
+            } else {
+                self.status_reason.clone()
+            },
+            last_updated_timestamp: self.last_updated_timestamp,
+        }
+    }
+}
+
+/// The organization's member accounts, keyed by account id, which is also the order a page
+/// walks them in — so a page boundary a reader hands out stays where it was.
+///
+/// AWS Organizations is what records an account's membership of an organization, so NO
+/// operation of this API creates a member account: this store is what
+/// `GetEnrollmentStatusesForOrganization` filters and pages over, and an emulator that
+/// records no organization holds none, which is the empty list that reader answers. What
+/// this API does write is a stored member account's ENROLLMENT ([`Self::enroll_all`]).
+#[derive(Debug, Default)]
+pub struct OrganizationMemberStore {
+    members: BTreeMap<String, MemberAccountEnrollment>,
+}
+
+impl OrganizationMemberStore {
+    /// Record `member` as an account of the organization. Recording the same account id
+    /// again replaces the stored record.
+    pub fn insert(&mut self, member: MemberAccountEnrollment) {
+        self.members.insert(member.account_id.clone(), member);
+    }
+
+    /// The record held for `account_id`, or `None` when the organization holds no such
+    /// member account.
+    pub fn get(&self, account_id: &str) -> Option<&MemberAccountEnrollment> {
+        self.members.get(account_id)
+    }
+
+    /// Every member account, in account-id order.
+    pub fn iter_in_order(&self) -> impl Iterator<Item = &MemberAccountEnrollment> {
+        self.members.values()
+    }
+
+    /// How many member accounts the organization holds.
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Whether the organization holds no member account at all — an emulator that records
+    /// no organization.
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    /// Enroll every member account at `status`, as of `now`: what an
+    /// `UpdateEnrollmentStatus` call that "include[s] member accounts of the organization"
+    /// asks for.
+    pub fn enroll_all(&mut self, status: &str, now: f64) {
+        for member in self.members.values_mut() {
+            member.enroll(status, now);
+        }
+    }
+}
+
+/// The most account enrollment statuses one page carries, whatever `maxResults` asks for:
+/// "You can specify up to 100 statuses to return with each request"
+/// (`GetEnrollmentStatusesForOrganizationRequest$maxResults`, whose modelled range is the
+/// wider 0..1000). Applied in the handler, so no number a request carries can size a
+/// response or the allocation that builds it, whatever any other layer does or does not
+/// refuse; it is also the page a request naming no size gets, plus a `nextToken` to walk
+/// the rest.
+pub const ENROLLMENT_STATUSES_MAX_PAGE_SIZE: usize = 100;
+
+/// Check a `GetEnrollmentStatusesForOrganization` filter set against the model's own
+/// vocabulary, returning the reason it is not valid.
+///
+/// `name` is an `EnrollmentFilterName` and the values a filter carries are the value set of
+/// the member that name selects on: `Status` selects on `Status`, whose "valid values are
+/// `Active`, `Inactive`, `Pending`, and `Failed`" (`EnrollmentFilter$values`). A name or a
+/// value outside those sets is refused rather than silently matching nothing.
+pub fn enrollment_filter_rejection(filters: &[EnrollmentFilter]) -> Option<String> {
+    for filter in filters {
+        let Some(name) = filter.name.as_deref() else {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: a filter name must be \
+                 supplied, one of [{}].",
+                ENROLLMENT_FILTER_NAME_VALUES.join(", ")
+            ));
+        };
+        let vocabulary: &[&str] = match name {
+            ENROLLMENT_FILTER_STATUS => STATUS_VALUES,
+            _ => {
+                return Some(format!(
+                    "The value supplied for parameter filters is not valid: {name} is not a \
+                     filter name, which must be one of [{}].",
+                    ENROLLMENT_FILTER_NAME_VALUES.join(", ")
+                ))
+            }
+        };
+        if let Some(value) = filter
+            .values
+            .iter()
+            .flatten()
+            .find(|value| !vocabulary.contains(&value.as_str()))
+        {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: {value} is not a value of \
+                 the {name} filter, which must be one of [{}].",
+                vocabulary.join(", ")
+            ));
+        }
+    }
+    None
+}
+
+/// Does `row` satisfy every `GetEnrollmentStatusesForOrganization` filter?
+///
+/// A filter matches when the member its name selects on equals any of the filter's values;
+/// several filters are ANDed, and a filter carrying no values constrains nothing. An
+/// unrecognised name never reaches here — [`enrollment_filter_rejection`] refuses the
+/// request first.
+pub fn account_enrollment_matches_filters(
+    row: &AccountEnrollmentStatus,
+    filters: &[EnrollmentFilter],
+) -> bool {
+    filters.iter().all(|filter| {
+        let Some(values) = filter.values.as_ref().filter(|values| !values.is_empty()) else {
+            return true;
+        };
+        let member = match filter.name.as_deref() {
+            Some(ENROLLMENT_FILTER_STATUS) => row.status.as_deref(),
+            _ => None,
+        };
+        member.is_some_and(|member| values.iter().any(|value| value == member))
+    })
 }
 
 /// The identity of a stored preference record: a resource type plus the scope it was
@@ -3678,6 +3936,11 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// The account's enrollment record, written by `UpdateEnrollmentStatus` and reported
     /// by `GetEnrollmentStatus`.
     pub enrollment: Enrollment,
+    /// The organization's member accounts and their enrollment, which
+    /// `GetEnrollmentStatusesForOrganization` reports and
+    /// `GetEnrollmentStatus$numberOfMemberAccountsOptedIn` counts over. See
+    /// [`OrganizationMemberStore`]: no operation of this API creates a member account.
+    pub organization_members: OrganizationMemberStore,
     /// Every stored recommendation preference, ordered by key so a page boundary is
     /// stable across calls.
     pub preferences: BTreeMap<PreferenceKey, PreferenceRecord>,
@@ -3722,14 +3985,16 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
 }
 
 impl Default for ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
-    /// The store's initial value: the account is not opted in, nobody has written a
-    /// preference, the EBS volume observation, the Auto Scaling group analysis and the
-    /// findings catalog this emulator analysed — which a reader only sees once the account
-    /// is enrolled — no idle resource recommendation (only an analysis records one) and no
-    /// export job (only an export call creates one).
+    /// The store's initial value: the account is not opted in, this emulator records no
+    /// organization so it holds no member account, nobody has written a preference, the EBS
+    /// volume observation, the Auto Scaling group analysis and the findings catalog this
+    /// emulator analysed — which a reader only sees once the account is enrolled — no idle
+    /// resource recommendation (only an analysis records one) and no export job (only an
+    /// export call creates one).
     fn default() -> Self {
         Self {
             enrollment: Enrollment::default(),
+            organization_members: OrganizationMemberStore::default(),
             preferences: BTreeMap::new(),
             volumes: observed_volumes()
                 .into_iter()
@@ -4302,6 +4567,27 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             savings_estimation_mode: effective(|record| record.savings_estimation_mode.is_some())
                 .and_then(|record| record.savings_estimation_mode.clone()),
         }
+    }
+
+    /// Every member account of the organization as `GetEnrollmentStatusesForOrganization`
+    /// reports it at `now`, in account-id order.
+    pub fn organization_enrollment_statuses(&self, now: f64) -> Vec<AccountEnrollmentStatus> {
+        self.organization_members
+            .iter_in_order()
+            .map(|member| member.to_status(now))
+            .collect()
+    }
+
+    /// How many organization member accounts are opted in at `now` — the count
+    /// `GetEnrollmentStatus` reports. DERIVED from the member accounts themselves, so the
+    /// count and the rows `GetEnrollmentStatusesForOrganization` reports cannot disagree.
+    pub fn member_accounts_opted_in(&self, now: f64) -> i32 {
+        let opted_in = self
+            .organization_members
+            .iter_in_order()
+            .filter(|member| member.is_opted_in_at(now))
+            .count();
+        i32::try_from(opted_in).unwrap_or(i32::MAX)
     }
 
     /// The Auto Scaling groups whose analysis a caller can read, in analysis order.

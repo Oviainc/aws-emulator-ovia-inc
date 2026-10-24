@@ -43,7 +43,10 @@ use crate::gateway_lifecycle::{build_engine, build_router, call, create, never_c
 /// A gateway-shaped ARN in `partition` naming `id`, so the rows span every partition the
 /// modelled `GatewayArn` pattern accepts (`aws`, `aws-cn`, `aws-us-gov`) and both
 /// resource types this service's ARNs name.
-fn arn_in(partition: &str, resource_type: &str, id: &str) -> String {
+///
+/// Shared with the sibling `maintenance_start_time` suite, which refuses the same ARN
+/// rows: one place builds a `GatewayArn` the modelled pattern accepts.
+pub(crate) fn arn_in(partition: &str, resource_type: &str, id: &str) -> String {
     format!(
         "arn:{partition}:backup-gateway:{REGION}:{}:{resource_type}/{id}",
         engine::EMULATOR_ACCOUNT_ID
@@ -55,7 +58,9 @@ fn arn_in(partition: &str, resource_type: &str, id: &str) -> String {
 /// (`smithy_query(query="shape",shape="GatewayArn")`). The id segment absorbs the length,
 /// so every character stays inside the pattern's `[a-zA-Z-0-9]+`, and the resource type is
 /// kept short enough that the 50-character minimum fits.
-fn arn_of_length(len: usize) -> String {
+///
+/// Shared with the sibling `maintenance_start_time` suite, which asserts the same bounds.
+pub(crate) fn arn_of_length(len: usize) -> String {
     let prefix = format!(
         "arn:aws:backup-gateway:{REGION}:{}:g/",
         engine::EMULATOR_ACCOUNT_ID

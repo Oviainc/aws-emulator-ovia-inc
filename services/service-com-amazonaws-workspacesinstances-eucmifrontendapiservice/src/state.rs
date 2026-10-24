@@ -6,14 +6,17 @@
 //! returns is read out of one of these records, never built from the request.
 
 use std::collections::BTreeMap;
+use std::fmt::Debug;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 
+use sha2::{Digest, Sha256};
+
 use crate::ops::types::{
-    BillingConfiguration, InstanceTypeInfo, ManagedInstanceRequest, ResourceNotFoundException,
-    ServiceQuotaExceededException, SupportedInstanceConfiguration, Tag, ValidationException,
-    ValidationExceptionField, BILLING_MODE_VALUES, INSTANCE_CONFIGURATION_TENANCY_ENUM_VALUES,
-    PLATFORM_TYPE_ENUM_VALUES,
+    BillingConfiguration, ConflictException, InstanceTypeInfo, ManagedInstanceRequest,
+    ResourceNotFoundException, ServiceQuotaExceededException, SupportedInstanceConfiguration, Tag,
+    ValidationException, ValidationExceptionField, BILLING_MODE_VALUES,
+    INSTANCE_CONFIGURATION_TENANCY_ENUM_VALUES, PLATFORM_TYPE_ENUM_VALUES,
 };
 
 /// The `ResourceType` this service reports for a WorkSpace Instance in its
@@ -1369,6 +1372,105 @@ pub struct VolumeRecord {
     pub created_at: SystemTime,
 }
 
+/// What one spent `@idempotencyToken` created, and WHICH request spent it.
+///
+/// A create's `ClientToken` identifies one request, not just one caller: a later
+/// call carrying the same token is a retry of THAT request, so the claim keeps a
+/// [`request_fingerprint`] of the parameters the first call carried beside the id it
+/// minted. A retry whose parameters fingerprint alike replays `resource_id`; one
+/// whose parameters differ is a different request under a spent token, which the
+/// create operations refuse with [`idempotent_parameter_mismatch`].
+#[derive(Debug, Clone)]
+pub struct IdempotencyClaim {
+    /// The id the first call minted: the only id this token can ever answer with.
+    pub resource_id: String,
+    /// [`request_fingerprint`] of the parameters that first call carried.
+    pub fingerprint: String,
+}
+
+/// What a create call must do about the `ClientToken` it carries — the answer
+/// [`resolve_client_token`] gives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenOutcome {
+    /// No claim holds this token (or the call carries none): create the resource.
+    Unclaimed,
+    /// A retry of the same request: replay this id and create nothing.
+    Replay(String),
+    /// The token is already spent on DIFFERENT parameters: refuse the call, naming
+    /// the resource the token did create.
+    Mismatch(String),
+}
+
+/// Resolve a create's `ClientToken` against the claims this service already holds.
+///
+/// The ONE place the idempotency decision is made, so every `@idempotent` create of
+/// this service tells a retry from a reuse the same way: a token is matched on the
+/// token AND the fingerprint of the request's parameters, never on the token alone.
+pub fn resolve_client_token(
+    claims: &BTreeMap<String, IdempotencyClaim>,
+    token: Option<&str>,
+    fingerprint: &str,
+) -> TokenOutcome {
+    let Some(claim) = token.and_then(|token| claims.get(token)) else {
+        return TokenOutcome::Unclaimed;
+    };
+    if claim.fingerprint == fingerprint {
+        TokenOutcome::Replay(claim.resource_id.clone())
+    } else {
+        TokenOutcome::Mismatch(claim.resource_id.clone())
+    }
+}
+
+/// Reduce a create request's parameters to ONE comparable value, so a reused
+/// `ClientToken` can be checked against the request it was first spent on.
+///
+/// `parameters` is the request shape itself with its `ClientToken` cleared — the
+/// token is the KEY a claim is stored under, not one of the parameters being
+/// compared. The rendering is the shape's DERIVED `Debug`, which prints every member
+/// the model declares, in declaration order, with each value in Rust literal form
+/// (strings quoted and escaped, so no member value can imitate the start of the next
+/// member): two renderings are equal exactly when every member is equal, and a member
+/// a later model revision adds joins the comparison without this code changing. The
+/// shapes this is called with must therefore keep their DERIVED `Debug`: a
+/// hand-written one that hid or folded a member would silently weaken the comparison.
+///
+/// The rendering is DIGESTED rather than stored: a claim then costs the same however
+/// large the request was, and the sensitive members a request can carry
+/// (`ClientToken`, `KmsKeyId`) are not held a second time in the clear. The digest is
+/// only ever compared with another digest this same code produced, and is never
+/// returned to a caller or logged.
+pub fn request_fingerprint(parameters: &impl Debug) -> String {
+    let mut digest = Sha256::new();
+    digest.update(format!("{parameters:?}").as_bytes());
+    hex::encode(digest.finalize())
+}
+
+/// The `Message` this service states for a `ClientToken` spent on one request and
+/// then reused for a different one.
+///
+/// A FIXED sentence, like [`INSTANCE_NOT_FOUND_MESSAGE`] and for the same reason: it
+/// states what the conflict IS and leaves the identity of the conflicting resource to
+/// the modelled `ResourceId` member, so the prose does not vary per request and echoes
+/// nothing the caller sent (the token is `@sensitive`).
+pub const IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE: &str =
+    "ClientToken was already used to create a resource with different parameters";
+
+/// The modelled `ConflictException` (HTTP 409) for a create whose `ClientToken` is
+/// already spent on different parameters.
+///
+/// The ONE place this shape is built, so every `@idempotent` create of this service
+/// refuses a reused token identically: `ResourceId` names the resource the token DID
+/// create — the only resource that token can ever answer with — and `ResourceType`
+/// that resource's kind ([`WORKSPACE_INSTANCE_RESOURCE_TYPE`] /
+/// [`VOLUME_RESOURCE_TYPE`]). Every member the model marks `@required` is filled.
+pub fn idempotent_parameter_mismatch(resource_id: &str, resource_type: &str) -> ConflictException {
+    ConflictException {
+        message: IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE.to_string(),
+        resource_id: resource_id.to_string(),
+        resource_type: resource_type.to_string(),
+    }
+}
+
 /// Per-service state for com-amazonaws-workspacesinstances-eucmifrontendapiservice. A handler reaches it through [`service_state`].
 ///
 /// `instances` is a `BTreeMap` rather than a hash map so iteration order is the
@@ -1379,15 +1481,17 @@ pub struct VolumeRecord {
 pub struct ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
     /// Every live WorkSpace Instance, keyed by its `wsinst-…` id.
     pub instances: BTreeMap<String, WorkspaceInstanceRecord>,
-    /// `ClientToken` -> `WorkspaceInstanceId`, for `@idempotent` create replay.
-    pub client_tokens: BTreeMap<String, String>,
+    /// `ClientToken` -> the [`IdempotencyClaim`] `CreateWorkspaceInstance` spent it
+    /// on: the instance id to replay, and the fingerprint of the request that minted
+    /// it, so a token reused for different parameters is refused rather than replayed.
+    pub client_tokens: BTreeMap<String, IdempotencyClaim>,
     /// Every live volume, keyed by its `vol-…` id.
     pub volumes: BTreeMap<String, VolumeRecord>,
-    /// `ClientToken` -> `VolumeId`, for `CreateVolume`'s `@idempotent` replay. A
+    /// `ClientToken` -> the [`IdempotencyClaim`] `CreateVolume` spent it on. A
     /// separate namespace from [`Self::client_tokens`]: a token is scoped to the
     /// create call that carried it, so a volume token can never replay an instance
     /// id (the two ids are not even the same shape).
-    pub volume_client_tokens: BTreeMap<String, String>,
+    pub volume_client_tokens: BTreeMap<String, IdempotencyClaim>,
     /// Source of the unique `wsinst-…` / `i-…` identifiers.
     pub id_counter: u64,
 }

@@ -3,7 +3,8 @@
 //! @op DeleteChallenge
 //!
 //! Removes the challenge password from state, so the next `GetChallengePassword` answers
-//! 404 and the next `ListChallengeMetadata` no longer lists it.
+//! 404 and the next `ListChallengeMetadata` no longer lists it. An ARN that names no stored
+//! challenge is itself a 404 `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -179,13 +180,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
-        // `@idempotent`: a retry of a delete that already succeeded must succeed too, so a
-        // challenge ARN that holds no record is a 202 rather than a 404. What the operation
-        // promises is that the record is gone afterwards, and `remove_challenge` is what
-        // makes that true.
-        store.remove_challenge(&input.challenge_arn);
+        // The ARN has to name a stored challenge: `@idempotent` says a retry is SAFE to
+        // repeat (it removes the same record and nothing else), not that a call about a
+        // record that is not there is a success. A well-formed ARN holding no challenge —
+        // one already deleted, one never created, or one whose owning connector is gone —
+        // is the only way this operation can reach its modelled `ResourceNotFoundException`.
+        if !store.remove_challenge(&input.challenge_arn) {
+            return Err(not_found(&input.challenge_arn));
+        }
         Ok(DeleteChallengeOutput)
     }
+}
+
+/// No challenge is stored under this ARN — HTTP 404 `ResourceNotFoundException`, carrying the
+/// ARN as `ResourceId` and the kind of resource it names as `ResourceType`.
+fn not_found(challenge_arn: &str) -> DeleteChallengeError {
+    DeleteChallengeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("Challenge {challenge_arn} could not be found"),
+        resource_id: challenge_arn.to_string(),
+        resource_type: crate::state::RESOURCE_TYPE_CHALLENGE.to_string(),
+    })
+    .into()
 }
 
 /// The store is unreachable — a server-side fault, which this operation models as
