@@ -41,6 +41,8 @@ mod list_deployment_strategies;
 mod list_environments;
 #[path = "all/list_extensions.rs"]
 mod list_extensions;
+#[path = "all/list_hosted_configuration_versions.rs"]
+mod list_hosted_configuration_versions;
 #[path = "all/refusal_message_templates.rs"]
 mod refusal_message_templates;
 #[path = "all/resource_deletes.rs"]

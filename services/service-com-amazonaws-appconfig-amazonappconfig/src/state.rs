@@ -2119,6 +2119,10 @@ pub const LISTING_DEPLOYMENT_STRATEGIES: &str = "ListDeploymentStrategies";
 /// listing cannot resume this one. See [`paginate`].
 pub const LISTING_EXTENSIONS: &str = "ListExtensions";
 
+/// The `kind` a `ListHostedConfigurationVersions` cursor is stamped with, so a token
+/// minted by another listing cannot resume this one. See [`paginate`].
+pub const LISTING_HOSTED_CONFIGURATION_VERSIONS: &str = "ListHostedConfigurationVersions";
+
 /// One page of a list operation: the items on it, and the token that resumes the walk
 /// after them (`None` on the last page).
 #[derive(Debug)]

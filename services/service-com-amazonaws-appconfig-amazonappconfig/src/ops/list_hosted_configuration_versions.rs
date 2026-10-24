@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListHostedConfigurationVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListHostedConfigurationVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListHostedConfigurationVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORT over stored state: it answers one summary per hosted configuration version
+//! the addressed configuration profile holds, newest version first, cut into pages a
+//! `NextToken` walks exactly once. It writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -118,6 +113,18 @@ impl From<ListHostedConfigurationVersionsErrorModeled> for ListHostedConfigurati
     }
 }
 
+/// A `ResourceNotFoundException` (HTTP 404) naming the resource that could not be
+/// resolved.
+fn not_found(message: String, resource_name: String) -> ListHostedConfigurationVersionsError {
+    ListHostedConfigurationVersionsErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message),
+            resource_name: Some(resource_name),
+        },
+    )
+    .into()
+}
+
 /// The `ListHostedConfigurationVersions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -152,20 +159,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListHostedConfigurationVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListHostedConfigurationVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListHostedConfigurationVersions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListHostedConfigurationVersionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        // A hosted configuration version only exists under a profile, which only exists
+        // under an application, so an unresolvable level of the path is not an empty
+        // listing: it is the 404 this operation models, exactly as the reader answers it.
+        let Some(application) = store.applications.get(&input.application_id) else {
+            return Err(not_found(
+                crate::state::application_not_found(&input.application_id),
+                input.application_id,
+            ));
+        };
+        let Some(profile) = application.profiles.get(&input.configuration_profile_id) else {
+            return Err(not_found(
+                crate::state::configuration_profile_not_found(
+                    &input.application_id,
+                    &input.configuration_profile_id,
+                ),
+                input.configuration_profile_id,
+            ));
+        };
+
+        // `hosted_versions` is a `BTreeMap` keyed by version number, so walking it in
+        // REVERSE yields the versions newest first — which is the order AppConfig lists
+        // them in, and (through the complement key below) ascending cursor order, which is
+        // what `paginate` walks. Version numbers are unique within a profile, so that key
+        // is a TOTAL order — what a pagination cursor needs to resume exactly once.
+        let ordered: Vec<(String, HostedConfigurationVersionSummary)> = profile
+            .hosted_versions
+            .values()
+            .rev()
+            .filter(|version| {
+                input
+                    .version_label
+                    .as_deref()
+                    .is_none_or(|filter| version_label_matches(filter, version))
+            })
+            .map(|version| {
+                (
+                    descending_version_key(version.version_number),
+                    summary_of(profile, version),
+                )
+            })
+            .collect();
+
+        let Some(page) = crate::state::paginate(
+            ordered,
+            crate::state::LISTING_HOSTED_CONFIGURATION_VERSIONS,
+            input.next_token.as_deref(),
+            input.max_results,
+        ) else {
+            return Err(ListHostedConfigurationVersionsErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(
+                        "NextToken is not a pagination token this operation issued.".to_string(),
+                    ),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(ListHostedConfigurationVersionsOutput {
+            // Reported even when empty: "the elements from this collection" is an answer
+            // about a profile holding no matching version — which is every profile whose
+            // configuration lives outside AppConfig's own hosted store — rather than a
+            // missing member.
+            items: Some(page.items),
+            next_token: page.next_token,
+        })
+    }
+}
+
+/// The sort key of one version, built so that ASCENDING key order is DESCENDING version
+/// order: AppConfig lists a profile's hosted configuration versions newest first, and
+/// [`crate::state::paginate`] walks its input in ascending key order.
+///
+/// A version number is a positive `Integer`, so complementing it against `i32::MAX` keeps
+/// it non-negative, and the fixed width makes the string comparison agree with the
+/// numeric one (`"10"` must not sort before `"9"`).
+fn descending_version_key(version_number: i32) -> String {
+    format!(
+        "{:010}",
+        i64::from(i32::MAX).saturating_sub(i64::from(version_number))
+    )
+}
+
+/// Whether `filter` — the request's `VersionLabel` — selects `version`.
+///
+/// "This parameter supports filtering by prefix using a wildcard, for example `v2*`. If
+/// you don't specify an asterisk at the end of the value, only an exact match is
+/// returned"
+/// (`smithy_query(query="doc",shape="ListHostedConfigurationVersionsRequest",member="VersionLabel")`).
+/// So a trailing asterisk makes the rest of the value a PREFIX, and anything else is
+/// compared whole. A version written with no label carries nothing to compare, so a
+/// request that names a filter never selects it — not even the empty prefix `*`.
+fn version_label_matches(
+    filter: &str,
+    version: &crate::state::HostedConfigurationVersion,
+) -> bool {
+    let Some(label) = version.version_label.as_deref() else {
+        return false;
+    };
+    match filter.strip_suffix('*') {
+        Some(prefix) => label.starts_with(prefix),
+        None => label == filter,
+    }
+}
+
+/// The summary this operation reports for one stored version.
+///
+/// Every member is read off the stored record, and each one the `Get` reader answers for
+/// that same version answers alike here — the summary is the version document without its
+/// `Content`. `KmsKeyArn` is deliberately unset, not overlooked: it names the key
+/// AppConfig encrypted the version with, and this emulator encrypts with no KMS key, so
+/// any ARN here would be fabricated (see `get_hosted_configuration_version`).
+fn summary_of(
+    profile: &crate::state::ConfigurationProfile,
+    version: &crate::state::HostedConfigurationVersion,
+) -> HostedConfigurationVersionSummary {
+    HostedConfigurationVersionSummary {
+        application_id: Some(profile.application_id.clone()),
+        configuration_profile_id: Some(profile.id.clone()),
+        version_number: version.version_number,
+        description: version.description.clone(),
+        content_type: Some(version.content_type.clone()),
+        version_label: version.version_label.clone(),
+        kms_key_arn: None,
     }
 }
