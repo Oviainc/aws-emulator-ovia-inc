@@ -1347,6 +1347,11 @@ async fn cancel_job_moves_the_stored_job_to_canceled() {
             again.status, again.body
         );
         assert_eq!(
+            again.error_type, None,
+            "case {label:?}: expected no error on the repeat, got {:?}",
+            again.error_type
+        );
+        assert_eq!(
             again.body,
             json!({}),
             "case {label:?}: the repeat cancel has no output members, got {}",
@@ -1359,6 +1364,19 @@ async fn cancel_job_moves_the_stored_job_to_canceled() {
             "case {label:?}: the repeat cancel must change nothing, got {} after {}",
             after.body,
             fetched.body
+        );
+        let after = emulator.get_job(&id).await;
+        assert_eq!(
+            after.string("/job/status"),
+            "CANCELED",
+            "case {label:?}: the repeat must leave the job CANCELED, got {}",
+            after.body
+        );
+        assert_eq!(
+            after.at("/job/timing/finishTime"),
+            fetched.at("/job/timing/finishTime"),
+            "case {label:?}: the repeat must not move the finish time, got {}",
+            after.body
         );
     }
 
