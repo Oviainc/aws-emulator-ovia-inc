@@ -103,10 +103,17 @@ async fn create_group(
     )
 }
 
-/// A well-formed `IdentityStoreId` naming no identity store, built from `n` so a row
-/// can have one of its own: the modelled `IdentityStoreId` pattern's `d-[0-9a-f]{10}`
-/// form.
+/// An `IdentityStoreId` the model admits that names no store this emulator serves,
+/// built from `n` so a row can have one of its own: the ARN form carries the OWNING
+/// ACCOUNT, and this one names a store of another account.
 fn unknown_store_id(n: usize) -> String {
+    format!("arn:aws:identitystore::210987654321:identitystore/d-{n:010x}")
+}
+
+/// A well-formed `IdentityStoreId` of THIS account that nothing has written to, built
+/// from `n`: the modelled pattern's `d-[0-9a-f]{10}` form, which names the store its
+/// caller has.
+fn unwritten_store_id(n: usize) -> String {
     format!("d-{n:010x}")
 }
 
@@ -276,11 +283,11 @@ async fn a_display_name_resolves_only_within_the_store_that_holds_it() {
         );
     }
 
-    // And a lookup addressed to an identity store that does not exist is refused for
-    // the STORE's sake: the store is the missing resource, not the group.
+    // And a lookup addressed to an identity store this emulator does not serve is
+    // refused for the STORE's sake: the store is the missing resource, not the group.
     for (case, identifier) in [
-        ("an unknown store id", MISSING_STORE.to_string()),
-        ("another unknown store id", unknown_store_id(0xff)),
+        ("another account's store", MISSING_STORE.to_string()),
+        ("another account's other store", unknown_store_id(0xff)),
     ] {
         let refusal = get_group_id_refused(
             &router,
@@ -454,11 +461,44 @@ async fn resolving_a_group_id_changes_nothing_a_later_caller_sees() {
     );
 
     // And a resolution never writes: the group's record is untouched above, and a miss
-    // in a store that does not exist stays a miss — were the read a write, it would
-    // bring that store into being and a later create in it would then be served.
+    // in a store nothing has written to stays a miss that leaves the store empty — were
+    // the read a write, the group it minted would be listed afterwards.
     let reader = emulator();
     for index in 0..4 {
-        let case = format!("miss in a store that does not exist {index}");
+        let case = format!("miss in a store nothing has written to {index}");
+        let store = unwritten_store_id(index);
+        for attempt in 0..2 {
+            let case = format!("{case}, attempt {attempt}");
+            let refusal = get_group_id_refused(
+                &reader,
+                &store,
+                by_display_name("engineering"),
+                404,
+                "ResourceNotFoundException",
+                &case,
+            )
+            .await;
+            assert_eq!(
+                refusal["ResourceType"],
+                json!("GROUP"),
+                "case {case:?}: expected the GROUP to be the missing resource in a store \
+                 that is served, got {refusal}"
+            );
+        }
+        let listed = ok(
+            &reader,
+            "ListGroups",
+            json!({ "IdentityStoreId": store.clone() }),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            listed["Groups"].as_array().map(Vec::len),
+            Some(0),
+            "case {case:?}: expected the misses to have written nothing, got {listed}"
+        );
+        // A lookup addressed to a store of ANOTHER account is refused instead, and that
+        // refusal writes nothing either.
         get_group_id_refused(
             &reader,
             &unknown_store_id(index),

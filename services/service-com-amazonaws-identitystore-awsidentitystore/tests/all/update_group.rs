@@ -39,8 +39,10 @@ const CREATED_DESCRIPTION: &str = "the description this group was created with";
 /// hexadecimal UUID (`smithy_query(query="shape",shape="ResourceId")`).
 const ABSENT_GROUP_ID: &str = "a1b2c3d4-5678-90ab-cdef-aaaaaaaaaaaa";
 
-/// A well-formed `IdentityStoreId` nothing was ever created in (`d-[0-9a-f]{10}`).
-const ABSENT_STORE: &str = "d-0000000099";
+/// A second `IdentityStoreId` that names no store this emulator serves: the ARN form
+/// carries the owning account, and this one names a store of another account (see
+/// [`crate::harness::MISSING_STORE`], which names a different one).
+const ABSENT_STORE: &str = "arn:aws:identitystore::210987654321:identitystore/d-0000000099";
 
 /// One created group: what `CreateGroup` minted for it.
 struct Created {
@@ -724,12 +726,12 @@ async fn the_group_an_update_names_must_exist_in_the_store_it_names() {
             ABSENT_GROUP_ID.to_string(),
         ),
         (
-            "an identity store that does not exist",
+            "a store of another account",
             ABSENT_STORE,
             group.group_id.clone(),
         ),
         (
-            "another identity store that does not exist",
+            "another account's other store",
             MISSING_STORE,
             group.group_id.clone(),
         ),

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this is a READ — it reports the code and the version token of ONE stage
+//! of a stored function, materialising nothing and changing nothing, so a later caller
+//! sees exactly what this one saw. The code it answers with is the one `CreateFunction`
+//! persisted, byte for byte. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,20 +139,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFunction"))
+        // The engine is reachable from `&self` (constructor-injected); this operation
+        // needs nothing from the request metadata the context carries.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+
+        // A READ: the store is locked only to copy the code out of it. Nothing about a
+        // function is owed by the clock, so this read materialises nothing.
+        let store = state.lock();
+
+        // "The function's stage, either DEVELOPMENT or LIVE": a request that names no
+        // stage addresses the stage a function is created in — the SAME default
+        // `DescribeFunction` reads under.
+        let stage = input
+            .stage
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_FUNCTION_STAGE);
+
+        // A name no function holds, and a stage a function has not been published to, are
+        // the same thing to the caller: the function it asked for does not exist.
+        let Some(stage_record) = store
+            .function(&input.name)
+            .and_then(|function| function.stage(stage))
+        else {
+            return Err(GetFunctionErrorModeled::NoSuchFunctionExists(
+                crate::state::no_such_function_exists(&input.name, stage),
+            )
+            .into());
+        };
+
+        Ok(GetFunctionOutput {
+            // "The function code of a CloudFront function" — the bytes the create or the
+            // last update of THIS stage stored, unchanged.
+            function_code: Some(stage_record.code.clone()),
+            // "The version identifier for the current version of the CloudFront
+            // function": the token the last mutation of THIS stage handed back.
+            e_tag: Some(stage_record.etag.clone()),
+            // "The content type (media type) of the response." `FunctionBlob` is an
+            // opaque blob on the wire, served as the payload of this response, so the
+            // media type is the one for arbitrary bytes.
+            content_type: Some(FUNCTION_CODE_CONTENT_TYPE.to_string()),
+        })
     }
 }
+
+/// The media type `GetFunction` reports for the function code it serves.
+///
+/// The response payload is the `FunctionBlob` itself rather than a document, and the
+/// model constrains it only as a blob, so it is served as arbitrary bytes rather than as
+/// a text or XML media type.
+const FUNCTION_CODE_CONTENT_TYPE: &str = "application/octet-stream";

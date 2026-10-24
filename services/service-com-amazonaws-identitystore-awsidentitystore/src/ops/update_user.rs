@@ -196,18 +196,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let mut state = state.lock();
-        // The identity store must exist, and so must the user: an update against either
-        // one that does not is refused with the modelled `ResourceNotFoundException`.
-        let store = state
-            .resolve_store_mut(&input.identity_store_id)
-            .map_err(UpdateUserErrorModeled::ResourceNotFoundException)?;
-        let user_key = crate::state::resource_key(&input.user_id);
-        let stored = store.users.get(&user_key).cloned().ok_or_else(|| {
+        // The identity store the request names is the store the caller has (any
+        // well-formed `IdentityStoreId` of this account), and the USER it names must
+        // exist in it: an update stores no new resource, so a store this emulator holds
+        // no record of holds no such user and the USER is what is missing. An identifier
+        // naming no store this emulator serves is refused for the store's own sake.
+        let user_not_found = || {
             UpdateUserErrorModeled::ResourceNotFoundException(crate::state::not_found(
                 crate::state::ResourceKind::User,
                 &input.user_id,
             ))
-        })?;
+        };
+        let store = state
+            .resolve_recorded_store_mut(&input.identity_store_id)
+            .map_err(UpdateUserErrorModeled::ResourceNotFoundException)?
+            .ok_or_else(user_not_found)?;
+        let user_key = crate::state::resource_key(&input.user_id);
+        let stored = store
+            .users
+            .get(&user_key)
+            .cloned()
+            .ok_or_else(user_not_found)?;
 
         // `Revision` is the caller's precondition: "the update is applied only if it
         // matches the current revision of the user … If the value doesn't match, the
