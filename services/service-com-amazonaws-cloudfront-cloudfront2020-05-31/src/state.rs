@@ -19,7 +19,7 @@
 //! one is owed by the clock; neither is anything about a function, which reaches its `LIVE`
 //! stage through a `PublishFunction` CALL rather than by waiting.
 //!
-//! Two things in here are owed by the CLOCK rather than by a call:
+//! Several things in here are owed by the CLOCK rather than by a call:
 //!
 //! * a distribution CloudFront has just created or reconfigured is `InProgress` until
 //!   its configuration has propagated, and is `Deployed` after
@@ -28,9 +28,12 @@
 //! * a key value store CloudFront has just created is `PROVISIONING` until it has been
 //!   provisioned, and `READY` after ([`KVS_PROVISIONING_DELAY`]);
 //! * a distribution tenant CloudFront has just created is `InProgress` until its
-//!   configuration has propagated, and `Deployed` after ([`PROPAGATION_DELAY`]).
+//!   configuration has propagated, and `Deployed` after ([`PROPAGATION_DELAY`]);
+//! * a connection group CloudFront has just created is `InProgress` until its routing
+//!   endpoint has propagated, and `Deployed` after ([`PROPAGATION_DELAY`]).
 //!
-//! Both are materialised by [`ComAmazonawsCloudfrontCloudfront20200531State::settle`],
+//! Each of them is materialised by
+//! [`ComAmazonawsCloudfrontCloudfront20200531State::settle`],
 //! which every handler calls before it reads: the transition was owed at the same
 //! instant whether or not anybody called, so applying it on a read never changes what a
 //! later caller sees.
@@ -47,7 +50,8 @@ use crate::ops::types::{
     ActiveTrustedKeyGroups, ActiveTrustedSigners, AllowedMethods, CacheBehavior, CacheBehaviors,
     CachePolicy, CachePolicyAlreadyExists, CachePolicyConfig,
     CachedMethods, CloudFrontOriginAccessIdentity, CloudFrontOriginAccessIdentityConfig,
-    CNAMEAlreadyExists, ContinuousDeploymentPolicy, ContinuousDeploymentPolicyConfig,
+    CNAMEAlreadyExists, ConnectionGroup, ConnectionGroupSummary, ContinuousDeploymentPolicy,
+    ContinuousDeploymentPolicyConfig,
     ContinuousDeploymentSingleHeaderConfig, ContinuousDeploymentSingleWeightConfig,
     CustomErrorResponse, CustomErrorResponses, CustomOriginConfig,
     Customizations, DefaultCacheBehavior, Distribution, DistributionConfig, DistributionSummary,
@@ -254,6 +258,36 @@ pub const DISTRIBUTION_TENANT_ID_PREFIX: &str = "dt_";
 /// tenant id and from a distribution id for the same reason
 /// [`DISTRIBUTION_TENANT_ID_PREFIX`] is.
 pub const CONNECTION_GROUP_ID_PREFIX: &str = "cg_";
+
+/// The name this emulator gives the account's AUTOMATICALLY created connection group.
+///
+/// `ConnectionGroupSummary$Name` is required, so the group CloudFront creates for you
+/// ("CloudFront will automatically create a default connection group for you") carries
+/// one too. AWS documents no name for it, so this is the emulator's choice; it is stable
+/// across reads, and a create that has already taken this name leaves the automatic one
+/// to [`ComAmazonawsCloudfrontCloudfront20200531State::default_connection_group`]'s
+/// fallback, which is derived from the group's own minted id.
+pub const DEFAULT_CONNECTION_GROUP_NAME: &str = "default";
+
+/// `CreateConnectionGroup$Ipv6Enabled` for a create that named none: "Enable IPv6 for
+/// the connection group. The default is `true`."
+pub const DEFAULT_CONNECTION_GROUP_IPV6_ENABLED: bool = true;
+
+/// `CreateConnectionGroup$Enabled` for a create that named none.
+///
+/// "Enable the connection group" — the member is optional, and a connection group is
+/// created to route the traffic of the distribution tenants placed in it, so leaving it
+/// out asks for the routing group, exactly as [`DEFAULT_TENANT_ENABLED`] does for a
+/// tenant.
+pub const DEFAULT_CONNECTION_GROUP_ENABLED: bool = true;
+
+/// How many connection groups this emulator holds.
+///
+/// `CreateConnectionGroup` models `EntityLimitExceeded` ("The entity limit has been
+/// exceeded"), so the store is bounded; the bound is this emulator's, chosen like
+/// [`MAX_KEY_VALUE_STORES`] rather than read off a published quota, and it is an entry
+/// count refused before the insert.
+pub const MAX_CONNECTION_GROUPS: usize = 1_000;
 
 /// `DistributionTenant$Enabled` for a create that named none.
 ///
@@ -1188,6 +1222,120 @@ pub fn staging_distribution_dns_names(config: &ContinuousDeploymentPolicyConfig)
         .unwrap_or_default()
 }
 
+/// One CloudFront connection group, as this emulator persists it.
+///
+/// A connection group is what a distribution tenant's viewers are routed through: it
+/// holds the routing endpoint (the DNS name) CloudFront assigned to it, whether it is
+/// enabled, whether IPv6 is on, and whether it is the account's automatically created
+/// DEFAULT group. The record is the single source of truth for every one of them, so the
+/// create, a later read and a later listing all answer from it rather than from the
+/// request being served.
+#[derive(Debug, Clone)]
+pub struct StoredConnectionGroup {
+    /// `ConnectionGroup$Id`, minted at creation and never reused. Also the key this
+    /// record is held under, and the resume point a listing's `Marker` names.
+    pub id: String,
+    /// `ConnectionGroup$Name` — "Enter a friendly identifier that is unique within your
+    /// Amazon Web Services account. This name can't be updated after you create the
+    /// connection group."
+    pub name: String,
+    /// `ConnectionGroup$Arn`. CloudFront is a global service, so the ARN carries no
+    /// region.
+    pub arn: String,
+    /// `ConnectionGroup$RoutingEndpoint` — "The routing endpoint (also known as the DNS
+    /// name) that is assigned to the connection group, such as
+    /// `d111111abcdef8.cloudfront.net`": assigned by the service at creation, so it is
+    /// minted here and never derived from the request.
+    pub routing_endpoint: String,
+    /// `ConnectionGroup$AnycastIpListId`, exactly as submitted — and only ever an id the
+    /// create resolved to an Anycast static IP list this service holds. It is also what
+    /// `ListConnectionGroups`'s `AssociationFilter` filters on.
+    pub anycast_ip_list_id: Option<String>,
+    /// `ConnectionGroup$Ipv6Enabled` — whether IPv6 is enabled for the group.
+    pub ipv6_enabled: bool,
+    /// `ConnectionGroup$Enabled` — whether the connection group is enabled.
+    pub enabled: bool,
+    /// `ConnectionGroup$IsDefault` — "Whether the connection group is the default
+    /// connection group for the distribution tenants." True of the ONE group this
+    /// service creates by itself, when a tenant that named none needed one.
+    pub is_default: bool,
+    /// [`STATUS_IN_PROGRESS`] until [`StoredConnectionGroup::deployed_due`], then
+    /// [`STATUS_DEPLOYED`]: a connection group's routing endpoint reaches the edge
+    /// locations the same way a distribution's configuration does.
+    pub status: String,
+    /// The instant this group is owed [`STATUS_DEPLOYED`]. Stored rather than slept for.
+    pub deployed_due: SystemTime,
+    /// `ConnectionGroup$CreatedTime`.
+    pub created_time: SystemTime,
+    /// `ConnectionGroup$LastModifiedTime`.
+    pub last_modified_time: SystemTime,
+    /// The version token the last mutation handed back, and the single source of truth
+    /// for every `If-Match` check against this group.
+    pub etag: String,
+    /// The tags submitted with the create, in the one representation every tagged
+    /// resource in this store uses.
+    pub tags: TagSet,
+}
+
+impl StoredConnectionGroup {
+    /// Apply the propagation transition the clock owes at `now`.
+    ///
+    /// Idempotent and monotonic, for the same reason [`StoredDistribution::settle`] is:
+    /// it only ever moves the non-terminal status to the terminal one, and only once the
+    /// deadline has passed, so a read that calls it cannot change what a later caller
+    /// sees.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.status == STATUS_IN_PROGRESS && now >= self.deployed_due {
+            self.status = STATUS_DEPLOYED.to_string();
+        }
+    }
+
+    /// The `Tags` projection a tag read returns, built from the one stored tag set.
+    pub fn to_tags(&self) -> Tags {
+        tags_projection(&self.tags)
+    }
+
+    /// The `ConnectionGroup` projection every single-group operation returns, read from
+    /// the one stored record.
+    pub fn to_connection_group(&self) -> ConnectionGroup {
+        ConnectionGroup {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            created_time: Some(::aws_smithy_types::DateTime::from(self.created_time)),
+            last_modified_time: Some(::aws_smithy_types::DateTime::from(
+                self.last_modified_time,
+            )),
+            tags: Some(self.to_tags()),
+            ipv6_enabled: Some(self.ipv6_enabled),
+            routing_endpoint: Some(self.routing_endpoint.clone()),
+            anycast_ip_list_id: self.anycast_ip_list_id.clone(),
+            status: Some(self.status.clone()),
+            enabled: Some(self.enabled),
+            is_default: Some(self.is_default),
+        }
+    }
+
+    /// The `ConnectionGroupSummary` a listing reports, read from the same stored record
+    /// the single-group projection is read from — so a listing and a read can never
+    /// disagree about one group.
+    pub fn to_summary(&self) -> ConnectionGroupSummary {
+        ConnectionGroupSummary {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            routing_endpoint: self.routing_endpoint.clone(),
+            created_time: ::aws_smithy_types::DateTime::from(self.created_time),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+            e_tag: self.etag.clone(),
+            anycast_ip_list_id: self.anycast_ip_list_id.clone(),
+            enabled: Some(self.enabled),
+            status: Some(self.status.clone()),
+            is_default: Some(self.is_default),
+        }
+    }
+}
+
 /// One CloudFront distribution tenant, as this emulator persists it.
 ///
 /// A tenant is "a distribution tenant" of ONE multi-tenant distribution: it holds the
@@ -1594,13 +1742,17 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// for the same reason as `distributions`: one stable total order a listing pages
     /// through.
     pub distribution_tenants: BTreeMap<String, StoredDistributionTenant>,
-    /// The id of the account's DEFAULT connection group, once something has needed one.
+    /// Every connection group this emulator holds, keyed by connection group id — the
+    /// identifier every connection group operation addresses one by. A `BTreeMap` for the
+    /// same reason as `distributions`: one stable total order for
+    /// `ListConnectionGroups`'s `Marker` to index into.
     ///
-    /// "When you first create a distribution tenant and you don't specify a connection
-    /// group, CloudFront will automatically create a default connection group for you" —
-    /// so it is minted ONCE, by the first create that needs it, and every later tenant
-    /// that names no connection group is routed through that same one.
-    pub default_connection_group_id: Option<String>,
+    /// At most ONE entry carries [`StoredConnectionGroup::is_default`]: "When you first
+    /// create a distribution tenant and you don't specify a connection group, CloudFront
+    /// will automatically create a default connection group for you" — so that one is
+    /// created ONCE, by the first call that needs it, and every later tenant that names no
+    /// connection group is routed through it.
+    pub connection_groups: BTreeMap<String, StoredConnectionGroup>,
     /// Every origin access identity this emulator holds, keyed by its id. A `BTreeMap`
     /// for the same reason as `distributions`: one stable total order for a listing to
     /// page through.
@@ -1648,6 +1800,9 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
         for tenant in self.distribution_tenants.values_mut() {
             tenant.settle(now);
+        }
+        for connection_group in self.connection_groups.values_mut() {
+            connection_group.settle(now);
         }
     }
 
@@ -1771,15 +1926,51 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             })
     }
 
-    /// Whether `id` names a connection group this store holds.
-    ///
-    /// The only connection group this emulator holds is the account's default one
-    /// ([`ComAmazonawsCloudfrontCloudfront20200531State::default_connection_group`]);
-    /// `CreateConnectionGroup` is still a scaffold, so no other one can have been created.
-    /// When it lands it extends this lookup with its own store rather than replacing the
-    /// rule: an id no connection group carries names no entity.
+    /// Whether `id` names a connection group this store holds — an id no connection group
+    /// carries names no entity.
     pub fn holds_connection_group(&self, id: &str) -> bool {
-        self.default_connection_group_id.as_deref() == Some(id)
+        self.connection_groups.contains_key(id)
+    }
+
+    /// Whether `id` names an Anycast static IP list this store holds.
+    ///
+    /// The Anycast static IP list surface is still a scaffold (`CreateAnycastIpList`), so
+    /// this store holds NONE and no id resolves to one — which is what the
+    /// `InvalidArgument` the connection group create and listing answer for one says
+    /// ([`invalid_anycast_ip_list`]). When that create lands it extends this lookup with
+    /// its own store rather than replacing the rule: an `AnycastIpListId` no Anycast
+    /// static IP list carries is no argument this service can resolve. It is also the ONE
+    /// place that will make the filter-matching branch of `ListConnectionGroups` live.
+    pub fn holds_anycast_ip_list(&self, _id: &str) -> bool {
+        false
+    }
+
+    /// The connection group `identifier` names, or `None` when the store holds none.
+    ///
+    /// `GetConnectionGroup$Identifier` is "The ID, name, or Amazon Resource Name (ARN) of
+    /// the connection group", so all three resolve to the one record: the id is the
+    /// store's key, and the ARN and the name are compared against the STORED values
+    /// rather than re-derived out of the request. The three namespaces cannot overlap —
+    /// an id carries [`CONNECTION_GROUP_ID_PREFIX`] and an ARN starts with `arn:` — so at
+    /// most one of them matches.
+    pub fn connection_group(&self, identifier: &str) -> Option<&StoredConnectionGroup> {
+        if let Some(group) = self.connection_groups.get(identifier) {
+            return Some(group);
+        }
+        self.connection_groups
+            .values()
+            .find(|group| group.arn == identifier || group.name == identifier)
+    }
+
+    /// The connection group whose STORED name is `name`, or `None` when none is.
+    ///
+    /// `CreateConnectionGroup$Name` is "a friendly identifier that is unique within your
+    /// Amazon Web Services account", so at most one group answers, and this is what makes
+    /// a repeated name a conflict rather than a second group.
+    pub fn connection_group_named(&self, name: &str) -> Option<&StoredConnectionGroup> {
+        self.connection_groups
+            .values()
+            .find(|group| group.name == name)
     }
 
     /// The response headers policy `id` names, or `None` when the store holds none.
@@ -1906,6 +2097,13 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         if let Some(store) = self.key_value_store_by_arn(arn) {
             return Some(&store.tags);
         }
+        if let Some(group) = self
+            .connection_groups
+            .values()
+            .find(|group| group.arn == arn)
+        {
+            return Some(&group.tags);
+        }
         if let Some(function) = self.function_by_arn(arn) {
             return Some(&function.tags);
         }
@@ -1936,6 +2134,13 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .find(|store| store.arn == arn)
         {
             return Some(&mut store.tags);
+        }
+        if let Some(group) = self
+            .connection_groups
+            .values_mut()
+            .find(|group| group.arn == arn)
+        {
+            return Some(&mut group.tags);
         }
         // The FIELD rather than the [`Self::function_by_arn`] lookup the tag READ goes
         // through: a method taking `&mut self` would borrow the whole store, which the
@@ -2233,15 +2438,60 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
     }
 
-    /// The id of the account's default connection group, minting it on the first call that
-    /// needs one — which is what "CloudFront will automatically create a default connection
-    /// group for you" means. Every later call reads that one id back.
-    pub fn default_connection_group(&mut self) -> String {
-        if let Some(id) = &self.default_connection_group_id {
-            return id.clone();
+    /// Allocate a connection group id no stored connection group holds:
+    /// [`CONNECTION_GROUP_ID_PREFIX`] followed by a minted token.
+    pub fn allocate_connection_group_id(&mut self) -> String {
+        loop {
+            let candidate = format!("{CONNECTION_GROUP_ID_PREFIX}{}", self.mint(ID_BODY_LEN));
+            if !self.connection_groups.contains_key(&candidate) {
+                break candidate;
+            }
         }
-        let id = format!("{CONNECTION_GROUP_ID_PREFIX}{}", self.mint(ID_BODY_LEN));
-        self.default_connection_group_id = Some(id.clone());
+    }
+
+    /// The id of the account's default connection group, creating the group on the first
+    /// call that needs one — which is what "CloudFront will automatically create a default
+    /// connection group for you" means. Every later call reads that one id back, and the
+    /// record it names is what a read and a listing of that group answer from.
+    ///
+    /// The group this creates is the only one carrying
+    /// [`StoredConnectionGroup::is_default`], and it is created exactly as
+    /// `CreateConnectionGroup` creates one: a minted id, a minted routing endpoint and a
+    /// minted version token, `InProgress` until the clock owes it `Deployed`.
+    pub fn default_connection_group(&mut self, now: SystemTime) -> String {
+        if let Some(group) = self.connection_groups.values().find(|group| group.is_default) {
+            return group.id.clone();
+        }
+        let id = self.allocate_connection_group_id();
+        // The automatic group's name is [`DEFAULT_CONNECTION_GROUP_NAME`] unless a create
+        // already took it: a name identifies ONE group in the account, so the fallback is
+        // derived from this group's own minted id, which no other group holds.
+        let name = match self.connection_group_named(DEFAULT_CONNECTION_GROUP_NAME) {
+            None => DEFAULT_CONNECTION_GROUP_NAME.to_string(),
+            Some(_) => format!("{DEFAULT_CONNECTION_GROUP_NAME}-{id}"),
+        };
+        let routing_endpoint = self.allocate_domain_name();
+        let etag = self.next_etag();
+        let stored = StoredConnectionGroup {
+            arn: connection_group_arn(&id),
+            id: id.clone(),
+            name,
+            routing_endpoint,
+            // Nothing asked for an Anycast static IP list, so the automatic group names
+            // none; every other member takes the same default a create that named none
+            // would get.
+            anycast_ip_list_id: None,
+            ipv6_enabled: DEFAULT_CONNECTION_GROUP_IPV6_ENABLED,
+            enabled: DEFAULT_CONNECTION_GROUP_ENABLED,
+            is_default: true,
+            status: STATUS_IN_PROGRESS.to_string(),
+            deployed_due: now + PROPAGATION_DELAY,
+            created_time: now,
+            last_modified_time: now,
+            etag,
+            tags: TagSet::new(),
+        };
+        self.connection_groups.insert(id.clone(), stored);
         id
     }
 
@@ -2290,6 +2540,10 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// What a distribution REPORTS is [`StoredDistribution::reported_domain_name`]: a
     /// multi-tenant distribution has no domain of its own, so it reports the placeholder
     /// instead of the label allocated here.
+    ///
+    /// A connection group's `RoutingEndpoint` is "also known as the DNS name ... such as
+    /// `d111111abcdef8.cloudfront.net`" — the same generated name in the same shape, so it
+    /// is drawn from here too rather than from a second rendering of the mint.
     pub fn allocate_domain_name(&mut self) -> String {
         let label = self.mint(ID_BODY_LEN).to_lowercase();
         format!("d{label}.cloudfront.net")
@@ -2580,6 +2834,13 @@ pub fn distribution_tenant_arn(id: &str) -> String {
     ::engine::emulator_arn("cloudfront", "", &format!("distribution-tenant/{id}"))
 }
 
+/// The ARN of a connection group. CloudFront is a GLOBAL service, so the ARN's region
+/// segment is empty: `arn:aws:cloudfront::<account>:connection-group/<Id>`, the resource
+/// type this service's own `/connection-group` routes name.
+pub fn connection_group_arn(id: &str) -> String {
+    ::engine::emulator_arn("cloudfront", "", &format!("connection-group/{id}"))
+}
+
 /// Whether two domain names are the same name. DNS names are case-insensitive, so the
 /// comparison is too — a domain claimed in one case is claimed in every case.
 pub fn same_domain(left: &str, right: &str) -> bool {
@@ -2794,6 +3055,19 @@ pub fn is_distribution_id(value: &str) -> bool {
     is_prefixed_token(value, 'E')
 }
 
+/// Whether `value` has the shape of a connection group id this service mints
+/// ([`CONNECTION_GROUP_ID_PREFIX`] followed by [`ID_BODY_LEN`] uppercase alphanumerics).
+///
+/// `ListConnectionGroups`'s `Marker` is "the marker for the next set of connection groups
+/// to retrieve", which is a value this service handed out, and the model constrains it no
+/// further than `string` — so this is what tells a resume point the service issued from a
+/// value a client made up.
+pub fn is_connection_group_id(value: &str) -> bool {
+    value
+        .strip_prefix(CONNECTION_GROUP_ID_PREFIX)
+        .is_some_and(is_token_body)
+}
+
 /// Whether `value` has the shape of a version token (`ETag`) this service mints.
 ///
 /// `If-Match` carries one, and the model constrains it no further than `string`: a value
@@ -2859,9 +3133,15 @@ pub fn is_public_key_id(value: &str) -> bool {
 /// alphabet.
 fn is_prefixed_token(value: &str, prefix: char) -> bool {
     match value.strip_prefix(prefix) {
-        Some(body) => body.len() == ID_BODY_LEN && body.bytes().all(is_token_byte),
+        Some(body) => is_token_body(body),
         None => false,
     }
+}
+
+/// Whether `body` is [`ID_BODY_LEN`] characters of the id alphabet — the body every
+/// token this service mints carries, whatever prefix it is minted under.
+fn is_token_body(body: &str) -> bool {
+    body.len() == ID_BODY_LEN && body.bytes().all(is_token_byte)
 }
 
 /// A byte of the id alphabet: a decimal digit or an uppercase ASCII letter.
@@ -4222,6 +4502,48 @@ pub fn distribution_tenant_not_found(identifier: &str) -> EntityNotFound {
 pub fn connection_group_not_found(id: &str) -> EntityNotFound {
     EntityNotFound {
         message: Some(format!("The specified connection group does not exist: {id}")),
+    }
+}
+
+/// The modelled `EntityAlreadyExists` (HTTP 409) for a connection group name that is
+/// already taken: the name is "unique within your Amazon Web Services account".
+pub fn connection_group_already_exists(name: &str) -> EntityAlreadyExists {
+    EntityAlreadyExists {
+        message: Some(format!(
+            "A connection group with the name {name} already exists in this account"
+        )),
+    }
+}
+
+/// The message CloudFront answers an `AssociationFilter` whose id it cannot use with, on
+/// the wire: one CONSTANT sentence for the condition, carrying nothing from the request —
+/// the recorded `ListConnectionGroups` contract pins this text, and it is a property of
+/// the filter rather than of the value submitted.
+pub const INVALID_ASSOCIATION_FILTER_MESSAGE: &str = "The association filter id is invalid.";
+
+/// The modelled `InvalidArgument` (HTTP 400) for an `AssociationFilter` naming an id this
+/// service cannot resolve — "An argument is invalid."
+pub fn invalid_association_filter() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(INVALID_ASSOCIATION_FILTER_MESSAGE.to_string()),
+    }
+}
+
+/// The modelled `InvalidArgument` (HTTP 400) for an `AnycastIpListId` that names no
+/// Anycast static IP list this service holds — "An argument is invalid."
+///
+/// The recorded `ListConnectionGroups` contract answers this condition with
+/// `InvalidArgument` rather than `EntityNotFound`: the id is an argument CloudFront cannot
+/// resolve, so every operation that takes one reports it the same way. Where the argument
+/// arrives on an `AssociationFilter`, the sentence is that filter's own
+/// ([`invalid_association_filter`]); elsewhere the member it arrived on is named, which a
+/// caller cannot work out for itself.
+pub fn invalid_anycast_ip_list(id: &str) -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(format!(
+            "An argument is invalid: AnycastIpListId {id} is not an Anycast static IP list of \
+             this account"
+        )),
     }
 }
 
