@@ -67,7 +67,12 @@ const GIT_HOST_LABEL: &str = "git-codecommit";
 /// a multi-thread runtime — the one the emulator boots — so on a current-thread
 /// runtime (a `#[tokio::test]`, or a caller driving the router in-process) the work
 /// runs inline, where there is no other worker to protect.
-fn off_the_async_worker<T>(work: impl FnOnce() -> T) -> T {
+///
+/// `pub(crate)` because a modeled handler whose CPU-bound work also runs under the
+/// store lock uses the same construct for the same reason: a merge evaluation
+/// (`crate::ops::get_merge_options`) compares two tree snapshots and may merge
+/// file content, holding the guard it reads them through for that whole span.
+pub(crate) fn off_the_async_worker<T>(work: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
         _ => work(),
@@ -246,6 +251,14 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         ("sortBy", ViolationKind::EnumValue(_)) => (
             "InvalidSortByException",
             "The specified sort by value is not valid.",
+        ),
+        ("conflictDetailLevel", ViolationKind::EnumValue(_)) => (
+            "InvalidConflictDetailLevelException",
+            "The specified conflict detail level is not valid.",
+        ),
+        ("conflictResolutionStrategy", ViolationKind::EnumValue(_)) => (
+            "InvalidConflictResolutionStrategyException",
+            "The specified conflict resolution strategy is not valid.",
         ),
         ("order", ViolationKind::EnumValue(_)) => (
             "InvalidOrderException",

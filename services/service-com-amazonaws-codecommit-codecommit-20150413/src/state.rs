@@ -20,6 +20,7 @@
 //! reading a file at a commit specifier is a lookup rather than a tree walk.
 
 pub mod git_object;
+pub mod merge;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1253,6 +1254,11 @@ impl Repository {
         let mut queue: Vec<String> = vec![id.to_string()];
         let mut seen: BTreeSet<String> = BTreeSet::new();
         while let Some(next) = queue.pop() {
+            // Charged BEFORE the skips below: every parent id comes from a pushed
+            // commit object, so a history whose parents name nothing this
+            // repository holds would otherwise drain its whole queue uncharged.
+            // This is also where the deadline is checked for this walk.
+            budget.entry()?;
             if !seen.insert(next.clone()) || self.commits.contains_key(&next) {
                 continue;
             }
@@ -1412,6 +1418,12 @@ impl Repository {
     /// `commit_id` itself: the history a read at that commit sees. An id whose
     /// commit [`Repository::prune_history`] has dropped is still reported, because
     /// a retained commit's `parents` keeps naming it.
+    ///
+    /// The UNCHARGED form, for a walk whose size is already bounded by what the
+    /// projection retained ([`MAX_COMMITS_RETAINED`] commits and the parents they
+    /// name). A walk a caller can drive past that — one that resolves a merge
+    /// base over a history of any shape — charges every commit it visits to its
+    /// own request budget instead; see [`merge`].
     pub fn ancestry(&self, commit_id: &str) -> BTreeSet<String> {
         let mut reachable = BTreeSet::new();
         let mut pending = vec![commit_id.to_string()];
