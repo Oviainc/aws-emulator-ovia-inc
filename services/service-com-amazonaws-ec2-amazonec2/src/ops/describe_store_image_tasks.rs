@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStoreImageTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStoreImageTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStoreImageTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the AMI store tasks [`crate::state`] holds — the ones `CreateStoreImageTask`
+//! started — newest first, either the subset the request's `ImageIds` names or the subset
+//! its `Filters` select, one `MaxResults`-sized page at a time. A reporting operation: it
+//! writes nothing of its own, and materialises only what the clock already owed the stored
+//! tasks ([`crate::state::ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]) —
+//! the end of the 31-day window a task is viewable for — which was due whether or not
+//! anybody asked. A task's state and its progress are derived from its age on read
+//! ([`crate::state::StoreImageTaskRecord::view_at`]), so two readers at one instant report
+//! one task identically.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +157,236 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStoreImageTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStoreImageTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStoreImageTasks"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MatchBudget, decode_page_token, encode_page_token,
+            image_id_is_well_formed, invalid_ami_id_malformed, invalid_pagination_token_for,
+            matches_every_filter, require_service_state,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The AMI IDs for which to show progress. Up to 20 AMI IDs can be included in a
+        // request" (`ImageIds`).
+        let requested_ids: &[String] = input.image_ids.as_deref().unwrap_or_default();
+        if requested_ids.len() > MAX_STORE_IMAGE_TASK_IMAGE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "ImageIds carries {} ids, above the maximum of \
+                 {MAX_STORE_IMAGE_TASK_IMAGE_IDS}",
+                requested_ids.len()
+            )));
+        }
+        // An id that is not an AMI id at all is refused before anything is looked up, the
+        // way every id-keyed EC2 describe refuses one. A well-formed id the account can see
+        // no image for is NOT refused: a store task outlives the AMI it stored — it stays
+        // viewable for 31 days whatever happens to the image — so an id with no image
+        // behind it simply selects no task.
+        for image_id in requested_ids {
+            if !image_id_is_well_formed(image_id) {
+                return Err(invalid_ami_id_malformed(image_id));
+            }
+        }
+
+        // "You cannot specify this parameter and the `ImageIds` parameter in the same call"
+        // (`MaxResults`).
+        if input.max_results.is_some() && !requested_ids.is_empty() {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "The parameter MaxResults cannot be used with the parameter ImageIds",
+            ));
+        }
+
+        // Matching cost is filters x values x held values x stored tasks, and the model
+        // bounds none of those, so the request-controlled factors are capped here before any
+        // work proportional to them is done — and their PRODUCT is charged to one
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any task
+        // would have matched it, so an unsupported filter can never read as "no results".
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !STORE_IMAGE_TASK_FILTERS.contains(&name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+        // "When you specify the `ImageIds` parameter, any filters that you specify are
+        // ignored" (`Filters`) — their NAMES are still refused above, because a name EC2
+        // does not publish is a bad request however the rest of the request narrows.
+        if !requested_ids.is_empty() {
+            selectors.clear();
+        }
+
+        // "The token returned from a previous paginated request" (`NextToken`) — anything
+        // else is refused rather than read as a position.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        // DryRun sits AFTER every parameter has been validated: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused is refused with
+        // that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // The end of the 31-day window a task is viewable for was owed at this instant
+        // whether or not anybody called, so materialising it changes nothing a later caller
+        // would otherwise have seen.
+        store.materialize_due_transitions();
+
+        // "Tasks are listed in reverse chronological order": the store's keys increase with
+        // time, so iterating it backwards IS that order, and the cursor below names the key
+        // the next page starts at.
+        let now = ::std::time::Instant::now();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<(String, StoreImageTaskResult)> = Vec::new();
+        for (key, record) in store.store_image_tasks.iter().rev() {
+            if budget.exhausted() {
+                break;
+            }
+            // The id narrowing is read off the stored record, so a task the request did not
+            // name costs no comparison at all.
+            if !requested_ids.is_empty() && !requested_ids.contains(&record.ami_id) {
+                continue;
+            }
+            let view = record.view_at(now);
+            if matches_every_filter(&selectors, &mut budget, &|name| filter_values(&view, name)) {
+                selected.push((key.clone(), view));
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // The cursor names a key in the reverse-chronological order above, where keys
+        // DESCEND — so the page starts at the first task whose key is not after it.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|(key, _)| key.as_str() > cursor),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of items to return for this request" (`MaxResults`), whose
+        // modelled range is 1..200, so a request that names none gets the largest page this
+        // operation serves.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .filter(|max_results| *max_results > 0)
+            .unwrap_or(MAX_STORE_IMAGE_TASKS_PAGE_SIZE)
+            .clamp(1, MAX_STORE_IMAGE_TASKS_PAGE_SIZE);
+
+        // "The token to include in another request to get the next page of items. This value
+        // is null when there are no more items to return" (`NextToken`): a token only when a
+        // task follows this page.
+        let next_token = page
+            .get(limit)
+            .map(|(key, _)| encode_page_token(key.as_str()));
+
+        Ok(DescribeStoreImageTasksOutput {
+            store_image_task_results: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|(_, view)| view.clone())
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The largest page this operation serves: the maximum of the modelled
+/// `DescribeStoreImageTasksRequestMaxResults` range, `1..200`
+/// (`smithy_query(query="operation",operation="DescribeStoreImageTasks")`). A request that
+/// names no page size gets one of this size, so the `NextToken` path behaves the same
+/// whether or not a page size was asked for.
+const MAX_STORE_IMAGE_TASKS_PAGE_SIZE: usize = 200;
+
+/// How many AMI ids one request may name: "Up to 20 AMI IDs can be included in a request"
+/// (`DescribeStoreImageTasksRequest$ImageIds`). The model declares no `@length` for the
+/// list, so the handler is the only place that sentence can be enforced.
+const MAX_STORE_IMAGE_TASK_IMAGE_IDS: usize = 20;
+
+/// The filter names this operation documents, from
+/// `DescribeStoreImageTasksRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeStoreImageTasksRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// "`task-state` - Returns tasks in a certain state (`InProgress` | `Completed` |
+/// `Failed`)" and "`bucket` - Returns task information for tasks that targeted a specific
+/// bucket. For the filter value, specify the bucket name." The member documents no `tag:`
+/// family for this operation, and a task carries no tags of its own, so there is none to
+/// answer. Every entry must be answered by [`filter_values`].
+const STORE_IMAGE_TASK_FILTERS: [&str; 2] = ["bucket", "task-state"];
+
+/// The values the EC2 filter `name` compares against this task.
+///
+/// A filter naming an attribute this task does not carry compares against NO values, so it
+/// selects nothing — the same answer AWS gives for any absent attribute. `name` is one of
+/// [`STORE_IMAGE_TASK_FILTERS`]. The AND/OR evaluation itself is the crate's shared
+/// [`crate::state::matches_every_filter`]; only this lookup is this operation's own.
+fn filter_values<'a>(
+    task: &'a StoreImageTaskResult,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "bucket" => text(task.bucket.as_deref()),
+        "task-state" => text(task.store_task_state.as_deref()),
+        // Unreachable: the handler has already refused every other name. An undefined name
+        // compares against nothing, so it could never widen a result even if that check
+        // were bypassed.
+        _ => Vec::new(),
     }
 }

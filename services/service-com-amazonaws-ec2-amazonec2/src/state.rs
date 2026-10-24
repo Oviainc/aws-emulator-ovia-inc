@@ -122,6 +122,25 @@
 //! retains is either a word the service chose or an id read back out of another store —
 //! nothing caller-sized — so no byte charge is made for one.
 //!
+//! ## AMI store tasks
+//!
+//! [`ComAmazonawsEc2Amazonec2State::store_image_tasks`] holds the AMI store tasks
+//! `CreateStoreImageTask` starts, as [`StoreImageTaskRecord`]s: the destination the request
+//! named (the AMI, the bucket and the object key the service derives from the AMI's id),
+//! the instant the task started, and the instant its upload finishes — on the same
+//! monotonic clock and the same [`TRANSITION_DELAY`] as every other clock-owed move in
+//! this module. The record holds no `StoreTaskState` and no `ProgressPercentage`: both are
+//! facts of the task's age, so [`StoreImageTaskRecord::view_at`] derives them on read the
+//! way [`SecondaryNetworkRecord::view_at`] derives a network's state, and a read writes
+//! nothing.
+//!
+//! The store is keyed by a MINTED, monotonically increasing internal key, so iterating it
+//! backwards is the "reverse chronological order" `DescribeStoreImageTasks` lists tasks in
+//! and a pagination token can name the key the next page starts at. A task leaves the
+//! account's view 31 days after it started ("Currently, only tasks from the past 31 days
+//! can be viewed", `DescribeStoreImageTasks`), which is a move the clock owes it too, so
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] drops it then.
+//!
 //! ## Launch templates
 //!
 //! [`ComAmazonawsEc2Amazonec2State::launch_templates`] holds the account's launch
@@ -1938,6 +1957,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// see the module docs. Ordered by id, which is the order
     /// `DescribeFastLaunchImages` reports and pages over.
     pub fast_launch_images: BTreeMap<String, FastLaunchRecord>,
+    /// Every AMI store task of the account, by the minted internal key the task was
+    /// stored under — see the module docs. The keys increase with time, so the map's
+    /// order is the task order, and its REVERSE is the "reverse chronological order"
+    /// `DescribeStoreImageTasks` lists tasks in and pages over.
+    pub store_image_tasks: BTreeMap<String, StoreImageTaskRecord>,
     /// Every Elastic IP address the account holds, by `AllocationId`, as the modelled
     /// [`Address`] shape itself — so a member a writer sets round-trips through
     /// `DescribeAddresses` without a field-by-field copy. Ordered by id, which is the
@@ -2333,6 +2357,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             capacity_reservation_client_tokens: HashMap::new(),
             application_status: BTreeMap::new(),
             fast_launch_images: BTreeMap::new(),
+            store_image_tasks: BTreeMap::new(),
             addresses: BTreeMap::new(),
             next_elastic_ip: 0,
             route_servers: BTreeMap::new(),
@@ -4513,6 +4538,7 @@ impl ComAmazonawsEc2Amazonec2State {
         self.complete_due_import_image_tasks(now);
         self.materialize_due_capacity_reservation_fleet_moves(now);
         self.materialize_due_spot_instance_requests(now);
+        self.expire_due_store_image_tasks(now);
     }
 
     /// The kernel and RAM disk an instance launched from `image_id` runs when its launch
@@ -18808,6 +18834,194 @@ impl ComAmazonawsEc2Amazonec2State {
 }
 
 // ---------------------------------------------------------------------------
+// AMI store tasks
+// ---------------------------------------------------------------------------
+
+// The modelled shape this slice reports, named HERE rather than in the module's shared
+// `use crate::ops::types::{..}` list at the top, the way the Spot Instance slice does it.
+use crate::ops::types::StoreImageTaskResult;
+
+/// "The state of the store task (`InProgress`, `Completed`, or `Failed`)"
+/// (`StoreImageTaskResult$StoreTaskState`): the state of a task whose upload is still
+/// running.
+pub const STORE_TASK_STATE_IN_PROGRESS: &str = "InProgress";
+
+/// `StoreImageTaskResult$StoreTaskState`'s `Completed`: the state of a task whose upload
+/// has finished, after which "the AMI object appears in the bucket"
+/// (`CreateStoreImageTaskRequest$Bucket`).
+pub const STORE_TASK_STATE_COMPLETED: &str = "Completed";
+
+/// `StoreImageTaskResult$StoreTaskState`'s `Failed`: the state of a task that did not
+/// finish, which is the one state this emulator never puts a task into — nothing here can
+/// fail an upload, and a state no work reached is not one to report.
+pub const STORE_TASK_STATE_FAILED: &str = "Failed";
+
+/// The percentage `StoreImageTaskResult$ProgressPercentage` reports for an upload that has
+/// finished: all of it.
+pub const STORE_IMAGE_TASK_COMPLETE_PERCENTAGE: i32 = 100;
+
+/// The largest percentage a task still `InProgress` reports: an upload that has not
+/// finished has not reached [`STORE_IMAGE_TASK_COMPLETE_PERCENTAGE`], so the estimate is
+/// held one below it rather than rounding up to "done" before the task is.
+pub const STORE_IMAGE_TASK_MAX_IN_PROGRESS_PERCENTAGE: i32 =
+    STORE_IMAGE_TASK_COMPLETE_PERCENTAGE - 1;
+
+/// The suffix of the object a store task writes: AWS stores the AMI "as a single object"
+/// named `<ami-id>.bin` in the bucket (`CreateStoreImageTask` / "Store and restore an AMI
+/// using S3"), which is what `CreateStoreImageTaskResult$ObjectKey` and
+/// `StoreImageTaskResult$S3objectKey` report. Derived from the AMI's id, never taken from a
+/// request.
+pub const STORE_IMAGE_OBJECT_KEY_SUFFIX: &str = ".bin";
+
+/// How long a store task stays in the account's view: "Currently, only tasks from the past
+/// 31 days can be viewed" (`DescribeStoreImageTasks`). A documented duration, so it keeps
+/// its documented value.
+pub const STORE_IMAGE_TASK_VISIBILITY: Duration = Duration::from_secs(31 * 24 * 60 * 60);
+
+/// The largest number of store tasks this in-memory store holds.
+///
+/// A capacity bound in the style of [`MAX_SECONDARY_NETWORKS`], not an AWS quota: each task
+/// is a record in this process's memory, so the number a caller can start has to be finite.
+/// A count ceiling is not a memory bound on its own — see [`MAX_STORED_BYTES`] — so the
+/// caller-chosen bytes of each task are charged against that budget too
+/// ([`store_image_task_payload_bytes`]).
+pub const MAX_STORE_IMAGE_TASKS: usize = 1_000;
+
+/// The error code a `CreateStoreImageTask` past [`MAX_STORE_IMAGE_TASKS`] is refused with.
+///
+/// AWS publishes no quota code for this resource, so this follows EC2's own
+/// `<Resource>LimitExceeded` spelling ([`VPC_LIMIT_EXCEEDED`],
+/// [`SECONDARY_NETWORK_LIMIT_EXCEEDED`]).
+pub const STORE_IMAGE_TASK_LIMIT_EXCEEDED: &str = "StoreImageTaskLimitExceeded";
+
+/// The fixed overhead one stored task costs whatever it carries: the record itself and the
+/// map entry holding it, as a CHOSEN constant in the same spirit as
+/// [`VPC_ENDPOINT_CONNECTION_RECORD_BYTES`] — the point is that a task is not free against
+/// [`MAX_STORED_BYTES`], not that it is byte-exact.
+pub const STORE_IMAGE_TASK_RECORD_BYTES: usize = 256;
+
+/// The prefix of the internal key a store task is held under.
+///
+/// A task has no id in the API — `StoreImageTaskResult` carries none — so this key is never
+/// reported: it exists so the store has one stable, monotonically increasing order, which
+/// is what makes "Tasks are listed in reverse chronological order"
+/// (`DescribeStoreImageTasks`) a plain reverse iteration and lets a pagination token name
+/// the task the next page starts at.
+pub const STORE_IMAGE_TASK_KEY_PREFIX: &str = "store-image-task";
+
+/// Refuse a store task a caller cannot start because the store is full: HTTP 400
+/// [`STORE_IMAGE_TASK_LIMIT_EXCEEDED`].
+pub fn store_image_task_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(STORE_IMAGE_TASK_LIMIT_EXCEEDED, 400, message)
+}
+
+/// One AMI store task: where it stores the AMI, when it started, and when its upload
+/// finishes.
+///
+/// The record holds neither the task's `StoreTaskState` nor its `ProgressPercentage`: both
+/// are facts of the task's age, so [`StoreImageTaskRecord::view_at`] derives them the way
+/// [`SecondaryNetworkRecord::view_at`] derives a network's state — a reader observes the
+/// progress the clock has made without writing anything, and two readers at the same
+/// instant report the same task.
+#[derive(Debug, Clone)]
+pub struct StoreImageTaskRecord {
+    /// "The ID of the AMI that is being stored" (`StoreImageTaskResult$AmiId`).
+    pub ami_id: String,
+    /// "The name of the Amazon S3 bucket that contains the stored AMI object"
+    /// (`StoreImageTaskResult$Bucket`) — the one member of the task a request chooses.
+    pub bucket: String,
+    /// "The name of the stored AMI object in the bucket"
+    /// (`StoreImageTaskResult$S3objectKey`), derived from the AMI's id.
+    pub object_key: String,
+    /// "The time the task started" (`StoreImageTaskResult$TaskStartTime`) — wall clock,
+    /// because it is reported.
+    pub started_at: SystemTime,
+    /// The monotonic instant the upload started, which the progress estimate is measured
+    /// from. Monotonic ([`Instant`]), because it is only ever compared against the clock,
+    /// so a wall-clock adjustment cannot run a task's progress backwards.
+    pub started_at_monotonic: Instant,
+    /// The instant from which this task's `InProgress` -> `Completed` move is due: the
+    /// upload is work the clock owes the task rather than the create call completing.
+    pub completes_at: Instant,
+    /// The instant from which this task is out of the account's view
+    /// ([`STORE_IMAGE_TASK_VISIBILITY`] after it started), at which
+    /// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] drops it.
+    pub leaves_view_at: Instant,
+}
+
+impl StoreImageTaskRecord {
+    /// A task storing `ami_id` into `bucket`, started now: `InProgress`, with its upload
+    /// due [`TRANSITION_DELAY`] later — the span this crate gives every clock-owed
+    /// transition, recorded rather than slept for.
+    pub fn starting_now(ami_id: &str, bucket: &str) -> Self {
+        let started_at_monotonic = Instant::now();
+        Self {
+            ami_id: ami_id.to_string(),
+            bucket: bucket.to_string(),
+            object_key: format!("{ami_id}{STORE_IMAGE_OBJECT_KEY_SUFFIX}"),
+            started_at: SystemTime::now(),
+            started_at_monotonic,
+            completes_at: started_at_monotonic + TRANSITION_DELAY,
+            leaves_view_at: started_at_monotonic + STORE_IMAGE_TASK_VISIBILITY,
+        }
+    }
+
+    /// The task's `StoreTaskState` at `now`.
+    ///
+    /// [`STORE_TASK_STATE_FAILED`] is never answered: nothing in this emulator fails an
+    /// upload, and a state no work reached is not one to report.
+    pub fn state_at(&self, now: Instant) -> &'static str {
+        if now < self.completes_at {
+            STORE_TASK_STATE_IN_PROGRESS
+        } else {
+            STORE_TASK_STATE_COMPLETED
+        }
+    }
+
+    /// "The progress of the task as a percentage"
+    /// (`StoreImageTaskResult$ProgressPercentage`) at `now`: how much of the upload's span
+    /// has elapsed, which is [`STORE_IMAGE_TASK_COMPLETE_PERCENTAGE`] once the task has
+    /// finished and is held at [`STORE_IMAGE_TASK_MAX_IN_PROGRESS_PERCENTAGE`] until then.
+    pub fn progress_at(&self, now: Instant) -> i32 {
+        if now >= self.completes_at {
+            return STORE_IMAGE_TASK_COMPLETE_PERCENTAGE;
+        }
+        let span = self
+            .completes_at
+            .saturating_duration_since(self.started_at_monotonic)
+            .as_nanos();
+        if span == 0 {
+            return STORE_IMAGE_TASK_MAX_IN_PROGRESS_PERCENTAGE;
+        }
+        let elapsed = now
+            .saturating_duration_since(self.started_at_monotonic)
+            .as_nanos();
+        let percentage = elapsed.saturating_mul(
+            u128::try_from(STORE_IMAGE_TASK_COMPLETE_PERCENTAGE).unwrap_or_default(),
+        ) / span;
+        i32::try_from(percentage)
+            .unwrap_or(STORE_IMAGE_TASK_MAX_IN_PROGRESS_PERCENTAGE)
+            .clamp(0, STORE_IMAGE_TASK_MAX_IN_PROGRESS_PERCENTAGE)
+    }
+
+    /// This task as of `now`, as the model shapes it.
+    ///
+    /// `StoreTaskFailureReason` stays absent: "If the task succeeds, `null` is returned"
+    /// (`StoreImageTaskResult$StoreTaskFailureReason`), and no task here fails.
+    pub fn view_at(&self, now: Instant) -> StoreImageTaskResult {
+        StoreImageTaskResult {
+            ami_id: Some(self.ami_id.clone()),
+            task_start_time: Some(system_time_to_date_time(self.started_at)),
+            bucket: Some(self.bucket.clone()),
+            s3object_key: Some(self.object_key.clone()),
+            progress_percentage: Some(self.progress_at(now)),
+            store_task_state: Some(self.state_at(now).to_string()),
+            store_task_failure_reason: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // EBS encryption by default (the account-level setting of a Region)
 // ---------------------------------------------------------------------------
 
@@ -19687,6 +19901,78 @@ impl SpotTransition {
         Self {
             due_at: due_instant(delay),
             at: due_system_time(SystemTime::now(), delay),
+        }
+    }
+}
+
+/// The bytes one stored task holds: its fixed overhead
+/// ([`STORE_IMAGE_TASK_RECORD_BYTES`]) plus the one caller-chosen string it keeps, the
+/// bucket name. The AMI id and the object key are derived from it, so they are a fixed
+/// size.
+///
+/// The ONE definition of that charge, the way [`address_payload_bytes`] is for an address:
+/// a writer charges exactly it, and a removal path gives back the same number.
+pub fn store_image_task_payload_bytes(record: &StoreImageTaskRecord) -> usize {
+    store_image_task_payload_bytes_for(&record.bucket)
+}
+
+/// What [`store_image_task_payload_bytes`] will charge a task targeting `bucket`, BEFORE
+/// one is minted — so a create can ask the byte budget without building a record only to
+/// measure it.
+pub fn store_image_task_payload_bytes_for(bucket: &str) -> usize {
+    STORE_IMAGE_TASK_RECORD_BYTES.saturating_add(bucket.len())
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another store task fits inside the store's ceiling
+    /// ([`MAX_STORE_IMAGE_TASKS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
+    /// with [`store_image_task_limit_exceeded`] when it answers `false`.
+    pub fn has_store_image_task_capacity(&self) -> bool {
+        self.store_image_tasks.len() < MAX_STORE_IMAGE_TASKS
+    }
+
+    /// Start a task storing `ami_id` into `bucket`, and answer the internal key it was
+    /// stored under.
+    ///
+    /// Everything the task reports beyond the bucket is derived here rather than taken from
+    /// the caller — the object key from the AMI's id, the start time from the clock, and the
+    /// state and progress from the task's age — so two readers cannot report one task
+    /// differently.
+    ///
+    /// EVERY call records a task: "you get a paginated list of store tasks from the last 31
+    /// days" (`DescribeStoreImageTasks`) is every task started, and AWS publishes no
+    /// de-duplication, so storing one AMI into one bucket again is a SECOND task — minted a
+    /// later key, which is what puts it first in the reverse-chronological report — rather
+    /// than something that drops a task a caller could still describe.
+    pub fn insert_store_image_task(&mut self, ami_id: &str, bucket: &str) -> String {
+        let key = self.next_id(STORE_IMAGE_TASK_KEY_PREFIX);
+        let record = StoreImageTaskRecord::starting_now(ami_id, bucket);
+        self.add_stored_bytes(store_image_task_payload_bytes(&record));
+        self.store_image_tasks.insert(key.clone(), record);
+        key
+    }
+
+    /// Drop every store task whose window has run out, as of `now`.
+    ///
+    /// "Currently, only tasks from the past 31 days can be viewed"
+    /// (`DescribeStoreImageTasks`): a task leaves the account's view
+    /// [`STORE_IMAGE_TASK_VISIBILITY`] after it started, which the clock owes it whether or
+    /// not anybody ever calls again — so
+    /// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] calls this, and the
+    /// caller-chosen bytes the task held are given back.
+    pub fn expire_due_store_image_tasks(&mut self, now: Instant) {
+        let expired: Vec<String> = self
+            .store_image_tasks
+            .iter()
+            .filter(|(_, record)| now >= record.leaves_view_at)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in expired {
+            if let Some(record) = self.store_image_tasks.remove(&key) {
+                self.release_stored_bytes(store_image_task_payload_bytes(&record));
+            }
         }
     }
 }

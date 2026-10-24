@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStoreImageTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStoreImageTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStoreImageTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts an AMI store task: "Stores an AMI as a single object in an Amazon S3 bucket".
+//! The task is minted into [`crate::state`] in the non-terminal `InProgress` state — "the
+//! AMI object appears in the bucket only after the upload task has completed"
+//! (`Bucket`) — and `DescribeStoreImageTasks` reports it from there, so the two operations
+//! cannot describe one task differently. The object key the response names is derived from
+//! the AMI's id and read back out of the store.
+//!
+//! The same storage-location rule `CreateRestoreImageTask` and the FPGA-image create keep
+//! applies first: a bucket name outside Amazon S3's published naming rules names no bucket
+//! at all ([`crate::state::s3_bucket_name_is_well_formed`]), which is the same refusal. No
+//! Amazon S3 object is written — this emulator stores none — so the task records the upload
+//! EC2 tracks, and nothing claims an object a later read could not find.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +145,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStoreImageTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStoreImageTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStoreImageTask"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            MAX_S3_BUCKET_NAME_CHARS, MAX_STORE_IMAGE_TASKS, MAX_STORED_BYTES,
+            MIN_S3_BUCKET_NAME_CHARS, inaccessible_storage_location, require_service_state,
+            require_visible_image, s3_bucket_name_is_well_formed, store_image_task_limit_exceeded,
+            store_image_task_payload_bytes_for,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // `Bucket` and `ImageId` are both `required`, so the boundary validator has already
+        // refused a request that omits either; an empty one that is PRESENT reaches here and
+        // is refused below — the bucket by its name rules, the AMI id as a malformed id.
+
+        // "The name of the Amazon S3 bucket in which the AMI object will be stored"
+        // (`Bucket`): EC2 names a bucket here rather than creating one, so what it can tell
+        // about the name without reading another service's state is whether it is a bucket
+        // name at all — the same storage-location rule, and the same refusal, as
+        // `CreateRestoreImageTask` and the FPGA-image create keep.
+        if !s3_bucket_name_is_well_formed(&input.bucket) {
+            return Err(inaccessible_storage_location(format!(
+                "The S3 bucket '{}' is not an accessible storage location: an S3 bucket name \
+                 holds {MIN_S3_BUCKET_NAME_CHARS} to {MAX_S3_BUCKET_NAME_CHARS} lowercase \
+                 letters, digits, dots and hyphens, begins and ends with a letter or a digit, \
+                 and is not formatted as an IP address",
+                input.bucket
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        store.materialize_due_transitions();
+
+        // "The ID of the AMI" (`ImageId`): an id that is not an AMI id is malformed, and one
+        // the account can see no image for does not exist — an AMI has to be there to be
+        // stored.
+        require_visible_image(&store, &input.image_id)?;
+
+        // A count ceiling is not a memory bound on its own: the bucket name is
+        // caller-sized, so the bytes this task would hold are asked for BEFORE the insert,
+        // the way every other create in this crate asks, and refused instead of overshot.
+        // EVERY create adds a task, so both ceilings apply to every one of them. Both are
+        // reads, and they sit BEFORE the DryRun branch so a dry run of a request this store
+        // has no room for is refused with that reason rather than told it would succeed.
+        if !store.has_store_image_task_capacity() {
+            return Err(store_image_task_limit_exceeded(format!(
+                "This emulator holds the maximum of {MAX_STORE_IMAGE_TASKS} AMI store tasks"
+            )));
+        }
+        let payload_bytes = store_image_task_payload_bytes_for(&input.bucket);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(store_image_task_limit_exceeded(format!(
+                "This emulator holds {held} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} bytes more",
+                held = store.stored_bytes(),
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated, the image resolved and the
+        // room for the task checked, and BEFORE the first write: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused is refused with
+        // that reason instead, and one that would have succeeded leaves the store untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The upload is work the clock owes the task rather than this call completing, so
+        // the task is stored `InProgress` and `DescribeStoreImageTasks` reports it moving.
+        let key = store.insert_store_image_task(&input.image_id, &input.bucket);
+
+        // "The tags to apply to the AMI object that will be stored in the Amazon S3 bucket"
+        // (`S3ObjectTags`) are tags of an S3 OBJECT, not of anything in EC2: no EC2
+        // operation reports them — `StoreImageTaskResult` carries no tag member — so they
+        // are not kept in this service's state, where nothing could ever read them back.
+        let _ = &input.s3_object_tags;
+
+        // Read the response back OUT of the store, so the caller sees the object key a later
+        // `DescribeStoreImageTasks` reports rather than one built beside it.
+        let object_key = store
+            .store_image_tasks
+            .get(&key)
+            .map(|record| record.object_key.clone())
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the store task for image '{}' could not be read back",
+                    input.image_id
+                ))
+            })?;
+        Ok(CreateStoreImageTaskOutput {
+            object_key: Some(object_key),
+        })
     }
 }

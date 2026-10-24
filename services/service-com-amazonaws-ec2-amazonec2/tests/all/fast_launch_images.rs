@@ -37,7 +37,9 @@ use ec2::state::{
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{call, element, elements, error_code, filters, indexed, unescaped};
+use super::ec2_query::{
+    as_timestamp, call, element, elements, error_code, filters, indexed, unescaped,
+};
 
 /// The Region every call here is signed for. A fast launch configuration carries no Region
 /// member, so the Region only selects the ec2Query envelope.
@@ -318,13 +320,6 @@ fn assert_reported(case: &str, body: &str, row: &EnableRow, image_id: &str, stat
         "case {case:?}: expected an ISO 8601 stateTransitionTime, got {transition_time:?} \
          in body {body}"
     );
-}
-
-/// `value` as the instant it names, or `None` when it is not an ISO 8601 timestamp.
-fn as_timestamp(value: &str) -> Option<f64> {
-    ::aws_smithy_types::DateTime::from_str(value, ::aws_smithy_types::date_time::Format::DateTime)
-        .ok()
-        .map(|at| at.as_secs_f64())
 }
 
 /// RULE 1: an enable stores the configuration the request asks for, and the describe

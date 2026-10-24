@@ -25,9 +25,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use p256::ecdsa::signature::Verifier;
-use p256::ecdsa::{Signature, VerifyingKey};
-use p256::{EncodedPoint, FieldBytes};
+use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -208,20 +206,21 @@ fn verify_against_jwks(token: &str, jwks: &Value) -> Result<Value, Rejected> {
             "the JWK's {member} must be a 32-byte P-256 coordinate, got {} bytes",
             bytes.len()
         );
-        FieldBytes::clone_from_slice(&bytes)
+        bytes
     };
-    let point = EncodedPoint::from_affine_coordinates(&coordinate("x"), &coordinate("y"), false);
-    let public = VerifyingKey::from_encoded_point(&point)
-        .expect("the JWK's coordinates are a point on P-256");
+    // SEC 1 §2.3.3: the uncompressed point a verifier reads the JWK's two
+    // coordinates into is `0x04 || X || Y`.
+    let mut point = vec![0x04_u8];
+    point.extend_from_slice(&coordinate("x"));
+    point.extend_from_slice(&coordinate("y"));
+    let public = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, point);
     // A signature segment that is not base64url, or not the 64-byte R||S form
     // RFC 7518 §3.4 defines, is no signature of this key: the token is refused
     // the same way one carrying wrong bytes is.
     let signature_bytes = try_decode_base64url(segments[2]).ok_or(Rejected::BadSignature)?;
-    let signature =
-        Signature::from_slice(signature_bytes.as_slice()).map_err(|_| Rejected::BadSignature)?;
     let signing_input = format!("{}.{}", segments[0], segments[1]);
     public
-        .verify(signing_input.as_bytes(), &signature)
+        .verify(signing_input.as_bytes(), &signature_bytes)
         .map_err(|_| Rejected::BadSignature)?;
     let claim_bytes = try_decode_base64url(segments[1])
         .ok_or_else(|| Rejected::Malformed("the claims are not base64url".to_string()))?;

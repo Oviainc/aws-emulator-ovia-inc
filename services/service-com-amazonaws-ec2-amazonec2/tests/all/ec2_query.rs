@@ -164,6 +164,16 @@ pub fn elements(xml: &str, name: &str) -> Vec<String> {
     found
 }
 
+/// An ISO 8601 timestamp element as the instant it names, or `None` when it is not one.
+///
+/// Every suite that asserts a timestamp member reads it the same way, so the parse lives
+/// here with the rest of the response plumbing rather than once per suite.
+pub fn as_timestamp(value: &str) -> Option<f64> {
+    ::aws_smithy_types::DateTime::from_str(value, ::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
+        .map(|at| at.as_secs_f64())
+}
+
 /// The `<Code>` of a failure body — EC2's error envelope is
 /// `<Response><Errors><Error><Code/><Message/></Error></Errors></Response>`.
 pub fn error_code(xml: &str) -> String {

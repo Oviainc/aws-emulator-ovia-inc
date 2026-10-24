@@ -26,13 +26,13 @@ tracing = { workspace = true }
 # publishes. ES256 rather than the RS256 AWS uses because the only maintained
 # pure-Rust RSA implementation carries two unfixable timing advisories
 # (RUSTSEC-2023-0071, GHSA-4grx-2x9w-596c) this repository's dependency audit
-# blocks; what a verifier checks is unchanged (see `src/state.rs`).
-p256 = "0.13"
+# blocks; what a verifier checks is unchanged (see `src/state.rs`). `ring`
+# rather than a pure-Rust P-256 crate because every released version of those
+# resolves to a `crypto-bigint` the audit blocks (RUSTSEC-2026-0387), and this
+# workspace already builds `ring`.
+ring = "0.17"
 # SHA-256 for the RFC 7638 JWK thumbprint used as the key's `kid`.
 sha2 = { workspace = true }
-# The CSPRNG the key is drawn from (rand 0.8 is the rand_core 0.6 generation
-# `p256` 0.13 takes).
-rand = "0.8"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

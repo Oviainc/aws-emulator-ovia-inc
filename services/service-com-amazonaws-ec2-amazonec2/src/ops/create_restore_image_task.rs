@@ -7,7 +7,7 @@
 //! "Starts a task that restores an AMI from an Amazon S3 object that was PREVIOUSLY CREATED
 //! by using CreateStoreImageTask" (`CreateRestoreImageTask`): the object is the input of the
 //! restore, not something this call creates. This emulator stores no Amazon S3 objects —
-//! `CreateStoreImageTask`, which is what would write one, is still a scaffold — so the
+//! `CreateStoreImageTask` records the store task EC2 tracks but writes no object — so the
 //! object a request names can only be one that cannot be read, and the task is refused at
 //! the start call with `InaccessibleStorageLocation` naming it. No AMI is minted: an AMI
 //! restored from an object nothing read would be an image this emulator invented.

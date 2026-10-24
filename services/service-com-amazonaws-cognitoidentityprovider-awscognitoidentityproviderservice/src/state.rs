@@ -10,8 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ::p256::ecdsa::signature::Signer;
-use ::p256::ecdsa::SigningKey;
+use ::ring::signature::KeyPair;
 use ::sha2::Digest;
 
 use crate::ops::types::{
@@ -1685,6 +1684,13 @@ const TOKEN_SIGNING_ALGORITHM: &str = "ES256";
 /// published JWK names it (RFC 7518 §6.2.1.1).
 const TOKEN_SIGNING_CURVE: &str = "P-256";
 
+/// The signing algorithm every pool's key is generated for and signs with:
+/// ECDSA on P-256 with SHA-256, in the FIXED (`R || S`) signature encoding RFC
+/// 7518 §3.4 puts in a JWS segment — not the ASN.1 DER form, which a JOSE
+/// verifier would reject.
+const SIGNING_ALGORITHM: &::ring::signature::EcdsaSigningAlgorithm =
+    &::ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING;
+
 /// One user pool's token-signing key pair: the private key the pool's tokens
 /// are signed with, named by the `kid` its published JWK carries.
 ///
@@ -1696,7 +1702,11 @@ pub struct PoolSigningKey {
     /// this key's RFC 7638 JWK thumbprint, so it is derived from the key itself
     /// rather than minted beside it.
     kid: String,
-    private: SigningKey,
+    /// The pool's private key. Behind an [`::std::sync::Arc`] because the key
+    /// pair itself is not clonable and a pool's key is READ from many places —
+    /// sharing the one key is also what makes every token of one pool verify
+    /// against that pool's single published JWK.
+    private: ::std::sync::Arc<::ring::signature::EcdsaKeyPair>,
 }
 
 /// Renders the key's PUBLIC identity only. Private key material is never
@@ -1719,9 +1729,17 @@ impl PoolSigningKey {
     /// its key when the pool is created and no request path ever generates one.
     #[must_use]
     pub fn generate() -> Self {
-        let private = SigningKey::random(&mut ::rand::thread_rng());
+        let rng = ::ring::rand::SystemRandom::new();
+        let document = ::ring::signature::EcdsaKeyPair::generate_pkcs8(SIGNING_ALGORITHM, &rng)
+            .expect("the operating system CSPRNG yields a P-256 key pair");
+        let private =
+            ::ring::signature::EcdsaKeyPair::from_pkcs8(SIGNING_ALGORITHM, document.as_ref(), &rng)
+                .expect("a freshly generated P-256 key pair parses");
         let kid = jwk_thumbprint(&public_coordinates(&private));
-        Self { kid, private }
+        Self {
+            kid,
+            private: ::std::sync::Arc::new(private),
+        }
     }
 
     /// The `kid` naming this key in the pool's JWKS.
@@ -1754,8 +1772,9 @@ impl PoolSigningKey {
     /// that are not a signature.
     #[must_use]
     pub fn sign(&self, signing_input: &[u8]) -> Option<Vec<u8>> {
-        let signature: ::p256::ecdsa::Signature = self.private.try_sign(signing_input).ok()?;
-        Some(signature.to_bytes().to_vec())
+        let rng = ::ring::rand::SystemRandom::new();
+        let signature = self.private.sign(&rng, signing_input).ok()?;
+        Some(signature.as_ref().to_vec())
     }
 }
 
@@ -1763,12 +1782,25 @@ impl PoolSigningKey {
 /// publishes: the uncompressed SEC1 encoding's `x` and `y`, 32 bytes each
 /// (RFC 7518 §6.2.1.2 — "the octet string representation MUST utilize all
 /// octets", i.e. no leading zero is dropped).
-fn public_coordinates(key: &SigningKey) -> (Vec<u8>, Vec<u8>) {
-    let point = key.verifying_key().to_encoded_point(false);
-    let x = point.x().map(|x| x.to_vec()).unwrap_or_default();
-    let y = point.y().map(|y| y.to_vec()).unwrap_or_default();
+fn public_coordinates(key: &::ring::signature::EcdsaKeyPair) -> (Vec<u8>, Vec<u8>) {
+    // SEC 1 §2.3.3: the uncompressed point is `0x04 || X || Y`, each coordinate
+    // the field element's full width, which on P-256 is
+    // [`P256_COORDINATE_BYTES`].
+    let point = key.public_key().as_ref();
+    let x = point
+        .get(1..=P256_COORDINATE_BYTES)
+        .unwrap_or_default()
+        .to_vec();
+    let y = point
+        .get(1 + P256_COORDINATE_BYTES..=2 * P256_COORDINATE_BYTES)
+        .unwrap_or_default()
+        .to_vec();
     (x, y)
 }
+
+/// The width of one P-256 coordinate: the curve's field elements are 256 bits,
+/// and RFC 7518 §6.2.1.2 publishes each as the full-width octet string.
+const P256_COORDINATE_BYTES: usize = 32;
 
 /// The RFC 7638 JWK thumbprint of the public key whose coordinates are
 /// `(x, y)`: the base64url SHA-256 of the key's canonical JWK — its required

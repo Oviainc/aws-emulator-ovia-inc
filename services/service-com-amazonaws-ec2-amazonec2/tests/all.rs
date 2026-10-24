@@ -199,6 +199,8 @@ mod spot_placement_scores;
 mod stale_security_groups;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/store_image_tasks.rs"]
+mod store_image_tasks;
 #[path = "all/transit_gateway_acceptance.rs"]
 mod transit_gateway_acceptance;
 #[path = "all/transit_gateway_lifecycle.rs"]
