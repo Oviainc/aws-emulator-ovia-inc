@@ -3,7 +3,8 @@
 //! @op CancelJob
 //!
 //! Moves a stored job to `JobState` `Cancelled`, which a later `DescribeJob` or
-//! `ListJobs` observes.
+//! `ListJobs` observes. Cancelling the main job of an export order cancels its job parts
+//! with it.
 //!
 //! ## Shape of an operation
 //!
@@ -144,7 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        let Some(job) = store.jobs.get_mut(&input.job_id) else {
+        let Some(job) = store.jobs.get(&input.job_id) else {
             return Err(CancelJobErrorModeled::InvalidResourceException(
                 InvalidResourceException {
                     message: Some(format!(
@@ -176,7 +177,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        job.job_state = crate::state::JobState::Cancelled;
+        // Cancelling the main job of an export order cancels the order: its job parts
+        // were minted by the same request and exist only as that main job's parts, so
+        // they move with it — each one that is still within its own cancellation window.
+        let order: Vec<String> = ::std::iter::once(input.job_id.clone())
+            .chain(job.job_part_ids.iter().cloned())
+            .collect();
+        for job_id in order {
+            if let Some(job) = store.jobs.get_mut(&job_id) {
+                if job.job_state.is_cancellable() {
+                    job.job_state = crate::state::JobState::Cancelled;
+                }
+            }
+        }
 
         Ok(CancelJobOutput {})
     }
