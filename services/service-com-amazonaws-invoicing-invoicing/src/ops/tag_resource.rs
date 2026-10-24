@@ -187,6 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: crate::state::TAG_QUOTA_EXCEEDED_MESSAGE.to_string(),
+                    // The tag plane keys the text as the model names the member; see
+                    // `crate::ops::types::MessageKey`.
+                    message_key: MessageKey::ModelMemberName,
                 },
             )
             .into());
