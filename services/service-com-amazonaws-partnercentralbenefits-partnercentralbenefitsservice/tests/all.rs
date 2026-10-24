@@ -19,6 +19,8 @@ mod application_status_gates;
 mod benefit_allocations;
 #[path = "all/benefit_application_lifecycle.rs"]
 mod benefit_application_lifecycle;
+#[path = "all/client_token_idempotency.rs"]
+mod client_token_idempotency;
 #[path = "all/entitlement_denial.rs"]
 mod entitlement_denial;
 #[path = "all/get_benefit.rs"]

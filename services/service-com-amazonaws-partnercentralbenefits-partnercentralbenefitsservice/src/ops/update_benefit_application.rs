@@ -15,6 +15,13 @@
 //! one, so an update built on a stale read is refused with the modelled
 //! `ConflictException` rather than silently overwriting a newer write.
 //!
+//! Idempotency: `ClientToken` identifies the REQUEST, so a retry carrying the token of an
+//! update that already applied changes nothing a second time and answers with the
+//! `Id`/`Arn`/`Revision` that update reported (see
+//! [`crate::state::BenefitApplication::applied_write`]). It is checked BEFORE the status
+//! and the revision, because the first call's own write is what moved the revision the
+//! retry still carries.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -103,6 +110,15 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The input members an update may apply, as the model spells them on the wire. Each is
+/// recorded on the applied-write record of the application it changed, so a stored write
+/// says which members that request wrote.
+const MEMBER_NAME: &str = "Name";
+const MEMBER_DESCRIPTION: &str = "Description";
+const MEMBER_DETAILS: &str = "BenefitApplicationDetails";
+const MEMBER_PARTNER_CONTACTS: &str = "PartnerContacts";
+const MEMBER_FILE_DETAILS: &str = "FileDetails";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -226,6 +242,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // A retry of an update that already applied applies nothing a second time and
+        // answers with what that call reported: the `ClientToken` is the identity of the
+        // REQUEST, so a request repeating one is the same request rather than a new
+        // write. It is checked BEFORE the status and the revision, because the first
+        // call's own write moved the revision the retry still carries (and the
+        // application may since have been submitted, which the status gate below refuses
+        // an update of) — so without this a lost response turns into a refusal of a write
+        // that already succeeded.
+        if let Some(applied) = application.applied_write(Self::NAME, &input.client_token) {
+            return Ok(UpdateBenefitApplicationOutput {
+                id: Some(application.id.clone()),
+                arn: Some(application.arn.clone()),
+                revision: Some(applied.revision.to_string()),
+            });
+        }
+
         // An update is the partner editing its own DRAFT: once the application has been
         // submitted the record is the one AWS is reviewing, and a terminal application is
         // finished with, so an update of anything but a `PENDING_SUBMISSION` application
@@ -261,31 +293,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Only the members the request carried are applied: an absent one leaves the
         // stored value alone, which is what lets a caller update one field without
-        // having to resend the rest.
+        // having to resend the rest. Each one applied is named on the write record below.
+        let mut applied_members: Vec<String> = Vec::new();
         if let Some(name) = input.name {
             application.name = Some(name);
+            applied_members.push(MEMBER_NAME.to_string());
         }
         if let Some(description) = input.description {
             application.description = Some(description);
+            applied_members.push(MEMBER_DESCRIPTION.to_string());
         }
         if let Some(details) = input.benefit_application_details {
             application.benefit_application_details = Some(details);
+            applied_members.push(MEMBER_DETAILS.to_string());
         }
         if let Some(contacts) = input.partner_contacts {
             application.partner_contacts = contacts;
+            applied_members.push(MEMBER_PARTNER_CONTACTS.to_string());
         }
         if let Some(files) = input.file_details {
             application.file_details = files
                 .iter()
                 .map(|file| crate::state::file_detail(file, &principal, now))
                 .collect();
+            applied_members.push(MEMBER_FILE_DETAILS.to_string());
         }
         application.revise(now);
+
+        // What this call reported, kept so a retry carrying the same `ClientToken`
+        // answers it again. The token is at most
+        // [`crate::state::MAX_CLIENT_TOKEN_LEN`] bytes — the modelled `@length(min: 1,
+        // max: 64)` the centralized walk refuses a longer one against — so the record
+        // the store keeps for it stays within the bound its own accounting cites.
+        let revision = application.revision;
+        let applied_at_millis = application.updated_at_millis;
+        application.record_write(crate::state::AppliedWrite {
+            operation: Self::NAME,
+            client_token: input.client_token,
+            // This operation carries no reason member, so the record states none.
+            reason: None,
+            fields: applied_members,
+            applied_at_millis,
+            revision,
+        });
 
         Ok(UpdateBenefitApplicationOutput {
             id: Some(application.id.clone()),
             arn: Some(application.arn.clone()),
-            revision: Some(application.revision_text()),
+            revision: Some(revision.to_string()),
         })
     }
 }
