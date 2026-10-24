@@ -54,7 +54,11 @@ async fn add_sources(emulator: &Emulator, arn: &str, body: Value) -> (u16, Optio
         .await
 }
 
-async fn add_outputs(emulator: &Emulator, arn: &str, body: Value) -> (u16, Option<String>, Value) {
+pub(crate) async fn add_outputs(
+    emulator: &Emulator,
+    arn: &str,
+    body: Value,
+) -> (u16, Option<String>, Value) {
     emulator
         .send("POST", &format!("/v1/bridges/{arn}/outputs"), Some(body))
         .await
@@ -85,7 +89,7 @@ async fn list_bridges(emulator: &Emulator, query: &str) -> (u16, Option<String>,
 }
 
 /// One network source entry, as a request configures it and as a bridge reports it.
-fn network_source(name: &str, port: i64, protocol: &str) -> Value {
+pub(crate) fn network_source(name: &str, port: i64, protocol: &str) -> Value {
     json!({ "networkSource": {
         "multicastIp": "224.0.1.1",
         "name": name,
@@ -96,7 +100,7 @@ fn network_source(name: &str, port: i64, protocol: &str) -> Value {
 }
 
 /// One network output entry, as a request configures it and as a bridge reports it.
-fn network_output(name: &str, port: i64, protocol: &str, ttl: i64) -> Value {
+pub(crate) fn network_output(name: &str, port: i64, protocol: &str, ttl: i64) -> Value {
     json!({ "networkOutput": {
         "ipAddress": "10.0.1.1",
         "name": name,
@@ -107,10 +111,12 @@ fn network_output(name: &str, port: i64, protocol: &str, ttl: i64) -> Value {
     }})
 }
 
-/// Create one ingress bridge carrying `sources` and `outputs`, and answer its ARN.
+/// Create one egress bridge carrying `sources` and `outputs`, and answer its ARN.
 ///
-/// The create is the subject of `bridge_lifecycle`; here it is only the fixture every
-/// member operation below addresses.
+/// A cloud-to-ground (egress) bridge is the kind that delivers to the premises network, so
+/// it is the kind a request configures outputs on; the create itself is the subject of
+/// `bridge_lifecycle`, and here it is only the fixture every member operation below
+/// addresses.
 async fn bridge_with(
     emulator: &Emulator,
     name: &str,
@@ -121,7 +127,7 @@ async fn bridge_with(
     let mut body = json!({
         "name": name,
         "placementArn": placement_arn,
-        "ingressGatewayBridge": { "maxBitrate": 20_000_000, "maxOutputs": 8 },
+        "egressGatewayBridge": { "maxBitrate": 20_000_000 },
         "sources": sources,
     });
     if !outputs.is_empty() {
@@ -690,14 +696,14 @@ async fn list_bridges_pages_every_stored_bridge_and_filters_by_placement() {
     }
     let mut on_b = Vec::new();
     for index in 0..2 {
-        // An egress bridge: `BridgeType` is read off the bridge-type member the create
+        // An ingress bridge: `BridgeType` is read off the bridge-type member the create
         // named, so the two placements also differ in the type they report.
         let (status, code, created) = create_bridge(
             &emulator,
             json!({
                 "name": format!("bridge-b-{index}"),
                 "placementArn": placement_b,
-                "egressGatewayBridge": { "maxBitrate": 80_000_000 },
+                "ingressGatewayBridge": { "maxBitrate": 80_000_000, "maxOutputs": 2 },
                 "sources": [network_source("src", 5100 + index, "rtp")],
             }),
         )
@@ -705,7 +711,8 @@ async fn list_bridges_pages_every_stored_bridge_and_filters_by_placement() {
         assert_eq!(
             (status, code.as_deref()),
             (201, None),
-            "fixture egress bridge {index}: create expected 201, got {status} {code:?}: {created}"
+            "fixture ingress bridge {index}: create expected 201, got {status} {code:?}: \
+             {created}"
         );
         on_b.push(
             created["bridge"]["bridgeArn"]

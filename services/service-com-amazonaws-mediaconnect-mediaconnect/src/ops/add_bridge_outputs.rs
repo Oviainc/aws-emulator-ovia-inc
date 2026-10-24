@@ -213,15 +213,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The bound is on the STORED bridge, so it counts the outputs already stored plus
-        // the ones this request would add (see `crate::state::MAX_BRIDGE_OUTPUTS`).
-        let held = bridge.outputs.len();
-        if held + input.outputs.len() > crate::state::MAX_BRIDGE_OUTPUTS {
+        // the ones this request would add — and the bound is the bridge's OWN: an output a
+        // request configures is a network output, which only a cloud-to-ground bridge
+        // delivers, and no bridge holds more outputs than its type declares (see
+        // `crate::state::request_bridge_output_rejection`).
+        if let Some(detail) = crate::state::request_bridge_output_rejection(
+            bridge
+                .ingress_gateway_bridge
+                .as_ref()
+                .map(|ingress| ingress.max_outputs),
+            bridge.outputs.len(),
+            input.outputs.len(),
+        ) {
             return Err(bad_request(format!(
-                "A bridge can hold at most {} outputs; bridge {} already has {held} and \
-                 this request adds {}.",
-                crate::state::MAX_BRIDGE_OUTPUTS,
-                input.bridge_arn,
-                input.outputs.len()
+                "{detail} The request addresses bridge {}.",
+                input.bridge_arn
             )));
         }
 

@@ -508,6 +508,85 @@ pub const MAX_BRIDGE_SOURCES: usize = MAX_FLOW_COLLECTION_ENTRIES;
 /// [`MAX_BRIDGE_SOURCES`].
 pub const MAX_BRIDGE_OUTPUTS: usize = MAX_FLOW_COLLECTION_ENTRIES;
 
+/// How many outputs a bridge may hold, read off the bridge's own type.
+///
+/// `ingress_max_outputs` is `Some` for a ground-to-cloud bridge, carrying the value of its
+/// REQUIRED `IngressGatewayBridge$MaxOutputs` — "the maximum number of outputs on the
+/// ingress bridge" — and `None` for a cloud-to-ground bridge, whose `EgressGatewayBridge`
+/// declares no output count at all, so the only bound on it is the one this crate applies
+/// to every bridge ([`MAX_BRIDGE_OUTPUTS`]).
+///
+/// A declared maximum is never read as room for more than the store itself holds, and a
+/// non-positive declaration is room for nothing: the member is an `Integer`, so the model
+/// alone does not keep a negative one out.
+///
+/// What a ground-to-cloud bridge declares bounds the outputs it can ever hold — the flow
+/// outputs the service materialises for it — and not the ones a request configures, of
+/// which it takes none at all (see [`request_bridge_output_rejection`], which refuses
+/// those by the bridge's direction before it counts anything).
+pub fn bridge_output_capacity(ingress_max_outputs: Option<i32>) -> usize {
+    match ingress_max_outputs {
+        Some(declared) => usize::try_from(declared)
+            .unwrap_or(0)
+            .min(MAX_BRIDGE_OUTPUTS),
+        None => MAX_BRIDGE_OUTPUTS,
+    }
+}
+
+/// Why a bridge cannot take `adding` more outputs a REQUEST configures on top of the
+/// `held` it already holds, or `None` when it can. `ingress_max_outputs` is the bridge's
+/// own type, as [`bridge_output_capacity`] reads it.
+///
+/// Two rules, both about the direction a bridge carries content in, decided in that
+/// order — which bridge takes a request-configured output at all, and then how many it
+/// may hold:
+///
+/// * an output a request configures is a `NetworkOutput` — the only member
+///   `AddBridgeOutputRequest` has, "delivered to your premises" — which is what a
+///   cloud-to-ground bridge delivers ("the content comes from an existing MediaConnect
+///   flow and is delivered to your premises"). A ground-to-cloud bridge delivers the
+///   other way ("the content originates at your premises and is delivered to the cloud"),
+///   so its outputs are the `BridgeFlowOutput`s the service itself materialises when a
+///   cloud flow takes the bridge as its source (`SetGatewayBridgeSourceRequest`), and
+///   none a request carries; and
+/// * a bridge that does take them holds no more outputs than its own type declares
+///   ([`bridge_output_capacity`]), which for a cloud-to-ground bridge is the bound this
+///   crate applies to every bridge, its `EgressGatewayBridge` declaring no output count.
+///
+/// A request that configures no output at all admits nothing, so it is nothing this
+/// decides: the operations refuse an empty required list in their own words.
+///
+/// Every operation that puts request-configured outputs on a bridge (CreateBridge's
+/// `Outputs`, AddBridgeOutputs) refuses through this one function, with
+/// `BadRequestException` — the error the model describes as the one for "a semantic
+/// error" in the request.
+pub fn request_bridge_output_rejection(
+    ingress_max_outputs: Option<i32>,
+    held: usize,
+    adding: usize,
+) -> Option<String> {
+    if adding == 0 {
+        return None;
+    }
+    if ingress_max_outputs.is_some() {
+        return Some(
+            "An output a request configures is a network output, which is delivered to the \
+             premises network — what a cloud-to-ground bridge delivers. This bridge is a \
+             ground-to-cloud bridge: its outputs are the flow outputs created for it when a \
+             flow takes the bridge as its source, so it accepts no output in a request."
+                .to_string(),
+        );
+    }
+    let capacity = bridge_output_capacity(ingress_max_outputs);
+    if held + adding > capacity {
+        return Some(format!(
+            "This bridge holds at most {capacity} outputs; it already holds {held} and this \
+             request adds {adding}."
+        ));
+    }
+    None
+}
+
 /// The most tags one resource carries, checked against the MERGED set a tag write would
 /// leave on the resource, so repeated tag writes cannot grow a resource's tag map past
 /// what a single create could set.

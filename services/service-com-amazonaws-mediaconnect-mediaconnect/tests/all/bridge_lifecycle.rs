@@ -170,12 +170,42 @@ fn create_cases() -> Vec<CreateCase> {
             source_failover_config: Value::Null,
         },
         CreateCase {
-            case: "ingress bridge, one network source, one network output",
+            case: "ingress bridge, one network source: a ground-to-cloud bridge carries no \
+                   output a request configures",
             name: "bridge-ingress-1",
             body: json!({
                 "name": "bridge-ingress-1",
                 "placementArn": placement,
                 "ingressGatewayBridge": { "maxBitrate": 20_000_000, "maxOutputs": 4 },
+                "sources": [{ "networkSource": {
+                    "multicastIp": "224.0.0.1",
+                    "name": "net-src",
+                    "networkName": "net-1",
+                    "port": 5000,
+                    "protocol": "rtp-fec",
+                }}],
+            }),
+            bridge_type: (
+                "ingressGatewayBridge",
+                json!({ "maxBitrate": 20_000_000, "maxOutputs": 4 }),
+            ),
+            sources: json!([{ "networkSource": {
+                "multicastIp": "224.0.0.1",
+                "name": "net-src",
+                "networkName": "net-1",
+                "port": 5000,
+                "protocol": "rtp-fec",
+            }}]),
+            outputs: Value::Null,
+            source_failover_config: Value::Null,
+        },
+        CreateCase {
+            case: "egress bridge, one network source, one network output",
+            name: "bridge-egress-1",
+            body: json!({
+                "name": "bridge-egress-1",
+                "placementArn": placement,
+                "egressGatewayBridge": { "maxBitrate": 20_000_000 },
                 "sources": [{ "networkSource": {
                     "multicastIp": "224.0.0.1",
                     "name": "net-src",
@@ -192,10 +222,7 @@ fn create_cases() -> Vec<CreateCase> {
                     "ttl": 64,
                 }}],
             }),
-            bridge_type: (
-                "ingressGatewayBridge",
-                json!({ "maxBitrate": 20_000_000, "maxOutputs": 4 }),
-            ),
+            bridge_type: ("egressGatewayBridge", json!({ "maxBitrate": 20_000_000 })),
             sources: json!([{ "networkSource": {
                 "multicastIp": "224.0.0.1",
                 "name": "net-src",
@@ -325,20 +352,17 @@ fn create_cases() -> Vec<CreateCase> {
             source_failover_config: json!({ "state": "DISABLED", "recoveryWindow": 3_000 }),
         },
         CreateCase {
-            case: "ingress bridge at the per-request bound: the most sources and the most \
+            case: "egress bridge at the per-request bound: the most sources and the most \
                    outputs one create may carry",
             name: "bridge-full",
             body: json!({
                 "name": "bridge-full",
                 "placementArn": placement,
-                "ingressGatewayBridge": { "maxBitrate": 1, "maxOutputs": 0 },
+                "egressGatewayBridge": { "maxBitrate": 1 },
                 "sources": full_sources,
                 "outputs": full_outputs,
             }),
-            bridge_type: (
-                "ingressGatewayBridge",
-                json!({ "maxBitrate": 1, "maxOutputs": 0 }),
-            ),
+            bridge_type: ("egressGatewayBridge", json!({ "maxBitrate": 1 })),
             sources: json!(full_projected_sources),
             outputs: json!(full_projected_outputs),
             source_failover_config: Value::Null,
@@ -470,7 +494,7 @@ async fn every_modelled_protocol_is_stored_on_a_bridge_source_and_output() {
             json!({
                 "name": format!("bridge-{}", protocol.replace('-', "")),
                 "placementArn": placement,
-                "ingressGatewayBridge": { "maxBitrate": 10_000, "maxOutputs": 2 },
+                "egressGatewayBridge": { "maxBitrate": 10_000 },
                 "sources": [{ "networkSource": {
                     "multicastIp": "224.0.0.2",
                     "name": "src",
@@ -512,7 +536,7 @@ async fn every_modelled_protocol_is_stored_on_a_bridge_source_and_output() {
         json!({
             "name": "bridge-bad-protocol",
             "placementArn": placement,
-            "ingressGatewayBridge": { "maxBitrate": 10_000, "maxOutputs": 2 },
+            "egressGatewayBridge": { "maxBitrate": 10_000 },
             "sources": [{ "networkSource": {
                 "multicastIp": "224.0.0.2",
                 "name": "src",
@@ -588,8 +612,16 @@ fn refusal_cases() -> Vec<(&'static str, Value)> {
             "one output past the per-request bound",
             json!({
                 "name": "b", "placementArn": placement,
-                "ingressGatewayBridge": ingress, "sources": [source],
+                "egressGatewayBridge": egress, "sources": [source],
                 "outputs": too_many_outputs,
+            }),
+        ),
+        (
+            "a network output on a ground-to-cloud bridge, which delivers into the cloud",
+            json!({
+                "name": "b", "placementArn": placement,
+                "ingressGatewayBridge": ingress, "sources": [source],
+                "outputs": [output],
             }),
         ),
         (
@@ -615,7 +647,7 @@ fn refusal_cases() -> Vec<(&'static str, Value)> {
             "two outputs with one name: an output name must be unique in a bridge",
             json!({
                 "name": "b", "placementArn": placement,
-                "ingressGatewayBridge": ingress, "sources": [source],
+                "egressGatewayBridge": egress, "sources": [source],
                 "outputs": [output, output],
             }),
         ),
@@ -641,7 +673,7 @@ fn refusal_cases() -> Vec<(&'static str, Value)> {
             "an output entry naming no network output",
             json!({
                 "name": "b", "placementArn": placement,
-                "ingressGatewayBridge": ingress, "sources": [source], "outputs": [{}],
+                "egressGatewayBridge": egress, "sources": [source], "outputs": [{}],
             }),
         ),
         (

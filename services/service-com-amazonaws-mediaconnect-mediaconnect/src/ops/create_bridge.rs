@@ -264,14 +264,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The same two rules for the outputs the request optionally carries
         // (`AddBridgeNetworkOutputRequest$Name` "must be unique among outputs in this
-        // bridge").
+        // bridge"), on top of the bound the addressed bridge's own type puts on how many
+        // outputs it holds, and the direction that type carries content in: a new bridge
+        // holds nothing yet, so this request's outputs are all of them (see
+        // `crate::state::request_bridge_output_rejection`).
         let requested_outputs: &[AddBridgeOutputRequest] = input.outputs.as_deref().unwrap_or(&[]);
-        if requested_outputs.len() > crate::state::MAX_BRIDGE_OUTPUTS {
-            return Err(bad_request(format!(
-                "A create bridge request may include at most {} outputs; this one has {}.",
-                crate::state::MAX_BRIDGE_OUTPUTS,
-                requested_outputs.len()
-            )));
+        if let Some(detail) = crate::state::request_bridge_output_rejection(
+            input
+                .ingress_gateway_bridge
+                .as_ref()
+                .map(|ingress| ingress.max_outputs),
+            0,
+            requested_outputs.len(),
+        ) {
+            return Err(bad_request(detail));
         }
         let mut outputs: Vec<BridgeOutput> = Vec::with_capacity(requested_outputs.len());
         let mut output_names: ::std::collections::BTreeSet<String> =

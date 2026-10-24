@@ -15,6 +15,8 @@
 mod bridge_lifecycle;
 #[path = "all/bridge_members_and_deletion.rs"]
 mod bridge_members_and_deletion;
+#[path = "all/bridge_output_admission.rs"]
+mod bridge_output_admission;
 #[path = "all/error_envelopes.rs"]
 mod error_envelopes;
 #[path = "all/flow_entitlements.rs"]
