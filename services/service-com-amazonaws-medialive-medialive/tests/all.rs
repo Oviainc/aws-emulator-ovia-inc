@@ -38,6 +38,9 @@ mod channel_placement_groups;
 #[path = "all/channel_schedule.rs"]
 mod channel_schedule;
 
+#[path = "all/channel_thumbnails.rs"]
+mod channel_thumbnails;
+
 #[path = "all/cloud_watch_alarm_template_datapoints.rs"]
 mod cloud_watch_alarm_template_datapoints;
 
