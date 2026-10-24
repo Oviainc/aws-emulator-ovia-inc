@@ -367,6 +367,9 @@ pub const OPERATION_TYPE_DETACH_DISK: &str = "DetachDisk";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE: &str = "CreateRelationalDatabase";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_UPDATE_RELATIONAL_DATABASE_PARAMETERS: &str =
+    "UpdateRelationalDatabaseParameters";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_LOAD_BALANCER: &str = "CreateLoadBalancer";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK_SNAPSHOT: &str = "CreateDiskSnapshot";
@@ -2928,6 +2931,238 @@ pub fn relational_database_parameter_names(specs: &[RelationalDatabaseParameterS
         .join(", ")
 }
 
+/// The parameter `parameter_name` names in the set the engine `engine` offers,
+/// or `None` when that engine offers no such parameter — a parameter of ANOTHER
+/// engine included, since a database has only its own engine's set.
+pub fn relational_database_parameter_spec(
+    engine: &str,
+    parameter_name: &str,
+) -> Option<RelationalDatabaseParameterSpec> {
+    relational_database_parameter_specs(engine)
+        .iter()
+        .find(|spec| spec.parameter_name == parameter_name)
+        .copied()
+}
+
+/// The most parameters one `UpdateRelationalDatabaseParameters` request may
+/// carry.
+///
+/// A Lightsail managed database is an RDS DB instance and this call is RDS's
+/// `ModifyDBParameterGroup`, which documents "A maximum of 20 parameters can be
+/// modified in a single request" — so this is AWS's own bound on the
+/// caller-sized list, not an emulator guard.
+pub const MAX_RELATIONAL_DATABASE_PARAMETER_UPDATES: usize = 20;
+
+/// The `parameterApplyStatus` of a database holding a parameter value the
+/// RUNNING engine has not loaded yet, beside
+/// [`PARAMETER_APPLY_STATUS_IN_SYNC`].
+///
+/// A Lightsail managed database is an RDS DB instance and the member carries
+/// RDS's own parameter group status. `RebootRelationalDatabase` is what clears
+/// it: "Parameters marked with a pending-reboot apply type are applied only
+/// after the database is rebooted using the reboot relational database
+/// operation" (the modelled `UpdateRelationalDatabaseParameters`
+/// documentation).
+pub const PARAMETER_APPLY_STATUS_PENDING_REBOOT: &str = "pending-reboot";
+
+/// A parameter value a database's parameter group carries because an
+/// `UpdateRelationalDatabaseParameters` call set it.
+///
+/// Only a parameter of the database's own engine set can be set, so the map of
+/// these a database holds is bounded by that set however many updates a caller
+/// makes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredParameterOverride {
+    /// The value the update set, which every later read of the parameter
+    /// reports: the modification reaches the parameter group at once.
+    pub value: String,
+    /// The apply method the update was made with, which the parameter reports
+    /// as its `applyMethod` from then on.
+    pub apply_method: &'static str,
+    /// Whether the RUNNING engine is still waiting for a reboot to load this
+    /// value — true for a value applied `pending-reboot`. It is what puts the
+    /// database in [`PARAMETER_APPLY_STATUS_PENDING_REBOOT`], and
+    /// `RebootRelationalDatabase` (still a scaffold stub, with its own issue) is
+    /// what clears it.
+    pub pending_reboot: bool,
+}
+
+/// One resolved parameter modification: which parameter of the engine's set an
+/// `UpdateRelationalDatabaseParameters` entry named, the value it sets and the
+/// method it is applied with.
+///
+/// An update carries only these three: every other member of the modelled
+/// `RelationalDatabaseParameter` DESCRIBES the parameter (its type, its allowed
+/// values, its description, whether it is modifiable) and is the engine's to
+/// report, so a request that spells one differently cannot change what the
+/// service reports about the parameter.
+#[derive(Debug, Clone)]
+pub struct RelationalDatabaseParameterUpdate {
+    /// The parameter the update names.
+    pub spec: RelationalDatabaseParameterSpec,
+    /// The value to set, already checked against that parameter.
+    pub value: String,
+    /// [`PARAMETER_APPLY_METHOD_IMMEDIATE`] or
+    /// [`PARAMETER_APPLY_METHOD_PENDING_REBOOT`].
+    pub apply_method: &'static str,
+}
+
+/// The modification `requested` makes to a parameter of `engine`, or a refusal
+/// naming the member that is wrong and the constraint it broke.
+///
+/// `member` is how the request spells the entry under check (`parameters[0]`),
+/// so a refusal points the caller at the entry it must fix.
+pub fn relational_database_parameter_update(
+    engine: &str,
+    member: &str,
+    requested: &RelationalDatabaseParameter,
+) -> Result<RelationalDatabaseParameterUpdate, String> {
+    let parameter_name = requested
+        .parameter_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            format!("{member}.parameterName is required: it names the parameter to update")
+        })?;
+    let spec = relational_database_parameter_spec(engine, parameter_name).ok_or_else(|| {
+        format!(
+            "{member}.parameterName '{parameter_name}' is not a parameter the {engine} engine \
+             offers; use GetRelationalDatabaseParameters to list this database's parameters \
+             ([{}])",
+            relational_database_parameter_names(relational_database_parameter_specs(engine))
+        )
+    })?;
+    if !spec.is_modifiable {
+        return Err(format!(
+            "{member}.parameterName '{parameter_name}' is not modifiable: the {engine} engine \
+             reports isModifiable false for it"
+        ));
+    }
+
+    let value = requested.parameter_value.as_deref().ok_or_else(|| {
+        format!(
+            "{member}.parameterValue is required: it carries the value to set on parameter \
+             '{parameter_name}'"
+        )
+    })?;
+    validate_relational_database_parameter_value(
+        &spec,
+        &format!("{member}.parameterValue"),
+        value,
+    )?;
+
+    // "Indicates when parameter updates are applied. Can be `immediate` or
+    // `pending-reboot`": an update that names neither is applied the way the
+    // parameter's own apply type admits, and one that names `immediate` for a
+    // parameter the engine reads only at startup is refused rather than
+    // silently held back.
+    let apply_method = match requested.apply_method.as_deref() {
+        None => spec.apply_method(),
+        Some(PARAMETER_APPLY_METHOD_PENDING_REBOOT) => PARAMETER_APPLY_METHOD_PENDING_REBOOT,
+        Some(PARAMETER_APPLY_METHOD_IMMEDIATE) => {
+            if spec.apply_type != PARAMETER_APPLY_TYPE_DYNAMIC {
+                return Err(format!(
+                    "{member}.applyMethod '{PARAMETER_APPLY_METHOD_IMMEDIATE}' cannot apply \
+                     parameter '{parameter_name}', whose applyType is '{}': a change to it takes \
+                     effect only when the database is rebooted, so apply it with \
+                     '{PARAMETER_APPLY_METHOD_PENDING_REBOOT}'",
+                    spec.apply_type
+                ));
+            }
+            PARAMETER_APPLY_METHOD_IMMEDIATE
+        }
+        Some(other) => {
+            return Err(format!(
+                "{member}.applyMethod '{other}' is not an apply method: it must be \
+                 '{PARAMETER_APPLY_METHOD_IMMEDIATE}' or \
+                 '{PARAMETER_APPLY_METHOD_PENDING_REBOOT}'"
+            ))
+        }
+    };
+
+    Ok(RelationalDatabaseParameterUpdate {
+        spec,
+        value: value.to_string(),
+        apply_method,
+    })
+}
+
+/// `value` checked against `spec`'s own data type and published value set, or a
+/// refusal naming the constraint it broke.
+///
+/// `member` is how the request spells the member carrying the value, so the
+/// refusal points at it.
+pub fn validate_relational_database_parameter_value(
+    spec: &RelationalDatabaseParameterSpec,
+    member: &str,
+    value: &str,
+) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!(
+            "{member} is empty: parameter '{}' takes a {} value",
+            spec.parameter_name, spec.data_type
+        ));
+    }
+    // A parameter's `dataType` is "the valid data type for the parameter", so a
+    // value that is not of that type is refused before its range is looked at.
+    let typed = match spec.data_type {
+        PARAMETER_DATA_TYPE_INTEGER | PARAMETER_DATA_TYPE_BOOLEAN => {
+            let number: i64 = value.parse().map_err(|_| {
+                format!(
+                    "{member} '{value}' is not a whole number: parameter '{}' has dataType {}",
+                    spec.parameter_name, spec.data_type
+                )
+            })?;
+            number as f64
+        }
+        PARAMETER_DATA_TYPE_FLOAT => value.parse::<f64>().map_err(|_| {
+            format!(
+                "{member} '{value}' is not a number: parameter '{}' has dataType {}",
+                spec.parameter_name, spec.data_type
+            )
+        })?,
+        // Free text: there is no type to fail, only the value set below.
+        _ => f64::NAN,
+    };
+
+    // `allowedValues` is "the valid range of values for the parameter", absent
+    // where the engine publishes none — and then any value of the data type is
+    // accepted.
+    let Some(allowed_values) = spec.allowed_values else {
+        return Ok(());
+    };
+    let admitted = allowed_values.split(',').any(|allowed| {
+        let allowed = allowed.trim();
+        // An entry is either a value the parameter takes verbatim or a
+        // `low-high` range a numeric value may fall inside.
+        allowed == value
+            || parse_allowed_range(allowed).is_some_and(|(low, high)| (low..=high).contains(&typed))
+    });
+    if admitted {
+        return Ok(());
+    }
+    Err(format!(
+        "{member} '{value}' is outside the allowedValues of parameter '{}' ({allowed_values})",
+        spec.parameter_name
+    ))
+}
+
+/// The `low-high` range `allowed` names, or `None` when it names a single value.
+///
+/// A lower bound may itself be negative (`-1-2147483647`), so the separator is
+/// the first `-` that is not the sign at the front.
+fn parse_allowed_range(allowed: &str) -> Option<(f64, f64)> {
+    let separator = allowed
+        .char_indices()
+        .skip(1)
+        .find(|(_, character)| *character == '-')
+        .map(|(index, _)| index)?;
+    let low = allowed[..separator].parse::<f64>().ok()?;
+    let high = allowed[separator + 1..].parse::<f64>().ok()?;
+    Some((low, high))
+}
+
 // ---------------------------------------------------------------------------
 // Locations
 // ---------------------------------------------------------------------------
@@ -4844,9 +5079,82 @@ pub struct StoredRelationalDatabase {
     pub state: &'static str,
     /// The state the clock owes this database, while one is outstanding.
     pub due: Option<DueNamedState>,
+    /// The parameters an `UpdateRelationalDatabaseParameters` call has set on
+    /// this database, by parameter name — the per-database half of what
+    /// `GetRelationalDatabaseParameters` reports, the other half being the
+    /// engine's own published set ([`relational_database_parameter_specs`]). A
+    /// parameter nothing has set is absent, and reports what the engine and this
+    /// database's own hardware give it.
+    pub parameter_overrides: BTreeMap<String, StoredParameterOverride>,
 }
 
 impl StoredRelationalDatabase {
+    /// `parameters` as THIS database reports them: an entry an
+    /// `UpdateRelationalDatabaseParameters` call has set on this database
+    /// carries the value it set and the apply method it was set with, and every
+    /// other entry is the engine's published one, unchanged.
+    ///
+    /// The value an update set is reported straight away, whichever apply method
+    /// it used: the modification reaches the database's parameter group when the
+    /// call is answered, and whether the RUNNING engine has loaded it is what
+    /// [`Self::parameter_apply_status`] reports instead.
+    pub fn applied_parameters(
+        &self,
+        parameters: Vec<RelationalDatabaseParameter>,
+    ) -> Vec<RelationalDatabaseParameter> {
+        parameters
+            .into_iter()
+            .map(|parameter| {
+                let Some(set) = parameter
+                    .parameter_name
+                    .as_deref()
+                    .and_then(|name| self.parameter_overrides.get(name))
+                else {
+                    return parameter;
+                };
+                RelationalDatabaseParameter {
+                    parameter_value: Some(set.value.clone()),
+                    apply_method: Some(set.apply_method.to_string()),
+                    ..parameter
+                }
+            })
+            .collect()
+    }
+
+    /// Apply `update` to this database's parameter group.
+    ///
+    /// The value is carried from here on, and a value applied
+    /// `pending-reboot` also leaves the RUNNING engine behind — which is what
+    /// [`Self::parameter_apply_status`] reports.
+    pub fn set_parameter(&mut self, update: RelationalDatabaseParameterUpdate) {
+        let pending_reboot = update.apply_method == PARAMETER_APPLY_METHOD_PENDING_REBOOT;
+        self.parameter_overrides.insert(
+            update.spec.parameter_name.to_string(),
+            StoredParameterOverride {
+                value: update.value,
+                apply_method: update.apply_method,
+                pending_reboot,
+            },
+        );
+    }
+
+    /// `RelationalDatabase$parameterApplyStatus`: DERIVED from the parameter
+    /// group rather than tracked beside it, where the two could disagree — a
+    /// database is [`PARAMETER_APPLY_STATUS_PENDING_REBOOT`] exactly while it
+    /// holds a parameter value the running engine has not loaded, and
+    /// [`PARAMETER_APPLY_STATUS_IN_SYNC`] otherwise.
+    pub fn parameter_apply_status(&self) -> &'static str {
+        if self
+            .parameter_overrides
+            .values()
+            .any(|set| set.pending_reboot)
+        {
+            PARAMETER_APPLY_STATUS_PENDING_REBOOT
+        } else {
+            PARAMETER_APPLY_STATUS_IN_SYNC
+        }
+    }
+
     /// This record as the modelled `RelationalDatabase`.
     pub fn view(&self) -> crate::ops::types::RelationalDatabase {
         crate::ops::types::RelationalDatabase {
@@ -4879,7 +5187,7 @@ impl StoredRelationalDatabase {
             // the database's own backup window — so there is no such point.
             latest_restorable_time: None,
             master_username: Some(self.master_username.clone()),
-            parameter_apply_status: Some(PARAMETER_APPLY_STATUS_IN_SYNC.to_string()),
+            parameter_apply_status: Some(self.parameter_apply_status().to_string()),
             preferred_backup_window: Some(self.preferred_backup_window.clone()),
             preferred_maintenance_window: Some(self.preferred_maintenance_window.clone()),
             publicly_accessible: Some(self.publicly_accessible),
@@ -6582,6 +6890,18 @@ impl ComAmazonawsLightsailLightsail20161128State {
     pub fn insert_relational_database(&mut self, database: StoredRelationalDatabase) {
         self.relational_databases
             .insert(database.name.clone(), database);
+    }
+
+    /// The managed relational database `name` names, for an operation the spec
+    /// says mutates it — setting a runtime parameter of its parameter group.
+    ///
+    /// `name` is this record's store key, so it may not be reassigned through
+    /// this handle; no operation in this slice renames a database.
+    pub fn relational_database_mut(
+        &mut self,
+        name: &str,
+    ) -> Option<&mut StoredRelationalDatabase> {
+        self.relational_databases.get_mut(name)
     }
 
     /// The alarm `name` names, for a reporting operation.

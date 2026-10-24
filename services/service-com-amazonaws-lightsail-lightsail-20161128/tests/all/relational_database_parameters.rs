@@ -347,7 +347,16 @@ fn want_apply_method(apply_type: &str) -> &'static str {
 }
 
 /// Create a database named `db_name` on `blueprint_id` and `bundle_id`.
-async fn create_database(emulator: &Emulator, db_name: &str, blueprint_id: &str, bundle_id: &str) {
+///
+/// `pub(crate)` so the sibling suite that drives
+/// `UpdateRelationalDatabaseParameters` stands a database up the same way rather
+/// than spelling a second create body.
+pub(crate) async fn create_database(
+    emulator: &Emulator,
+    db_name: &str,
+    blueprint_id: &str,
+    bundle_id: &str,
+) {
     emulator
         .ok(
             "CreateRelationalDatabase",
@@ -378,7 +387,10 @@ async fn page(emulator: &Emulator, request: Value) -> (Vec<Value>, Option<String
 
 /// Every parameter the walk from `request` reports, in page order, with the size
 /// of each page it took.
-async fn walk(emulator: &Emulator, request: Value) -> (Vec<Value>, Vec<usize>) {
+///
+/// `pub(crate)` so the sibling update suite reads a database's parameters back
+/// through the same paged walk a client uses.
+pub(crate) async fn walk(emulator: &Emulator, request: Value) -> (Vec<Value>, Vec<usize>) {
     let mut parameters = Vec::new();
     let mut page_sizes = Vec::new();
     let mut token: Option<String> = None;

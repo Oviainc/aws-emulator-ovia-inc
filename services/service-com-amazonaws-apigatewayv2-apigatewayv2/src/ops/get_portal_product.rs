@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPortalProduct
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPortalProduct`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPortalProduct::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored [`crate::state::PortalProduct`] addressed by
+//! `PortalProductId`, and 404 `NotFoundException` when no product is stored under it.
+//! A pure read: it writes nothing. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +148,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPortalProduct` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPortalProductErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPortalProduct"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetPortalProduct",
+            ));
+        };
+        // A reporting operation: the guard is taken for READING only, so a Get leaves
+        // the store exactly as the next caller will find it.
+        let store = state.lock();
+
+        // "The account ID of the resource owner of the portal product"
+        // (`GetPortalProduct$ResourceOwnerAccountId`) selects whose product to read: a
+        // product shared with this account is owned by another one. This emulator holds
+        // the products of its OWN account only, so naming any other owner addresses a
+        // product it does not hold.
+        let owner_is_elsewhere = input
+            .resource_owner_account_id
+            .as_deref()
+            .is_some_and(|owner| owner != ::engine::emulator_account_id());
+
+        let stored = if owner_is_elsewhere {
+            None
+        } else {
+            store.portal_products.get(&input.portal_product_id)
+        };
+        let Some(stored) = stored.map(crate::state::PortalProduct::to_wire) else {
+            return Err(GetPortalProductErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Invalid PortalProduct identifier specified {}:{}",
+                        ::engine::emulator_account_id(),
+                        input.portal_product_id
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        Ok(GetPortalProductOutput {
+            description: stored.description,
+            display_name: stored.display_name,
+            display_order: stored.display_order,
+            last_modified: stored.last_modified,
+            portal_product_arn: stored.portal_product_arn,
+            portal_product_id: stored.portal_product_id,
+            tags: stored.tags,
+        })
     }
 }
