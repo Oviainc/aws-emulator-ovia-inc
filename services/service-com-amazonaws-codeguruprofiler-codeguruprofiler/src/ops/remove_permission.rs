@@ -4,8 +4,9 @@
 //!
 //! Removes the action group's statement from the profiling group's resource-based
 //! policy under optimistic locking on `revisionId`, and answers with the policy as it
-//! then stands — the empty document once the last statement is gone, which also
-//! leaves the group with no policy for `GetPolicy` to find.
+//! then stands — or, once the removal has taken the LAST statement, with an empty body:
+//! the group then has no resource-based policy, so there is no document to report and no
+//! revision to report, which is also what `GetPolicy` then answers for it.
 //!
 //! ## Shape of an operation
 //!
@@ -195,8 +196,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 policy,
                 revision_id,
             } => Ok(RemovePermissionOutput {
-                policy,
-                revision_id,
+                policy: Some(policy),
+                revision_id: Some(revision_id),
+            }),
+            // The removal took the last statement, so the group now has no
+            // resource-based policy: there is no document and no revision to report,
+            // and inventing a revision the store does not hold would hand the caller a
+            // token no later write could use.
+            crate::state::PolicyWrite::Cleared => Ok(RemovePermissionOutput {
+                policy: None,
+                revision_id: None,
             }),
             crate::state::PolicyWrite::UnknownGroup => {
                 Err(RemovePermissionErrorModeled::ResourceNotFoundException(
@@ -210,13 +219,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into())
             }
-            // Nothing to remove from: the policy this request names does not exist, so
-            // the answer is the same 404 `GetPolicy` gives for it.
+            // Nothing to remove from: the group resolved but holds no resource-based
+            // policy, which the service states naming the group and the account the
+            // lookup was scoped to.
             crate::state::PolicyWrite::NoPolicy => {
                 Err(RemovePermissionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
+                        message: crate::state::policy_not_found_message(
+                            &input.profiling_group_name,
+                        ),
+                    },
+                )
+                .into())
+            }
+            // A different state, so a different thing to say about it: the group HAS a
+            // policy, and that policy grants the named action group to nobody, so there
+            // is no statement to remove.
+            crate::state::PolicyWrite::NoStatement => {
+                Err(RemovePermissionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
                         message: format!(
-                            "profiling group {} has no resource-based policy granting {}",
+                            "the resource-based policy of profiling group {} grants no {}",
                             input.profiling_group_name, input.action_group
                         ),
                     },

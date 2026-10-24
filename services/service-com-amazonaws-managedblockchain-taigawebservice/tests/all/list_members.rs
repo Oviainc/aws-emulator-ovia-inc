@@ -32,7 +32,7 @@ use crate::network_and_node_lifecycle::{
 
 /// An account that is not the one under emulation, so a member whose ARN names it is
 /// owned by "a different Amazon Web Services account" (`MemberSummary$IsOwned`).
-const OTHER_ACCOUNT: &str = "111122223333";
+pub(crate) const OTHER_ACCOUNT: &str = "111122223333";
 
 /// Long enough that a `CREATING` member seeded with this much left to run has not come
 /// due by the end of a test.
@@ -77,12 +77,12 @@ fn network_body_with_member(token: &str, network_name: &str, member: Value) -> V
 
 /// One seeded member: what this row varies from the member `CreateNetwork` stored.
 #[derive(Debug, Clone, Copy)]
-struct Seed {
-    name: &'static str,
+pub(crate) struct Seed {
+    pub(crate) name: &'static str,
     /// A `MemberStatus` value.
-    status: &'static str,
+    pub(crate) status: &'static str,
     /// The account the member's ARN names; `IsOwned` is read off it.
-    account: &'static str,
+    pub(crate) account: &'static str,
 }
 
 /// Write `seeds` into the store as members of `network_id`, and return their ids in the
@@ -91,7 +91,7 @@ struct Seed {
 /// Each seeded record is a copy of the one `CreateNetwork` stored, with only the row's
 /// name, status and owning account changed — so a case tests the handler, not a
 /// hand-built record that no create could have produced.
-fn seed_members(
+pub(crate) fn seed_members(
     engine: &engine::InMemoryEngine,
     network_id: &str,
     seeds: &[Seed],

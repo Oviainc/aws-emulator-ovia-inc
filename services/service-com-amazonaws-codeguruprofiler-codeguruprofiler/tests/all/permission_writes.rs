@@ -10,7 +10,9 @@
 //! fresh `revisionId`; a write is applied only when it names the revision the stored
 //! policy currently carries (and, for the first write, names none); `GetPolicy` reports
 //! that stored document and revision unchanged; and `RemovePermission` drops the
-//! statement, leaving the group with no policy once the last one is gone.
+//! statement, leaving the group with no policy once the last one is gone — reported as
+//! a 200 carrying neither `policy` nor `revisionId`, the same empty answer `GetPolicy`
+//! then gives.
 //!
 //! The harness and the group table are the ones [`crate::profiling_group_lifecycle`]
 //! already builds, so the group variation (compute platform, orchestration flag, tag
@@ -30,6 +32,10 @@ use crate::profiling_group_lifecycle::{Answer, GroupCase, Harness, group_cases};
 /// (`smithy_query(query="shape",shape="ActionGroup")`).
 const ACTION_GROUP: &str = "agentPermissions";
 
+/// The `Sid` the statement for [`ACTION_GROUP`] carries: the action group's statement
+/// id, which is its name plus the `-statement` suffix every statement id carries.
+const ACTION_GROUP_SID: &str = "agentPermissions-statement";
+
 /// The permissions `agentPermissions` grants, from that enum member's own doc:
 /// "Permission group type for Agent APIs - ConfigureAgent, PostAgentProfile"
 /// (`smithy_query(query="shape",shape="ActionGroup")`).
@@ -48,7 +54,7 @@ const MAX_PRINCIPALS: usize = 50;
 const FOREIGN_REVISION: &str = "00000000-0000-4000-8000-000000000000";
 
 /// A string member of a JSON answer.
-fn string_member(answer: &Answer, member: &str) -> String {
+pub(crate) fn string_member(answer: &Answer, member: &str) -> String {
     answer
         .json()
         .get(member)
@@ -71,7 +77,7 @@ fn policy_document(answer: &Answer) -> serde_json::Value {
 
 /// `PutPermission`: `PUT /profilingGroups/{profilingGroupName}/policy/{actionGroup}`,
 /// with `principals` and the optional `revisionId` in the payload.
-async fn put_permission(
+pub(crate) async fn put_permission(
     harness: &Harness,
     group: &str,
     action_group: &str,
@@ -102,7 +108,7 @@ async fn put_permission(
 }
 
 /// `GetPolicy`: `GET /profilingGroups/{profilingGroupName}/policy`.
-async fn get_policy(harness: &Harness, group: &str) -> Answer {
+pub(crate) async fn get_policy(harness: &Harness, group: &str) -> Answer {
     harness
         .send(
             "GET",
@@ -116,7 +122,7 @@ async fn get_policy(harness: &Harness, group: &str) -> Answer {
 /// `RemovePermission`:
 /// `DELETE /profilingGroups/{profilingGroupName}/policy/{actionGroup}?revisionId=..`,
 /// whose `revisionId` is modelled as a required query parameter.
-async fn remove_permission(
+pub(crate) async fn remove_permission(
     harness: &Harness,
     group: &str,
     action_group: &str,
@@ -244,25 +250,24 @@ fn assert_policy_grants(case: &WriteCase, policy: &serde_json::Value, granted: &
     let statement = &statements[0];
     assert_eq!(
         statement.get("Sid").and_then(|v| v.as_str()),
-        Some(ACTION_GROUP),
-        "case {case:?}: the statement's Sid must be the action group, got {statement}"
+        Some(ACTION_GROUP_SID),
+        "case {case:?}: the statement's Sid must be the action group's statement id, got {statement}"
     );
     assert_eq!(
         statement.get("Effect").and_then(|v| v.as_str()),
         Some("Allow"),
         "case {case:?}: a granted action group must Allow, got {statement}"
     );
-    let actual_principals: Vec<String> = statement
-        .get("Principal")
-        .and_then(|principal| principal.get("AWS"))
-        .and_then(|v| v.as_array())
-        .unwrap_or_else(|| panic!("case {case:?}: no Principal.AWS array in {statement}"))
-        .iter()
-        .map(|v| v.as_str().unwrap_or_default().to_string())
-        .collect();
+    // One principal is written as the ARN itself, several as a list.
+    let expected_principal = match granted {
+        [only] => serde_json::Value::from(only.clone()),
+        several => serde_json::Value::from(several.to_vec()),
+    };
     assert_eq!(
-        actual_principals, granted,
-        "case {case:?}: expected the stored principal set {granted:?}, got {actual_principals:?}"
+        statement.pointer("/Principal/AWS"),
+        Some(&expected_principal),
+        "case {case:?}: expected the stored principal set {granted:?} in the policy \
+         language's own form, got {statement}"
     );
     let actions: Vec<String> = statement
         .get("Action")
@@ -307,10 +312,20 @@ async fn a_put_permission_grant_reads_back_through_get_policy() {
 
     for case in created_cases(&harness).await {
         let group = case.group.name.as_str();
+        let unshared = get_policy(&harness, group).await;
         assert_eq!(
-            get_policy(&harness, group).await.status,
-            404,
-            "case {case:?}: a group with no resource-based policy must answer 404"
+            unshared.status,
+            200,
+            "case {case:?}: a group with no resource-based policy must answer 200, got {} {}",
+            unshared.status,
+            String::from_utf8_lossy(&unshared.body)
+        );
+        assert_eq!(
+            unshared.json(),
+            serde_json::json!({}),
+            "case {case:?}: a group with no resource-based policy must answer an empty \
+             body, got {}",
+            String::from_utf8_lossy(&unshared.body)
         );
 
         let created = put_permission(&harness, group, ACTION_GROUP, &case.first, None).await;
@@ -560,31 +575,14 @@ async fn remove_permission_drops_the_statement_and_deletes_the_policy_with_its_l
             removed.status,
             String::from_utf8_lossy(&removed.body)
         );
-        let removed_revision = string_member(&removed, "revisionId");
-        assert!(
-            is_revision_id(&removed_revision),
-            "case {case:?}: expected a UUID revisionId, got {removed_revision:?}"
-        );
-        assert_ne!(
-            removed_revision, revision,
-            "case {case:?}: a removal must mint a new revision"
-        );
-        let document = policy_document(&removed);
+        // It took the policy's only statement, so the group now has no resource-based
+        // policy: no document and no revision are reported, because none is stored.
         assert_eq!(
-            document
-                .get("Statement")
-                .and_then(|v| v.as_array())
-                .map(Vec::len),
-            Some(0),
-            "case {case:?}: the policy after its only statement was removed must grant \
-             nothing, got {document}"
+            removed.json(),
+            serde_json::json!({}),
+            "case {case:?}: removing the last statement must answer an empty body, got {}",
+            String::from_utf8_lossy(&removed.body)
         );
-        for dropped in expected_principals(&case.first) {
-            assert!(
-                !string_member(&removed, "policy").contains(&dropped),
-                "case {case:?}: {dropped} must no longer be granted after the removal"
-            );
-        }
 
         // The last statement went with the policy: there is none left to read, and
         // none stored.
@@ -596,21 +594,21 @@ async fn remove_permission_drops_the_statement_and_deletes_the_policy_with_its_l
         let gone = get_policy(&harness, group).await;
         assert_eq!(
             gone.status,
-            404,
-            "case {case:?}: GetPolicy must answer 404 once the policy is gone, got {} {}",
+            200,
+            "case {case:?}: the group still exists, so GetPolicy must answer 200, got {} {}",
             gone.status,
             String::from_utf8_lossy(&gone.body)
         );
         assert_eq!(
-            gone.error_code(),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {}",
+            gone.json(),
+            serde_json::json!({}),
+            "case {case:?}: GetPolicy must answer an empty body once the policy is gone, got {}",
             String::from_utf8_lossy(&gone.body)
         );
 
         // Nothing left to remove from, and the group is back to its first-write rules:
         // a write that names no revision creates the policy again.
-        let again = remove_permission(&harness, group, ACTION_GROUP, &removed_revision).await;
+        let again = remove_permission(&harness, group, ACTION_GROUP, FOREIGN_REVISION).await;
         assert_eq!(
             again.status,
             404,
