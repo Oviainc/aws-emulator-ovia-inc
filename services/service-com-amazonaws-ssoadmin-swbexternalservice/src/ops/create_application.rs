@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates a customer managed application under an existing IAM Identity
+//! Center instance and an existing application provider, stores it in this service's
+//! state (`crate::state`) under a freshly minted `ApplicationArn`, and answers with that
+//! ARN plus the owning instance and its identity store. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `ApplicationArn` is server-generated here; `Name`, `Description`, `PortalOptions`,
+//! `Status` and `Tags` are the caller's input, persisted so `DescribeApplication` reads
+//! back the same values, and `CreatedFrom` is the Region of this request.
+//!
+//! `ClientToken` is the operation's `@idempotencyToken`: a retry carrying the same token
+//! AND the same parameters answers with the ARN the first call minted and creates
+//! nothing, while the same token carrying DIFFERENT parameters is refused with the
+//! modelled `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +198,187 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateApplicationErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // What the CLOCK already owes every instance, plus the account's ambient instance
+        // if nothing has enabled one yet, so this create resolves the same instance a read
+        // at this instant would resolve.
+        store.on_request(&region, now);
+
+        // The instance the application will live under must exist.
+        let instance = store.instance(&input.instance_arn).ok_or_else(|| {
+            CreateApplicationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::instance_not_found_message(
+                    &input.instance_arn,
+                )),
+                // The model's `ResourceNotFoundExceptionReason` enum carries only KMS key
+                // states, none of which this refusal is.
+                reason: None,
+            })
+        })?;
+        let instance_arn = instance.instance_arn.clone();
+        let identity_store_arn = instance.identity_store_arn.clone();
+
+        // "The ARN of the application provider under which the operation will run": an
+        // application provider is AWS-owned, so the only ones that exist are the ones this
+        // service publishes, and an ARN naming no provider of that catalog resolves to
+        // nothing — the same `ResourceNotFoundException` `DescribeApplicationProvider`
+        // answers an unknown provider ARN with.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplication"))
+        // Which provider it is does not narrow the create further: AWS documents the
+        // operation as creating "an OAuth 2.0 customer managed application … for the given
+        // application provider" and publishes no refusal for any particular provider of
+        // the catalog, so none is invented here.
+        if crate::state::built_in_application_provider(&input.application_provider_arn).is_none() {
+            return Err(CreateApplicationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Could not find ApplicationProvider with arn {}.",
+                        input.application_provider_arn
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // `PortalOptions$Visibility` carries the model's own `@default("ENABLED")`, so an
+        // application created without portal options is stored with the visibility an
+        // omitted member takes rather than with no visibility at all. Everything else of
+        // the caller's portal options is kept as sent.
+        let portal_options = input.portal_options.clone().unwrap_or(PortalOptions {
+            sign_in_options: None,
+            visibility: crate::state::APPLICATION_VISIBILITY_ENABLED.to_string(),
+        });
+        // `SignInOptions$ApplicationUrl` is "a required parameter if the Origin parameter
+        // is APPLICATION" — a conditional requirement the model cannot express, so the
+        // boundary validator passed it and this is where it is refused.
+        if portal_options
+            .sign_in_options
+            .as_ref()
+            .is_some_and(|options| {
+                options.origin == crate::state::SIGN_IN_ORIGIN_APPLICATION
+                    && options
+                        .application_url
+                        .as_ref()
+                        .is_none_or(|url| url.is_empty())
+            })
+        {
+            return Err(CreateApplicationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::APPLICATION_URL_REQUIRED_MESSAGE.to_string()),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+        let status = input
+            .status
+            .clone()
+            .unwrap_or_else(|| crate::state::APPLICATION_STATUS_ENABLED.to_string());
+        let tags = input.tags.clone().unwrap_or_default();
+
+        // Every parameter the `ClientToken` is scoped to: "Passing the same value to a
+        // later call to an operation requires that you also pass the same value for all
+        // other parameters."
+        let fingerprint = crate::state::application_fingerprint(
+            &instance_arn,
+            &input.application_provider_arn,
+            &input.name,
+            input.description.as_deref(),
+            &portal_options,
+            &status,
+            &tags,
+        );
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = store.application_for_client_token(token) {
+                // A genuine retry: answer with the application the first call minted, and
+                // mint nothing.
+                if existing.request_fingerprint == fingerprint {
+                    return Ok(CreateApplicationOutput {
+                        application_arn: Some(existing.application_arn.clone()),
+                        instance_arn: Some(existing.instance_arn.clone()),
+                        identity_store_arn: Some(existing.identity_store_arn.clone()),
+                    });
+                }
+                // The same token carrying a DIFFERENT request is not a retry, so it is
+                // refused rather than answered with the other request's application.
+                return Err(CreateApplicationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "This ClientToken was already used for a different \
+                             CreateApplication request, which created {}",
+                            existing.application_arn
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The emulator's own memory ceiling: a stored application lives until a caller
+        // deletes it, and a caller can vary `Name` indefinitely.
+        if store.applications.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(
+                CreateApplicationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::quota_exceeded_message("applications")),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let application_arn = crate::state::mint_application_arn(&instance_arn);
+        // A freshly minted ARN cannot already be stored; if it somehow were, keeping the
+        // older record would answer this create with ANOTHER application's ARN, so the
+        // collision is reported rather than papered over.
+        if store.applications.contains_key(&application_arn) {
+            return Err(CreateApplicationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the minted ApplicationArn collided with a stored one".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        let record = crate::state::ApplicationRecord {
+            application_arn: application_arn.clone(),
+            instance_arn,
+            application_provider_arn: input.application_provider_arn,
+            // The application lives in the account that owns this emulator's resources —
+            // the account segment of its own ARN, which is what `ApplicationAccount`
+            // reports.
+            application_account: ::engine::emulator_account_id().to_string(),
+            identity_store_arn,
+            name: input.name,
+            description: input.description,
+            status,
+            portal_options,
+            created_date: ::aws_smithy_types::DateTime::from(now),
+            // "CreatedFrom" — the Region this create ran in, which is the only Region
+            // signal the request carries.
+            created_from: region,
+            tags,
+            client_token: input.client_token,
+            request_fingerprint: fingerprint,
+        };
+        // The response is built from the record that is about to be stored, so it cannot
+        // differ from what the next `DescribeApplication` reads: both report these
+        // members of this one record.
+        let output = CreateApplicationOutput {
+            application_arn: Some(record.application_arn.clone()),
+            instance_arn: Some(record.instance_arn.clone()),
+            identity_store_arn: Some(record.identity_store_arn.clone()),
+        };
+        store.applications.insert(application_arn, record);
+        Ok(output)
     }
 }

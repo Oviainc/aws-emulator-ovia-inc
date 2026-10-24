@@ -23,7 +23,7 @@ use crate::ops::types::{
     AccessControlAttribute, AccountAssignment, AccountAssignmentOperationStatus,
     ApplicationProvider, CustomerManagedPolicyReference, DisplayData,
     EncryptionConfigurationDetails, InstanceAccessControlAttributeConfiguration, InstanceMetadata,
-    PermissionSet, PermissionsBoundary, RegionMetadata, ResourceServerConfig,
+    PermissionSet, PermissionsBoundary, PortalOptions, RegionMetadata, ResourceServerConfig,
     ResourceServerScopeDetails, Tag, TrustedTokenIssuerConfiguration,
 };
 
@@ -206,6 +206,63 @@ pub fn instance_not_found_message(instance_arn: &str) -> String {
 pub fn trusted_token_issuer_not_found_message(trusted_token_issuer_arn: &str) -> String {
     format!("Could not find TrustedTokenIssuer with arn {trusted_token_issuer_arn}.")
 }
+
+/// The refusal an `ApplicationArn` this account holds no application for earns, as the
+/// message of the modelled `ResourceNotFoundException`.
+///
+/// Built from the request, like [`trusted_token_issuer_not_found_message`]: it names the
+/// ARN that resolved to nothing, which is what tells "this application is gone" from
+/// "some other resource of this call is missing".
+pub fn application_not_found_message(application_arn: &str) -> String {
+    format!("Could not find Application with arn {application_arn}.")
+}
+
+/// The refusal a `DescribeApplicationAssignment` of a principal that holds no DIRECT
+/// assignment to the application earns, as the message of the modelled
+/// `ResourceNotFoundException`.
+///
+/// Built from the request: the assignment's identity is the whole tuple, so the refusal
+/// names all three parts rather than the application alone.
+pub fn application_assignment_not_found_message(
+    application_arn: &str,
+    principal_type: &str,
+    principal_id: &str,
+) -> String {
+    format!(
+        "Could not find an assignment of {principal_type} {principal_id} to application \
+         {application_arn}."
+    )
+}
+
+/// `ApplicationStatus::ENABLED` (the enum is `ENABLED | DISABLED`) — the status an
+/// application carries when the create that made it named none.
+///
+/// CHOSEN default: the model marks `CreateApplication$Status` optional and declares no
+/// `@default` for it, and AWS publishes no value for an omitted one, so the emulator
+/// picks the usable state — an application nobody disabled is enabled, which is also
+/// what the `PortalOptions$Visibility` member of the same request defaults to.
+pub const APPLICATION_STATUS_ENABLED: &str = "ENABLED";
+
+/// `ApplicationVisibility::ENABLED` — the value `PortalOptions$Visibility` takes when
+/// the request names none. This one is the MODEL's default, not a choice:
+/// `smithy_query(query="shape",shape="ApplicationVisibility")` carries
+/// `"default": "ENABLED"`.
+pub const APPLICATION_VISIBILITY_ENABLED: &str = "ENABLED";
+
+/// `SignInOrigin::APPLICATION` — the origin that redirects the user to the application's
+/// own URL, which is why `SignInOptions$ApplicationUrl` is required with it.
+pub const SIGN_IN_ORIGIN_APPLICATION: &str = "APPLICATION";
+
+/// The refusal a `SignInOptions` with `Origin` `APPLICATION` and no `ApplicationUrl`
+/// earns, as the message of the modelled `ValidationException`.
+///
+/// The rule is `SignInOptions$ApplicationUrl`'s own documentation: "The URL that accepts
+/// authentication requests for an application. This is a required parameter if the
+/// Origin parameter is APPLICATION." The model cannot express a conditionally required
+/// member, so the boundary validator passes the request and the handler refuses it.
+pub const APPLICATION_URL_REQUIRED_MESSAGE: &str =
+    "PortalOptions.SignInOptions.ApplicationUrl is required when \
+     PortalOptions.SignInOptions.Origin is APPLICATION.";
 
 /// `KmsKeyType::AWS_OWNED_KMS_KEY` — the instance is encrypted with an Amazon Web
 /// Services owned key, so no `KmsKeyArn` names it ("Cannot be specified when KeyType is
@@ -825,6 +882,62 @@ impl AccountAssignmentRecord {
     }
 }
 
+/// A customer managed application `CreateApplication` created under one instance.
+///
+/// Every member `DescribeApplication` reports is held here, so a read answers from the
+/// record the create wrote rather than from anything recomputed on the way out.
+#[derive(Debug, Clone)]
+pub struct ApplicationRecord {
+    /// The server-minted `ApplicationArn` ([`mint_application_arn`]) the application is
+    /// stored under.
+    pub application_arn: String,
+    /// The instance the application belongs to: an application created under an instance
+    /// stops existing with it (see
+    /// [`ComAmazonawsSsoadminSwbexternalserviceState::remove_instance`]).
+    pub instance_arn: String,
+    /// `ApplicationProviderArn` — the provider the application runs under, one of
+    /// [`BUILT_IN_APPLICATION_PROVIDERS`].
+    pub application_provider_arn: String,
+    /// `DescribeApplication$ApplicationAccount` — "The account ID" the application lives
+    /// in, the account segment of its own ARN.
+    pub application_account: String,
+    /// The identity store of the owning instance, reported as `IdentityStoreArn`.
+    pub identity_store_arn: String,
+    /// `Name`, as the caller sent it.
+    pub name: String,
+    /// `Description`, when the caller sent one.
+    pub description: Option<String>,
+    /// `ApplicationStatus`: `ENABLED` or `DISABLED`.
+    pub status: String,
+    /// `PortalOptions`, normalised so the stored visibility is always explicit (see
+    /// [`APPLICATION_VISIBILITY_ENABLED`]).
+    pub portal_options: PortalOptions,
+    /// `CreatedDate` — when this create was accepted.
+    pub created_date: DateTime,
+    /// `CreatedFrom` — the Region of the request that created it ([`request_region`]).
+    pub created_from: String,
+    /// `Tags`, as the caller sent them.
+    pub tags: Vec<Tag>,
+    /// The `ClientToken` of the create that minted this application, if it carried one.
+    pub client_token: Option<String>,
+    /// [`application_fingerprint`] of that create, so a retry carrying the SAME token
+    /// can be told from the same token carrying a DIFFERENT request.
+    pub request_fingerprint: String,
+}
+
+/// A direct assignment of one principal to one application.
+///
+/// Its identity is the tuple (application, principal type, principal id) —
+/// [`ComAmazonawsSsoadminSwbexternalserviceState::application_assignment_position`] is
+/// the single place that tuple is compared — so granting the same assignment twice
+/// grants it once.
+#[derive(Debug, Clone)]
+pub struct ApplicationAssignmentRecord {
+    pub application_arn: String,
+    pub principal_type: String,
+    pub principal_id: String,
+}
+
 /// The status record of one create/delete assignment operation, keyed by its
 /// `RequestId` so `DescribeAccountAssignment*Status` and
 /// `ListAccountAssignment*Status` read real history rather than a synthesised answer.
@@ -878,6 +991,13 @@ pub struct ComAmazonawsSsoadminSwbexternalserviceState {
     /// enumeration walks one stable order and can page by key. Holds at most
     /// [`MAX_RECORDS_PER_STORE`] records.
     pub trusted_token_issuers: BTreeMap<String, TrustedTokenIssuerRecord>,
+    /// Applications by `ApplicationArn`. A `BTreeMap` so an enumeration walks one
+    /// stable order and can page by key. Holds at most [`MAX_RECORDS_PER_STORE`]
+    /// records.
+    pub applications: BTreeMap<String, ApplicationRecord>,
+    /// Direct application assignments. At most one row per (application, principal type,
+    /// principal id) tuple, and at most [`MAX_RECORDS_PER_STORE`] rows in all.
+    pub application_assignments: Vec<ApplicationAssignmentRecord>,
     /// Assignment operation statuses by `RequestId`: one per assignment currently
     /// granted, so a repeated create reads the record it already wrote instead of
     /// adding another, and a delete that removes an assignment removes its status
@@ -989,12 +1109,13 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
 
     /// Drop the instance `instance_arn` names and everything held INSIDE it.
     ///
-    /// A permission set, an account assignment and a trusted token issuer each belong to
-    /// one instance — every one of them is created under its `InstanceArn` — so an
-    /// instance that no longer exists holds none of them: leaving them behind would let a
-    /// later create of an instance inherit resources nobody created under it. The status
-    /// record of an assignment operation goes with the permission set it names, for the
-    /// same reason.
+    /// A permission set, an account assignment, a trusted token issuer and an
+    /// application each belong to one instance — every one of them is created under its
+    /// `InstanceArn` — so an instance that no longer exists holds none of them: leaving
+    /// them behind would let a later create of an instance inherit resources nobody
+    /// created under it. The status record of an assignment operation goes with the
+    /// permission set it names, and an application assignment with the application it
+    /// grants access to, for the same reason.
     fn remove_instance(&mut self, instance_arn: &str) {
         self.instances.remove(instance_arn);
         let orphaned: Vec<String> = self
@@ -1011,6 +1132,16 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
             .retain(|_, record| record.instance_arn != instance_arn);
         self.assignment_operations
             .retain(|_, record| !orphaned.contains(&record.permission_set_arn));
+        let orphaned_applications: Vec<String> = self
+            .applications
+            .values()
+            .filter(|record| record.instance_arn == instance_arn)
+            .map(|record| record.application_arn.clone())
+            .collect();
+        self.applications
+            .retain(|_, record| record.instance_arn != instance_arn);
+        self.application_assignments
+            .retain(|record| !orphaned_applications.contains(&record.application_arn));
     }
 
     /// Whether the permission-set / account-assignment surface is WITHDRAWN on the
@@ -1111,6 +1242,34 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         self.trusted_token_issuers
             .values()
             .find(|record| record.client_token.as_deref() == Some(client_token))
+    }
+
+    /// The application `application_arn` names, or `None` when no such application
+    /// exists — never created, or created under an instance that has since gone.
+    pub fn application(&self, application_arn: &str) -> Option<&ApplicationRecord> {
+        self.applications.get(application_arn)
+    }
+
+    /// The application a previous `CreateApplication` minted under `client_token`, if
+    /// one still exists.
+    pub fn application_for_client_token(&self, client_token: &str) -> Option<&ApplicationRecord> {
+        self.applications
+            .values()
+            .find(|record| record.client_token.as_deref() == Some(client_token))
+    }
+
+    /// The index of the application assignment with this identity tuple, if it exists.
+    pub fn application_assignment_position(
+        &self,
+        application_arn: &str,
+        principal_type: &str,
+        principal_id: &str,
+    ) -> Option<usize> {
+        self.application_assignments.iter().position(|row| {
+            row.application_arn == application_arn
+                && row.principal_type == principal_type
+                && row.principal_id == principal_id
+        })
     }
 
     /// The index of the assignment with this identity tuple, if it exists.
@@ -1643,6 +1802,66 @@ pub fn mint_trusted_token_issuer_arn(instance_arn: &str) -> String {
         ::engine::emulator_account_id(),
         mint_uuid_v4(),
     )
+}
+
+/// Mint a fresh `ApplicationArn` under `instance_arn`.
+///
+/// `arn:<partition>:sso::<account>:application/<instance id>/apl-<16 chars>`, per the
+/// model's `ApplicationArn` pattern — like a `TrustedTokenIssuerArn` it carries the
+/// owning ACCOUNT (`:sso::\d{12}:`) and no region. The partition and instance id come
+/// from the owning instance's ARN; only the `apl-` suffix is minted, as 16 hex digits,
+/// which is inside the pattern's `apl-[a-zA-Z0-9]{16}` and unique per call so two
+/// creates never collide.
+pub fn mint_application_arn(instance_arn: &str) -> String {
+    let partition = instance_arn.split(':').nth(1).unwrap_or("aws");
+    let instance_id = instance_arn.rsplit('/').next().unwrap_or(SEED_INSTANCE_ID);
+    format!(
+        "arn:{partition}:sso::{}:application/{instance_id}/apl-{}",
+        ::engine::emulator_account_id(),
+        &mint_digest()[..16],
+    )
+}
+
+/// A stable digest of every parameter a `@idempotencyToken`-carrying
+/// `CreateApplication` is scoped to — the same rule as
+/// [`trusted_token_issuer_fingerprint`], over this operation's members.
+///
+/// `Tags` go in SORTED, because a tag set carries no order the caller chose; everything
+/// else is length-prefixed in a fixed order by [`request_fingerprint`].
+pub fn application_fingerprint(
+    instance_arn: &str,
+    application_provider_arn: &str,
+    name: &str,
+    description: Option<&str>,
+    portal_options: &PortalOptions,
+    status: &str,
+    tags: &[Tag],
+) -> String {
+    let sign_in = portal_options.sign_in_options.as_ref();
+    let mut parts = vec![
+        instance_arn.to_string(),
+        application_provider_arn.to_string(),
+        name.to_string(),
+        description.unwrap_or_default().to_string(),
+        status.to_string(),
+        portal_options.visibility.clone(),
+        sign_in
+            .map(|options| options.origin.clone())
+            .unwrap_or_default(),
+        sign_in
+            .and_then(|options| options.application_url.clone())
+            .unwrap_or_default(),
+    ];
+    let mut sorted: Vec<(&str, &str)> = tags
+        .iter()
+        .map(|tag| (tag.key.as_str(), tag.value.as_str()))
+        .collect();
+    sorted.sort_unstable();
+    for (key, value) in sorted {
+        parts.push(key.to_string());
+        parts.push(value.to_string());
+    }
+    request_fingerprint(&parts)
 }
 
 /// A stable digest of every parameter a `@idempotencyToken`-carrying

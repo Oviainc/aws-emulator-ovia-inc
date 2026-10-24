@@ -15,6 +15,8 @@
 mod abac_attribute_configuration;
 #[path = "all/account_instance_restriction.rs"]
 mod account_instance_restriction;
+#[path = "all/application_assignments.rs"]
+mod application_assignments;
 #[path = "all/application_provider_describe.rs"]
 mod application_provider_describe;
 #[path = "all/application_providers.rs"]

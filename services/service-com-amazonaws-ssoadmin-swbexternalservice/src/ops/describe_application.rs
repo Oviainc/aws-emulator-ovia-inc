@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the application `CreateApplication` stored under this
+//! `ApplicationArn`, member for member, out of this service's state (`crate::state`).
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORT: it writes nothing of its own, beyond what the CLOCK already owes every
+//! instance (an instance whose deletion instant has passed is gone, and the applications
+//! held inside it with it). An `ApplicationArn` no create minted is refused with the
+//! modelled `ResourceNotFoundException`, never answered with an empty 200.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +173,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeApplication"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeApplicationErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // A READ, except for what the CLOCK already owes: an instance whose deletion
+        // instant has passed is gone, and the applications held inside it with it,
+        // whether or not anybody described one.
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        // Never created, or created under an instance that has since gone — the same
+        // answer either way: there is no such application to describe.
+        let record = store.application(&input.application_arn).ok_or_else(|| {
+            DescribeApplicationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::application_not_found_message(
+                    &input.application_arn,
+                )),
+                // The model's `ResourceNotFoundExceptionReason` enum carries only KMS key
+                // states, none of which this refusal is.
+                reason: None,
+            })
+        })?;
+
+        Ok(DescribeApplicationOutput {
+            application_arn: Some(record.application_arn.clone()),
+            application_provider_arn: Some(record.application_provider_arn.clone()),
+            name: Some(record.name.clone()),
+            application_account: Some(record.application_account.clone()),
+            instance_arn: Some(record.instance_arn.clone()),
+            identity_store_arn: Some(record.identity_store_arn.clone()),
+            status: Some(record.status.clone()),
+            portal_options: Some(record.portal_options.clone()),
+            description: record.description.clone(),
+            created_date: Some(record.created_date),
+            created_from: Some(record.created_from.clone()),
+        })
     }
 }
