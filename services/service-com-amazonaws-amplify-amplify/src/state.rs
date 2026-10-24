@@ -13,7 +13,9 @@
 //! transitively and `ListBranches` / `ListWebhooks` can never reach another app's
 //! records. Jobs live INSIDE their owning branch for the same reason: `DeleteBranch`
 //! takes that branch's jobs with it, and `GetJob` can never reach a job of another
-//! branch.
+//! branch. A deployment reserved on a branch and not started yet lives there too, so
+//! it shares its branch's lifetime and its `jobId` cannot collide with another
+//! branch's.
 
 use std::collections::BTreeMap;
 
@@ -57,6 +59,16 @@ impl AmplifyApp {
 pub struct AmplifyBranch {
     /// The branch record, exactly as every reader returns it.
     pub branch: Branch,
+    /// The deployments `CreateDeployment` has reserved on this branch and nobody has
+    /// started yet, keyed by the `jobId` reserved for each.
+    ///
+    /// A deployment is reserved by one call and started by another, so what the first
+    /// call minted — the job id and the upload destinations — has to outlive it; this
+    /// is where it lives until `StartDeployment` names that job id. The map is
+    /// BOUNDED: a reservation the clock has let expire is dropped (see
+    /// [`AmplifyBranch::expire_deployments`]) and a branch holds at most
+    /// [`MAX_PENDING_DEPLOYMENTS_PER_BRANCH`] live reservations at once.
+    pub deployments: BTreeMap<String, PendingDeployment>,
     /// The jobs started on this branch, keyed by `jobId`.
     ///
     /// BOUNDED, with an explicit retention policy: the map holds at most
@@ -68,9 +80,20 @@ pub struct AmplifyBranch {
     /// jobs the branch has STARTED ([`AmplifyBranch::jobs_started`]), not the
     /// retained ones, so retiring history does not rewrite that count.
     pub jobs: BTreeMap<String, BranchJob>,
-    /// Monotonic counter feeding [`AmplifyBranch::mint_job_id`], and so the number of
-    /// jobs this branch has started.
+    /// Monotonic counter feeding every `jobId` this branch hands out —
+    /// [`AmplifyBranch::mint_job_id`] for a job it is starting and
+    /// [`AmplifyBranch::reserve_job_id`] for a deployment it is reserving.
+    ///
+    /// ONE sequence for both, so a reserved id is never handed to a later job: the
+    /// deployment that reserved it is started by its own call, under that id.
     pub next_job_seq: u64,
+    /// How many jobs this branch has STARTED, which is what
+    /// [`AmplifyBranch::jobs_started`] reports.
+    ///
+    /// Not the same as [`Self::next_job_seq`]: reserving a deployment takes an id out
+    /// of that sequence without starting anything, and a job exists only once a
+    /// start call creates it.
+    pub started_jobs: u64,
 }
 
 impl AmplifyBranch {
@@ -78,12 +101,14 @@ impl AmplifyBranch {
     pub fn new(branch: Branch) -> Self {
         Self {
             branch,
+            deployments: BTreeMap::new(),
             jobs: BTreeMap::new(),
             next_job_seq: 0,
+            started_jobs: 0,
         }
     }
 
-    /// Mint a `jobId` no job of THIS branch is using.
+    /// Mint a `jobId` for a job this branch is STARTING, and count that job as started.
     ///
     /// `JobId` is modelled `length 0..255, pattern ^[0-9]+$`
     /// (`smithy_query(query="shape",shape="JobSummary")`), so a job id is decimal
@@ -92,10 +117,22 @@ impl AmplifyBranch {
     /// per-branch count: the first job a branch runs is `1`, the next `2`, which is
     /// also what `Branch$activeJobId` and `Branch$totalNumberOfJobs` report about.
     pub fn mint_job_id(&mut self) -> String {
+        let job_id = self.reserve_job_id();
+        self.started_jobs = self.started_jobs.wrapping_add(1);
+        job_id
+    }
+
+    /// Take the next `jobId` of this branch's id sequence without starting a job on it.
+    ///
+    /// What `CreateDeployment` reserves: it hands the caller the id its later
+    /// `StartDeployment` will run under, so the id is spent — no job this branch
+    /// starts afterwards may be handed the same one — while the branch has still
+    /// started no job, since nothing runs until that start call.
+    pub fn reserve_job_id(&mut self) -> String {
         loop {
             self.next_job_seq = self.next_job_seq.wrapping_add(1);
             let candidate = self.next_job_seq.to_string();
-            if !self.jobs.contains_key(&candidate) {
+            if !self.jobs.contains_key(&candidate) && !self.deployments.contains_key(&candidate) {
                 return candidate;
             }
         }
@@ -106,9 +143,22 @@ impl AmplifyBranch {
     ///
     /// Not the number of jobs the branch still holds: the history is bounded (see
     /// [`AmplifyBranch::jobs`]), and a branch that has run a thousand jobs has run a
-    /// thousand jobs whether or not the oldest are still readable.
+    /// thousand jobs whether or not the oldest are still readable. Not the number of
+    /// ids it has handed out either: a reserved deployment nobody started is not a job.
     pub fn jobs_started(&self) -> u64 {
-        self.next_job_seq
+        self.started_jobs
+    }
+
+    /// Drop every reservation whose deployment window the clock has already closed.
+    ///
+    /// The window closes at [`PendingDeployment::expires_at`] whether or not anybody
+    /// calls, so a call that reaches this branch materialises it rather than keeping a
+    /// reservation that can no longer be started. Before that instant this is a
+    /// no-op, so a caller that starts its deployment inside the window still finds it.
+    pub fn expire_deployments(&mut self) {
+        let now = now_millis();
+        self.deployments
+            .retain(|_, pending| now < pending.expires_at);
     }
 
     /// Retire old jobs until this branch can hold one more, and report whether it can.
@@ -158,6 +208,62 @@ impl AmplifyBranch {
 /// the oldest finished job rather than refusing the caller; see
 /// [`AmplifyBranch::make_room_for_a_job`].
 pub const MAX_JOBS_PER_BRANCH: usize = 50;
+
+/// One deployment reserved on a branch and not started yet: the `jobId` it reserved,
+/// where its content is uploaded, and the window it has to be started in.
+///
+/// A manual deployment is TWO calls — one reserves the job id and the upload
+/// destinations, a later one starts the job that deploys what was uploaded — so
+/// everything the first call minted is persisted here for the second to resolve from
+/// the `jobId` the caller was handed.
+#[derive(Debug, Clone)]
+pub struct PendingDeployment {
+    /// The `jobId` this reservation took out of its branch's id sequence, and so the
+    /// id the deployment's job runs under once it is started.
+    pub job_id: String,
+    /// The files the reservation named, keyed by file name: empty when the caller
+    /// reserved a single upload of the whole zipped deployment.
+    pub files: BTreeMap<String, DeploymentFile>,
+    /// Where the zipped deployment is uploaded, or the empty string when the
+    /// reservation named its files individually and so has no single zip upload.
+    pub zip_upload_url: String,
+    /// Epoch milliseconds at which this reservation was created.
+    pub created_at: i64,
+    /// Epoch milliseconds past which this reservation can no longer be started:
+    /// `created_at` plus [`DEPLOYMENT_WINDOW_MILLIS`].
+    pub expires_at: i64,
+}
+
+/// One file of a [`PendingDeployment`]: the content hash its caller declared for it,
+/// and the upload destination minted for that one file.
+#[derive(Debug, Clone)]
+pub struct DeploymentFile {
+    /// The hash of the file's content, as the reservation's caller declared it
+    /// (`FileMap` is modelled file name -> `MD5Hash`,
+    /// `smithy_query(query="shape",shape="FileMap")`).
+    pub content_md5: String,
+    /// Where this one file's content is uploaded.
+    pub upload_url: String,
+}
+
+/// How long a reserved deployment may wait to be started.
+///
+/// DOCUMENTED, not chosen: "The maximum duration between the CreateDeployment call
+/// and the StartDeployment call cannot exceed 8 hours"
+/// (`smithy_query(query="doc",shape="CreateDeployment")`), so the window a
+/// reservation carries is exactly those 8 hours.
+pub const DEPLOYMENT_WINDOW_MILLIS: i64 = 8 * 60 * 60 * 1_000;
+
+/// How many deployments one branch may have reserved and unstarted at once, past
+/// which reserving another answers the modelled `LimitExceededException` (HTTP 429,
+/// "A resource could not be created because service quotas were exceeded").
+///
+/// CHOSEN, not a published quota: a reservation holds state for up to
+/// [`DEPLOYMENT_WINDOW_MILLIS`] whether or not it is ever started, so without a bound
+/// one branch's reservation map could grow without limit inside that window. It is
+/// [`MAX_JOBS_PER_BRANCH`], because every reservation that IS started becomes one job
+/// of that branch's equally bounded history.
+pub const MAX_PENDING_DEPLOYMENTS_PER_BRANCH: usize = MAX_JOBS_PER_BRANCH;
 
 /// One job as this service persists it: the modelled [`Job`] record, plus the instant
 /// at which the clock owes that job its next status change.
@@ -268,6 +374,8 @@ pub struct ComAmazonawsAmplifyAmplifyState {
     pub next_app_id_seq: u64,
     /// Monotonic counter feeding [`ComAmazonawsAmplifyAmplifyState::mint_webhook_id`].
     pub next_webhook_id_seq: u64,
+    /// Monotonic counter feeding [`ComAmazonawsAmplifyAmplifyState::mint_upload_token`].
+    pub next_upload_token_seq: u64,
 }
 
 impl ComAmazonawsAmplifyAmplifyState {
@@ -315,6 +423,19 @@ impl ComAmazonawsAmplifyAmplifyState {
                 return (candidate, format!("{token_high:016x}{token_low:016x}"));
             }
         }
+    }
+
+    /// Mint the opaque token that authorises ONE upload of a reserved deployment.
+    ///
+    /// A deployment's upload destination is handed to the caller and to nobody else,
+    /// so what authorises writing to it cannot be the app id, the branch name or the
+    /// job id the caller already knows: it is 128 bits from the same mixer that mints
+    /// an app id, rendered as hexadecimal, minted once per upload so no two uploads of
+    /// a deployment — and no two deployments — share a destination.
+    pub fn mint_upload_token(&mut self) -> String {
+        self.next_upload_token_seq = self.next_upload_token_seq.wrapping_add(1);
+        let (high, low) = mixed_pair(self.next_upload_token_seq);
+        format!("{high:016x}{low:016x}")
     }
 
     /// The webhook `webhook_id` names, whichever app holds it.
