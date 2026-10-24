@@ -19,6 +19,8 @@ mod error_message_wording;
 mod error_semantics;
 #[path = "all/lexicons_and_speech.rs"]
 mod lexicons_and_speech;
+#[path = "all/pls_document_validity.rs"]
+mod pls_document_validity;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 // The synthesis-task fixtures the task suites share.
