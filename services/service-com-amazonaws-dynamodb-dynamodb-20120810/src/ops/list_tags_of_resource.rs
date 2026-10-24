@@ -2,11 +2,19 @@
 
 //! @op ListTagsOfResource
 //! Reports the tag set stored on the DynamoDB resource its `ResourceArn` names — what
-//! `CreateTable` seeded and every later `TagResource`/`UntagResource` left there.
+//! `CreateTable` seeded and every later `TagResource`/`UntagResource` left there, as
+//! far as this EVENTUALLY CONSISTENT read can see it yet.
+//!
+//! "ListTagsOfResource uses an eventually consistent query, and the metadata for your
+//! tags or table might not be available at that moment" (the `TagResource` doc), so a
+//! tag write is reported here only once its propagation span has elapsed; until then
+//! this reports the set that was visible before it (see
+//! [`crate::state::ResourceTags`]).
 //!
 //! A READ: it reports the stored set and writes nothing of its own, beyond finishing
 //! the status transition the clock has already made due (a table whose `DeleteTable`
-//! span has elapsed is gone whether or not anybody called).
+//! span has elapsed is gone, and a tag write whose propagation span has elapsed is
+//! visible, whether or not anybody called).
 //!
 //! ## Shape of an operation
 //!
@@ -170,13 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         // Finish any transition the clock already made due before reporting: a table
-        // whose DeleteTable span has elapsed is gone, and this is a read, so that is
-        // the only write it makes.
+        // whose DeleteTable span has elapsed is gone and a tag write whose propagation
+        // span has elapsed is visible, and this is a read, so those are the only writes
+        // it makes.
         store.apply_due_transitions(now);
         let table = store.table_by_arn(&resource).map_err(lift)?;
 
         Ok(ListTagsOfResourceOutput {
-            tags: Some(crate::state::tag_list(&table.tags)),
+            // The set this eventually consistent read can see — the newest one whose
+            // propagation span has elapsed, not whatever the last write stored.
+            tags: Some(crate::state::tag_list(table.tags.visible())),
             next_token: None,
         })
     }

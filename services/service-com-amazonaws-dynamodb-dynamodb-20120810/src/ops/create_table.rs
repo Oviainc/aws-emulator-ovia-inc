@@ -398,7 +398,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             local_secondary_indexes,
             table_class: input.table_class.clone(),
             deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
-            tags,
+            // The seeded set propagates to `ListTagsOfResource` like any other tag
+            // change — "the metadata for your tags or table might not be available at
+            // that moment" (the `TagResource` doc) — so it is readable once the create
+            // has propagated, which is the instant this table becomes ACTIVE.
+            tags: crate::state::ResourceTags::seeded(tags, now),
             creation_date_time: now,
             active_at,
             updated_at: None,

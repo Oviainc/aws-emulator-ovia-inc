@@ -19,6 +19,12 @@
 //! `ValidationException` (the refusal WORDING is pinned by
 //! `arn_addressed_tag_refusals`).
 //!
+//! The tag READ is eventually consistent ("ListTagsOfResource API will only reflect the
+//! changes after a few seconds" — the `TagResource` doc), so every read below waits out
+//! the propagation span the emulator owes: these tests are about WHAT a tagging call
+//! leaves on the resource, and `tag_read_propagation` is the test that pins WHEN it
+//! becomes visible.
+//!
 //! Every table below spans the class the rule generalises over — the number of tags,
 //! the value (including the empty one), the key's case, the modelled length bounds,
 //! which keys a later call names — rather than one recorded example.
@@ -138,7 +144,11 @@ fn tag_list(tags: &[(&str, &str)]) -> Value {
 /// The tag set `ListTagsOfResource` reports for `arn`, as a key -> value map, plus the
 /// assertion that the operation mints no pagination token (a resource's whole set fits
 /// in one page).
+///
+/// The read happens once the tag writes before it have propagated: a tag change becomes
+/// visible one `STATUS_TRANSITION` after the call that made it (see the module doc).
 async fn listed_tags(router: &MultiServiceRouter, region: &str, arn: &str) -> Map<String, Value> {
+    tokio::time::sleep(STATUS_TRANSITION + Duration::from_millis(50)).await;
     let listed = ok(
         router,
         region,
