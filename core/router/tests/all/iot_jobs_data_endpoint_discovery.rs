@@ -109,7 +109,7 @@ fn a_discovered_iot_endpoint_address_serves_the_jobs_data_plane() {
             service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::state::command_registry(&*engine)
                 .expect("the shared IoT command index")
                 .lock()
-                .register(COMMAND_ARN)
+                .register(COMMAND_ARN, service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::state::iot_commands::CommandFacts::default())
                 .expect("register the command this test starts");
             let mut router = build_router(engine);
             router.set_request_authentication(false);

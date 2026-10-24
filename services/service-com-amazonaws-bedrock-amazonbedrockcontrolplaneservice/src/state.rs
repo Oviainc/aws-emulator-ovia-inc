@@ -19,7 +19,10 @@
 //!
 //! And it holds the model import jobs `ops/create_model_import_job.rs` mints and
 //! `ops/get_model_import_job.rs` reads back, together with the instant each job's
-//! non-terminal `status` is owed its move to `Completed`.
+//! non-terminal `status` is owed its move to `Completed`. Those same records hold the
+//! models those jobs import, which `ops/get_imported_model.rs` reads back once the
+//! import has completed — the job that imports a model is where that model's identity,
+//! data source and key live, so there is only ever one copy of either.
 //!
 //! And it holds the evaluation jobs `ops/create_evaluation_job.rs` mints and
 //! `ops/get_evaluation_job.rs` reads back.
@@ -874,17 +877,68 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         Some(job)
     }
 
-    /// Whether a stored job in `region` already imports a model under
-    /// `imported_model_name`.
+    /// The ARN of the import job that imports the model an `ImportedModelIdentifier`
+    /// names, or `None` when no stored job imports one.
     ///
     /// An `ImportedModelIdentifier` is the imported model's ARN or its bare NAME
-    /// (`smithy_query(query="operation",operation="GetImportedModel")`), so a name names
-    /// at most one imported model in an account and region.
+    /// (`smithy_query(query="operation",operation="GetImportedModel")`), so both spellings
+    /// address the same model, and a name names at most one imported model in an account
+    /// and region. The imported model is not a record of its own: the job that imports it
+    /// holds its identity, its data source and its key from the call that accepted the
+    /// import onwards, so there is ONE copy of the model for every operation to read.
+    /// The ARN spelling takes PRECEDENCE over the name, as
+    /// [`Self::model_import_job_arn_of`] gives the job ARN precedence over the job name:
+    /// the store is a `HashMap`, so a scan that accepted either match without an order
+    /// would answer whichever record it reached first.
+    #[must_use]
+    pub fn importing_job_arn_of(&self, identifier: &str, region: &str) -> Option<String> {
+        let mut named = None;
+        for job in self.model_import_jobs.values() {
+            if job.region != region {
+                continue;
+            }
+            if job.imported_model_arn == identifier {
+                return Some(job.arn.clone());
+            }
+            if job.imported_model_name == identifier {
+                named = Some(job.arn.clone());
+            }
+        }
+        named
+    }
+
+    /// Whether a stored job in `region` already imports a model under
+    /// `imported_model_name`.
     #[must_use]
     pub fn imports_model_named(&self, region: &str, imported_model_name: &str) -> bool {
-        self.model_import_jobs
-            .values()
-            .any(|job| job.region == region && job.imported_model_name == imported_model_name)
+        self.importing_job_arn_of(imported_model_name, region)
+            .is_some()
+    }
+
+    /// The imported model an `ImportedModelIdentifier` names, reported as the import job
+    /// that holds it, together with the instant the import ENDED — the instant that model
+    /// came into being — with any status transition the clock has made due at `now`
+    /// materialised first, exactly as [`Self::model_import_job`] does it.
+    ///
+    /// `None` while that job has not reached [`IMPORT_JOB_STATUS_COMPLETED`]: importing is
+    /// what CREATES the customized model ("A successful job transitions from in-progress to
+    /// completed when the imported model is ready to use",
+    /// `smithy_query(query="operation",operation="GetModelImportJob")`), so until the
+    /// import has finished there is no imported model to report. That is also why the end
+    /// instant is handed back BESIDE the record rather than left to a caller to unwrap:
+    /// [`ModelImportJobRecord::complete`] sets it together with the terminal status, so a
+    /// model this reports always has one.
+    pub fn imported_model(
+        &mut self,
+        identifier: &str,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<(&ModelImportJobRecord, SystemTime)> {
+        let arn = self.importing_job_arn_of(identifier, region)?;
+        let job = self.model_import_jobs.get_mut(&arn)?;
+        job.complete(now);
+        let ended_at = job.ended_at?;
+        (job.status == IMPORT_JOB_STATUS_COMPLETED).then_some((&*job, ended_at))
     }
 
     /// Mint a fresh model import job id: the resource half of a `model-import-job/<id>`

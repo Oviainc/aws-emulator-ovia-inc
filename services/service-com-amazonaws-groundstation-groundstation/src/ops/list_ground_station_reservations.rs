@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGroundStationReservations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGroundStationReservations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGroundStationReservations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -144,23 +135,204 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_GROUND_STATION_RESERVATIONS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the reservations held at one ground station over a window, a page at a time.
+    ///
+    /// A reservation is a block of antenna time at the ground station: one this account
+    /// holds for a contact it reserved there (`CONTACT`, naming that contact), or one AWS
+    /// holds to maintain the antenna (`MAINTENANCE`, naming the maintenance type). The
+    /// answer is every such reservation whose own window overlaps the requested one,
+    /// narrowed to the requested `reservationTypes` when the request names any, in
+    /// chronological order.
+    ///
+    /// `@readonly`: the answer is computed from this service's contacts and from
+    /// [`crate::state::ComAmazonawsGroundstationGroundstationState::maintenance_reservations`].
+    /// The one write is [`crate::state::ComAmazonawsGroundstationGroundstationState::settle_due_contacts`],
+    /// which materialises the status moves the clock had already made due — owed at this
+    /// instant whether or not anybody called — so this listing changes nothing a later
+    /// caller could otherwise have seen.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGroundStationReservations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGroundStationReservationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGroundStationReservations"))
+        /// Names this listing inside its pagination tokens, so a token another listing
+        /// issued is not accepted here.
+        const LISTING: &str = "ground-station-reservations";
+
+        /// The key the listing is ordered by, read off the reservation itself: when the
+        /// block starts, then when it ends, then the antenna it holds, then its type and
+        /// what it is held for — so the order is total and a page boundary is stable
+        /// whatever order the store iterates in.
+        fn order_key(
+            reservation: &GroundStationReservationListItem,
+        ) -> (f64, f64, &str, &str, &str) {
+            let held_for = match &reservation.reservation_details {
+                ReservationDetails::Contact(contact) => {
+                    contact.contact_id.as_deref().unwrap_or_default()
+                }
+                ReservationDetails::Maintenance(maintenance) => {
+                    maintenance.maintenance_type.as_str()
+                }
+            };
+            (
+                reservation.start_time.as_secs_f64(),
+                reservation.end_time.as_secs_f64(),
+                &reservation.antenna_name,
+                &reservation.reservation_type,
+                held_for,
+            )
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListGroundStationReservationsErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // The window a listing searches runs forwards: a request whose `endTime` precedes
+        // its `startTime` describes no interval at all, so it is refused rather than
+        // answered with the empty page the overlap test would produce. Same rule, same
+        // wording as `ListContacts`, which searches a window the same way.
+        if input.end_time.as_secs_f64() < input.start_time.as_secs_f64() {
+            return Err(
+                ListGroundStationReservationsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some("endTime must not precede startTime".to_string()),
+                        parameter_name: Some("endTime".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An offset counts within the FILTERED sequence, so the ground station, the window
+        // and the type filter are part of the scope its token is issued under: resuming
+        // with any of them changed is refused rather than landing at an offset into a
+        // different sequence. The types are sorted first, so naming the same types in
+        // another order is the same scope.
+        let mut types: Vec<String> = input.reservation_types.clone().unwrap_or_default();
+        types.sort();
+        let scope = crate::state::page_scope(
+            LISTING,
+            &[
+                input.ground_station_id.clone(),
+                input.start_time.as_secs_f64().to_string(),
+                input.end_time.as_secs_f64().to_string(),
+                types.join(","),
+            ],
+        );
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_page_token(&scope, token).ok_or_else(|| {
+                ListGroundStationReservationsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            "nextToken was not issued by a previous \
+                             ListGroundStationReservations call with these filters"
+                                .to_string(),
+                        ),
+                        parameter_name: Some("nextToken".to_string()),
+                    },
+                )
+            })?,
+        };
+
+        // A request that names no type filters on none: every reservation type is
+        // reported. A value outside the modelled `ReservationType` enum never reaches
+        // here — the model's own rules refuse it before this handler runs.
+        let wanted = |reservation_type: &str| {
+            types.is_empty() || types.iter().any(|named| named == reservation_type)
+        };
+        let window = (
+            input.start_time.as_secs_f64(),
+            input.end_time.as_secs_f64(),
+        );
+
+        let mut guard = state.lock();
+        // Apply every status move already due, so a reservation released by a cancel that
+        // has since settled is no longer reported as holding its antenna.
+        guard.settle_due_contacts();
+
+        let mut items: Vec<GroundStationReservationListItem> = Vec::new();
+
+        if wanted(crate::state::RESERVATION_TYPE_MAINTENANCE) {
+            for maintenance in &guard.maintenance_reservations {
+                let held = (
+                    maintenance.start_time.as_secs_f64(),
+                    maintenance.end_time.as_secs_f64(),
+                );
+                if maintenance.ground_station != input.ground_station_id
+                    || !crate::state::windows_overlap(held, window)
+                {
+                    continue;
+                }
+                items.push(GroundStationReservationListItem {
+                    reservation_type: crate::state::RESERVATION_TYPE_MAINTENANCE.to_string(),
+                    ground_station_id: maintenance.ground_station.clone(),
+                    antenna_name: maintenance.antenna_name.clone(),
+                    start_time: maintenance.start_time,
+                    end_time: maintenance.end_time,
+                    reservation_details: ReservationDetails::Maintenance(
+                        MaintenanceReservationDetails {
+                            maintenance_type: maintenance.maintenance_type.clone(),
+                        },
+                    ),
+                });
+            }
+        }
+
+        if wanted(crate::state::RESERVATION_TYPE_CONTACT) {
+            for contact in guard.contacts.values() {
+                let held = (
+                    contact.start_time.as_secs_f64(),
+                    contact.end_time.as_secs_f64(),
+                );
+                // A contact whose status holds no antenna time at the ground station
+                // reserves nothing there — a window that was only ever offered, a
+                // reservation that never became a contact, or one released before its
+                // pass — so there is no reservation of it to report.
+                if contact.ground_station != input.ground_station_id
+                    || !contact.holds_antenna_time()
+                    || !crate::state::windows_overlap(held, window)
+                {
+                    continue;
+                }
+                items.push(GroundStationReservationListItem {
+                    reservation_type: crate::state::RESERVATION_TYPE_CONTACT.to_string(),
+                    ground_station_id: contact.ground_station.clone(),
+                    antenna_name: contact.antenna_name.clone(),
+                    // The window the reservation holds the antenna for is the contact's
+                    // own, the same span its antenna time is counted over
+                    // (`crate::state::Contact::scheduled_minutes`); the pre- and post-pass
+                    // spans are the set-up and tear-down around it.
+                    start_time: contact.start_time,
+                    end_time: contact.end_time,
+                    reservation_details: ReservationDetails::Contact(ContactReservationDetails {
+                        contact_id: Some(contact.contact_id.clone()),
+                    }),
+                });
+            }
+        }
+
+        items.sort_by(|left, right| {
+            let (left_start, left_end, left_antenna, left_type, left_held_for) = order_key(left);
+            let (right_start, right_end, right_antenna, right_type, right_held_for) =
+                order_key(right);
+            left_start
+                .total_cmp(&right_start)
+                .then_with(|| left_end.total_cmp(&right_end))
+                .then_with(|| left_antenna.cmp(right_antenna))
+                .then_with(|| left_type.cmp(right_type))
+                .then_with(|| left_held_for.cmp(right_held_for))
+        });
+
+        let (page, next_token) = crate::state::paginate(&scope, &items, input.max_results, offset);
+
+        Ok(ListGroundStationReservationsOutput {
+            reservation_list: page,
+            next_token,
+        })
     }
 }

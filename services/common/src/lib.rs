@@ -172,6 +172,12 @@
 //! `<ErrorResponse>` carries beside its `<Error>`, which no model declares and the
 //! framework's error renderers do not write, for every service of that protocol whose
 //! errors must carry the request id an SDK reports.
+//!
+//! [`query_timestamps`] is the fourth: the rewrite that lets an `@httpQuery` timestamp bind
+//! in the `epoch-seconds` form its model declares, for every service whose time-ranged
+//! reads take their window in the query string — the generated schema carries no
+//! member-level `@timestampFormat`, so without it the framework reads such a member as
+//! RFC-3339 only and refuses the form every SDK sends.
 
 pub mod rds_cluster_parameters;
 
@@ -196,6 +202,9 @@ pub mod lex;
 pub mod management_events;
 pub mod network;
 pub mod query_error_envelope;
+/// An `@httpQuery`-bound timestamp read in the `epoch-seconds` form the model declares (or
+/// documents), which the generated schema drops and the framework therefore refuses.
+pub mod query_timestamps;
 /// The media type a service announces on a response, where the recorded wire differs from
 /// the one its protocol trait implies.
 pub mod response_media_type;

@@ -407,21 +407,22 @@ async fn activation_turns_only_on_the_code_this_service_issued() {
     let em = emulator();
     let arn = create_ok(&em, "oncall-primary", "oncall@example.com").await;
 
-    // Before any activation email went out there is no code at all, so no
-    // well-formed code can activate the contact.
+    // Before any activation email went out there is no activation token at all, so
+    // there is nothing for a code to be compared against: that is the modelled 404,
+    // which `activation_token_resource.rs` owns in full.
     assert!(
         issued_code(&em, &arn).is_none(),
         "a fresh contact must carry no activation code"
     );
     let (status, body) = activate(&em, &arn, "abcdefg").await;
     assert_eq!(
-        status, 400,
-        "activating before any code was issued must be refused, got {status} / {body:?}"
+        status, 404,
+        "activating before any code was issued must answer the modelled 404, got {status} / {body:?}"
     );
     assert_eq!(
         error_code(&body),
-        "ValidationException",
-        "expected ValidationException, got {body:?}"
+        "ResourceNotFoundException",
+        "expected ResourceNotFoundException, got {body:?}"
     );
 
     let (status, body) = send_code(&em, &arn).await;

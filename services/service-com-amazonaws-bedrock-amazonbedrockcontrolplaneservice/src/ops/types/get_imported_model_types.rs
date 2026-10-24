@@ -17,7 +17,14 @@ pub struct GetImportedModelInput {
     pub model_identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#GetImportedModelResponse")]
+/// `GetImportedModelResponse`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `creationTime` carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation",operation="GetImportedModel")`), which the derive does
+/// not put on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct GetImportedModelOutput {
     pub model_arn: Option<String>,
@@ -31,6 +38,66 @@ pub struct GetImportedModelOutput {
     pub instruct_supported: Option<bool>,
     pub custom_model_units: Option<CustomModelUnits>,
 }
+
+bedrock_schema_and_codec!(
+    GetImportedModelOutput,
+    GET_IMPORTED_MODEL_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#GetImportedModelResponse",
+    "com.amazonaws.bedrock",
+    "GetImportedModelResponse",
+    (M_MODEL_ARN, model_arn, "modelArn", 0, opt, string),
+    (M_MODEL_NAME, model_name, "modelName", 1, opt, string),
+    (M_JOB_NAME, job_name, "jobName", 2, opt, string),
+    (M_JOB_ARN, job_arn, "jobArn", 3, opt, string),
+    (
+        M_MODEL_DATA_SOURCE,
+        model_data_source,
+        "modelDataSource",
+        4,
+        opt,
+        union_of(ModelDataSource)
+    ),
+    (
+        M_CREATION_TIME,
+        creation_time,
+        "creationTime",
+        5,
+        opt,
+        date_time
+    ),
+    (
+        M_MODEL_ARCHITECTURE,
+        model_architecture,
+        "modelArchitecture",
+        6,
+        opt,
+        string
+    ),
+    (
+        M_MODEL_KMS_KEY_ARN,
+        model_kms_key_arn,
+        "modelKmsKeyArn",
+        7,
+        opt,
+        string
+    ),
+    (
+        M_INSTRUCT_SUPPORTED,
+        instruct_supported,
+        "instructSupported",
+        8,
+        opt,
+        boolean
+    ),
+    (
+        M_CUSTOM_MODEL_UNITS,
+        custom_model_units,
+        "customModelUnits",
+        9,
+        opt,
+        struct_of(CustomModelUnits)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrock#CustomModelUnits")]
 #[derive(Debug, Clone, Default)]

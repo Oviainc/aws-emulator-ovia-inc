@@ -21,7 +21,9 @@
 //! self-describing envelope that names the key the material belongs to. `Decrypt`
 //! is the exact inverse: the envelope says which key to open it with, and the AEAD
 //! tag is what makes a ciphertext from another key — or the same ciphertext under a
-//! different encryption context — fail instead of decrypting.
+//! different encryption context — fail instead of decrypting. Rotating a key's
+//! material changes which version `Encrypt` seals under and retains the versions it
+//! replaces, so `Decrypt` opens a ciphertext with whichever version sealed it.
 //!
 //! The AEAD and the CSPRNG come from `ring` (`ring::aead::AES_256_GCM`,
 //! `ring::rand::SystemRandom`) rather than from anything written here: this file
@@ -94,6 +96,15 @@ pub const KEY_MANAGER_CUSTOMER: &str = "CUSTOMER";
 /// encryption KMS keys"
 /// (`smithy_query(query="doc",shape="EncryptRequest",member="EncryptionAlgorithm")`).
 pub const ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT: &str = "SYMMETRIC_DEFAULT";
+
+/// The `RotationType` of a rotation a caller asked for, as opposed to `AUTOMATIC`,
+/// from `smithy_query(shape="RotationType")`.
+pub const ROTATION_TYPE_ON_DEMAND: &str = "ON_DEMAND";
+
+/// How many on-demand rotations one KMS key allows: "You can perform on-demand key
+/// rotation a maximum of 25 times per KMS key"
+/// (`smithy_query(query="doc",shape="RotateKeyOnDemand")`).
+pub const MAX_ON_DEMAND_ROTATIONS: usize = 25;
 
 /// The `MultiRegionKeyType` of the key a `MultiRegion` create mints, from
 /// `smithy_query(shape="MultiRegionKeyType")`.
@@ -644,6 +655,17 @@ pub struct Cmk {
     /// is stable for as long as the material is. `None` for a key whose material
     /// KMS gives no id — see [`KeyMaterial::id`].
     pub current_key_material_id: Option<String>,
+    /// Every version of this key's material that a rotation has replaced, oldest
+    /// first. Rotation replaces which material the key encrypts UNDER; it does not
+    /// discard the material already in use, because "KMS retains all key material
+    /// until you delete the KMS key"
+    /// (`smithy_query(query="doc",shape="EnableKeyRotation")`), which is what keeps
+    /// a ciphertext sealed before a rotation decryptable after it.
+    pub superseded_material: Vec<KeyMaterial>,
+    /// This key's completed rotations, oldest first — the record
+    /// `ListKeyRotations` reports and the one [`Self::on_demand_rotation_count`]
+    /// counts against the on-demand quota.
+    pub rotations: Vec<KeyRotation>,
 }
 
 impl std::fmt::Debug for Cmk {
@@ -670,6 +692,10 @@ impl std::fmt::Debug for Cmk {
             // disclosing it.
             .field("material", &"<redacted>")
             .field("current_key_material_id", &self.current_key_material_id)
+            // Likewise for the material earlier rotations replaced: only how many
+            // versions are retained, never their bytes.
+            .field("superseded_material", &self.superseded_material.len())
+            .field("rotations", &self.rotations)
             .finish()
     }
 }
@@ -726,7 +752,56 @@ impl Cmk {
             tags,
             current_key_material_id: material.id(),
             material,
+            superseded_material: Vec::new(),
+            rotations: Vec::new(),
         }
+    }
+
+    /// Make `material` this key's current key material, retaining the version it
+    /// replaces and recording the rotation that did it.
+    ///
+    /// "Rotating key material automatically changes the key material for new
+    /// encryption operations" while "KMS retains all key material"
+    /// (`smithy_query(query="doc",shape="EnableKeyRotation")`), so this moves the
+    /// outgoing version to [`Self::superseded_material`] rather than dropping it:
+    /// after a rotation the key encrypts under the new material and still opens
+    /// ciphertext sealed under any earlier one.
+    ///
+    /// `rotation_type` is the `RotationType` of the rotation performing it — a
+    /// value of `smithy_query(shape="RotationType")`, e.g.
+    /// [`ROTATION_TYPE_ON_DEMAND`].
+    pub fn rotate_material(&mut self, material: KeyMaterial, rotation_type: &str) {
+        let key_material_id = material.id();
+        let superseded = std::mem::replace(&mut self.material, material);
+        self.superseded_material.push(superseded);
+        self.current_key_material_id = key_material_id.clone();
+        self.rotations.push(KeyRotation {
+            key_material_id,
+            rotation_date: SystemTime::now(),
+            rotation_type: rotation_type.to_string(),
+        });
+    }
+
+    /// How many ON_DEMAND rotations this key has had, which is what
+    /// [`MAX_ON_DEMAND_ROTATIONS`] bounds. An automatic rotation does not count
+    /// against that quota: it is a quota on on-demand rotation alone.
+    pub fn on_demand_rotation_count(&self) -> usize {
+        self.rotations
+            .iter()
+            .filter(|rotation| rotation.rotation_type == ROTATION_TYPE_ON_DEMAND)
+            .count()
+    }
+
+    /// Whether this key is a *symmetric encryption* KMS key: one whose key material
+    /// is an AES-GCM key and whose usage is encryption and decryption. It is the
+    /// partition the key-material operations are restricted to — "On-demand key
+    /// rotation is supported only on symmetric encryption KMS keys"
+    /// (`smithy_query(query="doc",shape="RotateKeyOnDemand")`) — so it is read from
+    /// the key's spec profile rather than from one spec's name.
+    pub fn is_symmetric_encryption(&self) -> bool {
+        self.key_usage == KEY_USAGE_ENCRYPT_DECRYPT
+            && key_spec_profile(&self.key_spec)
+                .is_some_and(|profile| matches!(profile.material, MaterialKind::Aes256))
     }
 
     /// This key's `KeyMetadata`, computed from the record — the one place the
@@ -811,6 +886,24 @@ impl Cmk {
     pub fn is_enableable(&self) -> bool {
         self.key_state == KEY_STATE_ENABLED || self.key_state == KEY_STATE_DISABLED
     }
+}
+
+/// One completed rotation of a KMS key's key material: which material the rotation
+/// made current, when it did, and which kind of rotation it was.
+///
+/// This is the history `ListKeyRotations` reports ("You can use ListKeyRotations to
+/// identify the date that completed on-demand rotations were performed",
+/// `smithy_query(query="doc",shape="RotateKeyOnDemand")`), kept oldest first on the
+/// key record so the order it is reported in is the order the rotations happened in.
+#[derive(Debug, Clone)]
+pub struct KeyRotation {
+    /// The `KeyMaterialId` of the material this rotation made current, or `None`
+    /// for material KMS gives no id — see [`KeyMaterial::id`].
+    pub key_material_id: Option<String>,
+    /// The instant the rotation completed.
+    pub rotation_date: SystemTime,
+    /// A `RotationType` value (`smithy_query(shape="RotationType")`).
+    pub rotation_type: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1543,10 +1636,10 @@ pub struct Envelope {
     body: Vec<u8>,
 }
 
-/// This key's material as an AES-256-GCM key, or `None` when the key is not a
-/// symmetric encryption key and has no AES material to seal or open with.
-fn cipher(key: &Cmk) -> Option<LessSafeKey> {
-    UnboundKey::new(&AES_256_GCM, key.material.aes256()?)
+/// `material` as an AES-256-GCM key, or `None` when it is not AES material and so
+/// has nothing to seal or open with.
+fn cipher(material: &KeyMaterial) -> Option<LessSafeKey> {
+    UnboundKey::new(&AES_256_GCM, material.aes256()?)
         .ok()
         .map(LessSafeKey::new)
 }
@@ -1561,7 +1654,7 @@ pub fn seal(
     plaintext: &[u8],
     context: Option<&HashMap<String, String>>,
 ) -> Option<Vec<u8>> {
-    let cipher = cipher(key)?;
+    let cipher = cipher(&key.material)?;
     let mut nonce = [0u8; NONCE_LEN_BYTES];
     SystemRandom::new().fill(&mut nonce).ok()?;
     let aad = encryption_context_aad(context);
@@ -1610,26 +1703,49 @@ pub fn parse_envelope(blob: &[u8]) -> Option<Envelope> {
     })
 }
 
+/// What opening a ciphertext envelope yielded: the plaintext, and which version of
+/// the key's material opened it.
+pub struct Opened {
+    /// The recovered plaintext.
+    pub plaintext: Vec<u8>,
+    /// The `KeyMaterialId` of the material that opened the ciphertext — the
+    /// material that sealed it, which after a rotation need not be the key's
+    /// current one.
+    pub key_material_id: Option<String>,
+}
+
 /// Open an envelope with `key`'s material under `context`.
 ///
-/// `None` means the AEAD tag did not verify: the ciphertext was sealed by another
+/// Every version of the key's material is tried: the one current now, then the ones
+/// rotation replaced, newest first. A KMS key keeps the material it has encrypted
+/// under, so a ciphertext sealed before a rotation still decrypts after it, and the
+/// authentication tag is what identifies the version that sealed it.
+///
+/// `None` means no version verified the tag: the ciphertext was sealed by another
 /// key, under a different encryption context, or has been altered.
 pub fn unseal(
     key: &Cmk,
     envelope: &Envelope,
     context: Option<&HashMap<String, String>>,
-) -> Option<Vec<u8>> {
-    let cipher = cipher(key)?;
+) -> Option<Opened> {
     let aad = encryption_context_aad(context);
-    let mut body = envelope.body.clone();
-    let plaintext = cipher
-        .open_in_place(
-            Nonce::assume_unique_for_key(envelope.nonce),
-            Aad::from(aad.as_slice()),
-            &mut body,
-        )
-        .ok()?;
-    Some(plaintext.to_vec())
+    std::iter::once(&key.material)
+        .chain(key.superseded_material.iter().rev())
+        .find_map(|material| {
+            let cipher = cipher(material)?;
+            let mut body = envelope.body.clone();
+            let plaintext = cipher
+                .open_in_place(
+                    Nonce::assume_unique_for_key(envelope.nonce),
+                    Aad::from(aad.as_slice()),
+                    &mut body,
+                )
+                .ok()?;
+            Some(Opened {
+                plaintext: plaintext.to_vec(),
+                key_material_id: material.id(),
+            })
+        })
 }
 
 /// The encryption context as additional authenticated data.

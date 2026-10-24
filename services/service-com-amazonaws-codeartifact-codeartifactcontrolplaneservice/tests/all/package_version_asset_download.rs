@@ -231,7 +231,7 @@ async fn describe_domain(router: &MultiServiceRouter, domain: &str) -> Value {
 }
 
 /// `DisposePackageVersions` for one version of the package a [`Publish`] addresses.
-async fn dispose(router: &MultiServiceRouter, published: &Publish) -> Value {
+pub(crate) async fn dispose(router: &MultiServiceRouter, published: &Publish) -> Value {
     let mut uri = format!(
         "/v1/package/versions/dispose?domain={}&repository={}&format={}&package={}",
         published.domain, published.repository, published.format, published.package

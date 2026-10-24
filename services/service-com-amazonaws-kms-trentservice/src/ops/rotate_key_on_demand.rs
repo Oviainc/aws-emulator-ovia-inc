@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RotateKeyOnDemand
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RotateKeyOnDemand`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RotateKeyOnDemand::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replaces the key material of a symmetric encryption KMS key with a freshly
+//! generated version, retaining the version it replaces so ciphertext sealed under it still
+//! decrypts, and records the rotation on the key. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -206,18 +201,177 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RotateKeyOnDemand` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RotateKeyOnDemandErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RotateKeyOnDemand"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RotateKeyOnDemandErrorModeled::KMSInternalException(
+                KMSInternalException {
+                    message: Some("the KMS state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        let key = match state.resolve_mut(&region, &input.key_id) {
+            crate::state::KeyRefMut::Found(key) => key,
+            crate::state::KeyRefMut::MalformedArn => {
+                return Err(RotateKeyOnDemandErrorModeled::InvalidArnException(
+                    InvalidArnException {
+                        message: Some(crate::state::invalid_arn_message(&input.key_id)),
+                    },
+                )
+                .into());
+            }
+            crate::state::KeyRefMut::NotFound => {
+                return Err(RotateKeyOnDemandErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // "You can perform on-demand rotation of the key material in customer managed
+        // KMS keys" and "You cannot initiate on-demand rotation of Amazon Web Services
+        // managed KMS keys": a key KMS manages is a resource this operation is not
+        // valid for, which is what `UnsupportedOperationException` reports.
+        if key.key_manager != crate::state::KEY_MANAGER_CUSTOMER {
+            return Err(unsupported(format!(
+                "{} is not a customer managed key. You cannot initiate on-demand \
+                 rotation of an Amazon Web Services managed KMS key.",
+                key.arn
+            )));
+        }
+
+        // "On-demand key rotation is supported only on symmetric encryption KMS keys.
+        // You cannot perform on-demand rotation of asymmetric KMS keys, HMAC KMS keys,
+        // or KMS keys in a custom key store." Which keys those are follows from the
+        // key's own spec and usage rather than from one spec's name.
+        if !key.is_symmetric_encryption() {
+            return Err(unsupported(format!(
+                "{} is not a symmetric encryption KMS key. On-demand key rotation is \
+                 supported only on symmetric encryption KMS keys.",
+                key.arn
+            )));
+        }
+
+        // Rotation replaces the key material a key encrypts under, so the key must be
+        // in a key state where its material is in use: a disabled key has the modelled
+        // `DisabledException`, and any other state outside `Enabled` (awaiting
+        // deletion, or awaiting imported key material) is a key state this operation
+        // is not compatible with.
+        if key.key_state == crate::state::KEY_STATE_DISABLED {
+            return Err(RotateKeyOnDemandErrorModeled::DisabledException(DisabledException {
+                message: Some(crate::state::invalid_state_message(key)),
+            })
+            .into());
+        }
+        if !key.is_usable() {
+            return Err(RotateKeyOnDemandErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    message: Some(crate::state::invalid_state_message(key)),
+                },
+            )
+            .into());
+        }
+
+        // "To perform on-demand rotation of a set of related multi-Region keys, ...
+        // invoke the on-demand rotation on the primary Region key" — so a replica key
+        // of a multi-Region set does not rotate; the primary key of its set does.
+        if let Some(primary_region) = key
+            .multi_region_topology
+            .as_ref()
+            .map(|topology| topology.primary_region.clone())
+            .filter(|primary_region| *primary_region != key.region)
+        {
+            return Err(unsupported(format!(
+                "{} is a replica key of a multi-region key. Invoke the on-demand \
+                 rotation on the primary key, in {primary_region}.",
+                key.arn
+            )));
+        }
+
+        // KMS generates the replacement material only for a key whose material KMS
+        // generates. "When you initiate on-demand key rotation on a symmetric
+        // encryption KMS key with imported key material, you must have already
+        // imported new key material and that key material's state should be
+        // PENDING_ROTATION": this slice holds no imported key material at all
+        // (`ImportKeyMaterial` is not implemented), so a key whose material does not
+        // originate in KMS has nothing waiting to become current, and the call is
+        // refused rather than served with material the caller never supplied.
+        if key.origin != crate::state::ORIGIN_AWS_KMS {
+            return Err(unsupported(format!(
+                "The key material of {} has origin {}. Import new key material for the \
+                 KMS key first; its key material state must be PENDING_ROTATION.",
+                key.arn, key.origin
+            )));
+        }
+
+        // "You can perform on-demand key rotation a maximum of 25 times per KMS key" —
+        // a quota, and an exceeded quota is the modelled `LimitExceededException`.
+        let on_demand_rotations = key.on_demand_rotation_count();
+        if on_demand_rotations >= crate::state::MAX_ON_DEMAND_ROTATIONS {
+            return Err(RotateKeyOnDemandErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "{} has already had {on_demand_rotations} on-demand rotations. \
+                         You can perform on-demand key rotation a maximum of {} times \
+                         per KMS key.",
+                        key.arn,
+                        crate::state::MAX_ON_DEMAND_ROTATIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `ConflictException` reports that "an automatic rotation of this key is
+        // currently in progress or scheduled to begin within the next 20 minutes".
+        // Nothing in this slice schedules an automatic rotation (`EnableKeyRotation`
+        // is not implemented, so no key carries a rotation schedule), so no key here
+        // is in that conflict and none is manufactured.
+
+        // The replacement material is drawn the way the key's first version was: from
+        // the OS CSPRNG, in the form the key's spec calls for.
+        let Some(profile) = crate::state::key_spec_profile(&key.key_spec) else {
+            return Err(RotateKeyOnDemandErrorModeled::KMSInternalException(
+                KMSInternalException {
+                    message: Some("the key spec of the KMS key is not supported".to_string()),
+                },
+            )
+            .into());
+        };
+        let Some(material) = crate::state::mint_material(profile.material) else {
+            return Err(RotateKeyOnDemandErrorModeled::KMSInternalException(
+                KMSInternalException {
+                    message: Some("the new key material could not be generated".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "Immediately initiates rotation of the key material": the new material
+        // becomes the one the key encrypts under, the version it replaces is retained
+        // so ciphertext sealed under it still decrypts, and the rotation is recorded
+        // with the instant it happened. "On-demand rotations do not change existing
+        // automatic rotation schedules", so nothing else about the key is touched.
+        key.rotate_material(material, crate::state::ROTATION_TYPE_ON_DEMAND);
+
+        Ok(RotateKeyOnDemandOutput {
+            // KMS answers with the key ARN, not the identifier the request used — the
+            // way every other operation in this service reports the key it acted on.
+            key_id: Some(key.arn.clone()),
+        })
     }
+}
+
+/// Refuse a key this operation cannot rotate: "a specified parameter is not supported
+/// or a specified resource is not valid for this operation"
+/// (`smithy_query(query="doc",shape="UnsupportedOperationException")`).
+fn unsupported(message: impl Into<String>) -> RotateKeyOnDemandError {
+    RotateKeyOnDemandErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+        message: Some(message.into()),
+    })
+    .into()
 }

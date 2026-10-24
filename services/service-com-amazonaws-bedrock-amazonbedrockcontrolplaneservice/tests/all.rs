@@ -23,6 +23,8 @@ mod guardrail_timestamp_wire_form;
 mod guardrail_wire_shape;
 #[path = "all/guardrails.rs"]
 mod guardrails;
+#[path = "all/imported_models.rs"]
+mod imported_models;
 #[path = "all/marketplace_model_endpoints.rs"]
 mod marketplace_model_endpoints;
 #[path = "all/model_import_jobs.rs"]

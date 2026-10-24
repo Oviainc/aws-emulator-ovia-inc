@@ -425,6 +425,40 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
         ids
     }
 
+    /// The invitations this account's inbox holds through `region`'s endpoint, in
+    /// a total order.
+    ///
+    /// The invitations hang off [`Detector::received_invitations`], and the
+    /// operations that report the inbox name no detector at all
+    /// (`smithy_query(operation="ListInvitations")` binds `GET /invitation`), so
+    /// the inbox a request addresses is the one the Region it was signed for
+    /// serves — a detector is a REGIONAL resource, so an invitation delivered to
+    /// one Region's endpoint is not in another's inbox.
+    ///
+    /// Ordered by the inviting account id and then by the invitation id, which is
+    /// a TOTAL order over the records: that is what makes a page token mean the
+    /// same thing on the call that hands it back.
+    ///
+    /// One inviting account appears at most once: the key of each inbox IS the
+    /// inviting account id, and a Region holds at most one detector ("you can
+    /// have only one detector per account per Region", which `CreateDetector`
+    /// refuses a second create under), so the walk below cannot see two inboxes
+    /// of one account.
+    pub fn received_invitations_in(&self, region: &str) -> Vec<&ReceivedInvitationRecord> {
+        let mut invitations: Vec<&ReceivedInvitationRecord> = self
+            .detectors
+            .values()
+            .filter(|detector| detector.region == region)
+            .flat_map(|detector| detector.received_invitations.values())
+            .collect();
+        invitations.sort_by(|left, right| {
+            left.administrator_account_id
+                .cmp(&right.administrator_account_id)
+                .then_with(|| left.invitation_id.cmp(&right.invitation_id))
+        });
+        invitations
+    }
+
     /// The Malware Protection plan `region`'s endpoint serves for `id`, if any.
     ///
     /// Regional for the same reason a detector is: a plan is created through one
@@ -1935,14 +1969,17 @@ pub struct Detector {
     /// This emulator serves a single account ([`administrator_account_id`]) and
     /// models no way for another account to call `InviteMembers` against it, so no
     /// operation writes this map and it is EMPTY for every request the emulator
-    /// answers — which is why `AcceptInvitation` refuses every well-formed pair.
-    /// `InviteMembers` does not write it either: it is called BY the administrator
-    /// this emulator serves and delivers its invitation to the account it names,
-    /// which is another account and so has no detector here; what it writes is the
-    /// administrator side of the relationship ([`MemberRecord`]).
-    /// This is state rather than a constant because the refusal is a lookup: an
-    /// invitation this store holds is accepted, and the operations that report one
-    /// (`ListInvitations`, `GetInvitationsCount`, `DeclineInvitations`,
+    /// answers — which is why `AcceptInvitation` refuses every well-formed pair
+    /// and `ListInvitations` reports an empty inbox. `InviteMembers` does not
+    /// write it either: it is called BY the administrator this emulator serves and
+    /// delivers its invitation to the account it names, which is another account
+    /// and so has no detector here; what it writes is the administrator side of
+    /// the relationship ([`MemberRecord`]).
+    /// This is state rather than a constant because both the refusal and the
+    /// report are a lookup: an invitation this store holds is accepted by one and
+    /// reported by the other, read through [`Self::received_invitations_in`] and
+    /// projected through [`invitation_view`]. The rest of the operations that
+    /// report or drop one (`GetInvitationsCount`, `DeclineInvitations`,
     /// `DeleteInvitations`) are scaffolds with issues of their own.
     ///
     /// BOUNDED by [`MAX_INVITATIONS_PER_DETECTOR`], so a future writer cannot
@@ -2076,6 +2113,28 @@ pub fn member_view(
         // which one was sent, so the optional member is absent rather than invented.
         invited_at: member.invited_at_millis.map(iso8601),
         updated_at: iso8601(member.updated_at_millis),
+    }
+}
+
+/// The modelled `Invitation` a read reports for one invitation in the inbox.
+///
+/// Every member of the shape is optional (`smithy_query(shape="Invitation")`) and
+/// every one of them is a fact the record holds, so the projection fills them all
+/// and lives here once: the operations that report the inbox must not disagree
+/// about one invitation.
+pub fn invitation_view(
+    invitation: &ReceivedInvitationRecord,
+) -> crate::ops::types::list_invitations_types::Invitation {
+    crate::ops::types::list_invitations_types::Invitation {
+        // "The ID of the account that the invitation was sent from"
+        // (`smithy_query(shape="Invitation")`), which is the key the inbox holds
+        // the record under.
+        account_id: Some(invitation.administrator_account_id.clone()),
+        invitation_id: Some(invitation.invitation_id.clone()),
+        relationship_status: Some(invitation.relationship_status.clone()),
+        // `Invitation.InvitedAt` targets a `String`, rendered the way every other
+        // instant this service reports as text is.
+        invited_at: Some(iso8601(invitation.invited_at_millis)),
     }
 }
 

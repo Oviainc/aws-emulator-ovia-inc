@@ -492,9 +492,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The encryption context is authenticated, not stored: a context that differs
         // from the one `Encrypt` was given fails the tag, exactly as a tampered
-        // ciphertext does.
-        let Some(plaintext) =
-            crate::state::unseal(key, &envelope, input.encryption_context.as_ref())
+        // ciphertext does. Which VERSION of the key's material sealed the ciphertext
+        // is read from the same tag, so a ciphertext sealed before a rotation opens
+        // under the material it was sealed with.
+        let Some(opened) = crate::state::unseal(key, &envelope, input.encryption_context.as_ref())
         else {
             return Err(invalid_ciphertext());
         };
@@ -502,7 +503,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DecryptResponse {
             modelled: DecryptOutput {
                 key_id: Some(key.arn.clone()),
-                plaintext: Some(plaintext),
+                plaintext: Some(opened.plaintext),
                 encryption_algorithm: Some(algorithm),
                 // Only a `Recipient` request has a ciphertext for one, and those are
                 // refused above.
@@ -510,8 +511,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "The identifier of the key material used to decrypt the ciphertext.
                 // This field is present only when the operation uses a symmetric
                 // encryption KMS key" (`smithy_query(shape="DecryptResponse")`), which
-                // is exactly the material that carries an id.
-                key_material_id: key.current_key_material_id.clone(),
+                // is exactly the material that carries an id — the version that
+                // actually opened this ciphertext, not whichever version is current.
+                key_material_id: opened.key_material_id,
             },
             // Where that key's material comes from — the same field `DescribeKey`
             // reports as `KeyMetadata.Origin`, read from the one key record so the two

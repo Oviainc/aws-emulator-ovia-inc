@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreVolumeFromRecycleBin
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreVolumeFromRecycleBin`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes the volume the Recycle Bin is keeping back into the account's
+//! volumes — the SAME record the bin held, so the volume comes back with its id, its ARN,
+//! its create time, its tags and its state — and answers `Return: true`. A volume id the
+//! bin holds no entry for is refused with `InvalidVolumeID.Malformed` (HTTP 400) and the
+//! message `The volume ID '<id>' is malformed` ([`crate::state::volume_id_not_in_recycle_bin`]) —
+//! the one code the real service answers for every id this operation cannot resolve in the
+//! bin — and nothing is written.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreVolumeFromRecycleBin::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Which volumes the bin holds, and the permanent deletion the clock owes each one at the
+//! end of its retention period, are [`crate::state`]'s — see its "Recycle Bin" module
+//! docs. Nothing in this service's implemented surface puts a volume IN the bin: a deleted
+//! resource is retained only when a Recycle Bin retention rule covers it, retention rules
+//! are the `rbin` service's resources rather than EC2's, and `DeleteVolume` (its own
+//! scaffold-stub issue) is the operation that will consult one.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +142,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreVolumeFromRecycleBin` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreVolumeFromRecycleBinErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreVolumeFromRecycleBin"))
+        // `ctx` carries request metadata only; this operation reads none of it — a volume
+        // is named by id. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // Whether the bin still holds the volume is a question about NOW, so a permanent
+        // deletion the clock already owed is applied before the bin is read: a volume
+        // whose retention period ran out is gone whether or not anybody called, and a
+        // restore must not resurrect it.
+        store.materialize_due_transitions();
+
+        // "Restores a volume from the Recycle Bin": the Recycle Bin is the ONLY place this
+        // operation resolves a `VolumeId` against, and it answers ONE code for every id it
+        // cannot resolve there — `InvalidVolumeID.Malformed`, HTTP 400. That is what the
+        // real service answers for a well-formed long-form volume id the bin holds no entry
+        // for, so this operation does not distinguish "no such entry" from "not a volume
+        // id" and neither does this handler: an id the account still has a volume for, one
+        // the bin never held, one whose retention period has ended and a value that is not
+        // a volume id at all are all refused the same way. (`DescribeVolumes`, which
+        // resolves against the account's volumes, keeps its own `InvalidVolume.NotFound`.)
+        if !store.volumes_in_recycle_bin.contains_key(&input.volume_id) {
+            return Err(state::volume_id_not_in_recycle_bin(&input.volume_id));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation"
+        // (`RestoreVolumeFromRecycleBinRequest$DryRun`). The volume is still in the bin,
+        // and stays there.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        if !store.restore_recycled_volume(&input.volume_id) {
+            return Err(state::internal_error(format!(
+                "the Recycle Bin entry for volume '{volume_id}' checked a moment ago \
+                 could not be restored",
+                volume_id = input.volume_id,
+            )));
+        }
+        // "Returns true if the request succeeds; otherwise, it returns an error"
+        // (`RestoreVolumeFromRecycleBinResult$Return`).
+        Ok(RestoreVolumeFromRecycleBinOutput {
+            r#return: Some(true),
+        })
     }
 }

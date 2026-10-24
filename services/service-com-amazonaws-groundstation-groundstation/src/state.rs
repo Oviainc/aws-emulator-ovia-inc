@@ -8,6 +8,12 @@
 //! by their uuid, plus one ARN index so a `trackingConfigArn` / `missionProfileArn`
 //! reference resolves without scanning a map.
 //!
+//! Beside them are the facts about the account and the ground station network that AWS
+//! establishes OUTSIDE this API, which the model therefore only reports: the uplink
+//! approval, the reserved-minutes plan, the on-boarded satellites and the antennas AWS has
+//! taken out of service for maintenance ([`MaintenanceReservation`]). Each is read from an
+//! operator setting when this store is created.
+//!
 //! The helpers beside the struct are the pieces every handler of this service needs —
 //! the request's region, the union-member-to-`ConfigCapabilityType` mapping, the
 //! capability's user-facing spelling, the `ConfigArn` reader, uuid minting and the
@@ -20,7 +26,7 @@
 //! one literal two operations genuinely share).
 
 use std::collections::hash_map::RandomState;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -870,6 +876,13 @@ pub struct Contact {
     pub pre_pass_start_time: DateTime,
     pub post_pass_end_time: DateTime,
     pub ground_station: String,
+    /// The antenna at that ground station this contact's pass is placed on, as
+    /// [`antenna_name`] spells it. Assigned when the contact is reserved
+    /// ([`ComAmazonawsGroundstationGroundstationState::free_antenna`]) and never changed
+    /// afterwards — the antenna is what the reservation holds, and `UpdateContact` changes
+    /// what the antenna does during the pass, not which antenna flies it. It is what
+    /// `ListGroundStationReservations` reports as the reservation's `antennaName`.
+    pub antenna_name: String,
     pub contact_status: String,
     pub region: String,
     pub tags: HashMap<String, String>,
@@ -1797,6 +1810,72 @@ pub fn tagged_resource_not_found_message(arn: &str) -> String {
     format!("No resource found with ARN {arn}")
 }
 
+/// The `ReservationType` of the block of antenna time one of this account's contacts
+/// holds at a ground station.
+///
+/// This and [`RESERVATION_TYPE_MAINTENANCE`] are the model's own enum values
+/// (`smithy_query(query="shape", shape="ReservationType")` — `MAINTENANCE` and
+/// `CONTACT`), which is both what `ListGroundStationReservations` reports as an item's
+/// `reservationType` and what its `reservationTypes` filters on.
+pub const RESERVATION_TYPE_CONTACT: &str = "CONTACT";
+
+/// The `ReservationType` of a block of antenna time AWS holds for its own maintenance of
+/// a ground station's antenna. See [`RESERVATION_TYPE_CONTACT`].
+pub const RESERVATION_TYPE_MAINTENANCE: &str = "MAINTENANCE";
+
+/// The `MaintenanceType` values a maintenance reservation can carry: the model's own enum
+/// (`smithy_query(query="shape", shape="MaintenanceType")` — `PLANNED` and `UNPLANNED`).
+pub const MAINTENANCE_TYPES: &[&str] = &["PLANNED", "UNPLANNED"];
+
+/// The name of the `number`th antenna of a ground station, counted from one.
+///
+/// CHOSEN spelling: the model constrains an `AntennaName` only to 4..256 characters of
+/// `[ a-zA-Z0-9-._:=]` (`smithy_query(query="shape", shape="AntennaName")`), documents it
+/// as no more than "Name of the antenna", and no request of this service names one — AWS
+/// places a pass on an antenna itself. So the name is this emulator's, spelled once here
+/// so the antenna a reservation reports and the antenna [`MAINTENANCE_ENV`] takes out of
+/// service read the same way. The ground station is reported beside it (a
+/// `GroundStationReservationListItem` carries both), so the name does not repeat it.
+pub fn antenna_name(number: usize) -> String {
+    format!("Antenna {number}")
+}
+
+/// Whether two windows, each `(start, end)` in epoch seconds, share any instant.
+///
+/// CLOSED at both ends, which is how a listing's window filter asks the question — a
+/// reservation is in the window when its own window overlaps it — so one that starts
+/// exactly as the window ends is in it. The SAME reading serves the antenna placement, so
+/// two passes that merely touch are placed on different antennas; the two call sites
+/// ([`ComAmazonawsGroundstationGroundstationState::antennas_held`] and the listings) read
+/// one rule, and a half-open reading would have to replace it in both rather than in one.
+pub fn windows_overlap(first: (f64, f64), second: (f64, f64)) -> bool {
+    first.1 >= second.0 && first.0 <= second.1
+}
+
+/// A ground station antenna AWS has taken out of service for a span, as
+/// [`MAINTENANCE_ENV`] described it — the `MAINTENANCE` half of what
+/// `ListGroundStationReservations` reports.
+///
+/// Nothing in THIS API creates one: the model declares no operation that schedules
+/// maintenance and none that reports it other than `ListGroundStationReservations` itself
+/// (`smithy_query(query="digest")`), because AWS maintains its own antennas. So a
+/// maintenance window is minted when this service's store is created, from the operator
+/// setting, and the API reports it — and, like a contact's reservation, it holds the
+/// antenna, so no pass is placed on an antenna while it is under maintenance.
+#[derive(Debug, Clone)]
+pub struct MaintenanceReservation {
+    /// The ground station whose antenna is out of service, a `GroundStationName`.
+    pub ground_station: String,
+    /// The antenna that is out of service, an `AntennaName` ([`antenna_name`]).
+    pub antenna_name: String,
+    /// Whether this maintenance was planned, a `MaintenanceType` ([`MAINTENANCE_TYPES`]).
+    pub maintenance_type: String,
+    /// The first instant the antenna is out of service.
+    pub start_time: DateTime,
+    /// The instant it is back in service.
+    pub end_time: DateTime,
+}
+
 /// A satellite this account is on-boarded to, as [`SATELLITES_ENV`] described it.
 ///
 /// Nothing in THIS API creates one: the model declares no operation that onboards a
@@ -1841,23 +1920,23 @@ pub fn is_norad_satellite_id(value: i32) -> bool {
 /// len 0..500), which is what `GetSatellite`/`ListSatellites` report.
 pub const MAX_GROUND_STATIONS_PER_SATELLITE: usize = 500;
 
+/// Whether `byte` is inside the character set a `GroundStationName` and an `AntennaName`
+/// are spelled from: `[ a-zA-Z0-9-._:=]`, which both shapes' patterns name
+/// (`smithy_query(query="shape", shape="GroundStationName,AntennaName")`).
+fn is_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'.' | b'_' | b':' | b'=')
+}
+
 /// Whether `name` is spellable as a `GroundStationName`: length 4..97 over the character
 /// set `[ a-zA-Z0-9-._:=]` (`smithy_query(query="shape", shape="GroundStationName")`).
 pub fn is_ground_station_name(name: &str) -> bool {
-    (4..=97).contains(&name.len())
-        && name.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'.' | b'_' | b':' | b'=')
-        })
+    (4..=97).contains(&name.len()) && name.bytes().all(is_name_byte)
 }
 
-/// Whether `name` is spellable as an `AntennaName`: length 4..256 over the character set
-/// `[ a-zA-Z0-9-._:=]` (`smithy_query(query="shape", shape="AntennaName")`) — the same
-/// character set a `GroundStationName` takes, over a longer span.
+/// Whether `name` is spellable as an `AntennaName`: length 4..256 over the same character
+/// set as a `GroundStationName` (`smithy_query(query="shape", shape="AntennaName")`).
 pub fn is_antenna_name(name: &str) -> bool {
-    (4..=256).contains(&name.len())
-        && name.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'.' | b'_' | b':' | b'=')
-        })
+    (4..=256).contains(&name.len()) && name.bytes().all(is_name_byte)
 }
 
 /// Most antennas one ground station can report: the modelled maximum length of
@@ -2143,6 +2222,18 @@ pub struct ComAmazonawsGroundstationGroundstationState {
     /// exactly as a new AWS account does, and `ListSatellites` answers an empty list until
     /// an onboarding lands here.
     pub satellites: HashMap<String, Satellite>,
+    /// The ground station antennas AWS has taken out of service for maintenance — the
+    /// `MAINTENANCE` reservations `ListGroundStationReservations` reports, and blocks of
+    /// antenna time no pass is placed on.
+    ///
+    /// EMPTY unless [`MAINTENANCE_ENV`] schedules one, and that is the real state of the
+    /// ground station network rather than a gap in the emulator: AWS maintains its own
+    /// antennas, and the model carries no operation that schedules maintenance and none
+    /// that reports it other than `ListGroundStationReservations` itself
+    /// (`smithy_query(query="digest")`). So a ground station starts with nothing out of
+    /// service and the listing reports only this account's own contact reservations until
+    /// a maintenance window lands here.
+    pub maintenance_reservations: Vec<MaintenanceReservation>,
     /// The ground stations this account is served by, keyed by their `GroundStationName`,
     /// and the antennas at each — what `ListAntennas` reports.
     ///
@@ -2323,6 +2414,62 @@ pub fn parse_satellites(setting: &str) -> HashMap<String, Satellite> {
     satellites
 }
 
+/// The environment variable an operator uses to take a ground station's antenna out of
+/// service for maintenance, since the API models no operation that schedules one: a
+/// comma-separated list of entries, each
+/// `<ground station>/<antenna>/<maintenance type>/<start>/<end>` with the two instants in
+/// epoch seconds (`"Ohio 1/Antenna 1/PLANNED/1763000000/1763003600"`). Read once when this
+/// service's store is created. Unset means nothing is out of service, which is what a
+/// ground station network normally is.
+///
+/// `,` separates entries and `/` the fields of one, because neither is spellable in a
+/// `GroundStationName` or an `AntennaName`, so no name can be split in two.
+pub const MAINTENANCE_ENV: &str = "GROUNDSTATION_MAINTENANCE";
+
+/// The maintenance windows `setting` schedules, in the order it lists them.
+///
+/// An entry that is not five `/`-separated fields — a ground station and an antenna
+/// spellable as their shapes require, a `MaintenanceType` of [`MAINTENANCE_TYPES`], and a
+/// window of two epoch-seconds instants running forwards — is skipped rather than guessed
+/// at, so a typo takes nothing out of service instead of something unintended. The list is
+/// bounded by [`MAX_RECORDS_PER_STORE`].
+pub fn parse_maintenance(setting: &str) -> Vec<MaintenanceReservation> {
+    let mut windows: Vec<MaintenanceReservation> = Vec::new();
+    for entry in setting.split(',') {
+        if windows.len() >= MAX_RECORDS_PER_STORE {
+            break;
+        }
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = entry.split('/').map(str::trim).collect();
+        let [ground_station, antenna, maintenance_type, start, end] = fields[..] else {
+            continue;
+        };
+        if !is_ground_station_name(ground_station)
+            || !is_antenna_name(antenna)
+            || !MAINTENANCE_TYPES.contains(&maintenance_type)
+        {
+            continue;
+        }
+        let (Ok(start), Ok(end)) = (start.parse::<i64>(), end.parse::<i64>()) else {
+            continue;
+        };
+        if end <= start {
+            continue;
+        }
+        windows.push(MaintenanceReservation {
+            ground_station: ground_station.to_string(),
+            antenna_name: antenna.to_string(),
+            maintenance_type: maintenance_type.to_string(),
+            start_time: DateTime::from_secs(start),
+            end_time: DateTime::from_secs(end),
+        });
+    }
+    windows
+}
+
 /// The environment variable an operator uses to describe the ground stations THIS
 /// emulated account is served by and the antennas at each, since the API models no
 /// operation that builds one: a comma-separated list of entries, each either a bare
@@ -2396,8 +2543,9 @@ fn from_env<T: Default>(variable: &str, parse: impl Fn(&str) -> T) -> T {
 impl Default for ComAmazonawsGroundstationGroundstationState {
     /// An account with no resources, the uplink approval [`APPROVED_UPLINK_BANDS_ENV`]
     /// grants it, the reserved minutes [`RESERVED_MINUTES_ENV`] commits, the satellites
-    /// [`SATELLITES_ENV`] onboards and the ground stations [`GROUND_STATIONS_ENV`]
-    /// describes (none of them, unless they are set).
+    /// [`SATELLITES_ENV`] onboards, the ground station maintenance [`MAINTENANCE_ENV`]
+    /// schedules and the ground stations [`GROUND_STATIONS_ENV`] describes (none of them,
+    /// unless they are set).
     fn default() -> Self {
         Self {
             configs: HashMap::new(),
@@ -2413,6 +2561,7 @@ impl Default for ComAmazonawsGroundstationGroundstationState {
             ),
             reserved_minutes: from_env(RESERVED_MINUTES_ENV, parse_reserved_minutes),
             satellites: from_env(SATELLITES_ENV, parse_satellites),
+            maintenance_reservations: from_env(MAINTENANCE_ENV, parse_maintenance),
             ground_stations: from_env(GROUND_STATIONS_ENV, parse_ground_stations),
         }
     }
@@ -2773,6 +2922,88 @@ impl ComAmazonawsGroundstationGroundstationState {
                 contact.scheduling_settles_at = None;
             }
         }
+    }
+
+    /// The antennas at `ground_station` that something already holds for any instant of
+    /// `window` (`(start, end)` in epoch seconds): the ones a maintenance window AWS
+    /// scheduled has taken out of service, and the ones a contact of this account whose
+    /// reservation still holds antenna time ([`Contact::holds_antenna_time`]) is placed on.
+    ///
+    /// A released reservation holds nothing, so the antenna it was on is free again. Read
+    /// in ONE pass over each store, so placing a pass does not rescan them per candidate
+    /// antenna.
+    pub fn antennas_held(&self, ground_station: &str, window: (f64, f64)) -> HashSet<&str> {
+        let under_maintenance = self
+            .maintenance_reservations
+            .iter()
+            .filter(|maintenance| maintenance.ground_station == ground_station)
+            .filter(|maintenance| {
+                windows_overlap(
+                    (
+                        maintenance.start_time.as_secs_f64(),
+                        maintenance.end_time.as_secs_f64(),
+                    ),
+                    window,
+                )
+            })
+            .map(|maintenance| maintenance.antenna_name.as_str());
+        let reserved = self
+            .contacts
+            .values()
+            .filter(|contact| contact.ground_station == ground_station)
+            .filter(|contact| contact.holds_antenna_time())
+            .filter(|contact| {
+                windows_overlap(
+                    (
+                        contact.start_time.as_secs_f64(),
+                        contact.end_time.as_secs_f64(),
+                    ),
+                    window,
+                )
+            })
+            .map(|contact| contact.antenna_name.as_str());
+        under_maintenance.chain(reserved).collect()
+    }
+
+    /// The antenna at `ground_station` a pass over `window` is placed on: the first one
+    /// nothing holds for any instant of it, taking the antennas this account has been told
+    /// are AT that ground station ([`Self::antennas_at`], in the name order the inventory
+    /// holds them) before the ones this emulator numbers itself ([`antenna_name`]).
+    ///
+    /// An antenna serves ONE pass at a time, so two reservations whose windows overlap at
+    /// a ground station are on different antennas, and a reservation that overlaps none
+    /// takes the first antenna. Overlap is [`windows_overlap`], which is inclusive at both
+    /// ends, so two passes that merely TOUCH — one ending exactly as the next starts — are
+    /// placed on different antennas too; the band between a pass and the next on one
+    /// antenna is this emulator's reading, not a documented one, and it is the same reading
+    /// the listing's window filter uses.
+    ///
+    /// CHOSEN placement: AWS assigns the antenna itself and documents no rule for which,
+    /// and no request of this service names one, so the emulator places a pass on the first
+    /// free antenna. A ground station here therefore never runs out of antennas: when every
+    /// antenna its inventory records is held — and at a ground station whose antennas this
+    /// account has not been told about, where the inventory records none — the placement
+    /// falls through to this emulator's own numbering rather than refusing the reservation,
+    /// which keeps a reservation at a ground station with no recorded inventory (the
+    /// account a `GROUNDSTATION_GROUND_STATIONS` setting says nothing about) answerable.
+    /// A maintenance window on an antenna neither the inventory nor that numbering names
+    /// ([`MAINTENANCE_ENV`] accepts any `AntennaName`) is an antenna no pass is placed on,
+    /// so it holds nothing from a contact — it is still reported as the reservation it is.
+    pub fn free_antenna(&self, ground_station: &str, window: (f64, f64)) -> String {
+        let held = self.antennas_held(ground_station, window);
+        let recorded = self.antennas_at(ground_station);
+        // At most one antenna per reservation already held for `window` can be busy, so
+        // one of the first `held + 1` numbered antennas is always free: the search is
+        // bounded even when every recorded antenna is taken.
+        let numbered = (1..=held.len() + 1)
+            .map(antenna_name)
+            .filter(|antenna| !recorded.contains(antenna));
+        recorded
+            .iter()
+            .cloned()
+            .chain(numbered)
+            .find(|antenna| !held.contains(antenna.as_str()))
+            .unwrap_or_else(|| antenna_name(1))
     }
 }
 

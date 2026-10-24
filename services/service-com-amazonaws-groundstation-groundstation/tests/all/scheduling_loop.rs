@@ -220,7 +220,11 @@ pub(crate) async fn list_pages(
         let route = if query.is_empty() {
             path.to_string()
         } else {
-            format!("{path}?{}", query.join("&"))
+            // A listing whose route already carries filters (a window, a type) keeps
+            // them: the page size and the token join that query string rather than
+            // starting a second one.
+            let separator = if path.contains('?') { '&' } else { '?' };
+            format!("{path}{separator}{}", query.join("&"))
         };
 
         let reply = send(router, "GET", &route, None).await;

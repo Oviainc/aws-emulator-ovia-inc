@@ -5,7 +5,8 @@
 //! matches the activation code [`crate::ops::send_activation_code`] persisted for it:
 //! flips that record's status to `active` and moves its `updateTime`, both observable
 //! through a later `GetEmailContact` or `ListEmailContacts`. The modelled 404 for an
-//! ARN the store does not hold, and the modelled 400 for a code that is not the one
+//! ARN the store does not hold AND for a contact that holds no outstanding activation
+//! token (none was ever sent), and the modelled 400 for a code that is not the token
 //! outstanding for this contact. Idempotent: activating an already-active contact
 //! with its own code changes nothing and still answers 200.
 //!
@@ -168,10 +169,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::contact_not_found(&input.arn),
                 )
             })?;
-            // A contact with no outstanding code has nothing any code can match, so
-            // this refuses the request rather than activating on a code nobody
-            // issued. The submitted code is `@sensitive`, so it is never echoed back.
-            if contact.pending_activation_code.as_deref() != Some(input.code.as_str()) {
+            // Two distinct failure modes, told apart by whether the activation token
+            // this call compares against EXISTS at all. The token is a resource of
+            // its own, minted only by `SendActivationCode`, so a contact that holds
+            // none has no token resource to compare with: that is the modelled 404,
+            // naming the absent token. Only once a token is outstanding does a
+            // submitted code that differs from it become a bad field — the modelled
+            // 400. The submitted code is `@sensitive`, so neither echoes it back.
+            let Some(outstanding) = contact.pending_activation_code.as_deref() else {
+                return Err(
+                    ActivateEmailContactErrorModeled::ResourceNotFoundException(
+                        crate::state::activation_token_not_found(&input.arn),
+                    )
+                    .into(),
+                );
+            };
+            if outstanding != input.code.as_str() {
                 return Err(ActivateEmailContactErrorModeled::ValidationException(
                     crate::state::field_validation_failure(
                         "code",

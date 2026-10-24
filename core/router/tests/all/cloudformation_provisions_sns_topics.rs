@@ -18,7 +18,10 @@
 //! attributes the properties set (and whether they are written as strings, numbers,
 //! booleans or an object), whether the topic is standard or FIFO, whether the properties
 //! carry the two that are NOT attributes (an inline subscription list, a per-protocol
-//! delivery-status logging config), and which attribute an out-of-band write then changes.
+//! delivery-status logging config), whether the stack operation supplies stack-level `Tags`
+//! of its own (which CloudFormation propagates to the topics it creates, the resource's own
+//! declaration winning a key both of them name), and which attribute an out-of-band write
+//! then changes.
 //! Every expected value is computed from what the row declares, never read back out of the
 //! answer being checked.
 //!
@@ -189,18 +192,36 @@ fn error_code(xml: &str) -> String {
 }
 
 /// Create a stack, wait past its transition, and answer the `DescribeStacks` body.
+///
+/// `stack_tags` are the stack-level `Tags` the `CreateStack` call supplies, which
+/// CloudFormation propagates to the resources it creates.
 async fn create_and_settle(
     router: &MultiServiceRouter,
     case: &str,
     stack_name: &str,
     template: &str,
+    stack_tags: &[(&str, &str)],
 ) -> String {
-    let (status, body) = cloudformation(
-        router,
-        "CreateStack",
-        &[("StackName", stack_name), ("TemplateBody", template)],
-    )
-    .await;
+    let mut owned: Vec<(String, String)> = vec![
+        ("StackName".to_string(), stack_name.to_string()),
+        ("TemplateBody".to_string(), template.to_string()),
+    ];
+    for (index, (key, value)) in stack_tags.iter().enumerate() {
+        let position = index + 1;
+        owned.push((
+            format!("Tags.member.{position}.Key"),
+            (*key).to_string(),
+        ));
+        owned.push((
+            format!("Tags.member.{position}.Value"),
+            (*value).to_string(),
+        ));
+    }
+    let members: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let (status, body) = cloudformation(router, "CreateStack", &members).await;
     assert_eq!(
         status, 200,
         "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body {body}"
@@ -258,6 +279,9 @@ struct Row {
     case: &'static str,
     stack_name: &'static str,
     template: &'static str,
+    /// The stack-level `Tags` the `CreateStack` call supplies, which CloudFormation
+    /// propagates to every topic the stack creates.
+    stack_tags: &'static [(&'static str, &'static str)],
     topics: &'static [DeclaredTopic],
 }
 
@@ -267,6 +291,7 @@ const ROWS: &[Row] = &[
         stack_name: "unnamed-topic-stack",
         template: r#"{"Resources":{"Topic":{"Type":"AWS::SNS::Topic"}},
              "Outputs":{"TopicArn":{"Value":{"Ref":"Topic"}}}}"#,
+        stack_tags: &[],
         topics: &[DeclaredTopic {
             arn_output: "TopicArn",
             logical_id: "Topic",
@@ -288,6 +313,7 @@ const ROWS: &[Row] = &[
              "Outputs":{"EventsArn":{"Value":{"Ref":"Events"}},
                "EventsTopicArn":{"Value":{"Fn::GetAtt":["Events","TopicArn"]}},
                "EventsName":{"Value":{"Fn::GetAtt":["Events","TopicName"]}}}}"#,
+        stack_tags: &[],
         topics: &[DeclaredTopic {
             arn_output: "EventsArn",
             logical_id: "Events",
@@ -311,6 +337,7 @@ const ROWS: &[Row] = &[
                  "ContentBasedDeduplication":true,"FifoThroughputScope":"Topic",
                  "ArchivePolicy":{"MessageRetentionPeriod":30}}}},
              "Outputs":{"OrderedArn":{"Value":{"Ref":"Ordered"}}}}"#,
+        stack_tags: &[],
         topics: &[DeclaredTopic {
             arn_output: "OrderedArn",
             logical_id: "Ordered",
@@ -345,6 +372,7 @@ const ROWS: &[Row] = &[
                      "FailureFeedbackRoleArn":"arn:aws:iam::000000000000:role/sns-logs"}]}}},
              "Outputs":{"NotifiedArn":{"Value":{"Ref":"Notified"}},
                "LoggedArn":{"Value":{"Ref":"Logged"}}}}"#,
+        stack_tags: &[],
         topics: &[
             DeclaredTopic {
                 arn_output: "NotifiedArn",
@@ -382,6 +410,67 @@ const ROWS: &[Row] = &[
             },
         ],
     },
+    Row {
+        // Stack-level `Tags`: supplied on the stack operation rather than on the resource,
+        // and propagated by CloudFormation to the topic it creates — beside the topic's own
+        // declaration, which wins the key both of them name.
+        case: "stack-level tags, one of them a key the topic's own declaration also names",
+        stack_name: "stack-tagged-topic-stack",
+        template: r#"{"Resources":{"Probe":{"Type":"AWS::SNS::Topic",
+               "Properties":{"TopicName":"stack-tagged-probe-topic",
+                 "Tags":[{"Key":"owner","Value":"the-resource"}]}}},
+             "Outputs":{"TopicArn":{"Value":{"Ref":"Probe"}}}}"#,
+        stack_tags: &[
+            ("sim2real:managed", "true"),
+            ("sim2real:prefix", "sim2real-xsvc"),
+            ("owner", "the-stack"),
+        ],
+        topics: &[DeclaredTopic {
+            arn_output: "TopicArn",
+            logical_id: "Probe",
+            declared_name: Some("stack-tagged-probe-topic"),
+            expected_attributes: &[],
+            // The resource's own declaration of `owner`; the stack's tags are added by the
+            // expectation below, which is where the stack-level half of the set comes from.
+            expected_tags: &[("owner", "the-resource")],
+            expected_subscriptions: &[],
+            out_of_band_write: ("DisplayName", "probe, drifted"),
+        }],
+    },
+    Row {
+        // Two topics under one stack's tags, neither declaring tags of its own: the
+        // stack-level set reaches each of them, and only the logical-id tag differs.
+        case: "two topics under one stack's own tags and no declaration of their own",
+        stack_name: "stack-tagged-pair-stack",
+        template: r#"{"Resources":{
+               "Alarms":{"Type":"AWS::SNS::Topic",
+                 "Properties":{"TopicName":"stack-tagged-alarms-topic"}},
+               "Notices":{"Type":"AWS::SNS::Topic",
+                 "Properties":{"TopicName":"stack-tagged-notices-topic"}}},
+             "Outputs":{"AlarmsArn":{"Value":{"Ref":"Alarms"}},
+               "NoticesArn":{"Value":{"Ref":"Notices"}}}}"#,
+        stack_tags: &[("team", "platform"), ("cost-centre", "4711")],
+        topics: &[
+            DeclaredTopic {
+                arn_output: "AlarmsArn",
+                logical_id: "Alarms",
+                declared_name: Some("stack-tagged-alarms-topic"),
+                expected_attributes: &[],
+                expected_tags: &[],
+                expected_subscriptions: &[],
+                out_of_band_write: ("DisplayName", "alarms, drifted"),
+            },
+            DeclaredTopic {
+                arn_output: "NoticesArn",
+                logical_id: "Notices",
+                declared_name: Some("stack-tagged-notices-topic"),
+                expected_attributes: &[],
+                expected_tags: &[],
+                expected_subscriptions: &[],
+                out_of_band_write: ("DisplayName", "notices, drifted"),
+            },
+        ],
+    },
 ];
 
 #[tokio::test]
@@ -389,7 +478,9 @@ async fn a_completed_stack_has_created_every_topic_it_declares_in_sns() {
     let router = build_router();
 
     for row in ROWS {
-        let body = create_and_settle(&router, row.case, row.stack_name, row.template).await;
+        let body =
+            create_and_settle(&router, row.case, row.stack_name, row.template, row.stack_tags)
+                .await;
         assert_eq!(
             xml_text(&body, "StackStatus").as_deref(),
             Some("CREATE_COMPLETE"),
@@ -466,17 +557,24 @@ async fn a_completed_stack_has_created_every_topic_it_declares_in_sns() {
             )
             .await;
             let tags = tags_of(&listed);
-            // The tags the template declared, PLUS the three CloudFormation records on
-            // every resource it provisions: `aws:cloudformation:stack-name`,
-            // `aws:cloudformation:stack-id` and `aws:cloudformation:logical-id` (these rows
-            // supply no stack-level `Tags`, which would be here too). The whole set is held
-            // to by
+            // The stack's own `Tags`, then the tags the template declared for this resource
+            // — which win a key the stack also names, the declaration being the more
+            // specific statement about this one resource — PLUS the three CloudFormation
+            // records on every resource it provisions: `aws:cloudformation:stack-name`,
+            // `aws:cloudformation:stack-id` and `aws:cloudformation:logical-id`, which are
+            // CloudFormation's to set. The whole set is held to by
             // `services/service-com-amazonaws-cloudformation-cloudformation/tests/all/stack_tag_propagation.rs`.
-            let mut expected_tags: BTreeMap<String, String> = topic
-                .expected_tags
+            let mut expected_tags: BTreeMap<String, String> = row
+                .stack_tags
                 .iter()
                 .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
                 .collect();
+            expected_tags.extend(
+                topic
+                    .expected_tags
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+            );
             expected_tags.insert(
                 "aws:cloudformation:stack-name".to_string(),
                 row.stack_name.to_string(),
@@ -491,8 +589,8 @@ async fn a_completed_stack_has_created_every_topic_it_declares_in_sns() {
             );
             assert_eq!(
                 tags, expected_tags,
-                "case {case:?}: expected the declared tags beside the aws:cloudformation \
-                 ones, got {tags:?}"
+                "case {case:?}: expected the stack's own tags and the declared ones beside \
+                 the aws:cloudformation ones, got {tags:?}"
             );
 
             let listed = sns_ok(
@@ -573,7 +671,7 @@ async fn deleting_the_stack_deletes_the_topics_it_created() {
          "Outputs":{"KeptArn":{"Value":{"Ref":"Kept"}},
            "OtherArn":{"Value":{"Ref":"Other"}}}}"#;
 
-    let body = create_and_settle(&router, case, stack_name, template).await;
+    let body = create_and_settle(&router, case, stack_name, template, &[]).await;
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
         Some("CREATE_COMPLETE"),
@@ -632,7 +730,7 @@ async fn a_topic_changed_out_of_band_is_detected_as_drifted() {
            "Untouched":{"Type":"AWS::SNS::Topic",
              "Properties":{"TopicName":"untouched-stack-topic","DisplayName":"as declared"}}}}"#;
 
-    let body = create_and_settle(&router, case, stack_name, template).await;
+    let body = create_and_settle(&router, case, stack_name, template, &[]).await;
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
         Some("CREATE_COMPLETE"),
@@ -708,7 +806,7 @@ async fn a_topic_sns_refuses_to_create_fails_the_stack() {
            "Properties":{"TopicName":"refused-stack-topic","FifoTopic":true}}},
          "Outputs":{"TopicArn":{"Value":{"Ref":"Topic"}}}}"#;
 
-    let body = create_and_settle(&router, case, stack_name, template).await;
+    let body = create_and_settle(&router, case, stack_name, template, &[]).await;
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
         Some("CREATE_FAILED"),
@@ -755,7 +853,7 @@ async fn a_subscription_sns_refuses_fails_the_stack_and_leaves_no_topic() {
            "Properties":{"TopicName":"refused-subscription-topic",
              "Subscription":[{"Protocol":"https","Endpoint":"not-a-url"}]}}}}"#;
 
-    let body = create_and_settle(&router, case, stack_name, template).await;
+    let body = create_and_settle(&router, case, stack_name, template, &[]).await;
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
         Some("CREATE_FAILED"),
@@ -803,7 +901,7 @@ async fn an_update_that_would_change_a_created_topic_in_place_fails_the_stack() 
     let next = r#"{"Resources":{"Topic":{"Type":"AWS::SNS::Topic",
            "Properties":{"TopicName":"updated-stack-topic","DisplayName":"after"}}}}"#;
 
-    let body = create_and_settle(&router, case, stack_name, template).await;
+    let body = create_and_settle(&router, case, stack_name, template, &[]).await;
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
         Some("CREATE_COMPLETE"),
