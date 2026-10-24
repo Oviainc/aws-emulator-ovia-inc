@@ -219,6 +219,28 @@ pub const RETURN_SHIPPING_LABEL_BUCKET: &str = "snowball-return-shipping-labels"
 /// prefix in [`RETURN_SHIPPING_LABEL_BUCKET`].
 pub const RETURN_SHIPPING_LABEL_OBJECT: &str = "return-shipping-label.pdf";
 
+/// How long a job's unlock code can be read for after the job was created.
+///
+/// `GetJobUnlockCode` publishes the window: "A particular UnlockCode value can be accessed
+/// for up to 360 days after the associated job has been created", and `GetJobManifest`
+/// states the same of the pair: "The credentials of a given job, including its manifest
+/// file and unlock code, expire 360 days after the job is created." So the window is the
+/// job's own creation instant plus 360 days, not something a read moves.
+pub const UNLOCK_CODE_VALIDITY: Duration = Duration::from_secs(360 * 24 * 60 * 60);
+
+/// How many hyphen-separated groups a job's unlock code carries, and how many alphanumeric
+/// characters are in each.
+///
+/// `GetJobUnlockCode` documents the form: "The UnlockCode value is a 29-character code with
+/// 25 alphanumeric characters and 4 hyphens" — 25 characters split evenly by the 4 hyphens
+/// is five groups of five, which is what [`UNLOCK_CODE_LEN`] counts up to.
+pub const UNLOCK_CODE_GROUPS: usize = 5;
+pub const UNLOCK_CODE_GROUP_LEN: usize = 5;
+
+/// How long a job's unlock code is: its groups and the hyphens between them, i.e. the 29
+/// characters `GetJobUnlockCode` documents.
+pub const UNLOCK_CODE_LEN: usize = UNLOCK_CODE_GROUPS * UNLOCK_CODE_GROUP_LEN + UNLOCK_CODE_GROUPS - 1;
+
 /// The lifecycle states a job can be in: the whole `JobState` enum
 /// (`shared_types::JOB_STATE_VALUES`), so the cancellation rule below is expressed
 /// over the modelled set rather than over the two states this slice can reach.
@@ -316,6 +338,41 @@ impl JobState {
                 | Self::Complete
         )
     }
+
+    /// Whether a job in this state releases the credentials that unlock its device — its
+    /// manifest and its unlock code.
+    ///
+    /// `GetJobUnlockCode` documents the window: "The only valid status for calling this API
+    /// is WithCustomer as the manifest and Unlock code values are used for securing your
+    /// device and should only be used when you have the device", and `GetJobManifest` says
+    /// the same of the manifest half of the pair. `WithCustomer` is the one `JobState` in
+    /// which the device is in the caller's hands, so it is the one state these credentials
+    /// are released from.
+    pub fn releases_device_credentials(self) -> bool {
+        matches!(self, Self::WithCustomer)
+    }
+
+    /// This state, read back from the wire value [`Self::as_wire`] spells it as, or `None`
+    /// when `value` is not a `JobState` this service models.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        [
+            Self::New,
+            Self::PreparingAppliance,
+            Self::PreparingShipment,
+            Self::InTransitToCustomer,
+            Self::WithCustomer,
+            Self::InTransitToAWS,
+            Self::WithAWSSortingFacility,
+            Self::WithAWS,
+            Self::InProgress,
+            Self::Complete,
+            Self::Cancelled,
+            Self::Listing,
+            Self::Pending,
+        ]
+        .into_iter()
+        .find(|state| state.as_wire() == value)
+    }
 }
 
 /// One stored shipping address: every `Address` member this service keeps, so
@@ -401,6 +458,11 @@ pub struct StoredJob {
     /// export order was split into. Empty for a job part and for every job that is not an
     /// export order's main job.
     pub job_part_ids: Vec<String>,
+    /// The unlock code this service minted for the job when the job was created: the
+    /// credential `GetJobUnlockCode` reports, which "is used to decrypt the manifest file
+    /// when it is passed along with the manifest to the Snow device". It is the job's own
+    /// and is minted once, so every read of it answers the same code.
+    pub unlock_code: String,
 }
 
 impl StoredJob {
@@ -415,6 +477,18 @@ impl StoredJob {
     /// job, cannot be represented.
     pub fn is_master(&self) -> bool {
         !self.job_part_ids.is_empty()
+    }
+
+    /// When this job's unlock code stops being readable: [`UNLOCK_CODE_VALIDITY`] after
+    /// the job was created.
+    pub fn unlock_code_expires_at(&self) -> SystemTime {
+        self.creation_date + UNLOCK_CODE_VALIDITY
+    }
+
+    /// Whether this job's unlock code can still be read at `now`, i.e. the job is still
+    /// inside the window [`Self::unlock_code_expires_at`] closes.
+    pub fn unlock_code_is_readable(&self, now: SystemTime) -> bool {
+        now < self.unlock_code_expires_at()
     }
 
     /// This record as the modelled `JobMetadata` `DescribeJob` reports.
@@ -540,7 +614,8 @@ impl StoredCluster {
         }
     }
 
-    /// A node job of this cluster under the id `job_id`, created at `created`.
+    /// A node job of this cluster under the id `job_id`, created at `created`, carrying
+    /// the unlock code `unlock_code` the store minted for it.
     ///
     /// "If you're creating a job for a node in a cluster, you only need to provide the
     /// clusterId value; the other job attributes are inherited from the cluster"
@@ -549,7 +624,7 @@ impl StoredCluster {
     /// its pickup details, the long-term pricing it is associated with — are left for the
     /// caller of this helper to fill in, since the cluster holds nothing to inherit them
     /// from.
-    pub fn node_job(&self, job_id: String, created: SystemTime) -> StoredJob {
+    pub fn node_job(&self, job_id: String, created: SystemTime, unlock_code: String) -> StoredJob {
         StoredJob {
             job_id,
             // A node job AWS has accepted but prepared no device for is `New`, exactly as
@@ -578,6 +653,7 @@ impl StoredCluster {
             // A cluster's node is a job of its own, never an export order's main job, so
             // it holds no job parts.
             job_part_ids: Vec::new(),
+            unlock_code,
         }
     }
 }
@@ -819,6 +895,26 @@ fn mint_update_token(seq: u64, now: SystemTime) -> String {
     mint_digest("software-update", seq, now)
 }
 
+/// Mint a job's unlock code in the form `GetJobUnlockCode` documents:
+/// [`UNLOCK_CODE_GROUPS`] groups of [`UNLOCK_CODE_GROUP_LEN`] alphanumeric characters
+/// joined by hyphens, [`UNLOCK_CODE_LEN`] characters in all.
+///
+/// The characters are the leading digits of a SHA-256 over the store's own monotonic
+/// sequence number and the instant the job is created — alphanumeric, as the documented
+/// form requires — so a code is the service's own, is distinct from every other code this
+/// process mints, and is derived from neither the job id a caller holds nor anything the
+/// request carried.
+fn mint_unlock_code(seq: u64, now: SystemTime) -> String {
+    let digest = mint_digest("job-unlock-code", seq, now);
+    let groups: Vec<String> = (0..UNLOCK_CODE_GROUPS)
+        .map(|group| {
+            let start = group * UNLOCK_CODE_GROUP_LEN;
+            digest[start..start + UNLOCK_CODE_GROUP_LEN].to_string()
+        })
+        .collect();
+    groups.join("-")
+}
+
 /// One supported version of a Snow on-device service, and what that version runs on.
 ///
 /// The catalog record behind `ServiceVersion`: it carries the version itself plus one
@@ -951,6 +1047,9 @@ pub struct ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     /// How many return shipping labels this store has ever started: the per-store sequence
     /// the label token hashes, so two labels never share a token.
     next_return_shipping_label_seq: u64,
+    /// How many unlock codes this store has ever minted: the per-store sequence
+    /// [`mint_unlock_code`] hashes, so two jobs never share an unlock code.
+    next_unlock_code_seq: u64,
 }
 
 impl Default for ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
@@ -970,6 +1069,7 @@ impl Default for ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
             next_cluster_seq: 0,
             next_software_update_seq: 0,
             next_return_shipping_label_seq: 0,
+            next_unlock_code_seq: 0,
         }
     }
 }
@@ -1009,6 +1109,13 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     pub fn mint_job_id(&mut self) -> String {
         self.next_job_seq += 1;
         mint_id("JID", self.next_job_seq, SystemTime::now())
+    }
+
+    /// Mint the next job's unlock code: the form `GetJobUnlockCode` documents, minted
+    /// once per job when the job is created and held on the job's record from then on.
+    pub fn mint_unlock_code(&mut self) -> String {
+        self.next_unlock_code_seq += 1;
+        mint_unlock_code(self.next_unlock_code_seq, SystemTime::now())
     }
 
     /// Whether this store can hold another cluster, i.e. is below

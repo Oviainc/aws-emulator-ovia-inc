@@ -348,9 +348,9 @@ pub struct OutpostRecord {
     pub assets: Vec<AssetInfo>,
     /// The Amazon EC2 instances RUNNING on this Outpost — what
     /// `ListBlockingInstancesForCapacityTask` weighs a capacity task against, and what
-    /// `ListAssetInstances` (still a scaffold stub, with an issue of its own) reports
+    /// `ListAssetInstances` reports
     /// — in the order they were recorded, which is the order a page of them is cut in
-    /// ([`BLOCKING_INSTANCE_PAGE`]).
+    /// ([`BLOCKING_INSTANCE_PAGE`], [`ASSET_INSTANCE_PAGE`]).
     ///
     /// Kept on the Outpost's own record for the reason [`OutpostRecord::assets`] is: an
     /// instance runs on exactly ONE Outpost (the modelled routes nest both lists of
@@ -1925,6 +1925,16 @@ pub const ASSET_PAGE: &str = "assets";
 /// in THAT list and the route it is replayed on names the Outpost (and the capacity
 /// task) it belongs to. See [`ASSET_PAGE`].
 pub const BLOCKING_INSTANCE_PAGE: &str = "blockingInstances";
+
+/// The stamp a `ListAssetInstances` page token carries.
+///
+/// What it pages through is every instance recorded as running on one Outpost,
+/// belonging to all accounts and narrowed by its own four filters — a different
+/// list from the one `ListBlockingInstancesForCapacityTask` cuts out of the same
+/// recorded order ([`BLOCKING_INSTANCE_PAGE`]), which reports only one account's
+/// and drops what a capacity task excludes — so a token issued for one of them is
+/// not a boundary of the other. See [`ASSET_PAGE`].
+pub const ASSET_INSTANCE_PAGE: &str = "assetInstances";
 
 /// The stamp a `GetOutpostSupportedInstanceTypes` page token carries.
 ///

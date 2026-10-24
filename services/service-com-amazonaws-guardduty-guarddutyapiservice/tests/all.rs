@@ -65,6 +65,8 @@ mod member_accounts;
 mod member_association;
 #[path = "all/member_creation.rs"]
 mod member_creation;
+#[path = "all/member_invitation.rs"]
+mod member_invitation;
 #[path = "all/member_monitoring.rs"]
 mod member_monitoring;
 #[path = "all/modeled_constraint_refusals.rs"]
