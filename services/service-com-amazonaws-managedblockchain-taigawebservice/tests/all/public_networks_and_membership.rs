@@ -39,7 +39,10 @@ const OTHER_ACCOUNT: &str = "210987654321";
 /// `VoteOnProposal` — which carries out the `InviteAction` of an approved proposal on the
 /// real service — is still a scaffold stub (its own issue), so a join is exercised from a
 /// recorded invitation rather than a fabricated one.
-fn invite(
+///
+/// `pub(crate)` so the sibling suite that drives `CreateMember`'s own `Tags` reaches a join
+/// through this one helper rather than a second copy of it.
+pub(crate) fn invite(
     engine: &engine::InMemoryEngine,
     network_id: &str,
     principal: &str,

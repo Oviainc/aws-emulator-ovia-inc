@@ -346,11 +346,13 @@ async fn a_patch_the_description_cannot_take_is_refused_and_changes_nothing() {
         ),
         (
             // `op` is modelled as an enum, so a value outside it is refused by the
-            // request walk before the handler runs — a 400 all the same, never a 501.
+            // request walk before the handler runs — the same 400
+            // `BadRequestException` this service answers every modelled-constraint
+            // violation with, never a 501.
             "an off-model op".to_string(),
             vec![json!({ "op": "upsert", "path": "/description", "value": "x" })],
             400,
-            "ValidationException",
+            "BadRequestException",
         ),
         (
             "a replace with no value".to_string(),

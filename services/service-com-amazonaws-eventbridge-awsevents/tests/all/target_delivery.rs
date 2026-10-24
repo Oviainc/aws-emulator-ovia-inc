@@ -23,9 +23,12 @@
 //! than to deliver the untransformed event: `InputPath` and `InputTransformer`
 //! ask for the event to be reshaped before it is handed over, and that
 //! transformation is not implemented in this emulator yet, so handing the target
-//! the whole envelope instead would deliver something it never asked for. The
-//! same holds for a target that is not an SQS queue: its invocation path is not
-//! implemented here, and nothing is invented for it.
+//! the whole envelope instead would deliver something it never asked for.
+//!
+//! The other target kinds a rule may carry are invoked too, each through its own
+//! service's API; `tests/all/target_dispatch.rs` is the suite for that rule, and
+//! this one keeps the queue case because a queue is where a delivery is easiest
+//! to read back.
 
 use std::sync::Arc;
 
@@ -395,15 +398,16 @@ async fn delivery_follows_the_rules_that_match_and_no_others() {
     }
 }
 
-/// A target whose ARN is not an SQS queue is still RECORDED as a target the event
-/// reached — the routing log says where the event went — and nothing is invented
-/// for it: its invocation path is not implemented here, so no other queue
-/// receives it in its place.
+/// Every target of a matching rule is RECORDED as a target the event reached —
+/// the routing log says where the event went — whatever service it belongs to,
+/// and nothing is invented for one whose own service is not mounted here: no
+/// other queue receives the event in its place.
 #[tokio::test]
 async fn a_target_that_is_not_a_queue_is_recorded_and_not_invented_for() {
     // Rows differ along the target's service: a function, a topic, a state
-    // machine, and a log group — none of which this operation delivers to — plus
-    // an SQS queue as the positive control.
+    // machine, and a log group — whose services this router does not mount, so
+    // their invocations reach nothing — plus an SQS queue as the positive
+    // control.
     let emulator = emulator();
     let (url, queue_arn) = given_queue(&emulator, "mixed-probe").await;
     let account = engine::emulator_account_id();
