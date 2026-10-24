@@ -19,6 +19,8 @@ mod admin_account_scopes;
 mod administrator_gated_operations;
 #[path = "all/apps_list_reporting.rs"]
 mod apps_list_reporting;
+#[path = "all/compliance_status.rs"]
+mod compliance_status;
 #[path = "all/error_message_members.rs"]
 mod error_message_members;
 #[path = "all/managed_list_deletion.rs"]
