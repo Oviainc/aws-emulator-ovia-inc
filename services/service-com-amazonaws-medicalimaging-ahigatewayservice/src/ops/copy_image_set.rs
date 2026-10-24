@@ -34,6 +34,10 @@
 //! the source the workflow status it carried before the copy, since a copy changes
 //! nothing about the source. Nothing here sleeps.
 //!
+//! The DATA STORE the copy runs in must have settled into `ACTIVE` as well: a copy
+//! writes into the store, so one still `CREATING`, or already `DELETING`, is refused
+//! with the same modelled `ConflictException` ([`crate::state::Datastore::is_active`]).
+//!
 //! A copy also carries the source's PIXEL DATA: the image frames the source holds when
 //! the copy is admitted are delivered to the destination by the same clock-owed
 //! transition that releases it, so `GetImageFrame` serves them from the destination once
@@ -276,6 +280,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let datastore_arn = datastore.datastore_arn.clone();
+
+        // A copy mints or supersedes an image set INSIDE the data store, so the store has
+        // to have settled into `ACTIVE` first: one still `CREATING`, or already
+        // `DELETING`, is refused with the modelled `ConflictException` (HTTP 409) before
+        // any image set is looked up ([`crate::state::Datastore::is_active`]).
+        if !datastore.is_active() {
+            return Err(CopyImageSetErrorModeled::ConflictException(ConflictException {
+                message: crate::state::DATASTORE_NOT_ACTIVE_MESSAGE.to_string(),
+            })
+            .into());
+        }
 
         let source = datastore
             .image_sets
