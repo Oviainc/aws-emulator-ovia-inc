@@ -1758,10 +1758,13 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// that have one.
     ///
     /// The subnet counterpart of [`Self::vpc_available_at`], for the same reason and on the
-    /// same clock: `CreateSubnet` answers a subnet in the non-terminal `pending` state, so
-    /// the clock owes it `available` [`TRANSITION_DELAY`] later whether or not anybody
-    /// calls again. A subnet AWS hands over ready — a default VPC's default subnets — never
-    /// has an entry here.
+    /// same clock, for a WRITER that hands a subnet over in the non-terminal `pending`
+    /// state: the clock then owes it `available` [`TRANSITION_DELAY`] later whether or not
+    /// anybody calls again. A subnet AWS hands over ready has no entry here, which is every
+    /// subnet EC2 itself mints — `CreateSubnet` is synchronous and answers `available`, and
+    /// a default VPC's default subnets are ready too; the entries are the VLAN subnets
+    /// Amazon EVS provisions into this account as part of an environment it is still
+    /// building.
     pub subnet_available_at: BTreeMap<String, Instant>,
     /// Every Verified Access trust provider the account holds, by
     /// `VerifiedAccessTrustProviderId`, as the modelled
@@ -3913,8 +3916,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// instant whether or not anybody asked, so materialising it changes nothing
     /// a later caller would otherwise have seen. It covers every resource kind that
     /// has one — an instance's next state, a `pending` VPC becoming `available` with
-    /// its IPv6 association moving `associating` -> `associated`, a `pending` subnet
-    /// becoming `available`, a `pending` transit gateway with the route tables that come up
+    /// its IPv6 association moving `associating` -> `associated`, a subnet another service
+    /// handed over `pending` becoming `available`, a `pending` transit
+    /// gateway with the route tables that come up
     /// with it, a `pending` route server endpoint or route server peer becoming
     /// `available` (a route server's own two states are derived on read by
     /// [`RouteServerRecord::view_at`] instead), a VPC BPA exclusion reaching
@@ -11030,9 +11034,15 @@ impl ComAmazonawsEc2Amazonec2State {
 /// than read as a cursor.
 const PAGE_TOKEN_VERSION: &str = "ec2-1";
 
-/// Encode a pagination cursor — the resource id the NEXT page starts at — as an opaque
-/// token.
+/// Encode a pagination cursor — a resource id — as an opaque token.
 ///
+/// WHICH id is the CALLER's reading, and the two in this crate differ: a describe paged by
+/// [`page_from_cursor`] encodes the LAST item of the page it answered and resumes strictly
+/// after it, while a describe that still hand-rolls its page encodes the FIRST item of the
+/// next page and resumes at it. Nothing here depends on which: the cursor is opaque and
+/// only ever presented back to the operation that minted it, so each operation reads its
+/// own tokens. A NEW call site should take the exclusive reading, which is the one that can
+/// also name a page nothing follows.
 /// The token is the hex of `<version>:<checksum>:<id>`, so it is opaque to the caller and
 /// a token this service did not mint fails verification in [`decode_page_token`] instead
 /// of being treated as an id. Hex alone would not do that: any even-length hex string
@@ -11069,6 +11079,95 @@ fn page_token_checksum(start_at: &str) -> u64 {
     PAGE_TOKEN_VERSION.hash(&mut hasher);
     start_at.hash(&mut hasher);
     hasher.finish()
+}
+
+/// When a paged EC2 describe mints the `NextToken` that tells a caller to ask again.
+///
+/// The two readings differ only on a page the caller's `MaxResults` did NOT fill, and EC2
+/// does not answer them the same way for every operation — which is a fact of each
+/// operation's own backend, so the operation names the one it was recorded answering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageTokenRule {
+    /// A token only when the selected set holds a further item AFTER this page: the
+    /// answer looks ahead, so the last page of a walk carries none. This is what every
+    /// describe of this service answered before one of them was recorded doing otherwise,
+    /// and it is what "this value is null when there are no more items to return" reads
+    /// as on its own.
+    WhenAnotherItemFollows,
+    /// A token whenever the page reported an item at all, whether or not the limit filled
+    /// it and without looking ahead: the token means "resume AFTER what I just gave you",
+    /// so a walk ends on the TRAILING EMPTY page that token leads to rather than on the
+    /// last page that carried items.
+    ///
+    /// Recorded behaviour, not something the model states: a vpc-scoped, paged
+    /// `DescribeSecurityGroups` read answers a `NextToken` on a page that did not reach
+    /// `MaxResults`, and the page after it is empty and carries none. A caller must
+    /// therefore follow the token rather than stop at a short page — which is the whole
+    /// reason this is modelled instead of assumed away.
+    WhenThePageHeldItems,
+}
+
+/// One page of `ordered`, and the `NextToken` that page carries.
+///
+/// `ordered` is the whole selected set in the stable order the cursor names a position
+/// in — the id order each describe sorts into — `cursor` is the cursor
+/// [`decode_page_token`] read out of the request's `NextToken`, and `limit` is the page
+/// size: `None` for an operation whose `MaxResults` doc says a request naming none is not
+/// paged at all, which is then reported in one answer with no token whichever `rule` is
+/// named.
+///
+/// A cursor names the LAST item of the page it was issued with and the next page resumes
+/// AFTER it, so a token can be minted without there being a known item to name — which is
+/// what [`PageTokenRule::WhenThePageHeldItems`] needs — and a cursor whose resource has
+/// been deleted since still resumes at the right place.
+///
+/// Paging on the cursor rather than on an index is what keeps a walk correct when the
+/// store changes under it: a token names an id, so a resource inserted or deleted ahead
+/// of the cursor cannot shift the page's contents, and the cursor always advances because
+/// the order is total.
+///
+/// MIGRATION, so the two readings in the crate are not mistaken for a bug: the describes
+/// that have not moved onto this helper yet still hand-roll the page with an INCLUSIVE
+/// cursor — their token names the FIRST item of the NEXT page — which cannot express a
+/// token for a page nothing follows. Nothing breaks while both exist, because a token is
+/// opaque and only ever presented back to the operation that minted it; each describe
+/// moves over as the issue that owns its behaviour reaches it.
+pub fn page_from_cursor<'a, T>(
+    ordered: &'a [T],
+    cursor: Option<&str>,
+    limit: Option<usize>,
+    rule: PageTokenRule,
+    id_of: impl Fn(&T) -> &str,
+) -> (&'a [T], Option<String>) {
+    // The cursor is a POSITION in `ordered`, found by binary search, so an unsorted set
+    // would silently skip items rather than fail: a caller that has not sorted by the id
+    // `id_of` reads is the bug, and it fails loudly here in a debug or test build.
+    debug_assert!(
+        ordered
+            .windows(2)
+            .all(|pair| id_of(&pair[0]) <= id_of(&pair[1])),
+        "page_from_cursor needs its set in ascending id order"
+    );
+    let from = match cursor {
+        None => 0,
+        Some(cursor) => ordered.partition_point(|item| id_of(item) <= cursor),
+    };
+    let rest = ordered.get(from..).unwrap_or_default();
+    let Some(limit) = limit else {
+        return (rest, None);
+    };
+    let page = rest.get(..limit.min(rest.len())).unwrap_or_default();
+    let due = match rule {
+        PageTokenRule::WhenAnotherItemFollows => rest.len() > page.len(),
+        PageTokenRule::WhenThePageHeldItems => !page.is_empty(),
+    };
+    // `page.last()` is `None` only for an empty page, which no rule above mints a token
+    // for: there is no item for the cursor to name.
+    let token = page
+        .last()
+        .filter(|_| due)
+        .map(|item| encode_page_token(id_of(item)));
+    (page, token)
 }
 
 // ---------------------------------------------------------------------------

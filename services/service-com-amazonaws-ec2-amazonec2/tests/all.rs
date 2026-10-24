@@ -66,6 +66,8 @@ mod delete_security_group;
 mod delete_vpc;
 #[path = "all/describe_images.rs"]
 mod describe_images;
+#[path = "all/describe_page_truncation.rs"]
+mod describe_page_truncation;
 #[path = "all/describe_security_groups.rs"]
 mod describe_security_groups;
 #[path = "all/describe_subnets.rs"]

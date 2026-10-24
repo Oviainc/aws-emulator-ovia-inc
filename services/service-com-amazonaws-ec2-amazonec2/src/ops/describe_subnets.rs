@@ -196,10 +196,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
-        // The clock-owed transition this read is allowed to apply, the same call
-        // `DescribeVpcs` makes: a subnet `CreateSubnet` answered as `pending` is `available`
-        // once its due instant has passed, whether or not anybody called, so applying it
-        // here changes nothing a later caller would not have seen anyway.
+        // The clock-owed transitions this read is allowed to apply, the same call
+        // `DescribeVpcs` makes: each was already owed at this instant whether or not
+        // anybody called, so applying them here changes nothing a later caller would not
+        // have seen anyway. For a subnet that is the move a `pending` subnet another
+        // service handed over is owed — `CreateSubnet` is synchronous and answers
+        // `available`, so a subnet EC2 minted has none.
         store.materialize_due_transitions();
 
         // "The IDs of the subnets" (`DescribeSubnetsRequest$SubnetIds`): an id that names
@@ -233,15 +235,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // than inheriting it from the container `crate::state` happens to hold.
         selected.sort_by(|left, right| left.subnet_id.cmp(&right.subnet_id));
 
-        // That order is both the stable paging order and the cursor, so a token naming the
-        // id the next page starts at always advances.
-        let from = match start_at.as_deref() {
-            None => 0,
-            Some(cursor) => selected
-                .partition_point(|subnet| subnet.subnet_id.as_deref().unwrap_or_default() < cursor),
-        };
-        let page = selected.get(from..).unwrap_or_default();
-
         // "The maximum number of items to return for this request"
         // (`DescribeSubnetsRequest$MaxResults`). A request that names none gets the largest
         // page the model publishes, so the `NextToken` path below behaves the same whether
@@ -253,21 +246,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|max_results| usize::try_from(max_results).ok())
             .unwrap_or(DEFAULT_MAX_RESULTS);
 
-        // "This value is null when there are no more items to return"
-        // (`DescribeSubnetsResult$NextToken`): a token only when a subnet follows this
-        // page.
-        let next_token = page
-            .get(limit)
-            .and_then(|subnet| subnet.subnet_id.as_deref())
-            .map(crate::state::encode_page_token);
+        // The page and the token that follows it, through the one definition of EC2 paging
+        // ([`crate::state::page_from_cursor`]): the cursor names the subnet this page ends
+        // at, and this operation was recorded answering a token only while a further
+        // subnet follows the page.
+        let (page, next_token) = crate::state::page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            crate::state::PageTokenRule::WhenAnotherItemFollows,
+            |subnet| subnet.subnet_id.as_deref().unwrap_or_default(),
+        );
 
         Ok(DescribeSubnetsOutput {
-            subnets: Some(
-                page.iter()
-                    .take(limit)
-                    .map(|subnet| (*subnet).clone())
-                    .collect(),
-            ),
+            subnets: Some(page.iter().map(|subnet| (*subnet).clone()).collect()),
             next_token,
         })
     }

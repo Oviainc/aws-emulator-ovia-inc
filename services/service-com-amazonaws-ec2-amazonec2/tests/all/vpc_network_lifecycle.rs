@@ -205,8 +205,8 @@ async fn create_subnet_stores_the_requested_block_and_round_trips_through_descri
         let state = member(case, &body, "state");
         assert_eq!(
             state,
-            ec2::state::SUBNET_STATE_PENDING,
-            "case {case:?}: expected a subnet the clock still owes `available`, got {state:?}"
+            ec2::state::SUBNET_STATE_AVAILABLE,
+            "case {case:?}: expected a subnet created ready, got {state:?}"
         );
         let count = member(case, &body, "availableIpAddressCount");
         assert_eq!(
@@ -454,44 +454,58 @@ async fn create_subnet_refuses_a_block_it_cannot_place() {
     );
 }
 
-/// The rule: a subnet is answered in the non-terminal `pending` state and the clock owes
-/// it `available`, so a caller reading straight after the create still sees `pending`.
+/// The rule: creating a subnet is SYNCHRONOUS — the create answers `available` and that is
+/// the state every later read reports, so a caller that creates a subnet and launches into
+/// it never waits. The VPC the subnet is created into is the contrast: that one IS answered
+/// `pending` and reaches `available` on the clock, so this also pins that a subnet of a
+/// still-`pending` VPC is `available` from the first read.
+///
+/// The rows differ in the block's size and in whether the read happens straight after the
+/// create or after the span a clock-owed move would have taken.
 #[tokio::test]
-async fn create_subnet_settles_to_available_when_the_clock_owes_it() {
-    let case = "the clock-owed move";
+async fn create_subnet_answers_available_and_stays_available() {
     let router = emulator();
-    let vpc_id = create_vpc(case, &router, "10.30.0.0/16").await;
-    let subnet_id = create_subnet(case, &router, &vpc_id, "10.30.1.0/24").await;
+    let vpc_id = create_vpc("synchronous creation", &router, "10.30.0.0/16").await;
 
-    let before = ok(
-        case,
-        &router,
-        "DescribeSubnets",
-        &indexed("SubnetId", &[&subnet_id]),
-    )
-    .await;
-    let state = member(case, &before, "state");
-    assert_eq!(
-        state,
-        ec2::state::SUBNET_STATE_PENDING,
-        "case {case:?}: a subnet read straight after the create must still be pending, \
-         got {state:?}"
-    );
+    // (case, the subnet's block, whether to wait a transition span before reading back)
+    let cases = [
+        ("read straight back", "10.30.1.0/24", false),
+        ("a /28, read straight back", "10.30.2.0/28", false),
+        ("read after a transition span", "10.30.16.0/20", true),
+    ];
+    for (case, block, settle) in cases {
+        let created = ok(
+            case,
+            &router,
+            "CreateSubnet",
+            &[param("VpcId", &vpc_id), param("CidrBlock", block)],
+        )
+        .await;
+        let answered = member(case, &created, "state");
+        assert_eq!(
+            answered,
+            ec2::state::SUBNET_STATE_AVAILABLE,
+            "case {case:?}: expected the create to answer available, got {answered:?}"
+        );
+        let subnet_id = member(case, &created, "subnetId");
 
-    tokio::time::sleep(SETTLE_WAIT).await;
-    let after = ok(
-        case,
-        &router,
-        "DescribeSubnets",
-        &indexed("SubnetId", &[&subnet_id]),
-    )
-    .await;
-    let state = member(case, &after, "state");
-    assert_eq!(
-        state,
-        ec2::state::SUBNET_STATE_AVAILABLE,
-        "case {case:?}: a subnet past its due instant must report available, got {state:?}"
-    );
+        if settle {
+            tokio::time::sleep(SETTLE_WAIT).await;
+        }
+        let described = ok(
+            case,
+            &router,
+            "DescribeSubnets",
+            &indexed("SubnetId", &[&subnet_id]),
+        )
+        .await;
+        let read_back = member(case, &described, "state");
+        assert_eq!(
+            read_back,
+            ec2::state::SUBNET_STATE_AVAILABLE,
+            "case {case:?}: expected the describe to report available, got {read_back:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
