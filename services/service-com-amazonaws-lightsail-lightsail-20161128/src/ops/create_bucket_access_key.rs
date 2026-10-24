@@ -226,12 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let created = crate::state::with_state(&*self.engine, |store| {
             let bucket = store
                 .bucket_mut(&region, &input.bucket_name)
-                .ok_or_else(|| {
-                    not_found(format!(
-                        "bucketName '{}' does not name a bucket of this account in {region}",
-                        input.bucket_name
-                    ))
-                })?;
+                .ok_or_else(|| not_found(&input.bucket_name))?;
             if bucket.access_keys.len() >= crate::state::MAX_BUCKET_ACCESS_KEYS {
                 return Err(invalid(format!(
                     "bucket '{}' already holds {} access keys, the maximum a bucket may have; \
@@ -312,15 +307,11 @@ fn invalid(message: String) -> CreateBucketAccessKeyError {
     .into()
 }
 
-/// This operation's 404 for a bucket name this account holds no bucket under: the
-/// modelled `NotFoundException`, which the model documents as what "Lightsail
-/// throws when it cannot find a resource".
-fn not_found(message: String) -> CreateBucketAccessKeyError {
-    CreateBucketAccessKeyErrorModeled::NotFoundException(NotFoundException {
-        message: Some(message),
-        ..Default::default()
-    })
-    .into()
+/// No bucket of that name is stored in this Region: Lightsail's `DoesNotExist`
+/// rejection — HTTP 400, wire error `NotFoundException`, body `code`
+/// `DoesNotExist` and a message naming the resource type and the requested name.
+fn not_found(name: &str) -> CreateBucketAccessKeyError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(crate::state::RESOURCE_TYPE_BUCKET, name)
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

@@ -406,13 +406,18 @@ async fn a_bucket_access_key_is_minted_read_back_and_deleted_per_bucket() {
                 )
                 .await;
             assert_eq!(
-                status, 404,
-                "case {case}: deleting {id:?} twice must be a 404, got {status} {missing:?}"
+                status, 400,
+                "case {case}: deleting {id:?} twice must be a 400, got {status} {missing:?}"
             );
             assert_eq!(
                 error_code(&missing),
                 "NotFoundException",
                 "case {case}: expected NotFoundException, got {missing:?}"
+            );
+            assert_eq!(
+                missing["code"].as_str(),
+                Some("DoesNotExist"),
+                "case {case}: expected the body code DoesNotExist, got {missing:?}"
             );
         }
 
@@ -433,8 +438,9 @@ async fn a_bucket_access_key_is_minted_read_back_and_deleted_per_bucket() {
 }
 
 /// Every operation on an access key is about ONE bucket of ONE Region: a bucket
-/// name that names nothing is a 404, and a key of one bucket is neither reported
-/// nor deleted through another bucket's name or another Region's.
+/// name that names nothing is the service's `DoesNotExist` refusal, and a key of
+/// one bucket is neither reported nor deleted through another bucket's name or
+/// another Region's.
 #[tokio::test]
 async fn an_access_key_belongs_to_one_bucket_in_one_region() {
     let emulator = Emulator::new();
@@ -461,13 +467,18 @@ async fn an_access_key_belongs_to_one_bucket_in_one_region() {
     for (case, operation, body) in absent {
         let (status, missing) = emulator.call_in(None, operation, body.clone()).await;
         assert_eq!(
-            status, 404,
-            "case {case}: expected a 404, got {status} {missing:?}"
+            status, 400,
+            "case {case}: expected a 400, got {status} {missing:?}"
         );
         assert_eq!(
             error_code(&missing),
             "NotFoundException",
             "case {case}: expected NotFoundException, got {missing:?}"
+        );
+        assert_eq!(
+            missing["code"].as_str(),
+            Some("DoesNotExist"),
+            "case {case}: expected the body code DoesNotExist, got {missing:?}"
         );
     }
 
@@ -503,13 +514,18 @@ async fn an_access_key_belongs_to_one_bucket_in_one_region() {
             )
             .await;
         assert_eq!(
-            status, 404,
-            "case {bucket}: deleting another bucket's key must be a 404, got {status} {missing:?}"
+            status, 400,
+            "case {bucket}: deleting another bucket's key must be a 400, got {status} {missing:?}"
         );
         assert_eq!(
             error_code(&missing),
             "NotFoundException",
             "case {bucket}: expected NotFoundException, got {missing:?}"
+        );
+        assert_eq!(
+            missing["code"].as_str(),
+            Some("DoesNotExist"),
+            "case {bucket}: expected the body code DoesNotExist, got {missing:?}"
         );
     }
     assert_eq!(
@@ -556,13 +572,18 @@ async fn an_access_key_belongs_to_one_bucket_in_one_region() {
             .call_in(Some("eu-central-1"), operation, body.clone())
             .await;
         assert_eq!(
-            status, 404,
-            "case {case}: expected a 404, got {status} {missing:?}"
+            status, 400,
+            "case {case}: expected a 400, got {status} {missing:?}"
         );
         assert_eq!(
             error_code(&missing),
             "NotFoundException",
             "case {case}: expected NotFoundException, got {missing:?}"
+        );
+        assert_eq!(
+            missing["code"].as_str(),
+            Some("DoesNotExist"),
+            "case {case}: expected the body code DoesNotExist, got {missing:?}"
         );
     }
     assert_eq!(
