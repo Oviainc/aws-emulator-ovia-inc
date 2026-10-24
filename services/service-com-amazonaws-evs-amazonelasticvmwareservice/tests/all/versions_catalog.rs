@@ -407,22 +407,23 @@ async fn a_host_that_names_no_esx_version_runs_the_catalogue_default_for_its_vcf
     // VCF version." The version a host runs is not a member of the modelled `Host` shape,
     // so it is read back out of this service's own store.
     //
-    // One row per provided VCF version, and in each: a host that names no ESX version, a
-    // host that names one of its own, and a host that names one the catalogue does not
-    // offer (accepted as named: nothing in the model constrains `esxVersion` beyond its
-    // length).
-    let named: [(&str, Option<&str>); 3] = [
-        ("no esxVersion at all", None),
-        ("an esxVersion the request names", Some("8.0.3-24674464")),
-        ("an esxVersion outside the catalogue", Some("7.0.3")),
+    // One row per provided VCF version, and in each: a host that names no ESX version, and
+    // a host that names the version the catalogue offers for that VCF version. A version
+    // the catalogue does NOT offer is refused instead — "To find the available ESX versions
+    // for a particular VCF version, use the GetVersions action" — which the loop below
+    // asserts after the accepted rows.
+    let named: [(&str, bool); 2] = [
+        ("no esxVersion at all", false),
+        ("the esxVersion the catalogue offers", true),
     ];
 
     for version in &versions {
         let vcf_version = version.vcf_version.as_str();
         let environment = deployed_environment(&router, vcf_version, vcf_version).await;
-        for (index, (named_case, esx_version)) in named.iter().enumerate() {
+        for (index, (named_case, names_the_offered_version)) in named.iter().enumerate() {
             let case = format!("{vcf_version} with {named_case}");
             let host_name = format!("esx-default-{index}-{}", vcf_version.replace('.', "-"));
+            let esx_version = names_the_offered_version.then(|| version.default_esx_version.clone());
             let mut request = json!({
                 "environmentId": environment,
                 "host": {
@@ -431,7 +432,7 @@ async fn a_host_that_names_no_esx_version_runs_the_catalogue_default_for_its_vcf
                     "instanceType": INSTANCE_TYPES[index % INSTANCE_TYPES.len()],
                 },
             });
-            if let Some(esx_version) = esx_version {
+            if let Some(esx_version) = esx_version.as_deref() {
                 request["esxVersion"] = json!(esx_version);
             }
             let (status, answer) = call(&router, "CreateEnvironmentHost", &request).await;
@@ -443,9 +444,7 @@ async fn a_host_that_names_no_esx_version_runs_the_catalogue_default_for_its_vcf
 
             // The version the host runs: the one the request named, or the catalogue's
             // default for the environment's VCF version.
-            let expected = esx_version
-                .map(str::to_string)
-                .unwrap_or_else(|| version.default_esx_version.clone());
+            let expected = esx_version.unwrap_or_else(|| version.default_esx_version.clone());
             let state = evs::service_state(&*router.engine)
                 .expect("the in-memory engine carries this service's store");
             let stored = state
@@ -458,6 +457,60 @@ async fn a_host_that_names_no_esx_version_runs_the_catalogue_default_for_its_vcf
                 stored.as_deref(),
                 Some(expected.as_str()),
                 "case {case:?}: expected the host to run ESX {expected:?}, got {stored:?}"
+            );
+        }
+
+        // A version the catalogue does not offer for this VCF version names no ESX
+        // version Amazon EVS can install, so the host is refused and nothing is stored:
+        // one row per form such a string takes — another release, a build-qualified
+        // version of the offered one, and a word.
+        let outside = [
+            "7.0.3".to_string(),
+            format!("{}-24674464", version.default_esx_version),
+            "latest".to_string(),
+        ];
+        for (index, esx_version) in outside.iter().enumerate() {
+            let case = format!("{vcf_version} with the esxVersion {esx_version}");
+            let host_name = format!("esx-outside-{index}-{}", vcf_version.replace('.', "-"));
+            let request = json!({
+                "environmentId": environment,
+                "esxVersion": esx_version,
+                "host": {
+                    "hostName": host_name,
+                    "keyName": "evs-key",
+                    "instanceType": INSTANCE_TYPES[index % INSTANCE_TYPES.len()],
+                },
+            });
+            let (status, answer) = call(&router, "CreateEnvironmentHost", &request).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected 400, got {status} ({}) {answer}",
+                error_type(&answer)
+            );
+            let named_members: Vec<&str> = answer["fieldList"]
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry["name"].as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(
+                named_members.contains(&"esxVersion"),
+                "case {case:?}: the refusal must name esxVersion, got {answer}"
+            );
+            let state = evs::service_state(&*router.engine)
+                .expect("the in-memory engine carries this service's store");
+            let stored = state
+                .lock()
+                .environments
+                .get(&environment)
+                .map(|environment| environment.hosts.contains_key(&host_name));
+            assert_eq!(
+                stored,
+                Some(false),
+                "case {case:?}: a refused request must store no host"
             );
         }
     }
