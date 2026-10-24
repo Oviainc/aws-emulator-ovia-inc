@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +78,33 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    patch_optional_string, DeploymentEntry, Patch, PatchFailure, MAX_STRING_CHARS,
+};
+
+/// The patch paths a `Deployment` accepts.
+///
+/// The `Deployment` shape this service models declares four members — `id`,
+/// `createdDate`, `apiSummary` and `description` (`smithy_query(query="shape",
+/// shape="Deployment")`) — and the first three are not caller-set: the service mints the
+/// `id` and stamps the `createdDate`, and the `apiSummary` is the snapshot of the API's
+/// methods taken when the deployment was created (`Deployment$apiSummary`: "A summary of
+/// the RestApi at the date and time that the deployment resource was created"), which a
+/// later edit would stop being. So `description` is the one member "Changes information
+/// about a Deployment resource" can change.
+const SUPPORTED_PATHS: &[&str] = &["/description"];
+
+/// Apply one patch to a COPY of a stored deployment.
+fn apply_patch(entry: &mut DeploymentEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    match patch.member() {
+        // `patch_optional_string` is this crate's one reading of an op on a
+        // single-valued optional string member: `add`/`replace` set it, `remove` clears
+        // it, and any other op is refused as unsupported.
+        "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
+        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -161,18 +179,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDeployment"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches = crate::state::parse_patches(input.patch_operations.as_ref())
+            .map_err(patch_failure)?;
+
+        let mut store = state.lock();
+        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+            UpdateDeploymentErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+            })
+        })?;
+
+        // Patched on a COPY of the record: a list whose later op is refused leaves the
+        // stored deployment untouched, rather than keeping the ops before it.
+        let mut updated = api
+            .deployments
+            .get(&input.deployment_id)
+            .ok_or_else(|| {
+                UpdateDeploymentErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::NO_SUCH_DEPLOYMENT.to_string()),
+                })
+            })?
+            .clone();
+        for patch in &patches {
+            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+        }
+        // Rendered through the one `Deployment` body this crate builds, so the update
+        // reports the record exactly as `GetDeployment` will read it back. This operation
+        // takes no `embed`, so — like `CreateDeployment` — it reports no `apiSummary`:
+        // that member is served only to a request that asks for it with
+        // `embed=apisummary`, which `GetDeployment` is the call that takes.
+        let body = super::create_deployment::deployment_body(&updated, false);
+        api.deployments.insert(input.deployment_id.clone(), updated);
+
+        Ok(UpdateDeploymentOutput {
+            id: body.id,
+            description: body.description,
+            created_date: body.created_date,
+            api_summary: body.api_summary,
+        })
     }
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateDeploymentError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateDeploymentErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateDeploymentErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateDeploymentErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
 }

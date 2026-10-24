@@ -85,3 +85,12 @@ mod update_method_response;
 mod usage_plan_lifecycle;
 #[path = "all/validation_message_rules.rs"]
 mod validation_message_rules;
+
+// Declared after the sorted list on purpose: every apigateway fix that lands adds its
+// suite inside that list, so a line inserted there collides with every other suite
+// landing in the same window — this fix lost three serialized squash merges to exactly
+// that. Appending keeps this change out of the contended region; the suite itself is an
+// ordinary `tests/all/<name>.rs` file. Fold it into the sorted list whenever the list is
+// next touched for another reason.
+#[path = "all/update_deployment.rs"]
+mod update_deployment;

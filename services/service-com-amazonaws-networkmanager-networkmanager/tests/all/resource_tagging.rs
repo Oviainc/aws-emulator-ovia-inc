@@ -20,6 +20,8 @@ pub(crate) const GLOBAL_NETWORK: &str = "global-network";
 pub(crate) const SITE: &str = "site";
 /// See [`GLOBAL_NETWORK`].
 pub(crate) const LINK: &str = "link";
+/// See [`GLOBAL_NETWORK`].
+pub(crate) const DEVICE: &str = "device";
 
 /// The documented maximum length of a tag key, in characters: "Constraints: Maximum
 /// length of 128 characters" (`smithy_query query="doc" shape="Tag" member="Key"`).
@@ -92,7 +94,8 @@ pub(crate) struct Taggable {
     pub(crate) kind: &'static str,
     pub(crate) arn: String,
     pub(crate) id: String,
-    /// The resource's own reader (`DescribeGlobalNetworks` / `GetSites` / `GetLinks`).
+    /// The resource's own reader (`DescribeGlobalNetworks` / `GetSites` / `GetLinks` /
+    /// `GetDevices`).
     pub(crate) read_uri: String,
     /// The list member that reader answers with, and the id member inside it.
     pub(crate) list: &'static str,
@@ -173,6 +176,28 @@ pub(crate) async fn create_taggable(
                 read_uri: format!("/global-networks/{network}/links"),
                 list: "Links",
                 id_member: "LinkId",
+            }
+        }
+        DEVICE => {
+            let network = emulator.create_global_network("tagging").await;
+            let site = emulator.create_site(&network, "tagging").await;
+            let (status, created) = emulator
+                .post(
+                    &format!("/global-networks/{network}/devices"),
+                    body_with(json!({ "SiteId": site, "Type": "router" }), tags),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "CreateDevice({tags}): expected 200, got {status} with {created}"
+            );
+            Taggable {
+                kind,
+                arn: string_member(&created["Device"], "DeviceArn"),
+                id: string_member(&created["Device"], "DeviceId"),
+                read_uri: format!("/global-networks/{network}/devices"),
+                list: "Devices",
+                id_member: "DeviceId",
             }
         }
         other => panic!("no taggable resource kind {other:?}"),
@@ -270,6 +295,18 @@ fn tag_cases() -> Vec<TagCase> {
             applied: json!([tag(&"k".repeat(MAX_KEY_CHARS), &"v".repeat(MAX_VALUE_CHARS))]),
             after_tag: json!([tag(&"k".repeat(MAX_KEY_CHARS), &"v".repeat(MAX_VALUE_CHARS))]),
             removed: vec![],
+            after_untag: json!([tag(&"k".repeat(MAX_KEY_CHARS), &"v".repeat(MAX_VALUE_CHARS))]),
+        },
+        TagCase {
+            name: "device, a key and value at the documented maximum lengths",
+            kind: DEVICE,
+            initial: json!([tag("env", "dev")]),
+            applied: json!([tag(&"k".repeat(MAX_KEY_CHARS), &"v".repeat(MAX_VALUE_CHARS))]),
+            after_tag: json!([
+                tag("env", "dev"),
+                tag(&"k".repeat(MAX_KEY_CHARS), &"v".repeat(MAX_VALUE_CHARS)),
+            ]),
+            removed: vec!["env"],
             after_untag: json!([tag(&"k".repeat(MAX_KEY_CHARS), &"v".repeat(MAX_VALUE_CHARS))]),
         },
         TagCase {

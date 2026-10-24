@@ -49,6 +49,8 @@ mod revoke_flow_entitlement;
 mod state_roundtrip;
 #[path = "all/update_bridge.rs"]
 mod update_bridge;
+#[path = "all/update_bridge_source.rs"]
+mod update_bridge_source;
 #[path = "all/update_flow.rs"]
 mod update_flow;
 #[path = "all/update_flow_entitlement.rs"]
