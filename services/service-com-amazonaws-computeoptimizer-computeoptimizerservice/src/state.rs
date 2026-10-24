@@ -103,6 +103,15 @@ pub const STATUS_INACTIVE: &str = "Inactive";
 pub const RESOURCE_TYPE_EC2_INSTANCE: &str = "Ec2Instance";
 /// See [`RESOURCE_TYPE_EC2_INSTANCE`].
 pub const RESOURCE_TYPE_AUTO_SCALING_GROUP: &str = "AutoScalingGroup";
+/// The `ResourceType` an Amazon ECS service is analysed as (`RESOURCE_TYPE_VALUES`). A
+/// preference written for it is what `GetECSServiceRecommendations` resolves its effective
+/// look-back period from.
+///
+/// Not to be confused with [`SOURCE_TYPE_ECS_SERVICE`], which spells the same word in the
+/// `RecommendationSourceType` domain a findings row carries: one is what a PREFERENCE is
+/// written for, the other what an analysed resource IS. Anything naming an ECS service in
+/// either domain uses one of these two constants rather than the literal.
+pub const RESOURCE_TYPE_ECS_SERVICE: &str = "EcsService";
 
 /// The account's Compute Optimizer enrollment: one record per account, as the service
 /// models it (`GetEnrollmentStatus` takes no input and returns exactly one).
