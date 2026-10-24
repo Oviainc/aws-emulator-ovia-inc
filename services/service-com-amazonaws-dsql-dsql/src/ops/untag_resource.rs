@@ -195,12 +195,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A tag under the AWS-reserved prefix is AWS's own: a caller can no more
+        // remove one than write it, so a request naming such a key is refused in
+        // full, before anything is resolved or removed. Same check, same refusal, as
+        // the operations that write tags.
+        if let Err(invalid) = crate::state::validate_tag_keys(
+            crate::state::TAG_KEYS_MEMBER,
+            input.tag_keys.iter().map(String::as_str),
+        ) {
+            return Err(UntagResourceErrorModeled::ValidationException(invalid).into());
+        }
+
         let mut state = state.lock();
         // A status change the clock already owes is materialised first: it was due at
         // this instant even if nobody had called, and a settled deletion is what
         // decides whether the named cluster is still addressable at all.
         state.settle(::std::time::SystemTime::now());
-
         let Some(tags) = state.resource_tags_mut(&resource) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(
