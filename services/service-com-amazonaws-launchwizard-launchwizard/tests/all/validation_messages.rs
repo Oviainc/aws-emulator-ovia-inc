@@ -35,11 +35,12 @@ const CODE: &str = "ValidationException";
 /// See [`CODE`].
 const STATUS: u16 = 400;
 
-/// A `specifications` map every seeded deployment pattern accepts: the two fields the
-/// published schema marks `required` and nothing it does not publish. The rows below
-/// are about a member OTHER than `specifications`, so they carry a map the handler's
-/// own schema check has nothing to say about — what they assert is the boundary
-/// refusal that precedes it.
+/// A well-formed `specifications` map for the rows below, which are about a member
+/// OTHER than `specifications`: each one is refused at the BOUNDARY, before the handler
+/// resolves the deployment pattern and judges the settings against the schema that
+/// pattern publishes, so what this map holds is not what those rows assert. A row that
+/// has to get PAST the boundary fills in the pattern's own published schema instead
+/// (`deployment_lifecycle::required_specifications`).
 fn conforming_specifications() -> Value {
     json!({"KeyPairName": "a-key-pair", "VpcId": "vpc-0123456789abcdef0"})
 }
@@ -383,23 +384,9 @@ async fn the_composed_rendering_covers_every_constrained_list_the_model_declares
 async fn an_unusable_next_token_is_refused_with_the_fixed_pagination_message() {
     let harness = Harness::new();
     // One deployment, so `ListDeploymentEvents` has a resource to page the events of.
-    let created = harness
-        .ok(
-            "seed",
-            "/createDeployment",
-            json!({
-                "workloadName": "SAP",
-                "deploymentPatternName": "SapHanaSingle",
-                "name": "token-suite",
-                "specifications": conforming_specifications(),
-                "dryRun": false,
-            }),
-        )
-        .await;
-    let deployment = created["deploymentId"]
-        .as_str()
-        .expect("a created deployment reports its id")
-        .to_string();
+    // Created through the shared helper, so its settings are the ones the pattern's own
+    // schema asks for.
+    let deployment = create(&harness, "seed", "SAP", "SapHanaSingle", "token-suite").await;
 
     // A real token, so one row can tamper with a token this service really issued.
     let first_page = harness
