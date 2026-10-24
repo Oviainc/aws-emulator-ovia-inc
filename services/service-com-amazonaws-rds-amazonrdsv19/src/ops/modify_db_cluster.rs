@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyDBCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyDBCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Modifies the settings of a DB cluster this service holds: every setting the request
+//! names is written onto the stored cluster record, which then reports the modification as
+//! `modifying` until the clock settles it back to `available`. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyDBCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A cluster takes ONE modification at a time. "The requested operation can't be performed
+//! while the cluster is in this state" (`InvalidDBClusterStateFault`) is what a request
+//! that arrives while the cluster is not `available` is answered with — which is what
+//! serialises two concurrent calls on one cluster: the first is accepted and leaves the
+//! cluster `modifying`, the second sees that state and is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -356,18 +357,471 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyDBCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyDBClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyDBCluster"))
+        let region =
+            crate::state::request_region(ctx).map_err(ModifyDBClusterError::validation)?;
+        // `DBClusterIdentifier`: "This parameter isn't case-sensitive", and a cluster's
+        // identifier is stored lowercased — so both the identifier and the ARN form fold
+        // to the key the store is keyed by before anything is looked up.
+        let identifier =
+            crate::state::db_cluster_identifier_of(&input.db_cluster_identifier).to_ascii_lowercase();
+        // `NewDBClusterIdentifier`: "The first character must be a letter. Can't end with a
+        // hyphen or contain two consecutive hyphens. … This value is stored as a lowercase
+        // string." The length bound is the one the cluster's type gives it, which is read
+        // from the cluster's engine further down.
+        let renamed_to = input
+            .new_db_cluster_identifier
+            .as_ref()
+            .map(|requested| requested.to_ascii_lowercase());
+
+        // The documented constraints of the values this request carries, refused with the
+        // Query API error code the real service answers each with.
+        if let Some(period) = input.backup_retention_period {
+            if !crate::state::CLUSTER_BACKUP_RETENTION_RANGE.contains(&period) {
+                return Err(ModifyDBClusterError::invalid_parameter_value(format!(
+                    "invalid value {period} for BackupRetentionPeriod: must be a value from \
+                     {} to {}",
+                    crate::state::CLUSTER_BACKUP_RETENTION_RANGE.start(),
+                    crate::state::CLUSTER_BACKUP_RETENTION_RANGE.end()
+                )));
+            }
+        }
+        if let Some(port) = input.port {
+            if !crate::state::PORT_RANGE.contains(&port) {
+                return Err(ModifyDBClusterError::invalid_parameter_value(format!(
+                    "invalid value {port} for Port: must be a value from {} to {}",
+                    crate::state::PORT_RANGE.start(),
+                    crate::state::PORT_RANGE.end()
+                )));
+            }
+        }
+        if let Some(window) = input.backtrack_window {
+            if !crate::state::BACKTRACK_WINDOW_RANGE.contains(&window) {
+                return Err(ModifyDBClusterError::invalid_parameter_value(format!(
+                    "invalid value {window} for BacktrackWindow: must be a value from {} to {}",
+                    crate::state::BACKTRACK_WINDOW_RANGE.start(),
+                    crate::state::BACKTRACK_WINDOW_RANGE.end()
+                )));
+            }
+        }
+        if let Some(password) = &input.master_user_password {
+            crate::state::check_master_user_password(password)
+                .map_err(ModifyDBClusterError::invalid_parameter_value)?;
+        }
+        if let Some(support) = &input.engine_lifecycle_support {
+            crate::state::check_engine_lifecycle_support(support)
+                .map_err(ModifyDBClusterError::invalid_parameter_value)?;
+        }
+        // Nothing caller-sized reaches the store unchecked: every free-form value this
+        // modification would store is length-bounded and every stored list is
+        // count-bounded (see the "store bounds" paragraph in `src/state.rs`).
+        for (member, value) in [
+            (
+                "DBClusterParameterGroupName",
+                input.db_cluster_parameter_group_name.as_deref(),
+            ),
+            (
+                "DBInstanceParameterGroupName",
+                input.db_instance_parameter_group_name.as_deref(),
+            ),
+            ("DBClusterInstanceClass", input.db_cluster_instance_class.as_deref()),
+            ("Domain", input.domain.as_deref()),
+            ("DomainIAMRoleName", input.domain_iam_role_name.as_deref()),
+            ("MonitoringRoleArn", input.monitoring_role_arn.as_deref()),
+            ("OptionGroupName", input.option_group_name.as_deref()),
+            (
+                "PerformanceInsightsKMSKeyId",
+                input.performance_insights_kms_key_id.as_deref(),
+            ),
+            ("PreferredBackupWindow", input.preferred_backup_window.as_deref()),
+            (
+                "PreferredMaintenanceWindow",
+                input.preferred_maintenance_window.as_deref(),
+            ),
+            ("StorageType", input.storage_type.as_deref()),
+            ("NetworkType", input.network_type.as_deref()),
+            ("CACertificateIdentifier", input.ca_certificate_identifier.as_deref()),
+        ] {
+            if let Some(value) = value {
+                crate::state::check_free_form(member, value)
+                    .map_err(ModifyDBClusterError::invalid_parameter_value)?;
+            }
+        }
+        if let Some(groups) = &input.vpc_security_group_ids {
+            crate::state::check_security_group_memberships("VpcSecurityGroupIds", groups)
+                .map_err(ModifyDBClusterError::invalid_parameter_value)?;
+        }
+        if let Some(exports) = &input.cloudwatch_logs_export_configuration {
+            for (member, values) in [
+                ("EnableLogTypes", exports.enable_log_types.as_ref()),
+                ("DisableLogTypes", exports.disable_log_types.as_ref()),
+            ] {
+                if let Some(values) = values {
+                    crate::state::check_request_list_len(
+                        member,
+                        values.len(),
+                        crate::state::MAX_CLUSTER_LIST_ENTRIES,
+                    )
+                    .map_err(ModifyDBClusterError::invalid_parameter_value)?;
+                    for value in values {
+                        crate::state::check_free_form(member, value)
+                            .map_err(ModifyDBClusterError::invalid_parameter_value)?;
+                    }
+                }
+            }
+        }
+        // `ManageMasterUserPassword` has RDS "generate and manage the master user password
+        // in Amazon Web Services Secrets Manager" and report the secret it created; this
+        // service mints no such secret, so the request is answered naming the member
+        // rather than with a cluster whose managed secret does not exist. The same goes for
+        // rotating one that was never created.
+        for (member, asked) in [
+            (
+                "ManageMasterUserPassword",
+                input.manage_master_user_password == Some(true),
+            ),
+            (
+                "RotateMasterUserPassword",
+                input.rotate_master_user_password == Some(true),
+            ),
+        ] {
+            if asked {
+                return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                    crate::scaffolded::NotImplemented {
+                        message: format!(
+                            "ModifyDBCluster${member} is not implemented in this emulator: it \
+                             has RDS manage the master user password in Amazon Web Services \
+                             Secrets Manager and report that secret as MasterUserSecret, and \
+                             this service mints no such secret. Name MasterUserPassword \
+                             instead."
+                        ),
+                    },
+                ));
+            }
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated cluster.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope.
+        let key = (region.clone(), identifier.clone());
+        let Some(current) = store.db_clusters.get(&key) else {
+            return Err(ModifyDBClusterErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(format!("DBCluster {identifier} not found.")),
+                },
+            )
+            .into());
+        };
+        let engine = current.engine.clone();
+        let status = current.status.clone();
+
+        // A cluster takes one modification at a time: one that is still coming up, on its
+        // way out, or already applying a modification is not in a state this operation can
+        // be performed in. The status the clock has yet to settle is real, which is what
+        // makes two concurrent calls serialise — see this file's module docs.
+        if status != crate::state::DB_CLUSTER_STATUS_AVAILABLE {
+            return Err(ModifyDBClusterErrorModeled::InvalidDBClusterStateFault(
+                InvalidDBClusterStateFault {
+                    message: Some(format!(
+                        "DB cluster {identifier} is in state {status} and cannot be modified"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if let Some(renamed) = &renamed_to {
+            crate::state::check_identifier(
+                "NewDBClusterIdentifier",
+                renamed,
+                crate::state::db_cluster_identifier_max_len(&engine),
+            )
+            .map_err(ModifyDBClusterError::invalid_parameter_value)?;
+            if *renamed != identifier
+                && store
+                    .db_clusters
+                    .contains_key(&(region.clone(), renamed.clone()))
+            {
+                return Err(ModifyDBClusterErrorModeled::DBClusterAlreadyExistsFault(
+                    DBClusterAlreadyExistsFault {
+                        message: Some(format!("DB cluster already exists: {renamed}")),
+                    },
+                )
+                .into());
+            }
+        }
+        // A cluster parameter group the request MOVES the cluster to is resolved in the
+        // store, answering the modelled not-found fault when it names none. The groups
+        // whose names begin `default.` are the ones AWS itself provides per engine family
+        // and no request creates, so this service holds no record of them and accepts them
+        // — the same reason `ModifyDBInstance` does not resolve `OptionGroupName`.
+        if let Some(name) = &input.db_cluster_parameter_group_name {
+            let lowered = name.to_ascii_lowercase();
+            if !lowered.starts_with("default.")
+                && !store
+                    .db_cluster_parameter_groups
+                    .contains_key(&(region.clone(), lowered.clone()))
+            {
+                return Err(
+                    ModifyDBClusterErrorModeled::DBClusterParameterGroupNotFoundFault(
+                        DBClusterParameterGroupNotFoundFault {
+                            message: Some(format!(
+                                "DBClusterParameterGroup not found: {name}"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        // A storage type must be one the cluster's TYPE publishes: "Aurora DB clusters -
+        // aurora | aurora-iopt1", "Multi-AZ DB clusters - io1 | io2 | gp3".
+        if let Some(storage_type) = &input.storage_type {
+            let published = crate::state::db_cluster_storage_types(&engine);
+            if !published
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(storage_type))
+            {
+                return Err(ModifyDBClusterErrorModeled::StorageTypeNotSupportedFault(
+                    StorageTypeNotSupportedFault {
+                        message: Some(format!(
+                            "Invalid storage type {storage_type} for engine {engine}: must be \
+                             one of {}",
+                            published.join(" | ")
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        // The version the cluster RUNS once the modification is applied: the same
+        // resolution `CreateDBCluster` does, against the engine the cluster is on.
+        // Resolved BEFORE the record is taken out of the store, so a version this service
+        // cannot provision leaves the cluster exactly as it was.
+        let resolved_engine_version = match &input.engine_version {
+            Some(requested) => {
+                let resolved = crate::ops::describe_db_engine_versions::resolve_version(
+                    &engine,
+                    Some(requested.as_str()),
+                )
+                .map_err(ModifyDBClusterError::invalid_parameter_combination)?;
+                Some(match resolved {
+                    Some(entry) => entry.engine_version.to_string(),
+                    // An engine the catalogue publishes no available version for: there is
+                    // nothing to resolve against, so what the request named stands.
+                    None => requested.clone(),
+                })
+            }
+            None => None,
+        };
+
+        let mut record = store
+            .db_clusters
+            .remove(&key)
+            .expect("the cluster was found above and the store is locked");
+
+        // Every supplied setting is written onto the stored record. The settings RDS
+        // defers to the maintenance window when `ApplyImmediately` is disabled are applied
+        // immediately here: this slice keeps no pending-modified-values set for a cluster,
+        // so deferring a change would mean dropping it.
+        let mut changed = false;
+        if let Some(renamed) = renamed_to {
+            changed |= renamed != record.identifier;
+            record.identifier = renamed;
+        }
+        if let Some(value) = resolved_engine_version {
+            changed = true;
+            record.engine_version = Some(value);
+        }
+        if let Some(value) = input.engine_mode {
+            changed = true;
+            record.engine_mode = value;
+        }
+        if let Some(value) = input.backup_retention_period {
+            changed = true;
+            record.backup_retention_period = value;
+        }
+        if let Some(value) = input.preferred_backup_window {
+            changed = true;
+            record.preferred_backup_window = value;
+        }
+        if let Some(value) = input.preferred_maintenance_window {
+            changed = true;
+            record.preferred_maintenance_window = value;
+        }
+        if let Some(value) = input.db_cluster_parameter_group_name {
+            changed = true;
+            record.db_cluster_parameter_group_name = Some(value.to_ascii_lowercase());
+        }
+        if let Some(value) = input.option_group_name {
+            changed = true;
+            record.option_group_name = Some(value);
+        }
+        if let Some(value) = input.vpc_security_group_ids {
+            changed = true;
+            record.vpc_security_group_ids = value;
+        }
+        if let Some(value) = input.port {
+            changed = true;
+            record.port = value;
+        }
+        if let Some(value) = input.backtrack_window {
+            changed = true;
+            record.backtrack_window = value;
+        }
+        if let Some(value) = input.storage_type {
+            changed = true;
+            record.storage_type = Some(value);
+        }
+        if let Some(value) = input.iops {
+            changed = true;
+            record.iops = Some(value);
+        }
+        if let Some(value) = input.allocated_storage {
+            changed = true;
+            record.allocated_storage = Some(value);
+        }
+        if let Some(value) = input.db_cluster_instance_class {
+            changed = true;
+            record.db_cluster_instance_class = Some(value);
+        }
+        if let Some(value) = input.auto_minor_version_upgrade {
+            changed = true;
+            record.auto_minor_version_upgrade = value;
+        }
+        if let Some(value) = input.deletion_protection {
+            changed = true;
+            record.deletion_protection = value;
+        }
+        if let Some(value) = input.copy_tags_to_snapshot {
+            changed = true;
+            record.copy_tags_to_snapshot = value;
+        }
+        if let Some(value) = input.enable_http_endpoint {
+            changed = true;
+            record.http_endpoint_enabled = value;
+        }
+        if let Some(value) = input.enable_iam_database_authentication {
+            changed = true;
+            record.iam_database_authentication_enabled = value;
+        }
+        if let Some(value) = input.enable_local_write_forwarding {
+            changed = true;
+            record.local_write_forwarding_enabled = value;
+        }
+        if let Some(value) = input.enable_global_write_forwarding {
+            changed = true;
+            record.global_write_forwarding_requested = value;
+        }
+        if let Some(value) = input.network_type {
+            changed = true;
+            record.network_type = Some(value);
+        }
+        if let Some(value) = input.monitoring_interval {
+            changed = true;
+            record.monitoring_interval = value;
+        }
+        if let Some(value) = input.monitoring_role_arn {
+            changed = true;
+            record.monitoring_role_arn = Some(value);
+        }
+        if let Some(value) = input.database_insights_mode {
+            changed = true;
+            record.database_insights_mode = value;
+        }
+        if let Some(value) = input.enable_performance_insights {
+            changed = true;
+            record.performance_insights_enabled = value;
+        }
+        if let Some(value) = input.performance_insights_kms_key_id {
+            changed = true;
+            record.performance_insights_kms_key_id = Some(value);
+        }
+        if let Some(value) = input.performance_insights_retention_period {
+            changed = true;
+            record.performance_insights_retention_period = Some(value);
+        }
+        if let Some(value) = input.ca_certificate_identifier {
+            changed = true;
+            record.ca_certificate_identifier = value;
+        }
+        if let Some(value) = input.engine_lifecycle_support {
+            changed = true;
+            record.engine_lifecycle_support = value;
+        }
+        // "Specify none to remove the cluster from its current domain."
+        if let Some(value) = input.domain {
+            changed = true;
+            record.domain = (value != "none").then_some(value);
+        }
+        if let Some(value) = input.domain_iam_role_name {
+            changed = true;
+            record.domain_iam_role_name = Some(value);
+        }
+        if let Some(value) = input.scaling_configuration {
+            changed = true;
+            record.scaling_configuration = Some(ScalingConfigurationInfo {
+                min_capacity: value.min_capacity,
+                max_capacity: value.max_capacity,
+                auto_pause: value.auto_pause,
+                seconds_until_auto_pause: value.seconds_until_auto_pause,
+                timeout_action: value.timeout_action,
+                seconds_before_timeout: value.seconds_before_timeout,
+            });
+        }
+        if let Some(value) = input.serverless_v2_scaling_configuration {
+            changed = true;
+            record.serverless_v2_scaling = Some(ServerlessV2ScalingConfigurationInfo {
+                min_capacity: value.min_capacity,
+                max_capacity: value.max_capacity,
+                seconds_until_auto_pause: value.seconds_until_auto_pause,
+            });
+        }
+        // "The configuration setting for the log types to be enabled for export to
+        // CloudWatch Logs": the enabled set is the stored one plus what the request
+        // enables, less what it disables.
+        if let Some(exports) = input.cloudwatch_logs_export_configuration {
+            changed = true;
+            for log_type in exports.enable_log_types.unwrap_or_default() {
+                if !record.enabled_cloudwatch_logs_exports.contains(&log_type) {
+                    record.enabled_cloudwatch_logs_exports.push(log_type);
+                }
+            }
+            for log_type in exports.disable_log_types.unwrap_or_default() {
+                record
+                    .enabled_cloudwatch_logs_exports
+                    .retain(|enabled| *enabled != log_type);
+            }
+            record.enabled_cloudwatch_logs_exports.truncate(
+                crate::state::MAX_CLUSTER_LIST_ENTRIES,
+            );
+        }
+        // `MasterUserPassword` is `@sensitive` and RDS reports no member carrying it: it is
+        // accepted and neither stored nor returned.
+        changed |= input.master_user_password.is_some();
+
+        if changed {
+            // RDS answers a modification with the cluster `modifying`; it settles back to
+            // `available` on its own, and until it does no further modification is taken.
+            record.status = crate::state::DB_CLUSTER_STATUS_MODIFYING.to_string();
+            record.pending_status = Some(crate::state::PendingStatus::in_a_moment(
+                crate::state::DB_CLUSTER_STATUS_AVAILABLE,
+            ));
+        }
+
+        let db_cluster = store.cluster_to_wire(&record);
+        store
+            .db_clusters
+            .insert((region, record.identifier.clone()), record);
+
+        Ok(ModifyDBClusterOutput {
+            db_cluster: Some(db_cluster),
+        })
     }
 }

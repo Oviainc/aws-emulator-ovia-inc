@@ -326,6 +326,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "When you create the feed, this property is empty": a resource is
             // associated later, with AssociateFeed or UpdateFeed.
             association: None,
+            // A feed is created with no resource-based policy attached: PutFeedPolicy
+            // is what attaches one, so GetFeedPolicy has nothing to report until it
+            // runs.
+            policy: None,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             transition_due_at: None,
         };
