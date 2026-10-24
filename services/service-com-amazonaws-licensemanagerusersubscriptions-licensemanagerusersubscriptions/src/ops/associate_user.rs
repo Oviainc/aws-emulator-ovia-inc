@@ -199,10 +199,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.provider_key_is_registered(&key) {
             return Err(AssociateUserErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(
-                        "the identity provider is not registered for user-based subscriptions"
-                            .to_string(),
-                    ),
+                    // The one sentence this service's user-association plane states this
+                    // refusal with, so this handler and `ListUserAssociations` — which
+                    // resolves the same directory the same way — cannot word one refusal
+                    // two ways.
+                    message: Some(crate::state::IDENTITY_PROVIDER_NOT_REGISTERED.to_string()),
                 },
             )
             .into());

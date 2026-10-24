@@ -198,6 +198,77 @@ async fn list_test_templates_names_the_published_catalog_rows() {
 }
 
 #[tokio::test]
+async fn list_test_templates_serves_the_published_catalog_text() {
+    let router = emulator();
+
+    // The catalog is SERVICE-owned static content, so each row's `description` is the
+    // wording the service publishes for that template, carried verbatim — it is not
+    // per-account, per-run or Region-dependent content this emulator may re-word.
+    //
+    // SOURCE of each row's wording: the AWS `ListTestTemplates` catalog this service
+    // publishes (the same rows `TEST_TEMPLATE_CATALOG` is projected from).
+    //
+    // (template name, the description the service publishes for it).
+    let published: [(&str, &str); 4] = [
+        (
+            "Availability Zone: recovery",
+            "Validate your service can detect and recover from an Availability Zone impairment.",
+        ),
+        (
+            "Dependency validation",
+            "Validate how your service responds when its dependencies within the Region are \
+             impaired.",
+        ),
+        (
+            "Multi-Region: isolation",
+            "Validate your service can operate independently from a Region when connectivity to \
+             another Region is unavailable.",
+        ),
+        (
+            "Multi-Region: recovery",
+            "Validate your service can recover and serve clients from another Region within your \
+             recovery objectives when a Region is impaired.",
+        ),
+    ];
+
+    // The text does not vary with the one per-request value in the answer, so every row of
+    // the catalog is asserted in each of these scopes.
+    let scopes: [Option<&str>; 3] = [Some("us-west-2"), Some("eu-central-1"), None];
+
+    for scope_region in scopes {
+        let case_scope = scope_region.unwrap_or("unsigned");
+        let reply = get(&router, scope_region, LIST_TEST_TEMPLATES).await;
+        let listed = templates(case_scope, &reply);
+
+        for (name, description) in published {
+            let case = format!("{name} @ {case_scope}");
+            let found = listed
+                .iter()
+                .find(|template| template["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("case {case:?}: no template named {name:?} in {listed:?}"));
+            let actual = found["description"].as_str().unwrap_or_default();
+            assert_eq!(
+                actual, description,
+                "case {case:?}: expected the published catalog text, got {actual:?}"
+            );
+        }
+
+        // Each row's text belongs to that row: a single description reused across rows
+        // would satisfy the per-row assertions above only if the catalog had collapsed.
+        let descriptions: BTreeSet<&str> = listed
+            .iter()
+            .map(|template| template["description"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            descriptions.len(),
+            listed.len(),
+            "case {case_scope:?}: expected one distinct description per catalog row, got \
+             {listed:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn list_test_templates_reports_the_catalog_for_the_signed_region() {
     let router = emulator();
 
@@ -241,8 +312,8 @@ async fn list_test_templates_reports_the_catalog_for_the_signed_region() {
 
         for (entry, reported) in TEST_TEMPLATE_CATALOG.iter().zip(listed.iter()) {
             // Every member of `TestTemplateSummary` is @required, so each must be present
-            // and non-empty — including the description of a template whose recorded
-            // example carried none.
+            // and non-empty, and each is the stored row projected unchanged (the published
+            // wording itself is pinned by the catalog-text suite above).
             let arn = reported["testTemplateArn"].as_str().unwrap_or_default();
             let name = reported["name"].as_str().unwrap_or_default();
             let description = reported["description"].as_str().unwrap_or_default();
