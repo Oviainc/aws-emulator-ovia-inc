@@ -85,7 +85,7 @@ async fn core_network_at(
 /// An EC2 VPC ARN in `region`, as the modelled `VpcArn` pattern spells one
 /// (`^arn:[^:]{1,63}:ec2:[^:]{0,63}:[^:]{0,63}:vpc\/vpc-[0-9a-f]{8,17}$`, `smithy_query
 /// shape=VpcArn`): the id is 8 hex digits, the shortest the pattern allows.
-fn vpc_arn(region: &str, index: usize) -> String {
+pub(crate) fn vpc_arn(region: &str, index: usize) -> String {
     format!(
         "arn:aws:ec2:{region}:{}:vpc/vpc-{index:08x}",
         engine::emulator_account_id()
@@ -94,7 +94,7 @@ fn vpc_arn(region: &str, index: usize) -> String {
 
 /// An EC2 subnet ARN in `region`. See [`vpc_arn`]; `SubnetArn` carries the matching
 /// `subnet/subnet-<hex>` pattern.
-fn subnet_arn(region: &str, index: usize) -> String {
+pub(crate) fn subnet_arn(region: &str, index: usize) -> String {
     format!(
         "arn:aws:ec2:{region}:{}:subnet/subnet-{index:08x}",
         engine::emulator_account_id()
@@ -102,17 +102,17 @@ fn subnet_arn(region: &str, index: usize) -> String {
 }
 
 /// `CreateVpcAttachment`.
-async fn create_vpc_attachment(emulator: &Emulator, body: Value) -> (u16, Value) {
+pub(crate) async fn create_vpc_attachment(emulator: &Emulator, body: Value) -> (u16, Value) {
     emulator.post("/vpc-attachments", body).await
 }
 
 /// `CreateConnectAttachment`.
-async fn create_connect_attachment(emulator: &Emulator, body: Value) -> (u16, Value) {
+pub(crate) async fn create_connect_attachment(emulator: &Emulator, body: Value) -> (u16, Value) {
     emulator.post("/connect-attachments", body).await
 }
 
 /// The id member of a created attachment, or a panic naming what was there instead.
-fn attachment_id(case: &str, wrapper: &Value) -> String {
+pub(crate) fn attachment_id(case: &str, wrapper: &Value) -> String {
     wrapper["Attachment"]["AttachmentId"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: no Attachment.AttachmentId in {wrapper}"))
