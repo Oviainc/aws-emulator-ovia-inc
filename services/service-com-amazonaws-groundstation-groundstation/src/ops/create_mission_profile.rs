@@ -181,6 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The platform's tagging rules, refused before an id and an ARN are minted: the
+        // model's `TagsMap` carries no constraint, so this is the only gate (see
+        // `crate::state::validate_tags`).
+        crate::state::validate_tags(input.tags.as_ref())
+            .map_err(CreateMissionProfileErrorModeled::InvalidParameterException)?;
+
         let region = crate::state::request_region(ctx.parts());
         let mission_profile_id = crate::state::new_uuid();
         let mission_profile_arn = ::engine::emulator_arn(
