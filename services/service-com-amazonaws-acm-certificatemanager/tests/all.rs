@@ -21,6 +21,8 @@ mod acme_account_listing;
 mod acme_directory_endpoint;
 #[path = "all/acme_domain_validation_lifecycle.rs"]
 mod acme_domain_validation_lifecycle;
+#[path = "all/acme_domain_validation_listing.rs"]
+mod acme_domain_validation_listing;
 #[path = "all/acme_endpoint_lifecycle.rs"]
 mod acme_endpoint_lifecycle;
 #[path = "all/acme_endpoint_list.rs"]

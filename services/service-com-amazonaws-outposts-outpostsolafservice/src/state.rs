@@ -5,7 +5,7 @@
 //! and ARN minting, resolving the `id OR ARN` identifier forms the modelled
 //! `@httpLabel` patterns accept, projecting a resource's tag map and an Outpost's
 //! two Availability Zone identities, materialising the Outpost lifecycle transition
-//! the clock owes, cutting an ordered list into pages with the modelled `Token` the
+//! and the quote expiry the clock owes, cutting an ordered list into pages with the modelled `Token` the
 //! next page resumes from, and the two rules this service words its refusals by —
 //! the `NotFoundException` identifier echo and the value-omitting
 //! `ValidationException` report.
@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use sha2::{Digest, Sha256};
 use smithy_server_runtime::{Violation, ViolationKind};
 
-use crate::ops::types::{Address, Outpost, Site};
+use crate::ops::types::{Address, Outpost, Quote, Site};
 
 /// The region every minted ARN falls back to when the request carries no SigV4
 /// credential scope to read one from (an unsigned, anonymous call).
@@ -48,6 +48,32 @@ pub const LIFE_CYCLE_STATUS_ACTIVE: &str = "ACTIVE";
 /// still observes the pending status the create reported. It is never zero —
 /// a transition the clock owes is owed at an instant, not on the next read.
 pub const OUTPOST_PROVISIONING: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The `QuoteStatus` a freshly created quote carries.
+///
+/// `CreateQuote` answers with a quote that exists to be read and ordered from, so
+/// the status a create reports is the one a quote is usable in. The modelled
+/// `QuoteStatus` enum declares exactly three values — `CREATED`,
+/// `ORDER_SUBMITTED` and `EXPIRED` — and a quote reaches the other two only by
+/// something happening to it: an order being submitted from it, or its own
+/// `ExpirationDate` passing.
+pub const QUOTE_STATUS_CREATED: &str = "CREATED";
+
+/// The `QuoteStatus` a quote holds once the `ExpirationDate` it reports has
+/// passed. See [`QUOTE_STATUS_CREATED`] and
+/// [`ComAmazonawsOutpostsOutpostsolafserviceState::settle_quotes`].
+pub const QUOTE_STATUS_EXPIRED: &str = "EXPIRED";
+
+/// How long after `CreateQuote` the quote's `ExpirationDate` falls.
+///
+/// AWS documents the member only as "The date the quote expires" and publishes no
+/// validity period, so this span is the emulator's own. It is a resource LIFETIME,
+/// not a provisioning span: a quote is created in order to be read and ordered
+/// from, so the window has to be long enough that every call a workflow makes
+/// against a quote it just created still sees it live, while the quote still
+/// carries a real expiry a caller can read and act on.
+pub const QUOTE_VALIDITY: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60);
 
 /// A persisted site: the modelled [`Site`] this service answers with, plus the two
 /// whole [`Address`] values `Site` itself does not carry (it exposes only the
@@ -84,6 +110,19 @@ pub struct OutpostRecord {
     pub active_at: Option<std::time::Instant>,
 }
 
+/// A persisted quote: the modelled [`Quote`] plus its creation order.
+///
+/// A quote carries its own `CreatedDate` and `ExpirationDate`, so the instant its
+/// `CREATED` -> `EXPIRED` transition falls due is the `ExpirationDate` the stored
+/// quote already reports — there is no second copy of it to drift from.
+#[derive(Debug, Clone)]
+pub struct QuoteRecord {
+    /// See [`SiteRecord::sequence`].
+    pub sequence: u64,
+    /// The quote as `CreateQuote` / `GetQuote` return it.
+    pub quote: Quote,
+}
+
 /// Per-service state for com-amazonaws-outposts-outpostsolafservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsOutpostsOutpostsolafserviceState {
@@ -92,6 +131,9 @@ pub struct ComAmazonawsOutpostsOutpostsolafserviceState {
     pub sites: BTreeMap<String, SiteRecord>,
     /// Every persisted Outpost, keyed by its bare `OutpostId` (`op-…`).
     pub outposts: BTreeMap<String, OutpostRecord>,
+    /// Every persisted quote, keyed by its bare `QuoteId` (`oq-…`), which is how
+    /// `GetQuote` resolves one.
+    pub quotes: BTreeMap<String, QuoteRecord>,
     /// How many resources this store has created. Doubles as the monotonically
     /// increasing creation order every record records and every page token names,
     /// and as part of each minted id's seed so no two ids collide.
@@ -117,12 +159,39 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         }
     }
 
+    /// Materialise every quote expiry the clock has already made due.
+    ///
+    /// Every operation that reports a quote calls this FIRST, for the same reason
+    /// [`Self::settle_outposts`] exists: a read answers the status the quote holds
+    /// at the instant it is asked for. A quote expires when the
+    /// `ExpirationDate` it itself reports has passed, so this writes only what the
+    /// clock already owed at that same instant and nothing a later caller would not
+    /// have seen anyway.
+    ///
+    /// Only a quote still in [`QUOTE_STATUS_CREATED`] is moved: the expiry of a
+    /// quote an order was already submitted from would be rewriting history, and
+    /// one already `EXPIRED` has nowhere left to go.
+    pub fn settle_quotes(&mut self) {
+        let now = now_timestamp().as_secs_f64();
+        for record in self.quotes.values_mut() {
+            let due = record
+                .quote
+                .expiration_date
+                .as_ref()
+                .is_some_and(|expiration| expiration.as_secs_f64() <= now);
+            if due && record.quote.quote_status.as_deref() == Some(QUOTE_STATUS_CREATED) {
+                record.quote.quote_status = Some(QUOTE_STATUS_EXPIRED.to_string());
+            }
+        }
+    }
+
     /// Mint a fresh resource id of the form `<prefix>-<17 lowercase hex chars>`,
     /// and return it with the creation sequence to record on the new resource.
     ///
-    /// Both `OutpostId` (`^op-[a-f0-9]{17}$`) and `SiteId` (`^os-[a-f0-9]{17}$`)
-    /// are a two-letter prefix and exactly 17 lowercase hex characters, so one
-    /// helper serves both. `created` advances on every call and is hashed into the
+    /// `OutpostId` (`^op-[a-f0-9]{17}$`), `SiteId` (`^os-[a-f0-9]{17}$`) and
+    /// `QuoteId` (`^oq-[a-f0-9]{17}$`) are each a two-letter prefix and exactly 17
+    /// lowercase hex characters, so one helper serves them all.
+    /// `created` advances on every call and is hashed into the
     /// seed with the wall clock and the process id, so repeated calls never return
     /// the same id.
     pub fn mint_id(&mut self, prefix: &str) -> (String, u64) {
@@ -209,6 +278,25 @@ pub fn resolve_site_id(identifier: &str) -> Option<String> {
 /// The `op-…` id an `OutpostId` names. See [`resolve_id`].
 pub fn resolve_outpost_id(identifier: &str) -> Option<String> {
     resolve_id(identifier, "op")
+}
+
+/// The `oq-…` id a `QuoteIdentifier` names. See [`resolve_id`].
+pub fn resolve_quote_id(identifier: &str) -> Option<String> {
+    resolve_id(identifier, "oq")
+}
+
+/// Now, as the modelled `ISO8601Timestamp` members of this API carry an instant.
+///
+/// One helper so every timestamp this service reports is read off the same clock
+/// and in the same units, whether it is being stored or compared against a stored
+/// one.
+pub fn now_timestamp() -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from(std::time::SystemTime::now())
+}
+
+/// `at` as a modelled `ISO8601Timestamp`. See [`now_timestamp`].
+pub fn timestamp(at: std::time::SystemTime) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from(at)
 }
 
 /// The `(resource type, resource id)` an Outposts resource ARN names, e.g.
@@ -549,6 +637,16 @@ pub const OUTPOST_ID_MEMBER: &str = "outpostId";
 /// See [`SITE_ID_MEMBER`].
 pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
 
+/// The validation-path name of the `QuoteIdentifier` input member the quote
+/// operations bind. See [`SITE_ID_MEMBER`].
+pub const QUOTE_IDENTIFIER_MEMBER: &str = "quoteIdentifier";
+
+/// The validation-path name of the `OutpostIdentifier` input member the quote
+/// operations take \u2014 a DIFFERENT member from the `OutpostId` the Outpost
+/// operations bind, so a refusal about it names it as the request spelled it.
+/// See [`SITE_ID_MEMBER`].
+pub const OUTPOST_IDENTIFIER_MEMBER: &str = "outpostIdentifier";
+
 /// The `@pattern` the model declares on `SiteId`, verbatim: a report names a
 /// pattern exactly as the model spells it, anchors included.
 pub const SITE_ID_PATTERN: &str =
@@ -556,6 +654,16 @@ pub const SITE_ID_PATTERN: &str =
 
 /// The `@pattern` the model declares on `OutpostId`. See [`SITE_ID_PATTERN`].
 pub const OUTPOST_ID_PATTERN: &str =
+    r"^(arn:aws([a-z-]+)?:outposts:[a-z\d-]+:\d{12}:outpost/)?op-[a-f0-9]{17}$";
+
+/// The `@pattern` the model declares on `QuoteIdentifier`. See
+/// [`SITE_ID_PATTERN`].
+pub const QUOTE_IDENTIFIER_PATTERN: &str =
+    r"^(arn:aws([a-z-]+)?:outposts:[a-z\d-]+:\d{12}:quote/)?oq-[a-f0-9]{17}$";
+
+/// The `@pattern` the model declares on `OutpostIdentifier`, the member the quote
+/// operations name an Outpost by. See [`SITE_ID_PATTERN`].
+pub const OUTPOST_IDENTIFIER_PATTERN: &str =
     r"^(arn:aws([a-z-]+)?:outposts:[a-z\d-]+:\d{12}:outpost/)?op-[a-f0-9]{17}$";
 
 /// The error code every refusal this service rewords answers with — the same
@@ -651,6 +759,24 @@ pub fn outpost_id_pattern_report() -> String {
     )
 }
 
+/// The report a `QuoteIdentifier` that is neither a quote id nor a quote ARN
+/// states. See [`site_id_pattern_report`].
+pub fn quote_identifier_pattern_report() -> String {
+    constraint_report(
+        QUOTE_IDENTIFIER_MEMBER,
+        ViolationKind::Pattern(QUOTE_IDENTIFIER_PATTERN.to_string()),
+    )
+}
+
+/// The report an `OutpostIdentifier` that is neither an Outpost id nor an Outpost
+/// ARN states. See [`site_id_pattern_report`].
+pub fn outpost_identifier_pattern_report() -> String {
+    constraint_report(
+        OUTPOST_IDENTIFIER_MEMBER,
+        ViolationKind::Pattern(OUTPOST_IDENTIFIER_PATTERN.to_string()),
+    )
+}
+
 /// The report an unusable pagination token states.
 ///
 /// No modelled constraint covers it — the modelled `Token` pattern has already
@@ -675,14 +801,18 @@ pub const SITE_PAGE: &str = "sites";
 /// the ceiling the model declares for it (`MaxResults1000`, `range(1..1000)`).
 pub const MAX_RESULTS: i32 = 1000;
 
-/// The ceiling on how many sites, and how many Outposts, this store holds.
+/// The ceiling on how many sites, how many Outposts, and how many quotes this
+/// store holds.
 ///
 /// A generated emulator keeps its resources in memory for the life of the process
 /// and a create is the only thing that adds one, so the store needs a maximum entry
 /// count: neither a TTL nor an eviction policy is available to it, because `GetSite`
 /// must still answer what `CreateSite` created. Past the cap the two creating
-/// operations answer the `ServiceQuotaExceededException` (HTTP 402) this service
-/// models on exactly them and on no read. The number is the emulator's own bound,
+/// operations that model `ServiceQuotaExceededException` (HTTP 402) answer it — it
+/// is modelled on exactly them and on no read — and `CreateQuote`, whose model
+/// declares no quota error, refuses the create as a bad request (400
+/// `ValidationException`) rather than inventing an error the model does not carry.
+/// The number is the emulator's own bound,
 /// not a published AWS default — AWS publishes both quotas as adjustable, so no
 /// single value is the contract — and is set high enough that no ordinary workflow
 /// meets it.

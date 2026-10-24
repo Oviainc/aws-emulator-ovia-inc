@@ -15,6 +15,8 @@
 mod error_classification;
 #[path = "all/error_message_rules.rs"]
 mod error_message_rules;
+#[path = "all/quote_lifecycle.rs"]
+mod quote_lifecycle;
 #[path = "all/site_and_outpost_lifecycle.rs"]
 mod site_and_outpost_lifecycle;
 #[path = "all/site_and_outpost_projection.rs"]
