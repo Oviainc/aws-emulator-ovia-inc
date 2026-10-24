@@ -28,6 +28,12 @@
 //! calls first: a read therefore reports what the clock has already made due and never
 //! advances a job because it was polled.
 //!
+//! The clock drives one more thing a caller can observe: a `ClientToken`'s validity
+//! window ([`CLIENT_TOKEN_VALIDITY`], [`ClientToken`]). A token takes part in idempotency
+//! only while that window is open, so the same `settle` that materialises a due status
+//! drops a token the clock has carried past it — and the next call under that token is a
+//! new request rather than a repeat or a conflict.
+//!
 //! WHICH status that is follows from the job's resolved scope, not from the operation
 //! that started it: [`scan_outcome`] turns the recovery points a scope resolved to
 //! ([`ComAmazonawsBackupsearchCryobackupsearchserviceState::recovery_points_in_scope`])
@@ -136,6 +142,80 @@ pub const TRANSITION_DELAY: Duration = Duration::from_millis(500);
 /// transient phases a scan passes through are therefore observable, the first one by a
 /// caller acting straight after the start call.
 pub const CREATING_DELAY: Duration = Duration::from_millis(250);
+
+/// How long a `ClientToken` of this service takes part in idempotency, measured from
+/// the moment the request that first used it completed.
+///
+/// MODELLED rather than chosen: the member's own documentation on BOTH operations that
+/// take one states the window and what happens after it — a token is valid for eight
+/// hours after the first request using it completed, and any later request carrying it
+/// is treated as a new request
+/// (`smithy_query(query="doc", shape="StartSearchJobInput", member="ClientToken")`,
+/// same text on `StartSearchResultExportJobInput`). So this is not one of the emulator's
+/// own spans: it is the duration the service publishes.
+pub const CLIENT_TOKEN_VALIDITY: Duration = Duration::from_secs(8 * 60 * 60);
+
+/// A `ClientToken` a request carried, together with the instant its validity window
+/// closes ([`CLIENT_TOKEN_VALIDITY`] after the request that used it completed).
+///
+/// The token and its window are ONE value, so no record can hold a token nothing
+/// bounds: a stored token answers a repeat only while its window is open, and once the
+/// clock has passed it the token names no earlier request at all — a call carrying it is
+/// a new request, neither a repeat nor a conflict.
+#[derive(Debug, Clone)]
+pub struct ClientToken {
+    value: String,
+    expires_at: SystemTime,
+}
+
+impl ClientToken {
+    /// The token `value` carried by a request that completed at `completed`, valid until
+    /// [`CLIENT_TOKEN_VALIDITY`] after that instant.
+    ///
+    /// Adding a duration to a `SystemTime` panics when the sum is not representable, so
+    /// the window's end is computed fallibly and an unrepresentable one is taken as a
+    /// window that has ALREADY closed: a clock far enough ahead makes the next call under
+    /// the token a new request rather than aborting the handler.
+    pub fn minted(value: String, completed: SystemTime) -> Self {
+        Self {
+            value,
+            expires_at: completed
+                .checked_add(CLIENT_TOKEN_VALIDITY)
+                .unwrap_or(completed),
+        }
+    }
+
+    /// The token as the request spelled it.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// Whether this token still takes part in idempotency at `now`. The window is open
+    /// up to but NOT including the instant it closes, so a token exactly its full
+    /// validity old is already past it.
+    pub fn is_valid_at(&self, now: SystemTime) -> bool {
+        now < self.expires_at
+    }
+
+    /// Whether this token is `value` AND still inside its window — which is what makes
+    /// the record carrying it the answer to a repeat rather than an unrelated record.
+    pub fn is_live(&self, value: &str, now: SystemTime) -> bool {
+        self.value == value && self.is_valid_at(now)
+    }
+}
+
+/// Drop a record's `ClientToken` once the clock has carried it past its validity window.
+///
+/// Materialising a change the CLOCK already made due, like every other transition this
+/// store settles: the window closed at an instant that was reached whether or not
+/// anybody called, and from then on the record no longer holds a token for anything to
+/// match. Clearing it is what keeps a token from naming one job for the life of the
+/// process.
+fn expire_client_token(token: &mut Option<ClientToken>, now: SystemTime) {
+    if token.as_ref().is_some_and(|held| !held.is_valid_at(now)) {
+        *token = None;
+    }
+}
 
 /// `MaxResults`'s modelled `@default(1000)`, shared by `ListSearchJobs` and
 /// `ListSearchJobResults`: the page size to serve when the member is absent.
@@ -331,10 +411,12 @@ pub struct SearchJob {
     /// so a job minted here covers none.
     pub backups: Vec<SearchJobBackupsResult>,
     pub tags: HashMap<String, String>,
-    /// The `ClientToken` the call that minted this job carried, if any. Idempotency is
-    /// keyed off the job records themselves, so a caller cannot grow a second index by
-    /// varying only the token.
-    pub client_token: Option<String>,
+    /// The `ClientToken` the call that minted this job carried, if any, with the instant
+    /// its validity window closes. Idempotency is keyed off the job records themselves,
+    /// so a caller cannot grow a second index by varying only the token; the window is
+    /// what keeps that key from outliving the token
+    /// ([`CLIENT_TOKEN_VALIDITY`]).
+    pub client_token: Option<ClientToken>,
     /// Canonical form of the `StartSearchJob` body this job was created from. A repeat
     /// of the same body under the same `ClientToken` is idempotent; a different body
     /// under that token is a conflict.
@@ -384,6 +466,7 @@ impl SearchJob {
     /// recorded; one that was `STOPPED` keeps the progress it had reached, and one that
     /// `FAILED` never got through its scope, so it keeps the progress it had too.
     fn settle(&mut self, now: SystemTime) {
+        expire_client_token(&mut self.client_token, now);
         while let Some(&(due, next, message)) = self.owed_statuses.front() {
             if now < due {
                 return;
@@ -436,8 +519,9 @@ pub struct ExportJob {
     /// role the export was started under.
     pub role_arn: Option<String>,
     pub tags: HashMap<String, String>,
-    /// The `ClientToken` the call that minted this export job carried, if any.
-    pub client_token: Option<String>,
+    /// The `ClientToken` the call that minted this export job carried, if any, with the
+    /// instant its validity window closes ([`CLIENT_TOKEN_VALIDITY`]).
+    pub client_token: Option<ClientToken>,
     /// Canonical form of the `StartSearchResultExportJob` body this job was created
     /// from: a repeat under the same `ClientToken` is idempotent, a different body under
     /// that token is a conflict.
@@ -451,6 +535,7 @@ pub struct ExportJob {
 impl ExportJob {
     /// Apply the owed status transition if the clock has already made it due.
     fn settle(&mut self, now: SystemTime) {
+        expire_client_token(&mut self.client_token, now);
         let Some((due, next, message)) = self.next_status_due.clone() else {
             return;
         };
@@ -628,13 +713,18 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
             .collect()
     }
 
-    /// The job the `StartSearchJob` call carrying `token` minted, if that call was
-    /// made. Read off the job records, so the idempotency index cannot outgrow
-    /// [`MAX_SEARCH_JOBS`].
-    pub fn job_by_client_token(&self, token: &str) -> Option<&SearchJob> {
+    /// The job the `StartSearchJob` call carrying `token` minted, if that call was made
+    /// and its token is still inside its validity window at `now`. Read off the job
+    /// records, so the idempotency index cannot outgrow [`MAX_SEARCH_JOBS`].
+    ///
+    /// A token whose window has closed matches NOTHING here, so the call carrying it is
+    /// a new request: it mints a job, and a body differing from the expired call's is no
+    /// longer a conflict. At most one held record can carry a live token of a given
+    /// value, because minting another under it requires that no live one exists.
+    pub fn job_by_client_token(&self, token: &str, now: SystemTime) -> Option<&SearchJob> {
         self.search_jobs
             .values()
-            .find(|job| job.client_token.as_deref() == Some(token))
+            .find(|job| job.client_token.as_ref().is_some_and(|held| held.is_live(token, now)))
     }
 
     /// Whether this store is already holding [`MAX_SEARCH_JOBS`] jobs, which is when
@@ -686,12 +776,14 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
     }
 
     /// The export job the `StartSearchResultExportJob` call carrying `token` minted, if
-    /// that call was made. Read off the records themselves, so the idempotency index
-    /// cannot outgrow [`MAX_EXPORT_JOBS`].
-    pub fn export_job_by_client_token(&self, token: &str) -> Option<&ExportJob> {
+    /// that call was made and its token is still inside its validity window at `now` —
+    /// the same rule [`job_by_client_token`](Self::job_by_client_token) applies, because
+    /// the model states it on both of this service's `ClientToken` members. Read off the
+    /// records themselves, so the idempotency index cannot outgrow [`MAX_EXPORT_JOBS`].
+    pub fn export_job_by_client_token(&self, token: &str, now: SystemTime) -> Option<&ExportJob> {
         self.export_jobs
             .values()
-            .find(|job| job.client_token.as_deref() == Some(token))
+            .find(|job| job.client_token.as_ref().is_some_and(|held| held.is_live(token, now)))
     }
 
     /// Whether this store is already holding [`MAX_EXPORT_JOBS`] export jobs, which is
