@@ -235,6 +235,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // MSK Serverless offers ONE access path: a client authenticates with IAM
+        // access control over TLS, on the SASL/IAM port. So a serverless cluster
+        // has exactly one bootstrap string — its own endpoint, not a broker list —
+        // and every other member is absent rather than empty.
+        if let Some(endpoint) = cluster.serverless_bootstrap_brokers() {
+            return Ok(GetBootstrapBrokersOutput {
+                bootstrap_broker_string_sasl_iam: Some(endpoint),
+                ..GetBootstrapBrokersOutput::default()
+            });
+        }
+
         // One string per access path the cluster enables, each listing every
         // broker on that path's port. `when` keeps a path's member absent rather
         // than empty when the cluster does not offer it.

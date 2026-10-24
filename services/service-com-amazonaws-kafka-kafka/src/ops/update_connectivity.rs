@@ -239,6 +239,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // being provisioned, deleted or updated has no settled configuration to
         // update. `UpdateConnectivity` models no conflict error, so this is the
         // bad request it is: the cluster is not in a state that accepts it.
+        if cluster.is_serverless() {
+            // This update reconfigures how clients reach the brokers, and a
+            // serverless cluster has no brokers: its connectivity is the VPC
+            // configuration its create submitted.
+            return Err(
+                UpdateConnectivityErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::PROVISIONED_ONLY_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
         if cluster.state != "ACTIVE" {
             return Err(
                 UpdateConnectivityErrorModeled::BadRequestException(BadRequestException {

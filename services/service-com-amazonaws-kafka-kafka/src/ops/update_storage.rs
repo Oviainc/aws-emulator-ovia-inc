@@ -204,6 +204,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let current_version = cluster.current_version.clone();
         let current_volume_size = cluster.volume_size_gb();
 
+        // This update reconfigures the brokers' storage, and a serverless cluster
+        // has no brokers to reconfigure.
+        if cluster.is_serverless() {
+            return Err(
+                UpdateStorageErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::PROVISIONED_ONLY_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
         // Only a cluster whose brokers are serving can take an update: one still
         // being provisioned, or already applying a change, has no settled
         // configuration to update from.

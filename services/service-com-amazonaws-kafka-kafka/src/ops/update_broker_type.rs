@@ -221,6 +221,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cluster_state = cluster.state.clone();
         let current_version = cluster.current_version.clone();
 
+        // This update changes the brokers' instance type, and a serverless
+        // cluster has no brokers to change.
+        if cluster.is_serverless() {
+            return Err(bad_request(
+                "ClusterArn",
+                crate::state::PROVISIONED_ONLY_MESSAGE.to_string(),
+            ));
+        }
+
         // A cluster reconfigures one change at a time, and one that is still being
         // provisioned, deleted or updated has no settled configuration to update
         // from. Worded as the sibling update operations word the same check, so the

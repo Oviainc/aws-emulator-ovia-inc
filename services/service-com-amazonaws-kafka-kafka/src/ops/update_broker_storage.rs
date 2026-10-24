@@ -266,6 +266,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let current_version = cluster.current_version.clone();
         let current_volume_size = cluster.volume_size_gb();
 
+        // This update reconfigures the brokers' EBS volumes, and a serverless
+        // cluster has no brokers to reconfigure.
+        if cluster.is_serverless() {
+            return Err(bad_request(
+                "ClusterArn",
+                crate::state::PROVISIONED_ONLY_MESSAGE.to_string(),
+            ));
+        }
+
         // A cluster reconfigures one change at a time, and one that is still being
         // provisioned, deleted or updated has no settled configuration to update
         // from. Worded as the sibling update operations word the same check, so the
