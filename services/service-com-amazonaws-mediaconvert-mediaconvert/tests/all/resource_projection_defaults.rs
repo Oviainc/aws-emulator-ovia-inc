@@ -79,7 +79,10 @@ fn template_settings() -> Value {
     json!({
         "outputGroups": [{
             "name": "File Group",
-            "outputs": [{ "nameModifier": "_0" }],
+            "outputs": [{
+                "nameModifier": "_0",
+                "containerSettings": { "container": "MP4" }
+            }],
             "outputGroupSettings": {
                 "type": "FILE_GROUP_SETTINGS",
                 "fileGroupSettings": { "destination": "s3://example-bucket/out/" }

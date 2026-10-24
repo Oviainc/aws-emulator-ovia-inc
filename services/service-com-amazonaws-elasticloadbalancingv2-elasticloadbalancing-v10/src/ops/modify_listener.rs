@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyListener
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyListener`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyListener::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the properties the request names on the listener `ListenerArn` names, and
+//! leaves every property it does not name unchanged — "Any properties that you do not
+//! specify remain unchanged." An ARN this store holds no listener for is the modelled
+//! `ListenerNotFoundException`.
+//!
+//! Two rules of the model follow the listener's PROTOCOL, and both are applied to the
+//! protocol the call LEAVES the listener on rather than to the one it arrived with:
+//! "Changing the protocol from HTTPS to HTTP, or from TLS to TCP, removes the security
+//! policy and default certificate properties. If you change the protocol from HTTP to
+//! HTTPS, or from TCP to TLS, you must add the security policy and default certificate
+//! properties." So a listener that ends up terminating no TLS keeps no certificate and
+//! no security policy, and one that ends up terminating TLS must have exactly one
+//! default certificate — the same bracket `CreateListener` enforces.
+//!
+//! Moving the listener to a port its load balancer already listens on is
+//! `DuplicateListenerException`, and a default action may forward only to a target group
+//! that exists.
 //!
 //! ## Shape of an operation
 //!
@@ -212,18 +221,175 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyListener` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyListenerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyListener"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("ModifyListener")
+        })?;
+
+        // A value that is no listener ARN at all names no listener this API can have:
+        // an invalid ARN rather than a missing listener.
+        crate::state::check_listener_arn(&input.listener_arn)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        let mut guard = state.lock();
+        let Some(stored) = guard.listeners.get(&input.listener_arn).cloned() else {
+            return Err(ModifyListenerErrorModeled::ListenerNotFoundException(
+                ListenerNotFoundException {
+                    message: Some(crate::state::listener_not_found_message(&input.listener_arn)),
+                },
+            )
+            .into());
+        };
+
+        // Every member the request did not name keeps the value the listener holds.
+        let mut updated = stored.clone();
+        if let Some(port) = input.port {
+            updated.port = Some(port);
+        }
+        if let Some(protocol) = input.protocol.clone() {
+            updated.protocol = Some(protocol);
+        }
+        if let Some(ssl_policy) = input.ssl_policy.clone() {
+            updated.ssl_policy = Some(ssl_policy);
+        }
+        if let Some(actions) = input.default_actions.clone() {
+            // "To add an item to a list, remove an item from a list, or update an item in
+            // a list, you must provide the entire list" — so the list the request
+            // carries replaces the stored one outright.
+            updated.default_actions = actions;
+        }
+        if let Some(alpn_policy) = input.alpn_policy.clone() {
+            updated.alpn_policy = alpn_policy;
+        }
+
+        apply_certificate_rules(&mut updated, input.certificates.as_deref())?;
+
+        // One listener per port on a load balancer: moving this one onto a port another
+        // of its load balancer's listeners holds is the modelled duplicate.
+        if updated.port != stored.port {
+            if let Some(clash) = guard
+                .listeners
+                .values()
+                .find(|other| {
+                    other.arn != updated.arn
+                        && other.load_balancer_arn == updated.load_balancer_arn
+                        && other.port == updated.port
+                })
+                .map(|other| other.arn.clone())
+            {
+                return Err(ModifyListenerErrorModeled::DuplicateListenerException(
+                    DuplicateListenerException {
+                        message: Some(format!(
+                            "A listener already exists on port {} of load balancer '{}': '{clash}'",
+                            updated.port.unwrap_or_default(),
+                            updated.load_balancer_arn
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A default action may forward only to a target group that exists.
+        let forwarded = crate::state::action_target_group_arns(&updated.default_actions);
+        for target_group_arn in &forwarded {
+            if !guard.target_groups.contains_key(target_group_arn) {
+                return Err(ModifyListenerErrorModeled::TargetGroupNotFoundException(
+                    TargetGroupNotFoundException {
+                        message: Some(crate::state::target_groups_not_found_message([
+                            target_group_arn.as_str(),
+                        ])),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let load_balancer_arn = updated.load_balancer_arn.clone();
+        guard.listeners.insert(updated.arn.clone(), updated);
+        // The listener's actions decide which target groups report this load balancer, so
+        // a modification that stopped forwarding to one drops that association and one
+        // that started forwarding adds it.
+        guard.refresh_target_group_associations(&load_balancer_arn);
+
+        let stored = guard
+            .listeners
+            .get(&input.listener_arn)
+            .expect("the listener just written");
+        Ok(ModifyListenerOutput {
+            listeners: Some(vec![stored.to_shape()]),
+        })
     }
+}
+
+/// Apply the model's certificate and security-policy rules to the listener the call
+/// LEAVES behind, and refuse a request that breaks them.
+///
+/// The rules are the protocol brackets `CreateListener` enforces, read through the
+/// transition this operation documents: a listener that terminates no TLS carries no
+/// certificate and no security policy ("Changing the protocol from HTTPS to HTTP, or from
+/// TLS to TCP, removes the security policy and default certificate properties"), and one
+/// that does must carry exactly one default certificate ("you must add the security
+/// policy and default certificate properties"; `Certificates`: "You must provide exactly
+/// one certificate").
+///
+/// The model declares no error shape for breaking either, so the refusal is this
+/// service's own input validation (`400` `ValidationError`) with a message naming the
+/// member and the protocol it was judged against.
+fn apply_certificate_rules(
+    listener: &mut crate::state::ListenerRecord,
+    certificates: Option<&[Certificate]>,
+) -> Result<(), ModifyListenerError> {
+    let requested = certificates.unwrap_or_default();
+    // How the refusal names what it judged, for a listener that names no protocol as
+    // well as for one that does.
+    let named = match listener.protocol.as_deref() {
+        Some(value) => format!("{value} listeners"),
+        None => "a listener with no protocol".to_string(),
+    };
+
+    if !listener.terminates_tls() {
+        if !requested.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "Certificates cannot be specified for {named}: the default certificate \
+                 applies only to {} listeners",
+                crate::state::TLS_TERMINATING_PROTOCOLS.join(" and ")
+            )));
+        }
+        // The protocol this call leaves the listener on terminates no TLS, so the
+        // certificate and security policy properties go with it.
+        listener.ssl_policy = None;
+        listener.certificate_arns.clear();
+        listener.list_certificate_arns.clear();
+        return Ok(());
+    }
+
+    if requested.len() > 1 {
+        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+            "You must provide exactly one certificate for {named}, got {}",
+            requested.len()
+        )));
+    }
+    if let Some(certificate) = requested.first() {
+        let Some(arn) = certificate
+            .certificate_arn
+            .as_deref()
+            .filter(|arn| !arn.is_empty())
+        else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "CertificateArn must be set on the certificate of {named}"
+            )));
+        };
+        listener.certificate_arns = vec![arn.to_string()];
+    }
+    if listener.certificate_arns.is_empty() {
+        // AWS's own wording for this refusal, built from the protocol the listener is
+        // left on: "A certificate must be specified for HTTPS listeners".
+        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+            "A certificate must be specified for {named}"
+        )));
+    }
+    Ok(())
 }
