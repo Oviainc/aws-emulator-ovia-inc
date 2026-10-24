@@ -109,6 +109,19 @@ const FIRST_CLUSTER_ID: u64 = 8_000_000;
 /// `TooManyRequestsException`, which is the refusal once the store is full.
 pub const MAX_CLUSTERS: usize = 100;
 
+/// The most `InterfaceMapping` entries this emulator stores for ONE cluster.
+///
+/// A ceiling for the same reason as [`MAX_CLUSTERS`], and the one that bounds
+/// the per-read derivation on the network side
+/// ([`ComAmazonawsMedialiveMedialiveState::clusters_using_network`]): a mapping
+/// list that grew without bound would make both the store and that scan grow
+/// without bound. "You need only one mapping for each interface because all the
+/// Nodes share the same interfaces" (`ClusterNetworkSettings$InterfaceMappings`,
+/// `smithy_query(query="shape", shape="ClusterNetworkSettings")`), so a list this
+/// long already names more interfaces than a node has; `CreateCluster` refuses a
+/// longer one with its own modelled `BadRequestException` rather than storing it.
+pub const MAX_CLUSTER_INTERFACE_MAPPINGS: usize = 32;
+
 /// The most `RequestId` entries kept for `CreateCluster` idempotency — the same
 /// bound, for the same reason, as [`super::MAX_IDEMPOTENCY_TOKENS`] on channels:
 /// a token is only useful while the cluster it created still exists.
@@ -446,9 +459,11 @@ impl ComAmazonawsMedialiveMedialiveState {
 /// the parent module.
 ///
 /// Every member is the value the request supplied: an `InterfaceMapping`'s
-/// `NetworkId` names one of the Networks the cluster is associated with, and
-/// this emulator holds no network store yet (`CreateNetwork` is still a
-/// scaffold), so it is stored as spelled rather than resolved.
+/// `NetworkId` names one of the Networks the cluster is associated with, and it
+/// is stored as spelled rather than resolved, because the network it names need
+/// not have been created yet. It is what the network side of the store reads
+/// that association back out of
+/// ([`ComAmazonawsMedialiveMedialiveState::clusters_using_network`]).
 pub fn described_cluster_network_settings(
     settings: &ClusterNetworkSettingsCreateRequest,
 ) -> ClusterNetworkSettings {

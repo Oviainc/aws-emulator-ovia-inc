@@ -294,7 +294,8 @@ pub mod clusters;
 pub use clusters::{
     cluster_alert_output, cluster_alert_state, cluster_state, described_cluster_network_settings,
     ClusterAlertRecord, ClusterRecord, ClusterRefusal, NewCluster, CLUSTER_ALERT_FILTERS,
-    CLUSTER_ALERT_FILTER_ALL, MAX_CLUSTERS, MAX_CLUSTER_ALERTS, MAX_CLUSTER_TOKENS,
+    CLUSTER_ALERT_FILTER_ALL, MAX_CLUSTERS, MAX_CLUSTER_ALERTS, MAX_CLUSTER_INTERFACE_MAPPINGS,
+    MAX_CLUSTER_TOKENS,
 };
 
 pub(crate) use clusters::cluster_description_output;
@@ -1941,17 +1942,45 @@ impl ComAmazonawsMedialiveMedialiveState {
             .map(|network| network.id.as_str())
     }
 
-    /// The ids of the clusters currently attached to the network `id` — what
-    /// `AssociatedClusterIds` reports. Derived from the store on every read, so
-    /// it tracks every later cluster create and delete rather than being recorded
-    /// at create time.
+    /// The ids of the clusters currently attached to the network `network_id` —
+    /// what `AssociatedClusterIds` reports. Derived from the cluster store on
+    /// every read, so it tracks every later cluster create rather than being
+    /// recorded at create time.
     ///
-    /// Empty for every network today: a cluster names its networks through
-    /// `CreateCluster`, which is still a scaffold, so this store holds no cluster
-    /// that could be attached to one. The derivation lives here so the cluster
-    /// slice has one place to fill in when it lands.
-    pub fn clusters_using_network(&self, _network_id: &str) -> Vec<String> {
-        Vec::new()
+    /// The association the store knows is the one a cluster's own request
+    /// carries: an `InterfaceMapping`'s `NetworkId`, "The ID of the network that
+    /// you want to connect to the specified logicalInterfaceName"
+    /// (`smithy_query(query="shape", shape="InterfaceMapping")`). A cluster that
+    /// maps several of its interfaces onto the same network is attached to it
+    /// once, and `DefaultRoute` names an interface rather than a network, so it
+    /// attaches nothing.
+    ///
+    /// BOUNDED work, on both factors: the store holds at most [`MAX_CLUSTERS`]
+    /// clusters (enforced in [`Self::insert_cluster`]) and each carries at most
+    /// [`MAX_CLUSTER_INTERFACE_MAPPINGS`] mappings (`CreateCluster` refuses a
+    /// longer list), so one call scans at most the product of the two and a
+    /// listing — itself capped at `MAX_LIST_PAGE_SIZE` networks per page — calls
+    /// it once per reported network.
+    ///
+    /// Reported in `BTreeMap` key order, which is the order the cluster ids were
+    /// minted in because they are minted from a counter at a fixed seven-digit
+    /// width (see `FIRST_CLUSTER_ID`), so the keys sort numerically.
+    pub fn clusters_using_network(&self, network_id: &str) -> Vec<String> {
+        self.clusters
+            .values()
+            .filter(|cluster| {
+                cluster
+                    .network_settings
+                    .as_ref()
+                    .and_then(|settings| settings.interface_mappings.as_ref())
+                    .is_some_and(|mappings| {
+                        mappings
+                            .iter()
+                            .any(|mapping| mapping.network_id.as_deref() == Some(network_id))
+                    })
+            })
+            .map(|cluster| cluster.id.clone())
+            .collect()
     }
 
     /// The `DescribeNetworkSummary` projection of one stored network, or `None`

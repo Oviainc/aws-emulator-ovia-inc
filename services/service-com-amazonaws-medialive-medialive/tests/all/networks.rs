@@ -7,13 +7,16 @@
 //! `MultiServiceRouter::dispatch` with real HTTP requests, so what is asserted is
 //! the emulator's wire behaviour, not an internal function's return value.
 //!
+//! A network's `AssociatedClusterIds` is derived from the clusters this store
+//! holds, so the suite that covers it drives `CreateCluster` too.
+//!
 //! The suites are TABLES: a single `ListNetworks` call on a store nothing has
 //! created a network in (the issue's own reproduction) is ONE row of the first of
 //! them.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_medialive_medialive::state::{
-    MAX_LIST_PAGE_SIZE, MAX_NETWORK_CIDR_ENTRIES,
+    MAX_CLUSTER_INTERFACE_MAPPINGS, MAX_LIST_PAGE_SIZE, MAX_NETWORK_CIDR_ENTRIES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -552,6 +555,444 @@ async fn a_retried_create_answers_with_the_network_the_token_created() {
     assert_eq!(
         ids, minted,
         "expected one network per distinct token; pages were {pages:?}"
+    );
+}
+
+/// A network id nothing minted, which is what a cluster mapping that names no
+/// stored network carries.
+const STRAY_NETWORK_ID: &str = "9999999";
+
+/// `CreateCluster`, answering the created cluster's id.
+async fn created_cluster(router: &MultiServiceRouter, case: &str, body: Value) -> String {
+    let (status, cluster) = call(router, "POST", "/prod/clusters", Some(body)).await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: expected CreateCluster to answer 201, got {status}: {cluster}"
+    );
+    id_of(case, &cluster)
+}
+
+/// One cluster an association row creates.
+struct ClusterSpec {
+    /// Whether the create carries a `NetworkSettings` block at all; `false` is a
+    /// cluster created without one.
+    settings: bool,
+    /// One `InterfaceMapping` per entry: `Some(index)` names the row's network at
+    /// that index and `None` names [`STRAY_NETWORK_ID`]. A repeated index is a
+    /// second interface mapped onto the same network.
+    mappings: &'static [Option<usize>],
+    /// When set, `DefaultRoute` is spelled with the id of the row's network at
+    /// this index. `DefaultRoute` is "the network interface that is the default
+    /// route for traffic to and from the node"
+    /// (`smithy_query(query="shape", shape="ClusterNetworkSettings")`) — an
+    /// interface, not a network — so it attaches nothing.
+    default_route: Option<usize>,
+}
+
+/// One row of the association table: how many networks the store holds and the
+/// clusters created against them.
+struct Attachment {
+    case: &'static str,
+    networks: usize,
+    clusters: &'static [ClusterSpec],
+}
+
+/// The `CreateCluster` body one [`ClusterSpec`] asks for, against the ids the
+/// row's networks were minted with.
+fn cluster_body(name: String, spec: &ClusterSpec, network_ids: &[String]) -> Value {
+    let mut body = json!({ "name": name, "clusterType": "ON_PREMISES" });
+    if !spec.settings {
+        return body;
+    }
+    let mut settings = json!({});
+    if let Some(index) = spec.default_route {
+        settings["defaultRoute"] = json!(network_ids[index]);
+    }
+    settings["interfaceMappings"] = Value::Array(
+        spec.mappings
+            .iter()
+            .enumerate()
+            .map(|(slot, mapping)| {
+                json!({
+                    "logicalInterfaceName": format!("eth{slot}"),
+                    "networkId": mapping.map_or_else(
+                        || STRAY_NETWORK_ID.to_string(),
+                        |index| network_ids[index].clone(),
+                    ),
+                })
+            })
+            .collect(),
+    );
+    body["networkSettings"] = settings;
+    body
+}
+
+/// Rule: a network's `AssociatedClusterIds` is derived from the cluster store on
+/// every read — the clusters one of whose `InterfaceMappings` carries that
+/// network's id as its `NetworkId` ("The ID of the network that you want to
+/// connect to the specified logicalInterfaceName",
+/// `smithy_query(query="shape", shape="InterfaceMapping")`), each reported once —
+/// so it tracks every cluster created after the network and is never a value
+/// recorded at create time.
+///
+/// The rows differ along the COUNT of clusters and of networks and along the FORM
+/// of the mapping that attaches them: none at all, one cluster on one network,
+/// one cluster across every network, two clusters on the same network, a cluster
+/// created without network settings, two interfaces of one cluster mapped onto
+/// one network, an empty mapping list, a mapping naming an id nothing minted, and
+/// a `DefaultRoute` spelled with a network id — because that is what the rule
+/// generalises over.
+#[tokio::test]
+async fn a_networks_associated_clusters_are_the_clusters_mapped_onto_it() {
+    let table = [
+        Attachment {
+            case: "no cluster at all",
+            networks: 2,
+            clusters: &[],
+        },
+        Attachment {
+            case: "one cluster on the first network",
+            networks: 2,
+            clusters: &[ClusterSpec {
+                settings: true,
+                mappings: &[Some(0)],
+                default_route: None,
+            }],
+        },
+        Attachment {
+            case: "one cluster across every network",
+            networks: 3,
+            clusters: &[ClusterSpec {
+                settings: true,
+                mappings: &[Some(0), Some(1), Some(2)],
+                default_route: Some(0),
+            }],
+        },
+        Attachment {
+            case: "two clusters on the same network",
+            networks: 2,
+            clusters: &[
+                ClusterSpec {
+                    settings: true,
+                    mappings: &[Some(1)],
+                    default_route: None,
+                },
+                ClusterSpec {
+                    settings: true,
+                    mappings: &[Some(1)],
+                    default_route: None,
+                },
+            ],
+        },
+        Attachment {
+            case: "a cluster with no network settings beside one with them",
+            networks: 2,
+            clusters: &[
+                ClusterSpec {
+                    settings: false,
+                    mappings: &[],
+                    default_route: None,
+                },
+                ClusterSpec {
+                    settings: true,
+                    mappings: &[Some(1)],
+                    default_route: None,
+                },
+            ],
+        },
+        Attachment {
+            case: "two interfaces of one cluster onto one network",
+            networks: 1,
+            clusters: &[ClusterSpec {
+                settings: true,
+                mappings: &[Some(0), Some(0)],
+                default_route: None,
+            }],
+        },
+        Attachment {
+            case: "an empty interface mapping list",
+            networks: 1,
+            clusters: &[ClusterSpec {
+                settings: true,
+                mappings: &[],
+                default_route: None,
+            }],
+        },
+        Attachment {
+            case: "a mapping naming an id nothing minted",
+            networks: 1,
+            clusters: &[ClusterSpec {
+                settings: true,
+                mappings: &[None],
+                default_route: None,
+            }],
+        },
+        Attachment {
+            case: "a default route spelled with a network id",
+            networks: 1,
+            clusters: &[ClusterSpec {
+                settings: true,
+                mappings: &[],
+                default_route: Some(0),
+            }],
+        },
+    ];
+
+    for Attachment {
+        case,
+        networks,
+        clusters,
+    } in table
+    {
+        let router = medialive();
+
+        let mut network_ids: Vec<String> = Vec::new();
+        for index in 0..networks {
+            let network = created(
+                &router,
+                case,
+                json!({
+                    "name": format!("network-{index}"),
+                    "ipPools": [{ "cidr": format!("10.{index}.0.0/16") }],
+                }),
+            )
+            .await;
+            // Nothing has created a cluster yet, so the create itself reports no
+            // association rather than inventing one.
+            assert_eq!(
+                list_member(&network, "associatedClusterIds"),
+                json!([]),
+                "case {case:?}: network {index}: expected no associated clusters before any \
+                 cluster exists, got {:?}",
+                network["associatedClusterIds"]
+            );
+            network_ids.push(id_of(case, &network));
+        }
+
+        let mut cluster_ids: Vec<String> = Vec::new();
+        for (index, spec) in clusters.iter().enumerate() {
+            let body = cluster_body(format!("cluster-{index}"), spec, &network_ids);
+            cluster_ids.push(created_cluster(&router, case, body).await);
+        }
+
+        for (index, network_id) in network_ids.iter().enumerate() {
+            // What the rule says this network's list must be, read off the
+            // requests rather than off the emulator: the clusters one of whose
+            // mappings named this network, in the order they were created, each
+            // once.
+            let expected: Value = clusters
+                .iter()
+                .zip(&cluster_ids)
+                .filter(|(spec, _)| {
+                    spec.settings && spec.mappings.contains(&Some(index))
+                })
+                .map(|(_, id)| json!(id))
+                .collect();
+
+            let (status, described) = describe(&router, network_id).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected DescribeNetwork to answer 200, got {status}: {described}"
+            );
+            assert_eq!(
+                list_member(&described, "associatedClusterIds"),
+                expected,
+                "case {case:?}: network {network_id}: expected DescribeNetwork to report \
+                 {expected}, got {:?}",
+                described["associatedClusterIds"]
+            );
+
+            let (status, listed) = list(&router, "").await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected ListNetworks to answer 200, got {status}: {listed}"
+            );
+            let summary = summaries(case, &listed)
+                .into_iter()
+                .find(|summary| summary["id"] == json!(network_id))
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: expected {network_id} in the listing, got {listed}")
+                });
+            assert_eq!(
+                list_member(&summary, "associatedClusterIds"),
+                expected,
+                "case {case:?}: network {network_id}: expected ListNetworks to report the same \
+                 {expected}, got {:?}",
+                summary["associatedClusterIds"]
+            );
+        }
+    }
+}
+
+/// Rule: `CreateNetwork` reports the SAME derived `AssociatedClusterIds` as the
+/// readers do, because all three answer from the one stored record — which the
+/// idempotent retry shows: the retry of a create whose network a cluster has
+/// since been mapped onto reports that cluster.
+#[tokio::test]
+async fn a_retried_create_reports_the_clusters_attached_since() {
+    let router = medialive();
+
+    let first = created(
+        &router,
+        "the retried create",
+        json!({
+            "name": "attached",
+            "requestId": "request-1",
+            "ipPools": [{ "cidr": "192.0.2.0/24" }],
+        }),
+    )
+    .await;
+    let network_id = id_of("the retried create", &first);
+    assert_eq!(
+        list_member(&first, "associatedClusterIds"),
+        json!([]),
+        "expected no association before a cluster exists, got {:?}",
+        first["associatedClusterIds"]
+    );
+
+    // Two clusters: one mapped onto this network and one mapped elsewhere, so
+    // the retry reports the attachment rather than every cluster in the store.
+    let attached = created_cluster(
+        &router,
+        "the attached cluster",
+        json!({
+            "name": "attached-cluster",
+            "clusterType": "ON_PREMISES",
+            "networkSettings": {
+                "interfaceMappings": [
+                    { "logicalInterfaceName": "eth0", "networkId": network_id }
+                ]
+            },
+        }),
+    )
+    .await;
+    created_cluster(
+        &router,
+        "the unattached cluster",
+        json!({
+            "name": "other-cluster",
+            "clusterType": "ON_PREMISES",
+            "networkSettings": {
+                "interfaceMappings": [
+                    { "logicalInterfaceName": "eth0", "networkId": STRAY_NETWORK_ID }
+                ]
+            },
+        }),
+    )
+    .await;
+
+    let retried = created(
+        &router,
+        "the retried create",
+        json!({
+            "name": "attached",
+            "requestId": "request-1",
+            "ipPools": [{ "cidr": "192.0.2.0/24" }],
+        }),
+    )
+    .await;
+    assert_eq!(
+        id_of("the retried create", &retried),
+        network_id,
+        "expected the retry to answer with the network the token created, got {retried}"
+    );
+    assert_eq!(
+        list_member(&retried, "associatedClusterIds"),
+        json!([attached]),
+        "expected CreateNetwork to report the cluster mapped onto this network, got {:?}",
+        retried["associatedClusterIds"]
+    );
+
+    let (status, described) = describe(&router, &network_id).await;
+    assert_eq!(
+        status, 200,
+        "expected DescribeNetwork to answer 200, got {status}: {described}"
+    );
+    assert_eq!(
+        list_member(&described, "associatedClusterIds"),
+        json!([attached]),
+        "expected DescribeNetwork to agree with the create, got {:?}",
+        described["associatedClusterIds"]
+    );
+}
+
+/// Rule: the mapping list one cluster carries is bounded by what this emulator
+/// stores (`MAX_CLUSTER_INTERFACE_MAPPINGS`), which is what keeps the network
+/// side's per-read derivation bounded: a cluster at the bound is stored and
+/// attached (once, however many of its interfaces name the same network) and one
+/// past it is refused with `CreateCluster`'s modelled `BadRequestException` (400)
+/// and attaches nothing.
+///
+/// The rows are the published bound itself and the first value past it.
+#[tokio::test]
+async fn a_cluster_maps_at_most_the_mappings_the_store_keeps() {
+    let router = medialive();
+    let network = created(
+        &router,
+        "the bounded cluster",
+        json!({ "name": "bounded", "ipPools": [{ "cidr": "192.0.2.0/24" }] }),
+    )
+    .await;
+    let network_id = id_of("the bounded cluster", &network);
+
+    // Every mapping names the SAME network, so the cluster at the bound is still
+    // reported once.
+    let mappings = |count: usize| -> Value {
+        (0..count)
+            .map(|slot| {
+                json!({
+                    "logicalInterfaceName": format!("eth{slot}"),
+                    "networkId": network_id,
+                })
+            })
+            .collect()
+    };
+
+    let at_the_bound = created_cluster(
+        &router,
+        "at the bound",
+        json!({
+            "name": "cluster-at-the-bound",
+            "clusterType": "ON_PREMISES",
+            "networkSettings": { "interfaceMappings": mappings(MAX_CLUSTER_INTERFACE_MAPPINGS) },
+        }),
+    )
+    .await;
+
+    let (status, refused) = call(
+        &router,
+        "POST",
+        "/prod/clusters",
+        Some(json!({
+            "name": "cluster-past-the-bound",
+            "clusterType": "ON_PREMISES",
+            "networkSettings": {
+                "interfaceMappings": mappings(MAX_CLUSTER_INTERFACE_MAPPINGS + 1)
+            },
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "expected {} mappings to be refused, got {status}: {refused}",
+        MAX_CLUSTER_INTERFACE_MAPPINGS + 1
+    );
+    assert_eq!(
+        error_code(status, &refused),
+        "BadRequestException",
+        "expected BadRequestException, got {refused}"
+    );
+
+    let (status, described) = describe(&router, &network_id).await;
+    assert_eq!(
+        status, 200,
+        "expected DescribeNetwork to answer 200, got {status}: {described}"
+    );
+    assert_eq!(
+        list_member(&described, "associatedClusterIds"),
+        json!([at_the_bound]),
+        "expected only the cluster at the bound, reported once, got {:?}",
+        described["associatedClusterIds"]
     );
 }
 

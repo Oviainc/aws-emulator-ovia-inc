@@ -197,6 +197,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::MAX_REQUEST_ID_LEN,
         )?;
 
+        // The mapping list is bounded BEFORE anything is written, so a refused
+        // request stores no cluster: the bound is what keeps the network side's
+        // per-read `AssociatedClusterIds` derivation
+        // (`clusters_using_network`, which scans each stored cluster's mappings)
+        // bounded too.
+        let mappings = input
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.interface_mappings.as_ref())
+            .map_or(0, Vec::len);
+        if mappings > crate::state::MAX_CLUSTER_INTERFACE_MAPPINGS {
+            return Err(
+                CreateClusterErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(format!(
+                        "networkSettings.interfaceMappings takes at most {} entries, but was {mappings}",
+                        crate::state::MAX_CLUSTER_INTERFACE_MAPPINGS
+                    )),
+                })
+                .into(),
+            );
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
