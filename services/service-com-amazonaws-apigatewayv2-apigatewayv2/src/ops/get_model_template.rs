@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetModelTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetModelTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: generates the mapping template of the [`crate::state::Model`] record its
+//! parent api holds under the requested `ModelId` — a Velocity (VTL) skeleton that maps an
+//! incoming payload onto the shape the model's JSON Schema declares. This is the ONLY file
+//! to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetModelTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The generation is a pure function of the stored schema ([`generate_template`]), so the
+//! operation is REPORTING: it reads the store and writes nothing, and two calls on an
+//! unchanged model answer the same template. The record is copied out from under the state
+//! guard before anything is generated, so the generation holds no lock, and it is bounded
+//! in descent ([`MAX_DEPTH`]), in steps ([`MAX_STEPS`]) and in output
+//! ([`MAX_TEMPLATE_BYTES`]) — a schema that does not fit those bounds is refused, so one
+//! request costs a fixed amount of work and returns a fixed amount of output however the
+//! stored schema branches or refers back into itself.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +143,465 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetModelTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetModelTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetModelTemplate"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetModelTemplate",
+            ));
+        };
+        // The store is read, and the record this call reports on is COPIED out of it,
+        // under a guard that lives no longer than the read: the generation below is
+        // bounded CPU work with nothing else to synchronise, so it must not hold the
+        // state another request needs. Nothing here writes — the operation reports.
+        let model = {
+            let store = state.lock();
+            // A model is addressed by the api that owns it AND its own id, so an id that
+            // names a model of ANOTHER api is not found here either — the same addressing
+            // `GetModel` reports on.
+            store
+                .apis
+                .get(&input.api_id)
+                .and_then(|api| api.models.get(&input.model_id))
+                .cloned()
+        };
+        let Some(model) = model else {
+            return Err(GetModelTemplateErrorModeled::NotFoundException(
+                NotFoundException {
+                    // The refusal names the identifier the REQUEST supplied, which is the
+                    // only thing the caller can act on: no model is addressable by it
+                    // under this api. This is the sentence API Gateway answers a
+                    // GetModelTemplate for an unaddressable model with, and the id in it
+                    // is the request's own.
+                    message: Some(format!(
+                        "Invalid model identifier specified: {}",
+                        input.model_id
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // The template is generated FROM the model's schema, and the one schema language
+        // this service reads is JSON Schema — the language of a JSON model's schema
+        // ("For application/json models, this should be JSON schema draft 4 model",
+        // `CreateModel$Schema`), which `crate::state::is_json_media_type` recognises and
+        // `crate::state::validate_model_schema` is what held a JSON model's schema to. A
+        // model of another content type carries its schema in that content type's own
+        // language, which nothing here can map a payload against, so the request is
+        // refused rather than answered with a template nothing generated.
+        let content_type = model.content_type.as_deref();
+        let document = Some(model.schema.as_str())
+            .filter(|_| crate::state::is_json_media_type(content_type))
+            .and_then(|schema| ::serde_json::from_str::<::serde_json::Value>(schema).ok())
+            .filter(::serde_json::Value::is_object)
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(format!(
+                    "Unable to generate a template for model {}: a template is generated \
+                     from a JSON Schema document, and this model's schema is not one. Its \
+                     content type is {}.",
+                    model.name,
+                    content_type.unwrap_or("unset, so application/json")
+                ))
+            })?;
+
+        // Generation is bounded in steps, in depth and in output size, and a schema that
+        // does not fit those bounds is REFUSED rather than expanded: one request can
+        // therefore cost at most a fixed amount of work and return at most a fixed amount
+        // of output, however the stored schema branches or refers back to itself.
+        let value = generate_template(&document).map_err(|exhausted| {
+            crate::scaffolded::Scaffolded::validation(format!(
+                "Unable to generate a template for model {}: its schema expands past {}, \
+                 the bound this service generates a template within.",
+                model.name,
+                exhausted.bound()
+            ))
+        })?;
+
+        Ok(GetModelTemplateOutput {
+            value: Some(value),
+        })
     }
+}
+
+/// The line every generated template opens with.
+///
+/// It binds the Velocity reference `$inputRoot` to the root of the incoming payload
+/// (`$input.path('$')`), so every mapped member below is addressed relative to it. This is
+/// the preamble API Gateway's own generated mapping templates carry (see the generated
+/// templates in the API Gateway "Models and mapping templates" documentation).
+const INPUT_ROOT: &str = "$inputRoot";
+
+/// One indentation step of a generated template's nested lines.
+const INDENT: &str = "  ";
+
+/// How deep into a schema the generator descends before it stops and maps the value as a
+/// whole.
+///
+/// A JSON Schema may point at itself through `$ref` (a tree node whose children are the
+/// same schema), so the descent needs a bound to terminate at all; past the bound the
+/// member is mapped by reference, which is a valid template for a value of unknown shape.
+/// Every `$ref` hop costs a level too ([`render`]), so a cycle cannot be re-entered free.
+pub const MAX_DEPTH: usize = 12;
+
+/// How many values one generation may render.
+///
+/// A bound on the generator's STEPS, which the depth bound alone does not give: a schema
+/// branches (an object renders one value per declared property), so the rendered values
+/// grow as the product of the branching factors, not with the depth. An EMULATOR bound,
+/// not a figure AWS publishes, and what it buys is that one `GetModelTemplate` request
+/// costs a fixed amount of work whatever the stored schema does. It is far above any
+/// schema that fits `Model$Schema`'s modelled 32K: a schema that size cannot declare more
+/// than a few thousand properties, so only a schema that re-expands itself through `$ref`
+/// reaches this bound, and such a schema is refused rather than expanded.
+pub const MAX_STEPS: usize = 20_000;
+
+/// The most bytes a generated template may carry.
+///
+/// A bound on the generator's OUTPUT, so a small request cannot be answered with an
+/// arbitrarily large response. Also an emulator bound: `Model$Schema` is modelled
+/// `StringWithLengthBetween0And32K`, and a template maps what that document declares, so
+/// twice the schema's own modelled bound leaves generous room for every schema that is not
+/// re-expanding itself.
+pub const MAX_TEMPLATE_BYTES: usize = 64 * 1024;
+
+/// Which bound a generation hit, for the refusal that names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exhausted {
+    /// More values to render than [`MAX_STEPS`].
+    Steps,
+    /// More output than [`MAX_TEMPLATE_BYTES`].
+    Size,
+}
+
+impl Exhausted {
+    /// The bound, as the refusal states it to the caller.
+    pub fn bound(self) -> String {
+        match self {
+            Self::Steps => format!("{MAX_STEPS} rendered values"),
+            Self::Size => format!("{MAX_TEMPLATE_BYTES} bytes of template"),
+        }
+    }
+}
+
+/// The template under construction, and the budget it is generated within.
+///
+/// Every byte of the template goes through [`Writer::push`] and every rendered value
+/// through [`Writer::step`], so the two bounds hold by construction: the generation cannot
+/// render more than [`MAX_STEPS`] values or build more than [`MAX_TEMPLATE_BYTES`] bytes,
+/// and it stops at the first of them it reaches.
+#[derive(Debug)]
+struct Writer {
+    template: String,
+    /// How many more values may be rendered.
+    steps: usize,
+}
+
+impl Writer {
+    fn new() -> Self {
+        Self {
+            template: String::new(),
+            steps: MAX_STEPS,
+        }
+    }
+
+    /// Charge one rendered value against the step budget.
+    fn step(&mut self) -> Result<(), Exhausted> {
+        self.steps = self.steps.checked_sub(1).ok_or(Exhausted::Steps)?;
+        Ok(())
+    }
+
+    /// Append `text`, or report the output bound if it would not fit.
+    fn push(&mut self, text: &str) -> Result<(), Exhausted> {
+        if self.template.len() + text.len() > MAX_TEMPLATE_BYTES {
+            return Err(Exhausted::Size);
+        }
+        self.template.push_str(text);
+        Ok(())
+    }
+}
+
+/// Generate the mapping template of a model whose schema is `document`.
+///
+/// The template is the preamble ([`INPUT_ROOT`]) followed by a skeleton of the payload the
+/// schema declares: each declared property is mapped to its path under `$inputRoot`, a
+/// string-typed value is quoted and any other scalar is not, an `array` becomes a
+/// `#foreach` over its items, and a nested `object` nests. A schema that declares no type
+/// for a value maps that value by reference, which preserves it whatever it is.
+///
+/// Bounded in depth ([`MAX_DEPTH`]), in steps ([`MAX_STEPS`]) and in output
+/// ([`MAX_TEMPLATE_BYTES`]): a schema that does not fit the step or output bound is
+/// reported as [`Exhausted`] rather than expanded, so this is a fixed amount of work and a
+/// fixed amount of output per call.
+pub fn generate_template(document: &::serde_json::Value) -> Result<String, Exhausted> {
+    let mut writer = Writer::new();
+    writer.push(&format!("#set({INPUT_ROOT} = $input.path('$'))\n"))?;
+    render(document, document, INPUT_ROOT, 0, 0, 0, &mut writer)?;
+    Ok(writer.template)
+}
+
+/// The JSON type a schema node declares for its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Object,
+    Array,
+    Str,
+    /// A `number`, `integer` or `boolean`: a scalar rendered unquoted.
+    Scalar,
+    Null,
+    /// The schema declares nothing this generator can key on.
+    Unknown,
+}
+
+/// Render the value `schema` describes, reachable in the template at `path`, into `writer`.
+///
+/// `root` is the whole schema document, so a `$ref` can be resolved against it; `indent`
+/// is how deep the rendered lines sit, `loops` how many `#foreach`s enclose this value
+/// (which names its loop variable), and `depth` the descent bounded by [`MAX_DEPTH`].
+/// Following a `$ref` costs a level of that descent, so a schema that refers back into
+/// itself is not re-expanded for free.
+fn render(
+    root: &::serde_json::Value,
+    schema: &::serde_json::Value,
+    path: &str,
+    indent: usize,
+    loops: usize,
+    depth: usize,
+    writer: &mut Writer,
+) -> Result<(), Exhausted> {
+    writer.step()?;
+    if depth >= MAX_DEPTH {
+        // Past the descent bound the value is mapped by reference, which is the mapping
+        // for a value of unknown shape — whatever the payload carries there flows through.
+        return writer.push(path);
+    }
+    if let Some(target) = referenced(root, schema) {
+        return render(root, target, path, indent, loops, depth + 1, writer);
+    }
+    match kind(schema) {
+        Kind::Object => render_object(root, schema, path, indent, loops, depth, writer),
+        Kind::Array => render_array(root, schema, path, indent, loops, depth, writer),
+        // A string value is quoted, so the template renders valid JSON; every other
+        // scalar is substituted bare.
+        Kind::Str => {
+            writer.push("\"")?;
+            writer.push(path)?;
+            writer.push("\"")
+        }
+        Kind::Scalar | Kind::Unknown => writer.push(path),
+        Kind::Null => writer.push("null"),
+    }
+}
+
+/// The schema a `$ref` names, when it resolves inside this document.
+///
+/// JSON Schema draft-04 section 7 addresses a referenced schema by URI fragment, and the
+/// fragment of a reference into the same document is a JSON Pointer (`#/definitions/Pet`),
+/// which is what a model's schema carries: API Gateway resolves a `$ref` within the model.
+/// A reference to another document, or one this document does not hold, resolves to
+/// nothing — its value is then of unknown shape and mapped by reference.
+fn referenced<'doc>(
+    root: &'doc ::serde_json::Value,
+    schema: &::serde_json::Value,
+) -> Option<&'doc ::serde_json::Value> {
+    let reference = schema.get("$ref")?.as_str()?;
+    root.pointer(reference.strip_prefix('#')?)
+}
+
+/// The type `schema` declares for its value.
+///
+/// `type` is the keyword that states it, and draft-04 allows a union of types there
+/// (section 5.5.2), of which the first is taken. A schema that states no `type` still
+/// declares one implicitly: `properties` only applies to an object and `items` only to an
+/// array (sections 5.4.4, 5.3.1), and every value of an `enum` has the JSON type its first
+/// entry does.
+fn kind(schema: &::serde_json::Value) -> Kind {
+    let Some(object) = schema.as_object() else {
+        return Kind::Unknown;
+    };
+    let declared = match object.get("type") {
+        Some(::serde_json::Value::String(name)) => Some(name.as_str()),
+        Some(::serde_json::Value::Array(names)) => names
+            .iter()
+            .find_map(::serde_json::Value::as_str)
+            .filter(|name| *name != "null"),
+        _ => None,
+    };
+    if let Some(declared) = declared {
+        return match declared {
+            "object" => Kind::Object,
+            "array" => Kind::Array,
+            "string" => Kind::Str,
+            "number" | "integer" | "boolean" => Kind::Scalar,
+            "null" => Kind::Null,
+            _ => Kind::Unknown,
+        };
+    }
+    if object.contains_key("properties") {
+        return Kind::Object;
+    }
+    if object.contains_key("items") {
+        return Kind::Array;
+    }
+    match object.get("enum").and_then(::serde_json::Value::as_array) {
+        Some(values) => match values.first() {
+            Some(::serde_json::Value::String(_)) => Kind::Str,
+            Some(::serde_json::Value::Object(_)) => Kind::Object,
+            Some(::serde_json::Value::Array(_)) => Kind::Array,
+            Some(::serde_json::Value::Number(_) | ::serde_json::Value::Bool(_)) => Kind::Scalar,
+            Some(::serde_json::Value::Null) => Kind::Null,
+            None => Kind::Unknown,
+        },
+        None => Kind::Unknown,
+    }
+}
+
+/// Render an object: a JSON literal whose members are the schema's declared properties,
+/// each mapped to its own path under `path`.
+///
+/// The properties are emitted in lexicographic order, so one model has ONE template
+/// however the schema document happened to be written and however a JSON map iterates. A
+/// schema that declares no properties constrains no member, so there is nothing to map and
+/// the object is rendered empty.
+fn render_object(
+    root: &::serde_json::Value,
+    schema: &::serde_json::Value,
+    path: &str,
+    indent: usize,
+    loops: usize,
+    depth: usize,
+    writer: &mut Writer,
+) -> Result<(), Exhausted> {
+    let mut properties: Vec<(&String, &::serde_json::Value)> = schema
+        .get("properties")
+        .and_then(::serde_json::Value::as_object)
+        .map(|properties| properties.iter().collect())
+        .unwrap_or_default();
+    properties.sort_by_key(|(name, _)| *name);
+    if properties.is_empty() {
+        return writer.push("{ }");
+    }
+
+    let inner = INDENT.repeat(indent + 1);
+    writer.push("{\n")?;
+    for (position, (name, property)) in properties.into_iter().enumerate() {
+        if position > 0 {
+            writer.push(",\n")?;
+        }
+        writer.push(&inner)?;
+        writer.push(&quoted(name))?;
+        writer.push(" : ")?;
+        render(
+            root,
+            property,
+            &member_path(path, name),
+            indent + 1,
+            loops,
+            depth + 1,
+            writer,
+        )?;
+    }
+    writer.push("\n")?;
+    writer.push(&INDENT.repeat(indent))?;
+    writer.push("}")
+}
+
+/// Render an array: a `#foreach` over the value at `path`, whose body is the element its
+/// `items` schema describes.
+///
+/// `items` may be a single schema (every element) or, in draft-04, a tuple of schemas
+/// (section 5.3.1), of which the first describes the element rendered here. The separating
+/// comma is emitted for every element but the last (`$foreach.hasNext`), so the rendered
+/// payload is valid JSON.
+fn render_array(
+    root: &::serde_json::Value,
+    schema: &::serde_json::Value,
+    path: &str,
+    indent: usize,
+    loops: usize,
+    depth: usize,
+    writer: &mut Writer,
+) -> Result<(), Exhausted> {
+    let items = match schema.get("items") {
+        Some(::serde_json::Value::Array(schemas)) => schemas.first(),
+        other => other,
+    };
+    let element = loop_variable(loops);
+    writer.push(&format!("[#foreach({element} in {path})\n"))?;
+    writer.push(&INDENT.repeat(indent + 1))?;
+    match items {
+        Some(items) => render(root, items, &element, indent + 1, loops + 1, depth + 1, writer)?,
+        // Elements of unspecified shape are mapped by reference, one per element.
+        None => writer.push(&element)?,
+    }
+    writer.push("#if($foreach.hasNext),#end\n")?;
+    writer.push(&INDENT.repeat(indent))?;
+    writer.push("#end]")
+}
+
+/// The Velocity variable the `#foreach` at nesting level `loops` binds its element to.
+///
+/// The outermost loop binds `$elem`, the loop inside it `$elem2`, and so on: a nested loop
+/// needs its own name or it would shadow the element its parent is iterating.
+fn loop_variable(loops: usize) -> String {
+    if loops == 0 {
+        "$elem".to_string()
+    } else {
+        format!("$elem{}", loops + 1)
+    }
+}
+
+/// How the property `name` of the value at `path` is addressed in a template.
+///
+/// `$inputRoot.id` is the dotted reference Velocity resolves on a map, but it is only a
+/// reference when the name is an identifier (a letter or `_` followed by letters, digits,
+/// `_` or `-`): `$inputRoot.order id` would not parse. Every other name is addressed
+/// through the map's own `get`, which takes the name as a single-quoted Velocity string
+/// literal, with the name ESCAPED for that literal ([`escaped`]) — so the structure of the
+/// emitted template is this generator's, never a property name's.
+fn member_path(path: &str, name: &str) -> String {
+    let mut characters = name.chars();
+    let identifier = characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        });
+    if identifier {
+        format!("{path}.{name}")
+    } else {
+        format!("{path}.get('{}')", escaped(name))
+    }
+}
+
+/// `name`, escaped for the single-quoted Velocity literal it is embedded in.
+///
+/// A quote of either kind, a backslash and every control character is emitted in backslash
+/// form: a name carrying an apostrophe would otherwise close that literal, and one
+/// carrying a double quote or a newline would close the double-quoted JSON literal a
+/// string-typed member is rendered inside (or its line). Escaping them is what keeps the
+/// emitted template well formed whatever the stored schema names its properties.
+fn escaped(name: &str) -> String {
+    let mut escaped = String::with_capacity(name.len());
+    for character in name.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\'' => escaped.push_str("\\'"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            control if control.is_control() => {
+                escaped.push_str(&format!("\\u{:04x}", control as u32));
+            }
+            plain => escaped.push(plain),
+        }
+    }
+    escaped
+}
+
+/// `value` as a JSON string literal, with whatever it carries escaped.
+fn quoted(value: &str) -> String {
+    ::serde_json::Value::String(value.to_string()).to_string()
 }
