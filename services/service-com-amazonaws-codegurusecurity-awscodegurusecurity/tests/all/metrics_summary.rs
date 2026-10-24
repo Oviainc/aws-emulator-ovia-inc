@@ -7,24 +7,26 @@
 //! the harness of `crate::scan_lifecycle`, so the restJson1 wire shape and the shared
 //! engine store are exercised exactly as a client would exercise them.
 //!
-//! The rule under test: the summary reports, as of the END of the UTC day the requested
-//! instant falls in, the account's OPEN findings — counted per severity, per finding
-//! category (the detector that found it) and per scan — with the top 5 categories and
-//! the top 3 scans by count, and it reports that day whatever age the requested date
-//! has. Each case varies what the rule generalises over: the requested day, how many
-//! categories and scans the store holds, the severity and status of each finding, and
-//! when each finding was created.
+//! The rule under test: a `date` inside the window the model documents for it is
+//! answered with the summary of the UTC day that instant falls in — the account's OPEN
+//! findings as of the END of that day, counted per severity, per finding category (the
+//! detector that found it) and per scan, with the top 5 categories and the top 3 scans by
+//! count — while a `date` outside that window fails a documented input constraint and is
+//! refused with the modelled `ValidationException` (HTTP 400). Each case varies what the
+//! rule generalises over: where in (or outside) the window the requested instant falls,
+//! how many categories and scans the store holds, the severity and status of each
+//! finding, and when each finding was created.
 
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 use serde_json::Value;
 use service_com_amazonaws_codegurusecurity_awscodegurusecurity::ops::get_metrics_summary::{
-    CATEGORIES_WITH_MOST_FINDINGS, SCANS_WITH_MOST_OPEN_FINDINGS,
+    CATEGORIES_WITH_MOST_FINDINGS, METRICS_SUMMARY_WINDOW_DAYS, SCANS_WITH_MOST_OPEN_FINDINGS,
 };
 use service_com_amazonaws_codegurusecurity_awscodegurusecurity::ops::types::Finding;
 use service_com_amazonaws_codegurusecurity_awscodegurusecurity::state::{
-    MILLIS_PER_DAY, SEVERITY_CRITICAL, SEVERITY_HIGH, SEVERITY_INFO, SEVERITY_LOW, SEVERITY_MEDIUM,
-    STATUS_OPEN,
+    now_millis, start_of_utc_day_millis, MILLIS_PER_DAY, SEVERITY_CRITICAL, SEVERITY_HIGH,
+    SEVERITY_INFO, SEVERITY_LOW, SEVERITY_MEDIUM, STATUS_OPEN,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -33,11 +35,48 @@ use crate::scan_lifecycle::{call, harness, store_of, Answer};
 /// One day in seconds.
 const DAY: i64 = 24 * 60 * 60;
 
-/// `2024-01-10T00:00:00Z`: the day the seeded store's first findings were created.
-const DAY_A: i64 = 1_704_844_800;
+/// The start of today's UTC day, in epoch seconds: the latest day
+/// `GetMetricsSummaryRequest$date` may name. Every fixture day below is expressed
+/// relative to it, so the suite keeps asking about days inside the window the handler
+/// accepts however long after it was written it runs.
+fn today_secs() -> i64 {
+    start_of_utc_day_millis(now_millis()) / 1_000
+}
 
-/// `2024-01-15T00:00:00Z`: five days later, when one more finding was created.
-const DAY_B: i64 = DAY_A + 5 * DAY;
+/// The day the seeded store's first findings were created: thirty days before today, far
+/// enough inside the window that the cases below can also ask about the day either side
+/// of it.
+fn day_a() -> i64 {
+    today_secs() - 30 * DAY
+}
+
+/// Five days after [`day_a`], when one more finding was created.
+fn day_b() -> i64 {
+    day_a() + 5 * DAY
+}
+
+/// How close to a UTC midnight [`off_a_day_boundary`] refuses to run a case: the test
+/// reads the clock to build its bounds and the handler reads it again, so a day that
+/// rolls over between the two reads would move the window under an exact-bound case.
+const DAY_ROLLOVER_MARGIN_MILLIS: i64 = 5_000;
+
+/// Wait out a UTC midnight that is about to happen, so every case of this test computes
+/// its bounds from the same day the handler will read. Waits at most
+/// [`DAY_ROLLOVER_MARGIN_MILLIS`] and usually not at all.
+async fn off_a_day_boundary() {
+    let until_midnight = MILLIS_PER_DAY - now_millis().rem_euclid(MILLIS_PER_DAY);
+    if until_midnight <= DAY_ROLLOVER_MARGIN_MILLIS {
+        let wait = u64::try_from(until_midnight).unwrap_or(0) + 100;
+        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+    }
+}
+
+/// A seeded finding created on [`day_a`], as the seed table spells a creation instant:
+/// seconds after that day's start.
+const AT_DAY_A: i64 = 0;
+
+/// A seeded finding created on [`day_b`]; see [`AT_DAY_A`].
+const AT_DAY_B: i64 = 5 * DAY;
 
 /// The `Closed` status, from `types::shared_types::STATUS_VALUES`
 /// (`All | Closed | Open`): a finding the summary must never count.
@@ -162,7 +201,9 @@ fn seeded_finding(
     }
 }
 
-/// One seeded row: `(scanName, findingId, status, severity, detectorName, createdAt)`.
+/// One seeded row: `(scanName, findingId, status, severity, detectorName,
+/// secondsAfterDayA)` — the creation instant is relative to [`day_a`], so the fixture
+/// ages with the clock.
 type Seed = (
     &'static str,
     &'static str,
@@ -176,7 +217,7 @@ type Seed = (
 fn seed(engine: &std::sync::Arc<engine::InMemoryEngine>, seeds: &[Seed]) {
     let store = store_of(engine);
     let mut guard = store.lock();
-    for (scan_name, finding_id, status, severity, detector_name, created_at_secs) in seeds {
+    for (scan_name, finding_id, status, severity, detector_name, after_day_a) in seeds {
         guard.findings.insert(
             ((*scan_name).to_string(), (*finding_id).to_string()),
             seeded_finding(
@@ -184,7 +225,7 @@ fn seed(engine: &std::sync::Arc<engine::InMemoryEngine>, seeds: &[Seed]) {
                 status,
                 *severity,
                 *detector_name,
-                *created_at_secs,
+                day_a() + *after_day_a,
             ),
         );
     }
@@ -201,7 +242,7 @@ const SEEDED: &[Seed] = &[
         STATUS_OPEN,
         Some(SEVERITY_CRITICAL),
         Some("SQL injection"),
-        DAY_A,
+        AT_DAY_A,
     ),
     (
         "alpha",
@@ -209,7 +250,7 @@ const SEEDED: &[Seed] = &[
         STATUS_OPEN,
         Some(SEVERITY_CRITICAL),
         Some("SQL injection"),
-        DAY_A,
+        AT_DAY_A,
     ),
     (
         "alpha",
@@ -217,7 +258,7 @@ const SEEDED: &[Seed] = &[
         STATUS_OPEN,
         Some(SEVERITY_HIGH),
         Some("Hardcoded credentials"),
-        DAY_A,
+        AT_DAY_A,
     ),
     (
         "alpha",
@@ -225,7 +266,7 @@ const SEEDED: &[Seed] = &[
         STATUS_CLOSED,
         Some(SEVERITY_CRITICAL),
         Some("SQL injection"),
-        DAY_A,
+        AT_DAY_A,
     ),
     (
         "alpha",
@@ -233,7 +274,7 @@ const SEEDED: &[Seed] = &[
         STATUS_OPEN,
         Some(SEVERITY_MEDIUM),
         Some("Insecure hashing"),
-        DAY_B,
+        AT_DAY_B,
     ),
     (
         "beta",
@@ -241,7 +282,7 @@ const SEEDED: &[Seed] = &[
         STATUS_OPEN,
         Some(SEVERITY_CRITICAL),
         Some("Cross-site scripting"),
-        DAY_A,
+        AT_DAY_A,
     ),
     (
         "beta",
@@ -249,7 +290,7 @@ const SEEDED: &[Seed] = &[
         STATUS_OPEN,
         Some(SEVERITY_LOW),
         Some("Insecure hashing"),
-        DAY_A,
+        AT_DAY_A,
     ),
     (
         "beta",
@@ -257,7 +298,7 @@ const SEEDED: &[Seed] = &[
         STATUS_OPEN,
         Some(SEVERITY_INFO),
         Some("Log injection"),
-        DAY_A,
+        AT_DAY_A,
     ),
     (
         "gamma",
@@ -265,7 +306,7 @@ const SEEDED: &[Seed] = &[
         STATUS_OPEN,
         Some(SEVERITY_HIGH),
         Some("SQL injection"),
-        DAY_A,
+        AT_DAY_A,
     ),
     (
         "gamma",
@@ -273,7 +314,7 @@ const SEEDED: &[Seed] = &[
         STATUS_OPEN,
         Some(SEVERITY_MEDIUM),
         Some("Weak crypto"),
-        DAY_A,
+        AT_DAY_A,
     ),
     (
         "delta",
@@ -281,7 +322,7 @@ const SEEDED: &[Seed] = &[
         STATUS_OPEN,
         Some(SEVERITY_LOW),
         Some("Resource leak"),
-        DAY_A,
+        AT_DAY_A,
     ),
     (
         "epsilon",
@@ -289,7 +330,7 @@ const SEEDED: &[Seed] = &[
         STATUS_OPEN,
         Some(SEVERITY_INFO),
         Some("Path traversal"),
-        DAY_A,
+        AT_DAY_A,
     ),
 ];
 
@@ -308,6 +349,7 @@ struct Case {
 
 #[tokio::test]
 async fn metrics_summary_counts_the_stored_findings_as_of_the_requested_day() {
+    off_a_day_boundary().await;
     let (engine, router) = harness();
     seed(&engine, SEEDED);
 
@@ -315,7 +357,7 @@ async fn metrics_summary_counts_the_stored_findings_as_of_the_requested_day() {
         // Nothing existed yet: every count is zero and every ranking empty.
         Case {
             label: "the day before the first finding",
-            at_secs: DAY_A - DAY + DAY / 2,
+            at_secs: day_a() - DAY + DAY / 2,
             open: (0.0, 0.0, 0.0, 0.0, 0.0),
             categories: &[],
             scans: &[],
@@ -327,7 +369,7 @@ async fn metrics_summary_counts_the_stored_findings_as_of_the_requested_day() {
         // the top 3, equal counts ordered by name.
         Case {
             label: "the day the first findings were created",
-            at_secs: DAY_A + 45_296,
+            at_secs: day_a() + 45_296,
             open: (2.0, 2.0, 1.0, 2.0, 3.0),
             categories: &[
                 ("SQL injection", 3),
@@ -343,7 +385,7 @@ async fn metrics_summary_counts_the_stored_findings_as_of_the_requested_day() {
         // day joins its severity, its category and its scan.
         Case {
             label: "the day the fifth finding was created",
-            at_secs: DAY_B + DAY - 1,
+            at_secs: day_b() + DAY - 1,
             open: (2.0, 2.0, 2.0, 2.0, 3.0),
             categories: &[
                 ("SQL injection", 3),
@@ -355,11 +397,12 @@ async fn metrics_summary_counts_the_stored_findings_as_of_the_requested_day() {
             scans: &[("alpha", 4), ("beta", 3), ("gamma", 2)],
             critical_scans: &[("alpha", 2), ("beta", 1)],
         },
-        // A date long after every finding was created reports the same summary: the
-        // cutoff is a lower bound on what has been created, not a window.
+        // The latest day the window reaches, long after every finding was created,
+        // reports the same summary: the cutoff is a lower bound on what has been
+        // created, not a second window.
         Case {
-            label: "a year after the last finding",
-            at_secs: DAY_B + 365 * DAY,
+            label: "today, the latest day the window reaches",
+            at_secs: today_secs() + DAY / 3,
             open: (2.0, 2.0, 2.0, 2.0, 3.0),
             categories: &[
                 ("SQL injection", 3),
@@ -435,36 +478,54 @@ async fn metrics_summary_counts_the_stored_findings_as_of_the_requested_day() {
     }
 }
 
-#[tokio::test]
-async fn metrics_summary_answers_any_date_age_with_the_day_the_date_falls_in() {
-    let (engine, router) = harness();
-    // One open finding, created on DAY_A, so every case also pins what the account held
-    // as of its own day.
+/// One open finding on [`day_a`], so a case also pins what the account held as of the
+/// day it asks about.
+fn seed_one_open_finding(engine: &std::sync::Arc<engine::InMemoryEngine>) {
     seed(
-        &engine,
+        engine,
         &[(
             "alpha",
             "a1",
             STATUS_OPEN,
             Some(SEVERITY_HIGH),
             Some("SQL injection"),
-            DAY_A,
+            AT_DAY_A,
         )],
     );
+}
 
-    // Rows: the age of the requested date, spanning well beyond the two-year window the
-    // model's `GetMetricsSummaryRequest$date` documentation mentions, plus three
-    // instants inside ONE day (its first second, the middle, its last second) which
-    // must all report that same day.
+/// The earliest day `GetMetricsSummaryRequest$date` may name, in epoch seconds: the
+/// published lower bound of the window the model documents ("The date must be within the
+/// past two years", `METRICS_SUMMARY_WINDOW_DAYS` days back from today).
+fn earliest_day_secs() -> i64 {
+    today_secs() - METRICS_SUMMARY_WINDOW_DAYS * DAY
+}
+
+#[tokio::test]
+async fn metrics_summary_answers_any_day_inside_the_documented_window() {
+    off_a_day_boundary().await;
+    let (engine, router) = harness();
+    seed_one_open_finding(&engine);
+
+    // Rows: where inside the window the requested instant falls — both published bounds
+    // (the earliest day the window reaches and today), a day just inside each, and three
+    // instants inside ONE day (its first second, the middle, its last second) which must
+    // all report that same day.
     let cases: &[(&str, i64, f64)] = &[
-        ("twenty years before the findings", DAY_A - 20 * 365 * DAY, 0.0),
-        ("three years before the findings", DAY_A - 3 * 365 * DAY, 0.0),
-        ("the day before the findings", DAY_A - DAY, 0.0),
-        ("the first second of the day", DAY_A, 1.0),
-        ("the middle of the day", DAY_A + DAY / 2, 1.0),
-        ("the last second of the day", DAY_A + DAY - 1, 1.0),
-        ("three years after the findings", DAY_A + 3 * 365 * DAY, 1.0),
-        ("twenty years after the findings", DAY_A + 20 * 365 * DAY, 1.0),
+        ("the earliest day of the window", earliest_day_secs(), 0.0),
+        (
+            "one day inside the earliest bound",
+            earliest_day_secs() + DAY,
+            0.0,
+        ),
+        ("the day before the findings", day_a() - DAY, 0.0),
+        ("the first second of the day", day_a(), 1.0),
+        ("the middle of the day", day_a() + DAY / 2, 1.0),
+        ("the last second of the day", day_a() + DAY - 1, 1.0),
+        ("the day the fifth finding exists", day_b(), 1.0),
+        ("yesterday", today_secs() - DAY, 1.0),
+        ("the first second of today", today_secs(), 1.0),
+        ("the last second of today", today_secs() + DAY - 1, 1.0),
     ];
 
     for (label, at_secs, expected_high) in cases {
@@ -473,7 +534,7 @@ async fn metrics_summary_answers_any_date_age_with_the_day_the_date_falls_in() {
         assert_eq!(
             instant_secs(label, &summary["date"]),
             at_secs - at_secs.rem_euclid(DAY),
-            "case {label:?}: a date of any age is answered for the UTC day it falls in, got {summary}"
+            "case {label:?}: a date inside the window is answered for the UTC day it falls in, got {summary}"
         );
         let high = open_findings(label, summary)
             .into_iter()
@@ -488,10 +549,69 @@ async fn metrics_summary_answers_any_date_age_with_the_day_the_date_falls_in() {
 }
 
 #[tokio::test]
+async fn metrics_summary_refuses_a_date_outside_the_documented_window() {
+    off_a_day_boundary().await;
+    let (engine, router) = harness();
+    seed_one_open_finding(&engine);
+
+    // Rows: how the requested date leaves the window — one day past each published
+    // bound, then far outside it on either side, including the epoch itself (what a
+    // client that sent an unset or a seconds-vs-milliseconds timestamp names).
+    let cases: &[(&str, i64)] = &[
+        ("one day before the earliest bound", earliest_day_secs() - DAY),
+        (
+            "the last second before the earliest bound",
+            earliest_day_secs() - 1,
+        ),
+        ("tomorrow", today_secs() + DAY),
+        (
+            "the last second of tomorrow",
+            today_secs() + 2 * DAY - 1,
+        ),
+        ("five years in the future", today_secs() + 5 * 365 * DAY),
+        ("the epoch", 0),
+        ("twenty years ago", today_secs() - 20 * 365 * DAY),
+    ];
+
+    for (label, at_secs) in cases {
+        let answer = get_metrics_summary(&router, *at_secs).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {label:?}: a date outside the documented window is refused, got {} {}",
+            answer.status, answer.json
+        );
+        assert!(
+            answer.error_type.contains("ValidationException"),
+            "case {label:?}: the refusal is the modelled ValidationException, got {:?}",
+            answer.error_type
+        );
+        assert_eq!(
+            answer.json["reason"].as_str(),
+            Some("fieldValidationFailed"),
+            "case {label:?}: an input constraint failed, got {}",
+            answer.json
+        );
+        let fields = answer.json["fieldList"].as_array().cloned().unwrap_or_default();
+        assert!(
+            fields
+                .iter()
+                .any(|field| field["name"].as_str() == Some("date")),
+            "case {label:?}: the refusal names the member that failed, got {}",
+            answer.json
+        );
+        assert!(
+            answer.json["metricsSummary"].is_null(),
+            "case {label:?}: a refused request reports no summary, got {}",
+            answer.json
+        );
+    }
+}
+
+#[tokio::test]
 async fn metrics_summary_of_an_account_with_no_findings_reports_zeros() {
     let (_engine, router) = harness();
 
-    let answer = get_metrics_summary(&router, DAY_A).await;
+    let answer = get_metrics_summary(&router, day_a()).await;
     let label = "an account with no findings";
     let summary = summary_of(label, &answer);
     assert_eq!(
@@ -527,21 +647,21 @@ async fn a_finding_with_no_severity_or_detector_is_counted_only_against_its_scan
     seed(
         &engine,
         &[
-            ("zeta", "z1", STATUS_OPEN, None, None, DAY_A),
-            ("zeta", "z2", STATUS_OPEN, None, None, DAY_A),
+            ("zeta", "z1", STATUS_OPEN, None, None, AT_DAY_A),
+            ("zeta", "z2", STATUS_OPEN, None, None, AT_DAY_A),
             (
                 "zeta",
                 "z3",
                 STATUS_CLOSED,
                 Some(SEVERITY_CRITICAL),
                 Some("SQL injection"),
-                DAY_A,
+                AT_DAY_A,
             ),
         ],
     );
 
     let label = "findings with neither severity nor detector";
-    let answer = get_metrics_summary(&router, DAY_A).await;
+    let answer = get_metrics_summary(&router, day_a()).await;
     let summary = summary_of(label, &answer);
     assert_eq!(
         open_findings(label, summary),
@@ -581,8 +701,8 @@ async fn reading_the_summary_does_not_change_what_a_later_read_reports() {
     seed(&engine, SEEDED);
 
     let label = "two reads of one store";
-    let first = get_metrics_summary(&router, DAY_B).await;
-    let second = get_metrics_summary(&router, DAY_B).await;
+    let first = get_metrics_summary(&router, day_b()).await;
+    let second = get_metrics_summary(&router, day_b()).await;
     assert_eq!(
         summary_of(label, &first),
         summary_of(label, &second),

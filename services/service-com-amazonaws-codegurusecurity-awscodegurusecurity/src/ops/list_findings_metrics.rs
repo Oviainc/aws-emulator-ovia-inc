@@ -318,8 +318,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // last, INCLUSIVE. An interval whose end day precedes its start day contains no
         // day, so it reports no metrics — the model declares no error for it.
         //
-        // Neither bound is range-checked: a day that precedes every finding the account
-        // has simply reports zeros.
+        // Neither bound is window-checked: unlike the sibling metrics operation, whose
+        // `date` the model documents as having to fall within a bounded span back from
+        // today, these members carry no documented window, so a day that precedes every
+        // finding the account has simply reports zeros.
         let start_day =
             crate::state::start_of_utc_day_millis(crate::state::from_timestamp(&input.start_date));
         let end_day =

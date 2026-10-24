@@ -646,6 +646,23 @@ pub fn end_of_utc_day_millis(epoch_millis: i64) -> i64 {
     start_of_utc_day_millis(epoch_millis).saturating_add(MILLIS_PER_DAY - 1)
 }
 
+/// Whether the UTC day that begins at `day_start_millis` lies inside the window of
+/// `window_days` days that ENDS with the UTC day `now_millis` falls in.
+///
+/// The ONE place a day-bounded input constraint is decided, so every member the model
+/// documents as having to fall within a bounded span back from today is checked the same
+/// way: a day later than today is outside the window (it has not happened yet), and so
+/// is a day more than `window_days` days before today. Both bounds are whole UTC days,
+/// because a value the model rounds to the nearest day names a day, not an instant — so
+/// any instant of today is inside the window and any instant of tomorrow is outside it.
+pub fn day_within_past_window(day_start_millis: i64, now_millis: i64, window_days: i64) -> bool {
+    let earliest = start_of_utc_day_millis(
+        now_millis.saturating_sub(window_days.saturating_mul(MILLIS_PER_DAY)),
+    );
+    let today = start_of_utc_day_millis(now_millis);
+    (earliest..=today).contains(&day_start_millis)
+}
+
 /// The bucket of `FindingMetricsValuePerSeverity` a finding's `severity` is counted in,
 /// or `None` when the finding records no modelled `Severity` value.
 ///

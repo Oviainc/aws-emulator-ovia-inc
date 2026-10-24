@@ -7,6 +7,10 @@
 //! apart from materialising the run-state transitions the clock already owes
 //! (`state::settle_due_runs`), exactly as the other readers of this store do.
 //!
+//! A `date` outside the window the model documents for it ("within the past two years",
+//! see [`METRICS_SUMMARY_WINDOW_DAYS`]) fails a specified input constraint and is refused
+//! with the modelled `ValidationException`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -135,6 +139,22 @@ pub const CATEGORIES_WITH_MOST_FINDINGS: usize = 5;
 /// (`length: max 3`).
 pub const SCANS_WITH_MOST_OPEN_FINDINGS: usize = 3;
 
+/// How far back the day `GetMetricsSummary` reports may reach: "The date must be within
+/// the past two years" (`GetMetricsSummaryRequest$date`).
+///
+/// Two years counted as 730 days, because Unix time counts no leap seconds, so every day
+/// on the scale this service keeps its instants on is exactly
+/// [`crate::state::MILLIS_PER_DAY`] long and the window is arithmetic on that scale. A
+/// date outside the window — earlier than this many days before today, or later than
+/// today — fails the documented constraint and is refused with the modelled
+/// `ValidationException`.
+///
+/// 730 rather than 731 days: a two-year span that contains a leap day is one day longer,
+/// and the model publishes no calendar rule for the bound, so the window is the shorter
+/// (stricter) of the two readings — it never accepts a day the documented span might not
+/// cover.
+pub const METRICS_SUMMARY_WINDOW_DAYS: i64 = 2 * 365;
+
 /// The open-finding counts of one day, accumulated over the findings store.
 #[derive(Debug, Default)]
 struct OpenFindingMetrics {
@@ -198,6 +218,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // Request metadata cannot change what an account-wide summary reports.
         let _ = ctx;
+
+        // "The date you want to retrieve summary metrics from, rounded to the nearest
+        // day" (`GetMetricsSummaryRequest$date`): the summary is a whole-day bucket, so
+        // the requested instant selects the UTC day it falls in, and the metrics are
+        // those of the account AS OF the end of that day ("A summary of metrics for an
+        // account as of a specified date", `MetricsSummary`). The reported `date` is
+        // that day, not the instant the request happened to name.
+        let requested_millis = crate::state::from_timestamp(&input.date);
+        let day_start_millis = crate::state::start_of_utc_day_millis(requested_millis);
+        let as_of_millis = crate::state::end_of_utc_day_millis(requested_millis);
+
+        // "The date must be within the past two years" is a constraint on the input, so a
+        // day outside that window — one older than the window reaches or one that has not
+        // happened yet — is reported with the modelled `ValidationException` (HTTP 400)
+        // rather than answered with a summary of a day the service keeps no metrics for.
+        let now_millis = crate::state::now_millis();
+        if !crate::state::day_within_past_window(
+            day_start_millis,
+            now_millis,
+            METRICS_SUMMARY_WINDOW_DAYS,
+        ) {
+            let day_of = |millis: i64| {
+                crate::state::to_timestamp(crate::state::start_of_utc_day_millis(millis))
+                    .fmt(::aws_smithy_types::date_time::Format::DateTime)
+                    .unwrap_or_else(|_| millis.to_string())
+            };
+            let earliest = day_of(now_millis.saturating_sub(
+                METRICS_SUMMARY_WINDOW_DAYS.saturating_mul(crate::state::MILLIS_PER_DAY),
+            ));
+            let today = day_of(now_millis);
+            return Err(GetMetricsSummaryErrorModeled::ValidationException(
+                ValidationException {
+                    error_code: "ValidationException".to_string(),
+                    message: format!(
+                        "date must be within the past {METRICS_SUMMARY_WINDOW_DAYS} days: \
+                         {requested} is not in {earliest}..{today}",
+                        requested = day_of(day_start_millis),
+                    ),
+                    reason: "fieldValidationFailed".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "date".to_string(),
+                        message: format!("name a day from {earliest} through {today}, inclusive"),
+                    }]),
+                },
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetMetricsSummaryErrorModeled::InternalServerException(
                 InternalServerException {
@@ -211,26 +279,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // "The date you want to retrieve summary metrics from, rounded to the nearest
-        // day" (`GetMetricsSummaryRequest$date`): the summary is a whole-day bucket, so
-        // the requested instant selects the UTC day it falls in, and the metrics are
-        // those of the account AS OF the end of that day ("A summary of metrics for an
-        // account as of a specified date", `MetricsSummary`). The reported `date` is
-        // that day, not the instant the request happened to name.
-        //
-        // The date is NOT range-checked: the model's "must be within the past two
-        // years" describes the window CodeGuru Security keeps metrics for, and the
-        // service answers 200 for a date outside it — an older date simply precedes
-        // every finding the account has, so its counts are zero.
-        let requested_millis = crate::state::from_timestamp(&input.date);
-        let day_start_millis = crate::state::start_of_utc_day_millis(requested_millis);
-        let as_of_millis = crate::state::end_of_utc_day_millis(requested_millis);
-
         let mut store = state.lock();
         // The only write: the run transitions the clock had already made due, which
         // every reader of this store materialises so a run is reported in the state it
         // was owed even if nobody polled when it fell due.
-        store.settle_due_runs(crate::state::now_millis());
+        store.settle_due_runs(now_millis);
 
         let mut metrics = OpenFindingMetrics::default();
         for ((scan_name, _finding_id), finding) in &store.findings {
