@@ -210,8 +210,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         enrollment.status = input.status.clone();
         enrollment.member_accounts_enrolled = input.include_member_accounts;
         enrollment.status_reason = Some(status_reason(&input.status));
-        enrollment.last_updated_timestamp = Some(::aws_smithy_types::DateTime::from(
-            ::std::time::SystemTime::now(),
+        enrollment.last_updated_timestamp = Some(::aws_smithy_types::DateTime::from_secs_f64(
+            crate::state::now_secs(),
         ));
         // The opted-in member-account count is not moved by this call: "the count of
         // organization member accounts that are opted in to the service" is zero whatever

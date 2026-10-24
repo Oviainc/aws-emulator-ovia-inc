@@ -29,6 +29,8 @@ mod idle_recommendations;
 mod lambda_function_recommendations;
 #[path = "all/rds_database_recommendations.rs"]
 mod rds_database_recommendations;
+#[path = "all/rds_database_recommendations_export.rs"]
+mod rds_database_recommendations_export;
 #[path = "all/recommendation_export_jobs.rs"]
 mod recommendation_export_jobs;
 #[path = "all/recommendation_summaries.rs"]
