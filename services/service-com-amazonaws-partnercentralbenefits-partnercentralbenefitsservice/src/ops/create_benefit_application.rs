@@ -14,6 +14,14 @@
 //! namespace is refused with the modelled `ValidationException` (HTTP 400) and no
 //! application is created — see [`crate::state::reserved_tag_key_refusal`].
 //!
+//! How many tags the create may supply is the per-resource tag cap
+//! ([`crate::state::MAX_TAGS_PER_RESOURCE`]) that `TagResource` refuses a merge past: the
+//! cap IS this member's modelled `length {max}`, so on this path it is the centralized
+//! constraint walk that refuses an oversized list (the modelled `ValidationException`,
+//! HTTP 400, naming the member and the maximum) before this handler runs, and the stored
+//! set — a map, so a repeated key counts once — can never exceed the cap. Both paths that
+//! add tags are pinned together in `tests/all/tag_cap.rs`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -349,6 +357,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .map(|file| crate::state::file_detail(file, &principal, now))
                 .collect(),
+            // The tag set is a MAP, so a list that repeats a key stores it once; its size
+            // is bounded by the per-resource cap, which on this path is the member's own
+            // modelled maximum length (`crate::state::MAX_TAGS_PER_RESOURCE`) and so is
+            // already enforced by the centralized walk.
             tags: crate::state::tag_map(input.tags.as_ref()),
             // A freshly created application has been amended by nobody.
             amendments: Vec::new(),

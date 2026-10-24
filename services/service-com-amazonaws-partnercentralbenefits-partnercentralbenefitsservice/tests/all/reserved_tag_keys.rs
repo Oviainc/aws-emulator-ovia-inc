@@ -511,8 +511,9 @@ async fn a_refused_create_leaves_its_client_token_unused() {
     );
 }
 
-/// How many applications `catalog` holds, read over the wire.
-async fn application_count(harness: &Harness, case: &str, catalog: &str) -> usize {
+/// How many applications `catalog` holds, read over the wire. Shared with the sibling
+/// `tests/all/tag_cap.rs`, so the two cannot drift on the page size or the member name.
+pub(crate) async fn application_count(harness: &Harness, case: &str, catalog: &str) -> usize {
     let out = ok(
         harness,
         case,
