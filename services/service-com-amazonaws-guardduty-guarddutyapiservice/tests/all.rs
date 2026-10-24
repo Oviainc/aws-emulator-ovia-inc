@@ -61,6 +61,8 @@ mod member_creation;
 mod modeled_constraint_refusals;
 #[path = "all/negative_class_rejections.rs"]
 mod negative_class_rejections;
+#[path = "all/object_malware_scan.rs"]
+mod object_malware_scan;
 #[path = "all/publishing_destination_lifecycle.rs"]
 mod publishing_destination_lifecycle;
 #[path = "all/publishing_destination_listing.rs"]

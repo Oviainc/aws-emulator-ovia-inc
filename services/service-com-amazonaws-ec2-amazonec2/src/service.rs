@@ -18,11 +18,12 @@
 //!
 //! - `override_protocol` — the wire protocol the dispatch sequence runs. This
 //!   service overrides it with [`Ec2QueryEnvelope`], which is the framework's
-//!   ec2Query protocol plus the two parts of EC2's response envelope the Smithy
-//!   protocol definition does not describe: the `<return>` success flag and the
-//!   media type's `charset` parameter. It reaches every response this service
-//!   renders and none of the ones the framework renders in front of it; see
-//!   `RESPONSE_CONTENT_TYPE` for exactly where the line falls.
+//!   ec2Query protocol plus the three parts of EC2's response envelope the Smithy
+//!   protocol definition does not describe: the `<return>` success flag, the
+//!   `<RequestID>` element of a refusal, and the media type's `charset`
+//!   parameter. It reaches every response this service renders and none of the
+//!   ones the framework renders in front of it; see `RESPONSE_CONTENT_TYPE` for
+//!   exactly where the line falls.
 //!
 //! - `can_handle` — which requests this service claims. The default matches the
 //!   request's resolved route key against this service's signing name. Edit it
@@ -158,12 +159,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
-        // EC2's ec2Query envelope carries two things the generated protocol does
+        // EC2's ec2Query envelope carries three things the generated protocol does
         // not write: the success flag `<return>` on a mutation whose modelled
-        // output shape does not declare it, and the `charset` parameter on the
-        // response media type. Both belong to the envelope rather than to any one
-        // operation, so they are served here, once, for every operation. What this
-        // seam does NOT reach is noted on `RESPONSE_CONTENT_TYPE`.
+        // output shape does not declare it, the `<RequestID>` a refusal closes its
+        // envelope with, and the `charset` parameter on the response media type.
+        // Each belongs to the envelope rather than to any one operation, so they
+        // are served here, once, for every operation. What this seam does NOT
+        // reach is noted on `RESPONSE_CONTENT_TYPE`.
         Some(&self.protocol)
     }
 }
@@ -316,8 +318,9 @@ impl SerializableStruct for WithReturnFlag<'_> {
     }
 }
 
-/// EC2's ec2Query protocol: the framework's [`QueryServerProtocol`] plus the two
-/// parts of EC2's envelope the Smithy protocol definition does not describe.
+/// EC2's ec2Query protocol: the framework's [`QueryServerProtocol`] plus the
+/// three parts of EC2's envelope the Smithy protocol definition does not
+/// describe.
 ///
 /// Request reading, routing and the error envelope's shape are the framework's
 /// unchanged — this only adds what EC2 writes on top.

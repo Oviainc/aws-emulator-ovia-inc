@@ -39,3 +39,5 @@ mod resource_tagging;
 mod state_roundtrip;
 #[path = "all/unknown_parent_reference.rs"]
 mod unknown_parent_reference;
+#[path = "all/update_site.rs"]
+mod update_site;

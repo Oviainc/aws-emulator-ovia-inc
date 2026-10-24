@@ -31,9 +31,5 @@ service-com-amazonaws-sagemaker-sagemaker = { workspace = true }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
-
 [lints]
 workspace = true

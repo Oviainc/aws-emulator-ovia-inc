@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAnomaly
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAnomaly`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the anomaly the store holds under the requested `Id`, rendered into the
+//! response member its kind selects: a proactive anomaly on `ProactiveAnomaly`, a
+//! reactive one on `ReactiveAnomaly`, never both — the two members are the two kinds of
+//! anomaly, and an anomaly is exactly one of them.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAnomaly::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORTING operation: "Returns details about an anomaly that you specify using its
+//! ID", so it only reads and the store is identical after the call, however often it is
+//! made.
+//!
+//! An `Id` the store does not hold names no anomaly, and is refused with
+//! `ResourceNotFoundException` (HTTP 404) naming the id asked for — the answer
+//! `DescribeInsight` gives an unknown insight id. An `AccountId` the caller cannot reach
+//! is an authorization refusal (`AccessDeniedException`, HTTP 403), decided BEFORE any
+//! lookup so a refusal cannot report whether the anomaly exists; an absent `AccountId`
+//! means the caller's own account.
+//!
+//! Anomalies live in
+//! [`crate::state::ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::anomalies`] —
+//! see `crate::state` for why that map is empty on a fresh emulator: DevOps Guru detects
+//! an anomaly through its own analysis, never through a client call, so this read reports
+//! nothing rather than inventing one.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +163,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAnomaly` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAnomalyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAnomaly"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeAnomalyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the DevOps Guru anomaly store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        // `AccountId` names the member account whose anomaly to read. This emulator
+        // serves one account and is in no organization, so no other account is
+        // accessible to the caller: that is an authorization refusal, decided BEFORE
+        // any lookup so a refusal cannot report whether the anomaly exists.
+        let account_id = crate::state::requested_account_id(input.account_id.as_deref());
+        if !crate::state::account_is_accessible(&account_id) {
+            return Err(DescribeAnomalyErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: format!(
+                        "Access denied when accessing anomaly {} in account {account_id}",
+                        input.id
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let store = state.lock();
+        let Some(record) = store.anomalies.get(&input.id) else {
+            return Err(DescribeAnomalyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no anomaly with id {} exists", input.id),
+                    resource_id: input.id.clone(),
+                    resource_type: crate::state::ANOMALY_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The two response members are the two anomaly kinds: a proactive anomaly
+        // predicts a problem, a reactive one reports behaviour that already went
+        // wrong, and one anomaly is exactly one of them — so the member the record's
+        // kind does not select stays absent.
+        if record.is_proactive() {
+            Ok(DescribeAnomalyOutput {
+                proactive_anomaly: Some(record.to_proactive_anomaly()),
+                reactive_anomaly: None,
+            })
+        } else {
+            Ok(DescribeAnomalyOutput {
+                proactive_anomaly: None,
+                reactive_anomaly: Some(record.to_reactive_anomaly()),
+            })
+        }
     }
 }

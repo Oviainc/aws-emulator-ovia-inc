@@ -195,38 +195,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // What the record says about the snapshot it exported, taken from
             // the SOURCE record as it stands now so the record keeps it however
-            // the snapshot changes afterwards. The exportable snapshots this
-            // store holds are disk snapshots (`CreateDiskSnapshot`), whose own
-            // source is either a block storage disk or an instance's system
-            // volume — which is what `fromResourceName`/`fromResourceArn`
-            // report, "the snapshot's source instance or disk".
-            let snapshot = store
-                .disk_snapshot(&source_snapshot_name)
+            // the snapshot changes afterwards. The exportable snapshots are the
+            // two kinds this store holds and the modelled
+            // `ExportSnapshotRecordSourceType` enum names: a disk snapshot
+            // (`CreateDiskSnapshot`), whose own source is either a block storage
+            // disk or an instance's system volume, and an instance snapshot
+            // (`CreateInstanceSnapshot`), whose source is an instance — which is
+            // what `fromResourceName`/`fromResourceArn` report, "the snapshot's
+            // source instance or disk". A name that is neither is refused.
+            let exported = export_source(store, &source_snapshot_name)
                 .ok_or_else(|| not_found(&source_snapshot_name))?;
-            let (from_resource_name, from_resource_arn) = match &snapshot.source {
-                crate::state::DiskSnapshotSource::Disk { name, arn }
-                | crate::state::DiskSnapshotSource::Instance { name, arn } => {
-                    (name.clone(), arn.clone())
-                }
-            };
-            let source_info = ExportSnapshotRecordSourceInfo {
-                // The modelled `ExportSnapshotRecordSourceType` value of a disk
-                // snapshot, the same `DiskSnapshot` the snapshot's own
-                // `resourceType` carries.
-                resource_type: Some(crate::state::RESOURCE_TYPE_DISK_SNAPSHOT.to_string()),
-                created_at: Some(crate::state::timestamp(snapshot.created_at_ms)),
-                name: Some(snapshot.name.clone()),
-                arn: Some(snapshot.arn.clone()),
-                from_resource_name: Some(from_resource_name),
-                from_resource_arn: Some(from_resource_arn),
-                // One description per KIND of snapshot: this record exported a
-                // disk snapshot, so there is no instance snapshot to describe.
-                instance_snapshot_info: None,
-                disk_snapshot_info: Some(DiskSnapshotInfo {
-                    size_in_gb: Some(snapshot.size_in_gb),
-                }),
-            };
-            let location = snapshot.location.clone();
+            let Exported {
+                source_info,
+                location,
+                resource_type,
+                destination_id_prefix,
+            } = exported;
 
             // The record's own id: it names the record and it is the id its ARN
             // carries. The destination resource gets an id of its own, because
@@ -234,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let id = store.mint_uuid();
             let name = format!("{}{id}", crate::state::EXPORT_SNAPSHOT_RECORD_NAME_PREFIX);
             let destination_id = crate::state::ec2_destination_id(
-                crate::state::EC2_VOLUME_ID_PREFIX,
+                destination_id_prefix,
                 &store.mint_uuid(),
             );
             // The export has only just started: the clock owes the record
@@ -259,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let operation = store.start_operation(
                 now,
                 crate::state::OPERATION_TYPE_EXPORT_SNAPSHOT,
-                crate::state::RESOURCE_TYPE_DISK_SNAPSHOT,
+                resource_type,
                 &source_snapshot_name,
                 &location,
                 Some(due.at_ms),
@@ -270,6 +254,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
         .ok_or_else(unavailable)?
     }
+}
+
+/// What one stored snapshot contributes to the export: the record's
+/// `sourceInfo`, where the snapshot lives ("Snapshots are exported to the same
+/// Amazon Web Services Region in Amazon EC2 as the source Lightsail snapshot"),
+/// the `Operation$resourceType` the export is logged against, and the id prefix
+/// of the Amazon EC2 resource the export creates.
+struct Exported {
+    source_info: ExportSnapshotRecordSourceInfo,
+    location: crate::state::StoredLocation,
+    resource_type: &'static str,
+    destination_id_prefix: &'static str,
+}
+
+/// The stored snapshot `name` names — a disk snapshot or an instance snapshot —
+/// as the export describes it, or `None` when the account holds neither.
+///
+/// The two kinds differ in exactly what the model says they do: a disk snapshot
+/// describes the snapshotted volume's size and "appear[s] in Amazon EC2 as Amazon
+/// EBS volumes", while an instance snapshot describes the blueprint and bundle
+/// its source instance was created from together with the disks that were
+/// attached to it, and "appear[s] in Amazon EC2 as Amazon Machine Images (AMIs)".
+fn export_source(
+    store: &crate::state::ComAmazonawsLightsailLightsail20161128State,
+    name: &str,
+) -> Option<Exported> {
+    if let Some(snapshot) = store.disk_snapshot(name) {
+        let (from_resource_name, from_resource_arn) = match &snapshot.source {
+            crate::state::DiskSnapshotSource::Disk { name, arn }
+            | crate::state::DiskSnapshotSource::Instance { name, arn } => {
+                (name.clone(), arn.clone())
+            }
+        };
+        return Some(Exported {
+            source_info: ExportSnapshotRecordSourceInfo {
+                // The modelled `ExportSnapshotRecordSourceType` value of a disk
+                // snapshot, the same `DiskSnapshot` the snapshot's own
+                // `resourceType` carries.
+                resource_type: Some(crate::state::RESOURCE_TYPE_DISK_SNAPSHOT.to_string()),
+                created_at: Some(crate::state::timestamp(snapshot.created_at_ms)),
+                name: Some(snapshot.name.clone()),
+                arn: Some(snapshot.arn.clone()),
+                from_resource_name: Some(from_resource_name),
+                from_resource_arn: Some(from_resource_arn),
+                // One description per KIND of snapshot: this record exported a
+                // disk snapshot, so there is no instance snapshot to describe.
+                instance_snapshot_info: None,
+                disk_snapshot_info: Some(DiskSnapshotInfo {
+                    size_in_gb: Some(snapshot.size_in_gb),
+                }),
+            },
+            location: snapshot.location.clone(),
+            resource_type: crate::state::RESOURCE_TYPE_DISK_SNAPSHOT,
+            destination_id_prefix: crate::state::EC2_VOLUME_ID_PREFIX,
+        });
+    }
+    let snapshot = store.instance_snapshot(name)?;
+    Some(Exported {
+        source_info: ExportSnapshotRecordSourceInfo {
+            // The other modelled `ExportSnapshotRecordSourceType` value, the
+            // same `InstanceSnapshot` the snapshot's own `resourceType` carries.
+            resource_type: Some(crate::state::RESOURCE_TYPE_INSTANCE_SNAPSHOT.to_string()),
+            created_at: Some(crate::state::timestamp(snapshot.created_at_ms)),
+            name: Some(snapshot.name.clone()),
+            arn: Some(snapshot.arn.clone()),
+            from_resource_name: Some(snapshot.from_instance_name.clone()),
+            from_resource_arn: Some(snapshot.from_instance_arn.clone()),
+            instance_snapshot_info: Some(InstanceSnapshotInfo {
+                from_bundle_id: Some(snapshot.from_bundle_id.clone()),
+                from_blueprint_id: Some(snapshot.from_blueprint_id.clone()),
+                from_disk_info: Some(instance_snapshot_disk_info(snapshot)),
+            }),
+            disk_snapshot_info: None,
+        },
+        location: snapshot.location.clone(),
+        resource_type: crate::state::RESOURCE_TYPE_INSTANCE_SNAPSHOT,
+        destination_id_prefix: crate::state::EC2_IMAGE_ID_PREFIX,
+    })
+}
+
+/// "The disks that were attached to the source instance" when `snapshot` was
+/// taken: its system volume first — the one disk every instance has, which the
+/// export turns into "an Amazon Elastic Block Store (Amazon EBS) volume" — then
+/// every block storage disk the snapshot captured, in the store's own order.
+///
+/// The system volume is not a `Disk` resource of its own, so it has no name to
+/// report; it reports what it has, its size and its path.
+fn instance_snapshot_disk_info(
+    snapshot: &crate::state::StoredInstanceSnapshot,
+) -> Vec<DiskInfo> {
+    let system = DiskInfo {
+        name: None,
+        path: Some(crate::state::SYSTEM_DISK_PATH.to_string()),
+        size_in_gb: Some(snapshot.size_in_gb),
+        is_system_disk: Some(true),
+    };
+    std::iter::once(system)
+        .chain(snapshot.from_attached_disks.iter().map(|disk| DiskInfo {
+            name: Some(disk.name.clone()),
+            path: disk.path.clone(),
+            size_in_gb: Some(disk.size_in_gb),
+            is_system_disk: Some(false),
+        }))
+        .collect()
 }
 
 /// This operation's 400 refusal for a request the model admits but the service
