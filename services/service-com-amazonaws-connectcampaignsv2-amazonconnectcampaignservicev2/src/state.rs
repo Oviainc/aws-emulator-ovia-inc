@@ -759,7 +759,7 @@ impl StoredIntegration {
 
 /// Why the store refused to take a campaign, as
 /// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::insert_new_campaign`]
-/// reports it. Nothing is stored in either case.
+/// reports it. Nothing is stored in any case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertRejected {
     /// The store already holds [`MAX_CAMPAIGNS`] campaigns. The caller answers
@@ -769,6 +769,11 @@ pub enum InsertRejected {
     /// discard the existing record. A freshly minted id cannot collide, so the
     /// caller answers this as a server fault rather than a client error.
     IdTaken,
+    /// The Connect instance this campaign names already holds a campaign of that
+    /// name, and a campaign name identifies a campaign within its instance (see
+    /// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::campaign_named`]).
+    /// The caller answers this with the modelled `ConflictException` (HTTP 409).
+    NameTaken,
 }
 
 /// Per-service state for com-amazonaws-connectcampaignsv2-amazonconnectcampaignservicev2. A handler reaches it through [`service_state`].
@@ -824,13 +829,27 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// now in the store — so a handler builds its response from the store rather
     /// than from the request it just read.
     ///
-    /// Refuses, storing nothing, when the store is full or the id is already
-    /// taken (see [`InsertRejected`]). The check and the insert happen under the
-    /// one lock the caller holds, so concurrent creates cannot both pass them.
+    /// Refuses, storing nothing, when the campaign's Connect instance already
+    /// holds a campaign of that name, when the store is full, or when the id is
+    /// already taken (see [`InsertRejected`]). The checks and the insert happen
+    /// under the one lock the caller holds, so concurrent creates cannot both pass
+    /// them — of two creates racing on one name, exactly one stores a campaign.
     pub fn insert_new_campaign(
         &mut self,
         campaign: StoredCampaign,
     ) -> Result<StoredCampaign, InsertRejected> {
+        // A campaign name identifies a campaign within its Connect instance, so a
+        // record whose (instance, name) pair is already held is refused before any
+        // capacity question: the resource it names exists, and taking a second one
+        // would leave the instance with two campaigns answering to one name. This is
+        // the one place that invariant is enforced, so every writer of a campaign
+        // name upholds it.
+        if self
+            .campaign_named(&campaign.connect_instance_id, &campaign.name)
+            .is_some()
+        {
+            return Err(InsertRejected::NameTaken);
+        }
         let full = self.campaigns.len() >= MAX_CAMPAIGNS;
         let id = campaign.id.clone();
         match self.campaigns.entry(id.clone()) {
@@ -852,6 +871,28 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// The campaign stored under `id`, or `None` when there is none.
     pub fn campaign(&self, id: &str) -> Option<&StoredCampaign> {
         self.campaigns.get(id)
+    }
+
+    /// The campaign `connect_instance_id` holds under `name`, or `None` when that
+    /// instance holds none.
+    ///
+    /// A campaign name is scoped to its Connect instance: the same name under two
+    /// instances names two campaigns, and the comparison is exact — a name differing
+    /// in case or in surrounding whitespace is a different name, since the model puts
+    /// no normalization on `CampaignName`.
+    ///
+    /// Walked in creation order, so the record answered for is the oldest one, not
+    /// whichever the hash map happens to yield first.
+    pub fn campaign_named(
+        &self,
+        connect_instance_id: &str,
+        name: &str,
+    ) -> Option<&StoredCampaign> {
+        self.campaigns_in_order()
+            .map(|(_, campaign)| campaign)
+            .find(|campaign| {
+                campaign.connect_instance_id == connect_instance_id && campaign.name == name
+            })
     }
 
     /// The campaign stored under `id`, for a handler that moves its state.

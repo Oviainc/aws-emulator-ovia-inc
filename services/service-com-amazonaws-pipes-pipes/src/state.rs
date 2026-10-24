@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    Pipe, PipeEnrichmentParameters, PipeLogConfiguration, PipeSourceParameters,
+    NotFoundException, Pipe, PipeEnrichmentParameters, PipeLogConfiguration, PipeSourceParameters,
     PipeTargetParameters, ValidationException, ValidationExceptionField,
 };
 
@@ -50,6 +50,15 @@ pub mod requested_state {
 
 /// The `resourceType` this service names in a `ConflictException` / `NotFoundException`.
 pub const PIPE_RESOURCE_TYPE: &str = "pipe";
+
+/// The scheme of the one non-ARN `Source` this service accepts: a self-managed Apache
+/// Kafka cluster. Source: the `^smk://…|arn:…$` alternation of `ArnOrUrl`'s pattern in
+/// `smithy-model/com-amazonaws-pipes-pipes.json`.
+pub const SELF_MANAGED_KAFKA_SCHEME: &str = "smk://";
+
+/// The source type [`PipeRecord::source_type`] reports for a `Source` carrying
+/// [`SELF_MANAGED_KAFKA_SCHEME`], which has no ARN service namespace to be named by.
+pub const SELF_MANAGED_KAFKA: &str = "selfmanagedkafka";
 
 /// The most pipe records this store holds, so a caller cannot grow the emulator's heap
 /// without limit by creating distinct names.
@@ -127,24 +136,65 @@ pub fn tag_violation(key: &str, value: &str) -> Option<String> {
 /// The refusal a write that installs tags answers with when [`tag_violation`] names one:
 /// the modelled `ValidationException`, carrying the violation as the `fieldList` entry for
 /// `member` (the input member the tags arrived on, which the operations name differently)
-/// and a message derived FROM that list, so the count it states cannot drift from it.
+/// and the message that list builds, so the two cannot drift apart.
 pub fn tag_violation_error(member: &str, violation: String) -> ValidationException {
-    let field_list = vec![ValidationExceptionField {
-        name: member.to_string(),
-        message: violation,
-    }];
-    ValidationException {
-        message: Some(format!(
-            "{} validation error detected: {}",
-            field_list.len(),
-            field_list
-                .iter()
-                .map(|field| field.message.as_str())
-                .collect::<Vec<_>>()
-                .join("; "),
-        )),
-        field_list: Some(field_list),
+    validation_error(vec![validation_field(member, violation)])
+}
+
+/// One entry of a [`validation_error`]'s list: the request field that was refused and why.
+pub fn validation_field(
+    name: impl Into<String>,
+    message: impl Into<String>,
+) -> ValidationExceptionField {
+    ValidationExceptionField {
+        name: name.into(),
+        message: message.into(),
     }
+}
+
+/// The `ValidationException` this service refuses a request with: the fields that failed
+/// validation reported BOTH as the modelled `fieldList` and, in the exception's `message`,
+/// as the JSON document this service words a refusal as — a `ValidationErrorFields` array
+/// whose entries carry each field's `Name` and `Message`. Both are built from the one list,
+/// so a client that parses the document and one that reads `fieldList` are told the same
+/// thing.
+pub fn validation_error(fields: Vec<ValidationExceptionField>) -> ValidationException {
+    // Written out rather than serialized from a map so the two keys keep the order this
+    // service reports them in; the values go through `serde_json` so any character they
+    // carry is escaped as JSON requires.
+    let entries = fields
+        .iter()
+        .map(|field| {
+            format!(
+                r#"{{"Name":{},"Message":{}}}"#,
+                ::serde_json::Value::String(field.name.clone()),
+                ::serde_json::Value::String(field.message.clone()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    ValidationException {
+        message: Some(format!(r#"{{"ValidationErrorFields":[{entries}]}}"#)),
+        field_list: Some(fields),
+    }
+}
+
+/// The `NotFoundException` every operation of this service answers with for a pipe this
+/// account does not hold.
+///
+/// The message is built from the request — the pipe the caller named interpolated into ONE
+/// fixed sentence — so an absent pipe reads the same whichever operation was asked for it.
+pub fn pipe_not_found(pipe: &str) -> NotFoundException {
+    NotFoundException {
+        message: Some(format!("Pipe {pipe} does not exist.")),
+    }
+}
+
+/// The pipe a `PipeArn` names, for the operations that address a pipe by ARN rather than
+/// by name: the resource part after `pipe/` (see [`pipe_arn`]), or the whole identifier
+/// when it carries none, so [`pipe_not_found`] names the pipe either way.
+pub fn pipe_name_in_arn(arn: &str) -> &str {
+    arn.rsplit_once("pipe/").map_or(arn, |(_, name)| name)
 }
 
 /// The region an ARN carries when the request names none.
@@ -234,6 +284,27 @@ impl PipeRecord {
             .iter()
             .find(|state| **state == self.current_state)
             .copied()
+    }
+
+    /// The source type this pipe reads from, as the token this service names a source by.
+    ///
+    /// It is resolved from the pipe's `Source`, which is fixed when the pipe is created
+    /// (no update shape carries a `Source`): the service namespace of its ARN
+    /// (`arn:<partition>:<service>:…`), lowercased, or [`SELF_MANAGED_KAFKA`] for the one
+    /// non-ARN form `ArnOrUrl` admits.
+    pub fn source_type(&self) -> String {
+        if self
+            .source
+            .get(..SELF_MANAGED_KAFKA_SCHEME.len())
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case(SELF_MANAGED_KAFKA_SCHEME))
+        {
+            return SELF_MANAGED_KAFKA.to_string();
+        }
+        self.source
+            .split(':')
+            .nth(2)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
     }
 
     /// This record as the `Pipe` summary `ListPipes` returns.

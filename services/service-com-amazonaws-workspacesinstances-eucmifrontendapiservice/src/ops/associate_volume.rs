@@ -186,6 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let instance_tearing_down = instance.is_tearing_down();
+        // The Availability Zone the instance was placed in, read while the instance is
+        // borrowed and compared below against the volume's own zone.
+        let instance_zone = instance
+            .placement_availability_zone()
+            .map(ToString::to_string);
 
         // Which volume already holds the device path asked for, read before the volume
         // being attached is borrowed mutably. One device path on an instance carries one
@@ -201,6 +206,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let volume_already_attached = volume.attachment.is_some();
+        // A volume and the instance it is attached to live in ONE Availability Zone,
+        // so this attach is possible only where the volume's zone is the zone the
+        // instance was placed in.
+        let zones_allow_attachment = crate::state::zones_allow_attachment(
+            instance_zone.as_deref(),
+            &volume.availability_zone,
+        );
+
+        // A volume cannot be attached across Availability Zones, and neither the
+        // volume's zone nor the instance's placement can be changed afterwards, so this
+        // pair of ids can never be attached — reported ahead of the conflicts below,
+        // which each describe a state some later call clears.
+        if !zones_allow_attachment {
+            return Err(AssociateVolumeErrorModeled::ValidationException(
+                crate::state::volume_zone_mismatch(),
+            )
+            .into());
+        }
 
         // An instance a delete has been accepted for is tearing down and releasing the
         // volumes it had, so attaching one to it conflicts with the state it is in: the

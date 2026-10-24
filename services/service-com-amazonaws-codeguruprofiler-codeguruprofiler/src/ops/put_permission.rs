@@ -196,17 +196,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The `principals` doc: "A list ARNs for the roles and users you want to grant
         // access to the profiling group. Wildcards are not are supported in the ARNs."
-        // The list's length bounds are modelled (1..50) and already enforced; that a
-        // principal is non-blank and carries no wildcard is not, so it is refused here.
+        // `Principal` is an `@arnReference` carrying no `@pattern`, so the boundary walk
+        // admits any string and what an identity ARN IS stays the handler's to read: a
+        // value outside those forms denotes no identity, so it can be granted nothing and
+        // the request is refused before anything is written. The forms themselves are
+        // `service_common::arn`'s, the one caller-supplied-ARN reader in this tree, so no
+        // service disagrees about what the ARN of a user or role is.
         for (index, principal) in input.principals.iter().enumerate() {
-            if principal.trim().is_empty() || principal.contains('*') {
+            if !::service_common::arn::is_iam_principal_arn(principal) {
                 return Err(PutPermissionErrorModeled::ValidationException(
                     ValidationException {
-                        message: format!(
-                            "principals.{} must be the ARN of a role or user, without \
-                             wildcards, got {principal}",
-                            index + 1
-                        ),
+                        message: crate::state::principal_validation_message(index, principal),
                     },
                 )
                 .into());

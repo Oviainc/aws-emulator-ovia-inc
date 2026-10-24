@@ -1806,6 +1806,23 @@ pub fn resource_arn_validation_message(resource_arn: &str) -> String {
     )
 }
 
+/// Why a `principals` element that is not the ARN of an IAM principal is refused on the
+/// INPUT, worded like every other refusal this service states about a submitted value: the
+/// value as submitted, the member's dotted path, and the requirement it failed, so the
+/// caller can fix the request from the message alone.
+///
+/// `position` is the element's 0-based index in the submitted list; the path states it the
+/// way the validating walk states a list element's — `<list>.<1-based position>.member` —
+/// so a refusal about an element of a list reads the same whoever found it.
+pub fn principal_validation_message(position: usize, principal: &str) -> String {
+    format!(
+        "Value '{principal}' at 'principals.{}.member' failed to satisfy constraint: \
+         Member must be the ARN of an IAM principal (an account root, user, role, \
+         federated user or assumed-role session), without wildcards",
+        position + 1
+    )
+}
+
 /// Refuse a caller-supplied tag map no AWS-tagged resource can hold: more than
 /// [`MAX_TAGS_PER_RESOURCE`] entries, a key outside 1..[`MAX_TAG_KEY_CHARS`]
 /// characters, or a value longer than [`MAX_TAG_VALUE_CHARS`].

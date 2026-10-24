@@ -37,7 +37,9 @@ fn valid_budget(name: &str) -> Value {
 /// (`smithy_query(query="shape",shape="NotFoundException")` — `Message` targeting
 /// `errorMessage`); the framework's own `ValidationException` is not in the model and
 /// names it lowercase `message`. Both are read here so one helper covers either.
-fn message(body: &Value) -> String {
+///
+/// `pub(crate)` so a sibling suite reads a refusal's message through the same helper.
+pub(crate) fn message(body: &Value) -> String {
     body.get("message")
         .or_else(|| body.get("Message"))
         .and_then(Value::as_str)

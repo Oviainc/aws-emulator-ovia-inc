@@ -206,6 +206,44 @@ pub fn invalid_request_message(operation: &str, rule: &str) -> String {
     format!("Your {operation} request isn't valid. {rule} Try your request again.")
 }
 
+/// The `ValidationException` message for a `nextToken` that is not a cursor this
+/// service minted, shared by every paginated operation of this service.
+///
+/// Stated through [`invalid_request_message`], like every other request-validation
+/// refusal this service raises from a handler, so a caller reading only the `message`
+/// learns which request was refused and which member of it was wrong. The rule
+/// RESTATES what the member documents — "reissue the search request and include the
+/// returned token"
+/// (`smithy_query(query="doc",shape="ListSlackChannelConfigurationsRequest",member="nextToken")`)
+/// — and names the member the way this service's prose names a parameter, in the
+/// API's PascalCase spelling. `operation` is the caller's `Operation::NAME`.
+pub fn invalid_pagination_token_message(operation: &str) -> String {
+    invalid_request_message(
+        operation,
+        &format!(
+            "NextToken must be a pagination token that an earlier {operation} response \
+             returned."
+        ),
+    )
+}
+
+/// The `ValidationException` message for a registration past
+/// [`MAX_SLACK_WORKSPACE_CONFIGURATIONS`], in the same envelope.
+///
+/// The rule is the documented quota — "You can add up to 5 Slack workspaces for your
+/// account" (`smithy_query(query="doc",shape="CreateSlackChannelConfiguration")`) —
+/// restated from the constant that enforces it, so the bound the store applies and the
+/// bound the message states cannot drift apart.
+pub fn workspace_quota_exceeded_message(operation: &str) -> String {
+    invalid_request_message(
+        operation,
+        &format!(
+            "You can add up to {MAX_SLACK_WORKSPACE_CONFIGURATIONS} Slack workspaces for your \
+             account."
+        ),
+    )
+}
+
 /// Why `severity` cannot hold together with the three notification flags, as the
 /// message the refusal carries, or `None` when it can.
 ///

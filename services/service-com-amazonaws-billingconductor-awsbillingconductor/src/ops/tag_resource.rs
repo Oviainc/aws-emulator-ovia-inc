@@ -15,6 +15,13 @@
 //! boundary (`skip_validation` on `TagResourceInput`) for the same recorded reason: AWS
 //! resolves the ARN and answers that 404 even for a value the pattern refuses.
 //!
+//! A `Tags` key in the reserved `aws:` namespace is REFUSED with the modelled 400
+//! `ValidationException` instead of stored, and the resource's tags are left exactly as
+//! they were: that prefix names the tags Amazon Web Services generates, which no caller
+//! may create, edit or delete. The rule lives in
+//! [`crate::state::check_tag_keys_not_reserved`], which every path taking a
+//! caller-supplied tag key shares.
+//!
 //! This operation is NOT payer-account-gated
 //! (`crate::service::PAYER_UNGATED_OPERATIONS`): a recorded call from a non-payer
 //! account is answered by resolution.
@@ -159,6 +166,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the `ResourceArn` pattern is not (see this module's header), so the ARN is
         // resolved here.
         let _ = ctx;
+
+        // A key in the reserved `aws:` namespace is refused from the REQUEST alone —
+        // before the store is reached, so nothing is written and a resource that does
+        // not exist is beside the point. It belongs here rather than at the ARN: it is a
+        // constraint on the INPUT, the kind the boundary walk would enforce itself if
+        // `TagKey` could express it (see [`crate::state::RESERVED_TAG_KEY_PREFIX`]). A
+        // request carrying one such key therefore stores NONE of its pairs rather than
+        // the rest of them.
+        if let Err(refusal) = crate::state::check_tag_keys_not_reserved(
+            "Tags",
+            input.tags.keys().map(String::as_str),
+        ) {
+            return Err(TagResourceErrorModeled::ValidationException(refusal).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServerException(
                 InternalServerException {

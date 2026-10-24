@@ -552,16 +552,31 @@
 //! reports, so the request shapes a replace carries are converted once, where they are
 //! validated, rather than at every read.
 //!
-//! ## The default VPC's default subnets
+//! ## The ambient default network of a Region
 //!
-//! "When we create a default VPC, we create a default subnet in each Availability Zone
-//! in the Region" (Amazon VPC User Guide, "Default VPCs"), so the subnet store starts
-//! with one default subnet per zone of the seeded default VPC rather than empty — the
-//! same reason the VPC store starts with that VPC. This store is per ACCOUNT, not per
-//! Region (a `Vpc` carries no Region member, so nothing in `DescribeVpcs` could say
-//! which Region its VPC belongs to), and a subnet's zone and ARN do name a Region, so
-//! the seeded subnets are the ones of [`DEFAULT_REGION`]. Everything a later writer
-//! stores names the Region its own request was signed for.
+//! "When you create an AWS account, we create a default VPC for you in each AWS Region"
+//! and "when we create a default VPC, we create a default subnet in each Availability Zone
+//! in the Region" (Amazon VPC User Guide, "Default VPCs"), so the network an account
+//! already holds before it has created anything is a fact OF THE REGION a request is
+//! signed for — not of one compile-time Region. A subnet's zone and its ARN name a Region,
+//! so a Region's ambient network has to be the one whose zones that Region HAS
+//! ([`availability_zones_in_region`]).
+//!
+//! [`ComAmazonawsEc2Amazonec2State::ensure_default_network`] is the ONE place it is
+//! materialised — a default VPC at [`DEFAULT_VPC_CIDR_BLOCK`], one default subnet per zone
+//! of that Region, and that VPC's default security group — and it is idempotent per
+//! Region: the Region's `VpcId` is recorded, so the second call in a Region answers the
+//! same ids instead of seeding a second copy of the same network. The store itself is per
+//! ACCOUNT, not per Region (a `Vpc` carries no Region member, so nothing in `DescribeVpcs`
+//! could say which Region its VPC belongs to), which is why the Region a resource belongs
+//! to is the one its zone and its ARN name — the Region of the request that wrote it.
+//!
+//! A Region's record is never removed, so a default VPC a caller DELETED is not seeded
+//! again behind its back: AWS does not recreate one either, which is what
+//! `CreateDefaultVpc` is for. And only a Region of the Region catalog
+//! ([`regions_in_partition_of`]) gets one, the Region in a credential scope being
+//! caller-controlled text: an account has a default VPC in the Regions that EXIST, not in
+//! every string shaped like a Region code.
 //!
 //! ## Route servers
 //!
@@ -1801,6 +1816,18 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::default_dhcp_options_id`] answer the same id for the second VPC of a Region
     /// as for the first, instead of minting a set per VPC.
     default_dhcp_options_ids: BTreeMap<String, String>,
+    /// The `VpcId` of each Region's DEFAULT VPC, by Region — the ambient network an
+    /// account already holds in that Region (see the module docs, "The ambient default
+    /// network of a Region").
+    ///
+    /// One entry per Region, because an account has one default VPC in each Region: this
+    /// is the index that makes [`Self::ensure_default_network`] idempotent, so a second
+    /// call in a Region answers the ids of the network already there rather than seeding a
+    /// second copy of it. An entry is never REMOVED, so a default VPC a caller deleted
+    /// stays deleted instead of reappearing on the next call in that Region; the id it
+    /// holds is therefore read through [`Self::default_vpc_id`], which answers only a VPC
+    /// the store still holds.
+    default_vpc_ids: BTreeMap<String, String>,
     /// Every association between a local gateway route table and a virtual interface group
     /// the account holds, by `LocalGatewayRouteTableVirtualInterfaceGroupAssociationId`, as
     /// the modelled `LocalGatewayRouteTableVirtualInterfaceGroupAssociation` shape itself —
@@ -2463,6 +2490,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_attributes: BTreeMap::new(),
             dhcp_options: BTreeMap::new(),
             default_dhcp_options_ids: BTreeMap::new(),
+            default_vpc_ids: BTreeMap::new(),
             subnets: BTreeMap::new(),
             subnet_available_at: BTreeMap::new(),
             verified_access_trust_providers: BTreeMap::new(),
@@ -2577,16 +2605,12 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // them follows the root user, which follows `DEFAULT_USE_LONG_IDS`.
             id_format_overrides: BTreeMap::new(),
         };
-        let default_vpc = state.insert_vpc(
-            DEFAULT_VPC_CIDR_BLOCK,
-            true,
-            DEFAULT_INSTANCE_TENANCY,
-            VPC_STATE_AVAILABLE,
-            DEFAULT_REGION,
-            Vec::new(),
-        );
-        state.insert_default_subnets(&default_vpc, DEFAULT_VPC_CIDR_BLOCK, DEFAULT_REGION);
-        state.insert_default_security_group(&default_vpc, DEFAULT_REGION);
+        // The ambient default network of [`DEFAULT_REGION`], so a request signed for the
+        // emulator's own Region finds it without this store ever writing on a read. Every
+        // OTHER Region's ambient network is materialised by the same one call the first
+        // time the account asks in that Region — see
+        // [`ComAmazonawsEc2Amazonec2State::ensure_default_network`].
+        state.ensure_default_network(DEFAULT_REGION);
         // After the resources of the default VPC, so the ids those are minted with do not
         // depend on how many images the published catalog holds.
         state.insert_published_images();
@@ -3337,6 +3361,70 @@ impl ComAmazonawsEc2Amazonec2State {
             region,
         );
         group_id
+    }
+
+    /// Make sure `region` holds the ambient default network an account already has there,
+    /// and answer that network's `VpcId`.
+    ///
+    /// "When you create an AWS account, we create a default VPC for you in each AWS
+    /// Region", and "when we create a default VPC, we create a default subnet in each
+    /// Availability Zone in the Region" together with the VPC's default security group
+    /// (Amazon VPC User Guide, "Default VPCs"). So the network exists in whichever Region
+    /// the account is calling in, and this is the one place it is materialised: a default
+    /// VPC at [`DEFAULT_VPC_CIDR_BLOCK`], one default subnet per zone of THAT Region
+    /// ([`Self::insert_default_subnets`], over [`availability_zones_in_region`]) and
+    /// [`Self::insert_default_security_group`].
+    ///
+    /// IDEMPOTENT per Region: the Region's entry is recorded, so a second call answers the
+    /// ids already there rather than seeding a second copy — which is what lets a reporting
+    /// operation call it. The network it materialises has been owed since the account
+    /// existed, not since the call, and the entry is never removed, so a default VPC the
+    /// caller DELETED is not seeded again (AWS does not recreate one either; that is
+    /// `CreateDefaultVpc`). A Region that has lost its default VPC that way therefore
+    /// answers `None`.
+    ///
+    /// `None` also when nothing was seeded: `region` is not a Region of the catalog
+    /// ([`is_catalog_region`] — the Region of a credential scope is caller-controlled text,
+    /// and an account has a default VPC in the Regions that exist rather than in every
+    /// string shaped like a Region code), or the store has no room for the WHOLE network
+    /// (one subnet per zone of the Region included), in which case nothing at all is
+    /// written and nothing recorded, so the Region is not left holding a VPC without its
+    /// subnets.
+    pub fn ensure_default_network(&mut self, region: &str) -> Option<String> {
+        if self.default_vpc_ids.contains_key(region) {
+            return self.default_vpc_id(region);
+        }
+        if !is_catalog_region(region) {
+            return None;
+        }
+        // The same bounds a `CreateVpc` and the subnets of this Region would have to
+        // clear, asked before anything is written so a store at a ceiling seeds nothing
+        // rather than a partial network a recorded index would then make permanent: the VPC
+        // count, room for a subnet in EVERY zone of the Region, the Region's default DHCP
+        // option set (which `insert_vpc` mints) and its bytes, and the group the VPC comes
+        // with.
+        let zone_count = availability_zones_in_region(region).len();
+        if !self.has_vpc_capacity()
+            || self.subnets.len().saturating_add(zone_count) > MAX_SUBNETS
+            || !self.has_dhcp_option_set_capacity(region)
+            || !self.has_security_group_capacity()
+            || self.would_exceed_stored_bytes(self.unheld_default_dhcp_options_bytes(region))
+        {
+            return None;
+        }
+        let vpc_id = self.insert_vpc(
+            DEFAULT_VPC_CIDR_BLOCK,
+            true,
+            DEFAULT_INSTANCE_TENANCY,
+            VPC_STATE_AVAILABLE,
+            region,
+            Vec::new(),
+        );
+        self.insert_default_subnets(&vpc_id, DEFAULT_VPC_CIDR_BLOCK, region);
+        self.insert_default_security_group(&vpc_id, region);
+        self.default_vpc_ids
+            .insert(region.to_string(), vpc_id.clone());
+        Some(vpc_id)
     }
 
     /// Store a launch template with its first version, and answer the `LaunchTemplateId` it
@@ -6992,6 +7080,21 @@ pub fn regions_in_partition_of(region: &str) -> Vec<&'static str> {
         .copied()
         .filter(|known| partition_prefix_of(known) == partition)
         .collect()
+}
+
+/// Whether `region` is a Region of the catalog [`regions_in_partition_of`] narrows — that
+/// is, a Region that EXISTS, as opposed to text merely shaped like a Region code
+/// ([`region_name_is_well_formed`]).
+///
+/// The catalog is the same `emulator_telemetry::policy::KNOWN_REGIONS` that function reads,
+/// already sorted, so one lookup answers it without building a Vec. Asked where a
+/// caller-controlled Region would otherwise cause a RESOURCE to be stored under it — the
+/// ambient default network of [`ComAmazonawsEc2Amazonec2State::ensure_default_network`] —
+/// rather than where the Region is only rendered back into an answer.
+pub fn is_catalog_region(region: &str) -> bool {
+    ::emulator_telemetry::policy::KNOWN_REGIONS
+        .binary_search(&region)
+        .is_ok()
 }
 
 /// The Regions of the commercial (`aws`) partition, in Region-code order: the ones a
@@ -13242,15 +13345,22 @@ pub fn subnet_payload_bytes(subnet: &Subnet) -> usize {
 }
 
 impl ComAmazonawsEc2Amazonec2State {
-    /// The account's default VPC, by id — the VPC a request that names none is about:
+    /// The default VPC OF `region`, by id — the VPC a request that names none is about:
     /// "If you don't specify a security group when you launch an instance, the instance is
     /// launched into the appropriate default security group" (`CreateSecurityGroup`), the
     /// group of that VPC.
-    pub fn default_vpc_id(&self) -> Option<String> {
-        self.vpcs
-            .iter()
-            .find(|(_, vpc)| vpc.is_default == Some(true))
-            .map(|(vpc_id, _)| vpc_id.clone())
+    ///
+    /// Per REGION, because an account has one default VPC in each Region it calls in, and
+    /// the VPC of another Region holds no subnet and no zone a request of THIS one could
+    /// place anything in. The index is the one
+    /// [`Self::ensure_default_network`] writes, and only a VPC the store still holds is
+    /// answered — so a Region whose default VPC has been deleted answers `None`, the way an
+    /// account that deleted its default VPC has none until it asks for a new one.
+    pub fn default_vpc_id(&self, region: &str) -> Option<String> {
+        self.default_vpc_ids
+            .get(region)
+            .filter(|vpc_id| self.vpcs.contains_key(vpc_id.as_str()))
+            .cloned()
     }
 
     /// Whether `group_id` is the default security group of its VPC: the group named
