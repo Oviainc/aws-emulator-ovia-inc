@@ -6,14 +6,18 @@
 //! Four rules, each asserted over a table whose rows differ along what the rule
 //! generalises over — never over one recorded request:
 //!
-//! 1. Every CONTROL-PLANE operation addressed by `Name` resolves the name in the stored
-//!    environments first and refuses one that resolves to nothing with its modelled
-//!    `ResourceNotFoundException` (HTTP 404), whose message names the environment the
-//!    request asked for: `Environment <Name> not found.` Rows vary the name (length, case,
-//!    the `-`/`_` characters `EnvironmentName`'s pattern allows) and the operation.
-//!    `InvokeRestApi` is NOT one of them: it is refused by the environment data endpoint it
-//!    proxies through, which carries the refusal as its own document payload — that rule
-//!    has its own suite (`tests/all/env_endpoint_payload.rs`).
+//! 1. Every operation addressed by `Name` resolves the name in the stored environments
+//!    first and refuses one that resolves to nothing with its modelled
+//!    `ResourceNotFoundException` (HTTP 404). The message depends on the endpoint the model
+//!    hosts the operation on: a control-plane (`api.`) lookup names the environment the
+//!    request asked for (`Environment <Name> not found.`), while an operation hosted on the
+//!    environment data endpoint (`env.`) is refused by that front door, whose sentence is
+//!    fixed and names no environment. Rows vary the name (length, case, the `-`/`_`
+//!    characters `EnvironmentName`'s pattern allows) and the operation; the wording rule
+//!    itself has its own suite (`tests/all/env_endpoint_not_found_wording.rs`).
+//!    `InvokeRestApi` is NOT one of them: it carries its refusal as the data endpoint's own
+//!    document payload rather than as a serialized exception — that shape has its own suite
+//!    (`tests/all/env_endpoint_payload.rs`).
 //! 2. The `/tags/{ResourceArn}` operations refuse a well-formed ARN that resolves to no
 //!    environment with HTTP 404 and the WIRE error code the service publishes for them,
 //!    `NotFoundException` — the code a client's error dispatch branches on. Rows vary the
@@ -196,32 +200,47 @@ fn unknown_names() -> Vec<String> {
     ]
 }
 
-/// Every CONTROL-PLANE operation addressed by `Name`, as `(label, method, uri template,
-/// body)`. The template's `{}` takes the name.
+/// Every operation addressed by `Name` whose refusal is a serialized modelled exception, as
+/// `(label, method, uri template, body, host prefix)`. The template's `{}` takes the name,
+/// and the host prefix is the one the model's `@endpoint` trait declares for the operation —
+/// which is what decides the refusal's wording.
 ///
 /// `InvokeRestApi` is absent deliberately: it is served through the environment data
 /// endpoint's proxy, whose not-found refusal is that endpoint's document payload rather
 /// than a serialized modelled exception, and is asserted in
 /// `tests/all/env_endpoint_payload.rs`.
-type NamedCall = (&'static str, &'static str, &'static str, Option<Value>);
+type NamedCall = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<Value>,
+    &'static str,
+);
 
 fn name_addressed_calls() -> Vec<NamedCall> {
     vec![
-        ("GetEnvironment", "GET", "/environments/{}", None),
+        ("GetEnvironment", "GET", "/environments/{}", None, "api."),
         (
             "UpdateEnvironment",
             "PATCH",
             "/environments/{}",
             Some(json!({"MaxWorkers": 2})),
+            "api.",
         ),
-        ("DeleteEnvironment", "DELETE", "/environments/{}", None),
-        ("CreateCliToken", "POST", "/clitoken/{}", None),
-        ("CreateWebLoginToken", "POST", "/webtoken/{}", None),
+        (
+            "DeleteEnvironment",
+            "DELETE",
+            "/environments/{}",
+            None,
+            "api.",
+        ),
+        ("CreateCliToken", "POST", "/clitoken/{}", None, "env."),
+        ("CreateWebLoginToken", "POST", "/webtoken/{}", None, "env."),
     ]
 }
 
 #[tokio::test]
-async fn every_control_plane_operation_refuses_an_unknown_environment_with_the_same_404() {
+async fn every_name_addressed_operation_refuses_an_unknown_environment_with_the_same_404() {
     let harness = Harness::new();
     // One environment exists, so a refusal below is the lookup failing and not an empty
     // store answering.
@@ -232,7 +251,7 @@ async fn every_control_plane_operation_refuses_an_unknown_environment_with_the_s
     );
 
     for name in unknown_names() {
-        for (operation, method, uri, body) in name_addressed_calls() {
+        for (operation, method, uri, body, host_prefix) in name_addressed_calls() {
             let case = format!("{operation}/{name}");
             let answer = harness
                 .send(method, &uri.replace("{}", &name), body.clone())
@@ -255,10 +274,18 @@ async fn every_control_plane_operation_refuses_an_unknown_environment_with_the_s
                 "case {case:?}: restJson1 resolves the shape from x-amzn-errortype, got {:?}",
                 answer.error_type_header
             );
+            // The control plane words the condition from the request; the environment data
+            // endpoint's front door words it itself, naming no environment.
+            let expected = if host_prefix == "env." {
+                service_com_amazonaws_mwaa_amazonmwaa::state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE
+                    .to_string()
+            } else {
+                format!("Environment {name} not found.")
+            };
             assert_eq!(
                 answer.message(),
-                format!("Environment {name} not found."),
-                "case {case:?}: the refusal must name the requested environment, got {:?}",
+                expected,
+                "case {case:?}: expected the {host_prefix} endpoint's wording {expected:?}, got {:?}",
                 answer.message()
             );
         }

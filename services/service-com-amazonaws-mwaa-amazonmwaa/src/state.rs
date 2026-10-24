@@ -475,29 +475,37 @@ impl ComAmazonawsMwaaAmazonmwaaState {
     }
 }
 
-/// The message an environment-not-found refusal carries: the sentence names the
-/// environment the REQUEST asked for.
+/// The message an environment-not-found refusal of a CONTROL-PLANE operation carries: the
+/// sentence names the environment the REQUEST asked for.
 ///
 /// Request-derived, so the form is the rule and the name is whatever the request carried.
-/// Every CONTROL-PLANE operation addressed by `Name` — `GetEnvironment`,
-/// `UpdateEnvironment`, `DeleteEnvironment`, `CreateCliToken`, `CreateWebLoginToken` —
-/// words the same condition through this one builder, so none of them can drift from the
-/// rest. `InvokeRestApi` is refused by the environment data endpoint it proxies through
-/// instead, which words it differently: see
-/// [`ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE`].
+/// Every operation the model hosts on the control-plane endpoint (`@endpoint` host prefix
+/// `api.`) and addresses by `Name` — `GetEnvironment`, `UpdateEnvironment`,
+/// `DeleteEnvironment` — words the same condition through this one builder, so none of them
+/// can drift from the rest. The operations hosted on the ENVIRONMENT data endpoint
+/// (`@endpoint` host prefix `env.`: `CreateCliToken`, `CreateWebLoginToken`,
+/// `InvokeRestApi`) never reach this builder — that front door words the condition itself,
+/// and names no environment: see [`ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE`].
 pub fn environment_not_found_message(name: &str) -> String {
     format!("Environment {name} not found.")
 }
 
 /// What the environment data endpoint says about an environment it could not resolve.
 ///
-/// `InvokeRestApi` is served through that endpoint's proxy to an environment's Apache
-/// Airflow web server, so its not-found refusal is worded by the front door that resolves
-/// the request to a web server — ahead of the request-derived builder above — and names no
-/// environment: the sentence is fixed, and it is carried as the endpoint's own document
-/// payload rather than as a serialized exception (see [`crate::service::env_endpoint`]).
-/// The text itself is only an example of that payload; what a client branches on is the 404
-/// and the `x-amzn-errortype` code beside it.
+/// Every operation the model hosts on that endpoint (`@endpoint` host prefix `env.`:
+/// `CreateCliToken`, `CreateWebLoginToken` and `InvokeRestApi`) is addressed to a
+/// PER-ENVIRONMENT front door, which resolves the request to one environment's Apache
+/// Airflow web server before any of this service's own code runs. A name that resolves to
+/// nothing is refused by that front door, so the sentence is the endpoint's own and is
+/// FIXED: it states the condition and names no environment, ahead of the request-derived
+/// builder above. `InvokeRestApi`, the one operation the model declares as a PROXY, carries
+/// it as the endpoint's document payload rather than as a serialized exception (see
+/// [`crate::service::env_endpoint`]); the token operations carry it in the `message` of
+/// their modelled `ResourceNotFoundException`.
+///
+/// The text itself is only an example; what a client branches on is the 404 and the
+/// `x-amzn-errortype` code beside it. What is NOT an example is that the sentence is fixed:
+/// a message built from the request would leak a name AWS keeps out of this refusal.
 pub const ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE: &str = "Environment not found";
 
 /// The message the `/tags/{ResourceArn}` operations' not-found refusal carries.

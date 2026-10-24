@@ -247,29 +247,47 @@ async fn every_other_answer_of_this_service_stays_a_serialized_exception_object(
         "the fixture create must succeed"
     );
 
-    // The control-plane operations addressed by the same `Name`: their not-found refusal is
-    // the modelled exception object, naming the environment the request asked for.
+    // The operations addressed by the same `Name` whose refusal is the modelled exception
+    // OBJECT: the control-plane lookups, which word it from the request, and the two
+    // `env.`-hosted token operations, which carry the endpoint's own fixed sentence in that
+    // object's `message` (the wording rule itself is pinned by
+    // `tests/all/env_endpoint_not_found_wording.rs`).
     let name = "NoSuchEnvironment";
-    for (operation, method, uri, body) in [
-        ("GetEnvironment", "GET", format!("/environments/{name}"), None),
+    for (operation, method, uri, body, message) in [
+        (
+            "GetEnvironment",
+            "GET",
+            format!("/environments/{name}"),
+            None,
+            state::environment_not_found_message(name),
+        ),
         (
             "UpdateEnvironment",
             "PATCH",
             format!("/environments/{name}"),
             Some(json!({"MaxWorkers": 2})),
+            state::environment_not_found_message(name),
         ),
         (
             "DeleteEnvironment",
             "DELETE",
             format!("/environments/{name}"),
             None,
+            state::environment_not_found_message(name),
         ),
-        ("CreateCliToken", "POST", format!("/clitoken/{name}"), None),
+        (
+            "CreateCliToken",
+            "POST",
+            format!("/clitoken/{name}"),
+            None,
+            state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE.to_string(),
+        ),
         (
             "CreateWebLoginToken",
             "POST",
             format!("/webtoken/{name}"),
             None,
+            state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE.to_string(),
         ),
     ] {
         let answer = harness.send(method, &uri, body).await;
@@ -287,8 +305,8 @@ async fn every_other_answer_of_this_service_stays_a_serialized_exception_object(
         );
         assert_eq!(
             answer.json().get("message").and_then(Value::as_str),
-            Some(state::environment_not_found_message(name).as_str()),
-            "case {operation:?}: the control-plane refusal names the environment, got {}",
+            Some(message.as_str()),
+            "case {operation:?}: expected the message {message:?}, got {}",
             answer.text()
         );
     }

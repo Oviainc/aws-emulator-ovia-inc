@@ -43,12 +43,15 @@
 //! * Every other answer of `InvokeRestApi`: the scaffold's 501 for an environment that
 //!   exists (no Apache Airflow runs in this process), the framework's 400 refusal of an
 //!   input outside its modelled constraints, and any success.
-//! * The control-plane operations, including the other two `env.`-host-prefixed ones
+//! * The control-plane operations, and the BODY of the other two `env.`-host-prefixed ones
 //!   (`CreateCliToken`, `CreateWebLoginToken`). Those mint a token in the service itself
 //!   rather than proxying a request to an environment's web server, and the recorded
 //!   behaviour this emulator is held to shows their refusal arriving as the modelled
 //!   exception object (`issues/things-that-now-work/20261022T022901Z-mwaa-control-plane-divergences-createweblogintoken-invokerestapi-answer-501.md`,
-//!   cause 1), so nothing here touches them.
+//!   cause 1), so nothing here touches them. Their refusal is still worded by this
+//!   endpoint — `crate::state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE`, carried in the
+//!   exception's `message` — because the front door that fails to resolve the environment
+//!   is the same one.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_types::body::SdkBody;

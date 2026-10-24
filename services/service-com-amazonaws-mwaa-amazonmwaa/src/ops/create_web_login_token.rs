@@ -169,9 +169,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The web server a token is minted for is the one the STORED record names, so a
         // name matching no environment has nothing to mint a token against: that is the
         // modeled `ResourceNotFoundException` (HTTP 404), never a 501.
+        //
+        // This operation is hosted on the ENVIRONMENT data endpoint (`@endpoint` host
+        // prefix `env.`), whose front door resolves the request to one environment's web
+        // server: it is that front door that refuses an unresolvable name, with its own
+        // FIXED, environment-free sentence, not the control plane's request-derived builder
+        // (see `crate::state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE`).
         let stored = store.environments.get(&input.name).ok_or_else(|| {
             CreateWebLoginTokenErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::environment_not_found_message(&input.name)),
+                message: Some(crate::state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE.to_string()),
             })
         })?;
         let web_server_hostname = crate::state::webserver_hostname(&stored.webserver_url).to_string();
