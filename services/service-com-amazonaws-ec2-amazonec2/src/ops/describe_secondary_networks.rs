@@ -220,7 +220,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // "The IDs of the secondary networks" (`SecondaryNetworkIds`): an id that names no
-        // network of the account is an error, not an absent row.
+        // network of the account is an error, not an absent row — and one that is not a
+        // secondary network id at all is refused as malformed before any lookup, by the one
+        // reader of that question (`require_known_secondary_network`).
         for secondary_network_id in &requested_ids {
             require_known_secondary_network(&store, secondary_network_id)?;
         }

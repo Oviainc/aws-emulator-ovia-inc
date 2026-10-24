@@ -7034,15 +7034,27 @@ pub fn invalid_volume_modification_not_found<E>(
 /// The prefix of a secondary network's id.
 ///
 /// `com.amazonaws.ec2#SecondaryNetworkId` carries no `@pattern`, so the model publishes no
-/// spelling for it; this service mints EC2's own `<prefix>-<17 lowercase hex digits>` id
-/// form ([`ComAmazonawsEc2Amazonec2State::next_id`]) with a prefix naming the resource, the
-/// way every other id of this store is minted.
-pub const SECONDARY_NETWORK_ID_PREFIX: &str = "sn";
+/// spelling for it; the recorded wire corpus does. AWS answers
+/// `secnet-00000000000000000` with `InvalidSecondaryNetworkId.Malformed` rather than with
+/// the `UnknownParameter`/`InvalidParameterValue` it answers a value it cannot place at
+/// all, and the SAME recorded catalog probes `afi-00000000000000000` and
+/// `imgusgrpt-00000000000000000` — prefixes EC2 certainly issues — and gets each resource's
+/// own `.Malformed` back too. What those probes share is the ALL-ZERO long-form suffix, not
+/// an unknown prefix, so `secnet` is read as the prefix AWS issues for this resource and
+/// the suffix as what makes the probe malformed (see
+/// [`secondary_network_id_is_well_formed`]).
+///
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] mints EC2's own
+/// `<prefix>-<17 lowercase hex digits>` form under it, the way every other id of this store
+/// is minted, so every id this store issues is one that reader accepts.
+pub const SECONDARY_NETWORK_ID_PREFIX: &str = "secnet";
 
 /// The prefix of the id of a secondary network's IPv4 CIDR block association
 /// (`com.amazonaws.ec2#SecondaryNetworkCidrAssociationId`, which publishes no pattern
-/// either), minted the same way as [`SECONDARY_NETWORK_ID_PREFIX`].
-pub const SECONDARY_NETWORK_CIDR_ASSOCIATION_ID_PREFIX: &str = "sn-cidr-assoc";
+/// either and which no recording probes), minted the same way as
+/// [`SECONDARY_NETWORK_ID_PREFIX`]: CHOSEN, spelled as that prefix extended by the
+/// association it names.
+pub const SECONDARY_NETWORK_CIDR_ASSOCIATION_ID_PREFIX: &str = "secnet-cidr-assoc";
 
 /// A secondary network AWS has not finished creating: `SecondaryNetworkState`'s
 /// `create-in-progress` (`smithy_query(query="shape",shape="SecondaryNetworkState")`).
@@ -7107,6 +7119,12 @@ pub const SECONDARY_NETWORK_LIMIT_EXCEEDED: &str = "SecondaryNetworkLimitExceede
 /// for, in EC2's `Invalid<Resource>Id.NotFound` spelling — the same spelling as
 /// [`INVALID_LAUNCH_TEMPLATE_ID_NOT_FOUND`].
 pub const INVALID_SECONDARY_NETWORK_ID_NOT_FOUND: &str = "InvalidSecondaryNetworkId.NotFound";
+
+/// The error code for a request naming something that is not a secondary network id at all,
+/// in EC2's `Invalid<Resource>Id.Malformed` spelling — the code AWS answers before any
+/// lookup, as the recorded wire corpus behind this issue shows
+/// (`secnet-00000000000000000` -> `InvalidSecondaryNetworkId.Malformed`).
+pub const INVALID_SECONDARY_NETWORK_ID_MALFORMED: &str = "InvalidSecondaryNetworkId.Malformed";
 
 /// One stored secondary network: the modelled [`SecondaryNetwork`] every operation that
 /// reports one answers with, plus the instant the clock owes it its `create-in-progress`
@@ -7300,19 +7318,58 @@ pub fn secondary_network_payload_bytes(tags: &[Tag], client_token: Option<&str>)
     tag_list_bytes(tags).saturating_add(client_token.map_or(0, str::len))
 }
 
+/// Whether `id` is a well-formed secondary network id — one this service could have ISSUED.
+///
+/// Read by the stricter of the two generic id readers
+/// ([`issued_long_id_is_well_formed`]): the long EC2 resource id form only
+/// (`<prefix>-<17 lowercase hex digits>`, leading `0`, not all `0`) under this resource's
+/// own prefix ([`SECONDARY_NETWORK_ID_PREFIX`], whose doc carries the recorded evidence).
+/// Secondary networks are a resource EC2 only ever issued LONG ids for — there is no
+/// eight-digit era behind them — and the all-zero suffix is what the recorded catalog shows
+/// AWS calling malformed, under this prefix and under the `afi-` and `imgusgrpt-` prefixes
+/// it probes beside it.
+///
+/// Anything else is [`INVALID_SECONDARY_NETWORK_ID_MALFORMED`] BEFORE any lookup, so a
+/// caller can tell "not an id of this kind" from "no such network".
+pub fn secondary_network_id_is_well_formed(id: &str) -> bool {
+    issued_long_id_is_well_formed(SECONDARY_NETWORK_ID_PREFIX, id)
+}
+
 /// Refuse a secondary network id the request named that this service cannot resolve.
 ///
-/// `SecondaryNetworkId` publishes no pattern, so there is no spelling to call an id
-/// malformed by: an id no network of the account has is answered as not found whatever it
-/// looks like, rather than being sorted into two codes on a rule AWS does not state.
+/// The two questions EC2 asks in order: is this an id of this resource kind at all
+/// ([`secondary_network_id_is_well_formed`], answered
+/// [`INVALID_SECONDARY_NETWORK_ID_MALFORMED`] before any lookup), and does the account hold
+/// a network with it ([`INVALID_SECONDARY_NETWORK_ID_NOT_FOUND`])? A caller branches on the
+/// code, and the two mean different things: a malformed id is a permanent client bug, while
+/// a missing one is a resource that is gone.
 pub fn require_known_secondary_network<E>(
     store: &ComAmazonawsEc2Amazonec2State,
     secondary_network_id: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if !secondary_network_id_is_well_formed(secondary_network_id) {
+        return Err(invalid_secondary_network_id_malformed(secondary_network_id));
+    }
     if store.secondary_networks.contains_key(secondary_network_id) {
         return Ok(());
     }
     Err(invalid_secondary_network_id_not_found(secondary_network_id))
+}
+
+/// Refuse something that is not a secondary network id at all: HTTP 400
+/// [`INVALID_SECONDARY_NETWORK_ID_MALFORMED`], worded the way EC2 words a malformed id of a
+/// resource kind ([`invalid_ipam_internet_registry_association_id_malformed`]) and built
+/// from the request's own value.
+pub fn invalid_secondary_network_id_malformed<E>(
+    secondary_network_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_SECONDARY_NETWORK_ID_MALFORMED,
+        400,
+        format!(
+            "The {SECONDARY_NETWORK_TAGGABLE_RESOURCE} ID '{secondary_network_id}' is malformed"
+        ),
+    )
 }
 
 /// Refuse a request that named a secondary network id no network of the account has: HTTP
