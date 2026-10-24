@@ -29,7 +29,7 @@ use service_com_amazonaws_groundstation_groundstation::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::scheduling_loop::{harness_with_engine, send, Reply, ABSENT_UUID, REGION};
+use crate::scheduling_loop::{harness_with_engine, is_uuid, send, Reply, ABSENT_UUID, REGION};
 
 /// The values `AgentStatus` accepts (`smithy_query(query="shape", shape="AgentStatus")`).
 /// Every one of them is a status an agent may report, so the report table spans all four.
@@ -42,17 +42,21 @@ const COMPONENT_STATUSES_MIN: usize = 0;
 const COMPONENT_STATUSES_MAX: usize = 20;
 
 /// Register an agent from `body`.
-async fn register(router: &MultiServiceRouter, body: Value) -> Reply {
+pub(crate) async fn register(router: &MultiServiceRouter, body: Value) -> Reply {
     send(router, "POST", "/agent", Some(body)).await
 }
 
 /// Report `body` as `agent_id`'s status.
-async fn update_status(router: &MultiServiceRouter, agent_id: &str, body: Value) -> Reply {
+pub(crate) async fn update_status(
+    router: &MultiServiceRouter,
+    agent_id: &str,
+    body: Value,
+) -> Reply {
     send(router, "PUT", &format!("/agent/{agent_id}"), Some(body)).await
 }
 
 /// Read `agent_id`'s configuration back.
-async fn get_configuration(router: &MultiServiceRouter, agent_id: &str) -> Reply {
+pub(crate) async fn get_configuration(router: &MultiServiceRouter, agent_id: &str) -> Reply {
     send(
         router,
         "GET",
@@ -65,23 +69,8 @@ async fn get_configuration(router: &MultiServiceRouter, agent_id: &str) -> Reply
 /// A `Uuid` the test derives from `index`, spelled the way the model requires
 /// (`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`), so a row's task and
 /// dataflow ids are distinct and well formed without being drawn from any recording.
-fn uuid_from(prefix: u32, index: usize) -> String {
+pub(crate) fn uuid_from(prefix: u32, index: usize) -> String {
     format!("{prefix:08x}-0000-4000-8000-{index:012x}")
-}
-
-/// Whether `id` is spelled the way the modelled `Uuid` requires.
-fn is_uuid(id: &str) -> bool {
-    let groups: Vec<&str> = id.split('-').collect();
-    groups.len() == 5
-        && [8, 4, 4, 4, 12]
-            .iter()
-            .zip(&groups)
-            .all(|(len, group)| group.len() == *len)
-        && groups.iter().all(|group| {
-            group
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        })
 }
 
 /// The ARN this service mints for an agent: `agent/{agentId}` under the request's region
@@ -98,7 +87,7 @@ fn expected_arn(agent_id: &str) -> String {
 /// a capability of the Ground Station PROVIDER (`smithy_query(query="shape",
 /// shape="CapabilityArn")`) — a resource no operation of this model creates — so the value
 /// is only required to be a string naming one.
-fn capability_arn(index: usize) -> String {
+pub(crate) fn capability_arn(index: usize) -> String {
     format!(
         "arn:aws:groundstation:{REGION}:{}:capability/{}-antenna",
         engine::emulator_account_id(),
