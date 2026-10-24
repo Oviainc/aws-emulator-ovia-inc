@@ -483,6 +483,41 @@ const COST_BUDGET_TYPE: &str = "COST";
 /// budget" (`Budget$PlannedBudgetLimits`).
 const LIMIT_REQUIRED_BUDGET_TYPES: [&str; 2] = [COST_BUDGET_TYPE, "USAGE"];
 
+/// The `BudgetType` members whose budget tracks a utilization or coverage PERCENTAGE,
+/// and whose `BudgetLimit` therefore has exactly one documented value: "RI and Savings
+/// Plans utilization or coverage budgets default to `100`. This is the only valid value
+/// for RI or Savings Plans utilization or coverage budgets" (`Budget$BudgetLimit`).
+///
+/// Spelled out rather than taken as the complement of [`LIMIT_REQUIRED_BUDGET_TYPES`]:
+/// these are the four members of the `BudgetType` enum that sentence names, so a member
+/// the model adds later gets no limit invented for it. The list is pinned against the
+/// generated `BUDGET_TYPE_VALUES` catalog by
+/// `tests/all/service_owned_budget_members.rs`.
+pub const PERCENTAGE_LIMIT_BUDGET_TYPES: [&str; 4] = [
+    "RI_UTILIZATION",
+    "RI_COVERAGE",
+    "SAVINGS_PLANS_UTILIZATION",
+    "SAVINGS_PLANS_COVERAGE",
+];
+
+/// "RI and Savings Plans utilization or coverage budgets default to `100`"
+/// (`Budget$BudgetLimit`) — the `Spend$Amount` such a budget is stored with when the
+/// request carries no `BudgetLimit`. `NumericValue` is a string (`^([0-9]*\.)?[0-9]+$`),
+/// so the default is written as the digits AWS documents.
+pub const PERCENTAGE_LIMIT_AMOUNT: &str = "100";
+
+/// The `Spend$Unit` of the limit above — a unit this emulator CHOOSES, not one the model
+/// states: `Budget$BudgetLimit` documents the defaulted amount (`100`) and nothing about
+/// the unit it is measured in, and `UnitValue`'s `.*` pattern constrains nothing either.
+///
+/// A utilization or coverage budget's limit is a percentage (the `100` it defaults to is
+/// "the only valid value", which no currency or usage unit bounds), so the unit is spelled
+/// the way this model spells that unit elsewhere (`ThresholdType$PERCENTAGE`, for a
+/// threshold that is "a certain percentage"). A recorded RI/SP `DescribeBudget` response
+/// is what would pin it; until one is on hand, a caller that cares sends its own
+/// `BudgetLimit`, which is always stored as sent.
+pub const PERCENTAGE_LIMIT_UNIT: &str = "PERCENTAGE";
+
 /// The `TimeUnit` members a `PlannedBudgetLimits` map can be written for:
 /// "`PlannedBudgetLimits` ... supports both monthly and quarterly `TimeUnit`"
 /// (`Budget$PlannedBudgetLimits`). The map's key is "the start of the month" or "the
@@ -567,9 +602,16 @@ fn is_period_start(time_unit: &str, secs: i64) -> bool {
 ///   the caller does not set. `previous` carries the status the budget already had: the
 ///   status did not change because somebody edited the budget, so neither does its
 ///   `LastUpdatedTime`.
+/// * the members the service DERIVES from the cost and usage it tracks, which a request
+///   cannot set at all (see [`drop_service_derived`]).
+/// * `BudgetLimit` — the documented default of a utilization or coverage budget whose
+///   request carried none (see [`apply_percentage_limit_default`]).
 pub fn stamp_service_owned(budget: &mut Budget, at: SystemTime, previous: Option<HealthStatus>) {
     let stamped = ::aws_smithy_types::DateTime::from(at);
     budget.last_updated_time = Some(stamped);
+
+    drop_service_derived(budget);
+    apply_percentage_limit_default(budget);
 
     let default_start = default_time_period_start(&budget.time_unit, at);
     let period = budget.time_period.get_or_insert_with(TimePeriod::default);
@@ -589,6 +631,75 @@ pub fn stamp_service_owned(budget: &mut Budget, at: SystemTime, previous: Option
         status_reason: None,
         last_updated_time: Some(stamped),
     }));
+}
+
+/// Discard every member of `budget` whose value the SERVICE derives from the cost and
+/// usage data it tracks. A request cannot set any of them, so the write path drops what
+/// it carried instead of storing it and echoing it back from every later read — the same
+/// treatment a caller-supplied `LastUpdatedTime` already gets.
+///
+/// This emulator tracks no cost or usage behind a budget: it holds budgets, their
+/// notifications and their tags, and nothing that spends. So each of these members is
+/// stored ABSENT rather than filled with a figure nothing computed:
+///
+/// * `CalculatedSpend` — "the actual and forecasted cost or usage that the budget
+///   tracks" (`Budget$CalculatedSpend`), and the one member `UpdateBudget` documents a
+///   caller cannot change ("you can change every part of a budget except for the
+///   `budgetName` and the `calculatedSpend`"). With nothing spent behind the budget
+///   there is no actual or forecasted amount to report.
+/// * `AutoAdjustData$LastAutoAdjustTime` — "the last time that your budget was
+///   auto-adjusted". Adjusting an auto-adjusting budget's amount means averaging the
+///   account's historical or forecasted cost, which this emulator holds none of, so it
+///   never adjusts one: there is no such time, and stamping the write instant would
+///   report an adjustment that never ran.
+/// * `HistoricalOptions$LookBackAvailablePeriods` — "you can't set your own
+///   `LookBackAvailablePeriods`. The value is automatically calculated from the
+///   `BudgetAdjustmentPeriod` and your historical cost data", counting the periods of
+///   that window that have cost data. None do here, and the member's modelled
+///   `@range(min: 1)` cannot express a count of zero, so absence is the only answer the
+///   model allows.
+///
+/// The members of the same shapes the CALLER owns are left exactly as sent:
+/// `AutoAdjustData$AutoAdjustType` and `HistoricalOptions$BudgetAdjustmentPeriod` are
+/// "the parameters that determine the budget amount", which is a caller's choice.
+fn drop_service_derived(budget: &mut Budget) {
+    budget.calculated_spend = None;
+    if let Some(auto_adjust) = budget.auto_adjust_data.as_mut() {
+        auto_adjust.last_auto_adjust_time = None;
+        if let Some(options) = auto_adjust.historical_options.as_mut() {
+            options.look_back_available_periods = None;
+        }
+    }
+}
+
+/// Store the documented default `BudgetLimit` of a utilization or coverage budget whose
+/// request carried none: "`BudgetLimit` is required for cost or usage budgets, but
+/// optional for RI or Savings Plans utilization or coverage budgets. RI and Savings Plans
+/// utilization or coverage budgets default to `100`. This is the only valid value for RI
+/// or Savings Plans utilization or coverage budgets" (`Budget$BudgetLimit`) — so such a
+/// budget always reads back with a limit, the way a budget written without a `TimePeriod`
+/// reads back with the defaulted one.
+///
+/// A limit the caller DID send is kept as sent, and no default is invented for any other
+/// budget type: `BudgetLimit` is required for a cost or usage budget
+/// ([`validate_budget_limit_present`] refuses one that carries no limit at all), and an
+/// auto-adjusting budget's amount is the average of cost data this emulator does not hold
+/// (see [`drop_service_derived`]), so none is derived for it either.
+///
+/// Defaulting here cannot produce the combination `Budget$BudgetLimit` forbids
+/// ("you can't use `BudgetLimit` with `PlannedBudgetLimits`"): `PlannedBudgetLimits` "is
+/// available for cost or usage budget", which [`validate_planned_budget_limits`] already
+/// refuses on exactly the budget types defaulted here.
+fn apply_percentage_limit_default(budget: &mut Budget) {
+    if budget.budget_limit.is_some()
+        || !PERCENTAGE_LIMIT_BUDGET_TYPES.contains(&budget.budget_type.as_str())
+    {
+        return;
+    }
+    budget.budget_limit = Some(Spend {
+        amount: PERCENTAGE_LIMIT_AMOUNT.to_string(),
+        unit: PERCENTAGE_LIMIT_UNIT.to_string(),
+    });
 }
 
 /// Stamp the members of `notification` the SERVICE owns, on the write path that creates
