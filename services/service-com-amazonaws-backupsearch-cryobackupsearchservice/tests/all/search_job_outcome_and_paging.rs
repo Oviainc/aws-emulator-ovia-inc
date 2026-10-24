@@ -420,6 +420,7 @@ fn seed_job(engine: &engine::InMemoryEngine, status: &str) -> String {
         search_scope_summary: types::SearchScopeSummary::default(),
         current_search_progress: types::CurrentSearchProgress::default(),
         results: Vec::new(),
+        scan_matches: Vec::new(),
         backups: Vec::new(),
         tags: std::collections::HashMap::new(),
         client_token: None,
