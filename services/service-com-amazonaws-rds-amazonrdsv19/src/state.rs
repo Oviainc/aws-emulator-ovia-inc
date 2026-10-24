@@ -2,15 +2,18 @@
 
 //! Engine state for the com-amazonaws-rds-amazonrdsv19 service.
 //!
-//! The DB instance, DB snapshot, DB cluster, option group, DB subnet group, cluster
-//! parameter group, event subscription and global cluster records the implemented
-//! handlers read and write, plus the projection of a stored record onto the modelled
-//! `DBInstance` / `DBSnapshot` / `DBCluster` / `OptionGroup` / `DBSubnetGroup` /
+//! The DB instance, DB snapshot, DB cluster, DB shard group, option group, DB subnet
+//! group, cluster parameter group, event subscription and global cluster records the
+//! implemented handlers read and write, plus the projection of a stored record onto the
+//! modelled
+//! `DBInstance` / `DBSnapshot` / `DBCluster` / `DBShardGroup` / `OptionGroup` /
+//! `DBSubnetGroup` /
 //! `DBClusterParameterGroup` / `EventSubscription` /
 //! `GlobalCluster` wire shapes. These live here rather than in one operation file because
 //! every implemented operation shares them: `CreateDBInstance`, `DescribeDBInstances`,
 //! `ModifyDBInstance`, `CreateDBSnapshot`, `DescribeDBSnapshots`, `DeleteDBInstance`,
 //! `CreateDBCluster`, `DescribeDBClusters`,
+//! `CreateDBShardGroup`, `DescribeDBShardGroups`,
 //! `CreateOptionGroup`, `ModifyOptionGroup`, `DescribeOptionGroups`,
 //! `DeleteOptionGroup`, `CreateDBSubnetGroup`, `DescribeDBSubnetGroups`, the six
 //! cluster-parameter-group operations, `CreateEventSubscription`,
@@ -32,6 +35,7 @@
 //! `MAX_REGIONS * DB_SNAPSHOT_QUOTA_PER_REGION` snapshots,
 //! `MAX_REGIONS * DB_CLUSTER_QUOTA_PER_REGION` DB clusters — each carrying at most
 //! [`MAX_CLUSTER_LIST_VALUES`] values in each of its stored string lists —
+//! `MAX_REGIONS * DB_SHARD_GROUP_QUOTA_PER_REGION` DB shard groups,
 //! `MAX_REGIONS * OPTION_GROUP_QUOTA_PER_REGION` option groups and
 //! `MAX_REGIONS * DB_SUBNET_GROUP_QUOTA_PER_REGION` DB subnet groups,
 //! `MAX_REGIONS * DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION` cluster parameter groups
@@ -46,10 +50,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    Certificate, CertificateDetails, ClusterPendingModifiedValues, DBCluster,
-    DBClusterAutomatedBackup, DBClusterMember, DBClusterOptionGroupStatus, DBClusterParameterGroup,
-    DBClusterRole, DBClusterSnapshot, DBClusterSnapshotAttribute, DBClusterSnapshotAttributesResult,
-    DBInstance, DBParameterGroupStatus, DBSecurityGroupMembership, DBSnapshot, DBSubnetGroup,
+    Certificate, CertificateDetails, ClusterPendingModifiedValues, CreateDBShardGroupOutput,
+    DBCluster, DBClusterAutomatedBackup, DBClusterMember, DBClusterOptionGroupStatus,
+    DBClusterParameterGroup, DBClusterRole, DBClusterSnapshot, DBClusterSnapshotAttribute,
+    DBClusterSnapshotAttributesResult, DBInstance, DBParameterGroupStatus,
+    DBSecurityGroupMembership, DBSnapshot, DBSubnetGroup,
     DomainMembership, Endpoint, EventCategoriesMap, EventSubscription, GlobalCluster,
     GlobalClusterMember, Option2, OptionGroup, OptionGroupMembership, OptionSetting, Parameter,
     PendingModifiedValues, RestoreWindow, ScalingConfigurationInfo,
@@ -233,6 +238,76 @@ pub const EVENT_SUBSCRIPTION_QUOTA_PER_REGION: usize = 20;
 /// account is already at the maximum allowed" — which is worded per ACCOUNT, as is the
 /// map this bounds: a global cluster is account-scoped and carries no region.
 pub const GLOBAL_CLUSTER_QUOTA_PER_ACCOUNT: usize = 5;
+
+/// How many DB shard groups one region may hold.
+///
+/// Aurora Limitless Database publishes no public allowance for DB shard groups, and each
+/// one is request data that enters the store, so this bound is this emulator's — the same
+/// reason [`MAX_FILTER_TERMS`] bounds a describe's filter terms. A create past it answers
+/// the modelled `MaxDBShardGroupLimitReached` ("The maximum number of DB shard groups for
+/// your Amazon Web Services account in the specified Amazon Web Services Region has been
+/// reached"), which is what AWS answers when a create would exceed the allowance.
+pub const DB_SHARD_GROUP_QUOTA_PER_REGION: usize = 50;
+
+/// The status a DB shard group reports from the create that was accepted for it until the
+/// clock makes its transition to [`DB_SHARD_GROUP_STATUS_AVAILABLE`] due.
+///
+/// `CreateDBShardGroup` "creates a new DB shard group for Aurora Limitless Database" and
+/// answers before the shard group is usable, which is why the transition is owed at all;
+/// the value is the `creating` status RDS reports for a resource it is still
+/// provisioning, as `DBShardGroup$Status` ("the status of the DB shard group") carries it.
+pub const DB_SHARD_GROUP_STATUS_CREATING: &str = "creating";
+
+/// The status a DB shard group reports once it is usable, as `DBShardGroup$Status`
+/// carries it.
+pub const DB_SHARD_GROUP_STATUS_AVAILABLE: &str = "available";
+
+/// The status a DB shard group reports once a delete has been accepted for it — the same
+/// `deleting` status the other delete paths of this service report
+/// ([`DB_INSTANCE_STATUS_DELETING`], [`DB_CLUSTER_STATUS_DELETING`]).
+///
+/// It is a TRANSIENT status: the clock owes the record's removal from the store, after
+/// which every read of the identifier is a `DBShardGroupNotFoundFault`.
+pub const DB_SHARD_GROUP_STATUS_DELETING: &str = "deleting";
+
+/// The values `CreateDBShardGroupMessage$ComputeRedundancy` documents: "Valid values are
+/// the following: 0 - Creates a DB shard group without a standby DB data access shard.
+/// This is the default value. 1 - Creates a DB shard group with a standby DB data access
+/// shard in a different Availability Zone (AZ). 2 - Creates a DB shard group with two
+/// standby DB data access shard in two different AZs."
+pub const COMPUTE_REDUNDANCY_VALUES: [i32; 3] = [0, 1, 2];
+
+/// The `ComputeRedundancy` a DB shard group created without one gets: "0 ... This is the
+/// default value."
+pub const DEFAULT_COMPUTE_REDUNDANCY: i32 = 0;
+
+/// Refuse a `ComputeRedundancy` outside [`COMPUTE_REDUNDANCY_VALUES`], naming the value
+/// and the set it is not in.
+pub fn check_compute_redundancy(value: i32) -> Result<(), String> {
+    if !COMPUTE_REDUNDANCY_VALUES.contains(&value) {
+        return Err(format!(
+            "invalid value {value} for ComputeRedundancy: must be one of {}",
+            COMPUTE_REDUNDANCY_VALUES
+                .iter()
+                .map(i32::to_string)
+                .collect::<Vec<String>>()
+                .join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse an Aurora capacity unit count that is not a capacity: a capacity in ACUs is a
+/// positive, finite quantity.
+pub fn check_capacity_units(member: &str, value: f64) -> Result<(), String> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!(
+            "invalid value {value} for {member}: a capacity in Aurora capacity units must \
+             be a positive number"
+        ));
+    }
+    Ok(())
+}
 
 /// How many DB clusters one region may hold: Amazon RDS's published default quota ("DB
 /// clusters": 40 per Region). Reaching it is the modelled `DBClusterQuotaExceededFault` —
@@ -899,6 +974,16 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// one without passing [`ComAmazonawsRdsAmazonrdsv19State::has_room_for_region`], so
     /// the map is bounded by [`MAX_REGIONS`] like every other store here.
     pub certificate_overrides: BTreeMap<String, String>,
+    /// Aurora Limitless Database DB shard groups by `(region, db_shard_group_key)` — the
+    /// identifier folded by [`db_shard_group_key`], because
+    /// `DescribeDBShardGroupsMessage$DBShardGroupIdentifier` "isn't case-sensitive", while
+    /// the record keeps the identifier in the case the create named it. Ordered, so
+    /// `DescribeDBShardGroups` pages deterministically within a region.
+    ///
+    /// `CreateDBShardGroup` inserts here — bounded by
+    /// [`DB_SHARD_GROUP_QUOTA_PER_REGION`] per region and by [`MAX_REGIONS`] regions — and
+    /// `DescribeDBShardGroups` reports what is here.
+    pub db_shard_groups: BTreeMap<RegionalKey, DbShardGroupRecord>,
     /// Monotonic counter behind every server-assigned id this service mints, so
     /// resource ids and endpoint hosts are unique and reproducible.
     pub mint_counter: u64,
@@ -996,6 +1081,20 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         for key in gone.drain(..) {
             self.db_clusters.remove(&key);
         }
+        for (key, shard_group) in self
+            .db_shard_groups
+            .range_mut((region.to_string(), String::new())..)
+        {
+            if key.0 != region {
+                break;
+            }
+            if shard_group.settle(now) {
+                gone.push(key.clone());
+            }
+        }
+        for key in gone.drain(..) {
+            self.db_shard_groups.remove(&key);
+        }
         for (key, deployment) in self
             .blue_green_deployments
             .range_mut((region.to_string(), String::new())..)
@@ -1052,6 +1151,25 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         for key in gone {
             self.db_proxies.remove(&key);
         }
+    }
+
+    /// The DB shard groups stored in `region`, in folded-identifier order.
+    ///
+    /// An ordered range rather than a scan of the whole map, so the work is bounded by
+    /// [`DB_SHARD_GROUP_QUOTA_PER_REGION`] however many regions the store holds.
+    pub fn shard_groups_in(&self, region: &str) -> Vec<&DbShardGroupRecord> {
+        range_in(&self.db_shard_groups, region)
+    }
+
+    /// The DB shard group `named` resolves to in `region`, or `None` when nothing of that
+    /// name exists — what a request that NAMES a DB shard group is resolved against.
+    ///
+    /// `DescribeDBShardGroupsMessage$DBShardGroupIdentifier` is "the user-supplied DB
+    /// shard group identifier" and "this parameter isn't case-sensitive", so the lookup
+    /// folds the way [`db_shard_group_key`] keys the store.
+    pub fn resolve_db_shard_group(&self, region: &str, named: &str) -> Option<&DbShardGroupRecord> {
+        self.db_shard_groups
+            .get(&(region.to_string(), db_shard_group_key(named)))
     }
 
     /// The DB clusters stored in `region`, in identifier order.
@@ -1398,6 +1516,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .chain(self.event_subscriptions.keys())
             .chain(self.option_groups.keys())
             .chain(self.db_subnet_groups.keys())
+            .chain(self.db_shard_groups.keys())
             .chain(self.blue_green_deployments.keys())
             .chain(self.integrations.keys())
             .chain(self.tenant_databases.keys())
@@ -2746,6 +2865,146 @@ impl DbClusterSnapshotRecord {
             storage_type: self.storage_type.clone(),
             db_cluster_resource_id: Some(self.db_cluster_resource_id.clone()),
             ..DBClusterSnapshot::default()
+        }
+    }
+}
+
+/// The key a DB shard group is stored and looked up under: its identifier folded to
+/// lower case.
+///
+/// `DescribeDBShardGroupsMessage$DBShardGroupIdentifier` "isn't case-sensitive", so two
+/// requests differing only in case name ONE shard group — which is what folding the key
+/// gives, while the record keeps the identifier in the case `CreateDBShardGroup` named it
+/// (nothing in the model says a DB shard group identifier is stored lowercased, and
+/// `DBShardGroupIdentifier`'s own pattern admits upper-case letters).
+pub fn db_shard_group_key(identifier: &str) -> String {
+    identifier.to_ascii_lowercase()
+}
+
+/// `arn:aws:rds:<region>:<account>:shard-group:<identifier>` — the ARN form RDS gives a
+/// DB shard group, with the `shard-group` resource type its own tagging documentation
+/// names it by.
+pub fn db_shard_group_arn(region: &str, identifier: &str) -> String {
+    emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("shard-group:{identifier}"))
+}
+
+/// The immutable resource id RDS reports as `DBShardGroupResourceId`: "the Amazon Web
+/// Services Region-unique, immutable identifier for the DB shard group", of the same
+/// `<prefix>-` plus 26 server-minted characters form as [`mint_db_cluster_resource_id`].
+/// Both draw on the one store-wide counter, so no two resources of this service can be
+/// minted the same id.
+pub fn mint_db_shard_group_resource_id(mint: u64) -> String {
+    format!("shardgroup-{}", base36(mint, 26))
+}
+
+/// A stored Aurora Limitless Database DB shard group: everything the service persists
+/// about it.
+///
+/// The ARN and the endpoint DNS name are NOT stored as text: they are functions of the
+/// stored region, identifier and minted endpoint host, and [`Self::to_wire`] computes
+/// them — the same reason [`DbInstanceRecord`] computes its own.
+#[derive(Debug, Clone)]
+pub struct DbShardGroupRecord {
+    /// `DBShardGroupIdentifier`, in the case the create named it.
+    pub identifier: String,
+    /// The region the shard group was created in; the scope of its ARN and endpoint.
+    pub region: String,
+    /// `DBClusterIdentifier`: "the name of the primary DB cluster for the DB shard
+    /// group", resolved in the store before the shard group was stored.
+    pub db_cluster_identifier: String,
+    /// `DBShardGroupResourceId`, minted once.
+    pub resource_id: String,
+    /// The server-assigned middle label of the endpoint DNS name, minted once.
+    pub endpoint_host: String,
+    /// `MaxACU`: "the maximum capacity of the DB shard group in Aurora capacity units
+    /// (ACUs)".
+    pub max_acu: f64,
+    /// `MinACU`, for the creates that named one.
+    pub min_acu: Option<f64>,
+    /// `ComputeRedundancy`: how many standby DB data access shards the shard group has.
+    pub compute_redundancy: i32,
+    /// `Status`.
+    pub status: String,
+    /// The transition the clock owes this record, if any.
+    pub pending_status: Option<PendingStatus>,
+    /// `PubliclyAccessible`.
+    pub publicly_accessible: bool,
+    /// `TagList`.
+    pub tags: Vec<Tag>,
+}
+
+impl DbShardGroupRecord {
+    /// Apply a change whose due instant has passed. Returns whether the record is now
+    /// gone, exactly as [`DbInstanceRecord::settle`] does.
+    fn settle(&mut self, now: Instant) -> bool {
+        let due = self
+            .pending_status
+            .as_ref()
+            .is_some_and(|pending| now >= pending.due_at);
+        if !due {
+            return false;
+        }
+        match self.pending_status.take().map(|pending| pending.change) {
+            Some(PendingChange::Status(status)) => self.status = status,
+            Some(PendingChange::Removal) => return true,
+            // Unreachable: the change was there a line ago, under this one `&mut self`.
+            // Answered as "nothing was due" rather than with a panic in a request path.
+            None => {}
+        }
+        false
+    }
+
+    /// `arn:aws:rds:<region>:<account>:shard-group:<identifier>`, from the stored region
+    /// and identifier.
+    pub fn arn(&self) -> String {
+        db_shard_group_arn(&self.region, &self.identifier)
+    }
+
+    /// `Endpoint`: "the connection endpoint for the DB shard group", in the RDS endpoint
+    /// form `<name>.<server-assigned label>.<region>.rds.amazonaws.com` that
+    /// [`DbClusterRecord::endpoint`] states for a cluster, with the label a DB shard
+    /// group's own endpoint carries.
+    pub fn endpoint(&self) -> String {
+        format!(
+            "{}.shardgrp-{}.{}.rds.amazonaws.com",
+            self.identifier, self.endpoint_host, self.region
+        )
+    }
+
+    /// Whether the shard group is up: the state `InvalidDBShardGroupStateFault` ("the DB
+    /// shard group must be in the available state") is answered for every other one,
+    /// `deleting` included.
+    pub fn is_available(&self) -> bool {
+        self.status == DB_SHARD_GROUP_STATUS_AVAILABLE
+    }
+
+    /// Accept a delete: the shard group reports `deleting` from now on, and the clock owes
+    /// its removal from the store [`STATUS_TRANSITION_DELAY`] from now, after which every
+    /// read of the identifier is a `DBShardGroupNotFoundFault`. Nothing sleeps: the due
+    /// instant is stored and materialised by
+    /// [`ComAmazonawsRdsAmazonrdsv19State::settle_due_transitions`], exactly as
+    /// [`DbClusterRecord::begin_deletion`] does for a DB cluster.
+    pub fn begin_deletion(&mut self) {
+        self.status = DB_SHARD_GROUP_STATUS_DELETING.to_string();
+        self.pending_status = Some(PendingStatus::removal_in_a_moment());
+    }
+
+    /// Project the stored record onto the modelled `DBShardGroup` wire shape — the output
+    /// of every DB shard group operation, and one entry of the `DescribeDBShardGroups`
+    /// report, so the two cannot disagree about a shard group.
+    pub fn to_wire(&self) -> CreateDBShardGroupOutput {
+        CreateDBShardGroupOutput {
+            db_shard_group_identifier: Some(self.identifier.clone()),
+            db_shard_group_resource_id: Some(self.resource_id.clone()),
+            db_shard_group_arn: Some(self.arn()),
+            db_cluster_identifier: Some(self.db_cluster_identifier.clone()),
+            max_acu: Some(self.max_acu),
+            min_acu: self.min_acu,
+            compute_redundancy: Some(self.compute_redundancy),
+            status: Some(self.status.clone()),
+            publicly_accessible: Some(self.publicly_accessible),
+            endpoint: Some(self.endpoint()),
+            tag_list: Some(self.tags.clone()),
         }
     }
 }

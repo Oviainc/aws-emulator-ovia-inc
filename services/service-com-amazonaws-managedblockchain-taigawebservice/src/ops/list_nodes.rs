@@ -178,7 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A reporting operation: the page is cut from stored state, and the one write it
         // makes is materialising the status transitions the clock already owed.
-        let _ = ctx;
+        //
+        // The Region this request is addressed to, read off its own credential scope: a
+        // resource belongs to the Region its create was signed for, so the lookups below
+        // are scoped to it.
+        let region = crate::state::request_region(ctx);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListNodesErrorModeled::InternalServiceErrorException(
@@ -205,12 +209,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());
 
-        // A network this store does not hold has no framework to read the member rule
-        // from, so the request is answered through the member scope it names — or through
-        // the one it omits. Either way the answer is this operation's own
+        // A network this store does not hold in this Region has no framework to read the
+        // member rule from, so the request is answered through the member scope it names —
+        // or through the one it omits. Either way the answer is this operation's own
         // `InvalidRequestException`, never a `ResourceNotFoundException` its model does
         // not declare.
-        let Some(network) = guard.networks.get(&input.network_id) else {
+        let Some(network) = guard.network(&region, &input.network_id) else {
             return Err(match input.member_id.as_deref() {
                 Some(member_id) => member_not_found(member_id, &input.network_id),
                 None => member_id_required(&input.network_id),
@@ -224,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(member_id) = input.member_id.as_deref() else {
                 return Err(member_id_required(&input.network_id));
             };
-            if !network.members.contains_key(member_id) {
+            if network.member(&region, member_id).is_none() {
                 return Err(member_not_found(member_id, &input.network_id));
             }
         } else if let Some(member_id) = input.member_id.as_deref() {
@@ -232,8 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let selected: Vec<(String, NodeSummary)> = network
-            .nodes
-            .values()
+            .nodes_in(&region)
             .filter(|node| {
                 input.member_id.as_deref().is_none_or(|member_id| {
                     node.member_id.as_deref() == Some(member_id)

@@ -153,13 +153,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `id` accepts the `waba-...` short form and the account ARN alike.
         let Some(account_id) = store.linked_account_id(&input.id) else {
+            // The message is a CONSTANT, like every other error text this service states:
+            // nothing of the request is formatted into it, so the id a caller asked about
+            // does not come back in an error body. This operation models no not-found, so
+            // the class is its own client-input error rather than
+            // `ResourceNotFoundException`, and no recorded text is known for it.
             return Err(
                 PutWhatsAppBusinessAccountEventDestinationsErrorModeled::InvalidParametersException(
                     InvalidParametersException {
-                        message: Some(format!(
-                            "no linked WhatsApp Business Account with id '{}'",
-                            input.id
-                        )),
+                        message: Some(
+                            "The id provided is not a linked WhatsApp Business Account."
+                                .to_string(),
+                        ),
                     },
                 )
                 .into(),

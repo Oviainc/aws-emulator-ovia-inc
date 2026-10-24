@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListManagedEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListManagedEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the managed endpoints one virtual cluster HOLDS, newest first, every one of them
+//! the record [`crate::ops::describe_managed_endpoint`] answers with.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListManagedEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `@paginated` (`maxResults` + `nextToken`), and filtered by `states`, `types` and the
+//! `createdAfter` / `createdBefore` bounds; a filter the request omits constrains nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +74,71 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The opaque `nextToken` for the endpoint the next page starts at: the cluster's endpoint
+/// listing — the cursor's scope — plus that endpoint's place in the newest-first order.
+///
+/// The format and the scope check both live in [`crate::state::encode_list_cursor`], the
+/// one encoder every paginated list in this service shares.
+fn encode_cursor(virtual_cluster_id: &str, record: &crate::state::ManagedEndpointRecord) -> String {
+    crate::state::encode_list_cursor(
+        &crate::state::list_managed_endpoints_scope(virtual_cluster_id),
+        record.created_at_millis,
+        record.sequence,
+    )
+}
+
+/// The place in this cluster's newest-first order a `nextToken` names.
+///
+/// `None` — refused as an invalid request — when the token is not one of this service's
+/// cursors or belongs to another listing (another cluster's endpoints, or the same
+/// cluster's job runs), so a token cannot be carried from one listing to another's.
+fn decode_cursor(virtual_cluster_id: &str, token: &str) -> Option<(i64, u64)> {
+    crate::state::decode_list_cursor(
+        &crate::state::list_managed_endpoints_scope(virtual_cluster_id),
+        token,
+    )
+}
+
+/// Whether one stored managed endpoint satisfies every filter the request carried. A
+/// filter the request omitted constrains nothing.
+fn matches_filters(
+    record: &crate::state::ManagedEndpointRecord,
+    input: &ListManagedEndpointsInput,
+) -> bool {
+    // `states` keeps the endpoints in any listed `EndpointState`. An empty list names no
+    // state to keep out, so it constrains nothing.
+    if let Some(states) = input.states.as_ref().filter(|states| !states.is_empty()) {
+        if !states.contains(&record.state) {
+            return false;
+        }
+    }
+    // `types` is the same, over the endpoint's `type`: an `EndpointType` is a free-form
+    // string in the model, so a row matches exactly rather than by pattern.
+    if let Some(types) = input.types.as_ref().filter(|types| !types.is_empty()) {
+        if !types.contains(&record.endpoint_type) {
+            return false;
+        }
+    }
+    // `createdBefore` / `createdAfter` bound `createdAt` strictly, so the two together
+    // name an open interval and neither ever returns the endpoint created exactly at a
+    // bound.
+    if input
+        .created_before
+        .as_ref()
+        .is_some_and(|bound| record.created_at_millis >= crate::state::millis_of(bound))
+    {
+        return false;
+    }
+    if input
+        .created_after
+        .as_ref()
+        .is_some_and(|bound| record.created_at_millis <= crate::state::millis_of(bound))
+    {
+        return false;
+    }
+    true
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +209,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListManagedEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListManagedEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListManagedEndpoints"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListManagedEndpointsError::Modeled(
+                ListManagedEndpointsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the managed endpoint store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+        let mut state = store.lock();
+        // Reporting, but it materialises what the clock already owed: an endpoint's
+        // CREATING -> ACTIVE step was due at that instant whether or not anybody listed.
+        state.settle();
+
+        // This operation models no not-found error, so an unknown virtual cluster is
+        // refused as an invalid request. A cluster that exists in any state still lists
+        // its endpoints, including a terminated one.
+        if !state
+            .virtual_clusters
+            .contains_key(&input.virtual_cluster_id)
+        {
+            return Err(ListManagedEndpointsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Virtual cluster {} was not found",
+                        input.virtual_cluster_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `maxResults` is the page size. The model declares no range for it, but a page of
+        // fewer than one item is not a page, so it is refused rather than silently read as
+        // "no limit".
+        let page_size = match input.max_results {
+            Some(limit) if limit < 1 => {
+                return Err(ListManagedEndpointsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "maxResults must be at least 1, but {limit} was requested"
+                        )),
+                    },
+                )
+                .into());
+            }
+            Some(limit) => Some(usize::try_from(limit).unwrap_or(usize::MAX)),
+            None => None,
+        };
+
+        // Newest first, over the endpoints this cluster actually holds. The creation
+        // sequence breaks a tie between two endpoints created in the same millisecond, so
+        // the order is total and a page boundary never depends on hash order.
+        let mut matching: Vec<&crate::state::ManagedEndpointRecord> = state
+            .cluster_managed_endpoints(&input.virtual_cluster_id)
+            .filter(|record| matches_filters(record, &input))
+            .collect();
+        matching.sort_by(|left, right| {
+            (right.created_at_millis, right.sequence).cmp(&(left.created_at_millis, left.sequence))
+        });
+
+        // `nextToken` is the cursor the previous page ended on: the POSITION in the
+        // newest-first order of the next endpoint to report, not the identity of a row. So
+        // an endpoint whose state changed between pages (a CREATING one that reached
+        // ACTIVE, say, under a `states` filter) cannot invalidate a token the client
+        // already holds: resuming reports everything ordered after the cursor, with no
+        // repeats and no gaps.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(cursor) = decode_cursor(&input.virtual_cluster_id, token) else {
+                    return Err(ListManagedEndpointsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some("nextToken is not a valid pagination token".to_string()),
+                        },
+                    )
+                    .into());
+                };
+                matching
+                    .iter()
+                    .position(|record| (record.created_at_millis, record.sequence) <= cursor)
+                    .unwrap_or(matching.len())
+            }
+        };
+
+        let end = page_size.map_or(matching.len(), |size| {
+            start.saturating_add(size).min(matching.len())
+        });
+        let endpoints: Vec<Endpoint> = matching[start..end]
+            .iter()
+            .map(|record| record.to_endpoint())
+            .collect();
+        // A `nextToken` only when endpoints remain after this page.
+        let next_token = matching
+            .get(end)
+            .map(|record| encode_cursor(&input.virtual_cluster_id, record));
+
+        Ok(ListManagedEndpointsOutput {
+            endpoints: Some(endpoints),
+            next_token,
+        })
     }
 }

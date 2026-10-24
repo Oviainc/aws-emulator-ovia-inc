@@ -171,11 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already owed (a proposal past its expiration date, a resource past its
         // provisioning span) — changes due at this instant whether or not anybody called.
         //
-        // Nothing on this path needs the request metadata: every reported value is read
-        // off stored records, and the refusal names a resource by the id the request
-        // carried rather than by ARN, so this handler mints no ARN and needs no region —
-        // discarded rather than renamed, the way `list_proposals.rs` does.
-        let _ = ctx;
+        // The Region this request is addressed to, read off its own credential scope: a
+        // network and the proposals on it belong to the Region their creates were signed
+        // for, so the lookups below are scoped to it.
+        let region = crate::state::request_region(ctx);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListProposalVotesErrorModeled::InternalServiceErrorException(
@@ -204,11 +203,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The PROPOSAL is the resource whose votes this call reports; the network id only
         // scopes the lookup, so an id that resolves to no stored proposal — including one
-        // scoped by a network nothing stored holds — is refused naming that proposal.
-        let found = guard.networks.get(&input.network_id).and_then(|network| {
+        // scoped by a network this Region does not hold — is refused naming that proposal.
+        let found = guard.network(&region, &input.network_id).and_then(|network| {
             network
-                .proposals
-                .get(&input.proposal_id)
+                .proposal(&region, &input.proposal_id)
                 .map(|proposal| (network, proposal))
         });
         let Some((network, proposal)) = found else {

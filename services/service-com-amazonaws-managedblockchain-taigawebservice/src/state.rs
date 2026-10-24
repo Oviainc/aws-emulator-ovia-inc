@@ -10,6 +10,15 @@
 //! one network. Every implemented operation answers from the records below: ids, ARNs,
 //! endpoints, billing tokens and creation dates are minted once by the call that creates
 //! the record and stored, never recomputed on a read.
+//!
+//! Managed Blockchain is a REGIONAL service, so every record belongs to the Region the
+//! call that created it was signed for, and only a request addressed to that Region
+//! reaches it. The Region a record lives in is the one its stored ARN names — see
+//! [`arn_in_region`] — and every lookup goes through a resolver that compares it with the
+//! Region of the request ([`ComAmazonawsManagedblockchainTaigawebserviceState::network`],
+//! [`StoredNetwork::member`] and the rest), so no operation can reach another Region's
+//! resources. The only records every Region reads are AWS's standing public networks,
+//! which no request creates.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -458,10 +467,13 @@ pub struct CreatedIds {
     pub accessor_id: Option<String>,
 }
 
-/// The idempotency key of one `@idempotencyToken` call: the token is scoped to the
-/// operation that minted it, so reusing a network token on `CreateNode` is a new call.
-pub fn idempotency_key(operation: &str, token: &str) -> String {
-    format!("{operation}/{token}")
+/// The idempotency key of one `@idempotencyToken` call: the token is scoped to the Region
+/// the call was signed for and to the operation that minted it, so reusing a network token
+/// on `CreateNode` is a new call, and so is replaying a token through another Region's
+/// endpoint — where the resources the first call created do not exist, so there is nothing
+/// of it to replay.
+pub fn idempotency_key(region: &str, operation: &str, token: &str) -> String {
+    format!("{region}/{operation}/{token}")
 }
 
 /// One stored network, with the members that belong to it and the nodes that run on it.
@@ -552,15 +564,100 @@ impl StoredNetwork {
         }
     }
 
-    /// Whether the current account participates in this network, which is what
-    /// `ListNetworks` reports ("the networks in which the current Amazon Web Services
+    /// Whether a request addressed to `region` reaches this network.
+    ///
+    /// A network this account created belongs to the Region its `CreateNetwork` was signed
+    /// for — the Region its stored ARN names — so no other Region's endpoint resolves it.
+    /// AWS's standing public networks ([`PUBLIC_NETWORKS`]) are a different thing: no
+    /// request created them and they belong to no account, so every Region's endpoint
+    /// reads the same ones, exactly as every account does. What an account creates ON one
+    /// of them — a member, a node, a proposal — is an account resource again, and is
+    /// reached only through the Region it was created in.
+    pub fn in_region(&self, region: &str) -> bool {
+        self.aws_owned || arn_in_region(&self.arn, region)
+    }
+
+    /// The member `member_id` names, as a request addressed to `region` sees it.
+    pub fn member(&self, region: &str, member_id: &str) -> Option<&StoredMember> {
+        self.members
+            .get(member_id)
+            .filter(|member| member.in_region(region))
+    }
+
+    /// The member `member_id` names, to write, as a request addressed to `region` sees it.
+    pub fn member_mut(&mut self, region: &str, member_id: &str) -> Option<&mut StoredMember> {
+        self.members
+            .get_mut(member_id)
+            .filter(|member| member.in_region(region))
+    }
+
+    /// This network's members that belong to `region`, in the id order the listings take.
+    pub fn members_in<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a StoredMember> + 'a {
+        self.members
+            .values()
+            .filter(move |member| member.in_region(region))
+    }
+
+    /// The node `node_id` names, as a request addressed to `region` sees it.
+    pub fn node(&self, region: &str, node_id: &str) -> Option<&StoredNode> {
+        self.nodes.get(node_id).filter(|node| node.in_region(region))
+    }
+
+    /// The node `node_id` names, to write, as a request addressed to `region` sees it.
+    pub fn node_mut(&mut self, region: &str, node_id: &str) -> Option<&mut StoredNode> {
+        self.nodes
+            .get_mut(node_id)
+            .filter(|node| node.in_region(region))
+    }
+
+    /// This network's nodes that belong to `region`, in the id order the listings take.
+    pub fn nodes_in<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a StoredNode> + 'a {
+        self.nodes
+            .values()
+            .filter(move |node| node.in_region(region))
+    }
+
+    /// The proposal `proposal_id` names, as a request addressed to `region` sees it.
+    pub fn proposal(&self, region: &str, proposal_id: &str) -> Option<&StoredProposal> {
+        self.proposals
+            .get(proposal_id)
+            .filter(|proposal| proposal.in_region(region))
+    }
+
+    /// The proposal `proposal_id` names, to write, as a request addressed to `region` sees
+    /// it.
+    pub fn proposal_mut(
+        &mut self,
+        region: &str,
+        proposal_id: &str,
+    ) -> Option<&mut StoredProposal> {
+        self.proposals
+            .get_mut(proposal_id)
+            .filter(|proposal| proposal.in_region(region))
+    }
+
+    /// This network's proposals that belong to `region`, in the id order the listings take.
+    pub fn proposals_in<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a StoredProposal> + 'a {
+        self.proposals
+            .values()
+            .filter(move |proposal| proposal.in_region(region))
+    }
+
+    /// Whether the current account participates in this network through `region`, which is
+    /// what `ListNetworks` reports ("the networks in which the current Amazon Web Services
     /// account participates").
     ///
-    /// Every network the account created counts; one of AWS's standing public networks
-    /// counts only once the account holds a member or a node on it, because until then
-    /// the account merely *can read* it.
-    pub fn account_participates(&self) -> bool {
-        !self.aws_owned || !self.members.is_empty() || !self.nodes.is_empty()
+    /// Every network the account created counts (it is reported only in its own Region, so
+    /// a network reached here at all is one of that Region's); one of AWS's standing public
+    /// networks counts only once the account holds a member or a node on it IN that Region,
+    /// because until then the account merely *can read* it there.
+    pub fn account_participates(&self, region: &str) -> bool {
+        !self.aws_owned
+            || self.members_in(region).next().is_some()
+            || self.nodes_in(region).next().is_some()
     }
 
     /// The modelled `NetworkFrameworkAttributes` for this record: the framework's own
@@ -640,6 +737,13 @@ pub struct StoredMember {
 }
 
 impl StoredMember {
+    /// Whether a request addressed to `region` reaches this member: a member belongs to
+    /// the Region the call that created it was signed for, which is the Region its stored
+    /// ARN names.
+    pub fn in_region(&self, region: &str) -> bool {
+        arn_in_region(&self.arn, region)
+    }
+
     /// The modelled `Member` for this record, as `GetMember` returns it.
     pub fn to_member(&self) -> Member {
         Member {
@@ -777,6 +881,12 @@ pub struct StoredNode {
 }
 
 impl StoredNode {
+    /// Whether a request addressed to `region` reaches this node: a node belongs to the
+    /// Region its `CreateNode` was signed for, which is the Region its stored ARN names.
+    pub fn in_region(&self, region: &str) -> bool {
+        arn_in_region(&self.arn, region)
+    }
+
     /// The modelled `NodeFrameworkAttributes` for this record: the attributes of the
     /// framework whose endpoints it was minted with, and nothing for the other.
     fn to_framework_attributes(&self) -> NodeFrameworkAttributes {
@@ -865,6 +975,13 @@ pub struct StoredProposal {
 }
 
 impl StoredProposal {
+    /// Whether a request addressed to `region` reaches this proposal: a proposal belongs to
+    /// the Region its `CreateProposal` was signed for, which is the Region its stored ARN
+    /// names.
+    pub fn in_region(&self, region: &str) -> bool {
+        arn_in_region(&self.arn, region)
+    }
+
     /// Materialise the expiry the clock already owes this proposal.
     ///
     /// Like [`StoredNetwork::settle`] this is the only write a reporting operation makes:
@@ -997,6 +1114,13 @@ pub struct StoredAccessor {
 }
 
 impl StoredAccessor {
+    /// Whether a request addressed to `region` reaches this accessor: an accessor belongs
+    /// to the Region its `CreateAccessor` was signed for, which is the Region its stored
+    /// ARN names.
+    pub fn in_region(&self, region: &str) -> bool {
+        arn_in_region(&self.arn, region)
+    }
+
     /// Start this accessor's deletion, as `DeleteAccessor` does: "the status of the
     /// accessor changes from AVAILABLE to PENDING_DELETION", and `DELETED` falls due
     /// [`ACCESSOR_DELETION_SPAN`] later.
@@ -1085,6 +1209,13 @@ pub struct StoredInvitation {
 }
 
 impl StoredInvitation {
+    /// Whether a request addressed to `region` reaches this invitation: an invitation is
+    /// recorded in the Region the approved proposal that minted it was voted in, which is
+    /// the Region its stored ARN names.
+    pub fn in_region(&self, region: &str) -> bool {
+        arn_in_region(&self.arn, region)
+    }
+
     /// The modelled `Invitation` for this record, as `ListInvitations` returns it.
     ///
     /// `network` is the stored network this invitation is onto, which the caller looks up
@@ -1224,6 +1355,108 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         for accessor in self.accessors.values_mut() {
             accessor.settle(now);
         }
+    }
+
+    /// The network `network_id` names, as a request addressed to `region` sees it.
+    ///
+    /// This is the ONE door every id-addressed read of a network goes through, so no
+    /// operation can answer from a network of another Region: Managed Blockchain is
+    /// regional, and a network created through one Region's endpoint does not exist at
+    /// another's. `None` is therefore the same answer as a network that was never created
+    /// — the modelled `ResourceNotFoundException`.
+    pub fn network(&self, region: &str, network_id: &str) -> Option<&StoredNetwork> {
+        self.networks
+            .get(network_id)
+            .filter(|network| network.in_region(region))
+    }
+
+    /// The network `network_id` names, to write, as a request addressed to `region` sees
+    /// it: the write counterpart of [`Self::network`], so a mutation cannot reach another
+    /// Region's network either.
+    pub fn network_mut(&mut self, region: &str, network_id: &str) -> Option<&mut StoredNetwork> {
+        self.networks
+            .get_mut(network_id)
+            .filter(|network| network.in_region(region))
+    }
+
+    /// The networks a request addressed to `region` sees, in the id order the listings
+    /// take.
+    pub fn networks_in<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a StoredNetwork> + 'a {
+        self.networks
+            .values()
+            .filter(move |network| network.in_region(region))
+    }
+
+    /// Drop the network `network_id` names in `region`, answering whether it was there to
+    /// drop: a network of another Region is not this request's to delete.
+    pub fn remove_network(&mut self, region: &str, network_id: &str) -> bool {
+        if self.network(region, network_id).is_none() {
+            return false;
+        }
+        self.networks.remove(network_id).is_some()
+    }
+
+    /// The accessor `accessor_id` names, as a request addressed to `region` sees it.
+    pub fn accessor(&self, region: &str, accessor_id: &str) -> Option<&StoredAccessor> {
+        self.accessors
+            .get(accessor_id)
+            .filter(|accessor| accessor.in_region(region))
+    }
+
+    /// The accessor `accessor_id` names, to write, as a request addressed to `region` sees
+    /// it.
+    pub fn accessor_mut(
+        &mut self,
+        region: &str,
+        accessor_id: &str,
+    ) -> Option<&mut StoredAccessor> {
+        self.accessors
+            .get_mut(accessor_id)
+            .filter(|accessor| accessor.in_region(region))
+    }
+
+    /// The accessors a request addressed to `region` sees, in the id order the listings
+    /// take.
+    pub fn accessors_in<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a StoredAccessor> + 'a {
+        self.accessors
+            .values()
+            .filter(move |accessor| accessor.in_region(region))
+    }
+
+    /// The invitation `invitation_id` names, as a request addressed to `region` sees it.
+    pub fn invitation(&self, region: &str, invitation_id: &str) -> Option<&StoredInvitation> {
+        self.invitations
+            .get(invitation_id)
+            .filter(|invitation| invitation.in_region(region))
+    }
+
+    /// The invitation `invitation_id` names, to write, as a request addressed to `region`
+    /// sees it.
+    pub fn invitation_mut(
+        &mut self,
+        region: &str,
+        invitation_id: &str,
+    ) -> Option<&mut StoredInvitation> {
+        self.invitations
+            .get_mut(invitation_id)
+            .filter(|invitation| invitation.in_region(region))
+    }
+
+    /// The invitations a request addressed to `region` sees, in the id order the listings
+    /// take.
+    pub fn invitations_in<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a StoredInvitation> + 'a {
+        self.invitations
+            .values()
+            .filter(move |invitation| invitation.in_region(region))
     }
 
     /// The tags held by the resource `arn` names, or `None` when no stored resource
@@ -1509,9 +1742,10 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
     /// `ApprovalThresholdPolicy$ProposalDurationInHours` (defaulting to
     /// [`DEFAULT_PROPOSAL_DURATION_IN_HOURS`]), as `Invitation$ExpirationDate` documents.
     ///
-    /// Answers the minted invitation id, or `None` when `network_id` names no stored
-    /// network (there is nothing to be invited onto) or the store is already holding
-    /// [`MAX_INVITATIONS`] records.
+    /// Answers the minted invitation id, or `None` when `network_id` names no network of
+    /// `region` (there is nothing to be invited onto) or the store is already holding
+    /// [`MAX_INVITATIONS`] records. The invitation is recorded in the Region of the vote
+    /// that approved it, and `ListInvitations` reports it only there.
     pub fn record_invitation(
         &mut self,
         network_id: &str,
@@ -1523,8 +1757,7 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
             return None;
         }
         let duration = self
-            .networks
-            .get(network_id)?
+            .network(region, network_id)?
             .voting_policy
             .as_ref()
             .and_then(proposal_duration)
@@ -1580,7 +1813,7 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
             }
         }
         for removal in actions.removals.iter().flatten() {
-            if !self.remove_member(network_id, &removal.member_id) {
+            if !self.remove_member(region, network_id, &removal.member_id) {
                 carried_out = false;
             }
         }
@@ -1593,11 +1826,15 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
     /// [`Self::forget_node_token`] is called when a node is deleted outright).
     ///
     /// Answers whether the member was there to remove: `false` when the network or the
-    /// member names nothing stored, which is an action that could not be carried out.
-    pub fn remove_member(&mut self, network_id: &str, member_id: &str) -> bool {
-        let Some(network) = self.networks.get_mut(network_id) else {
+    /// member names nothing a request addressed to `region` reaches, which is an action
+    /// that could not be carried out.
+    pub fn remove_member(&mut self, region: &str, network_id: &str, member_id: &str) -> bool {
+        let Some(network) = self.network_mut(region, network_id) else {
             return false;
         };
+        if network.member(region, member_id).is_none() {
+            return false;
+        }
         if network.members.remove(member_id).is_none() {
             return false;
         }
@@ -2289,6 +2526,24 @@ pub fn default_state_db() -> String {
 /// or `None` when the string carries no non-empty one.
 fn arn_account_id(arn: &str) -> Option<&str> {
     arn.split(':').nth(4).filter(|account| !account.is_empty())
+}
+
+/// The Region segment of an ARN (`arn:<partition>:<service>:<region>:<account>:<rest>`),
+/// or `None` when the string carries no non-empty one.
+fn arn_region(arn: &str) -> Option<&str> {
+    arn.split(':').nth(3).filter(|region| !region.is_empty())
+}
+
+/// Whether `arn` names a resource of `region`.
+///
+/// Every record this store holds carries the ARN its create minted for the Region that
+/// create was signed for, and that ARN is this emulator's record of WHERE the resource
+/// lives — so the Region a request addresses is compared against it, exactly as
+/// [`arn_account_id`] reads which account holds a record. A resource of another Region is
+/// therefore as good as absent, which is the answer the tag plane already gives for an ARN
+/// of another Region.
+pub fn arn_in_region(arn: &str, region: &str) -> bool {
+    arn_region(arn) == Some(region)
 }
 
 /// A stored tag map as the modelled `OutputTagMap`.

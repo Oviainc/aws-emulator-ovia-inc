@@ -42,7 +42,8 @@ use crate::ops::types::{
     GatewayCapabilitySummary, GatewayPlatform, ImageLocation, LoggingOptions, Mount,
     MountOverrides, PipelineExecutionStatus, PortalStatus, PortalTypeEntry, ProcessingInput,
     PropertyType, ResourceStatus, TaskConfiguration, TimeInNanos, TrimSettings, Variant,
-    WorkspaceEncryptionConfiguration, WorkspaceStatus,
+    WorkspaceEncryptionConfiguration, WorkspaceEncryptionConfigurationInfo, WorkspaceStatus,
+    ENCRYPTION_TYPE_VALUES,
 };
 
 /// The `iotsitewise` ARN service namespace, as `OPERATIONS.md` reports it.
@@ -73,6 +74,11 @@ pub const STATE_ACTIVE: &str = "ACTIVE";
 pub const STATE_UPDATING: &str = "UPDATING";
 /// `AssetState`/`AssetModelState` value a deleted resource's last answer carries.
 pub const STATE_DELETING: &str = "DELETING";
+/// The state value a resource whose provisioning did not complete reports. This
+/// emulator settles every owed transition, so nothing it holds reaches this
+/// state; the operations whose rules are stated in terms of it still have to
+/// recognise it (`UpdateWorkspace` may be called on a workspace in it).
+pub const STATE_FAILED: &str = "FAILED";
 
 /// The `LoggingLevel` a scope reports until a `PutLoggingOptions` sets one.
 ///
@@ -208,6 +214,9 @@ pub const GATEWAY_RESOURCE_TYPE: &str = "gateway";
 pub const PORTAL_RESOURCE_TYPE: &str = "portal";
 /// The ARN resource-type segment of a pipeline ARN, as [`pipeline_arn`] builds it.
 pub const PIPELINE_RESOURCE_TYPE: &str = "pipeline";
+
+/// The ARN service namespace a workspace's customer managed key lives under.
+pub const KMS_ARN_SERVICE: &str = "kms";
 
 /// How many pipelines one workspace holds.
 ///
@@ -970,6 +979,14 @@ pub struct WorkspaceRecord {
     /// one, so a retry of that same create replays its answer rather than
     /// colliding with the workspace it already made.
     pub client_token: Option<String>,
+    /// The `clientToken` of the last accepted UPDATE, for the same reason: a
+    /// retry carrying it "succeeds without performing any further actions".
+    ///
+    /// Only the LAST one is kept, so a retry of an update another accepted
+    /// update has since superseded is treated as a fresh request. The retry a
+    /// client actually makes is of its most recent call, which is the one this
+    /// recognises.
+    pub update_token: Option<String>,
     pub tags: HashMap<String, String>,
 }
 
@@ -987,6 +1004,29 @@ impl WorkspaceRecord {
             state: self.state(now).to_string(),
             error: None,
         }
+    }
+
+    /// Record that an accepted update landed at `now`: the members it leaves the
+    /// workspace with replace what it held, and the workspace reports `UPDATING`
+    /// until the transition this call owes falls due.
+    ///
+    /// Every member is passed in resolved, so the caller is the one place that
+    /// decides what an omitted member keeps. The due instant is STORED, never
+    /// slept on, so the caller's own call returns immediately and the transient
+    /// state is still what a read taken straight afterwards observes.
+    pub fn record_update(
+        &mut self,
+        description: Option<String>,
+        encryption: WorkspaceEncryptionConfiguration,
+        client_token: Option<String>,
+        now: SystemTime,
+    ) {
+        self.description = description;
+        self.encryption = encryption;
+        self.update_token = client_token;
+        self.last_update_date = now;
+        self.settling_state = STATE_UPDATING.to_string();
+        self.active_at = now + ACTIVATION_DELAY;
     }
 }
 
@@ -1684,6 +1724,85 @@ pub fn task_arn(region: &str, workspace_name: &str, task_name: &str) -> String {
         region,
         &format!("{TASK_RESOURCE_TYPE}/{workspace_name}/{task_name}"),
     )
+}
+
+/// The `kmsKeyArn` a workspace reports for the `kmsKeyId` it was given.
+///
+/// `kmsKeyId` "Accepts a key ID, key ARN, or key alias" while the read form
+/// reports an ARN, so the three forms are normalised to one here: an ARN is
+/// reported as it was supplied, and a bare key id or an `alias/<name>` becomes
+/// the ARN of that same key in the request's region and this account. The id is
+/// NOT resolved through KMS — this service holds no key registry — so an alias is
+/// reported as the alias's own ARN rather than as the ARN of the key behind it.
+pub fn kms_key_arn(region: &str, kms_key_id: &str) -> String {
+    if kms_key_id.starts_with("arn:") {
+        return kms_key_id.to_string();
+    }
+    let resource = if kms_key_id.starts_with("alias/") {
+        kms_key_id.to_string()
+    } else {
+        format!("key/{kms_key_id}")
+    };
+    ::engine::emulator_arn(KMS_ARN_SERVICE, region, &resource)
+}
+
+/// The encryption configuration a read reports for `workspace`: the stored
+/// `EncryptionType`, and the ARN of the key the create named.
+///
+/// Derived from the stored record alone — the region comes from the workspace's
+/// own ARN rather than from the calling request — so every read of one workspace
+/// reports the same value.
+pub fn workspace_encryption_info(
+    workspace: &WorkspaceRecord,
+) -> WorkspaceEncryptionConfigurationInfo {
+    WorkspaceEncryptionConfigurationInfo {
+        encryption_type: workspace.encryption.encryption_type.clone(),
+        kms_key_arn: workspace
+            .encryption
+            .kms_key_id
+            .as_deref()
+            .map(|kms_key_id| kms_key_arn(arn_region(&workspace.arn), kms_key_id)),
+    }
+}
+
+/// The region section of an ARN this service minted, or [`DEFAULT_REGION`] for a
+/// string that is not one.
+fn arn_region(arn: &str) -> &str {
+    // `arn:<partition>:<service>:<region>:<account>:<resource>`.
+    arn.split(':').nth(3).unwrap_or(DEFAULT_REGION)
+}
+
+/// Refuse a workspace encryption configuration this service cannot accept, in the
+/// wording the refusal carries; `Ok` for one it can.
+///
+/// The rules the shape states, in ONE place because the create and the update
+/// both supply it: `encryptionType` is an `EncryptionType`, and `kmsKeyId` is
+/// "Required for KMS_BASED_ENCRYPTION; must be omitted for
+/// SITEWISE_DEFAULT_ENCRYPTION". The value set is the generated, model-synced
+/// `ENCRYPTION_TYPE_VALUES`, the way `PutLoggingOptions` reads its own enum's.
+pub fn check_workspace_encryption(
+    configuration: &WorkspaceEncryptionConfiguration,
+) -> Result<(), String> {
+    let encryption_type = configuration.encryption_type.as_str();
+    if !ENCRYPTION_TYPE_VALUES.contains(&encryption_type) {
+        return Err(format!(
+            "The encryptionType {encryption_type} is not supported; it must be one of {}.",
+            ENCRYPTION_TYPE_VALUES.join(" | ")
+        ));
+    }
+    match (
+        encryption_type == ENCRYPTION_TYPE_KMS_BASED,
+        configuration.kms_key_id.is_some(),
+    ) {
+        (true, false) => Err(format!(
+            "A kmsKeyId is required when encryptionType is {ENCRYPTION_TYPE_KMS_BASED}."
+        )),
+        (false, true) => Err(format!(
+            "A kmsKeyId must be omitted when encryptionType is \
+             {ENCRYPTION_TYPE_SITEWISE_DEFAULT}."
+        )),
+        _ => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------

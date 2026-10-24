@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AuthorizeSecurityGroupEgress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AuthorizeSecurityGroupEgress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: adds the outbound rules the request's `IpPermissions` describe to the
+//! security group it names — one rule per destination a permission grants — stores each of
+//! them through [`crate::state::ComAmazonawsEc2Amazonec2State::insert_security_group_rules`],
+//! which mints the `SecurityGroupRuleId` and recomputes the group's `IpPermissionsEgress`
+//! that `DescribeSecurityGroups` reports, and answers the rules it added.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AuthorizeSecurityGroupEgress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +154,662 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AuthorizeSecurityGroupEgress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AuthorizeSecurityGroupEgressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AuthorizeSecurityGroupEgress"))
+        use crate::state;
+
+        // "The ID of the security group" (`$GroupId`) is the one member this operation
+        // requires. It is modelled `clientOptional`, so an empty value reaches this handler
+        // and has to be refused here.
+        let group_id = input.group_id.clone();
+        if group_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter groupId",
+            ));
+        }
+
+        // "Not supported. Use IP permissions instead" (`$CidrIp`, `$IpProtocol`,
+        // `$FromPort`, `$ToPort`, `$SourceSecurityGroupName`,
+        // `$SourceSecurityGroupOwnerId`): these members describe one EC2-Classic rule, and
+        // an outbound rule is described by `IpPermissions` only. Refused rather than
+        // silently dropped — a caller that sent one asked for a rule that would not be
+        // created.
+        let unsupported: [(&str, bool); 6] = [
+            ("cidrIp", input.cidr_ip.is_some()),
+            ("ipProtocol", input.ip_protocol.is_some()),
+            ("fromPort", input.from_port.is_some()),
+            ("toPort", input.to_port.is_some()),
+            (
+                "sourceSecurityGroupName",
+                input.source_security_group_name.is_some(),
+            ),
+            (
+                "sourceSecurityGroupOwnerId",
+                input.source_security_group_owner_id.is_some(),
+            ),
+        ];
+        if let Some((member, _)) = unsupported.iter().find(|(_, given)| *given) {
+            return Err(state::invalid_parameter_value(format!(
+                "The parameter {member} is not supported for this operation. \
+                 Use ipPermissions instead"
+            )));
+        }
+
+        // "The permissions for the security group rules" (`$IpPermissions`): the only
+        // description of an outbound rule this operation takes, so a request carrying none
+        // describes no rule to add.
+        let permissions = input.ip_permissions.clone().unwrap_or_default();
+        if permissions.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter ipPermissions",
+            ));
+        }
+
+        // "The tags applied to the security group rule" (`$TagSpecifications`) — the shared
+        // reader refuses a specification naming any other resource type and holds the tag
+        // payload to the documented bounds, so one rule has one implementation. Every rule
+        // this call adds carries them, the way the specification applies to the resources
+        // the call creates.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_SECURITY_GROUP_RULE,
+            Self::NAME,
+        )?;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let region = state::request_region(ctx.parts());
+        let mut store = state_handle.lock();
+
+        // A value that is not a security group id names no group in ANY account, so it is
+        // refused as malformed before the store is asked about it — the same ordering a
+        // referenced group's id is read in below.
+        if !state::security_group_id_is_well_formed(&group_id) {
+            return Err(state::invalid_group_id_malformed(&group_id));
+        }
+
+        // A group id this account holds no group for has no rules to add to.
+        let Some(group) = store.security_groups.get(&group_id) else {
+            return Err(state::invalid_group_not_found(&group_id));
+        };
+        let vpc_id = group.vpc_id.clone().unwrap_or_default();
+
+        // Every permission is read into the form it will be STORED in before anything is
+        // written: its protocol folded to the one spelling a protocol has, its CIDRs
+        // canonicalised, and a referenced group named only by name resolved to that group's
+        // id. A request that describes one rule it may not have is refused with nothing
+        // stored, however many of its other rules were fine.
+        let mut prepared: Vec<IpPermission> = Vec::with_capacity(permissions.len());
+        for (index, permission) in permissions.iter().enumerate() {
+            let position = index + 1;
+            let protocol = validated_protocol(permission, position)?;
+            validate_port_range(protocol, position, permission.from_port, permission.to_port)?;
+            prepared.push(prepared_permission(
+                &store, &vpc_id, permission, protocol, position,
+            )?);
+        }
+
+        // How many rules the request asks for is how many destinations it names, and that is
+        // bounded HERE, before any work proportional to it: "inbound or outbound rules per
+        // security group" is a published quota per side, so a request that would take the
+        // group past it is refused before a rule is stored for any of them. Asked about
+        // every rule of the request at once, so the writer below cannot refuse one of them
+        // after its predecessors were stored.
+        let requested: usize = prepared.iter().map(state::ip_permission_grant_count).sum();
+        if !store.has_security_group_rule_capacity(&group_id, true, requested) {
+            return Err(state::rules_per_security_group_limit_exceeded());
+        }
+
+        // "The specified rule already exists for that security group"
+        // (`InvalidPermission.Duplicate`): against the rules the group already holds on THIS
+        // side, and against the earlier rules of this same request, since one call cannot
+        // add the same rule twice either. Both scans are over at most the quota's worth of
+        // rules.
+        let held: Vec<SecurityGroupRule> = store
+            .security_group_rules
+            .values()
+            .filter(|record| {
+                record.rule.group_id.as_deref() == Some(group_id.as_str())
+                    && record.rule.is_egress == Some(true)
+            })
+            .map(|record| record.rule.clone())
+            .collect();
+        let grants: Vec<Grant> = prepared
+            .iter()
+            .enumerate()
+            .flat_map(|(index, permission)| grants_of(permission, index + 1))
+            .collect();
+        for (index, grant) in grants.iter().enumerate() {
+            if let Some(existing) = held.iter().find(|rule| grant.is_rule(rule)) {
+                return Err(state::invalid_permission_duplicate(
+                    existing
+                        .security_group_rule_id
+                        .as_deref()
+                        .unwrap_or_default(),
+                ));
+            }
+            if grants[..index].iter().any(|earlier| earlier.is_same(grant)) {
+                return Err(state::invalid_permission_duplicate_in_request(
+                    grant.position,
+                ));
+            }
+        }
+
+        // A rule count on its own admits unbounded bytes, because each rule holds a
+        // description, tags and a destination the caller chose the length of. Charged with
+        // the SAME function the stored record is charged with
+        // ([`state::security_group_rules_charge`], over the rules the store says these
+        // permissions describe), over every rule of the request at once: a request that
+        // would pass the budget is refused here with nothing stored, rather than part-way
+        // through the write below.
+        let payload_bytes = state::security_group_rules_charge(&prepared, &tags);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // `insert_security_group_rules` expands one permission into one rule per destination
+        // it grants, derives the rule id, its ARN and the owning account itself, and
+        // recomputes the group's `IpPermissionsEgress` — so this handler never invents an id
+        // and `DescribeSecurityGroups` cannot disagree with the rules answered here. The
+        // bounds it enforces were asked about EVERY rule of this request above, through the
+        // store's own functions, so it mints a rule for every grant; asserted rather than
+        // refused here, because a refusal at this point would answer an error with the
+        // earlier permissions of the same request already stored — the partially applied
+        // authorize the pre-check exists to prevent.
+        let mut rules: Vec<SecurityGroupRule> = Vec::with_capacity(requested);
+        for permission in &prepared {
+            let minted =
+                store.insert_security_group_rules(&group_id, true, permission, &tags, true, &region);
+            debug_assert_eq!(
+                minted.len(),
+                state::ip_permission_grant_count(permission),
+                "every grant of an authorised permission mints a rule"
+            );
+            for rule_id in minted {
+                if let Some(record) = store.security_group_rules.get(&rule_id) {
+                    rules.push(record.rule.clone());
+                }
+            }
+        }
+
+        // "Returns true if the request succeeds; otherwise, returns an error" (`$Return`),
+        // beside "information about the outbound (egress) security group rules that were
+        // added" — the records as they were stored.
+        Ok(AuthorizeSecurityGroupEgressOutput {
+            r#return: Some(true),
+            security_group_rules: Some(rules),
+        })
     }
+}
+
+/// The largest IANA protocol number a rule may name: protocol numbers are a single byte
+/// (`IpPermission$IpProtocol`, "or number (see Protocol Numbers)").
+const MAX_PROTOCOL_NUMBER: i32 = 255;
+
+/// The statuses a referenced group's `PeeringStatus` may name: "the status of a VPC peering
+/// connection, if applicable" (`UserIdGroupPair$PeeringStatus`), which is the model's
+/// `VpcPeeringConnectionStateReasonCode` vocabulary — named through the generated constant,
+/// so this validation cannot drift from the model.
+const PEERING_STATUSES: &[&str] = VPC_PEERING_CONNECTION_STATE_REASON_CODE_VALUES;
+
+/// The one destination a rule names: "you must specify exactly one of the following
+/// destinations: an IPv4 or IPv6 address range, a prefix list, or a security group"
+/// (`AuthorizeSecurityGroupEgress`) — a statement about one RULE, which is why a permission
+/// naming three of them describes three rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Destination {
+    /// An IPv4 CIDR range, canonicalised.
+    Ipv4(String),
+    /// An IPv6 CIDR range, canonicalised.
+    Ipv6(String),
+    /// A prefix list, by id.
+    PrefixList(String),
+    /// Another security group, by the id a rule references it by.
+    Group(String),
+}
+
+/// One rule the request describes, as what makes two rules ONE rule: the protocol, the port
+/// range and the one destination. The description and the tags are NOT part of that
+/// identity — AWS refuses a second rule for a destination already allowed whatever text
+/// accompanies it.
+#[derive(Debug, Clone)]
+struct Grant {
+    /// Which `ipPermissions` entry described it, 1-based, so a refusal can name it.
+    position: usize,
+    /// The protocol the rule allows, in the form it will be stored in.
+    protocol: Option<String>,
+    /// The start of the port range, or the ICMP type.
+    from_port: Option<i32>,
+    /// The end of the port range, or the ICMP code.
+    to_port: Option<i32>,
+    /// The one destination the rule allows traffic to.
+    destination: Destination,
+}
+
+impl Grant {
+    /// Whether `rule`, a rule the group already holds, IS this rule.
+    fn is_rule(&self, rule: &SecurityGroupRule) -> bool {
+        rule.ip_protocol == self.protocol
+            && rule.from_port == self.from_port
+            && rule.to_port == self.to_port
+            && match &self.destination {
+                Destination::Ipv4(cidr) => rule.cidr_ipv4.as_deref() == Some(cidr.as_str()),
+                Destination::Ipv6(cidr) => rule.cidr_ipv6.as_deref() == Some(cidr.as_str()),
+                Destination::PrefixList(id) => rule.prefix_list_id.as_deref() == Some(id.as_str()),
+                Destination::Group(id) => rule
+                    .referenced_group_info
+                    .as_ref()
+                    .and_then(|referenced| referenced.group_id.as_deref())
+                    == Some(id.as_str()),
+            }
+    }
+
+    /// Whether `other` describes the same rule — [`Self::is_rule`]'s question asked of two
+    /// rules neither of which is stored yet, so a request that names one of them twice can
+    /// be told.
+    fn is_same(&self, other: &Self) -> bool {
+        self.protocol == other.protocol
+            && self.from_port == other.from_port
+            && self.to_port == other.to_port
+            && self.destination == other.destination
+    }
+}
+
+/// The rules one PREPARED permission describes, one per destination it grants.
+fn grants_of(permission: &IpPermission, position: usize) -> Vec<Grant> {
+    let grant = |destination: Destination| Grant {
+        position,
+        protocol: permission.ip_protocol.clone(),
+        from_port: permission.from_port,
+        to_port: permission.to_port,
+        destination,
+    };
+    let ipv4 = permission
+        .ip_ranges
+        .iter()
+        .flatten()
+        .map(|range| grant(Destination::Ipv4(text(&range.cidr_ip))));
+    let ipv6 = permission
+        .ipv6_ranges
+        .iter()
+        .flatten()
+        .map(|range| grant(Destination::Ipv6(text(&range.cidr_ipv6))));
+    let prefix_lists = permission
+        .prefix_list_ids
+        .iter()
+        .flatten()
+        .map(|entry| grant(Destination::PrefixList(text(&entry.prefix_list_id))));
+    let groups = permission
+        .user_id_group_pairs
+        .iter()
+        .flatten()
+        .map(|pair| grant(Destination::Group(text(&pair.group_id))));
+    ipv4.chain(ipv6).chain(prefix_lists).chain(groups).collect()
+}
+
+/// An optional string as the value it carries, or the empty one.
+fn text(value: &Option<String>) -> String {
+    value.clone().unwrap_or_default()
+}
+
+/// The protocol `permission` names, refused when it names none or names one no rule may
+/// carry.
+///
+/// "The IP protocol name (`tcp`, `udp`, `icmp`, `icmpv6`) or number (see Protocol Numbers).
+/// Use `-1` to specify all protocols" (`IpPermission$IpProtocol`) — so a protocol is one of
+/// those four names, a number a single byte holds, or `-1`.
+fn validated_protocol(
+    permission: &IpPermission,
+    position: usize,
+) -> Result<&str, AuthorizeSecurityGroupEgressError> {
+    use crate::state;
+
+    let protocol = permission
+        .ip_protocol
+        .as_deref()
+        .filter(|protocol| !protocol.is_empty())
+        .ok_or_else(|| {
+            state::missing_parameter(format!(
+                "The request must contain the parameter ipPermissions.{position}.ipProtocol"
+            ))
+        })?;
+    if !protocol_is_known(protocol) {
+        return Err(state::invalid_parameter_value(format!(
+            "Invalid IP protocol '{protocol}' for ipPermissions.{position}: use a protocol \
+             name ({tcp}, {udp}, {icmp}, {icmpv6}), a protocol number between 0 and {max}, \
+             or {all} for all protocols",
+            tcp = state::IP_PROTOCOL_TCP,
+            udp = state::IP_PROTOCOL_UDP,
+            icmp = state::IP_PROTOCOL_ICMP,
+            icmpv6 = state::IP_PROTOCOL_ICMPV6,
+            max = MAX_PROTOCOL_NUMBER,
+            all = state::ALL_IP_PROTOCOLS,
+        )));
+    }
+    Ok(protocol)
+}
+
+/// Whether `protocol` is a protocol a rule may name: one of the four names the model
+/// lists, a protocol number, or `-1` for every protocol (`IpPermission$IpProtocol`).
+fn protocol_is_known(protocol: &str) -> bool {
+    if protocol == crate::state::ALL_IP_PROTOCOLS {
+        return true;
+    }
+    if [
+        crate::state::IP_PROTOCOL_TCP,
+        crate::state::IP_PROTOCOL_UDP,
+        crate::state::IP_PROTOCOL_ICMP,
+        crate::state::IP_PROTOCOL_ICMPV6,
+    ]
+    .iter()
+    .any(|named| protocol.eq_ignore_ascii_case(named))
+    {
+        return true;
+    }
+    protocol
+        .parse::<i32>()
+        .is_ok_and(|number| (0..=MAX_PROTOCOL_NUMBER).contains(&number))
+}
+
+/// Hold one permission's port range to what the model says the protocol admits.
+///
+/// "For `tcp`, `udp`, and `icmp`, you must specify a port range. For `icmpv6`, the port
+/// range is optional", and "specifying `-1` or a protocol number other than `tcp`, `udp`,
+/// `icmp`, or `icmpv6` allows traffic on all ports, regardless of any port range you
+/// specify" (`IpPermission$IpProtocol`) — so a port range is required only for the first
+/// three, and a range that IS given has to be a range: for ICMP a type and a code, where
+/// "if the start port is -1 (all ICMP types), then the end port must be -1 (all ICMP
+/// codes)" (`IpPermission$ToPort`), and for everything else a pair of port numbers in
+/// order.
+fn validate_port_range(
+    protocol: &str,
+    position: usize,
+    from_port: Option<i32>,
+    to_port: Option<i32>,
+) -> Result<(), AuthorizeSecurityGroupEgressError> {
+    use crate::state;
+
+    if state::protocol_requires_port_range(protocol) && (from_port.is_none() || to_port.is_none())
+    {
+        return Err(state::invalid_parameter_value(format!(
+            "ipPermissions.{position} must specify both fromPort and toPort for protocol \
+             '{protocol}'"
+        )));
+    }
+    let (Some(from_port), Some(to_port)) = (from_port, to_port) else {
+        // One end without the other is a half-described range on a protocol that needs
+        // none; neither end is a range at all, which is the shape of an all-ports rule.
+        return match (from_port, to_port) {
+            (None, None) => Ok(()),
+            _ => Err(state::invalid_permission_malformed(format!(
+                "ipPermissions.{position} carries one end of a port range: fromPort and \
+                 toPort are given together or not at all"
+            ))),
+        };
+    };
+    let highest = if state::protocol_is_icmp(protocol) {
+        state::MAX_ICMP_TYPE
+    } else {
+        state::MAX_PORT
+    };
+    for (member, value) in [("fromPort", from_port), ("toPort", to_port)] {
+        if value != state::ALL_PORTS && !(0..=highest).contains(&value) {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{value}' for ipPermissions.{position}.{member}: it must be \
+                 between 0 and {highest}, or {all} for all values",
+                all = state::ALL_PORTS,
+            )));
+        }
+    }
+    if from_port == state::ALL_PORTS && to_port != state::ALL_PORTS {
+        return Err(state::invalid_permission_malformed(format!(
+            "ipPermissions.{position} starts at {all} (all values), so toPort must be \
+             {all} too",
+            all = state::ALL_PORTS,
+        )));
+    }
+    if from_port != state::ALL_PORTS
+        && to_port != state::ALL_PORTS
+        && from_port > to_port
+        // For ICMP the two members are a TYPE and a CODE rather than the ends of a range
+        // ("this is the ICMP type", "this is the ICMP code" — `IpPermission$FromPort` and
+        // `$ToPort`), so there is no order between them to hold.
+        && !state::protocol_is_icmp(protocol)
+    {
+        return Err(state::invalid_permission_malformed(format!(
+            "ipPermissions.{position} ends at {to_port}, before it starts at {from_port}"
+        )));
+    }
+    Ok(())
+}
+
+/// Hold a rule's description to the bounds the model publishes for one.
+///
+/// "Constraints: Up to 255 characters in length. Allowed characters are a-z, A-Z, 0-9,
+/// spaces, and ._-:/()#,@[]+=&;{}!$*" (`IpRange$Description`, and the same sentence on
+/// `Ipv6Range`, `PrefixListId` and `UserIdGroupPair`) — the same bound and alphabet a
+/// group's own name and description carry, so one reader serves both.
+fn validate_rule_description(
+    description: Option<&String>,
+) -> Result<(), AuthorizeSecurityGroupEgressError> {
+    use crate::state;
+
+    let Some(description) = description else {
+        return Ok(());
+    };
+    if description.chars().count() > state::MAX_SECURITY_GROUP_TEXT_CHARS {
+        return Err(state::invalid_parameter_value(format!(
+            "Value ({description}) for parameter description is invalid. \
+             A security group rule description accepts at most {max} characters",
+            max = state::MAX_SECURITY_GROUP_TEXT_CHARS,
+        )));
+    }
+    if !state::is_security_group_text(description) {
+        return Err(state::invalid_parameter_value(format!(
+            "Value ({description}) for parameter description is invalid. \
+             Valid characters: a-z, A-Z, 0-9, spaces, and {punctuation}",
+            punctuation = state::SECURITY_GROUP_PUNCTUATION,
+        )));
+    }
+    Ok(())
+}
+
+/// `permission` in the form the rules it grants are STORED in, every member of it validated
+/// as the member it came from documents.
+///
+/// A CIDR range is canonicalised here — "Amazon Web Services canonicalizes IPv4 and IPv6
+/// CIDRs … any subsequent DescribeSecurityGroups and DescribeSecurityGroupRules calls will
+/// return the canonicalized form" — so the rule is stored and reported in the form AWS
+/// stores it in, and a second rule for the same block is the duplicate AWS calls it. A
+/// referenced group named only by NAME is resolved to its id inside the authorizing group's
+/// VPC, because "names are case-insensitive and must be unique within the VPC" and so name
+/// no group outside it, and because a rule references a group by id.
+fn prepared_permission(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    vpc_id: &str,
+    permission: &IpPermission,
+    protocol: &str,
+    position: usize,
+) -> Result<IpPermission, AuthorizeSecurityGroupEgressError> {
+    use crate::state;
+
+    let mut ip_ranges: Vec<IpRange> = Vec::new();
+    for range in permission.ip_ranges.iter().flatten() {
+        validate_rule_description(range.description.as_ref())?;
+        let cidr = range.cidr_ip.as_deref().unwrap_or_default();
+        let canonical = state::canonical_security_group_cidr(cidr).map_err(|_| {
+            state::invalid_parameter_value(format!(
+                "CIDR block '{cidr}' of ipPermissions.{position} is malformed"
+            ))
+        })?;
+        ip_ranges.push(IpRange {
+            cidr_ip: Some(canonical),
+            description: range.description.clone(),
+        });
+    }
+
+    let mut ipv6_ranges: Vec<Ipv6Range> = Vec::new();
+    for range in permission.ipv6_ranges.iter().flatten() {
+        validate_rule_description(range.description.as_ref())?;
+        let cidr = range.cidr_ipv6.as_deref().unwrap_or_default();
+        let canonical = state::canonical_ipv6_cidr(cidr).map_err(|_| {
+            state::invalid_parameter_value(format!(
+                "CIDR block '{cidr}' of ipPermissions.{position} is malformed"
+            ))
+        })?;
+        ipv6_ranges.push(Ipv6Range {
+            cidr_ipv6: Some(canonical),
+            description: range.description.clone(),
+        });
+    }
+
+    let mut prefix_list_ids: Vec<PrefixListId> = Vec::new();
+    for entry in permission.prefix_list_ids.iter().flatten() {
+        validate_rule_description(entry.description.as_ref())?;
+        let prefix_list_id = entry.prefix_list_id.as_deref().unwrap_or_default();
+        if !state::prefix_list_id_is_well_formed(prefix_list_id) {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid prefix list id '{prefix_list_id}' for ipPermissions.{position}"
+            )));
+        }
+        prefix_list_ids.push(PrefixListId {
+            prefix_list_id: Some(prefix_list_id.to_string()),
+            description: entry.description.clone(),
+        });
+    }
+
+    let mut user_id_group_pairs: Vec<UserIdGroupPair> = Vec::new();
+    for pair in permission.user_id_group_pairs.iter().flatten() {
+        validate_rule_description(pair.description.as_ref())?;
+        user_id_group_pairs.push(prepared_group_pair(store, vpc_id, pair, position)?);
+    }
+
+    // "You must specify exactly one of the following destinations" — of a RULE, so a
+    // permission that names none describes no rule at all.
+    if ip_ranges.is_empty()
+        && ipv6_ranges.is_empty()
+        && prefix_list_ids.is_empty()
+        && user_id_group_pairs.is_empty()
+    {
+        return Err(state::missing_parameter(format!(
+            "The request must name a destination for ipPermissions.{position}: an IPv4 range \
+             (ipRanges), an IPv6 range (ipv6Ranges), a prefix list (prefixListIds) or a \
+             security group (groups)"
+        )));
+    }
+
+    Ok(IpPermission {
+        // Stored in the one form a protocol has, the way the CIDRs above are stored
+        // canonicalised, so one rule has one stored form however the request spelled it.
+        ip_protocol: Some(state::canonical_ip_protocol(protocol)),
+        from_port: permission.from_port,
+        to_port: permission.to_port,
+        user_id_group_pairs: Some(user_id_group_pairs),
+        ip_ranges: Some(ip_ranges),
+        ipv6_ranges: Some(ipv6_ranges),
+        prefix_list_ids: Some(prefix_list_ids),
+    })
+}
+
+/// One referenced-group grant in the form the rule that names it is stored in: the group by
+/// the ID a rule references it by, and the account that owns it.
+///
+/// "For a referenced security group in another VPC, the account ID of the referenced security
+/// group is returned in the response" (`UserIdGroupPair$UserId`): the owner is this account
+/// unless the request named another one. A group of ANOTHER account is not in this store, so
+/// whether it exists is not a question this emulator can answer; one of this account's has to
+/// exist.
+fn prepared_group_pair(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    vpc_id: &str,
+    pair: &UserIdGroupPair,
+    position: usize,
+) -> Result<UserIdGroupPair, AuthorizeSecurityGroupEgressError> {
+    use crate::state;
+
+    let user_id = pair
+        .user_id
+        .clone()
+        .filter(|user_id| !user_id.is_empty())
+        .unwrap_or_else(|| ::engine::emulator_account_id().to_string());
+    if !state::aws_account_id_is_well_formed(&user_id) {
+        return Err(state::invalid_parameter_value(format!(
+            "Invalid account id '{user_id}' for ipPermissions.{position}"
+        )));
+    }
+    // "The ID of the VPC for the referenced security group, if applicable"
+    // (`UserIdGroupPair$VpcId`) and "the ID of the VPC peering connection, if applicable"
+    // (`$VpcPeeringConnectionId`): a value that is not an id of its kind names no resource
+    // at all, so it is refused rather than stored on the rule.
+    for (member, prefix, value) in [
+        ("vpcId", "vpc-", pair.vpc_id.as_deref()),
+        (
+            "vpcPeeringConnectionId",
+            "pcx-",
+            pair.vpc_peering_connection_id.as_deref(),
+        ),
+    ] {
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            if !state::prefixed_id_is_well_formed(prefix, value) {
+                return Err(state::invalid_parameter_value(format!(
+                    "Invalid id '{value}' for ipPermissions.{position}.{member}"
+                )));
+            }
+        }
+    }
+    if let Some(status) = pair.peering_status.as_deref().filter(|it| !it.is_empty()) {
+        if !PEERING_STATUSES.contains(&status) {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{status}' for ipPermissions.{position}.peeringStatus: it must \
+                 be one of {known}",
+                known = PEERING_STATUSES.join(", "),
+            )));
+        }
+    }
+
+    let group_id = match (
+        pair.group_id.as_deref().filter(|id| !id.is_empty()),
+        pair.group_name.as_deref().filter(|name| !name.is_empty()),
+    ) {
+        // A value that is not a security group id names no group in any account, so it is
+        // refused whoever the request says owns it.
+        (Some(group_id), _) => {
+            if !state::security_group_id_is_well_formed(group_id) {
+                return Err(state::invalid_group_id_malformed(group_id));
+            }
+            let owned_here = user_id == ::engine::emulator_account_id();
+            if owned_here && !store.security_groups.contains_key(group_id) {
+                return Err(state::invalid_group_not_found(group_id));
+            }
+            group_id.to_string()
+        }
+        (None, Some(group_name)) => store
+            .security_group_id_for_name(vpc_id, group_name)
+            .ok_or_else(|| state::invalid_group_not_found(group_name))?,
+        (None, None) => {
+            return Err(state::invalid_permission_malformed(format!(
+                "ipPermissions.{position} names a security group with neither a groupId nor \
+                 a groupName"
+            )))
+        }
+    };
+
+    Ok(UserIdGroupPair {
+        group_id: Some(group_id),
+        group_name: pair.group_name.clone(),
+        user_id: Some(user_id),
+        description: pair.description.clone(),
+        vpc_id: pair.vpc_id.clone(),
+        vpc_peering_connection_id: pair.vpc_peering_connection_id.clone(),
+        peering_status: pair.peering_status.clone(),
+    })
 }

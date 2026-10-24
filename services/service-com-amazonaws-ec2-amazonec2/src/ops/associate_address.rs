@@ -7,10 +7,13 @@
 //! address through `Instance$PublicIpAddress`. This is the ONLY file to touch for this
 //! operation.
 //!
-//! A `NetworkInterfaceId` is refused `InvalidNetworkInterfaceID.NotFound`: this emulator
-//! holds no network interfaces at all (nothing mints one, and
-//! `CreateNetworkInterface`/`DescribeNetworkInterfaces` are still scaffolds), so an id a
-//! request names can only be one the account holds no interface for.
+//! A `NetworkInterfaceId` is resolved against the account's network interfaces — the same
+//! store `CreateNetworkInterface` writes and `DescribeNetworkInterfaces` reports: a value
+//! that is not an interface id is refused `InvalidNetworkInterfaceID.Malformed` and a
+//! well-formed id the account holds no interface for `InvalidNetworkInterfaceID.NotFound`.
+//! Associating an address with an INTERFACE rather than with an instance is work this slice
+//! has not done, so an id the store DOES hold is refused rather than answered with an
+//! association nothing persists.
 //!
 //! ## Shape of an operation
 //!
@@ -235,10 +238,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A malformed id is refused first, the way the service orders the two, and then
             // an id the store holds no interface for. Associating an address with an
             // INTERFACE rather than with an instance is work this slice has not done — the
-            // association has to be reported on the interface itself, which
-            // `DescribeNetworkInterfaces` is still a scaffold for — so an interface the
-            // store DOES hold is answered with the 501 rather than with an association
-            // nothing would report.
+            // association has to be persisted on the interface itself, which this slice does
+            // not write — so an interface the store DOES hold is answered with the 501
+            // rather than with an association nothing would report.
             (None, Some(network_interface_id)) => {
                 if !network_interface_id_is_well_formed(network_interface_id) {
                     return Err(invalid_network_interface_id_malformed(network_interface_id));

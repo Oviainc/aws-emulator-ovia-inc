@@ -25,6 +25,10 @@
 //! the ones the model documents, and both are applied by every dashboard
 //! operation rather than copied into each.
 //!
+//! An event data store's own configuration — the retention bounds and defaults that
+//! follow from its billing mode, and the `CREATED` -> `ENABLED` transition its clock
+//! owes — lives here beside that registry, for the same reason.
+//!
 //! It owns the **resource-based policy** registry too — the policy document attached
 //! to one CloudTrail resource — plus the rules every resource-policy operation
 //! shares: how a `ResourceArn` is read, which resource types carry a policy at all,
@@ -51,8 +55,8 @@ use service_common::management_events::{
 use smithy_server_runtime::OperationError;
 
 use crate::ops::types::{
-    AdvancedEventSelector, AggregationConfiguration, ContextKeySelector, EventSelector,
-    ImportSource, ImportStatistics, ImportsListItem, InsightSelector, PartitionKey,
+    AdvancedEventSelector, AggregationConfiguration, ContextKeySelector, EventDataStore,
+    EventSelector, ImportSource, ImportStatistics, ImportsListItem, InsightSelector, PartitionKey,
     RefreshSchedule, RequestWidget, Tag, Trail, TrailInfo, Widget, INSIGHT_TYPE_VALUES,
 };
 
@@ -1379,12 +1383,15 @@ impl EventDataStoreRecord {
     /// Materialise the federation transition the clock already owes: `ENABLING`
     /// into `ENABLED`, `DISABLING` into `DISABLED`.
     ///
-    /// A reporting operation may call this: the transition was due at
+    /// A reporting operation reaches this through
+    /// [`ComAmazonawsCloudtrailCloudtrail20131101State::settle_event_data_stores`],
+    /// the one pass that applies every transition a store is owed: the transition
+    /// was due at
     /// `federation_settles_at` whether or not anybody read the store, so applying
     /// it changes nothing a later caller would otherwise have seen. Federation
     /// reaching `DISABLED` releases the role it ran under — that role is held
     /// "only while federation is on".
-    pub fn settle_federation(&mut self, now: SystemTime) {
+    fn settle_federation(&mut self, now: SystemTime) {
         let Some(due) = self.federation_settles_at else {
             return;
         };
@@ -1404,10 +1411,12 @@ impl EventDataStoreRecord {
     /// `STARTING_INGESTION` into `ENABLED`, `STOPPING_INGESTION` into
     /// `STOPPED_INGESTION`.
     ///
-    /// A reporting operation may call this: the transition was due at
+    /// A reporting operation reaches this through
+    /// [`ComAmazonawsCloudtrailCloudtrail20131101State::settle_event_data_stores`]:
+    /// the transition was due at
     /// `ingestion_settles_at` whether or not anybody read the store, so applying
     /// it changes nothing a later caller would otherwise have seen.
-    pub fn settle_ingestion(&mut self, now: SystemTime) {
+    fn settle_ingestion(&mut self, now: SystemTime) {
         let Some(due) = self.ingestion_settles_at else {
             return;
         };
@@ -1417,6 +1426,21 @@ impl EventDataStoreRecord {
         self.ingestion_settles_at = None;
         if let Some(settled) = self.status.settled() {
             self.status = settled;
+        }
+    }
+
+    /// Project onto the modelled `EventDataStore` shape, as `ListEventDataStores`
+    /// reports it.
+    ///
+    /// Only the ARN and the name: the model deprecates every other member of that
+    /// shape with "<member> is no longer returned by ListEventDataStores", so a
+    /// listing reports the two that identify a store and nothing else. The values a
+    /// store is configured with are read through `GetEventDataStore`.
+    pub fn to_list_entry(&self) -> EventDataStore {
+        EventDataStore {
+            event_data_store_arn: Some(self.arn()),
+            name: Some(self.name.clone()),
+            ..EventDataStore::default()
         }
     }
 
@@ -1765,15 +1789,15 @@ pub fn parse_event_data_store_identifier(
 /// store: the UUID that is the resource suffix of its ARN
 /// (`eventdatastore/1a0abbc2-dfa0-46e6-885a-5ce09f2ee3ee`).
 ///
-/// Only the lower-case hyphenated form counts. `Uuid::try_parse` also accepts the
-/// simple, braced and URN forms and upper-case hex, and none of those is an id
-/// `CreateEventDataStore` ever handed out: the modelled `UUID` shape every store
-/// id member targets is `len 36..36`, `pattern ^[a-f0-9\-]+$`
+/// Only the lower-case hyphenated form counts, which is [`is_minted_uuid_id`] — this
+/// service's ONE reading of that form, shared with every other resource whose id it
+/// mints as a UUID, so two predicates cannot drift on letter case. `Uuid::try_parse`
+/// also accepts the simple, braced and URN forms and upper-case hex, and none of
+/// those is an id `CreateEventDataStore` ever handed out: the modelled `UUID` shape
+/// every store id member targets is `len 36..36`, `pattern ^[a-f0-9\-]+$`
 /// (`smithy_query(query="shape", shape="UUID")`).
 pub fn is_event_data_store_id(value: &str) -> bool {
-    value.len() == 36
-        && !value.contains(|c: char| c.is_ascii_uppercase())
-        && ::uuid::Uuid::try_parse(value).is_ok()
+    is_minted_uuid_id(value)
 }
 
 /// The text an unreadable event data store identifier is refused with, worded the
@@ -2194,10 +2218,9 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
 
     /// [`Self::addressed_event_data_store`] for a caller that CHANGES the store —
     /// or that materialises a transition the clock already owed it: its status move
-    /// (see [`EventDataStoreRecord::settle`], which covers the create's step and
-    /// the ingestion step alike) and its federation transition (see
-    /// [`EventDataStoreRecord::settle_federation`]), each of which was due at the
-    /// stored instant whether or not anybody called.
+    /// and its federation transition, each of which was due at the stored instant
+    /// whether or not anybody called. The whole registry's owed changes are applied
+    /// in one place, [`ComAmazonawsCloudtrailCloudtrail20131101State::settle_event_data_stores`].
     ///
     /// The addressing rule is the same one: a store is reachable only from the
     /// Region it lives in, whether it is named by a bare id or by an ARN.
@@ -2648,6 +2671,88 @@ pub fn request_widget_to_widget(widget: RequestWidget) -> Widget {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pagination: the one page token this service's listings issue
+// ---------------------------------------------------------------------------
+
+/// The page token a paged listing hands back, and how it reads one again.
+///
+/// Stated here rather than per operation, for the reason this module exists:
+/// `InvalidNextTokenException` is documented as "a token that is not valid, or a
+/// token that was previously used in a request with different parameters", and a
+/// listing applies that rule to the same two parameters — the page size the token was
+/// issued for and the Region it was issued in — so a second copy of it would drift
+/// from the first. Each operation keeps only what is its own: the shape of a resume
+/// key it could have minted, and the modelled error it refuses with.
+///
+/// `ListChannels` and `ListEventDataStores` read their tokens through here. The other
+/// listings of this service still carry a token format of their own
+/// (`ops::list_imports`, `ops::list_trails`, `ops::list_dashboards`), each shaped by
+/// the filters it pages with; folding those in belongs with whichever of those
+/// operations is worked next, and this is the reader they fold into.
+pub mod page_token {
+    /// The separator between the token's fields. Neither a Region, a page size, nor
+    /// an id this service mints carries one, so the split is unambiguous.
+    const FIELD_SEPARATOR: char = '|';
+
+    /// The token for resuming at `resume_at`: the hex of
+    /// `<page size>|<region>|<resume key>`.
+    ///
+    /// Hex-coded because a `PaginationToken` is opaque to the caller — it is only
+    /// ever handed straight back — and because the coding keeps the token inside the
+    /// member's modelled `@length 4..1000`: the shortest payload is already 4 bytes,
+    /// and the longest (a resource id, a Region, at most four digits of page size and
+    /// the separators) codes to well under 1000 characters.
+    pub fn encode(page_size: usize, region: &str, resume_at: &str) -> String {
+        ::hex::encode(format!(
+            "{page_size}{FIELD_SEPARATOR}{region}{FIELD_SEPARATOR}{resume_at}"
+        ))
+    }
+
+    /// The resume key a token that `operation` issued for THIS walk carries, where
+    /// `is_minted_key` is what that operation's resume keys look like.
+    ///
+    /// `Err` is the refusal text for the caller's own
+    /// `InvalidNextTokenException`, naming the way the token does not belong to this
+    /// walk, so a caller can fix the request from it alone.
+    pub fn decode(
+        token: &str,
+        page_size: usize,
+        region: &str,
+        operation: &str,
+        is_minted_key: impl Fn(&str) -> bool,
+    ) -> Result<String, String> {
+        let invalid = |reason: String| format!("Invalid NextToken '{token}': {reason}");
+        let unissued = || invalid(format!("it was not issued by {operation}"));
+
+        let decoded = ::hex::decode(token)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .ok_or_else(unissued)?;
+        let (issued_for, rest) = decoded.split_once(FIELD_SEPARATOR).ok_or_else(unissued)?;
+        let (issued_in, resume_at) = rest.split_once(FIELD_SEPARATOR).ok_or_else(unissued)?;
+        if issued_for.parse::<usize>() != Ok(page_size) {
+            return Err(invalid(format!(
+                "it was issued for a different MaxResults than the {page_size} this request \
+                 asks for"
+            )));
+        }
+        if issued_in != region {
+            return Err(invalid(format!(
+                "it was issued for another Region than {region}"
+            )));
+        }
+        // Every token a listing issues resumes at a key the service minted, so
+        // anything else is a position no page of this walk ever stopped at. A
+        // resource released since the page was issued is NOT refused here: the walk
+        // resumes where it stopped whether or not that resource is still stored.
+        if !is_minted_key(resume_at) {
+            return Err(unissued());
+        }
+        Ok(resume_at.to_string())
+    }
+}
+
 impl ComAmazonawsCloudtrailCloudtrail20131101State {
     /// The registry key a caller-supplied dashboard identifier addresses: the
     /// dashboard of that name in the Region the identifier pins — the ARN's own
@@ -2698,6 +2803,29 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pagination: how many event data stores one listing page carries
+// ---------------------------------------------------------------------------
+
+/// How many event data stores one `ListEventDataStores` page carries when the
+/// request names no `MaxResults`.
+///
+/// The model bounds `MaxResults` at 1..1000 but publishes no default, so the default
+/// page size is the service's to choose; the remainder is reached through
+/// `NextToken`.
+pub const LIST_EVENT_DATA_STORES_PAGE_SIZE: usize = 50;
+
+/// The largest `ListEventDataStores` page the model admits, from the `@range 1..1000`
+/// on `ListEventDataStoresMaxResultsCount`. The boundary refusal already answers a
+/// request outside that bound with the modelled `InvalidMaxResultsException`; the
+/// handler clamps to it so the walk stays bounded whatever reaches it.
+pub const LIST_EVENT_DATA_STORES_MAX_PAGE_SIZE: usize = 1_000;
+
+/// The smallest page that bound admits — the other end of the same `@range`. A page
+/// of zero would carry nothing and still mint a token, so this is the floor the
+/// handler clamps to.
+pub const LIST_EVENT_DATA_STORES_MIN_PAGE_SIZE: usize = 1;
 
 // ---------------------------------------------------------------------------
 // Resource-based policies
@@ -3215,6 +3343,24 @@ impl TaggableArn {
             Self::Channel { .. } => format!("The {} {subject} was not found.", self.noun()),
         }
     }
+}
+
+/// Whether `value` has the shape of a resource id this service MINTED: the canonical
+/// lowercase hyphenated rendering of a UUID, the one form every minted-UUID id of
+/// this service takes.
+///
+/// Stated once for every such resource, because one reader of it now serves them all:
+/// a page token's resume key is checked through [`page_token::decode`], and two
+/// predicates that disagreed (on letter case, say) would make one listing accept a
+/// resume position the other refuses.
+///
+/// Only a caller that needs to know whether an id COULD be one this service handed
+/// out uses this. Resolving an identifier does not: an id of any other shape simply
+/// names no resource. The canonical spelling is the test rather than "parses as a
+/// UUID", because the id is also the registry key a walk resumes at, and another
+/// spelling of the same UUID would seek to a key the registry does not order there.
+pub fn is_minted_uuid_id(value: &str) -> bool {
+    ::uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.hyphenated().to_string() == value)
 }
 
 /// Why a tagging `ResourceId` can name no taggable resource.

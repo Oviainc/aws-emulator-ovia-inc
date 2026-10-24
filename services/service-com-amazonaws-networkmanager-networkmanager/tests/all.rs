@@ -29,6 +29,8 @@ mod core_network_policy_versions;
 mod delete_dependency_refusal;
 #[path = "all/device_lifecycle.rs"]
 mod device_lifecycle;
+#[path = "all/direct_connect_gateway_attachment_lifecycle.rs"]
+mod direct_connect_gateway_attachment_lifecycle;
 #[path = "all/filter_id_list_maximum.rs"]
 mod filter_id_list_maximum;
 #[path = "all/global_network_lifecycle.rs"]

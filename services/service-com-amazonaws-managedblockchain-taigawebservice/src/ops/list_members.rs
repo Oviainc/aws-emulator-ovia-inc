@@ -169,7 +169,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A reporting operation: the page is cut from stored state, and the one write it
         // makes is materialising the status transitions the clock already owed.
-        let _ = ctx;
+        //
+        // The Region this request is addressed to, read off its own credential scope: a
+        // resource belongs to the Region its create was signed for, so the lookups below
+        // are scoped to it.
+        let region = crate::state::request_region(ctx);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListMembersErrorModeled::InternalServiceErrorException(
@@ -196,11 +200,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());
 
-        // A `NetworkId` that names no network is the resource-not-found case, not an
-        // empty page: an empty page would claim the network exists and holds no members.
-        // The network is the resource this listing was asked for, and the shared
-        // constructor states it the way every other failure of this service does.
-        let Some(network) = guard.networks.get(&input.network_id) else {
+        // A `NetworkId` that names no network of this Region is the resource-not-found
+        // case, not an empty page: an empty page would claim the network exists and holds
+        // no members. The network is the resource this listing was asked for, and the
+        // shared constructor states it the way every other failure of this service does.
+        let Some(network) = guard.network(&region, &input.network_id) else {
             return Err(ListMembersErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
             )
@@ -213,8 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // current Amazon Web Services account owns (true) or that other Amazon Web
         // Services accounts own (false)". An omitted filter selects every member.
         let selected: Vec<(String, MemberSummary)> = network
-            .members
-            .values()
+            .members_in(&region)
             .filter(|member| {
                 input.name.as_deref().is_none_or(|name| member.name == name)
                     && input

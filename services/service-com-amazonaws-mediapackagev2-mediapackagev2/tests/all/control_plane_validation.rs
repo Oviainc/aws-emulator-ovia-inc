@@ -297,7 +297,17 @@ fn input_type_cases() -> Vec<InputTypeCase> {
         InputTypeCase {
             label: "OutputLockingMode on MULTIVIEW input",
             input_type: Some("MULTIVIEW"),
-            members: || json!({"OutputLockingMode": "NON_EPOCH_LOCKED"}),
+            // A MULTIVIEW channel carries the configuration its own doc calls required on
+            // that input type, over the CMAF source this suite seeds.
+            members: || {
+                json!({
+                    "OutputLockingMode": "NON_EPOCH_LOCKED",
+                    "MultiviewConfiguration": {
+                        "AvailableSources": ["source-a"],
+                        "AvailableLayouts": ["LAYOUT_2EH"],
+                    },
+                })
+            },
             refused_as: None,
         },
         InputTypeCase {
@@ -365,6 +375,16 @@ fn input_type_cases() -> Vec<InputTypeCase> {
 async fn a_channel_member_restricted_to_an_input_type_is_refused_on_the_others() {
     let emulator = Emulator::new();
     assert_eq!(emulator.create_group("grp", json!({})).await.0, 200);
+    // The source a multiview row names must be a CMAF channel of the same group, which is
+    // what `MultiviewConfiguration$AvailableSources` requires of a tile source.
+    assert_eq!(
+        emulator
+            .create_channel("grp", "source-a", json!({"InputType": "CMAF"}))
+            .await
+            .0,
+        200,
+        "seeding the CMAF source channel must succeed"
+    );
 
     for (index, case) in input_type_cases().into_iter().enumerate() {
         let label = case.label;

@@ -154,7 +154,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A reporting operation: the page is cut from stored state, and the one write it
         // makes is materialising the status transitions the clock already owed.
-        let _ = ctx;
+        //
+        // The Region this request is addressed to, read off its own credential scope: a
+        // network belongs to the Region its `CreateNetwork` was signed for, so a listing
+        // reports only the networks of the Region it is addressed to.
+        let region = crate::state::request_region(ctx);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListNetworksErrorModeled::InternalServiceErrorException(
@@ -183,14 +187,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // This operation "Returns information about the networks in which the current
         // Amazon Web Services account participates", so AWS's standing, AWS-owned public
-        // networks are reported only once the account holds a member or a node on one;
-        // until then the account merely can READ them (`GetNetwork` resolves them).
-        // Each filter then selects on the stored value of the member it names; an absent
-        // one selects everything.
+        // networks are reported only once the account holds a member or a node on one in
+        // this Region; until then the account merely can READ them (`GetNetwork` resolves
+        // them). Each filter then selects on the stored value of the member it names; an
+        // absent one selects everything.
         let selected: Vec<(String, NetworkSummary)> = guard
-            .networks
-            .values()
-            .filter(|network| network.account_participates())
+            .networks_in(&region)
+            .filter(|network| network.account_participates(&region))
             .filter(|network| {
                 input
                     .name

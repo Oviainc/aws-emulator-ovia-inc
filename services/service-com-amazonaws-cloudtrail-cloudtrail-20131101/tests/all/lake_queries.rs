@@ -76,8 +76,8 @@ fn at(secs: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
 }
 
-/// Seed one event data store, the way `CreateEventDataStore` will once it is
-/// implemented.
+/// Seed one event data store, the way `CreateEventDataStore` does — directly, so a
+/// case can pin a store in a status or an account that operation does not mint.
 fn seed_store(emulator: &Emulator, id: &str, region: &str, status: EventDataStoreState) {
     seed_store_with(emulator, id, region, status, None);
 }

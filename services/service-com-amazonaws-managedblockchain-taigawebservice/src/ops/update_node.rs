@@ -148,7 +148,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The update is driven entirely by stored state and the request body; nothing
         // region-dependent is minted here (the node's ARN and endpoints were minted by
         // its create and are never recomputed).
-        let _ = ctx;
+        //
+        // The Region this request is addressed to, read off its own credential scope: a
+        // resource belongs to the Region its create was signed for, so a node of another
+        // Region is not this request's to update.
+        let region = crate::state::request_region(ctx);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateNodeErrorModeled::InternalServiceErrorException(
@@ -162,9 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `PATCH /networks/{NetworkId}/nodes/{NodeId}` nests the node INSIDE the network,
         // so the path labels resolve left to right: a `NetworkId` this service does not
-        // hold is itself the missing resource, and the node inside it is never reached
-        // (and nothing is written for the request).
-        let Some(network) = guard.networks.get_mut(&input.network_id) else {
+        // hold in this Region is itself the missing resource, and the node inside it is
+        // never reached (and nothing is written for the request).
+        let Some(network) = guard.network_mut(&region, &input.network_id) else {
             return Err(UpdateNodeErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
             )
@@ -181,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // here only SCOPES the lookup: a node the named member does not own is not found
         // under it, exactly as an unknown node id is not, while a request that names no
         // member addresses the node by network and node id alone.
-        let found = network.nodes.get_mut(&input.node_id).filter(|node| {
+        let found = network.node_mut(&region, &input.node_id).filter(|node| {
             input
                 .member_id
                 .as_deref()

@@ -754,14 +754,17 @@ async fn create_environment_enforces_the_documented_request_rules() {
             400,
         ),
         (
-            "a host may name a placement group alone",
+            // A host is PLACED on an EC2 resource of the caller's own account, and this
+            // account holds neither of these two: the accepted side of that rule lives in
+            // `host_placement_references`, which mints them through Amazon EC2 itself.
+            "a host may not name a placement group the account does not hold",
             json!({ "hosts": four_hosts(json!({ "placementGroupId": "pg-0123456789abcdef0" })) }),
-            200,
+            400,
         ),
         (
-            "a host may name a dedicated host alone",
+            "a host may not name a dedicated host the account does not hold",
             json!({ "hosts": four_hosts(json!({ "dedicatedHostId": "h-0123456789abcdef0" })) }),
-            200,
+            400,
         ),
     ];
 

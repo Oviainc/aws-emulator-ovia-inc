@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Untag
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Untag`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Untag::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes tags from the resource group its `Arn` addresses: every key the request
+//! names is dropped from the group's stored tag map, together with the value that
+//! key carried, and a key the request does not name keeps the value it had. The
+//! response reports the stored ARN and the keys whose tag this call actually
+//! removed, read back out of the record — so a key the group did not carry removes
+//! nothing and is reported in nothing, which makes repeating the call idempotent.
+//!
+//! A request whose ARN addresses no stored group is `NotFoundException` (404), and
+//! one naming a tag key a caller may not change is `BadRequestException` (400),
+//! which removes none of the batch.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +161,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Untag` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Untag"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` is deliberately unreachable here and a success says
+        // nothing about the caller's permissions. `ctx` is read for the audit record
+        // this operation emits.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the resource-groups store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // The key rules every tagging path of this service decides in one place: a
+        // key a caller cannot write is one it cannot remove either. Judged before
+        // the group is resolved and before anything is removed, so a batch holding
+        // one key this service refuses removes none of its keys.
+        crate::state::check_tag_keys(input.keys.iter().map(String::as_str)).map_err(bad_request)?;
+        let not_found = || {
+            UntagError::from(UntagErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::GROUP_NOT_FOUND_MESSAGE.to_string()),
+            }))
+        };
+        let mut store = state.lock();
+        // `Arn` is a group ARN (the modelled `GroupArnV2`), so it resolves only
+        // against a group's own STORED ARN: an ARN for another region or account
+        // addresses no group here.
+        let name = store.lookup(&input.arn).ok_or_else(not_found)?;
+        let record = store.groups.get_mut(&name).ok_or_else(not_found)?;
+        // The removal lives on the record: the keys that come back are the ones the
+        // stored map actually LOST, so a key the group did not carry is reported in
+        // nothing and an empty batch is a no-op success.
+        let removed = record.remove_tags(input.keys.iter().map(String::as_str));
+        let arn = record.group_arn.clone();
+        // Everything below is owned, so the store lock is released before the
+        // response is formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, where, what, and
+        // the outcome. Metadata only — the tag keys a caller sent are never
+        // recorded, only how many tags were removed — and request-derived values are
+        // `Debug`-escaped so none can split a record.
+        tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            region = ?crate::state::request_region(ctx.parts()),
+            group = ?name,
+            tags = removed.len(),
+            outcome = "untagged",
+            "resource group untagged",
+        );
+        Ok(UntagOutput {
+            arn: Some(arn),
+            keys: Some(removed),
+        })
     }
+}
+
+/// A `BadRequestException` (HTTP 400) — the modelled refusal for a request whose
+/// parameters violate this operation's validation rules.
+fn bad_request(message: impl Into<String>) -> UntagError {
+    UntagErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

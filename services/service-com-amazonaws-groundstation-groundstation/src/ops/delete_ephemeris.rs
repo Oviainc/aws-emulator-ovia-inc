@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEphemeris
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEphemeris`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEphemeris::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does
+//!
+//! REMOVES the ephemeris this account holds under `{ephemerisId}`, and answers that id.
+//! The removal takes the ARN index entry that resolved the ephemeris with it, so every
+//! later read of it and every ARN-valued reference to it answers as it does for an
+//! ephemeris that never existed, and a repeat of the delete is refused as a missing
+//! resource.
+//!
+//! An ephemeris a contact still to be flown depends on is NOT removed: the trajectory a
+//! pass is flown on is the ephemeris in force for the contact's satellite, so while any
+//! contact of that satellite is in a non-terminal `ContactStatus` the delete is refused
+//! with the modelled `ResourceInUseException` and nothing is written
+//! (`state::contacts_using_ephemeris`). A delete first materialises every status move the
+//! clock has already made due — the end of an ephemeris's validation, its expiration, and
+//! the scheduler's and a release's moves on a contact — which is owed whether or not
+//! anybody called, and is what makes "in force" and "non-terminal" read the statuses that
+//! hold at this instant.
 //!
 //! ## Shape of an operation
 //!
@@ -143,20 +152,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEphemeris` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEphemerisErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEphemeris"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteEphemerisErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        let mut guard = state.lock();
+        // Both sides of the in-use question are statuses the clock moves on its own: an
+        // ephemeris leaves `VALIDATING` and becomes `EXPIRED` at instants its create and
+        // its expiration recorded, and a contact is scheduled and its release completed at
+        // instants its reservation and its cancel recorded. Each move was owed at this
+        // instant whether or not anybody called, so materialising them first is what makes
+        // this delete read the statuses that hold now.
+        guard.settle_due_ephemerides();
+        guard.settle_due_contacts();
+
+        if !guard.ephemerides.contains_key(&input.ephemeris_id) {
+            return Err(DeleteEphemerisErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // This service's ephemeris literal: it does not disclose the id that
+                    // was asked for.
+                    message: Some(crate::state::EPHEMERIS_NOT_FOUND.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // An ephemeris a contact still to be flown depends on is not removed: dropping it
+        // would take the trajectory out from under a pass that is still to happen. So the
+        // holding contacts are counted first and, when there are any, the delete is
+        // refused as the modelled in-use failure naming them — the caller flies or
+        // releases those first and retries. Nothing is written on this path, so the
+        // ephemeris and every contact are left exactly as they were.
+        let holding = guard.contacts_using_ephemeris(&input.ephemeris_id);
+        if !holding.is_empty() {
+            return Err(DeleteEphemerisErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(crate::state::ephemeris_in_use_message(&holding)),
+                },
+            )
+            .into());
+        }
+
+        // The removal drops the ephemeris AND the ARN index entry that resolved to it, so
+        // from here on every read of it and every ARN-valued reference to it answers as it
+        // does for an ephemeris that never existed.
+        let removed = guard
+            .remove_ephemeris(&input.ephemeris_id)
+            .expect("the ephemeris whose presence was just checked under this lock");
+
+        Ok(DeleteEphemerisOutput {
+            ephemeris_id: Some(removed.ephemeris_id),
+        })
     }
 }

@@ -157,7 +157,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // makes is materialising the status transitions the clock already owed (an
         // invitation past its `ExpirationDate` is `EXPIRED`), each of which was due at
         // this instant whether or not anybody called.
-        let _ = ctx;
+        //
+        // The Region this request is addressed to, read off its own credential scope: an
+        // invitation is recorded in the Region the vote that approved it was cast in, so a
+        // listing reports only the invitations of the Region it is addressed to.
+        let region = crate::state::request_region(ctx);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListInvitationsErrorModeled::InternalServiceErrorException(
@@ -190,13 +194,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record, so it reports that network's current configuration and status.
         let account = ::engine::emulator_account_id();
         let selected: Vec<(String, Invitation)> = guard
-            .invitations
-            .values()
+            .invitations_in(&region)
             .filter(|invitation| invitation.principal == account)
             .map(|invitation| {
                 (
                     invitation.id.clone(),
-                    invitation.to_invitation(guard.networks.get(&invitation.network_id)),
+                    invitation.to_invitation(guard.network(&region, &invitation.network_id)),
                 )
             })
             .collect();

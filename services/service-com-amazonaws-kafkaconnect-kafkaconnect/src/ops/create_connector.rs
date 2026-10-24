@@ -224,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateConnectorErrorModeled::BadRequestException(BadRequestException {
                 message: Some(crate::state::invalid_parameter_because(
                     "capacity",
-                    "Specify exactly one of autoScaling or provisionedCapacity.",
+                    crate::state::ONE_CAPACITY_FORM,
                 )),
             })
             .into());
@@ -345,6 +345,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             pending: Some(crate::state::PendingChange::in_a_moment(
                 crate::state::PendingKind::Settle,
             )),
+            // The clock owes a connector that has just been created no change
+            // of settings: an update is refused until it is running.
+            pending_update: None,
         };
 
         let output = CreateConnectorOutput {

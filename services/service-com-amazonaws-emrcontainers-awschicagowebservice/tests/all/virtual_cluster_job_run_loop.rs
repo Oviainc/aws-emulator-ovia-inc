@@ -1339,22 +1339,19 @@ async fn operations_outside_this_slice_still_answer_501() {
     let cases = [
         ("ListVirtualClusters", "GET", "/virtualclusters".to_string(), None),
         (
-            "CreateManagedEndpoint",
-            "POST",
-            "/virtualclusters/doesnotexist1/endpoints".to_string(),
-            Some(json!({
-                "name": "endpoint",
-                "clientToken": "endpoint-tok",
-                "type": "JUPYTER_ENTERPRISE_GATEWAY",
-                "releaseLabel": "emr-6.10.0-latest",
-                "executionRoleArn": "arn:aws:iam::000000000000:role/EMRJobRole",
-            })),
+            "DeleteManagedEndpoint",
+            "DELETE",
+            "/virtualclusters/doesnotexist1/endpoints/doesnotexist2".to_string(),
+            None,
         ),
         (
-            "ListManagedEndpoints",
-            "GET",
-            "/virtualclusters/doesnotexist1/endpoints".to_string(),
-            None,
+            "GetManagedEndpointSessionCredentials",
+            "POST",
+            "/virtualclusters/doesnotexist1/endpoints/doesnotexist2/credentials".to_string(),
+            Some(json!({
+                "executionRoleArn": "arn:aws:iam::000000000000:role/EMRJobRole",
+                "credentialType": "TOKEN",
+            })),
         ),
     ];
 

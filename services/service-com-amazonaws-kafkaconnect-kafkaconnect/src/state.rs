@@ -90,9 +90,23 @@ pub const CONNECTOR_DELETING: &str = "DELETING";
 /// call, is what returns it to [`CONNECTOR_RUNNING`].
 pub const CONNECTOR_RESTARTING: &str = "RESTARTING";
 
+/// `ConnectorState` while a connector takes on the capacity or the
+/// configuration an update named; one of [`CONNECTOR_STATE_VALUES`]. The clock,
+/// not the next call, is what returns it to [`CONNECTOR_RUNNING`].
+pub const CONNECTOR_UPDATING: &str = "UPDATING";
+
 /// `ConnectorOperationType` of the operation a restart starts; one of
 /// [`CONNECTOR_OPERATION_TYPE_VALUES`].
 pub const CONNECTOR_OPERATION_RESTART: &str = "RESTART_CONNECTOR";
+
+/// `ConnectorOperationType` of the operation an update to a connector's
+/// capacity starts — capacity is the connector's worker setting, which is what
+/// `WorkerSetting` carries; one of [`CONNECTOR_OPERATION_TYPE_VALUES`].
+pub const CONNECTOR_OPERATION_UPDATE_WORKER_SETTING: &str = "UPDATE_WORKER_SETTING";
+
+/// `ConnectorOperationType` of the operation an update to a connector's
+/// configuration starts; one of [`CONNECTOR_OPERATION_TYPE_VALUES`].
+pub const CONNECTOR_OPERATION_UPDATE_CONFIGURATION: &str = "UPDATE_CONNECTOR_CONFIGURATION";
 
 /// `ConnectorOperationState` every connector operation starts in — the work is
 /// recorded and has not begun; one of [`CONNECTOR_OPERATION_STATE_VALUES`].
@@ -111,6 +125,47 @@ pub const RESTART_PROGRESSION: &[&str] = &[
     CONNECTOR_OPERATION_RESTART_IN_PROGRESS,
     CONNECTOR_OPERATION_RESTART_COMPLETE,
 ];
+
+/// `ConnectorOperationState` while an update is running.
+pub const CONNECTOR_OPERATION_UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
+
+/// `ConnectorOperationState` an update that finished ends in.
+pub const CONNECTOR_OPERATION_UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
+
+/// `ConnectorOperationStepState` of a step that has not begun.
+pub const STEP_PENDING: &str = "PENDING";
+/// `ConnectorOperationStepState` of the step an operation is working.
+pub const STEP_IN_PROGRESS: &str = "IN_PROGRESS";
+/// `ConnectorOperationStepState` of a step that has finished.
+pub const STEP_COMPLETED: &str = "COMPLETED";
+
+/// `ConnectorOperationStepType` of the step every update opens with.
+const STEP_INITIALIZE_UPDATE: &str = "INITIALIZE_UPDATE";
+/// `ConnectorOperationStepType` of the step that checks what an update asks
+/// for before anything is changed.
+const STEP_VALIDATE_UPDATE: &str = "VALIDATE_UPDATE";
+/// `ConnectorOperationStepType` of the step every update closes with.
+const STEP_FINALIZE_UPDATE: &str = "FINALIZE_UPDATE";
+
+/// The steps an update of `operation_type` walks, in order.
+///
+/// `ConnectorOperationStepType` lists exactly five values
+/// (`INITIALIZE_UPDATE`, `VALIDATE_UPDATE`, `UPDATE_WORKER_SETTING`,
+/// `UPDATE_CONNECTOR_CONFIGURATION`, `FINALIZE_UPDATE`): the three an update of
+/// either kind shares, around the one that names the change itself — and that
+/// one is spelled the same as the operation's own type, which is why it is
+/// taken from it rather than listed twice.
+fn update_step_types(operation_type: &str) -> Vec<String> {
+    [
+        STEP_INITIALIZE_UPDATE,
+        STEP_VALIDATE_UPDATE,
+        operation_type,
+        STEP_FINALIZE_UPDATE,
+    ]
+    .iter()
+    .map(|step| (*step).to_string())
+    .collect()
+}
 
 /// The version a freshly created connector is at. `currentVersion` is an opaque
 /// string to a client, which only ever echoes it back on an update or a delete.
@@ -183,6 +238,20 @@ impl PendingChange {
         Self {
             kind,
             due: Instant::now() + TRANSITION_SPAN,
+        }
+    }
+
+    /// The change `kind`, due once a progression of `steps` steps has run: one
+    /// [`TRANSITION_SPAN`] per step, counted from now.
+    ///
+    /// For a change the clock owes at the instant the work a call started
+    /// FINISHES rather than one span later — a connector leaving the state it
+    /// is updating in, say, which is owed exactly when its update's last step
+    /// is done.
+    pub fn in_steps(kind: PendingKind, steps: u32) -> Self {
+        Self {
+            kind,
+            due: Instant::now() + TRANSITION_SPAN * steps.max(1),
         }
     }
 
@@ -261,6 +330,130 @@ impl CustomPluginRecord {
     }
 }
 
+/// The settings one `UpdateConnector` call moves a connector between: its
+/// capacity — the worker setting `WorkerSetting` carries — or its
+/// configuration. The operation's own documentation says a request names
+/// exactly one of the two, so one value of this enum is one update.
+#[derive(Debug, Clone)]
+pub enum ConnectorSettings {
+    /// A connector's capacity (`UpdateConnector$capacity`).
+    Capacity(Capacity),
+    /// A connector's configuration (`UpdateConnector$connectorConfiguration`),
+    /// the whole map rather than a patch: the member carries "the configuration
+    /// for the connector", the same wording the create's own configuration
+    /// member carries, and the model gives no member naming keys to drop.
+    Configuration(HashMap<String, String>),
+}
+
+impl ConnectorSettings {
+    /// The `ConnectorOperationType` an update to these settings runs under.
+    pub fn operation_type(&self) -> &'static str {
+        match self {
+            Self::Capacity(_) => CONNECTOR_OPERATION_UPDATE_WORKER_SETTING,
+            Self::Configuration(_) => CONNECTOR_OPERATION_UPDATE_CONFIGURATION,
+        }
+    }
+
+    /// These settings as the `WorkerSetting` a report carries, or `None` when
+    /// they are not a worker setting at all.
+    pub fn worker_setting(&self) -> Option<WorkerSetting> {
+        match self {
+            Self::Capacity(capacity) => Some(WorkerSetting {
+                capacity: Some(capacity_description(capacity)),
+            }),
+            Self::Configuration(_) => None,
+        }
+    }
+
+    /// These settings as the connector configuration a report carries, or
+    /// `None` when they are not a configuration at all.
+    pub fn configuration(&self) -> Option<HashMap<String, String>> {
+        match self {
+            Self::Capacity(_) => None,
+            Self::Configuration(configuration) => Some(configuration.clone()),
+        }
+    }
+}
+
+/// The capacity an update names, as the shape a connector stores.
+///
+/// `CapacityUpdate` mirrors `Capacity` member for member — the two scaling
+/// policies are required there and optional here — so the conversion keeps
+/// every value the request carried and invents none.
+pub fn capacity_from_update(update: CapacityUpdate) -> Capacity {
+    Capacity {
+        auto_scaling: update.auto_scaling.map(|scaling| AutoScaling {
+            max_worker_count: scaling.max_worker_count,
+            mcu_count: scaling.mcu_count,
+            min_worker_count: scaling.min_worker_count,
+            scale_in_policy: Some(ScaleInPolicy {
+                cpu_utilization_percentage: scaling.scale_in_policy.cpu_utilization_percentage,
+            }),
+            scale_out_policy: Some(ScaleOutPolicy {
+                cpu_utilization_percentage: scaling.scale_out_policy.cpu_utilization_percentage,
+            }),
+            max_autoscaling_task_count: scaling.max_autoscaling_task_count,
+        }),
+        provisioned_capacity: update
+            .provisioned_capacity
+            .map(|fixed| ProvisionedCapacity {
+                mcu_count: fixed.mcu_count,
+                worker_count: fixed.worker_count,
+            }),
+    }
+}
+
+/// `capacity` as the read operations report it.
+///
+/// A free function because two records report a capacity: the connector its own
+/// ([`ConnectorRecord::capacity_description`]) and a connector operation the
+/// capacity on each side of the update it applies.
+pub fn capacity_description(capacity: &Capacity) -> CapacityDescription {
+    CapacityDescription {
+        auto_scaling: capacity
+            .auto_scaling
+            .as_ref()
+            .map(|scaling| AutoScalingDescription {
+                max_worker_count: scaling.max_worker_count,
+                mcu_count: scaling.mcu_count,
+                min_worker_count: scaling.min_worker_count,
+                scale_in_policy: scaling.scale_in_policy.as_ref().map(|policy| {
+                    ScaleInPolicyDescription {
+                        cpu_utilization_percentage: policy.cpu_utilization_percentage,
+                    }
+                }),
+                scale_out_policy: scaling.scale_out_policy.as_ref().map(|policy| {
+                    ScaleOutPolicyDescription {
+                        cpu_utilization_percentage: policy.cpu_utilization_percentage,
+                    }
+                }),
+                max_autoscaling_task_count: scaling.max_autoscaling_task_count,
+            }),
+        provisioned_capacity: capacity.provisioned_capacity.as_ref().map(|fixed| {
+            ProvisionedCapacityDescription {
+                mcu_count: fixed.mcu_count,
+                worker_count: fixed.worker_count,
+            }
+        }),
+    }
+}
+
+/// The version a connector moves to from `current` once an update lands.
+///
+/// The versions this service mints are counted from
+/// [`FIRST_CONNECTOR_VERSION`], so the next one is the one after it. A stored
+/// value outside that count (which the API cannot produce — a client only ever
+/// echoes back the version it was handed) restarts the count rather than
+/// panicking.
+fn next_connector_version(current: &str) -> String {
+    current
+        .parse::<u64>()
+        .map_or_else(
+            |_| FIRST_CONNECTOR_VERSION.to_string(),
+            |version| version.saturating_add(1).to_string(),
+        )
+}
+
 /// One stored connector: the whole `CreateConnector` request plus the identity,
 /// version and lifecycle the service assigned it.
 #[derive(Debug, Clone)]
@@ -284,39 +477,31 @@ pub struct ConnectorRecord {
     pub creation_time: SystemTime,
     pub tags: HashMap<String, String>,
     pub pending: Option<PendingChange>,
+    /// The settings an update that is still running will leave this connector
+    /// holding, kept here until that update's last step is done: a connector
+    /// reports what it is RUNNING with, so the change lands with the move back
+    /// to that state and not before.
+    pub pending_update: Option<ConnectorSettings>,
 }
 
 impl ConnectorRecord {
+    /// Take on the settings an update has made due, and move to the next
+    /// version.
+    ///
+    /// `currentVersion` names the settings the connector is running with, so it
+    /// moves exactly when those settings do — one update's worth at a time,
+    /// because a connector that is not running takes no further update.
+    fn apply_update(&mut self, settings: ConnectorSettings) {
+        match settings {
+            ConnectorSettings::Capacity(capacity) => self.capacity = capacity,
+            ConnectorSettings::Configuration(configuration) => self.configuration = configuration,
+        }
+        self.current_version = next_connector_version(&self.current_version);
+    }
+
     /// This connector's stored capacity, as the read operations report it.
     pub fn capacity_description(&self) -> CapacityDescription {
-        CapacityDescription {
-            auto_scaling: self
-                .capacity
-                .auto_scaling
-                .as_ref()
-                .map(|scaling| AutoScalingDescription {
-                    max_worker_count: scaling.max_worker_count,
-                    mcu_count: scaling.mcu_count,
-                    min_worker_count: scaling.min_worker_count,
-                    scale_in_policy: scaling.scale_in_policy.as_ref().map(|policy| {
-                        ScaleInPolicyDescription {
-                            cpu_utilization_percentage: policy.cpu_utilization_percentage,
-                        }
-                    }),
-                    scale_out_policy: scaling.scale_out_policy.as_ref().map(|policy| {
-                        ScaleOutPolicyDescription {
-                            cpu_utilization_percentage: policy.cpu_utilization_percentage,
-                        }
-                    }),
-                    max_autoscaling_task_count: scaling.max_autoscaling_task_count,
-                }),
-            provisioned_capacity: self.capacity.provisioned_capacity.as_ref().map(|fixed| {
-                ProvisionedCapacityDescription {
-                    mcu_count: fixed.mcu_count,
-                    worker_count: fixed.worker_count,
-                }
-            }),
-        }
+        capacity_description(&self.capacity)
     }
 
     /// This connector's stored Kafka cluster, as the read operations report it.
@@ -434,8 +619,8 @@ impl ConnectorRecord {
 /// One stored connector operation: the asynchronous work a call against a
 /// connector started, with the progression the clock walks it along.
 ///
-/// Nothing creates one directly: `RestartConnector` mints one per restart (as
-/// `UpdateConnector` will per update), and `ListConnectorOperations` and
+/// Nothing creates one directly: `RestartConnector` mints one per restart and
+/// `UpdateConnector` one per update, and `ListConnectorOperations` and
 /// `DescribeConnectorOperation` report it. An operation belongs to its
 /// connector, so it is dropped with it.
 #[derive(Debug, Clone)]
@@ -451,6 +636,15 @@ pub struct ConnectorOperationRecord {
     /// The states this operation has still to pass through, in order; empty
     /// once it has reached its terminal state.
     pub remaining_states: VecDeque<String>,
+    /// The `ConnectorOperationStepType`s this operation walks, in order, one
+    /// per entry of its progression; empty for an operation type the model
+    /// declares no step for.
+    pub step_types: Vec<String>,
+    /// The settings the connector held when this operation started, and the
+    /// ones it leaves the connector holding — the origin and target a report
+    /// carries. Both `None` for an operation that changes no settings.
+    pub origin: Option<ConnectorSettings>,
+    pub target: Option<ConnectorSettings>,
     pub creation_time: SystemTime,
     /// When this operation reaches its terminal state. Fixed when it starts (it
     /// is [`TRANSITION_SPAN`] per step of the progression), because the clock
@@ -458,10 +652,11 @@ pub struct ConnectorOperationRecord {
     /// so a running operation carries no `endTime`.
     pub ends_at: SystemTime,
     /// Whether the restart that started this operation asked for only the
-    /// connector's failed tasks (`RestartConnector$onlyFailedTasks`). Stored
-    /// because it is what the caller asked for; no modelled response member of
-    /// this service reports it.
-    pub only_failed_tasks: bool,
+    /// connector's failed tasks (`RestartConnector$onlyFailedTasks`), or `None`
+    /// for an operation no restart started. Stored because it is what the
+    /// caller asked for; no modelled response member of this service reports
+    /// it.
+    pub only_failed_tasks: Option<bool>,
     pub pending: Option<PendingChange>,
 }
 
@@ -469,22 +664,138 @@ impl ConnectorOperationRecord {
     /// The operation a `RestartConnector` call against `connector_arn` starts:
     /// `PENDING`, with the whole [`RESTART_PROGRESSION`] still ahead of it.
     pub fn restart(arn: String, connector_arn: String, only_failed_tasks: bool) -> Self {
+        let states: VecDeque<String> = RESTART_PROGRESSION
+            .iter()
+            .map(|state| (*state).to_string())
+            .collect();
+        Self {
+            // A restart changes neither the connector's worker setting nor its
+            // configuration, so there is no pair of settings to report.
+            only_failed_tasks: Some(only_failed_tasks),
+            // Every value `ConnectorOperationStepType` lists names a step of an
+            // UPDATE, so a restart has no modelled step to report and none is
+            // invented for it.
+            ..Self::starting(
+                arn,
+                connector_arn,
+                CONNECTOR_OPERATION_RESTART,
+                Vec::new(),
+                states,
+            )
+        }
+    }
+
+    /// The operation an `UpdateConnector` call starts: `PENDING`, with one step
+    /// of this kind of update ahead of it per entry of its progression.
+    ///
+    /// `origin` is what the connector holds now and `target` what the update
+    /// named; they are settings of the same kind, which is what fixes the
+    /// operation's type and its steps.
+    pub fn update(
+        arn: String,
+        connector_arn: String,
+        origin: ConnectorSettings,
+        target: ConnectorSettings,
+    ) -> Self {
+        let operation_type = target.operation_type();
+        let step_types = update_step_types(operation_type);
+        // One modelled update state per step: finishing a step that is not the
+        // last leaves the operation running, and finishing the last one
+        // completes it. So the states already passed count the steps done.
+        let last = step_types.len().saturating_sub(1);
+        let states: VecDeque<String> = (0..step_types.len())
+            .map(|step| {
+                if step == last {
+                    CONNECTOR_OPERATION_UPDATE_COMPLETE.to_string()
+                } else {
+                    CONNECTOR_OPERATION_UPDATE_IN_PROGRESS.to_string()
+                }
+            })
+            .collect();
+        Self {
+            origin: Some(origin),
+            target: Some(target),
+            ..Self::starting(
+                arn,
+                connector_arn,
+                operation_type,
+                step_types,
+                states,
+            )
+        }
+    }
+
+    /// The shape every operation starts in, whatever kind it is: `PENDING`,
+    /// typed `operation_type`, with `step_types` and `states` still ahead of it
+    /// and its first step owed one [`TRANSITION_SPAN`] from now. The settings a
+    /// kind of operation moves between, and the restart flag, are the caller's
+    /// to fill where its kind carries them.
+    fn starting(
+        arn: String,
+        connector_arn: String,
+        operation_type: &str,
+        step_types: Vec<String>,
+        states: VecDeque<String>,
+    ) -> Self {
         let creation_time = SystemTime::now();
-        let steps = u32::try_from(RESTART_PROGRESSION.len()).unwrap_or(1);
+        let steps = u32::try_from(states.len()).unwrap_or(1);
         Self {
             arn,
             connector_arn,
-            operation_type: CONNECTOR_OPERATION_RESTART.to_string(),
+            operation_type: operation_type.to_string(),
             state: CONNECTOR_OPERATION_PENDING.to_string(),
-            remaining_states: RESTART_PROGRESSION
-                .iter()
-                .map(|state| (*state).to_string())
-                .collect(),
+            remaining_states: states,
+            step_types,
+            origin: None,
+            target: None,
             creation_time,
             ends_at: creation_time + TRANSITION_SPAN * steps,
-            only_failed_tasks,
+            only_failed_tasks: None,
             pending: Some(PendingChange::in_a_moment(PendingKind::Advance)),
         }
+    }
+
+    /// How many of this operation's steps are done: one per entry of its
+    /// progression the clock has already walked it past.
+    fn steps_done(&self) -> usize {
+        self.step_types.len().saturating_sub(self.remaining_states.len())
+    }
+
+    /// `operationSteps`: this operation's steps, each in the state this
+    /// operation's own position puts it in — the steps before the one being
+    /// worked have completed, that one is in progress, and the ones after it
+    /// have not begun; nothing has begun at all while the operation itself is
+    /// still `PENDING`, and every step has completed once it has ended.
+    ///
+    /// `None` for an operation the model declares no step for, which is every
+    /// operation that is not an update.
+    pub fn steps(&self) -> Option<Vec<ConnectorOperationStep>> {
+        if self.step_types.is_empty() {
+            return None;
+        }
+        // An operation that has not left `PENDING` is working no step yet.
+        let working =
+            (self.state != CONNECTOR_OPERATION_PENDING).then(|| self.steps_done());
+        Some(
+            self.step_types
+                .iter()
+                .enumerate()
+                .map(|(index, step_type)| ConnectorOperationStep {
+                    step_type: Some(step_type.clone()),
+                    step_state: Some(
+                        match working {
+                            None => STEP_PENDING,
+                            Some(working) => match index.cmp(&working) {
+                                ::std::cmp::Ordering::Less => STEP_COMPLETED,
+                                ::std::cmp::Ordering::Equal => STEP_IN_PROGRESS,
+                                ::std::cmp::Ordering::Greater => STEP_PENDING,
+                            },
+                        }
+                        .to_string(),
+                    ),
+                })
+                .collect(),
+        )
     }
 
     /// Whether this operation has reached its terminal state.
@@ -633,6 +944,13 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
             .retain(|_, connector| !removal_due(connector.pending, now));
         for connector in self.connectors.values_mut() {
             if settling_due(connector.pending, now) {
+                // The settings an update made due land with the move back to
+                // the running state: a connector reports what it is running
+                // with, so its capacity, its configuration and the version that
+                // names them all move at the instant the update finishes.
+                if let Some(settings) = connector.pending_update.take() {
+                    connector.apply_update(settings);
+                }
                 connector.state = CONNECTOR_RUNNING.to_string();
                 connector.pending = None;
             }
@@ -942,6 +1260,24 @@ pub const RESOURCE_DOES_NOT_EXIST: &str = "The requested resource doesn\u{2019}t
 /// The reason a parameter that must carry an ARN, and does not, is rejected
 /// with.
 pub const INVALID_ARN: &str = "Invalid ARN.";
+
+/// The reason a call that names a version other than the resource's own is
+/// refused with. The version a client holds is the one the service handed it,
+/// so a different one names settings the resource has moved on from.
+pub const VERSION_IS_NOT_CURRENT: &str = "The specified version is not the current version of the resource.";
+
+/// The reason a capacity naming both of its forms, or neither, is refused with.
+/// `Capacity` models `autoScaling` and `provisionedCapacity` as two optional
+/// members of which a connector has exactly one — "whether it is auto scaled or
+/// provisioned", as the member's own documentation puts it.
+pub const ONE_CAPACITY_FORM: &str = "Specify exactly one of autoScaling or provisionedCapacity.";
+
+/// The reason a call only a RUNNING connector can serve is refused with for a
+/// connector in any other state: one still being created, already restarting,
+/// updating or being deleted has no running workers for the call to act on.
+pub fn connector_is_not_running() -> String {
+    format!("The connector is not {CONNECTOR_RUNNING}.")
+}
 
 /// The reason a create whose name is already taken is refused with: the
 /// modelled `ConflictException` sentence, as its own documentation states it

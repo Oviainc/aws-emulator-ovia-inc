@@ -52,7 +52,10 @@ struct Track {
 /// element. Element names are matched WHOLE — the character after the name must
 /// end the tag — so `<MaintenanceTrack>` never matches `<MaintenanceTracks>` or
 /// `<MaintenanceTrackName>`.
-fn elements(xml: &str, tag: &str) -> Vec<String> {
+///
+/// `pub(crate)` so a sibling suite reading a nested list reuses this scanner
+/// instead of keeping a second copy of it.
+pub(crate) fn elements(xml: &str, tag: &str) -> Vec<String> {
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
     let mut found = Vec::new();

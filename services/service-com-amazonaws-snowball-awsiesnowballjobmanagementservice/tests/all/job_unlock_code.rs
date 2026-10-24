@@ -52,7 +52,7 @@ const RELEASING_STATE: &str = "WithCustomer";
 
 /// A router with just this service mounted, plus the engine it was mounted on, so a row
 /// can put a job into a state this emulator's own operations do not reach yet.
-fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are not what these tests are about; the router still routes by the SigV4
