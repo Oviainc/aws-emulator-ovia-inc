@@ -185,7 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(identifier) => Some(
                 state
                     .alarm_template_group(&region, identifier)
-                    .ok_or_else(|| group_not_found("CloudWatch alarm template group", identifier))?
+                    .ok_or_else(|| {
+                        alarm_group_not_found("CloudWatch alarm template group", identifier)
+                    })?
                     .id
                     .clone(),
             ),
@@ -198,9 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(identifier) => Some(
                 state
                     .event_bridge_rule_template_group(&region, identifier)
-                    .ok_or_else(|| {
-                        group_not_found("EventBridge rule template group", identifier)
-                    })?
+                    .ok_or_else(rule_group_not_found)?
                     .id
                     .clone(),
             ),
@@ -248,11 +248,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The request filtered by a template group that does not exist in the region it
-/// was signed for, so the filter names no set of signal maps.
-fn group_not_found(resource_type: &str, identifier: &str) -> ListSignalMapsError {
+/// The request filtered by a CloudWatch alarm template group that does not exist
+/// in the region it was signed for, so the filter names no set of signal maps.
+/// That family's 404 states its message, built from the request.
+fn alarm_group_not_found(resource_type: &str, identifier: &str) -> ListSignalMapsError {
     ListSignalMapsErrorModeled::NotFoundException(NotFoundException {
         message: Some(crate::state::not_found_message(resource_type, identifier)),
+    })
+    .into()
+}
+
+/// The request filtered by an eventbridge rule template group that does not
+/// exist in the region it was signed for. The same 404, carrying no `message`
+/// member — the group is a resource of the rule-template hierarchy, which
+/// reports a resource an identifier does not resolve to with the status and the
+/// code alone (see
+/// [`crate::state::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE`]).
+fn rule_group_not_found() -> ListSignalMapsError {
+    ListSignalMapsErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE,
     })
     .into()
 }

@@ -555,37 +555,40 @@ async fn a_bad_page_size_or_an_unresolvable_group_filter_is_refused() {
         );
     }
 
-    // (case, query member, identifier, the resource type the message names)
-    let unresolvable: [(&str, &str, String, &str); 5] = [
+    // (case, query member, identifier, the message the refusal carries — the
+    //  alarm family composes one from the request; a rule-template group's 404
+    //  leaves the member unset, which is that hierarchy's own rule, pinned by
+    //  `crate::event_bridge_rule_template_not_found`)
+    let unresolvable: [(&str, &str, String, Option<&str>); 5] = [
         (
             "alarm group never created",
             "cloudWatchAlarmTemplateGroupIdentifier",
             "no-such-group".to_string(),
-            "CloudWatch alarm template group",
+            Some("CloudWatch alarm template group"),
         ),
         (
             "alarm filter naming a rule group's id",
             "cloudWatchAlarmTemplateGroupIdentifier",
             rule.clone(),
-            "CloudWatch alarm template group",
+            Some("CloudWatch alarm template group"),
         ),
         (
             "rule group never created",
             "eventBridgeRuleTemplateGroupIdentifier",
             "no-such-group".to_string(),
-            "EventBridge rule template group",
+            None,
         ),
         (
             "rule filter naming an alarm group's id",
             "eventBridgeRuleTemplateGroupIdentifier",
             alarm.clone(),
-            "EventBridge rule template group",
+            None,
         ),
         (
             "alarm group by a name no group holds",
             "cloudWatchAlarmTemplateGroupIdentifier",
             "rule-one".to_string(),
-            "CloudWatch alarm template group",
+            Some("CloudWatch alarm template group"),
         ),
     ];
 
@@ -601,13 +604,22 @@ async fn a_bad_page_size_or_an_unresolvable_group_filter_is_refused() {
             "NotFoundException",
             "case {case:?}: expected NotFoundException, got {body}"
         );
-        assert_eq!(
-            body["message"],
-            json!(format!("{resource_type} {identifier} not found")),
-            "case {case:?}: expected the message to name the resource type then the \
-             identifier, got {:?}",
-            body["message"]
-        );
+        match resource_type {
+            Some(resource_type) => assert_eq!(
+                body["message"],
+                json!(format!("{resource_type} {identifier} not found")),
+                "case {case:?}: expected the message to name the resource type then the \
+                 identifier, got {:?}",
+                body["message"]
+            ),
+            None => assert_eq!(
+                body.get("message"),
+                Some(&json!(null)),
+                "case {case:?}: expected a rule-template group's refusal to report the \
+                 message member with no value, got {:?}",
+                body.get("message")
+            ),
+        }
     }
 
     // A group belongs to the region it was created in, so the same identifier

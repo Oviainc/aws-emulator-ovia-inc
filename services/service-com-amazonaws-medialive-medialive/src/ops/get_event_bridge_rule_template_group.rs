@@ -153,7 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
         let group = state
             .event_bridge_rule_template_group(&region, &input.identifier)
-            .ok_or_else(|| not_found(&input.identifier))?;
+            .ok_or_else(not_found)?;
 
         Ok(crate::state::event_bridge_rule_template_group_output!(
             GetEventBridgeRuleTemplateGroupOutput,
@@ -163,12 +163,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// No group in this region has that id or name. The operation's own modelled
-/// 404, with a message built from the request.
-fn not_found(identifier: &str) -> GetEventBridgeRuleTemplateGroupError {
+/// 404, carrying no `message` member — the rule-template hierarchy reports a
+/// resource an identifier does not resolve to with the status and the code
+/// alone (see [`crate::state::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE`]).
+fn not_found() -> GetEventBridgeRuleTemplateGroupError {
     GetEventBridgeRuleTemplateGroupErrorModeled::NotFoundException(NotFoundException {
-        message: Some(format!(
-            "No eventbridge rule template group has the id or name {identifier}"
-        )),
+        message: crate::state::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE,
     })
     .into()
 }

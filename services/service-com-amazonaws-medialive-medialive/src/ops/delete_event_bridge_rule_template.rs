@@ -174,21 +174,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation documents no precondition, so the miss is the only refusal.
         state
             .delete_event_bridge_rule_template(&region, &input.identifier)
-            .ok_or_else(|| not_found(&input.identifier))?;
+            .ok_or_else(not_found)?;
 
         Ok(DeleteEventBridgeRuleTemplateOutput)
     }
 }
 
 /// No template in this region has that id or name, by either form `Identifier`
-/// documents. The operation's own modelled 404, with a message built from the
-/// request.
-fn not_found(identifier: &str) -> DeleteEventBridgeRuleTemplateError {
+/// documents. The operation's own modelled 404, carrying no `message` member —
+/// the rule-template hierarchy reports a resource an identifier does not resolve
+/// to with the status and the code alone (see
+/// [`crate::state::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE`]).
+fn not_found() -> DeleteEventBridgeRuleTemplateError {
     DeleteEventBridgeRuleTemplateErrorModeled::NotFoundException(NotFoundException {
-        message: Some(crate::state::not_found_message(
-            "eventbridge rule template",
-            identifier,
-        )),
+        message: crate::state::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE,
     })
     .into()
 }

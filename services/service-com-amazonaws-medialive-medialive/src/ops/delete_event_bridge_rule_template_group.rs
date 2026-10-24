@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store, beside the removal, so a refused delete removes nothing.
         state
             .delete_event_bridge_rule_template_group(&region, &input.identifier)
-            .map_err(|refusal| refused(refusal, &input.identifier))?;
+            .map_err(refused)?;
 
         Ok(DeleteEventBridgeRuleTemplateGroupOutput)
     }
@@ -187,17 +187,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// the region holds no group for is its 404, and a group a signal map still names
 /// or that still holds templates is its 409 — the state the caller must leave
 /// behind first, not a bad request.
+///
+/// The 404 carries no `message` member: the rule-template hierarchy reports a
+/// resource an identifier does not resolve to with the status and the code alone
+/// (see [`crate::state::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE`]). The
+/// 409 keeps the fixed sentence of its own class.
 fn refused(
     refusal: crate::state::TemplateGroupDeleteRefusal,
-    identifier: &str,
 ) -> DeleteEventBridgeRuleTemplateGroupError {
     match refusal {
         crate::state::TemplateGroupDeleteRefusal::NotFound => {
             DeleteEventBridgeRuleTemplateGroupErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message(
-                    "eventbridge rule template group",
-                    identifier,
-                )),
+                message: crate::state::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE,
             })
             .into()
         }

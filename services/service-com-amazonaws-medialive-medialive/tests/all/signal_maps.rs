@@ -678,26 +678,33 @@ async fn repeated_creates_and_unresolvable_group_identifiers_are_refused() {
         );
     }
 
-    // (case, the member carrying an identifier that resolves to no group)
-    let unresolvable: [(&str, &str, &str); 3] = [
+    // (case, the member carrying an identifier that resolves to no group, the
+    //  identifier, whether the refusal's message names it — the alarm family
+    //  composes a message from the request, while a rule-template group's 404
+    //  carries no message member at all, which is that hierarchy's own rule,
+    //  pinned by `crate::event_bridge_rule_template_not_found`)
+    let unresolvable: [(&str, &str, &str, bool); 3] = [
         (
             "alarm group by name",
             "cloudWatchAlarmTemplateGroupIdentifiers",
             "group-1",
+            true,
         ),
         (
             // Even the id of a group of ANOTHER type resolves to no alarm group.
             "alarm group by a stored eventbridge group's id",
             "cloudWatchAlarmTemplateGroupIdentifiers",
             &group_id,
+            true,
         ),
         (
             "eventbridge group that was never created",
             "eventBridgeRuleTemplateGroupIdentifiers",
             "no-such-group",
+            false,
         ),
     ];
-    for (case, member, identifier) in unresolvable {
+    for (case, member, identifier, states_a_message) in unresolvable {
         let mut body = json!({
             "name": format!("grouped-{}", slug(case)),
             "discoveryEntryPointArn": entry_point,
@@ -713,11 +720,21 @@ async fn repeated_creates_and_unresolvable_group_identifiers_are_refused() {
             "NotFoundException",
             "case {case:?}: expected NotFoundException, got {refused}"
         );
-        assert!(
-            error_message(&refused).contains(identifier),
-            "case {case:?}: expected the message to name the identifier, got {:?}",
-            error_message(&refused)
-        );
+        if states_a_message {
+            assert!(
+                error_message(&refused).contains(identifier),
+                "case {case:?}: expected the message to name the identifier, got {:?}",
+                error_message(&refused)
+            );
+        } else {
+            assert_eq!(
+                refused.get("message"),
+                Some(&json!(null)),
+                "case {case:?}: expected a rule-template group's refusal to report the \
+                 message member with no value, got {:?}",
+                refused.get("message")
+            );
+        }
     }
 }
 

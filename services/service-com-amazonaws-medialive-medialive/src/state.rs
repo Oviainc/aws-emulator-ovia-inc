@@ -3433,6 +3433,31 @@ pub fn not_found_message(resource_type: &str, identifier: &str) -> String {
     format!("{resource_type} {identifier} not found")
 }
 
+/// The `message` a not-found refusal carries when what the identifier failed to
+/// resolve to is a resource of the EVENTBRIDGE RULE-TEMPLATE hierarchy — a rule
+/// template or a rule-template group: NONE, the member is left unset.
+///
+/// `NotFoundException` is a structure whose single member `Message` (jsonName
+/// `message`) is OPTIONAL and whose documentation is a placeholder
+/// (`smithy_query(query="shape",shape="NotFoundException")`), so the model
+/// states no message rule for it and the member may legitimately be absent. The
+/// recorded behaviour of this hierarchy is that it IS absent: a 404 answered for
+/// a rule template or a rule-template group an identifier does not resolve to
+/// carries the status and the error code and no `message` member at all. So this
+/// is a `None` and not an empty string — an empty string is a present member
+/// whose value is empty, which is a different error document.
+///
+/// Every OTHER MediaLive resource family keeps composing its message with
+/// [`not_found_message`]: the recorded 404s of the classic channel/input API
+/// ("Channel <id> not found") and of the signal map's discovery entry point do
+/// carry one, so the absence is this hierarchy's, not the service's.
+///
+/// ONE constant, so the ten places that report such a resource missing — its
+/// own get/update/delete at both levels, the template create's and the
+/// listing's group resolution, and the signal-map operations that resolve a rule
+/// template group — cannot answer it two ways.
+pub const EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE: Option<String> = None;
+
 /// The message a mutation refused on an id whose delete has already been
 /// accepted carries: the subject the request named, then `already deleted` —
 /// the distinction the real service draws between an id that was deleted and

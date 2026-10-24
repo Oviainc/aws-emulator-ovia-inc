@@ -116,9 +116,12 @@ pub fn is_event_target_arn(arn: &str) -> bool {
 #[derive(Debug)]
 pub enum EventBridgeRuleTemplateRefusal {
     /// No eventbridge rule template group in the request's region has that id or
-    /// name, so there is no group to create the template in. Carries the
-    /// identifier that resolved to nothing.
-    GroupNotFound { identifier: String },
+    /// name, so there is no group to create the template in.
+    ///
+    /// Carries nothing: the hierarchy's 404 states no message, so no caller
+    /// reads the identifier back out of the refusal (see
+    /// [`crate::state::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE`]).
+    GroupNotFound,
     /// A template in the same region already carries that name, which `Name` is
     /// documented to make unique there. Carries the name asked for and the id of
     /// the template that holds it.
@@ -133,12 +136,15 @@ pub enum EventBridgeRuleTemplateRefusal {
 #[derive(Debug)]
 pub enum EventBridgeRuleTemplateUpdateRefusal {
     /// No template in the request's region has that id or name, so there is no
-    /// template to change. Carries the identifier that resolved to nothing.
-    NotFound { identifier: String },
+    /// template to change.
+    ///
+    /// Carries nothing, for the reason
+    /// [`EventBridgeRuleTemplateRefusal::GroupNotFound`] states.
+    NotFound,
     /// No eventbridge rule template group in the request's region has that id or
-    /// name, so there is no group to move the template into. Carries the
-    /// identifier that resolved to nothing.
-    GroupNotFound { identifier: String },
+    /// name, so there is no group to move the template into. Carries nothing,
+    /// for the same reason.
+    GroupNotFound,
     /// Another template in the same region already carries the name asked for,
     /// which `Name` is documented to make unique there. Carries the name and the
     /// id of the template that holds it.
@@ -231,9 +237,7 @@ impl ComAmazonawsMedialiveMedialiveState {
         now: SystemTime,
     ) -> Result<String, EventBridgeRuleTemplateRefusal> {
         let Some(group) = self.event_bridge_rule_template_group(region, group_identifier) else {
-            return Err(EventBridgeRuleTemplateRefusal::GroupNotFound {
-                identifier: group_identifier.to_string(),
-            });
+            return Err(EventBridgeRuleTemplateRefusal::GroupNotFound);
         };
         let group_id = group.id.clone();
 
@@ -298,9 +302,7 @@ impl ComAmazonawsMedialiveMedialiveState {
         now: SystemTime,
     ) -> Result<String, EventBridgeRuleTemplateUpdateRefusal> {
         let Some(template) = self.event_bridge_rule_template(region, identifier) else {
-            return Err(EventBridgeRuleTemplateUpdateRefusal::NotFound {
-                identifier: identifier.to_string(),
-            });
+            return Err(EventBridgeRuleTemplateUpdateRefusal::NotFound);
         };
         let id = template.id.clone();
 
@@ -311,9 +313,7 @@ impl ComAmazonawsMedialiveMedialiveState {
             Some(group_identifier) => {
                 let Some(group) = self.event_bridge_rule_template_group(region, group_identifier)
                 else {
-                    return Err(EventBridgeRuleTemplateUpdateRefusal::GroupNotFound {
-                        identifier: group_identifier.to_string(),
-                    });
+                    return Err(EventBridgeRuleTemplateUpdateRefusal::GroupNotFound);
                 };
                 Some(group.id.clone())
             }
@@ -336,9 +336,7 @@ impl ComAmazonawsMedialiveMedialiveState {
         }
 
         let Some(template) = self.event_bridge_rule_templates.get_mut(&id) else {
-            return Err(EventBridgeRuleTemplateUpdateRefusal::NotFound {
-                identifier: identifier.to_string(),
-            });
+            return Err(EventBridgeRuleTemplateUpdateRefusal::NotFound);
         };
         if let Some(group_id) = group_id {
             template.group_id = group_id;

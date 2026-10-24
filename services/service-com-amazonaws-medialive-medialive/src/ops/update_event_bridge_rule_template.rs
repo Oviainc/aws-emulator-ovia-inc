@@ -301,25 +301,19 @@ fn event_targets(
 /// no template in the region has and a group identifier no group in it has are
 /// both its 404 (neither leaves a template to change, or a group to move it
 /// into), and a name another template in the region already holds is its 409.
+///
+/// Both 404s carry no `message` member: the rule-template hierarchy reports a
+/// resource an identifier does not resolve to with the status and the code alone
+/// (see [`crate::state::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE`]), and
+/// both of these are resources of that hierarchy.
 fn refused(
     refusal: crate::state::EventBridgeRuleTemplateUpdateRefusal,
 ) -> UpdateEventBridgeRuleTemplateError {
     match refusal {
-        crate::state::EventBridgeRuleTemplateUpdateRefusal::NotFound { identifier } => {
+        crate::state::EventBridgeRuleTemplateUpdateRefusal::NotFound
+        | crate::state::EventBridgeRuleTemplateUpdateRefusal::GroupNotFound => {
             UpdateEventBridgeRuleTemplateErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message(
-                    "eventbridge rule template",
-                    &identifier,
-                )),
-            })
-            .into()
-        }
-        crate::state::EventBridgeRuleTemplateUpdateRefusal::GroupNotFound { identifier } => {
-            UpdateEventBridgeRuleTemplateErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message(
-                    "eventbridge rule template group",
-                    &identifier,
-                )),
+                message: crate::state::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE,
             })
             .into()
         }

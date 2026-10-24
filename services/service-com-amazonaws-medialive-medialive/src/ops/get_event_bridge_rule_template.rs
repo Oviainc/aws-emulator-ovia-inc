@@ -162,7 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
         let template = state
             .event_bridge_rule_template(&region, &input.identifier)
-            .ok_or_else(|| not_found(&input.identifier))?;
+            .ok_or_else(not_found)?;
 
         Ok(crate::state::event_bridge_rule_template_output!(
             GetEventBridgeRuleTemplateOutput,
@@ -172,13 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// No template in this region has that id or name. The operation's own modelled
-/// 404, with a message built from the request.
-fn not_found(identifier: &str) -> GetEventBridgeRuleTemplateError {
+/// 404, carrying no `message` member — the rule-template hierarchy reports a
+/// resource an identifier does not resolve to with the status and the code
+/// alone (see [`crate::state::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE`]).
+fn not_found() -> GetEventBridgeRuleTemplateError {
     GetEventBridgeRuleTemplateErrorModeled::NotFoundException(NotFoundException {
-        message: Some(crate::state::not_found_message(
-            "eventbridge rule template",
-            identifier,
-        )),
+        message: crate::state::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE,
     })
     .into()
 }

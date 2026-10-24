@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.description,
                 now,
             )
-            .ok_or_else(|| not_found(&input.identifier))?;
+            .ok_or_else(not_found)?;
 
         // The response is read back out of the stored record, never built from
         // `input`, so what this update answers is what the next
@@ -199,13 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// No group in this region answers to the requested identifier, by either of the
 /// two forms `Identifier` documents (its id or its current name), so there is
-/// nothing to update.
-fn not_found(identifier: &str) -> UpdateEventBridgeRuleTemplateGroupError {
+/// nothing to update. The modelled 404 carries no `message` member — the
+/// rule-template hierarchy reports a resource an identifier does not resolve to
+/// with the status and the code alone (see
+/// [`crate::state::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE`]).
+fn not_found() -> UpdateEventBridgeRuleTemplateGroupError {
     UpdateEventBridgeRuleTemplateGroupErrorModeled::NotFoundException(NotFoundException {
-        message: Some(crate::state::not_found_message(
-            "eventbridge rule template group",
-            identifier,
-        )),
+        message: crate::state::EVENT_BRIDGE_RULE_TEMPLATE_NOT_FOUND_MESSAGE,
     })
     .into()
 }

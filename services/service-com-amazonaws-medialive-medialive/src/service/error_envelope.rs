@@ -50,7 +50,16 @@
 //! * `time` is the instant this response was produced, in the `date-time` form the model
 //!   uses for every timestamp it declares.
 //!
-//! What is deliberately left alone: the HTTP status, `__type`, `message`, the success body
+//! The modelled `message` is left to the framework with ONE exception: where the error
+//! value carries none, the key is reported as an explicit JSON `null` rather than dropped,
+//! because a MediaLive error document always carries the member (see [`complete_envelope`]).
+//! A message the error value DID state is never touched. What grounds that claim is the
+//! EventBridge rule-template hierarchy's recorded 404s, the only refusals of this service
+//! that state no message; it is written here for every modelled exception because the key's
+//! presence is a property of the document rather than of one family, and it must be
+//! re-grounded if another family's recording ever shows the member dropped instead.
+//!
+//! What is deliberately left alone: the HTTP status, `__type`, the success body
 //! and every other header stay with the framework renderer that owns them; and a body
 //! whose code is NOT one of this service's modelled exceptions — the scaffold's 501
 //! `NotImplemented`, a framework `SerializationException` — is left exactly as the
@@ -165,6 +174,14 @@ fn set_from_response(object: &mut Map<String, Value>, member: &str, value: Value
 
 /// Add the envelope members this body does not already carry, set the two the response
 /// itself is the authority for, and answer how many of them changed the document.
+///
+/// `message` is the modelled member and is NEVER overwritten here — whatever the error
+/// value carried survives. It is only ADDED, as an explicit JSON `null`, when the error
+/// value carried none: a MediaLive error document always has the `message` key, and
+/// reports "this failure states no message" as that key's null rather than by dropping
+/// it. The restJson1 renderer omits an unset optional member, so this is the one place
+/// the difference can be written, and it is a real one to a client: a reader of the
+/// member gets a null it can branch on instead of a missing key.
 fn complete_envelope(
     object: &mut Map<String, Value>,
     status: u16,
@@ -173,6 +190,7 @@ fn complete_envelope(
     time: &str,
 ) -> usize {
     let mut added = 0;
+    added += insert_absent(object, "message", Value::Null);
     added += insert_absent(object, "code", Value::from(code));
     added += set_from_response(object, "statusCode", Value::from(status));
     added += insert_absent(object, "retryable", Value::from(retryable(status)));
@@ -469,6 +487,58 @@ mod tests {
                 object.get("code").and_then(Value::as_str),
                 Some("ConflictException"),
                 "case {label:?}: expected the bare shape name, got {object:?}"
+            );
+        }
+    }
+
+    /// The modelled `message` is reported either way: a message the error value stated
+    /// survives verbatim, and an error value that stated none reports the member as an
+    /// explicit null rather than dropping it.
+    ///
+    /// The rows span what the rule generalises over: whether the body arrived with the
+    /// member, the value it arrived with (a sentence, and the empty string — a stated
+    /// message that happens to be empty is NOT the same as none), and the modelled code
+    /// the body names.
+    #[test]
+    fn a_message_the_error_stated_survives_and_an_absent_one_is_reported_as_null() {
+        // (case, the body the renderer wrote, the value the member must end up with)
+        let table: [(&str, String, Value); 5] = [
+            (
+                "a stated message",
+                r#"{"__type":"ConflictException","message":"Name already in use"}"#.to_string(),
+                Value::from("Name already in use"),
+            ),
+            (
+                "a stated empty message",
+                r#"{"__type":"ConflictException","message":""}"#.to_string(),
+                Value::from(""),
+            ),
+            (
+                "no member at all",
+                r#"{"__type":"NotFoundException"}"#.to_string(),
+                Value::Null,
+            ),
+            (
+                "the member already null",
+                r#"{"__type":"NotFoundException","message":null}"#.to_string(),
+                Value::Null,
+            ),
+            (
+                "no member, code from the header",
+                r#"{}"#.to_string(),
+                Value::Null,
+            ),
+        ];
+
+        for (case, body, expected) in table {
+            let header = (case == "no member, code from the header").then_some("NotFoundException");
+            let rewritten = with_envelope_members(body.as_bytes(), 404, header, ID, TIME)
+                .unwrap_or_else(|| panic!("case {case:?}: expected a rewrite"));
+            let object = decoded(rewritten);
+            assert_eq!(
+                object.get("message"),
+                Some(&expected),
+                "case {case:?}: expected the message member to be {expected:?}, got {object:?}"
             );
         }
     }

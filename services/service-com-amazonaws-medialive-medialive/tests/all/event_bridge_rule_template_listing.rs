@@ -677,7 +677,15 @@ async fn a_listing_reports_only_the_templates_of_its_own_region() {
 /// Rule: a `MaxResults` that asks for no results at all is refused with
 /// `BadRequestException` (400), and an identifier that resolves to no resource of
 /// the filtered type where the request can see it is refused with
-/// `NotFoundException` (404) naming the resource type and the identifier.
+/// `NotFoundException` (404).
+///
+/// What that 404's error document carries depends on the FAMILY of the resource
+/// the filter named: a signal map's 404 states the message its family composes
+/// (the resource type, the identifier, then `not found`), while a rule-template
+/// GROUP's 404 carries NO `message` member at all — the rule-template hierarchy
+/// reports a resource an identifier does not resolve to with the status and the
+/// code alone (`crate::event_bridge_rule_template_not_found` is that rule's own
+/// suite).
 ///
 /// The rows differ along the page size asked for, which filter carries the
 /// unresolvable identifier, and WHY it is unresolvable — never created, the id of
@@ -703,43 +711,39 @@ async fn a_bad_page_size_or_an_unresolvable_filter_is_refused() {
         );
     }
 
-    // (case, query member, identifier, the resource type the message names)
-    let unresolvable: [(&str, &str, String, &str); 6] = [
-        (
-            "group never created",
-            "groupIdentifier",
-            "no-such-group".to_string(),
-            "eventbridge rule template group",
-        ),
+    // (case, query member, identifier, the message the refusal carries — `None`
+    //  where the family leaves the member unset)
+    let unresolvable: [(&str, &str, String, Option<&str>); 6] = [
+        ("group never created", "groupIdentifier", "no-such-group".to_string(), None),
         (
             "group filter naming a signal map's id",
             "groupIdentifier",
             map.clone(),
-            "eventbridge rule template group",
+            None,
         ),
         (
             "group by a name nothing holds",
             "groupIdentifier",
             "map-one".to_string(),
-            "eventbridge rule template group",
+            None,
         ),
         (
             "signal map never created",
             "signalMapIdentifier",
             "no-such-map".to_string(),
-            "Signal map",
+            Some("Signal map"),
         ),
         (
             "signal map filter naming a group's id",
             "signalMapIdentifier",
             group.clone(),
-            "Signal map",
+            Some("Signal map"),
         ),
         (
             "signal map by a name nothing holds",
             "signalMapIdentifier",
             "group-one".to_string(),
-            "Signal map",
+            Some("Signal map"),
         ),
     ];
 
@@ -755,13 +759,22 @@ async fn a_bad_page_size_or_an_unresolvable_filter_is_refused() {
             "NotFoundException",
             "case {case:?}: expected NotFoundException, got {body}"
         );
-        assert_eq!(
-            body["message"],
-            json!(format!("{resource_type} {identifier} not found")),
-            "case {case:?}: expected the message to name the resource type then the \
-             identifier, got {:?}",
-            body["message"]
-        );
+        match resource_type {
+            Some(resource_type) => assert_eq!(
+                body["message"],
+                json!(format!("{resource_type} {identifier} not found")),
+                "case {case:?}: expected the message to name the resource type then the \
+                 identifier, got {:?}",
+                body["message"]
+            ),
+            None => assert_eq!(
+                body.get("message"),
+                Some(&json!(null)),
+                "case {case:?}: expected a rule-template group's refusal to report the \
+                 message member with no value, got {:?}",
+                body.get("message")
+            ),
+        }
     }
 
     // A group belongs to the region it was created in, so the same identifier
