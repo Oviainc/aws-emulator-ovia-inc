@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSoftwareUpdates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSoftwareUpdates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSoftwareUpdates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Issues a software-update grant for the requested job and answers the Amazon S3 URL
+//! that grant publishes. The job must be one this service persisted, and it must still
+//! have a device an update file can be fetched for; the URL is available for the two days
+//! `GetSoftwareUpdatesResult$UpdatesURI` documents, after which another call issues
+//! another one.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +141,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSoftwareUpdates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSoftwareUpdatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSoftwareUpdates"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STATE_UNAVAILABLE,
+            ));
+        };
+
+        // The URL addresses a bucket in the Region the request was signed for: the
+        // credential scope is the only Region a request carries.
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        let Some(job) = store.jobs.get(&input.job_id) else {
+            return Err(GetSoftwareUpdatesErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(format!(
+                        "The job ID {} can't be found. Check the information you provided in \
+                         your last request, and try again.",
+                        input.job_id
+                    )),
+                    resource_type: Some("job".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "Main jobs aren't associated with any Snowballs. Instead, each main job will
+        // have at least one job part, and each job part is associated with a Snowball"
+        // (`JobListEntry$IsMaster`): the update file is a DEVICE's software, so it is the
+        // job parts that have one and the main job of an export order that has none. The
+        // update file of a main job is a resource no record answers to, which is what
+        // `InvalidResourceException` states.
+        if job.is_master() {
+            return Err(GetSoftwareUpdatesErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(format!(
+                        "The job {} is the main job of an export order and is associated with \
+                         no Snowball, so it has no software update file. Request the update for \
+                         one of its job parts instead.",
+                        job.job_id
+                    )),
+                    resource_type: Some("job".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A job whose state leaves it without a device has no update file to fetch
+        // either; unlike a main job that is a property of where the job GOT TO, which is
+        // what `InvalidJobStateException` states.
+        if !job.job_state.has_software_update() {
+            return Err(GetSoftwareUpdatesErrorModeled::InvalidJobStateException(
+                InvalidJobStateException {
+                    message: Some(format!(
+                        "The job {} is in state {} and no device will be prepared for it, so \
+                         its software update file can't be requested.",
+                        job.job_id,
+                        job.job_state.as_wire()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Issuing the grant is what this operation DOES — it hands the caller a URL that
+        // is available for the two days `UpdatesURI` documents — so the store records the
+        // URL it published, and the response is read back out of that record.
+        let grant = store.issue_software_update_grant(&input.job_id, ::std::time::SystemTime::now());
+
+        Ok(GetSoftwareUpdatesOutput {
+            updates_uri: Some(grant.updates_uri(&region)),
+        })
     }
 }
