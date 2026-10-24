@@ -1449,8 +1449,9 @@ async fn the_operations_this_slice_does_not_cover_still_answer_501() {
     let router = emulator();
     // `GET /serviceSettings` and `GET /listQuickSetupTypes` are no longer here: both
     // are implemented, and `tests/all/service_settings_and_types.rs` covers them.
-    let cases: [(&str, &str, Option<Value>); 2] = [
-        ("GET", "/getConfiguration/some-configuration-id", None),
+    // `GET /getConfiguration/{ConfigurationId}` is no longer here either — it is
+    // implemented, and the `GetConfiguration` section below covers it.
+    let cases: [(&str, &str, Option<Value>); 1] = [
         (
             "GET",
             "/tags/arn%3Aaws%3Assm-quicksetup%3Aus-west-2%3A000000000000%3Aconfiguration-manager%2F00000000-0000-4000-8000-000000000000",
@@ -1464,4 +1465,341 @@ async fn the_operations_this_slice_does_not_cover_still_answer_501() {
             "case {method} {uri}: a stub must answer 501, got {status} / {answer:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// GetConfiguration
+// ---------------------------------------------------------------------------
+
+/// `GET /getConfiguration/{ConfigurationId}`, the id carried as one `@httpLabel`.
+async fn get_configuration(router: &MultiServiceRouter, configuration_id: &str) -> (u16, Value) {
+    call(
+        router,
+        "GET",
+        &format!("/getConfiguration/{}", label(configuration_id)),
+        None,
+    )
+    .await
+}
+
+/// Every `ConfigurationSummary` the listing reports for one manager, in listing order.
+async fn configurations_of(
+    router: &MultiServiceRouter,
+    case: &str,
+    manager_arn: &str,
+) -> Vec<Value> {
+    let (status, answer) = list_configurations(router, &json!({ "ManagerArn": manager_arn })).await;
+    assert_eq!(
+        status, 200,
+        "case {case}: ListConfigurations must succeed, got {status} / {answer:?}"
+    );
+    answer
+        .get("ConfigurationsList")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case}: expected a ConfigurationsList, got {answer:?}"))
+        .clone()
+}
+
+/// The rule: `GetConfiguration` reports the stored configuration its `ConfigurationId`
+/// names — the record the create minted for one configuration definition — so every
+/// member comes back as it was stored, and as the configuration listing reports it.
+///
+/// Each row differs along what the rule generalises over: how many definitions the
+/// create carried, how large each parameter map is (including an empty one), whether a
+/// `TypeVersion` was given, and which Quick Setup type was deployed.
+#[tokio::test]
+async fn a_stored_configuration_is_read_back_by_its_service_generated_id() {
+    let router = emulator();
+    // Every configuration id the service hands out must be new, across managers too.
+    let mut seen_ids: BTreeSet<String> = BTreeSet::new();
+
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "one definition, one parameter",
+            json!({
+                "Name": "single",
+                "ConfigurationDefinitions": [definition(
+                    "AWSQuickSetupType-SSMOpsCenter",
+                    json!({ "TargetRegions": "us-east-1" }),
+                )],
+            }),
+        ),
+        (
+            "three definitions, differing types, one with a TypeVersion",
+            json!({
+                "ConfigurationDefinitions": [
+                    definition("AWSQuickSetupType-Scheduler", json!({ "TargetTagKey": "Env" })),
+                    {
+                        "Type": "AWSQuickSetupType-PatchPolicy",
+                        "Parameters": {
+                            "RateControlErrorThreshold": "10%",
+                            "TargetRegions": "us-east-1",
+                            "TargetType": "*",
+                        },
+                        "TypeVersion": "2.0",
+                    },
+                    definition("AWSQuickSetupType-DHMC", json!({ "TargetType": "*" })),
+                ],
+            }),
+        ),
+        (
+            "a definition with an empty parameter map",
+            json!({
+                "Name": "empty-params",
+                "ConfigurationDefinitions": [definition("AWSQuickSetupType-SSM", json!({}))],
+            }),
+        ),
+        (
+            "a definition carrying every optional member",
+            json!({
+                "Name": "fully-specified",
+                "ConfigurationDefinitions": [{
+                    "Type": "AWSQuickSetupType-ResourceExplorer",
+                    "Parameters": { "SelectedAggregatorRegion": "us-west-2" },
+                    "TypeVersion": "1.1",
+                    "LocalDeploymentExecutionRoleName": "QuickSetupExecRole",
+                    "LocalDeploymentAdministrationRoleArn":
+                        "arn:aws:iam::000000000000:role/QuickSetupAdminRole",
+                }],
+                "Tags": { "env": "prod" },
+            }),
+        ),
+    ];
+
+    for (case, request) in cases {
+        let manager_arn = create_ok(&router, case, &request).await;
+        let submitted = request
+            .get("ConfigurationDefinitions")
+            .and_then(Value::as_array)
+            .expect("the request carries definitions");
+        // The definition ids the service assigned, in the order the create submitted
+        // them, so each configuration can be matched to the definition it deploys.
+        let ids = definition_ids(case, &get_ok(&router, case, &manager_arn).await);
+        let listed = configurations_of(&router, case, &manager_arn).await;
+        assert_eq!(
+            listed.len(),
+            submitted.len(),
+            "case {case}: expected one configuration per submitted definition, got {listed:?}"
+        );
+
+        for summary in &listed {
+            let id = summary
+                .get("Id")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("case {case}: expected an Id, got {summary:?}"));
+            let definition_id = summary
+                .get("ConfigurationDefinitionId")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("case {case}: expected a ConfigurationDefinitionId, got {summary:?}")
+                });
+            let index = ids
+                .iter()
+                .position(|assigned| assigned == definition_id)
+                .unwrap_or_else(|| {
+                    panic!("case {case}: {definition_id:?} is not one of this manager's definition ids {ids:?}")
+                });
+            let want = &submitted[index];
+
+            let (status, got) = get_configuration(&router, id).await;
+            assert_eq!(
+                status, 200,
+                "case {case}: GetConfiguration({id}) must succeed, got {status} / {got:?}"
+            );
+            assert_eq!(
+                got.get("Id").and_then(Value::as_str),
+                Some(id),
+                "case {case}: the Get must report the id it was asked for, got {got:?}"
+            );
+            assert_eq!(
+                got.get("ManagerArn").and_then(Value::as_str),
+                Some(manager_arn.as_str()),
+                "case {case}: the configuration must name the manager that owns it, got {got:?}"
+            );
+            assert_eq!(
+                got.get("ConfigurationDefinitionId").and_then(Value::as_str),
+                Some(definition_id),
+                "case {case}: the Get must name the definition it deploys, got {got:?}"
+            );
+            for member in ["Type", "TypeVersion"] {
+                assert_eq!(
+                    got.get(member),
+                    want.get(member),
+                    "case {case}: {member} must come back as it was stored, got {got:?}"
+                );
+            }
+            // The create supplied the parameters; `GetConfiguration$Parameters` and the
+            // listing's `ConfigurationSummary$FirstClassParameters` are both that map.
+            let stored_parameters = got.get("Parameters").cloned().unwrap_or_else(|| json!({}));
+            assert_eq!(
+                stored_parameters,
+                want.get("Parameters").cloned().unwrap_or_else(|| json!({})),
+                "case {case}: Parameters must come back as they were stored, got {got:?}"
+            );
+            assert_eq!(
+                Some(&stored_parameters),
+                summary.get("FirstClassParameters"),
+                "case {case}: the Get and the listing must report one stored parameter map, got {got:?}"
+            );
+            assert_eq!(
+                got.get("Account").and_then(Value::as_str),
+                Some(ACCOUNT),
+                "case {case}: a configuration is deployed in the emulator account, got {got:?}"
+            );
+            assert_eq!(
+                got.get("Region").and_then(Value::as_str),
+                Some(REGION),
+                "case {case}: a configuration is deployed in the signing region, got {got:?}"
+            );
+            let created = epoch_seconds(case, &got, "CreatedAt");
+            let modified = epoch_seconds(case, &got, "LastModifiedAt");
+            assert!(
+                modified >= created,
+                "case {case}: LastModifiedAt {modified} must not precede CreatedAt {created}"
+            );
+            assert_eq!(
+                epoch_seconds(case, summary, "CreatedAt"),
+                created,
+                "case {case}: the Get and the listing must report one CreatedAt, got {got:?}"
+            );
+            assert_status_summaries(
+                case,
+                got.get("StatusSummaries")
+                    .unwrap_or_else(|| panic!("case {case}: expected StatusSummaries, got {got:?}")),
+            );
+            assert!(
+                seen_ids.insert(id.to_string()),
+                "case {case}: configuration id {id:?} was handed out twice"
+            );
+        }
+    }
+}
+
+/// A configuration the store does not hold is the modelled 404, whatever the form of
+/// the id asked for: one reclaimed with the manager that owned it, and well-formed ids
+/// of every size the `ConfigurationId` pattern `^[a-zA-Z0-9-_/:]{1,100}$` admits (from
+/// `smithy_query(query="operation",operation="GetConfiguration")`) that no create minted.
+#[tokio::test]
+async fn a_configuration_the_store_does_not_hold_is_the_modelled_404() {
+    let router = emulator();
+    let manager_arn = create_ok(
+        &router,
+        "404",
+        &json!({
+            "Name": "to-be-deleted",
+            "ConfigurationDefinitions": [definition(
+                "AWSQuickSetupType-SSMOpsCenter",
+                json!({ "TargetRegions": "us-east-1" }),
+            )],
+        }),
+    )
+    .await;
+    let listed = configurations_of(&router, "404", &manager_arn).await;
+    let reclaimed = listed[0]["Id"]
+        .as_str()
+        .expect("a stored configuration carries its id")
+        .to_string();
+
+    // While its manager is stored, the configuration is readable.
+    let (status, answer) = get_configuration(&router, &reclaimed).await;
+    assert_eq!(
+        status, 200,
+        "a stored configuration must be readable, got {status} / {answer:?}"
+    );
+
+    let (status, answer) = delete(&router, &manager_arn).await;
+    assert_eq!(
+        status, 200,
+        "DeleteConfigurationManager must succeed, got {status} / {answer:?}"
+    );
+
+    let cases: Vec<(&str, String)> = vec![
+        ("reclaimed with its manager", reclaimed),
+        (
+            "a uuid no create minted",
+            "00000000-0000-4000-8000-000000000000".to_string(),
+        ),
+        ("the shortest id the pattern admits", "a".to_string()),
+        ("the longest id the pattern admits", "c".repeat(100)),
+        (
+            "an id carrying every character class the pattern admits",
+            "Ab9-_/:".to_string(),
+        ),
+    ];
+
+    for (case, configuration_id) in cases {
+        let (status, answer) = get_configuration(&router, &configuration_id).await;
+        assert_eq!(
+            status, 404,
+            "case {case}: an unstored configuration must answer 404, got {status} / {answer:?}"
+        );
+        assert_eq!(
+            error_code(&answer),
+            "ResourceNotFoundException",
+            "case {case}: expected ResourceNotFoundException, got {answer:?}"
+        );
+    }
+
+    // One past the pattern's published maximum is a bad request, not a 404: the
+    // modelled constraint is refused before the handler runs.
+    let (status, answer) = get_configuration(&router, &"c".repeat(101)).await;
+    assert_eq!(
+        status, 400,
+        "an id past the pattern's 100-character maximum must be refused, got {status} / {answer:?}"
+    );
+    assert_eq!(
+        error_code(&answer),
+        "ValidationException",
+        "expected ValidationException, got {answer:?}"
+    );
+}
+
+/// Reading a configuration reports the deployment status the clock owes it — the
+/// transient one straight after the create, the settled one once the span has passed —
+/// and reports it without moving anything: a second read answers exactly the same.
+#[tokio::test]
+async fn reading_a_configuration_reports_the_status_the_clock_owes_and_moves_nothing() {
+    let router = emulator();
+    let manager_arn = create_ok(
+        &router,
+        "clock",
+        &json!({
+            "Name": "settling-configuration",
+            "ConfigurationDefinitions": [definition(
+                "AWSQuickSetupType-SSMOpsCenter",
+                json!({ "TargetRegions": "us-east-1" }),
+            )],
+        }),
+    )
+    .await;
+    let listed = configurations_of(&router, "clock", &manager_arn).await;
+    let id = listed[0]["Id"]
+        .as_str()
+        .expect("a stored configuration carries its id")
+        .to_string();
+
+    let (status, fresh) = get_configuration(&router, &id).await;
+    assert_eq!(status, 200, "got {status} / {fresh:?}");
+    assert_eq!(
+        deployment_status("fresh", &fresh["StatusSummaries"]),
+        STATUS_INITIALIZING,
+        "a caller reading straight after the create must still see the transient status, got {fresh:?}"
+    );
+
+    tokio::time::sleep(past_transition()).await;
+
+    let (status, settled) = get_configuration(&router, &id).await;
+    assert_eq!(status, 200, "got {status} / {settled:?}");
+    assert_eq!(
+        deployment_status("settled", &settled["StatusSummaries"]),
+        STATUS_SUCCEEDED,
+        "the deployment must settle without any other call, got {settled:?}"
+    );
+
+    let (status, again) = get_configuration(&router, &id).await;
+    assert_eq!(status, 200, "got {status} / {again:?}");
+    assert_eq!(
+        again, settled,
+        "a second read must report the same record, got {again:?}"
+    );
 }

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the one stored configuration the request's `ConfigurationId` names: a
+//! record `CreateConfigurationManager` created, one per configuration definition,
+//! exactly as the store holds it — and the modelled 404 when the store holds no such
+//! configuration (it never existed, or the manager that owned it was deleted).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting, not mutating (`@readonly`): the only write it makes is materialising the
+//! status changes the clock already owes (see
+//! [`crate::state::ComAmazonawsSsmquicksetupQuicksetupState::settle`]), so a read
+//! leaves what a later caller sees unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +165,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetConfigurationErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the configuration manager store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        store.settle(::std::time::SystemTime::now());
+
+        // A configuration the store does not hold is the modelled 404: the id names a
+        // configuration that was never created, or one reclaimed with its manager.
+        let Some(configuration) = store.configurations.get(&input.configuration_id) else {
+            return Err(GetConfigurationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no configuration with ID {} exists",
+                        input.configuration_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetConfigurationOutput {
+            id: Some(configuration.id.clone()),
+            manager_arn: Some(configuration.manager_arn.clone()),
+            configuration_definition_id: Some(configuration.configuration_definition_id.clone()),
+            r#type: Some(configuration.type_.clone()),
+            type_version: configuration.type_version.clone(),
+            account: Some(configuration.account.clone()),
+            region: Some(configuration.region.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(configuration.created_at)),
+            last_modified_at: Some(::aws_smithy_types::DateTime::from(
+                configuration.last_modified_at,
+            )),
+            status_summaries: Some(
+                configuration
+                    .status_summaries
+                    .iter()
+                    .map(crate::state::StatusSummaryRecord::to_status_summary)
+                    .collect(),
+            ),
+            // The parameters are stored with the configuration, so one created without
+            // any reports an empty map rather than nothing at all.
+            parameters: Some(crate::state::to_hash_map(&configuration.parameters)),
+        })
     }
 }
